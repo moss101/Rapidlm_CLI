@@ -1,0 +1,3 @@
+# Node workspace is SDK/schema tooling only; the RapidLM runtime is Rust.
+packages:
+  - "sdk/typescript"

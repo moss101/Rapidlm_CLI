@@ -1,0 +1,5516 @@
+{
+  "schema": 1,
+  "task_count": 320,
+  "tasks": [
+    {
+      "id": "RLM-01-foundation-001",
+      "category": "01-foundation",
+      "title": "Bootstrap Rust workspace",
+      "path": "Cargo.toml, rust-toolchain.toml, apps/rapid/Cargo.toml, apps/rapid/src/main.rs",
+      "deps": [],
+      "references": [
+        "00-README.md",
+        "02-SDD.md",
+        "AGENTS.md",
+        "data-models/domain-model.md",
+        "data-models/config-schema.md"
+      ]
+    },
+    {
+      "id": "RLM-01-foundation-002",
+      "category": "01-foundation",
+      "title": "Bootstrap SDK tooling",
+      "path": "package.json, pnpm-workspace.yaml, sdk/typescript/package.json",
+      "deps": [
+        "RLM-01-foundation-001"
+      ],
+      "references": [
+        "00-README.md",
+        "02-SDD.md",
+        "AGENTS.md",
+        "data-models/domain-model.md",
+        "data-models/config-schema.md"
+      ]
+    },
+    {
+      "id": "RLM-01-foundation-003",
+      "category": "01-foundation",
+      "title": "Define typed UUID identifiers",
+      "path": "crates/protocol/src/id.rs",
+      "deps": [
+        "RLM-01-foundation-001"
+      ],
+      "references": [
+        "00-README.md",
+        "02-SDD.md",
+        "AGENTS.md",
+        "data-models/domain-model.md",
+        "data-models/config-schema.md"
+      ]
+    },
+    {
+      "id": "RLM-01-foundation-004",
+      "category": "01-foundation",
+      "title": "Define public error envelope",
+      "path": "crates/protocol/src/error.rs",
+      "deps": [
+        "RLM-01-foundation-003"
+      ],
+      "references": [
+        "00-README.md",
+        "02-SDD.md",
+        "AGENTS.md",
+        "data-models/domain-model.md",
+        "data-models/config-schema.md",
+        "reference/error-codes.md"
+      ]
+    },
+    {
+      "id": "RLM-01-foundation-005",
+      "category": "01-foundation",
+      "title": "Define artifact references",
+      "path": "crates/protocol/src/artifact.rs",
+      "deps": [
+        "RLM-01-foundation-003"
+      ],
+      "references": [
+        "00-README.md",
+        "02-SDD.md",
+        "AGENTS.md",
+        "data-models/domain-model.md",
+        "data-models/config-schema.md"
+      ]
+    },
+    {
+      "id": "RLM-01-foundation-006",
+      "category": "01-foundation",
+      "title": "Implement config type schema",
+      "path": "crates/protocol/src/config.rs",
+      "deps": [
+        "RLM-01-foundation-004"
+      ],
+      "references": [
+        "00-README.md",
+        "02-SDD.md",
+        "AGENTS.md",
+        "data-models/domain-model.md",
+        "data-models/config-schema.md"
+      ]
+    },
+    {
+      "id": "RLM-01-foundation-007",
+      "category": "01-foundation",
+      "title": "Implement config precedence loader",
+      "path": "crates/kernel/src/config/loader.rs",
+      "deps": [
+        "RLM-01-foundation-006"
+      ],
+      "references": [
+        "00-README.md",
+        "02-SDD.md",
+        "AGENTS.md",
+        "data-models/domain-model.md",
+        "data-models/config-schema.md"
+      ]
+    },
+    {
+      "id": "RLM-01-foundation-008",
+      "category": "01-foundation",
+      "title": "Implement restrictive security config merge",
+      "path": "crates/kernel/src/config/security_merge.rs",
+      "deps": [
+        "RLM-01-foundation-007"
+      ],
+      "references": [
+        "00-README.md",
+        "02-SDD.md",
+        "AGENTS.md",
+        "data-models/domain-model.md",
+        "data-models/config-schema.md"
+      ]
+    },
+    {
+      "id": "RLM-01-foundation-009",
+      "category": "01-foundation",
+      "title": "Implement project trust record",
+      "path": "crates/kernel/src/project/trust.rs",
+      "deps": [
+        "RLM-01-foundation-007"
+      ],
+      "references": [
+        "00-README.md",
+        "02-SDD.md",
+        "AGENTS.md",
+        "data-models/domain-model.md",
+        "data-models/config-schema.md",
+        "architecture/project-and-config.md",
+        "threat-model-and-security.md"
+      ]
+    },
+    {
+      "id": "RLM-01-foundation-010",
+      "category": "01-foundation",
+      "title": "Implement secret-aware value type",
+      "path": "crates/auth/src/secret.rs",
+      "deps": [
+        "RLM-01-foundation-001"
+      ],
+      "references": [
+        "00-README.md",
+        "02-SDD.md",
+        "AGENTS.md",
+        "data-models/domain-model.md",
+        "data-models/config-schema.md",
+        "architecture/authentication-and-identity.md",
+        "threat-model-and-security.md"
+      ]
+    },
+    {
+      "id": "RLM-01-foundation-011",
+      "category": "01-foundation",
+      "title": "Implement OS credential-store interface",
+      "path": "crates/auth/src/store.rs",
+      "deps": [
+        "RLM-01-foundation-010"
+      ],
+      "references": [
+        "00-README.md",
+        "02-SDD.md",
+        "AGENTS.md",
+        "data-models/domain-model.md",
+        "data-models/config-schema.md",
+        "architecture/authentication-and-identity.md"
+      ]
+    },
+    {
+      "id": "RLM-01-foundation-012",
+      "category": "01-foundation",
+      "title": "Implement artifact store",
+      "path": "crates/event-ledger/src/artifact_store.rs",
+      "deps": [
+        "RLM-01-foundation-005"
+      ],
+      "references": [
+        "00-README.md",
+        "02-SDD.md",
+        "AGENTS.md",
+        "data-models/domain-model.md",
+        "data-models/config-schema.md",
+        "architecture/artifact-store.md"
+      ]
+    },
+    {
+      "id": "RLM-01-foundation-013",
+      "category": "01-foundation",
+      "title": "Implement repository path type",
+      "path": "crates/protocol/src/repo_path.rs",
+      "deps": [
+        "RLM-01-foundation-003"
+      ],
+      "references": [
+        "00-README.md",
+        "02-SDD.md",
+        "AGENTS.md",
+        "data-models/domain-model.md",
+        "data-models/config-schema.md"
+      ]
+    },
+    {
+      "id": "RLM-01-foundation-014",
+      "category": "01-foundation",
+      "title": "Add tracing correlation primitives",
+      "path": "crates/protocol/src/trace.rs",
+      "deps": [
+        "RLM-01-foundation-003"
+      ],
+      "references": [
+        "00-README.md",
+        "02-SDD.md",
+        "AGENTS.md",
+        "data-models/domain-model.md",
+        "data-models/config-schema.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-01-foundation-015",
+      "category": "01-foundation",
+      "title": "Create schema fixture harness",
+      "path": "crates/protocol/tests/schema_fixtures.rs",
+      "deps": [
+        "RLM-01-foundation-004",
+        "RLM-01-foundation-005",
+        "RLM-01-foundation-014"
+      ],
+      "references": [
+        "00-README.md",
+        "02-SDD.md",
+        "AGENTS.md",
+        "data-models/domain-model.md",
+        "data-models/config-schema.md"
+      ]
+    },
+    {
+      "id": "RLM-01-foundation-016",
+      "category": "01-foundation",
+      "title": "Add repository CI baseline",
+      "path": ".github/workflows/ci.yml",
+      "deps": [
+        "RLM-01-foundation-002",
+        "RLM-01-foundation-015"
+      ],
+      "references": [
+        "00-README.md",
+        "02-SDD.md",
+        "AGENTS.md",
+        "data-models/domain-model.md",
+        "data-models/config-schema.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-02-kernel-ledger-001",
+      "category": "02-kernel-ledger",
+      "title": "Implement lifecycle service trait",
+      "path": "crates/kernel/src/service.rs",
+      "deps": [
+        "RLM-01-foundation-004",
+        "RLM-01-foundation-014"
+      ],
+      "references": [
+        "architecture/kernel.md",
+        "architecture/event-ledger-and-sessions.md",
+        "api-contracts/kernel-api.md",
+        "data-models/event-schema.md",
+        "data-models/sqlite-schema.sql.md"
+      ]
+    },
+    {
+      "id": "RLM-02-kernel-ledger-002",
+      "category": "02-kernel-ledger",
+      "title": "Implement service graph startup/shutdown",
+      "path": "crates/kernel/src/service_graph.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-001"
+      ],
+      "references": [
+        "architecture/kernel.md",
+        "architecture/event-ledger-and-sessions.md",
+        "api-contracts/kernel-api.md",
+        "data-models/event-schema.md",
+        "data-models/sqlite-schema.sql.md"
+      ]
+    },
+    {
+      "id": "RLM-02-kernel-ledger-003",
+      "category": "02-kernel-ledger",
+      "title": "Create SQLite migration runner",
+      "path": "crates/event-ledger/src/migrations.rs",
+      "deps": [
+        "RLM-01-foundation-001"
+      ],
+      "references": [
+        "architecture/kernel.md",
+        "architecture/event-ledger-and-sessions.md",
+        "api-contracts/kernel-api.md",
+        "data-models/event-schema.md",
+        "data-models/sqlite-schema.sql.md"
+      ]
+    },
+    {
+      "id": "RLM-02-kernel-ledger-004",
+      "category": "02-kernel-ledger",
+      "title": "Implement event envelope types",
+      "path": "crates/event-ledger/src/event.rs",
+      "deps": [
+        "RLM-01-foundation-003",
+        "RLM-01-foundation-014",
+        "RLM-02-kernel-ledger-003"
+      ],
+      "references": [
+        "architecture/kernel.md",
+        "architecture/event-ledger-and-sessions.md",
+        "api-contracts/kernel-api.md",
+        "data-models/event-schema.md",
+        "data-models/sqlite-schema.sql.md"
+      ]
+    },
+    {
+      "id": "RLM-02-kernel-ledger-005",
+      "category": "02-kernel-ledger",
+      "title": "Implement transactional event append",
+      "path": "crates/event-ledger/src/ledger.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-004"
+      ],
+      "references": [
+        "architecture/kernel.md",
+        "architecture/event-ledger-and-sessions.md",
+        "api-contracts/kernel-api.md",
+        "data-models/event-schema.md",
+        "data-models/sqlite-schema.sql.md"
+      ]
+    },
+    {
+      "id": "RLM-02-kernel-ledger-006",
+      "category": "02-kernel-ledger",
+      "title": "Implement event subscription stream",
+      "path": "crates/event-ledger/src/subscription.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-005"
+      ],
+      "references": [
+        "architecture/kernel.md",
+        "architecture/event-ledger-and-sessions.md",
+        "api-contracts/kernel-api.md",
+        "data-models/event-schema.md",
+        "data-models/sqlite-schema.sql.md"
+      ]
+    },
+    {
+      "id": "RLM-02-kernel-ledger-007",
+      "category": "02-kernel-ledger",
+      "title": "Implement session projection",
+      "path": "crates/kernel/src/session/projection.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-004"
+      ],
+      "references": [
+        "architecture/kernel.md",
+        "architecture/event-ledger-and-sessions.md",
+        "api-contracts/kernel-api.md",
+        "data-models/event-schema.md",
+        "data-models/sqlite-schema.sql.md"
+      ]
+    },
+    {
+      "id": "RLM-02-kernel-ledger-008",
+      "category": "02-kernel-ledger",
+      "title": "Implement projection checkpoints",
+      "path": "crates/event-ledger/src/checkpoint.rs",
+      "deps": [
+        "RLM-01-foundation-012",
+        "RLM-02-kernel-ledger-005",
+        "RLM-02-kernel-ledger-007"
+      ],
+      "references": [
+        "architecture/kernel.md",
+        "architecture/event-ledger-and-sessions.md",
+        "api-contracts/kernel-api.md",
+        "data-models/event-schema.md",
+        "data-models/sqlite-schema.sql.md"
+      ]
+    },
+    {
+      "id": "RLM-02-kernel-ledger-009",
+      "category": "02-kernel-ledger",
+      "title": "Implement session creation/read",
+      "path": "crates/kernel/src/session/service.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-005",
+        "RLM-02-kernel-ledger-007"
+      ],
+      "references": [
+        "architecture/kernel.md",
+        "architecture/event-ledger-and-sessions.md",
+        "api-contracts/kernel-api.md",
+        "data-models/event-schema.md",
+        "data-models/sqlite-schema.sql.md"
+      ]
+    },
+    {
+      "id": "RLM-02-kernel-ledger-010",
+      "category": "02-kernel-ledger",
+      "title": "Implement optimistic turn submission guard",
+      "path": "crates/kernel/src/turn/guard.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-009"
+      ],
+      "references": [
+        "architecture/kernel.md",
+        "architecture/event-ledger-and-sessions.md",
+        "api-contracts/kernel-api.md",
+        "data-models/event-schema.md",
+        "data-models/sqlite-schema.sql.md"
+      ]
+    },
+    {
+      "id": "RLM-02-kernel-ledger-011",
+      "category": "02-kernel-ledger",
+      "title": "Implement cancellation tree",
+      "path": "crates/kernel/src/cancel.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-001"
+      ],
+      "references": [
+        "architecture/kernel.md",
+        "architecture/event-ledger-and-sessions.md",
+        "api-contracts/kernel-api.md",
+        "data-models/event-schema.md",
+        "data-models/sqlite-schema.sql.md"
+      ]
+    },
+    {
+      "id": "RLM-02-kernel-ledger-012",
+      "category": "02-kernel-ledger",
+      "title": "Implement recovery classifier",
+      "path": "crates/kernel/src/recovery/classify.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-007",
+        "RLM-02-kernel-ledger-011"
+      ],
+      "references": [
+        "architecture/kernel.md",
+        "architecture/event-ledger-and-sessions.md",
+        "api-contracts/kernel-api.md",
+        "data-models/event-schema.md",
+        "data-models/sqlite-schema.sql.md",
+        "operations/incident-recovery.md"
+      ]
+    },
+    {
+      "id": "RLM-02-kernel-ledger-013",
+      "category": "02-kernel-ledger",
+      "title": "Implement session recovery pipeline",
+      "path": "crates/kernel/src/recovery/mod.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-008",
+        "RLM-02-kernel-ledger-012"
+      ],
+      "references": [
+        "architecture/kernel.md",
+        "architecture/event-ledger-and-sessions.md",
+        "api-contracts/kernel-api.md",
+        "data-models/event-schema.md",
+        "data-models/sqlite-schema.sql.md"
+      ]
+    },
+    {
+      "id": "RLM-02-kernel-ledger-014",
+      "category": "02-kernel-ledger",
+      "title": "Implement session fork",
+      "path": "crates/kernel/src/session/fork.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-009",
+        "RLM-02-kernel-ledger-013"
+      ],
+      "references": [
+        "architecture/kernel.md",
+        "architecture/event-ledger-and-sessions.md",
+        "api-contracts/kernel-api.md",
+        "data-models/event-schema.md",
+        "data-models/sqlite-schema.sql.md"
+      ]
+    },
+    {
+      "id": "RLM-02-kernel-ledger-015",
+      "category": "02-kernel-ledger",
+      "title": "Implement kernel client facade",
+      "path": "crates/kernel/src/client.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-009",
+        "RLM-02-kernel-ledger-010",
+        "RLM-02-kernel-ledger-011",
+        "RLM-02-kernel-ledger-014"
+      ],
+      "references": [
+        "architecture/kernel.md",
+        "architecture/event-ledger-and-sessions.md",
+        "api-contracts/kernel-api.md",
+        "data-models/event-schema.md",
+        "data-models/sqlite-schema.sql.md"
+      ]
+    },
+    {
+      "id": "RLM-02-kernel-ledger-016",
+      "category": "02-kernel-ledger",
+      "title": "Implement headless JSONL emitter",
+      "path": "apps/rapid/src/headless/jsonl.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-006",
+        "RLM-02-kernel-ledger-015"
+      ],
+      "references": [
+        "architecture/kernel.md",
+        "architecture/event-ledger-and-sessions.md",
+        "api-contracts/kernel-api.md",
+        "data-models/event-schema.md",
+        "data-models/sqlite-schema.sql.md",
+        "api-contracts/headless-jsonl.md"
+      ]
+    },
+    {
+      "id": "RLM-02-kernel-ledger-017",
+      "category": "02-kernel-ledger",
+      "title": "Add crash-recovery integration test",
+      "path": "crates/kernel/tests/crash_recovery.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-013",
+        "RLM-02-kernel-ledger-016"
+      ],
+      "references": [
+        "architecture/kernel.md",
+        "architecture/event-ledger-and-sessions.md",
+        "api-contracts/kernel-api.md",
+        "data-models/event-schema.md",
+        "data-models/sqlite-schema.sql.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-001",
+      "category": "03-policy-workspace",
+      "title": "Define capability taxonomy",
+      "path": "crates/capability-broker/src/capability.rs",
+      "deps": [
+        "RLM-01-foundation-013"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-002",
+      "category": "03-policy-workspace",
+      "title": "Implement command action normalizer",
+      "path": "crates/capability-broker/src/normalize/command.rs",
+      "deps": [
+        "RLM-03-policy-workspace-001"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-003",
+      "category": "03-policy-workspace",
+      "title": "Implement filesystem action normalizer",
+      "path": "crates/capability-broker/src/normalize/fs.rs",
+      "deps": [
+        "RLM-03-policy-workspace-001",
+        "RLM-01-foundation-013"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-004",
+      "category": "03-policy-workspace",
+      "title": "Implement network action normalizer",
+      "path": "crates/capability-broker/src/normalize/network.rs",
+      "deps": [
+        "RLM-03-policy-workspace-001"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-005",
+      "category": "03-policy-workspace",
+      "title": "Implement policy file parser",
+      "path": "crates/capability-broker/src/policy/parser.rs",
+      "deps": [
+        "RLM-03-policy-workspace-001",
+        "RLM-01-foundation-008"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-006",
+      "category": "03-policy-workspace",
+      "title": "Implement deterministic policy evaluator",
+      "path": "crates/capability-broker/src/policy/evaluator.rs",
+      "deps": [
+        "RLM-03-policy-workspace-002",
+        "RLM-03-policy-workspace-003",
+        "RLM-03-policy-workspace-004",
+        "RLM-03-policy-workspace-005"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-007",
+      "category": "03-policy-workspace",
+      "title": "Implement approval request model",
+      "path": "crates/capability-broker/src/approval.rs",
+      "deps": [
+        "RLM-03-policy-workspace-006"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-008",
+      "category": "03-policy-workspace",
+      "title": "Implement capability lease issuance",
+      "path": "crates/capability-broker/src/lease.rs",
+      "deps": [
+        "RLM-03-policy-workspace-007",
+        "RLM-01-foundation-011"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-009",
+      "category": "03-policy-workspace",
+      "title": "Implement executor lease validator",
+      "path": "crates/capability-broker/src/validator.rs",
+      "deps": [
+        "RLM-03-policy-workspace-008"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-010",
+      "category": "03-policy-workspace",
+      "title": "Implement capability audit events",
+      "path": "crates/capability-broker/src/audit.rs",
+      "deps": [
+        "RLM-03-policy-workspace-008",
+        "RLM-02-kernel-ledger-005"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-011",
+      "category": "03-policy-workspace",
+      "title": "Implement WorkspaceView model",
+      "path": "crates/workspace/src/view.rs",
+      "deps": [
+        "RLM-01-foundation-013",
+        "RLM-02-kernel-ledger-005"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-012",
+      "category": "03-policy-workspace",
+      "title": "Implement direct workspace backend",
+      "path": "crates/workspace/src/backends/direct.rs",
+      "deps": [
+        "RLM-03-policy-workspace-003",
+        "RLM-03-policy-workspace-011"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-013",
+      "category": "03-policy-workspace",
+      "title": "Implement Git worktree backend",
+      "path": "crates/workspace/src/backends/git_worktree.rs",
+      "deps": [
+        "RLM-03-policy-workspace-011"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-014",
+      "category": "03-policy-workspace",
+      "title": "Implement semantic patch data model",
+      "path": "crates/workspace/src/patch/model.rs",
+      "deps": [
+        "RLM-01-foundation-013",
+        "RLM-03-policy-workspace-011"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-015",
+      "category": "03-policy-workspace",
+      "title": "Implement semantic patch apply-to-overlay",
+      "path": "crates/workspace/src/patch/apply.rs",
+      "deps": [
+        "RLM-03-policy-workspace-014",
+        "RLM-03-policy-workspace-012"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-016",
+      "category": "03-policy-workspace",
+      "title": "Detect shell external mutations",
+      "path": "crates/workspace/src/external_mutation.rs",
+      "deps": [
+        "RLM-03-policy-workspace-011",
+        "RLM-03-policy-workspace-014"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-017",
+      "category": "03-policy-workspace",
+      "title": "Implement workspace checkpoints and rewind",
+      "path": "crates/workspace/src/checkpoint.rs",
+      "deps": [
+        "RLM-03-policy-workspace-012",
+        "RLM-03-policy-workspace-015",
+        "RLM-02-kernel-ledger-005"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-018",
+      "category": "03-policy-workspace",
+      "title": "Implement child-view merge preview",
+      "path": "crates/workspace/src/merge.rs",
+      "deps": [
+        "RLM-03-policy-workspace-013",
+        "RLM-03-policy-workspace-015"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-019",
+      "category": "03-policy-workspace",
+      "title": "Implement transactional merge commit",
+      "path": "crates/workspace/src/transaction.rs",
+      "deps": [
+        "RLM-03-policy-workspace-018",
+        "RLM-03-policy-workspace-017"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-020",
+      "category": "03-policy-workspace",
+      "title": "Implement provenance edge store",
+      "path": "crates/vcs/src/provenance.rs",
+      "deps": [
+        "RLM-03-policy-workspace-019",
+        "RLM-02-kernel-ledger-005"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md"
+      ]
+    },
+    {
+      "id": "RLM-03-policy-workspace-021",
+      "category": "03-policy-workspace",
+      "title": "Add lease TOCTOU security tests",
+      "path": "crates/capability-broker/tests/lease_toctou.rs",
+      "deps": [
+        "RLM-03-policy-workspace-009",
+        "RLM-03-policy-workspace-019"
+      ],
+      "references": [
+        "architecture/capability-broker-and-policy.md",
+        "architecture/workspace-vcs-and-semantic-patch.md",
+        "architecture/vcs-provenance-and-attestations.md",
+        "api-contracts/capability-policy-api.md",
+        "api-contracts/workspace-api.md",
+        "evaluation-specs/security-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-001",
+      "category": "04-context-engine",
+      "title": "Implement repo manifest and identities",
+      "path": "crates/context-engine/src/repo_manifest.rs",
+      "deps": [
+        "RLM-01-foundation-013",
+        "RLM-01-foundation-007"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-002",
+      "category": "04-context-engine",
+      "title": "Implement ignore-aware file walker",
+      "path": "crates/context-engine/src/ingest/walk.rs",
+      "deps": [
+        "RLM-04-context-engine-001"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-003",
+      "category": "04-context-engine",
+      "title": "Implement content hasher and language detector",
+      "path": "crates/context-engine/src/ingest/content.rs",
+      "deps": [
+        "RLM-04-context-engine-002"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-004",
+      "category": "04-context-engine",
+      "title": "Add Tree-sitter parser registry",
+      "path": "crates/context-engine/src/parse/registry.rs",
+      "deps": [
+        "RLM-04-context-engine-003"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-005",
+      "category": "04-context-engine",
+      "title": "Implement symbol extraction",
+      "path": "crates/context-engine/src/parse/symbols.rs",
+      "deps": [
+        "RLM-04-context-engine-004"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-006",
+      "category": "04-context-engine",
+      "title": "Implement code-aware chunker",
+      "path": "crates/context-engine/src/chunk.rs",
+      "deps": [
+        "RLM-04-context-engine-005"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-007",
+      "category": "04-context-engine",
+      "title": "Implement FTS5 index writer/search",
+      "path": "crates/context-engine/src/index/fts.rs",
+      "deps": [
+        "RLM-04-context-engine-006",
+        "RLM-02-kernel-ledger-003"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-008",
+      "category": "04-context-engine",
+      "title": "Implement symbol/code graph",
+      "path": "crates/context-engine/src/index/graph.rs",
+      "deps": [
+        "RLM-04-context-engine-005",
+        "RLM-02-kernel-ledger-003"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-009",
+      "category": "04-context-engine",
+      "title": "Implement optional vector index abstraction",
+      "path": "crates/context-engine/src/index/vector.rs",
+      "deps": [
+        "RLM-04-context-engine-006"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-010",
+      "category": "04-context-engine",
+      "title": "Implement incremental indexing transaction",
+      "path": "crates/context-engine/src/ingest/pipeline.rs",
+      "deps": [
+        "RLM-04-context-engine-007",
+        "RLM-04-context-engine-008",
+        "RLM-04-context-engine-009"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-011",
+      "category": "04-context-engine",
+      "title": "Implement filesystem watcher coalescer",
+      "path": "crates/context-engine/src/ingest/watch.rs",
+      "deps": [
+        "RLM-04-context-engine-010"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-012",
+      "category": "04-context-engine",
+      "title": "Implement LSP enrichment adapter",
+      "path": "crates/context-engine/src/lsp/mod.rs",
+      "deps": [
+        "RLM-04-context-engine-005"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-013",
+      "category": "04-context-engine",
+      "title": "Implement hybrid candidate generators",
+      "path": "crates/context-engine/src/retrieval/candidates.rs",
+      "deps": [
+        "RLM-04-context-engine-007",
+        "RLM-04-context-engine-008",
+        "RLM-04-context-engine-009",
+        "RLM-04-context-engine-012"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-014",
+      "category": "04-context-engine",
+      "title": "Implement rank fusion and MMR",
+      "path": "crates/context-engine/src/retrieval/rank.rs",
+      "deps": [
+        "RLM-04-context-engine-013"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-015",
+      "category": "04-context-engine",
+      "title": "Implement read tracking",
+      "path": "crates/context-engine/src/read_set.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-005",
+        "RLM-04-context-engine-003"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-016",
+      "category": "04-context-engine",
+      "title": "Implement token estimator abstraction",
+      "path": "crates/context-engine/src/token_estimate.rs",
+      "deps": [
+        "RLM-04-context-engine-003"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-017",
+      "category": "04-context-engine",
+      "title": "Implement context compiler budgeting",
+      "path": "crates/context-engine/src/compile.rs",
+      "deps": [
+        "RLM-04-context-engine-014",
+        "RLM-04-context-engine-015",
+        "RLM-04-context-engine-016"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-018",
+      "category": "04-context-engine",
+      "title": "Implement durable scoped memory",
+      "path": "crates/context-engine/src/memory.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-003",
+        "RLM-02-kernel-ledger-005"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-04-context-engine-019",
+      "category": "04-context-engine",
+      "title": "Add context benchmark harness",
+      "path": "crates/context-engine/benches/eval_queries.rs",
+      "deps": [
+        "RLM-04-context-engine-017",
+        "RLM-04-context-engine-018"
+      ],
+      "references": [
+        "architecture/context-engine.md",
+        "api-contracts/context-engine-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/context-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-001",
+      "category": "05-agent-llm-goal",
+      "title": "Define provider capability model",
+      "path": "crates/llm-router/src/provider.rs",
+      "deps": [
+        "RLM-01-foundation-004",
+        "RLM-01-foundation-014"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-002",
+      "category": "05-agent-llm-goal",
+      "title": "Implement provider credential resolver",
+      "path": "crates/llm-router/src/credentials.rs",
+      "deps": [
+        "RLM-01-foundation-011",
+        "RLM-05-agent-llm-goal-001"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-003",
+      "category": "05-agent-llm-goal",
+      "title": "Implement OpenAI-compatible provider adapter",
+      "path": "crates/llm-router/src/providers/openai_compatible.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-001",
+        "RLM-05-agent-llm-goal-002"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-004",
+      "category": "05-agent-llm-goal",
+      "title": "Implement Anthropic provider adapter",
+      "path": "crates/llm-router/src/providers/anthropic.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-001",
+        "RLM-05-agent-llm-goal-002"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-005",
+      "category": "05-agent-llm-goal",
+      "title": "Implement model catalog",
+      "path": "crates/llm-router/src/catalog.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-001",
+        "RLM-05-agent-llm-goal-003",
+        "RLM-05-agent-llm-goal-004"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-006",
+      "category": "05-agent-llm-goal",
+      "title": "Implement hard route filters",
+      "path": "crates/llm-router/src/route/filter.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-005"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-007",
+      "category": "05-agent-llm-goal",
+      "title": "Implement versioned route scoring",
+      "path": "crates/llm-router/src/route/score.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-006"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-008",
+      "category": "05-agent-llm-goal",
+      "title": "Implement safe fallback controller",
+      "path": "crates/llm-router/src/fallback.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-007"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-009",
+      "category": "05-agent-llm-goal",
+      "title": "Implement usage/cost accounting",
+      "path": "crates/llm-router/src/usage.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-003",
+        "RLM-05-agent-llm-goal-004",
+        "RLM-02-kernel-ledger-005"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-010",
+      "category": "05-agent-llm-goal",
+      "title": "Define stable model tool schemas",
+      "path": "crates/tool-gateway/src/schema.rs",
+      "deps": [
+        "RLM-01-foundation-004",
+        "RLM-03-policy-workspace-001",
+        "RLM-04-context-engine-017"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md",
+        "api-contracts/tool-gateway-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-011",
+      "category": "05-agent-llm-goal",
+      "title": "Implement tool invocation validator",
+      "path": "crates/tool-gateway/src/validate.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-010"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-012",
+      "category": "05-agent-llm-goal",
+      "title": "Implement tool dispatch skeleton",
+      "path": "crates/tool-gateway/src/dispatch.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-011",
+        "RLM-03-policy-workspace-009"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-013",
+      "category": "05-agent-llm-goal",
+      "title": "Implement prompt bundle compiler",
+      "path": "crates/agent-runtime/src/prompt.rs",
+      "deps": [
+        "RLM-04-context-engine-017",
+        "RLM-05-agent-llm-goal-010"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md",
+        "system-prompts/00-core-system.md",
+        "system-prompts/prompt-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-014",
+      "category": "05-agent-llm-goal",
+      "title": "Implement cancellable turn loop",
+      "path": "crates/agent-runtime/src/turn.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-010",
+        "RLM-02-kernel-ledger-011",
+        "RLM-05-agent-llm-goal-008",
+        "RLM-05-agent-llm-goal-009",
+        "RLM-05-agent-llm-goal-012",
+        "RLM-05-agent-llm-goal-013"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-015",
+      "category": "05-agent-llm-goal",
+      "title": "Define agent lifecycle/result model",
+      "path": "crates/agent-runtime/src/agent/model.rs",
+      "deps": [
+        "RLM-01-foundation-003",
+        "RLM-03-policy-workspace-011"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-016",
+      "category": "05-agent-llm-goal",
+      "title": "Implement agent scheduler queues",
+      "path": "crates/agent-runtime/src/agent/scheduler.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-015",
+        "RLM-05-agent-llm-goal-007",
+        "RLM-02-kernel-ledger-011"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-017",
+      "category": "05-agent-llm-goal",
+      "title": "Implement isolated subagent spawn",
+      "path": "crates/agent-runtime/src/agent/spawn.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-016",
+        "RLM-03-policy-workspace-013",
+        "RLM-05-agent-llm-goal-014"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-018",
+      "category": "05-agent-llm-goal",
+      "title": "Implement subagent result/merge handoff",
+      "path": "crates/agent-runtime/src/agent/result.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-017",
+        "RLM-03-policy-workspace-019"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-019",
+      "category": "05-agent-llm-goal",
+      "title": "Implement goal state machine",
+      "path": "crates/agent-runtime/src/goal/state.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-015",
+        "RLM-02-kernel-ledger-005"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md",
+        "data-models/domain-model.md",
+        "system-prompts/goal-driver.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-020",
+      "category": "05-agent-llm-goal",
+      "title": "Implement goal budgets and usage",
+      "path": "crates/agent-runtime/src/goal/budget.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-009",
+        "RLM-05-agent-llm-goal-019"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-021",
+      "category": "05-agent-llm-goal",
+      "title": "Implement evidence store/validators",
+      "path": "crates/agent-runtime/src/evidence.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-019",
+        "RLM-03-policy-workspace-020"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-022",
+      "category": "05-agent-llm-goal",
+      "title": "Implement autonomous goal driver",
+      "path": "crates/agent-runtime/src/goal/driver.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-014",
+        "RLM-05-agent-llm-goal-020",
+        "RLM-05-agent-llm-goal-021"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-023",
+      "category": "05-agent-llm-goal",
+      "title": "Integrate goal crash recovery",
+      "path": "crates/agent-runtime/src/goal/recovery.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-013",
+        "RLM-05-agent-llm-goal-022"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md"
+      ]
+    },
+    {
+      "id": "RLM-05-agent-llm-goal-024",
+      "category": "05-agent-llm-goal",
+      "title": "Implement structured compaction",
+      "path": "crates/agent-runtime/src/compaction.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-013",
+        "RLM-04-context-engine-015",
+        "RLM-01-foundation-012"
+      ],
+      "references": [
+        "architecture/llm-router.md",
+        "architecture/goal-dag-and-evidence.md",
+        "architecture/prompt-runtime.md",
+        "architecture/agents-panel.md",
+        "api-contracts/llm-provider-api.md",
+        "api-contracts/agent-scheduler-api.md",
+        "system-prompts/compaction.md"
+      ]
+    },
+    {
+      "id": "RLM-06-cli-tui-001",
+      "category": "06-cli-tui",
+      "title": "Implement frontend state projection",
+      "path": "crates/tui/src/state.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-015",
+        "RLM-05-agent-llm-goal-015",
+        "RLM-05-agent-llm-goal-019"
+      ],
+      "references": [
+        "architecture/cli-tui.md",
+        "architecture/agents-panel.md",
+        "api-contracts/kernel-api.md",
+        "api-contracts/headless-jsonl.md"
+      ]
+    },
+    {
+      "id": "RLM-06-cli-tui-002",
+      "category": "06-cli-tui",
+      "title": "Implement terminal output sanitizer",
+      "path": "crates/tui/src/sanitize.rs",
+      "deps": [
+        "RLM-01-foundation-001"
+      ],
+      "references": [
+        "architecture/cli-tui.md",
+        "architecture/agents-panel.md",
+        "api-contracts/kernel-api.md",
+        "api-contracts/headless-jsonl.md",
+        "threat-model-and-security.md",
+        "evaluation-specs/security-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-06-cli-tui-003",
+      "category": "06-cli-tui",
+      "title": "Implement terminal lifecycle",
+      "path": "crates/tui/src/terminal.rs",
+      "deps": [
+        "RLM-06-cli-tui-002"
+      ],
+      "references": [
+        "architecture/cli-tui.md",
+        "architecture/agents-panel.md",
+        "api-contracts/kernel-api.md",
+        "api-contracts/headless-jsonl.md"
+      ]
+    },
+    {
+      "id": "RLM-06-cli-tui-004",
+      "category": "06-cli-tui",
+      "title": "Implement responsive layout model",
+      "path": "crates/tui/src/layout.rs",
+      "deps": [
+        "RLM-06-cli-tui-001"
+      ],
+      "references": [
+        "architecture/cli-tui.md",
+        "architecture/agents-panel.md",
+        "api-contracts/kernel-api.md",
+        "api-contracts/headless-jsonl.md"
+      ]
+    },
+    {
+      "id": "RLM-06-cli-tui-005",
+      "category": "06-cli-tui",
+      "title": "Implement transcript virtualizer",
+      "path": "crates/tui/src/transcript.rs",
+      "deps": [
+        "RLM-06-cli-tui-002",
+        "RLM-06-cli-tui-004"
+      ],
+      "references": [
+        "architecture/cli-tui.md",
+        "architecture/agents-panel.md",
+        "api-contracts/kernel-api.md",
+        "api-contracts/headless-jsonl.md"
+      ]
+    },
+    {
+      "id": "RLM-06-cli-tui-006",
+      "category": "06-cli-tui",
+      "title": "Implement composer editor",
+      "path": "crates/tui/src/composer.rs",
+      "deps": [
+        "RLM-06-cli-tui-004"
+      ],
+      "references": [
+        "architecture/cli-tui.md",
+        "architecture/agents-panel.md",
+        "api-contracts/kernel-api.md",
+        "api-contracts/headless-jsonl.md"
+      ]
+    },
+    {
+      "id": "RLM-06-cli-tui-007",
+      "category": "06-cli-tui",
+      "title": "Implement status bar",
+      "path": "crates/tui/src/status.rs",
+      "deps": [
+        "RLM-06-cli-tui-001",
+        "RLM-06-cli-tui-004"
+      ],
+      "references": [
+        "architecture/cli-tui.md",
+        "architecture/agents-panel.md",
+        "api-contracts/kernel-api.md",
+        "api-contracts/headless-jsonl.md"
+      ]
+    },
+    {
+      "id": "RLM-06-cli-tui-008",
+      "category": "06-cli-tui",
+      "title": "Implement command palette/slash router",
+      "path": "crates/tui/src/commands.rs",
+      "deps": [
+        "RLM-06-cli-tui-006",
+        "RLM-02-kernel-ledger-015"
+      ],
+      "references": [
+        "architecture/cli-tui.md",
+        "architecture/agents-panel.md",
+        "api-contracts/kernel-api.md",
+        "api-contracts/headless-jsonl.md",
+        "reference/cli-command-reference.md"
+      ]
+    },
+    {
+      "id": "RLM-06-cli-tui-009",
+      "category": "06-cli-tui",
+      "title": "Implement Agents Panel",
+      "path": "crates/tui/src/panels/agents.rs",
+      "deps": [
+        "RLM-06-cli-tui-001",
+        "RLM-06-cli-tui-004",
+        "RLM-05-agent-llm-goal-018"
+      ],
+      "references": [
+        "architecture/cli-tui.md",
+        "architecture/agents-panel.md",
+        "api-contracts/kernel-api.md",
+        "api-contracts/headless-jsonl.md"
+      ]
+    },
+    {
+      "id": "RLM-06-cli-tui-010",
+      "category": "06-cli-tui",
+      "title": "Implement diff viewer",
+      "path": "crates/tui/src/panels/diff.rs",
+      "deps": [
+        "RLM-06-cli-tui-004",
+        "RLM-03-policy-workspace-018",
+        "RLM-03-policy-workspace-020"
+      ],
+      "references": [
+        "architecture/cli-tui.md",
+        "architecture/agents-panel.md",
+        "api-contracts/kernel-api.md",
+        "api-contracts/headless-jsonl.md"
+      ]
+    },
+    {
+      "id": "RLM-06-cli-tui-011",
+      "category": "06-cli-tui",
+      "title": "Implement approval UI",
+      "path": "crates/tui/src/panels/approval.rs",
+      "deps": [
+        "RLM-06-cli-tui-004",
+        "RLM-03-policy-workspace-007",
+        "RLM-02-kernel-ledger-015"
+      ],
+      "references": [
+        "architecture/cli-tui.md",
+        "architecture/agents-panel.md",
+        "api-contracts/kernel-api.md",
+        "api-contracts/headless-jsonl.md"
+      ]
+    },
+    {
+      "id": "RLM-06-cli-tui-012",
+      "category": "06-cli-tui",
+      "title": "Implement context inspector",
+      "path": "crates/tui/src/panels/context.rs",
+      "deps": [
+        "RLM-06-cli-tui-004",
+        "RLM-04-context-engine-017"
+      ],
+      "references": [
+        "architecture/cli-tui.md",
+        "architecture/agents-panel.md",
+        "api-contracts/kernel-api.md",
+        "api-contracts/headless-jsonl.md"
+      ]
+    },
+    {
+      "id": "RLM-06-cli-tui-013",
+      "category": "06-cli-tui",
+      "title": "Implement memory inspector",
+      "path": "crates/tui/src/panels/memory.rs",
+      "deps": [
+        "RLM-06-cli-tui-004",
+        "RLM-04-context-engine-018"
+      ],
+      "references": [
+        "architecture/cli-tui.md",
+        "architecture/agents-panel.md",
+        "api-contracts/kernel-api.md",
+        "api-contracts/headless-jsonl.md"
+      ]
+    },
+    {
+      "id": "RLM-06-cli-tui-014",
+      "category": "06-cli-tui",
+      "title": "Implement model selector",
+      "path": "crates/tui/src/panels/model.rs",
+      "deps": [
+        "RLM-06-cli-tui-004",
+        "RLM-05-agent-llm-goal-007"
+      ],
+      "references": [
+        "architecture/cli-tui.md",
+        "architecture/agents-panel.md",
+        "api-contracts/kernel-api.md",
+        "api-contracts/headless-jsonl.md"
+      ]
+    },
+    {
+      "id": "RLM-06-cli-tui-015",
+      "category": "06-cli-tui",
+      "title": "Implement trace/jobs inspector",
+      "path": "crates/tui/src/panels/trace_jobs.rs",
+      "deps": [
+        "RLM-06-cli-tui-004",
+        "RLM-02-kernel-ledger-006"
+      ],
+      "references": [
+        "architecture/cli-tui.md",
+        "architecture/agents-panel.md",
+        "api-contracts/kernel-api.md",
+        "api-contracts/headless-jsonl.md"
+      ]
+    },
+    {
+      "id": "RLM-06-cli-tui-016",
+      "category": "06-cli-tui",
+      "title": "Implement session lifecycle UI",
+      "path": "crates/tui/src/session_actions.rs",
+      "deps": [
+        "RLM-06-cli-tui-008",
+        "RLM-02-kernel-ledger-014",
+        "RLM-03-policy-workspace-017",
+        "RLM-05-agent-llm-goal-024"
+      ],
+      "references": [
+        "architecture/cli-tui.md",
+        "architecture/agents-panel.md",
+        "api-contracts/kernel-api.md",
+        "api-contracts/headless-jsonl.md"
+      ]
+    },
+    {
+      "id": "RLM-06-cli-tui-017",
+      "category": "06-cli-tui",
+      "title": "Add TUI snapshot/performance harness",
+      "path": "crates/tui/tests/ui_snapshots.rs",
+      "deps": [
+        "RLM-06-cli-tui-005",
+        "RLM-06-cli-tui-009",
+        "RLM-06-cli-tui-010",
+        "RLM-06-cli-tui-011",
+        "RLM-06-cli-tui-012",
+        "RLM-06-cli-tui-013",
+        "RLM-06-cli-tui-014",
+        "RLM-06-cli-tui-015"
+      ],
+      "references": [
+        "architecture/cli-tui.md",
+        "architecture/agents-panel.md",
+        "api-contracts/kernel-api.md",
+        "api-contracts/headless-jsonl.md"
+      ]
+    },
+    {
+      "id": "RLM-06-cli-tui-018",
+      "category": "06-cli-tui",
+      "title": "Wire interactive rapid entrypoint",
+      "path": "apps/rapid/src/interactive.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-002",
+        "RLM-02-kernel-ledger-015",
+        "RLM-06-cli-tui-003",
+        "RLM-06-cli-tui-017"
+      ],
+      "references": [
+        "architecture/cli-tui.md",
+        "architecture/agents-panel.md",
+        "api-contracts/kernel-api.md",
+        "api-contracts/headless-jsonl.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-001",
+      "category": "07-sandbox-security",
+      "title": "Implement supervised process spawn",
+      "path": "crates/process-supervisor/src/spawn.rs",
+      "deps": [
+        "RLM-03-policy-workspace-009",
+        "RLM-02-kernel-ledger-011",
+        "RLM-01-foundation-010"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-002",
+      "category": "07-sandbox-security",
+      "title": "Implement bounded output spool",
+      "path": "crates/process-supervisor/src/output.rs",
+      "deps": [
+        "RLM-07-sandbox-security-001",
+        "RLM-01-foundation-012"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-003",
+      "category": "07-sandbox-security",
+      "title": "Implement process-tree cancellation",
+      "path": "crates/process-supervisor/src/cancel.rs",
+      "deps": [
+        "RLM-07-sandbox-security-001",
+        "RLM-02-kernel-ledger-011"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-004",
+      "category": "07-sandbox-security",
+      "title": "Implement background job registry",
+      "path": "crates/process-supervisor/src/jobs.rs",
+      "deps": [
+        "RLM-07-sandbox-security-001",
+        "RLM-02-kernel-ledger-005"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-005",
+      "category": "07-sandbox-security",
+      "title": "Implement orphan process reconciliation",
+      "path": "crates/process-supervisor/src/recovery.rs",
+      "deps": [
+        "RLM-07-sandbox-security-004",
+        "RLM-02-kernel-ledger-013"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-006",
+      "category": "07-sandbox-security",
+      "title": "Implement cron-like schedule parser",
+      "path": "crates/process-supervisor/src/schedule.rs",
+      "deps": [
+        "RLM-07-sandbox-security-004"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-007",
+      "category": "07-sandbox-security",
+      "title": "Define sandbox backend trait",
+      "path": "crates/sandbox/src/backend.rs",
+      "deps": [
+        "RLM-07-sandbox-security-001"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-008",
+      "category": "07-sandbox-security",
+      "title": "Implement host-restricted backend",
+      "path": "crates/sandbox/src/backends/host_restricted.rs",
+      "deps": [
+        "RLM-07-sandbox-security-007",
+        "RLM-03-policy-workspace-009"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-009",
+      "category": "07-sandbox-security",
+      "title": "Implement rootless container backend",
+      "path": "crates/sandbox/src/backends/container.rs",
+      "deps": [
+        "RLM-07-sandbox-security-007"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-010",
+      "category": "07-sandbox-security",
+      "title": "Implement gVisor backend adapter",
+      "path": "crates/sandbox/src/backends/gvisor.rs",
+      "deps": [
+        "RLM-07-sandbox-security-007",
+        "RLM-07-sandbox-security-009"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-011",
+      "category": "07-sandbox-security",
+      "title": "Define remote microVM sandbox protocol",
+      "path": "crates/sandbox/src/backends/remote.rs",
+      "deps": [
+        "RLM-07-sandbox-security-007",
+        "RLM-01-foundation-005"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-012",
+      "category": "07-sandbox-security",
+      "title": "Implement egress policy proxy",
+      "path": "crates/security/src/network_policy.rs",
+      "deps": [
+        "RLM-03-policy-workspace-004",
+        "RLM-03-policy-workspace-009"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-013",
+      "category": "07-sandbox-security",
+      "title": "Implement secret redaction registry",
+      "path": "crates/security/src/redaction.rs",
+      "deps": [
+        "RLM-01-foundation-010"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-014",
+      "category": "07-sandbox-security",
+      "title": "Implement native secret scanner",
+      "path": "crates/security/src/scanners/secrets.rs",
+      "deps": [
+        "RLM-07-sandbox-security-013",
+        "RLM-03-policy-workspace-014"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-015",
+      "category": "07-sandbox-security",
+      "title": "Implement dangerous command scanner",
+      "path": "crates/security/src/scanners/command.rs",
+      "deps": [
+        "RLM-03-policy-workspace-002"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-016",
+      "category": "07-sandbox-security",
+      "title": "Implement patch security scanner",
+      "path": "crates/security/src/scanners/patch.rs",
+      "deps": [
+        "RLM-03-policy-workspace-014"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-017",
+      "category": "07-sandbox-security",
+      "title": "Implement external scanner adapter protocol",
+      "path": "crates/security/src/scanners/external.rs",
+      "deps": [
+        "RLM-07-sandbox-security-002",
+        "RLM-07-sandbox-security-007"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-018",
+      "category": "07-sandbox-security",
+      "title": "Implement scanner gate aggregator",
+      "path": "crates/security/src/gate.rs",
+      "deps": [
+        "RLM-07-sandbox-security-014",
+        "RLM-07-sandbox-security-015",
+        "RLM-07-sandbox-security-016",
+        "RLM-07-sandbox-security-017"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-019",
+      "category": "07-sandbox-security",
+      "title": "Implement terminal/control-output security filter for logs",
+      "path": "crates/security/src/output_safety.rs",
+      "deps": [
+        "RLM-06-cli-tui-002",
+        "RLM-07-sandbox-security-002"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-020",
+      "category": "07-sandbox-security",
+      "title": "Implement security doctor checks",
+      "path": "crates/security/src/doctor.rs",
+      "deps": [
+        "RLM-07-sandbox-security-008",
+        "RLM-07-sandbox-security-009",
+        "RLM-07-sandbox-security-010",
+        "RLM-07-sandbox-security-012",
+        "RLM-07-sandbox-security-013"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-07-sandbox-security-021",
+      "category": "07-sandbox-security",
+      "title": "Add adversarial sandbox/policy suite",
+      "path": "crates/security/tests/adversarial.rs",
+      "deps": [
+        "RLM-07-sandbox-security-012",
+        "RLM-07-sandbox-security-013",
+        "RLM-07-sandbox-security-018",
+        "RLM-07-sandbox-security-019",
+        "RLM-03-policy-workspace-021"
+      ],
+      "references": [
+        "architecture/process-supervisor-and-jobs.md",
+        "architecture/sandbox.md",
+        "architecture/security-scanners.md",
+        "threat-model-and-security.md",
+        "api-contracts/sandbox-process-api.md"
+      ]
+    },
+    {
+      "id": "RLM-08-computer-mobile-001",
+      "category": "08-computer-mobile",
+      "title": "Implement browser session manager",
+      "path": "crates/computer-use/src/browser/session.rs",
+      "deps": [
+        "RLM-01-foundation-012",
+        "RLM-03-policy-workspace-009",
+        "RLM-07-sandbox-security-012"
+      ],
+      "references": [
+        "architecture/computer-use.md",
+        "architecture/mobile-simulator.md",
+        "api-contracts/computer-mobile-api.md",
+        "evaluation-specs/computer-mobile-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-08-computer-mobile-002",
+      "category": "08-computer-mobile",
+      "title": "Implement browser observation",
+      "path": "crates/computer-use/src/browser/observe.rs",
+      "deps": [
+        "RLM-08-computer-mobile-001"
+      ],
+      "references": [
+        "architecture/computer-use.md",
+        "architecture/mobile-simulator.md",
+        "api-contracts/computer-mobile-api.md",
+        "evaluation-specs/computer-mobile-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-08-computer-mobile-003",
+      "category": "08-computer-mobile",
+      "title": "Implement semantic browser actions",
+      "path": "crates/computer-use/src/browser/action.rs",
+      "deps": [
+        "RLM-08-computer-mobile-002"
+      ],
+      "references": [
+        "architecture/computer-use.md",
+        "architecture/mobile-simulator.md",
+        "api-contracts/computer-mobile-api.md",
+        "evaluation-specs/computer-mobile-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-08-computer-mobile-004",
+      "category": "08-computer-mobile",
+      "title": "Implement browser verify step",
+      "path": "crates/computer-use/src/browser/verify.rs",
+      "deps": [
+        "RLM-08-computer-mobile-003"
+      ],
+      "references": [
+        "architecture/computer-use.md",
+        "architecture/mobile-simulator.md",
+        "api-contracts/computer-mobile-api.md",
+        "evaluation-specs/computer-mobile-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-08-computer-mobile-005",
+      "category": "08-computer-mobile",
+      "title": "Implement browser sensitive-action gates",
+      "path": "crates/computer-use/src/browser/security.rs",
+      "deps": [
+        "RLM-08-computer-mobile-003",
+        "RLM-03-policy-workspace-001"
+      ],
+      "references": [
+        "architecture/computer-use.md",
+        "architecture/mobile-simulator.md",
+        "api-contracts/computer-mobile-api.md",
+        "evaluation-specs/computer-mobile-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-08-computer-mobile-006",
+      "category": "08-computer-mobile",
+      "title": "Implement browser trace artifact exporter",
+      "path": "crates/computer-use/src/browser/trace.rs",
+      "deps": [
+        "RLM-08-computer-mobile-004",
+        "RLM-01-foundation-012"
+      ],
+      "references": [
+        "architecture/computer-use.md",
+        "architecture/mobile-simulator.md",
+        "api-contracts/computer-mobile-api.md",
+        "evaluation-specs/computer-mobile-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-08-computer-mobile-007",
+      "category": "08-computer-mobile",
+      "title": "Define desktop automation backend trait",
+      "path": "crates/computer-use/src/desktop/backend.rs",
+      "deps": [
+        "RLM-03-policy-workspace-009"
+      ],
+      "references": [
+        "architecture/computer-use.md",
+        "architecture/mobile-simulator.md",
+        "api-contracts/computer-mobile-api.md",
+        "evaluation-specs/computer-mobile-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-08-computer-mobile-008",
+      "category": "08-computer-mobile",
+      "title": "Implement macOS accessibility adapter",
+      "path": "crates/computer-use/src/desktop/macos.rs",
+      "deps": [
+        "RLM-08-computer-mobile-007"
+      ],
+      "references": [
+        "architecture/computer-use.md",
+        "architecture/mobile-simulator.md",
+        "api-contracts/computer-mobile-api.md",
+        "evaluation-specs/computer-mobile-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-08-computer-mobile-009",
+      "category": "08-computer-mobile",
+      "title": "Implement Windows UI Automation adapter",
+      "path": "crates/computer-use/src/desktop/windows.rs",
+      "deps": [
+        "RLM-08-computer-mobile-007"
+      ],
+      "references": [
+        "architecture/computer-use.md",
+        "architecture/mobile-simulator.md",
+        "api-contracts/computer-mobile-api.md",
+        "evaluation-specs/computer-mobile-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-08-computer-mobile-010",
+      "category": "08-computer-mobile",
+      "title": "Implement Linux accessibility adapter",
+      "path": "crates/computer-use/src/desktop/linux.rs",
+      "deps": [
+        "RLM-08-computer-mobile-007"
+      ],
+      "references": [
+        "architecture/computer-use.md",
+        "architecture/mobile-simulator.md",
+        "api-contracts/computer-mobile-api.md",
+        "evaluation-specs/computer-mobile-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-08-computer-mobile-011",
+      "category": "08-computer-mobile",
+      "title": "Implement Android emulator manager",
+      "path": "crates/mobile-sim/src/android/manager.rs",
+      "deps": [
+        "RLM-07-sandbox-security-003",
+        "RLM-03-policy-workspace-009"
+      ],
+      "references": [
+        "architecture/computer-use.md",
+        "architecture/mobile-simulator.md",
+        "api-contracts/computer-mobile-api.md",
+        "evaluation-specs/computer-mobile-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-08-computer-mobile-012",
+      "category": "08-computer-mobile",
+      "title": "Implement Android observe/action adapter",
+      "path": "crates/mobile-sim/src/android/action.rs",
+      "deps": [
+        "RLM-08-computer-mobile-011"
+      ],
+      "references": [
+        "architecture/computer-use.md",
+        "architecture/mobile-simulator.md",
+        "api-contracts/computer-mobile-api.md",
+        "evaluation-specs/computer-mobile-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-08-computer-mobile-013",
+      "category": "08-computer-mobile",
+      "title": "Implement Android snapshot/reset lifecycle",
+      "path": "crates/mobile-sim/src/android/snapshot.rs",
+      "deps": [
+        "RLM-08-computer-mobile-011"
+      ],
+      "references": [
+        "architecture/computer-use.md",
+        "architecture/mobile-simulator.md",
+        "api-contracts/computer-mobile-api.md",
+        "evaluation-specs/computer-mobile-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-08-computer-mobile-014",
+      "category": "08-computer-mobile",
+      "title": "Implement iOS simctl backend",
+      "path": "crates/mobile-sim/src/ios/simctl.rs",
+      "deps": [
+        "RLM-07-sandbox-security-001",
+        "RLM-03-policy-workspace-009"
+      ],
+      "references": [
+        "architecture/computer-use.md",
+        "architecture/mobile-simulator.md",
+        "api-contracts/computer-mobile-api.md",
+        "evaluation-specs/computer-mobile-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-08-computer-mobile-015",
+      "category": "08-computer-mobile",
+      "title": "Implement remote macOS simulator delegation",
+      "path": "crates/mobile-sim/src/ios/remote.rs",
+      "deps": [
+        "RLM-08-computer-mobile-014",
+        "RLM-07-sandbox-security-011"
+      ],
+      "references": [
+        "architecture/computer-use.md",
+        "architecture/mobile-simulator.md",
+        "api-contracts/computer-mobile-api.md",
+        "evaluation-specs/computer-mobile-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-08-computer-mobile-016",
+      "category": "08-computer-mobile",
+      "title": "Implement mobile trace/evidence bundle",
+      "path": "crates/mobile-sim/src/trace.rs",
+      "deps": [
+        "RLM-08-computer-mobile-012",
+        "RLM-08-computer-mobile-013",
+        "RLM-08-computer-mobile-014",
+        "RLM-01-foundation-012"
+      ],
+      "references": [
+        "architecture/computer-use.md",
+        "architecture/mobile-simulator.md",
+        "api-contracts/computer-mobile-api.md",
+        "evaluation-specs/computer-mobile-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-08-computer-mobile-017",
+      "category": "08-computer-mobile",
+      "title": "Add computer/mobile deterministic fixtures",
+      "path": "crates/computer-use/tests/fixtures.rs, crates/mobile-sim/tests/fixtures.rs",
+      "deps": [
+        "RLM-08-computer-mobile-004",
+        "RLM-08-computer-mobile-005",
+        "RLM-08-computer-mobile-007",
+        "RLM-08-computer-mobile-016"
+      ],
+      "references": [
+        "architecture/computer-use.md",
+        "architecture/mobile-simulator.md",
+        "api-contracts/computer-mobile-api.md",
+        "evaluation-specs/computer-mobile-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-001",
+      "category": "09-protocols-extensions",
+      "title": "Implement MCP transport/session abstraction",
+      "path": "crates/mcp/src/transport.rs",
+      "deps": [
+        "RLM-07-sandbox-security-001",
+        "RLM-07-sandbox-security-012",
+        "RLM-01-foundation-010"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-002",
+      "category": "09-protocols-extensions",
+      "title": "Implement deterministic MCP catalog cache",
+      "path": "crates/mcp/src/catalog.rs",
+      "deps": [
+        "RLM-09-protocols-extensions-001"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-003",
+      "category": "09-protocols-extensions",
+      "title": "Implement MCP trust/auth records",
+      "path": "crates/mcp/src/trust.rs",
+      "deps": [
+        "RLM-09-protocols-extensions-001",
+        "RLM-01-foundation-009",
+        "RLM-01-foundation-011"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-004",
+      "category": "09-protocols-extensions",
+      "title": "Implement external.call MCP gateway",
+      "path": "crates/mcp/src/gateway.rs",
+      "deps": [
+        "RLM-09-protocols-extensions-002",
+        "RLM-09-protocols-extensions-003",
+        "RLM-05-agent-llm-goal-012"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-005",
+      "category": "09-protocols-extensions",
+      "title": "Implement RapidLM MCP server mode",
+      "path": "crates/mcp/src/server.rs",
+      "deps": [
+        "RLM-09-protocols-extensions-001",
+        "RLM-03-policy-workspace-006"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-006",
+      "category": "09-protocols-extensions",
+      "title": "Implement ACP stdio transport",
+      "path": "crates/acp/src/stdio.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-015"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-007",
+      "category": "09-protocols-extensions",
+      "title": "Implement ACP v1 adapter",
+      "path": "crates/acp/src/v1.rs",
+      "deps": [
+        "RLM-09-protocols-extensions-006"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-008",
+      "category": "09-protocols-extensions",
+      "title": "Implement ACP v2 capability negotiation",
+      "path": "crates/acp/src/v2.rs",
+      "deps": [
+        "RLM-09-protocols-extensions-007"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-009",
+      "category": "09-protocols-extensions",
+      "title": "Generate TypeScript wire types",
+      "path": "sdk/typescript/src/generated/index.ts",
+      "deps": [
+        "RLM-01-foundation-002",
+        "RLM-01-foundation-015",
+        "RLM-02-kernel-ledger-004"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-010",
+      "category": "09-protocols-extensions",
+      "title": "Implement TypeScript local transport",
+      "path": "sdk/typescript/src/transport/local.ts",
+      "deps": [
+        "RLM-09-protocols-extensions-009",
+        "RLM-02-kernel-ledger-015"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-011",
+      "category": "09-protocols-extensions",
+      "title": "Implement TypeScript session client",
+      "path": "sdk/typescript/src/client.ts",
+      "deps": [
+        "RLM-09-protocols-extensions-010"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-012",
+      "category": "09-protocols-extensions",
+      "title": "Define WASM plugin manifest/capabilities",
+      "path": "crates/plugin-host/src/manifest.rs",
+      "deps": [
+        "RLM-03-policy-workspace-001",
+        "RLM-01-foundation-005"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-013",
+      "category": "09-protocols-extensions",
+      "title": "Implement WASM plugin runtime",
+      "path": "crates/plugin-host/src/wasm.rs",
+      "deps": [
+        "RLM-09-protocols-extensions-012",
+        "RLM-03-policy-workspace-009"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-014",
+      "category": "09-protocols-extensions",
+      "title": "Implement skill discovery/activation",
+      "path": "crates/plugin-host/src/skills.rs",
+      "deps": [
+        "RLM-01-foundation-009",
+        "RLM-05-agent-llm-goal-013"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md",
+        "SKILLS.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-015",
+      "category": "09-protocols-extensions",
+      "title": "Implement out-of-process hook runner",
+      "path": "crates/plugin-host/src/hooks.rs",
+      "deps": [
+        "RLM-07-sandbox-security-001",
+        "RLM-07-sandbox-security-007",
+        "RLM-09-protocols-extensions-012"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-016",
+      "category": "09-protocols-extensions",
+      "title": "Implement extension trust ledger",
+      "path": "crates/plugin-host/src/trust.rs",
+      "deps": [
+        "RLM-09-protocols-extensions-012",
+        "RLM-09-protocols-extensions-014",
+        "RLM-02-kernel-ledger-005"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-017",
+      "category": "09-protocols-extensions",
+      "title": "Implement plugin install/remove transaction",
+      "path": "crates/plugin-host/src/install.rs",
+      "deps": [
+        "RLM-09-protocols-extensions-016",
+        "RLM-01-foundation-012"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-018",
+      "category": "09-protocols-extensions",
+      "title": "Add protocol compatibility fixtures",
+      "path": "crates/acp/tests/compat.rs, crates/mcp/tests/compat.rs, sdk/typescript/test/compat.test.ts",
+      "deps": [
+        "RLM-09-protocols-extensions-005",
+        "RLM-09-protocols-extensions-008",
+        "RLM-09-protocols-extensions-011"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-09-protocols-extensions-019",
+      "category": "09-protocols-extensions",
+      "title": "Add malicious extension/MCP tests",
+      "path": "crates/plugin-host/tests/adversarial.rs, crates/mcp/tests/adversarial.rs",
+      "deps": [
+        "RLM-09-protocols-extensions-004",
+        "RLM-09-protocols-extensions-013",
+        "RLM-09-protocols-extensions-015",
+        "RLM-09-protocols-extensions-017"
+      ],
+      "references": [
+        "architecture/mcp-acp-and-sdk.md",
+        "architecture/plugins-skills-and-hooks.md",
+        "api-contracts/mcp-acp-sdk.md",
+        "architecture/capability-broker-and-policy.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-001",
+      "category": "10-daemon-remote-release",
+      "title": "Implement local daemon IPC listener",
+      "path": "crates/kernel/src/ipc/server.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-015"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-002",
+      "category": "10-daemon-remote-release",
+      "title": "Implement local client authentication",
+      "path": "crates/auth/src/local_daemon.rs",
+      "deps": [
+        "RLM-10-daemon-remote-release-001",
+        "RLM-01-foundation-011"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-003",
+      "category": "10-daemon-remote-release",
+      "title": "Implement reconnectable daemon client",
+      "path": "crates/kernel/src/ipc/client.rs",
+      "deps": [
+        "RLM-10-daemon-remote-release-002",
+        "RLM-02-kernel-ledger-006"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-004",
+      "category": "10-daemon-remote-release",
+      "title": "Wire daemon CLI lifecycle",
+      "path": "apps/rapid/src/daemon.rs",
+      "deps": [
+        "RLM-10-daemon-remote-release-003",
+        "RLM-02-kernel-ledger-002"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-005",
+      "category": "10-daemon-remote-release",
+      "title": "Define remote worker wire protocol",
+      "path": "crates/protocol/src/remote_worker.rs",
+      "deps": [
+        "RLM-01-foundation-005",
+        "RLM-01-foundation-014",
+        "RLM-07-sandbox-security-011"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-006",
+      "category": "10-daemon-remote-release",
+      "title": "Implement mTLS worker identity",
+      "path": "crates/auth/src/mtls.rs",
+      "deps": [
+        "RLM-10-daemon-remote-release-005",
+        "RLM-01-foundation-011"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-007",
+      "category": "10-daemon-remote-release",
+      "title": "Implement worker capability registry",
+      "path": "crates/kernel/src/remote/registry.rs",
+      "deps": [
+        "RLM-10-daemon-remote-release-006"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-008",
+      "category": "10-daemon-remote-release",
+      "title": "Implement remote work lease signer/verifier",
+      "path": "crates/kernel/src/remote/lease.rs",
+      "deps": [
+        "RLM-10-daemon-remote-release-006",
+        "RLM-10-daemon-remote-release-005"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-009",
+      "category": "10-daemon-remote-release",
+      "title": "Implement artifact transfer protocol",
+      "path": "crates/kernel/src/remote/artifacts.rs",
+      "deps": [
+        "RLM-10-daemon-remote-release-008",
+        "RLM-01-foundation-012"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-010",
+      "category": "10-daemon-remote-release",
+      "title": "Implement remote task scheduler",
+      "path": "crates/kernel/src/remote/scheduler.rs",
+      "deps": [
+        "RLM-10-daemon-remote-release-007",
+        "RLM-10-daemon-remote-release-008",
+        "RLM-10-daemon-remote-release-009"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-011",
+      "category": "10-daemon-remote-release",
+      "title": "Implement remote result verification/import",
+      "path": "crates/kernel/src/remote/result.rs",
+      "deps": [
+        "RLM-10-daemon-remote-release-010",
+        "RLM-03-policy-workspace-020"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-012",
+      "category": "10-daemon-remote-release",
+      "title": "Implement telemetry event/span sink",
+      "path": "crates/telemetry/src/lib.rs",
+      "deps": [
+        "RLM-01-foundation-014",
+        "RLM-07-sandbox-security-013"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-013",
+      "category": "10-daemon-remote-release",
+      "title": "Implement trace artifact export",
+      "path": "crates/telemetry/src/export.rs",
+      "deps": [
+        "RLM-10-daemon-remote-release-012",
+        "RLM-01-foundation-012"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-014",
+      "category": "10-daemon-remote-release",
+      "title": "Implement database migration compatibility tests",
+      "path": "crates/event-ledger/tests/migrations_compat.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-003",
+        "RLM-02-kernel-ledger-008"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-015",
+      "category": "10-daemon-remote-release",
+      "title": "Implement signed update manifest verifier",
+      "path": "crates/kernel/src/update/verify.rs",
+      "deps": [
+        "RLM-01-foundation-005"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-016",
+      "category": "10-daemon-remote-release",
+      "title": "Implement atomic binary updater",
+      "path": "crates/kernel/src/update/install.rs",
+      "deps": [
+        "RLM-10-daemon-remote-release-015",
+        "RLM-01-foundation-012"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-017",
+      "category": "10-daemon-remote-release",
+      "title": "Add reproducible packaging metadata",
+      "path": ".github/workflows/release.yml, scripts/release/",
+      "deps": [
+        "RLM-01-foundation-016",
+        "RLM-10-daemon-remote-release-015"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-018",
+      "category": "10-daemon-remote-release",
+      "title": "Implement provenance/SBOM release attestations",
+      "path": "scripts/release/attest.rs or equivalent release tooling",
+      "deps": [
+        "RLM-10-daemon-remote-release-017"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-019",
+      "category": "10-daemon-remote-release",
+      "title": "Implement rapid doctor command",
+      "path": "apps/rapid/src/doctor.rs",
+      "deps": [
+        "RLM-07-sandbox-security-020",
+        "RLM-10-daemon-remote-release-004",
+        "RLM-04-context-engine-010",
+        "RLM-05-agent-llm-goal-005",
+        "RLM-09-protocols-extensions-016"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-10-daemon-remote-release-020",
+      "category": "10-daemon-remote-release",
+      "title": "Add install/upgrade smoke harness",
+      "path": "scripts/test-install.sh, scripts/test-install.ps1",
+      "deps": [
+        "RLM-10-daemon-remote-release-016",
+        "RLM-10-daemon-remote-release-017",
+        "RLM-10-daemon-remote-release-019"
+      ],
+      "references": [
+        "architecture/remote-workers-and-daemon.md",
+        "architecture/updates-and-release.md",
+        "architecture/telemetry-and-observability.md",
+        "operations/release-and-supply-chain.md",
+        "operations/observability.md"
+      ]
+    },
+    {
+      "id": "RLM-11-evals-hardening-001",
+      "category": "11-evals-hardening",
+      "title": "Define eval case manifest schema",
+      "path": "crates/harness/src/case.rs",
+      "deps": [
+        "RLM-01-foundation-004",
+        "RLM-03-policy-workspace-001"
+      ],
+      "references": [
+        "architecture/eval-and-agent-harness.md",
+        "evaluation-specs/agent-evals.md",
+        "evaluation-specs/context-evals.md",
+        "evaluation-specs/security-evals.md",
+        "evaluation-specs/router-prompt-evals.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-11-evals-hardening-002",
+      "category": "11-evals-hardening",
+      "title": "Implement deterministic fixture provider",
+      "path": "crates/harness/src/providers/scripted.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-001",
+        "RLM-11-evals-hardening-001"
+      ],
+      "references": [
+        "architecture/eval-and-agent-harness.md",
+        "evaluation-specs/agent-evals.md",
+        "evaluation-specs/context-evals.md",
+        "evaluation-specs/security-evals.md",
+        "evaluation-specs/router-prompt-evals.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-11-evals-hardening-003",
+      "category": "11-evals-hardening",
+      "title": "Implement event/tool record-replay",
+      "path": "crates/harness/src/replay.rs",
+      "deps": [
+        "RLM-11-evals-hardening-002",
+        "RLM-02-kernel-ledger-006",
+        "RLM-05-agent-llm-goal-012"
+      ],
+      "references": [
+        "architecture/eval-and-agent-harness.md",
+        "evaluation-specs/agent-evals.md",
+        "evaluation-specs/context-evals.md",
+        "evaluation-specs/security-evals.md",
+        "evaluation-specs/router-prompt-evals.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-11-evals-hardening-004",
+      "category": "11-evals-hardening",
+      "title": "Implement repository eval runner",
+      "path": "crates/harness/src/runner.rs",
+      "deps": [
+        "RLM-11-evals-hardening-001",
+        "RLM-11-evals-hardening-003",
+        "RLM-03-policy-workspace-013",
+        "RLM-05-agent-llm-goal-022"
+      ],
+      "references": [
+        "architecture/eval-and-agent-harness.md",
+        "evaluation-specs/agent-evals.md",
+        "evaluation-specs/context-evals.md",
+        "evaluation-specs/security-evals.md",
+        "evaluation-specs/router-prompt-evals.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-11-evals-hardening-005",
+      "category": "11-evals-hardening",
+      "title": "Implement eval result metric schema",
+      "path": "crates/harness/src/metrics.rs",
+      "deps": [
+        "RLM-11-evals-hardening-004",
+        "RLM-05-agent-llm-goal-009"
+      ],
+      "references": [
+        "architecture/eval-and-agent-harness.md",
+        "evaluation-specs/agent-evals.md",
+        "evaluation-specs/context-evals.md",
+        "evaluation-specs/security-evals.md",
+        "evaluation-specs/router-prompt-evals.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-11-evals-hardening-006",
+      "category": "11-evals-hardening",
+      "title": "Implement eval comparison report",
+      "path": "crates/harness/src/compare.rs",
+      "deps": [
+        "RLM-11-evals-hardening-005"
+      ],
+      "references": [
+        "architecture/eval-and-agent-harness.md",
+        "evaluation-specs/agent-evals.md",
+        "evaluation-specs/context-evals.md",
+        "evaluation-specs/security-evals.md",
+        "evaluation-specs/router-prompt-evals.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-11-evals-hardening-007",
+      "category": "11-evals-hardening",
+      "title": "Create agent/goal golden scenarios",
+      "path": "evals/agent/*.json",
+      "deps": [
+        "RLM-11-evals-hardening-004",
+        "RLM-05-agent-llm-goal-023"
+      ],
+      "references": [
+        "architecture/eval-and-agent-harness.md",
+        "evaluation-specs/agent-evals.md",
+        "evaluation-specs/context-evals.md",
+        "evaluation-specs/security-evals.md",
+        "evaluation-specs/router-prompt-evals.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-11-evals-hardening-008",
+      "category": "11-evals-hardening",
+      "title": "Create context gold-query corpus",
+      "path": "evals/context/*.jsonl",
+      "deps": [
+        "RLM-04-context-engine-019"
+      ],
+      "references": [
+        "architecture/eval-and-agent-harness.md",
+        "evaluation-specs/agent-evals.md",
+        "evaluation-specs/context-evals.md",
+        "evaluation-specs/security-evals.md",
+        "evaluation-specs/router-prompt-evals.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-11-evals-hardening-009",
+      "category": "11-evals-hardening",
+      "title": "Create policy/prompt-injection corpus",
+      "path": "evals/security/injection/*.json",
+      "deps": [
+        "RLM-07-sandbox-security-021",
+        "RLM-09-protocols-extensions-019",
+        "RLM-08-computer-mobile-017"
+      ],
+      "references": [
+        "architecture/eval-and-agent-harness.md",
+        "evaluation-specs/agent-evals.md",
+        "evaluation-specs/context-evals.md",
+        "evaluation-specs/security-evals.md",
+        "evaluation-specs/router-prompt-evals.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-11-evals-hardening-010",
+      "category": "11-evals-hardening",
+      "title": "Create browser/mobile eval corpus",
+      "path": "evals/computer-mobile/*.json",
+      "deps": [
+        "RLM-08-computer-mobile-017",
+        "RLM-11-evals-hardening-004"
+      ],
+      "references": [
+        "architecture/eval-and-agent-harness.md",
+        "evaluation-specs/agent-evals.md",
+        "evaluation-specs/context-evals.md",
+        "evaluation-specs/security-evals.md",
+        "evaluation-specs/router-prompt-evals.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-11-evals-hardening-011",
+      "category": "11-evals-hardening",
+      "title": "Create router property/eval suite",
+      "path": "crates/harness/tests/router_prompt.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-008",
+        "RLM-05-agent-llm-goal-013",
+        "RLM-11-evals-hardening-002"
+      ],
+      "references": [
+        "architecture/eval-and-agent-harness.md",
+        "evaluation-specs/agent-evals.md",
+        "evaluation-specs/context-evals.md",
+        "evaluation-specs/security-evals.md",
+        "evaluation-specs/router-prompt-evals.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-11-evals-hardening-012",
+      "category": "11-evals-hardening",
+      "title": "Add policy/parser fuzz targets",
+      "path": "fuzz/ or crates/*/fuzz targets",
+      "deps": [
+        "RLM-03-policy-workspace-006",
+        "RLM-05-agent-llm-goal-011",
+        "RLM-02-kernel-ledger-004"
+      ],
+      "references": [
+        "architecture/eval-and-agent-harness.md",
+        "evaluation-specs/agent-evals.md",
+        "evaluation-specs/context-evals.md",
+        "evaluation-specs/security-evals.md",
+        "evaluation-specs/router-prompt-evals.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-11-evals-hardening-013",
+      "category": "11-evals-hardening",
+      "title": "Add event-ledger crash/property tests",
+      "path": "crates/event-ledger/tests/properties.rs",
+      "deps": [
+        "RLM-02-kernel-ledger-008",
+        "RLM-02-kernel-ledger-017"
+      ],
+      "references": [
+        "architecture/eval-and-agent-harness.md",
+        "evaluation-specs/agent-evals.md",
+        "evaluation-specs/context-evals.md",
+        "evaluation-specs/security-evals.md",
+        "evaluation-specs/router-prompt-evals.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-11-evals-hardening-014",
+      "category": "11-evals-hardening",
+      "title": "Add workspace merge/property tests",
+      "path": "crates/workspace/tests/properties.rs",
+      "deps": [
+        "RLM-03-policy-workspace-019"
+      ],
+      "references": [
+        "architecture/eval-and-agent-harness.md",
+        "evaluation-specs/agent-evals.md",
+        "evaluation-specs/context-evals.md",
+        "evaluation-specs/security-evals.md",
+        "evaluation-specs/router-prompt-evals.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-11-evals-hardening-015",
+      "category": "11-evals-hardening",
+      "title": "Implement performance benchmark suite",
+      "path": "benches/README.md and crate benchmark targets",
+      "deps": [
+        "RLM-06-cli-tui-017",
+        "RLM-04-context-engine-019",
+        "RLM-07-sandbox-security-009",
+        "RLM-05-agent-llm-goal-016",
+        "RLM-02-kernel-ledger-005"
+      ],
+      "references": [
+        "architecture/eval-and-agent-harness.md",
+        "evaluation-specs/agent-evals.md",
+        "evaluation-specs/context-evals.md",
+        "evaluation-specs/security-evals.md",
+        "evaluation-specs/router-prompt-evals.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-11-evals-hardening-016",
+      "category": "11-evals-hardening",
+      "title": "Implement end-to-end golden workflow",
+      "path": "tests/e2e/golden_goal.rs",
+      "deps": [
+        "RLM-11-evals-hardening-003",
+        "RLM-11-evals-hardening-007",
+        "RLM-06-cli-tui-018",
+        "RLM-07-sandbox-security-018"
+      ],
+      "references": [
+        "architecture/eval-and-agent-harness.md",
+        "evaluation-specs/agent-evals.md",
+        "evaluation-specs/context-evals.md",
+        "evaluation-specs/security-evals.md",
+        "evaluation-specs/router-prompt-evals.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-11-evals-hardening-017",
+      "category": "11-evals-hardening",
+      "title": "Implement release gate aggregator",
+      "path": "scripts/release/gate.rs",
+      "deps": [
+        "RLM-11-evals-hardening-006",
+        "RLM-11-evals-hardening-009",
+        "RLM-11-evals-hardening-010",
+        "RLM-11-evals-hardening-015",
+        "RLM-10-daemon-remote-release-020",
+        "RLM-10-daemon-remote-release-018"
+      ],
+      "references": [
+        "architecture/eval-and-agent-harness.md",
+        "evaluation-specs/agent-evals.md",
+        "evaluation-specs/context-evals.md",
+        "evaluation-specs/security-evals.md",
+        "evaluation-specs/router-prompt-evals.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-11-evals-hardening-018",
+      "category": "11-evals-hardening",
+      "title": "Generate requirements traceability check",
+      "path": "scripts/check-traceability.py, requirements-traceability.md",
+      "deps": [
+        "RLM-11-evals-hardening-017"
+      ],
+      "references": [
+        "architecture/eval-and-agent-harness.md",
+        "evaluation-specs/agent-evals.md",
+        "evaluation-specs/context-evals.md",
+        "evaluation-specs/security-evals.md",
+        "evaluation-specs/router-prompt-evals.md",
+        "operations/testing-strategy.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-001",
+      "category": "12-managed-agent-runtime",
+      "title": "Define V2 managed-agent protocol types",
+      "path": "crates/protocol/src/agent_v2.rs",
+      "deps": [
+        "RLM-05-agent-llm-goal-015"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-002",
+      "category": "12-managed-agent-runtime",
+      "title": "Define typed AgentMailbox topics and cursors",
+      "path": "crates/protocol/src/agent_mail.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-001"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-003",
+      "category": "12-managed-agent-runtime",
+      "title": "Add persistent AgentPool projection schema",
+      "path": "crates/event-ledger/src/projections/agent_pool.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-001",
+        "RLM-02-kernel-ledger-008"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md",
+        "data-models/event-schema.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-004",
+      "category": "12-managed-agent-runtime",
+      "title": "Implement AgentPool service lifecycle",
+      "path": "crates/agent-runtime/src/agent/pool.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-003",
+        "RLM-05-agent-llm-goal-016"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-005",
+      "category": "12-managed-agent-runtime",
+      "title": "Implement background-agent restart and idle parking policy",
+      "path": "crates/agent-runtime/src/agent/background_policy.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-004"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-006",
+      "category": "12-managed-agent-runtime",
+      "title": "Implement TaskEnvelope builder",
+      "path": "crates/agent-runtime/src/agent/task_envelope.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-001",
+        "RLM-05-agent-llm-goal-021",
+        "RLM-04-context-engine-015"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md",
+        "architecture/context-engine.md",
+        "architecture/knowledge-registry.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-007",
+      "category": "12-managed-agent-runtime",
+      "title": "Implement clean-context child compiler",
+      "path": "crates/agent-runtime/src/agent/child_context.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-006",
+        "RLM-05-agent-llm-goal-013"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md",
+        "architecture/context-engine.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-008",
+      "category": "12-managed-agent-runtime",
+      "title": "Implement managed worker spawn service",
+      "path": "crates/agent-runtime/src/agent/managed_spawn.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-007",
+        "RLM-05-agent-llm-goal-017"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-009",
+      "category": "12-managed-agent-runtime",
+      "title": "Implement isolated writer WorkspaceAllocator",
+      "path": "crates/agent-runtime/src/agent/workspace_allocator.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-008",
+        "RLM-03-policy-workspace-013"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md",
+        "architecture/workspace-vcs-and-semantic-patch.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-010",
+      "category": "12-managed-agent-runtime",
+      "title": "Link child sessions and events to parent task graph",
+      "path": "crates/agent-runtime/src/agent/lineage.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-003",
+        "RLM-12-managed-agent-runtime-008"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md",
+        "architecture/event-ledger-and-sessions.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-011",
+      "category": "12-managed-agent-runtime",
+      "title": "Implement durable AgentMailbox store",
+      "path": "crates/agent-runtime/src/agent/mailbox.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-002",
+        "RLM-02-kernel-ledger-005"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-012",
+      "category": "12-managed-agent-runtime",
+      "title": "Implement mailbox quotas and backpressure",
+      "path": "crates/agent-runtime/src/agent/mailbox_limits.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-011"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-013",
+      "category": "12-managed-agent-runtime",
+      "title": "Implement coordinator task decomposition adapter",
+      "path": "crates/agent-runtime/src/agent/coordinator.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-006",
+        "RLM-05-agent-llm-goal-022"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md",
+        "architecture/goal-dag-and-evidence.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-014",
+      "category": "12-managed-agent-runtime",
+      "title": "Extend scheduler with dependency DAG readiness",
+      "path": "crates/agent-runtime/src/agent/scheduler_v2.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-013",
+        "RLM-05-agent-llm-goal-016"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-015",
+      "category": "12-managed-agent-runtime",
+      "title": "Implement delegation value/spawn policy",
+      "path": "crates/agent-runtime/src/agent/spawn_policy.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-014",
+        "RLM-04-context-engine-019"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/managed-agent-handoff-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-016",
+      "category": "12-managed-agent-runtime",
+      "title": "Implement per-agent budget controller",
+      "path": "crates/agent-runtime/src/agent/budget_v2.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-014",
+        "RLM-05-agent-llm-goal-009"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-017",
+      "category": "12-managed-agent-runtime",
+      "title": "Implement scheduler fairness and provider concurrency adaptation",
+      "path": "crates/agent-runtime/src/agent/fairness.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-016",
+        "RLM-05-agent-llm-goal-008"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-018",
+      "category": "12-managed-agent-runtime",
+      "title": "Implement managed agent pause/sleep/resume/cancel",
+      "path": "crates/agent-runtime/src/agent/control.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-004",
+        "RLM-12-managed-agent-runtime-008"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-019",
+      "category": "12-managed-agent-runtime",
+      "title": "Implement observable child trajectory summary",
+      "path": "crates/agent-runtime/src/agent/trajectory_summary.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-010",
+        "RLM-01-foundation-012"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md",
+        "architecture/trajectory-learning-and-optimization.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-020",
+      "category": "12-managed-agent-runtime",
+      "title": "Implement AgentResult verifier and integration gate",
+      "path": "crates/agent-runtime/src/agent/result_v2.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-019",
+        "RLM-03-policy-workspace-020",
+        "RLM-05-agent-llm-goal-021"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-021",
+      "category": "12-managed-agent-runtime",
+      "title": "Extend Agents Panel hierarchy projection",
+      "path": "crates/tui/src/panels/agents_v2.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-003",
+        "RLM-06-cli-tui-001"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md",
+        "architecture/agents-panel.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-022",
+      "category": "12-managed-agent-runtime",
+      "title": "Implement Agents Panel detail/trajectory view",
+      "path": "crates/tui/src/panels/agent_detail.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-019",
+        "RLM-12-managed-agent-runtime-021"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md",
+        "architecture/agents-panel.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-023",
+      "category": "12-managed-agent-runtime",
+      "title": "Implement default persistent Explorer role",
+      "path": "crates/agent-runtime/src/agent/roles/explorer_bg.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-004",
+        "RLM-12-managed-agent-runtime-011",
+        "RLM-04-context-engine-013"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md",
+        "system-prompts/background-explorer.md"
+      ]
+    },
+    {
+      "id": "RLM-12-managed-agent-runtime-024",
+      "category": "12-managed-agent-runtime",
+      "title": "Add deterministic managed-agent end-to-end suite",
+      "path": "tests/e2e/managed_agents_v2.rs",
+      "deps": [
+        "RLM-12-managed-agent-runtime-020",
+        "RLM-12-managed-agent-runtime-023",
+        "RLM-11-evals-hardening-004"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/agent-pool-and-managed-agents.md",
+        "api-contracts/managed-agent-api.md",
+        "data-models/domain-model.md",
+        "evaluation-specs/managed-agent-handoff-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-001",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Define handoff/control/knowledge protocol identifiers",
+      "path": "crates/protocol/src/v2_ids.rs",
+      "deps": [
+        "RLM-01-foundation-003"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md",
+        "data-models/domain-model.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-002",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement SessionExecutionLease store",
+      "path": "crates/kernel/src/handoff/execution_lease.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-001",
+        "RLM-02-kernel-ledger-005"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md",
+        "api-contracts/execution-handoff-api.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-003",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement handoff source quiescence",
+      "path": "crates/kernel/src/handoff/quiesce.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-002",
+        "RLM-07-sandbox-security-005"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-004",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement HandoffBundle manifest builder",
+      "path": "crates/kernel/src/handoff/bundle.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-003",
+        "RLM-12-managed-agent-runtime-003",
+        "RLM-03-policy-workspace-020"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md",
+        "api-contracts/execution-handoff-api.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-005",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement HandoffBundle signature and encryption envelope",
+      "path": "crates/kernel/src/handoff/crypto.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-004",
+        "RLM-01-foundation-010"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-006",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement handoff artifact transfer transport",
+      "path": "crates/kernel/src/handoff/transfer.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-005",
+        "RLM-10-daemon-remote-release-007"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-007",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement target handoff compatibility verifier",
+      "path": "crates/kernel/src/handoff/target_verify.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-005",
+        "RLM-10-daemon-remote-release-008"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-008",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement repository and ChangeSet restore",
+      "path": "crates/kernel/src/handoff/restore_workspace.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-006",
+        "RLM-13-handoff-knowledge-playbooks-007",
+        "RLM-03-policy-workspace-019"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-009",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement context/artifact restore",
+      "path": "crates/kernel/src/handoff/restore_context.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-006",
+        "RLM-04-context-engine-008"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md",
+        "architecture/context-engine.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-010",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement goal/agent restore as paused",
+      "path": "crates/kernel/src/handoff/restore_runtime.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-008",
+        "RLM-13-handoff-knowledge-playbooks-009",
+        "RLM-12-managed-agent-runtime-003"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-011",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement execution lease transfer commit",
+      "path": "crates/kernel/src/handoff/commit.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-002",
+        "RLM-13-handoff-knowledge-playbooks-010"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-012",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement handoff abort and recovery state machine",
+      "path": "crates/kernel/src/handoff/recovery.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-011",
+        "RLM-02-kernel-ledger-013"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-013",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement remote-to-local return handoff",
+      "path": "crates/kernel/src/handoff/return_local.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-012"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-014",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Add /handoff CLI and headless commands",
+      "path": "apps/rapid/src/commands/handoff.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-011",
+        "RLM-06-cli-tui-018"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-015",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement TUI handoff progress view",
+      "path": "crates/tui/src/panels/handoff.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-014",
+        "RLM-06-cli-tui-001"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-016",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Define ControlLease protocol types",
+      "path": "crates/protocol/src/control_lease.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-001"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md",
+        "api-contracts/computer-mobile-api.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-017",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement ControlLease manager",
+      "path": "crates/kernel/src/control_lease.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-016",
+        "RLM-02-kernel-ledger-005"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-018",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement human workspace-write takeover",
+      "path": "crates/workspace/src/human_takeover.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-017",
+        "RLM-03-policy-workspace-017"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-019",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement human terminal-input takeover",
+      "path": "crates/process-supervisor/src/human_input.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-017",
+        "RLM-07-sandbox-security-004"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-020",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement human Computer Use takeover bridge",
+      "path": "crates/computer-use/src/human_takeover.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-017",
+        "RLM-08-computer-mobile-007"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md",
+        "architecture/computer-use.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-021",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement takeover resume mutation reconciliation",
+      "path": "crates/kernel/src/control_reconcile.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-018",
+        "RLM-13-handoff-knowledge-playbooks-019",
+        "RLM-13-handoff-knowledge-playbooks-020"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-022",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement KnowledgeItem persistence schema",
+      "path": "crates/context-engine/src/knowledge/store.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-001",
+        "RLM-04-context-engine-004"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md",
+        "api-contracts/knowledge-playbook-api.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-023",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement Knowledge trigger matcher",
+      "path": "crates/context-engine/src/knowledge/matcher.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-022",
+        "RLM-04-context-engine-011"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-024",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Integrate Knowledge into Context Compiler",
+      "path": "crates/context-engine/src/compile/knowledge.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-023",
+        "RLM-04-context-engine-015"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md",
+        "architecture/context-engine.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-025",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement Knowledge proposal and governance flow",
+      "path": "crates/context-engine/src/knowledge/governance.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-022"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-026",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Add Knowledge CLI/TUI inspector",
+      "path": "apps/rapid/src/commands/knowledge.rs, crates/tui/src/panels/knowledge.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-024",
+        "RLM-13-handoff-knowledge-playbooks-025"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-027",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Define and validate Playbook schema",
+      "path": "crates/automation/src/playbook/schema.rs",
+      "deps": [
+        "RLM-01-foundation-007"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md",
+        "api-contracts/knowledge-playbook-api.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-028",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement Playbook DAG runner",
+      "path": "crates/automation/src/playbook/runner.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-027",
+        "RLM-12-managed-agent-runtime-013"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-029",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Implement Automation trigger cursor and dedup state",
+      "path": "crates/automation/src/state.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-028",
+        "RLM-07-sandbox-security-006"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md"
+      ]
+    },
+    {
+      "id": "RLM-13-handoff-knowledge-playbooks-030",
+      "category": "13-handoff-knowledge-playbooks",
+      "title": "Add V2 handoff/knowledge/playbook end-to-end suite",
+      "path": "tests/e2e/handoff_knowledge_playbook_v2.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-13",
+        "RLM-13-handoff-knowledge-playbooks-21",
+        "RLM-13-handoff-knowledge-playbooks-29",
+        "RLM-11-evals-hardening-004"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "02-SDD.md",
+        "architecture/execution-handoff.md",
+        "architecture/human-agent-control-handoff.md",
+        "architecture/knowledge-registry.md",
+        "architecture/playbooks-and-automations.md",
+        "evaluation-specs/managed-agent-handoff-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-001",
+      "category": "14-trajectory-insights",
+      "title": "Define observable trajectory protocol schema",
+      "path": "crates/protocol/src/trajectory.rs",
+      "deps": [
+        "RLM-13-handoff-knowledge-playbooks-001",
+        "RLM-11-evals-hardening-005"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md",
+        "data-models/domain-model.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-002",
+      "category": "14-trajectory-insights",
+      "title": "Implement trajectory collector from Event Ledger",
+      "path": "crates/harness/src/trajectory/collect.rs",
+      "deps": [
+        "RLM-14-trajectory-insights-001",
+        "RLM-11-evals-hardening-003"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-003",
+      "category": "14-trajectory-insights",
+      "title": "Implement trajectory environment/context serializer",
+      "path": "crates/harness/src/trajectory/environment.rs",
+      "deps": [
+        "RLM-14-trajectory-insights-002",
+        "RLM-04-context-engine-019"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-004",
+      "category": "14-trajectory-insights",
+      "title": "Implement trajectory redaction pipeline",
+      "path": "crates/harness/src/trajectory/redact.rs",
+      "deps": [
+        "RLM-14-trajectory-insights-002",
+        "RLM-07-sandbox-security-013"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md",
+        "threat-model-and-security.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-005",
+      "category": "14-trajectory-insights",
+      "title": "Implement trajectory data-policy export gate",
+      "path": "crates/harness/src/trajectory/policy.rs",
+      "deps": [
+        "RLM-14-trajectory-insights-004",
+        "RLM-01-foundation-009"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-006",
+      "category": "14-trajectory-insights",
+      "title": "Implement multi-objective RewardVector calculators",
+      "path": "crates/harness/src/trajectory/reward.rs",
+      "deps": [
+        "RLM-14-trajectory-insights-001",
+        "RLM-11-evals-hardening-005"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-007",
+      "category": "14-trajectory-insights",
+      "title": "Implement deterministic outcome graders",
+      "path": "crates/harness/src/graders/deterministic.rs",
+      "deps": [
+        "RLM-11-evals-hardening-004",
+        "RLM-14-trajectory-insights-006"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-008",
+      "category": "14-trajectory-insights",
+      "title": "Implement candidate trajectory ranker",
+      "path": "crates/harness/src/trajectory/rank.rs",
+      "deps": [
+        "RLM-14-trajectory-insights-006",
+        "RLM-14-trajectory-insights-007"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-009",
+      "category": "14-trajectory-insights",
+      "title": "Implement rejection-sampled dataset exporter",
+      "path": "crates/harness/src/trajectory/export.rs",
+      "deps": [
+        "RLM-14-trajectory-insights-005",
+        "RLM-14-trajectory-insights-008"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-010",
+      "category": "14-trajectory-insights",
+      "title": "Implement experiment registry",
+      "path": "crates/harness/src/experiment/registry.rs",
+      "deps": [
+        "RLM-14-trajectory-insights-008"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-011",
+      "category": "14-trajectory-insights",
+      "title": "Implement paired baseline statistics",
+      "path": "crates/harness/src/experiment/stats.rs",
+      "deps": [
+        "RLM-14-trajectory-insights-010",
+        "RLM-11-evals-hardening-006"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-012",
+      "category": "14-trajectory-insights",
+      "title": "Define synthetic task environment generator interface",
+      "path": "crates/harness/src/generator/mod.rs",
+      "deps": [
+        "RLM-14-trajectory-insights-010"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-013",
+      "category": "14-trajectory-insights",
+      "title": "Implement synthetic fixture builder with hidden verifier",
+      "path": "crates/harness/src/generator/builder.rs",
+      "deps": [
+        "RLM-14-trajectory-insights-012",
+        "RLM-01-foundation-012"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-014",
+      "category": "14-trajectory-insights",
+      "title": "Implement generated-task solvability/adversarial validator",
+      "path": "crates/harness/src/generator/validate.rs",
+      "deps": [
+        "RLM-14-trajectory-insights-013",
+        "RLM-14-trajectory-insights-007"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-015",
+      "category": "14-trajectory-insights",
+      "title": "Implement long-horizon endurance runner",
+      "path": "crates/harness/src/endurance/runner.rs",
+      "deps": [
+        "RLM-11-evals-hardening-004",
+        "RLM-13-handoff-knowledge-playbooks-12",
+        "RLM-12-managed-agent-runtime-24"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md",
+        "evaluation-specs/trajectory-long-horizon-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-016",
+      "category": "14-trajectory-insights",
+      "title": "Implement endurance fault scheduler",
+      "path": "crates/harness/src/endurance/faults.rs",
+      "deps": [
+        "RLM-14-trajectory-insights-015"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-017",
+      "category": "14-trajectory-insights",
+      "title": "Implement context/compaction drift metrics",
+      "path": "crates/harness/src/endurance/drift.rs",
+      "deps": [
+        "RLM-14-trajectory-insights-015",
+        "RLM-04-context-engine-019",
+        "RLM-05-agent-llm-goal-024"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-018",
+      "category": "14-trajectory-insights",
+      "title": "Implement deterministic Session Insights analyzers",
+      "path": "crates/harness/src/insights/analyzers.rs",
+      "deps": [
+        "RLM-14-trajectory-insights-002",
+        "RLM-14-trajectory-insights-017"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-019",
+      "category": "14-trajectory-insights",
+      "title": "Implement governed improvement candidate generator",
+      "path": "crates/harness/src/insights/proposals.rs",
+      "deps": [
+        "RLM-14-trajectory-insights-018",
+        "RLM-13-handoff-knowledge-playbooks-25",
+        "RLM-14-trajectory-insights-010"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-020",
+      "category": "14-trajectory-insights",
+      "title": "Add Session Insights CLI/TUI report",
+      "path": "apps/rapid/src/commands/insights.rs, crates/tui/src/panels/insights.rs",
+      "deps": [
+        "RLM-14-trajectory-insights-18",
+        "RLM-14-trajectory-insights-19"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-021",
+      "category": "14-trajectory-insights",
+      "title": "Add trajectory privacy and experiment regression tests",
+      "path": "crates/harness/tests/trajectory_v2.rs",
+      "deps": [
+        "RLM-14-trajectory-insights-009",
+        "RLM-14-trajectory-insights-011",
+        "RLM-14-trajectory-insights-14"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md"
+      ]
+    },
+    {
+      "id": "RLM-14-trajectory-insights-022",
+      "category": "14-trajectory-insights",
+      "title": "Add >=1000-tool-call endurance integration scenario",
+      "path": "evals/endurance/kernel-24h-v1.yaml",
+      "deps": [
+        "RLM-14-trajectory-insights-016",
+        "RLM-14-trajectory-insights-017",
+        "RLM-11-evals-hardening-017"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/eval-and-agent-harness.md",
+        "architecture/trajectory-learning-and-optimization.md",
+        "architecture/session-insights.md",
+        "api-contracts/trajectory-insights-api.md",
+        "evaluation-specs/trajectory-long-horizon-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-001",
+      "category": "15-computer-use-v2",
+      "title": "Define V2 Computer Use Surface protocol",
+      "path": "crates/protocol/src/computer_surface.rs",
+      "deps": [
+        "RLM-08-computer-mobile-007",
+        "RLM-13-handoff-knowledge-playbooks-001"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-002",
+      "category": "15-computer-use-v2",
+      "title": "Implement ComputerSessionManager",
+      "path": "crates/computer-use/src/session.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-001",
+        "RLM-07-sandbox-security-001"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-003",
+      "category": "15-computer-use-v2",
+      "title": "Implement SurfaceRegistry and generation tracking",
+      "path": "crates/computer-use/src/surface_registry.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-002"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-004",
+      "category": "15-computer-use-v2",
+      "title": "Implement Linux isolated virtual desktop backend",
+      "path": "crates/computer-use/src/platform/linux_desktop.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-002",
+        "RLM-07-sandbox-security-009"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md",
+        "architecture/sandbox.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-005",
+      "category": "15-computer-use-v2",
+      "title": "Implement Windows desktop worker adapter",
+      "path": "crates/computer-use/src/platform/windows.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-002",
+        "RLM-10-daemon-remote-release-010"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-006",
+      "category": "15-computer-use-v2",
+      "title": "Implement macOS desktop/accessibility adapter V2",
+      "path": "crates/computer-use/src/platform/macos.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-002",
+        "RLM-08-computer-mobile-008"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-007",
+      "category": "15-computer-use-v2",
+      "title": "Define normalized AccessibilitySnapshot schema",
+      "path": "crates/protocol/src/accessibility.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-001"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-008",
+      "category": "15-computer-use-v2",
+      "title": "Implement DOM/accessibility observation merger",
+      "path": "crates/computer-use/src/observe/semantic.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-007",
+        "RLM-08-computer-mobile-002"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-009",
+      "category": "15-computer-use-v2",
+      "title": "Implement PTY/TUI observer",
+      "path": "crates/computer-use/src/tui/observer.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-001",
+        "RLM-07-sandbox-security-004"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-010",
+      "category": "15-computer-use-v2",
+      "title": "Implement ObservationBuilder V2",
+      "path": "crates/computer-use/src/observe/mod.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-003",
+        "RLM-15-computer-use-v2-008",
+        "RLM-15-computer-use-v2-009"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-011",
+      "category": "15-computer-use-v2",
+      "title": "Implement VisualDelta engine",
+      "path": "crates/computer-use/src/observe/visual_delta.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-010",
+        "RLM-01-foundation-012"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-012",
+      "category": "15-computer-use-v2",
+      "title": "Implement semantic TargetResolver",
+      "path": "crates/computer-use/src/target/semantic.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-008",
+        "RLM-15-computer-use-v2-010"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-013",
+      "category": "15-computer-use-v2",
+      "title": "Implement stale and ambiguous target guard",
+      "path": "crates/computer-use/src/target/guard.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-003",
+        "RLM-15-computer-use-v2-012"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-014",
+      "category": "15-computer-use-v2",
+      "title": "Implement bounded vision fallback adapter",
+      "path": "crates/computer-use/src/target/vision.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-011",
+        "RLM-05-agent-llm-goal-007"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-015",
+      "category": "15-computer-use-v2",
+      "title": "Implement guarded coordinate fallback",
+      "path": "crates/computer-use/src/target/coordinate.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-13",
+        "RLM-15-computer-use-v2-14"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-016",
+      "category": "15-computer-use-v2",
+      "title": "Implement pointer/click/scroll action executor",
+      "path": "crates/computer-use/src/action/pointer.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-13",
+        "RLM-03-policy-workspace-009"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-017",
+      "category": "15-computer-use-v2",
+      "title": "Implement keyboard/chord/type action executor",
+      "path": "crates/computer-use/src/action/keyboard.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-16"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-018",
+      "category": "15-computer-use-v2",
+      "title": "Implement drag/drop and window action executor",
+      "path": "crates/computer-use/src/action/window.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-16",
+        "RLM-15-computer-use-v2-003"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-019",
+      "category": "15-computer-use-v2",
+      "title": "Implement controlled app launch/focus manager",
+      "path": "crates/computer-use/src/action/app.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-004",
+        "RLM-15-computer-use-v2-005",
+        "RLM-15-computer-use-v2-006"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-020",
+      "category": "15-computer-use-v2",
+      "title": "Upgrade browser lifecycle into SurfaceRegistry",
+      "path": "crates/computer-use/src/browser/session_v2.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-002",
+        "RLM-08-computer-mobile-001"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-021",
+      "category": "15-computer-use-v2",
+      "title": "Implement browser origin/upload/download policy adapter",
+      "path": "crates/computer-use/src/browser/policy.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-20",
+        "RLM-03-policy-workspace-004"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-022",
+      "category": "15-computer-use-v2",
+      "title": "Implement SecretHandle UI input injector",
+      "path": "crates/computer-use/src/security/secret_input.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-17",
+        "RLM-01-foundation-010"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-023",
+      "category": "15-computer-use-v2",
+      "title": "Implement screen-recording secret redaction zones",
+      "path": "crates/computer-use/src/recording/redaction.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-22",
+        "RLM-01-foundation-011"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-024",
+      "category": "15-computer-use-v2",
+      "title": "Implement SensitiveUiClassifier",
+      "path": "crates/computer-use/src/security/classifier.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-10",
+        "RLM-03-policy-workspace-003"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md",
+        "threat-model-and-security.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-025",
+      "category": "15-computer-use-v2",
+      "title": "Implement Computer Use postcondition verifier",
+      "path": "crates/computer-use/src/verify.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-16",
+        "RLM-15-computer-use-v2-10"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-026",
+      "category": "15-computer-use-v2",
+      "title": "Implement ComputerEvidence builder",
+      "path": "crates/computer-use/src/evidence.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-25",
+        "RLM-05-agent-llm-goal-021"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md",
+        "architecture/goal-dag-and-evidence.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-027",
+      "category": "15-computer-use-v2",
+      "title": "Implement diff-aware UiTestPlanner",
+      "path": "crates/computer-use/src/test_plan.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-26",
+        "RLM-03-policy-workspace-020"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-028",
+      "category": "15-computer-use-v2",
+      "title": "Implement annotated video recorder",
+      "path": "crates/computer-use/src/recording/video.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-23",
+        "RLM-15-computer-use-v2-25"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-029",
+      "category": "15-computer-use-v2",
+      "title": "Implement browser E2E test runner",
+      "path": "crates/computer-use/src/testing/browser_runner.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-21",
+        "RLM-15-computer-use-v2-27",
+        "RLM-15-computer-use-v2-28"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-030",
+      "category": "15-computer-use-v2",
+      "title": "Implement desktop/TUI E2E test runner",
+      "path": "crates/computer-use/src/testing/desktop_runner.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-18",
+        "RLM-15-computer-use-v2-19",
+        "RLM-15-computer-use-v2-27",
+        "RLM-15-computer-use-v2-28"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-031",
+      "category": "15-computer-use-v2",
+      "title": "Integrate Android ADB + visual Computer Use bridge",
+      "path": "crates/mobile/src/android/computer_bridge.rs",
+      "deps": [
+        "RLM-08-computer-mobile-012",
+        "RLM-15-computer-use-v2-02"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md",
+        "architecture/mobile-simulator.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-032",
+      "category": "15-computer-use-v2",
+      "title": "Integrate iOS Simulator + Computer Use bridge",
+      "path": "crates/mobile/src/ios/computer_bridge.rs",
+      "deps": [
+        "RLM-08-computer-mobile-014",
+        "RLM-15-computer-use-v2-06",
+        "RLM-15-computer-use-v2-02"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md",
+        "architecture/mobile-simulator.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-033",
+      "category": "15-computer-use-v2",
+      "title": "Add Computer Use TUI panel and human takeover controls",
+      "path": "crates/tui/src/panels/computer_use_v2.rs",
+      "deps": [
+        "RLM-15-computer-use-v2-26",
+        "RLM-15-computer-use-v2-28",
+        "RLM-13-handoff-knowledge-playbooks-20"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    },
+    {
+      "id": "RLM-15-computer-use-v2-034",
+      "category": "15-computer-use-v2",
+      "title": "Add Computer Use V2 deterministic and safety eval suite",
+      "path": "tests/e2e/computer_use_v2.rs, evals/computer-v2/",
+      "deps": [
+        "RLM-15-computer-use-v2-24",
+        "RLM-15-computer-use-v2-29",
+        "RLM-15-computer-use-v2-30",
+        "RLM-15-computer-use-v2-31",
+        "RLM-15-computer-use-v2-33",
+        "RLM-11-evals-hardening-004"
+      ],
+      "references": [
+        "V2-CHANGELOG.md",
+        "architecture/computer-use.md",
+        "api-contracts/computer-mobile-api.md",
+        "architecture/human-agent-control-handoff.md",
+        "evaluation-specs/computer-use-v2-evals.md"
+      ]
+    }
+  ]
+}

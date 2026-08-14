@@ -1,0 +1,16 @@
+{
+  "name": "rapidlm",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Node/pnpm workspace for RapidLM TypeScript SDK and schema tooling only",
+  "packageManager": "pnpm@11.20.0",
+  "engines": {
+    "node": "24.19.0",
+    "pnpm": "11.20.0"
+  },
+  "scripts": {
+    "build": "pnpm --filter @rapidlm/sdk build",
+    "typecheck": "pnpm --filter @rapidlm/sdk typecheck",
+    "test": "pnpm --filter @rapidlm/sdk test"
+  }
+}

@@ -1,0 +1,1334 @@
+# Complete Task Breakdown
+
+This is the implementation work-breakdown structure. It contains **320 atomic tasks**: the original 210 V1 tasks plus 110 V2 tasks for managed agents, handoff/Knowledge/Playbooks, trajectory learning/Session Insights, and full Computer Use. The canonical execution prompt for each task is in `prompts.md`. Task IDs are stable; do not reuse retired IDs.
+
+## Dependency rules
+
+- A task may start only when all `Depends on` task IDs are complete, unless an engineering lead records an explicit exception.
+- Parallel tasks MUST respect write-scope isolation. A coding agent receives only the files/directories named by its prompt plus dependencies needed to compile/test.
+- Completion means the prompt acceptance criteria and `reference/definition-of-done.md` are satisfied; writing code alone is not completion.
+
+## 01-foundation — Foundation & contracts
+
+- [ ] **RLM-01-foundation-001 — Bootstrap Rust workspace**
+  - Deliverable: `Cargo.toml, rust-toolchain.toml, apps/rapid/Cargo.toml, apps/rapid/src/main.rs`
+  - Depends on: None
+  - Goal: Create the compilable Rust workspace and composition-root binary with the exact crate boundaries in the dossier.
+- [ ] **RLM-01-foundation-002 — Bootstrap SDK tooling**
+  - Deliverable: `package.json, pnpm-workspace.yaml, sdk/typescript/package.json`
+  - Depends on: `RLM-01-foundation-001`
+  - Goal: Create the Node/pnpm workspace used only for TypeScript SDK/schema tooling.
+- [ ] **RLM-01-foundation-003 — Define typed UUID identifiers**
+  - Deliverable: `crates/protocol/src/id.rs`
+  - Depends on: `RLM-01-foundation-001`
+  - Goal: Implement UUIDv7-backed newtypes for all canonical runtime identifiers.
+- [ ] **RLM-01-foundation-004 — Define public error envelope**
+  - Deliverable: `crates/protocol/src/error.rs`
+  - Depends on: `RLM-01-foundation-003`
+  - Goal: Implement stable machine-readable error codes and safe error envelope conversion.
+- [ ] **RLM-01-foundation-005 — Define artifact references**
+  - Deliverable: `crates/protocol/src/artifact.rs`
+  - Depends on: `RLM-01-foundation-003`
+  - Goal: Implement content-addressed artifact IDs and redaction metadata types.
+- [ ] **RLM-01-foundation-006 — Implement config type schema**
+  - Deliverable: `crates/protocol/src/config.rs`
+  - Depends on: `RLM-01-foundation-004`
+  - Goal: Implement strongly typed user/workspace configuration structs with defaults.
+- [ ] **RLM-01-foundation-007 — Implement config precedence loader**
+  - Deliverable: `crates/kernel/src/config/loader.rs`
+  - Depends on: `RLM-01-foundation-006`
+  - Goal: Merge defaults, user file, workspace file, environment and CLI overrides with deterministic precedence.
+- [ ] **RLM-01-foundation-008 — Implement restrictive security config merge**
+  - Deliverable: `crates/kernel/src/config/security_merge.rs`
+  - Depends on: `RLM-01-foundation-007`
+  - Goal: Make security-policy merging intersection-only so lower-trust config cannot broaden authority.
+- [ ] **RLM-01-foundation-009 — Implement project trust record**
+  - Deliverable: `crates/kernel/src/project/trust.rs`
+  - Depends on: `RLM-01-foundation-007`
+  - Goal: Persist per-project trust keyed by canonical project identity and expose trusted/untrusted status.
+- [ ] **RLM-01-foundation-010 — Implement secret-aware value type**
+  - Deliverable: `crates/auth/src/secret.rs`
+  - Depends on: `RLM-01-foundation-001`
+  - Goal: Create a value type that distinguishes plaintext non-secret values from credential handles and prevents accidental Debug/Display leakage.
+- [ ] **RLM-01-foundation-011 — Implement OS credential-store interface**
+  - Deliverable: `crates/auth/src/store.rs`
+  - Depends on: `RLM-01-foundation-010`
+  - Goal: Define credential provider trait and platform-keychain-backed storage adapter boundary.
+- [ ] **RLM-01-foundation-012 — Implement artifact store**
+  - Deliverable: `crates/event-ledger/src/artifact_store.rs`
+  - Depends on: `RLM-01-foundation-005`
+  - Goal: Implement atomic content-addressed artifact writes and verified reads on local disk.
+- [ ] **RLM-01-foundation-013 — Implement repository path type**
+  - Deliverable: `crates/protocol/src/repo_path.rs`
+  - Depends on: `RLM-01-foundation-003`
+  - Goal: Create normalized repository-relative path type that rejects absolute paths and traversal.
+- [ ] **RLM-01-foundation-014 — Add tracing correlation primitives**
+  - Deliverable: `crates/protocol/src/trace.rs`
+  - Depends on: `RLM-01-foundation-003`
+  - Goal: Define trace/span correlation IDs and context propagation structs shared by events/tools/providers.
+- [ ] **RLM-01-foundation-015 — Create schema fixture harness**
+  - Deliverable: `crates/protocol/tests/schema_fixtures.rs`
+  - Depends on: `RLM-01-foundation-004`, `RLM-01-foundation-005`, `RLM-01-foundation-014`
+  - Goal: Create a reusable golden-fixture test helper for JSON wire types.
+- [ ] **RLM-01-foundation-016 — Add repository CI baseline**
+  - Deliverable: `.github/workflows/ci.yml`
+  - Depends on: `RLM-01-foundation-002`, `RLM-01-foundation-015`
+  - Goal: Add formatting, lint, test, schema and SDK checks without release credentials.
+
+## 02-kernel-ledger — Kernel, event ledger & sessions
+
+- [ ] **RLM-02-kernel-ledger-001 — Implement lifecycle service trait**
+  - Deliverable: `crates/kernel/src/service.rs`
+  - Depends on: `RLM-01-foundation-004`, `RLM-01-foundation-014`
+  - Goal: Implement the kernel service lifecycle/health abstraction and dependency declaration.
+- [ ] **RLM-02-kernel-ledger-002 — Implement service graph startup/shutdown**
+  - Deliverable: `crates/kernel/src/service_graph.rs`
+  - Depends on: `RLM-02-kernel-ledger-001`
+  - Goal: Topologically start services and reverse-quiesce/stop them with cancellation deadlines.
+- [ ] **RLM-02-kernel-ledger-003 — Create SQLite migration runner**
+  - Deliverable: `crates/event-ledger/src/migrations.rs`
+  - Depends on: `RLM-01-foundation-001`
+  - Goal: Create versioned, transactional SQLite migrations with WAL/foreign-key validation.
+- [ ] **RLM-02-kernel-ledger-004 — Implement event envelope types**
+  - Deliverable: `crates/event-ledger/src/event.rs`
+  - Depends on: `RLM-01-foundation-003`, `RLM-01-foundation-014`, `RLM-02-kernel-ledger-003`
+  - Goal: Implement canonical event envelope and typed event-kind registry.
+- [ ] **RLM-02-kernel-ledger-005 — Implement transactional event append**
+  - Deliverable: `crates/event-ledger/src/ledger.rs`
+  - Depends on: `RLM-02-kernel-ledger-004`
+  - Goal: Append events with monotonic per-session sequence and durability before acknowledgement.
+- [ ] **RLM-02-kernel-ledger-006 — Implement event subscription stream**
+  - Deliverable: `crates/event-ledger/src/subscription.rs`
+  - Depends on: `RLM-02-kernel-ledger-005`
+  - Goal: Stream committed events from a cursor with backpressure and reconnect cursor support.
+- [ ] **RLM-02-kernel-ledger-007 — Implement session projection**
+  - Deliverable: `crates/kernel/src/session/projection.rs`
+  - Depends on: `RLM-02-kernel-ledger-004`
+  - Goal: Derive `SessionSnapshot` deterministically from session events.
+- [ ] **RLM-02-kernel-ledger-008 — Implement projection checkpoints**
+  - Deliverable: `crates/event-ledger/src/checkpoint.rs`
+  - Depends on: `RLM-01-foundation-012`, `RLM-02-kernel-ledger-005`, `RLM-02-kernel-ledger-007`
+  - Goal: Persist and load hashed compressed projection checkpoints keyed by through-seq/schema.
+- [ ] **RLM-02-kernel-ledger-009 — Implement session creation/read**
+  - Deliverable: `crates/kernel/src/session/service.rs`
+  - Depends on: `RLM-02-kernel-ledger-005`, `RLM-02-kernel-ledger-007`
+  - Goal: Add kernel session repository and `create_session/get_session` API path.
+- [ ] **RLM-02-kernel-ledger-010 — Implement optimistic turn submission guard**
+  - Deliverable: `crates/kernel/src/turn/guard.rs`
+  - Depends on: `RLM-02-kernel-ledger-009`
+  - Goal: Ensure only one foreground turn mutates a session and validate `expected_seq`.
+- [ ] **RLM-02-kernel-ledger-011 — Implement cancellation tree**
+  - Deliverable: `crates/kernel/src/cancel.rs`
+  - Depends on: `RLM-02-kernel-ledger-001`
+  - Goal: Create hierarchical cancellation tokens for session→turn→model/tool/job children.
+- [ ] **RLM-02-kernel-ledger-012 — Implement recovery classifier**
+  - Deliverable: `crates/kernel/src/recovery/classify.rs`
+  - Depends on: `RLM-02-kernel-ledger-007`, `RLM-02-kernel-ledger-011`
+  - Goal: Classify incomplete model/tool/turn events after restart into interrupted states without fabricating success.
+- [ ] **RLM-02-kernel-ledger-013 — Implement session recovery pipeline**
+  - Deliverable: `crates/kernel/src/recovery/mod.rs`
+  - Depends on: `RLM-02-kernel-ledger-008`, `RLM-02-kernel-ledger-012`
+  - Goal: Load checkpoint/replay events, apply recovery actions and expose recovered session.
+- [ ] **RLM-02-kernel-ledger-014 — Implement session fork**
+  - Deliverable: `crates/kernel/src/session/fork.rs`
+  - Depends on: `RLM-02-kernel-ledger-009`, `RLM-02-kernel-ledger-013`
+  - Goal: Fork conversation projection and workspace pointer into a new session without inheriting active goal/leases.
+- [ ] **RLM-02-kernel-ledger-015 — Implement kernel client facade**
+  - Deliverable: `crates/kernel/src/client.rs`
+  - Depends on: `RLM-02-kernel-ledger-009`, `RLM-02-kernel-ledger-010`, `RLM-02-kernel-ledger-011`, `RLM-02-kernel-ledger-014`
+  - Goal: Expose in-process `KernelClient` implementation over session/turn/event primitives.
+- [ ] **RLM-02-kernel-ledger-016 — Implement headless JSONL emitter**
+  - Deliverable: `apps/rapid/src/headless/jsonl.rs`
+  - Depends on: `RLM-02-kernel-ledger-006`, `RLM-02-kernel-ledger-015`
+  - Goal: Map kernel events to versioned JSONL stdout records and diagnostics to stderr.
+- [ ] **RLM-02-kernel-ledger-017 — Add crash-recovery integration test**
+  - Deliverable: `crates/kernel/tests/crash_recovery.rs`
+  - Depends on: `RLM-02-kernel-ledger-013`, `RLM-02-kernel-ledger-016`
+  - Goal: Prove durability/recovery by killing a child RapidLM fixture mid-turn and restarting against the same DB.
+
+## 03-policy-workspace — Capability policy, workspace & VCS
+
+- [ ] **RLM-03-policy-workspace-001 — Define capability taxonomy**
+  - Deliverable: `crates/capability-broker/src/capability.rs`
+  - Depends on: `RLM-01-foundation-013`
+  - Goal: Implement canonical capability/resource/action types for filesystem, process, network, browser, mobile, MCP/plugin and secrets.
+- [ ] **RLM-03-policy-workspace-002 — Implement command action normalizer**
+  - Deliverable: `crates/capability-broker/src/normalize/command.rs`
+  - Depends on: `RLM-03-policy-workspace-001`
+  - Goal: Normalize executable, argv, cwd, env names and shell mode before policy hashing.
+- [ ] **RLM-03-policy-workspace-003 — Implement filesystem action normalizer**
+  - Deliverable: `crates/capability-broker/src/normalize/fs.rs`
+  - Depends on: `RLM-03-policy-workspace-001`, `RLM-01-foundation-013`
+  - Goal: Resolve repo/host paths, symlinks and intended operation into stable canonical filesystem scope.
+- [ ] **RLM-03-policy-workspace-004 — Implement network action normalizer**
+  - Deliverable: `crates/capability-broker/src/normalize/network.rs`
+  - Depends on: `RLM-03-policy-workspace-001`
+  - Goal: Normalize scheme/host/port and resolved IP class with redirect revalidation metadata.
+- [ ] **RLM-03-policy-workspace-005 — Implement policy file parser**
+  - Deliverable: `crates/capability-broker/src/policy/parser.rs`
+  - Depends on: `RLM-03-policy-workspace-001`, `RLM-01-foundation-008`
+  - Goal: Parse typed allow/ask/deny rules with origin/provenance and reject unknown privileged match fields.
+- [ ] **RLM-03-policy-workspace-006 — Implement deterministic policy evaluator**
+  - Deliverable: `crates/capability-broker/src/policy/evaluator.rs`
+  - Depends on: `RLM-03-policy-workspace-002`, `RLM-03-policy-workspace-003`, `RLM-03-policy-workspace-004`, `RLM-03-policy-workspace-005`
+  - Goal: Evaluate normalized actions using most-restrictive applicable layers and produce allow/ask/deny explanation.
+- [ ] **RLM-03-policy-workspace-007 — Implement approval request model**
+  - Deliverable: `crates/capability-broker/src/approval.rs`
+  - Depends on: `RLM-03-policy-workspace-006`
+  - Goal: Create approval requests with risk summary, exact normalized action diff and bounded scope choices.
+- [ ] **RLM-03-policy-workspace-008 — Implement capability lease issuance**
+  - Deliverable: `crates/capability-broker/src/lease.rs`
+  - Depends on: `RLM-03-policy-workspace-007`, `RLM-01-foundation-011`
+  - Goal: Issue signed/MAC-protected in-process lease records bound to principal/action hash/scope/expiry/uses/policy revision.
+- [ ] **RLM-03-policy-workspace-009 — Implement executor lease validator**
+  - Deliverable: `crates/capability-broker/src/validator.rs`
+  - Depends on: `RLM-03-policy-workspace-008`
+  - Goal: Provide mandatory `validate_use` guard that decrements use count atomically immediately before side effects.
+- [ ] **RLM-03-policy-workspace-010 — Implement capability audit events**
+  - Deliverable: `crates/capability-broker/src/audit.rs`
+  - Depends on: `RLM-03-policy-workspace-008`, `RLM-02-kernel-ledger-005`
+  - Goal: Append authorization/approval/lease outcomes to event/audit storage with redacted action summaries.
+- [ ] **RLM-03-policy-workspace-011 — Implement WorkspaceView model**
+  - Deliverable: `crates/workspace/src/view.rs`
+  - Depends on: `RLM-01-foundation-013`, `RLM-02-kernel-ledger-005`
+  - Goal: Create workspace view lifecycle and exclusive write-owner enforcement.
+- [ ] **RLM-03-policy-workspace-012 — Implement direct workspace backend**
+  - Deliverable: `crates/workspace/src/backends/direct.rs`
+  - Depends on: `RLM-03-policy-workspace-003`, `RLM-03-policy-workspace-011`
+  - Goal: Implement direct-checkout view with mutation journal/checkpoints for interactive single-writer use.
+- [ ] **RLM-03-policy-workspace-013 — Implement Git worktree backend**
+  - Deliverable: `crates/workspace/src/backends/git_worktree.rs`
+  - Depends on: `RLM-03-policy-workspace-011`
+  - Goal: Create/remove isolated Git worktrees for write-capable subagents and persist view metadata.
+- [ ] **RLM-03-policy-workspace-014 — Implement semantic patch data model**
+  - Deliverable: `crates/workspace/src/patch/model.rs`
+  - Depends on: `RLM-01-foundation-013`, `RLM-03-policy-workspace-011`
+  - Goal: Implement create/delete/move/replace patch ops with preimage hashes and deterministic serialization.
+- [ ] **RLM-03-policy-workspace-015 — Implement semantic patch apply-to-overlay**
+  - Deliverable: `crates/workspace/src/patch/apply.rs`
+  - Depends on: `RLM-03-policy-workspace-014`, `RLM-03-policy-workspace-012`
+  - Goal: Validate all preimages then apply a patch atomically to a staging overlay.
+- [ ] **RLM-03-policy-workspace-016 — Detect shell external mutations**
+  - Deliverable: `crates/workspace/src/external_mutation.rs`
+  - Depends on: `RLM-03-policy-workspace-011`, `RLM-03-policy-workspace-014`
+  - Goal: Snapshot/hash relevant workspace state around supervised commands and journal file mutations not created through semantic patches.
+- [ ] **RLM-03-policy-workspace-017 — Implement workspace checkpoints and rewind**
+  - Deliverable: `crates/workspace/src/checkpoint.rs`
+  - Depends on: `RLM-03-policy-workspace-012`, `RLM-03-policy-workspace-015`, `RLM-02-kernel-ledger-005`
+  - Goal: Persist view checkpoints and safely restore a selected checkpoint without discarding unrelated external user work.
+- [ ] **RLM-03-policy-workspace-018 — Implement child-view merge preview**
+  - Deliverable: `crates/workspace/src/merge.rs`
+  - Depends on: `RLM-03-policy-workspace-013`, `RLM-03-policy-workspace-015`
+  - Goal: Compute semantic/textual merge preview from child view into parent and identify op/path conflicts.
+- [ ] **RLM-03-policy-workspace-019 — Implement transactional merge commit**
+  - Deliverable: `crates/workspace/src/transaction.rs`
+  - Depends on: `RLM-03-policy-workspace-018`, `RLM-03-policy-workspace-017`
+  - Goal: Apply conflict-free merge preview to staging parent, run hooks, then atomically commit or rollback.
+- [ ] **RLM-03-policy-workspace-020 — Implement provenance edge store**
+  - Deliverable: `crates/vcs/src/provenance.rs`
+  - Depends on: `RLM-03-policy-workspace-019`, `RLM-02-kernel-ledger-005`
+  - Goal: Record goal/evidence/agent/workspace/patch/verification/commit attribution edges.
+- [ ] **RLM-03-policy-workspace-021 — Add lease TOCTOU security tests**
+  - Deliverable: `crates/capability-broker/tests/lease_toctou.rs`
+  - Depends on: `RLM-03-policy-workspace-009`, `RLM-03-policy-workspace-019`
+  - Goal: Build adversarial integration tests that mutate command/path/URL/principal/view between approval and execution.
+
+## 04-context-engine — Context engine
+
+- [ ] **RLM-04-context-engine-001 — Implement repo manifest and identities**
+  - Deliverable: `crates/context-engine/src/repo_manifest.rs`
+  - Depends on: `RLM-01-foundation-013`, `RLM-01-foundation-007`
+  - Goal: Parse multi-repo workspace manifest with alias, root, read/write mode and stable repo identity.
+- [ ] **RLM-04-context-engine-002 — Implement ignore-aware file walker**
+  - Deliverable: `crates/context-engine/src/ingest/walk.rs`
+  - Depends on: `RLM-04-context-engine-001`
+  - Goal: Enumerate indexable files respecting .gitignore, RapidLM ignores, size/binary limits and repo scopes.
+- [ ] **RLM-04-context-engine-003 — Implement content hasher and language detector**
+  - Deliverable: `crates/context-engine/src/ingest/content.rs`
+  - Depends on: `RLM-04-context-engine-002`
+  - Goal: Hash bytes and detect Tier-1 language/content type without trusting extension alone for binaries.
+- [ ] **RLM-04-context-engine-004 — Add Tree-sitter parser registry**
+  - Deliverable: `crates/context-engine/src/parse/registry.rs`
+  - Depends on: `RLM-04-context-engine-003`
+  - Goal: Register Tier-1 parsers behind a common bounded parse API.
+- [ ] **RLM-04-context-engine-005 — Implement symbol extraction**
+  - Deliverable: `crates/context-engine/src/parse/symbols.rs`
+  - Depends on: `RLM-04-context-engine-004`
+  - Goal: Extract definitions/imports/references-ish syntax facts and stable symbol locators from parse trees.
+- [ ] **RLM-04-context-engine-006 — Implement code-aware chunker**
+  - Deliverable: `crates/context-engine/src/chunk.rs`
+  - Depends on: `RLM-04-context-engine-005`
+  - Goal: Chunk source around symbol/syntax boundaries with overlap caps and stable chunk IDs tied to content hash/range.
+- [ ] **RLM-04-context-engine-007 — Implement FTS5 index writer/search**
+  - Deliverable: `crates/context-engine/src/index/fts.rs`
+  - Depends on: `RLM-04-context-engine-006`, `RLM-02-kernel-ledger-003`
+  - Goal: Persist chunks/symbol terms in SQLite FTS5 and expose filtered BM25 search.
+- [ ] **RLM-04-context-engine-008 — Implement symbol/code graph**
+  - Deliverable: `crates/context-engine/src/index/graph.rs`
+  - Depends on: `RLM-04-context-engine-005`, `RLM-02-kernel-ledger-003`
+  - Goal: Persist definition/import/reference edges sufficient for local graph-neighborhood retrieval.
+- [ ] **RLM-04-context-engine-009 — Implement optional vector index abstraction**
+  - Deliverable: `crates/context-engine/src/index/vector.rs`
+  - Depends on: `RLM-04-context-engine-006`
+  - Goal: Define embedding provider and rebuildable vector index keyed by chunk ID, with disabled/offline mode.
+- [ ] **RLM-04-context-engine-010 — Implement incremental indexing transaction**
+  - Deliverable: `crates/context-engine/src/ingest/pipeline.rs`
+  - Depends on: `RLM-04-context-engine-007`, `RLM-04-context-engine-008`, `RLM-04-context-engine-009`
+  - Goal: Connect hash→parse→chunk→FTS/graph/vector update with per-file content-hash idempotence.
+- [ ] **RLM-04-context-engine-011 — Implement filesystem watcher coalescer**
+  - Deliverable: `crates/context-engine/src/ingest/watch.rs`
+  - Depends on: `RLM-04-context-engine-010`
+  - Goal: Coalesce watcher bursts/renames into bounded indexing jobs with overflow-to-rescan behavior.
+- [ ] **RLM-04-context-engine-012 — Implement LSP enrichment adapter**
+  - Deliverable: `crates/context-engine/src/lsp/mod.rs`
+  - Depends on: `RLM-04-context-engine-005`
+  - Goal: Query configured language servers for definitions/references/symbol details with strict timeouts and degrade behavior.
+- [ ] **RLM-04-context-engine-013 — Implement hybrid candidate generators**
+  - Deliverable: `crates/context-engine/src/retrieval/candidates.rs`
+  - Depends on: `RLM-04-context-engine-007`, `RLM-04-context-engine-008`, `RLM-04-context-engine-009`, `RLM-04-context-engine-012`
+  - Goal: Generate explicit, FTS, vector, graph, diff/error and read-set candidates under per-source caps.
+- [ ] **RLM-04-context-engine-014 — Implement rank fusion and MMR**
+  - Deliverable: `crates/context-engine/src/retrieval/rank.rs`
+  - Depends on: `RLM-04-context-engine-013`
+  - Goal: Normalize/fuse candidates and apply MMR-style redundancy suppression under a requested limit.
+- [ ] **RLM-04-context-engine-015 — Implement read tracking**
+  - Deliverable: `crates/context-engine/src/read_set.rs`
+  - Depends on: `RLM-02-kernel-ledger-005`, `RLM-04-context-engine-003`
+  - Goal: Record exact file/range/content-hash reads per session/agent and expose changed-since-read detection.
+- [ ] **RLM-04-context-engine-016 — Implement token estimator abstraction**
+  - Deliverable: `crates/context-engine/src/token_estimate.rs`
+  - Depends on: `RLM-04-context-engine-003`
+  - Goal: Provide provider-aware token estimates with conservative fallback and cache by content hash/model tokenizer family.
+- [ ] **RLM-04-context-engine-017 — Implement context compiler budgeting**
+  - Deliverable: `crates/context-engine/src/compile.rs`
+  - Depends on: `RLM-04-context-engine-014`, `RLM-04-context-engine-015`, `RLM-04-context-engine-016`
+  - Goal: Compile system/user/goal/diff/retrieved/memory/read-set blocks into hard token partitions with reserved output/safety margin.
+- [ ] **RLM-04-context-engine-018 — Implement durable scoped memory**
+  - Deliverable: `crates/context-engine/src/memory.rs`
+  - Depends on: `RLM-02-kernel-ledger-003`, `RLM-02-kernel-ledger-005`
+  - Goal: Store/retrieve memory with scope, provenance, confidence and expiry; separate user/project/session scopes.
+- [ ] **RLM-04-context-engine-019 — Add context benchmark harness**
+  - Deliverable: `crates/context-engine/benches/eval_queries.rs`
+  - Depends on: `RLM-04-context-engine-017`, `RLM-04-context-engine-018`
+  - Goal: Implement gold-query runner measuring recall/nDCG/redundant tokens/latency and rg/vector baselines.
+
+## 05-agent-llm-goal — LLM router, agent runtime & goals
+
+- [ ] **RLM-05-agent-llm-goal-001 — Define provider capability model**
+  - Deliverable: `crates/llm-router/src/provider.rs`
+  - Depends on: `RLM-01-foundation-004`, `RLM-01-foundation-014`
+  - Goal: Implement canonical model/provider metadata and streaming request/response types.
+- [ ] **RLM-05-agent-llm-goal-002 — Implement provider credential resolver**
+  - Deliverable: `crates/llm-router/src/credentials.rs`
+  - Depends on: `RLM-01-foundation-011`, `RLM-05-agent-llm-goal-001`
+  - Goal: Resolve provider credential handles from auth store without placing plaintext in model/config structures.
+- [ ] **RLM-05-agent-llm-goal-003 — Implement OpenAI-compatible provider adapter**
+  - Deliverable: `crates/llm-router/src/providers/openai_compatible.rs`
+  - Depends on: `RLM-05-agent-llm-goal-001`, `RLM-05-agent-llm-goal-002`
+  - Goal: Implement canonical streaming/tool-call adapter for OpenAI-compatible chat/responses-style endpoint configured by provider profile.
+- [ ] **RLM-05-agent-llm-goal-004 — Implement Anthropic provider adapter**
+  - Deliverable: `crates/llm-router/src/providers/anthropic.rs`
+  - Depends on: `RLM-05-agent-llm-goal-001`, `RLM-05-agent-llm-goal-002`
+  - Goal: Implement canonical streaming/tool-call adapter for Anthropic-compatible Messages API using the same provider trait.
+- [ ] **RLM-05-agent-llm-goal-005 — Implement model catalog**
+  - Deliverable: `crates/llm-router/src/catalog.rs`
+  - Depends on: `RLM-05-agent-llm-goal-001`, `RLM-05-agent-llm-goal-003`, `RLM-05-agent-llm-goal-004`
+  - Goal: Load configured provider/model entries into a validated immutable catalog snapshot.
+- [ ] **RLM-05-agent-llm-goal-006 — Implement hard route filters**
+  - Deliverable: `crates/llm-router/src/route/filter.rs`
+  - Depends on: `RLM-05-agent-llm-goal-005`
+  - Goal: Filter catalog by required tool/vision/context/privacy/region/provider availability/user pin before scoring.
+- [ ] **RLM-05-agent-llm-goal-007 — Implement versioned route scoring**
+  - Deliverable: `crates/llm-router/src/route/score.rs`
+  - Depends on: `RLM-05-agent-llm-goal-006`
+  - Goal: Score eligible models by task-purpose quality prior, cost, latency and reliability using explicit versioned weights.
+- [ ] **RLM-05-agent-llm-goal-008 — Implement safe fallback controller**
+  - Deliverable: `crates/llm-router/src/fallback.rs`
+  - Depends on: `RLM-05-agent-llm-goal-007`
+  - Goal: Retry/fallback only for allowed transient failures without violating hard route constraints or multiplying tool side effects.
+- [ ] **RLM-05-agent-llm-goal-009 — Implement usage/cost accounting**
+  - Deliverable: `crates/llm-router/src/usage.rs`
+  - Depends on: `RLM-05-agent-llm-goal-003`, `RLM-05-agent-llm-goal-004`, `RLM-02-kernel-ledger-005`
+  - Goal: Normalize provider usage, cached input, output/reasoning tokens and estimated/reported cost into model events.
+- [ ] **RLM-05-agent-llm-goal-010 — Define stable model tool schemas**
+  - Deliverable: `crates/tool-gateway/src/schema.rs`
+  - Depends on: `RLM-01-foundation-004`, `RLM-03-policy-workspace-001`, `RLM-04-context-engine-017`
+  - Goal: Implement canonical JSON schemas for the twelve v1 model-visible gateway tools.
+- [ ] **RLM-05-agent-llm-goal-011 — Implement tool invocation validator**
+  - Deliverable: `crates/tool-gateway/src/validate.rs`
+  - Depends on: `RLM-05-agent-llm-goal-010`
+  - Goal: Validate provider tool-call arguments against canonical schema before any policy evaluation/execution.
+- [ ] **RLM-05-agent-llm-goal-012 — Implement tool dispatch skeleton**
+  - Deliverable: `crates/tool-gateway/src/dispatch.rs`
+  - Depends on: `RLM-05-agent-llm-goal-011`, `RLM-03-policy-workspace-009`
+  - Goal: Route validated canonical tool invocations through capability broker to registered executor traits with bounded result envelopes.
+- [ ] **RLM-05-agent-llm-goal-013 — Implement prompt bundle compiler**
+  - Deliverable: `crates/agent-runtime/src/prompt.rs`
+  - Depends on: `RLM-04-context-engine-017`, `RLM-05-agent-llm-goal-010`
+  - Goal: Assemble versioned core/role/project/goal/context prompt sections with fixed precedence and untrusted-data delimiters.
+- [ ] **RLM-05-agent-llm-goal-014 — Implement cancellable turn loop**
+  - Deliverable: `crates/agent-runtime/src/turn.rs`
+  - Depends on: `RLM-02-kernel-ledger-010`, `RLM-02-kernel-ledger-011`, `RLM-05-agent-llm-goal-008`, `RLM-05-agent-llm-goal-009`, `RLM-05-agent-llm-goal-012`, `RLM-05-agent-llm-goal-013`
+  - Goal: Execute model step→validated tool→model continuation until assistant terminal output/budget/cancel using kernel events.
+- [ ] **RLM-05-agent-llm-goal-015 — Define agent lifecycle/result model**
+  - Deliverable: `crates/agent-runtime/src/agent/model.rs`
+  - Depends on: `RLM-01-foundation-003`, `RLM-03-policy-workspace-011`
+  - Goal: Implement `AgentSpec`, states, budgets and typed `AgentResult` with evidence/view/artifact refs.
+- [ ] **RLM-05-agent-llm-goal-016 — Implement agent scheduler queues**
+  - Deliverable: `crates/agent-runtime/src/agent/scheduler.rs`
+  - Depends on: `RLM-05-agent-llm-goal-015`, `RLM-05-agent-llm-goal-007`, `RLM-02-kernel-ledger-011`
+  - Goal: Schedule agents under global/provider/write-concurrency and cost budgets with priority/cancellation.
+- [ ] **RLM-05-agent-llm-goal-017 — Implement isolated subagent spawn**
+  - Deliverable: `crates/agent-runtime/src/agent/spawn.rs`
+  - Depends on: `RLM-05-agent-llm-goal-016`, `RLM-03-policy-workspace-013`, `RLM-05-agent-llm-goal-014`
+  - Goal: Create read-only or Git-worktree child view, compile role prompt and start child turn under scheduler.
+- [ ] **RLM-05-agent-llm-goal-018 — Implement subagent result/merge handoff**
+  - Deliverable: `crates/agent-runtime/src/agent/result.rs`
+  - Depends on: `RLM-05-agent-llm-goal-017`, `RLM-03-policy-workspace-019`
+  - Goal: Persist typed child result and expose explicit inspect/merge path to parent without shared hidden chat.
+- [ ] **RLM-05-agent-llm-goal-019 — Implement goal state machine**
+  - Deliverable: `crates/agent-runtime/src/goal/state.rs`
+  - Depends on: `RLM-05-agent-llm-goal-015`, `RLM-02-kernel-ledger-005`
+  - Goal: Implement top-level goal create/pause/resume/block/complete/cancel transitions and main-agent-only mutation authority.
+- [ ] **RLM-05-agent-llm-goal-020 — Implement goal budgets and usage**
+  - Deliverable: `crates/agent-runtime/src/goal/budget.rs`
+  - Depends on: `RLM-05-agent-llm-goal-009`, `RLM-05-agent-llm-goal-019`
+  - Goal: Track continuation turns, tokens, active wall-clock and cost only while goal is active; enforce explicit optional limits.
+- [ ] **RLM-05-agent-llm-goal-021 — Implement evidence store/validators**
+  - Deliverable: `crates/agent-runtime/src/evidence.rs`
+  - Depends on: `RLM-05-agent-llm-goal-019`, `RLM-03-policy-workspace-020`
+  - Goal: Record typed evidence and validate required completion criteria through runtime validators.
+- [ ] **RLM-05-agent-llm-goal-022 — Implement autonomous goal driver**
+  - Deliverable: `crates/agent-runtime/src/goal/driver.rs`
+  - Depends on: `RLM-05-agent-llm-goal-014`, `RLM-05-agent-llm-goal-020`, `RLM-05-agent-llm-goal-021`
+  - Goal: At turn boundaries continue active goals, inject goal snapshot/budget hint, and stop on pause/block/complete/cancel.
+- [ ] **RLM-05-agent-llm-goal-023 — Integrate goal crash recovery**
+  - Deliverable: `crates/agent-runtime/src/goal/recovery.rs`
+  - Depends on: `RLM-02-kernel-ledger-013`, `RLM-05-agent-llm-goal-022`
+  - Goal: Hook session recovery so formerly active goals become paused with `process_recovered` and never auto-continue.
+- [ ] **RLM-05-agent-llm-goal-024 — Implement structured compaction**
+  - Deliverable: `crates/agent-runtime/src/compaction.rs`
+  - Depends on: `RLM-05-agent-llm-goal-013`, `RLM-04-context-engine-015`, `RLM-01-foundation-012`
+  - Goal: Summarize session state into durable continuation record with decisions/files/evidence/handles/read hashes and no hidden reasoning.
+
+## 06-cli-tui — CLI / TUI
+
+- [ ] **RLM-06-cli-tui-001 — Implement frontend state projection**
+  - Deliverable: `crates/tui/src/state.rs`
+  - Depends on: `RLM-02-kernel-ledger-015`, `RLM-05-agent-llm-goal-015`, `RLM-05-agent-llm-goal-019`
+  - Goal: Create immutable TUI state reducer driven only by kernel events/snapshots.
+- [ ] **RLM-06-cli-tui-002 — Implement terminal output sanitizer**
+  - Deliverable: `crates/tui/src/sanitize.rs`
+  - Depends on: `RLM-01-foundation-001`
+  - Goal: Sanitize model/tool/file text so OSC/CSI/clipboard/title/control escapes cannot trigger terminal side effects.
+- [ ] **RLM-06-cli-tui-003 — Implement terminal lifecycle**
+  - Deliverable: `crates/tui/src/terminal.rs`
+  - Depends on: `RLM-06-cli-tui-002`
+  - Goal: Own raw mode/alternate screen/panic cleanup and restore terminal reliably on exit/crash paths.
+- [ ] **RLM-06-cli-tui-004 — Implement responsive layout model**
+  - Deliverable: `crates/tui/src/layout.rs`
+  - Depends on: `RLM-06-cli-tui-001`
+  - Goal: Define layout regions/pane sizing for transcript/composer/status/sidebar/modal across terminal sizes.
+- [ ] **RLM-06-cli-tui-005 — Implement transcript virtualizer**
+  - Deliverable: `crates/tui/src/transcript.rs`
+  - Depends on: `RLM-06-cli-tui-002`, `RLM-06-cli-tui-004`
+  - Goal: Render large transcripts using viewport/windowed blocks instead of laying out the entire history each frame.
+- [ ] **RLM-06-cli-tui-006 — Implement composer editor**
+  - Deliverable: `crates/tui/src/composer.rs`
+  - Depends on: `RLM-06-cli-tui-004`
+  - Goal: Implement multi-line composer, history, submit/cancel, paste handling and IME-safe text model.
+- [ ] **RLM-06-cli-tui-007 — Implement status bar**
+  - Deliverable: `crates/tui/src/status.rs`
+  - Depends on: `RLM-06-cli-tui-001`, `RLM-06-cli-tui-004`
+  - Goal: Render model, sandbox/policy mode, context usage, goal budget, agent count, cost and connectivity from state.
+- [ ] **RLM-06-cli-tui-008 — Implement command palette/slash router**
+  - Deliverable: `crates/tui/src/commands.rs`
+  - Depends on: `RLM-06-cli-tui-006`, `RLM-02-kernel-ledger-015`
+  - Goal: Parse slash commands and dispatch to typed frontend actions rather than shell strings.
+- [ ] **RLM-06-cli-tui-009 — Implement Agents Panel**
+  - Deliverable: `crates/tui/src/panels/agents.rs`
+  - Depends on: `RLM-06-cli-tui-001`, `RLM-06-cli-tui-004`, `RLM-05-agent-llm-goal-018`
+  - Goal: Render agent tree, state/action/elapsed/tokens/cost/view/diff/blocker/evidence and selection actions.
+- [ ] **RLM-06-cli-tui-010 — Implement diff viewer**
+  - Deliverable: `crates/tui/src/panels/diff.rs`
+  - Depends on: `RLM-06-cli-tui-004`, `RLM-03-policy-workspace-018`, `RLM-03-policy-workspace-020`
+  - Goal: Render unified/semantic diff, file navigation, attribution and external-mutation warnings without applying changes.
+- [ ] **RLM-06-cli-tui-011 — Implement approval UI**
+  - Deliverable: `crates/tui/src/panels/approval.rs`
+  - Depends on: `RLM-06-cli-tui-004`, `RLM-03-policy-workspace-007`, `RLM-02-kernel-ledger-015`
+  - Goal: Render exact normalized action, risk/reason, policy source and bounded approval scope choices.
+- [ ] **RLM-06-cli-tui-012 — Implement context inspector**
+  - Deliverable: `crates/tui/src/panels/context.rs`
+  - Depends on: `RLM-06-cli-tui-004`, `RLM-04-context-engine-017`
+  - Goal: Show compiled blocks, tokens, source/reason/trust/freshness and pin/unpin actions.
+- [ ] **RLM-06-cli-tui-013 — Implement memory inspector**
+  - Deliverable: `crates/tui/src/panels/memory.rs`
+  - Depends on: `RLM-06-cli-tui-004`, `RLM-04-context-engine-018`
+  - Goal: List memories by scope/source/confidence/expiry and allow explicit delete/disable writes.
+- [ ] **RLM-06-cli-tui-014 — Implement model selector**
+  - Deliverable: `crates/tui/src/panels/model.rs`
+  - Depends on: `RLM-06-cli-tui-004`, `RLM-05-agent-llm-goal-007`
+  - Goal: Display eligible/unavailable models with provider, capabilities, context, cost/latency hints and pin selection.
+- [ ] **RLM-06-cli-tui-015 — Implement trace/jobs inspector**
+  - Deliverable: `crates/tui/src/panels/trace_jobs.rs`
+  - Depends on: `RLM-06-cli-tui-004`, `RLM-02-kernel-ledger-006`
+  - Goal: Render trace spans and supervised/background job state with bounded log/artifact viewing/cancel actions.
+- [ ] **RLM-06-cli-tui-016 — Implement session lifecycle UI**
+  - Deliverable: `crates/tui/src/session_actions.rs`
+  - Depends on: `RLM-06-cli-tui-008`, `RLM-02-kernel-ledger-014`, `RLM-03-policy-workspace-017`, `RLM-05-agent-llm-goal-024`
+  - Goal: Implement resume/fork/rewind/compact command flows with conflict previews and goal safety semantics.
+- [ ] **RLM-06-cli-tui-017 — Add TUI snapshot/performance harness**
+  - Deliverable: `crates/tui/tests/ui_snapshots.rs`
+  - Depends on: `RLM-06-cli-tui-005`, `RLM-06-cli-tui-009`, `RLM-06-cli-tui-010`, `RLM-06-cli-tui-011`, `RLM-06-cli-tui-012`, `RLM-06-cli-tui-013`, `RLM-06-cli-tui-014`, `RLM-06-cli-tui-015`
+  - Goal: Create deterministic event-driven snapshots and frame latency benchmark for major panels.
+- [ ] **RLM-06-cli-tui-018 — Wire interactive rapid entrypoint**
+  - Deliverable: `apps/rapid/src/interactive.rs`
+  - Depends on: `RLM-02-kernel-ledger-002`, `RLM-02-kernel-ledger-015`, `RLM-06-cli-tui-003`, `RLM-06-cli-tui-017`
+  - Goal: Start kernel/in-process client/TUI, resolve project trust/config and ensure graceful shutdown.
+
+## 07-sandbox-security — Process, sandbox & security
+
+- [ ] **RLM-07-sandbox-security-001 — Implement supervised process spawn**
+  - Deliverable: `crates/process-supervisor/src/spawn.rs`
+  - Depends on: `RLM-03-policy-workspace-009`, `RLM-02-kernel-ledger-011`, `RLM-01-foundation-010`
+  - Goal: Spawn argv-first child processes in dedicated process groups/jobs with cwd/env/stdin and lifecycle IDs.
+- [ ] **RLM-07-sandbox-security-002 — Implement bounded output spool**
+  - Deliverable: `crates/process-supervisor/src/output.rs`
+  - Depends on: `RLM-07-sandbox-security-001`, `RLM-01-foundation-012`
+  - Goal: Stream stdout/stderr to bounded inline buffers then immutable artifacts with cursors.
+- [ ] **RLM-07-sandbox-security-003 — Implement process-tree cancellation**
+  - Deliverable: `crates/process-supervisor/src/cancel.rs`
+  - Depends on: `RLM-07-sandbox-security-001`, `RLM-02-kernel-ledger-011`
+  - Goal: Terminate supervised process tree on cancellation/timeout using platform-appropriate group/job semantics and escalate after grace period.
+- [ ] **RLM-07-sandbox-security-004 — Implement background job registry**
+  - Deliverable: `crates/process-supervisor/src/jobs.rs`
+  - Depends on: `RLM-07-sandbox-security-001`, `RLM-02-kernel-ledger-005`
+  - Goal: Persist daemon-owned job specs/state/artifact output references and reconnect-safe status.
+- [ ] **RLM-07-sandbox-security-005 — Implement orphan process reconciliation**
+  - Deliverable: `crates/process-supervisor/src/recovery.rs`
+  - Depends on: `RLM-07-sandbox-security-004`, `RLM-02-kernel-ledger-013`
+  - Goal: On startup safely determine whether persisted child identity is alive/owned and terminate/re-adopt by policy.
+- [ ] **RLM-07-sandbox-security-006 — Implement cron-like schedule parser**
+  - Deliverable: `crates/process-supervisor/src/schedule.rs`
+  - Depends on: `RLM-07-sandbox-security-004`
+  - Goal: Parse bounded daemon schedules and calculate next fire without executing jobs.
+- [ ] **RLM-07-sandbox-security-007 — Define sandbox backend trait**
+  - Deliverable: `crates/sandbox/src/backend.rs`
+  - Depends on: `RLM-07-sandbox-security-001`
+  - Goal: Define backend capability/health/start/exec/cleanup interface and no-downgrade selection.
+- [ ] **RLM-07-sandbox-security-008 — Implement host-restricted backend**
+  - Deliverable: `crates/sandbox/src/backends/host_restricted.rs`
+  - Depends on: `RLM-07-sandbox-security-007`, `RLM-03-policy-workspace-009`
+  - Goal: Execute via process supervisor with workspace/path/network policy but clearly classify as non-strong isolation.
+- [ ] **RLM-07-sandbox-security-009 — Implement rootless container backend**
+  - Deliverable: `crates/sandbox/src/backends/container.rs`
+  - Depends on: `RLM-07-sandbox-security-007`
+  - Goal: Create rootless Linux container sandbox with minimal mounts, namespaces/cgroups/seccomp and explicit network mode.
+- [ ] **RLM-07-sandbox-security-010 — Implement gVisor backend adapter**
+  - Deliverable: `crates/sandbox/src/backends/gvisor.rs`
+  - Depends on: `RLM-07-sandbox-security-007`, `RLM-07-sandbox-security-009`
+  - Goal: Add gVisor/runsc-backed sandbox implementation with capability/availability detection and explicit fallback refusal.
+- [ ] **RLM-07-sandbox-security-011 — Define remote microVM sandbox protocol**
+  - Deliverable: `crates/sandbox/src/backends/remote.rs`
+  - Depends on: `RLM-07-sandbox-security-007`, `RLM-01-foundation-005`
+  - Goal: Define controller-side sandbox spec/work lease for Firecracker-class remote worker execution.
+- [ ] **RLM-07-sandbox-security-012 — Implement egress policy proxy**
+  - Deliverable: `crates/security/src/network_policy.rs`
+  - Depends on: `RLM-03-policy-workspace-004`, `RLM-03-policy-workspace-009`
+  - Goal: Enforce sandbox/browser/tool network allow/deny rules with DNS/IP/redirect revalidation and auditable decisions.
+- [ ] **RLM-07-sandbox-security-013 — Implement secret redaction registry**
+  - Deliverable: `crates/security/src/redaction.rs`
+  - Depends on: `RLM-01-foundation-010`
+  - Goal: Register secret canaries/derived encodings and redact exact protected values from process/tool/event/trace text sinks.
+- [ ] **RLM-07-sandbox-security-014 — Implement native secret scanner**
+  - Deliverable: `crates/security/src/scanners/secrets.rs`
+  - Depends on: `RLM-07-sandbox-security-013`, `RLM-03-policy-workspace-014`
+  - Goal: Scan staged diffs/artifacts for high-confidence credential patterns plus configured canaries; emit normalized finding.
+- [ ] **RLM-07-sandbox-security-015 — Implement dangerous command scanner**
+  - Deliverable: `crates/security/src/scanners/command.rs`
+  - Depends on: `RLM-03-policy-workspace-002`
+  - Goal: Statically classify normalized commands for destructive/privilege/persistence/exfiltration risk before policy decision.
+- [ ] **RLM-07-sandbox-security-016 — Implement patch security scanner**
+  - Deliverable: `crates/security/src/scanners/patch.rs`
+  - Depends on: `RLM-03-policy-workspace-014`
+  - Goal: Scan staged patch for suspicious permission broadening, credential handling, CI/release changes and executable hooks.
+- [ ] **RLM-07-sandbox-security-017 — Implement external scanner adapter protocol**
+  - Deliverable: `crates/security/src/scanners/external.rs`
+  - Depends on: `RLM-07-sandbox-security-002`, `RLM-07-sandbox-security-007`
+  - Goal: Run configured SAST/SCA scanners in supervised sandbox and normalize SARIF into RapidLM findings.
+- [ ] **RLM-07-sandbox-security-018 — Implement scanner gate aggregator**
+  - Deliverable: `crates/security/src/gate.rs`
+  - Depends on: `RLM-07-sandbox-security-014`, `RLM-07-sandbox-security-015`, `RLM-07-sandbox-security-016`, `RLM-07-sandbox-security-017`
+  - Goal: Combine required scanners by policy and block verification/apply when required scanner is failed/unavailable/error.
+- [ ] **RLM-07-sandbox-security-019 — Implement terminal/control-output security filter for logs**
+  - Deliverable: `crates/security/src/output_safety.rs`
+  - Depends on: `RLM-06-cli-tui-002`, `RLM-07-sandbox-security-002`
+  - Goal: Apply non-TUI safe serialization/escaping to tool/process log exports and artifacts metadata.
+- [ ] **RLM-07-sandbox-security-020 — Implement security doctor checks**
+  - Deliverable: `crates/security/src/doctor.rs`
+  - Depends on: `RLM-07-sandbox-security-008`, `RLM-07-sandbox-security-009`, `RLM-07-sandbox-security-010`, `RLM-07-sandbox-security-012`, `RLM-07-sandbox-security-013`
+  - Goal: Report sandbox availability, policy parse status, credential-store health, dangerous project config and release signature state without exposing secrets.
+- [ ] **RLM-07-sandbox-security-021 — Add adversarial sandbox/policy suite**
+  - Deliverable: `crates/security/tests/adversarial.rs`
+  - Depends on: `RLM-07-sandbox-security-012`, `RLM-07-sandbox-security-013`, `RLM-07-sandbox-security-018`, `RLM-07-sandbox-security-019`, `RLM-03-policy-workspace-021`
+  - Goal: Implement integration tests for SSRF, symlink escape, output escapes, secret leak and sandbox downgrade regressions.
+
+## 08-computer-mobile — Computer use & mobile simulator
+
+- [ ] **RLM-08-computer-mobile-001 — Implement browser session manager**
+  - Deliverable: `crates/computer-use/src/browser/session.rs`
+  - Depends on: `RLM-01-foundation-012`, `RLM-03-policy-workspace-009`, `RLM-07-sandbox-security-012`
+  - Goal: Launch/reuse isolated Playwright browser contexts with per-session profile, downloads/temp dirs and trace option.
+- [ ] **RLM-08-computer-mobile-002 — Implement browser observation**
+  - Deliverable: `crates/computer-use/src/browser/observe.rs`
+  - Depends on: `RLM-08-computer-mobile-001`
+  - Goal: Capture URL/title/accessibility/DOM-derived semantic targets and optional screenshot under bounded size.
+- [ ] **RLM-08-computer-mobile-003 — Implement semantic browser actions**
+  - Deliverable: `crates/computer-use/src/browser/action.rs`
+  - Depends on: `RLM-08-computer-mobile-002`
+  - Goal: Implement click/type/key/scroll/navigate using current semantic target and reject stale observation IDs.
+- [ ] **RLM-08-computer-mobile-004 — Implement browser verify step**
+  - Deliverable: `crates/computer-use/src/browser/verify.rs`
+  - Depends on: `RLM-08-computer-mobile-003`
+  - Goal: Re-observe after material actions and evaluate requested postcondition without assuming action success.
+- [ ] **RLM-08-computer-mobile-005 — Implement browser sensitive-action gates**
+  - Deliverable: `crates/computer-use/src/browser/security.rs`
+  - Depends on: `RLM-08-computer-mobile-003`, `RLM-03-policy-workspace-001`
+  - Goal: Classify file upload/download, clipboard, credential entry, auth/security/account and destructive actions into dedicated capabilities.
+- [ ] **RLM-08-computer-mobile-006 — Implement browser trace artifact exporter**
+  - Deliverable: `crates/computer-use/src/browser/trace.rs`
+  - Depends on: `RLM-08-computer-mobile-004`, `RLM-01-foundation-012`
+  - Goal: Export Playwright trace/action/observation manifest as linked artifacts with redaction metadata.
+- [ ] **RLM-08-computer-mobile-007 — Define desktop automation backend trait**
+  - Deliverable: `crates/computer-use/src/desktop/backend.rs`
+  - Depends on: `RLM-03-policy-workspace-009`
+  - Goal: Define accessibility-first desktop observe/action APIs and capability reporting for OS adapters.
+- [ ] **RLM-08-computer-mobile-008 — Implement macOS accessibility adapter**
+  - Deliverable: `crates/computer-use/src/desktop/macos.rs`
+  - Depends on: `RLM-08-computer-mobile-007`
+  - Goal: Implement macOS Accessibility API window/tree/action adapter behind desktop trait.
+- [ ] **RLM-08-computer-mobile-009 — Implement Windows UI Automation adapter**
+  - Deliverable: `crates/computer-use/src/desktop/windows.rs`
+  - Depends on: `RLM-08-computer-mobile-007`
+  - Goal: Implement Windows UI Automation observe/action adapter behind desktop trait.
+- [ ] **RLM-08-computer-mobile-010 — Implement Linux accessibility adapter**
+  - Deliverable: `crates/computer-use/src/desktop/linux.rs`
+  - Depends on: `RLM-08-computer-mobile-007`
+  - Goal: Implement AT-SPI adapter where available and explicit unsupported health otherwise.
+- [ ] **RLM-08-computer-mobile-011 — Implement Android emulator manager**
+  - Deliverable: `crates/mobile-sim/src/android/manager.rs`
+  - Depends on: `RLM-07-sandbox-security-003`, `RLM-03-policy-workspace-009`
+  - Goal: Discover/start assigned Android Emulator instances, allocate ports, isolate AVD working data and track ownership.
+- [ ] **RLM-08-computer-mobile-012 — Implement Android observe/action adapter**
+  - Deliverable: `crates/mobile-sim/src/android/action.rs`
+  - Depends on: `RLM-08-computer-mobile-011`
+  - Goal: Use adb/accessibility/UI hierarchy plus screenshots for observe and input/tap/text/key/rotation/deeplink actions.
+- [ ] **RLM-08-computer-mobile-013 — Implement Android snapshot/reset lifecycle**
+  - Deliverable: `crates/mobile-sim/src/android/snapshot.rs`
+  - Depends on: `RLM-08-computer-mobile-011`
+  - Goal: Create/load named emulator snapshots and isolated reset/cleanup with policy gate for destructive data clear.
+- [ ] **RLM-08-computer-mobile-014 — Implement iOS simctl backend**
+  - Deliverable: `crates/mobile-sim/src/ios/simctl.rs`
+  - Depends on: `RLM-07-sandbox-security-001`, `RLM-03-policy-workspace-009`
+  - Goal: Discover/boot/control iOS Simulator via `xcrun simctl` on macOS with typed commands and no shell concatenation.
+- [ ] **RLM-08-computer-mobile-015 — Implement remote macOS simulator delegation**
+  - Deliverable: `crates/mobile-sim/src/ios/remote.rs`
+  - Depends on: `RLM-08-computer-mobile-014`, `RLM-07-sandbox-security-011`
+  - Goal: Route iOS simulator work to an authorized remote macOS worker when local capability is unavailable.
+- [ ] **RLM-08-computer-mobile-016 — Implement mobile trace/evidence bundle**
+  - Deliverable: `crates/mobile-sim/src/trace.rs`
+  - Depends on: `RLM-08-computer-mobile-012`, `RLM-08-computer-mobile-013`, `RLM-08-computer-mobile-014`, `RLM-01-foundation-012`
+  - Goal: Record device/app observations/actions/logcat or sim logs/screenshots into bounded trace bundle for eval/verification.
+- [ ] **RLM-08-computer-mobile-017 — Add computer/mobile deterministic fixtures**
+  - Deliverable: `crates/computer-use/tests/fixtures.rs, crates/mobile-sim/tests/fixtures.rs`
+  - Depends on: `RLM-08-computer-mobile-004`, `RLM-08-computer-mobile-005`, `RLM-08-computer-mobile-007`, `RLM-08-computer-mobile-016`
+  - Goal: Create local browser fixture site and simulator mock backends to test observe→act→verify, stale targets and policy gates in CI.
+
+## 09-protocols-extensions — MCP, ACP, SDK, plugins, skills & hooks
+
+- [ ] **RLM-09-protocols-extensions-001 — Implement MCP transport/session abstraction**
+  - Deliverable: `crates/mcp/src/transport.rs`
+  - Depends on: `RLM-07-sandbox-security-001`, `RLM-07-sandbox-security-012`, `RLM-01-foundation-010`
+  - Goal: Implement MCP stdio and streamable-HTTP client transport boundary with protocol-version negotiation.
+- [ ] **RLM-09-protocols-extensions-002 — Implement deterministic MCP catalog cache**
+  - Deliverable: `crates/mcp/src/catalog.rs`
+  - Depends on: `RLM-09-protocols-extensions-001`
+  - Goal: List/cache server tools/resources/prompts deterministically outside model-visible tool catalog.
+- [ ] **RLM-09-protocols-extensions-003 — Implement MCP trust/auth records**
+  - Deliverable: `crates/mcp/src/trust.rs`
+  - Depends on: `RLM-09-protocols-extensions-001`, `RLM-01-foundation-009`, `RLM-01-foundation-011`
+  - Goal: Persist MCP server trust, credential handle and allowed capability/tool scopes.
+- [ ] **RLM-09-protocols-extensions-004 — Implement external.call MCP gateway**
+  - Deliverable: `crates/mcp/src/gateway.rs`
+  - Depends on: `RLM-09-protocols-extensions-002`, `RLM-09-protocols-extensions-003`, `RLM-05-agent-llm-goal-012`
+  - Goal: Map canonical `external.call` tool to trusted MCP server/tool after policy/lease validation and bound result.
+- [ ] **RLM-09-protocols-extensions-005 — Implement RapidLM MCP server mode**
+  - Deliverable: `crates/mcp/src/server.rs`
+  - Depends on: `RLM-09-protocols-extensions-001`, `RLM-03-policy-workspace-006`
+  - Goal: Expose explicitly published RapidLM resources/tools as MCP server without leaking host-only capabilities.
+- [ ] **RLM-09-protocols-extensions-006 — Implement ACP stdio transport**
+  - Deliverable: `crates/acp/src/stdio.rs`
+  - Depends on: `RLM-02-kernel-ledger-015`
+  - Goal: Implement JSON-RPC framing/session transport over stdio with strict stdout ownership.
+- [ ] **RLM-09-protocols-extensions-007 — Implement ACP v1 adapter**
+  - Deliverable: `crates/acp/src/v1.rs`
+  - Depends on: `RLM-09-protocols-extensions-006`
+  - Goal: Map ACP v1 session/prompt/tool-update semantics onto KernelClient/events.
+- [ ] **RLM-09-protocols-extensions-008 — Implement ACP v2 capability negotiation**
+  - Deliverable: `crates/acp/src/v2.rs`
+  - Depends on: `RLM-09-protocols-extensions-007`
+  - Goal: Add additive ACP v2 feature negotiation while retaining v1 compatibility path.
+- [ ] **RLM-09-protocols-extensions-009 — Generate TypeScript wire types**
+  - Deliverable: `sdk/typescript/src/generated/index.ts`
+  - Depends on: `RLM-01-foundation-002`, `RLM-01-foundation-015`, `RLM-02-kernel-ledger-004`
+  - Goal: Generate checked-in TypeScript types/codecs from canonical JSON schemas/fixtures.
+- [ ] **RLM-09-protocols-extensions-010 — Implement TypeScript local transport**
+  - Deliverable: `sdk/typescript/src/transport/local.ts`
+  - Depends on: `RLM-09-protocols-extensions-009`, `RLM-02-kernel-ledger-015`
+  - Goal: Connect SDK to local daemon IPC/websocket bridge with request IDs, cancellation and event cursor reconnect.
+- [ ] **RLM-09-protocols-extensions-011 — Implement TypeScript session client**
+  - Deliverable: `sdk/typescript/src/client.ts`
+  - Depends on: `RLM-09-protocols-extensions-010`
+  - Goal: Expose sessions/create/run/subscribe/interrupt/fork/approval API with AsyncIterable events.
+- [ ] **RLM-09-protocols-extensions-012 — Define WASM plugin manifest/capabilities**
+  - Deliverable: `crates/plugin-host/src/manifest.rs`
+  - Depends on: `RLM-03-policy-workspace-001`, `RLM-01-foundation-005`
+  - Goal: Implement plugin manifest schema with identity/version/hash/entrypoint/requested capabilities and compatibility range.
+- [ ] **RLM-09-protocols-extensions-013 — Implement WASM plugin runtime**
+  - Deliverable: `crates/plugin-host/src/wasm.rs`
+  - Depends on: `RLM-09-protocols-extensions-012`, `RLM-03-policy-workspace-009`
+  - Goal: Run plugin component/module with fuel/time/memory limits and host functions only for granted brokered capabilities.
+- [ ] **RLM-09-protocols-extensions-014 — Implement skill discovery/activation**
+  - Deliverable: `crates/plugin-host/src/skills.rs`
+  - Depends on: `RLM-01-foundation-009`, `RLM-05-agent-llm-goal-013`
+  - Goal: Discover `SKILL.md` bundles with metadata/triggers/resources and load instructions without granting capabilities.
+- [ ] **RLM-09-protocols-extensions-015 — Implement out-of-process hook runner**
+  - Deliverable: `crates/plugin-host/src/hooks.rs`
+  - Depends on: `RLM-07-sandbox-security-001`, `RLM-07-sandbox-security-007`, `RLM-09-protocols-extensions-012`
+  - Goal: Run lifecycle hooks as supervised commands with event payload input and explicit capability/sandbox profile.
+- [ ] **RLM-09-protocols-extensions-016 — Implement extension trust ledger**
+  - Deliverable: `crates/plugin-host/src/trust.rs`
+  - Depends on: `RLM-09-protocols-extensions-012`, `RLM-09-protocols-extensions-014`, `RLM-02-kernel-ledger-005`
+  - Goal: Persist install source, package hash/signature, granted capabilities, project/user scope and last review.
+- [ ] **RLM-09-protocols-extensions-017 — Implement plugin install/remove transaction**
+  - Deliverable: `crates/plugin-host/src/install.rs`
+  - Depends on: `RLM-09-protocols-extensions-016`, `RLM-01-foundation-012`
+  - Goal: Stage extension package, validate manifest/hash/signature/policy, then atomically install or rollback.
+- [ ] **RLM-09-protocols-extensions-018 — Add protocol compatibility fixtures**
+  - Deliverable: `crates/acp/tests/compat.rs, crates/mcp/tests/compat.rs, sdk/typescript/test/compat.test.ts`
+  - Depends on: `RLM-09-protocols-extensions-005`, `RLM-09-protocols-extensions-008`, `RLM-09-protocols-extensions-011`
+  - Goal: Create MCP/ACP/SDK golden/interoperability fixtures for supported versions and unknown-field behavior.
+- [ ] **RLM-09-protocols-extensions-019 — Add malicious extension/MCP tests**
+  - Deliverable: `crates/plugin-host/tests/adversarial.rs, crates/mcp/tests/adversarial.rs`
+  - Depends on: `RLM-09-protocols-extensions-004`, `RLM-09-protocols-extensions-013`, `RLM-09-protocols-extensions-015`, `RLM-09-protocols-extensions-017`
+  - Goal: Test prompt-injection results, oversized schemas, denied plugin capabilities, hook secret isolation and catalog TOCTOU.
+
+## 10-daemon-remote-release — Daemon, remote workers, telemetry & release
+
+- [ ] **RLM-10-daemon-remote-release-001 — Implement local daemon IPC listener**
+  - Deliverable: `crates/kernel/src/ipc/server.rs`
+  - Depends on: `RLM-02-kernel-ledger-015`
+  - Goal: Expose KernelClient-compatible local IPC on Unix socket/named pipe with restrictive filesystem/ACL permissions.
+- [ ] **RLM-10-daemon-remote-release-002 — Implement local client authentication**
+  - Deliverable: `crates/auth/src/local_daemon.rs`
+  - Depends on: `RLM-10-daemon-remote-release-001`, `RLM-01-foundation-011`
+  - Goal: Issue/store OS-user-bound local daemon auth token and require challenge/auth before session APIs.
+- [ ] **RLM-10-daemon-remote-release-003 — Implement reconnectable daemon client**
+  - Deliverable: `crates/kernel/src/ipc/client.rs`
+  - Depends on: `RLM-10-daemon-remote-release-002`, `RLM-02-kernel-ledger-006`
+  - Goal: Reconnect after transient local IPC loss and resume event stream from last committed sequence.
+- [ ] **RLM-10-daemon-remote-release-004 — Wire daemon CLI lifecycle**
+  - Deliverable: `apps/rapid/src/daemon.rs`
+  - Depends on: `RLM-10-daemon-remote-release-003`, `RLM-02-kernel-ledger-002`
+  - Goal: Implement `rapid daemon start|status|stop` with PID/lock/socket ownership and graceful kernel quiesce.
+- [ ] **RLM-10-daemon-remote-release-005 — Define remote worker wire protocol**
+  - Deliverable: `crates/protocol/src/remote_worker.rs`
+  - Depends on: `RLM-01-foundation-005`, `RLM-01-foundation-014`, `RLM-07-sandbox-security-011`
+  - Goal: Define versioned worker registration/capabilities/work-lease/progress/result/cancel messages.
+- [ ] **RLM-10-daemon-remote-release-006 — Implement mTLS worker identity**
+  - Deliverable: `crates/auth/src/mtls.rs`
+  - Depends on: `RLM-10-daemon-remote-release-005`, `RLM-01-foundation-011`
+  - Goal: Authenticate controller↔worker with configured CA/pinned identities and bind worker ID to certificate identity.
+- [ ] **RLM-10-daemon-remote-release-007 — Implement worker capability registry**
+  - Deliverable: `crates/kernel/src/remote/registry.rs`
+  - Depends on: `RLM-10-daemon-remote-release-006`
+  - Goal: Track authenticated workers, platform/resources/sandbox/mobile capabilities and health heartbeats.
+- [ ] **RLM-10-daemon-remote-release-008 — Implement remote work lease signer/verifier**
+  - Deliverable: `crates/kernel/src/remote/lease.rs`
+  - Depends on: `RLM-10-daemon-remote-release-006`, `RLM-10-daemon-remote-release-005`
+  - Goal: Sign controller work leases and verify expiry/task/input/capability hash on worker side contract helper.
+- [ ] **RLM-10-daemon-remote-release-009 — Implement artifact transfer protocol**
+  - Deliverable: `crates/kernel/src/remote/artifacts.rs`
+  - Depends on: `RLM-10-daemon-remote-release-008`, `RLM-01-foundation-012`
+  - Goal: Transfer content-addressed inputs/results with chunk hashes/resume and verify whole artifact before exposure.
+- [ ] **RLM-10-daemon-remote-release-010 — Implement remote task scheduler**
+  - Deliverable: `crates/kernel/src/remote/scheduler.rs`
+  - Depends on: `RLM-10-daemon-remote-release-007`, `RLM-10-daemon-remote-release-008`, `RLM-10-daemon-remote-release-009`
+  - Goal: Select eligible worker by required platform/sandbox/resources/data policy and issue bounded lease/cancellation.
+- [ ] **RLM-10-daemon-remote-release-011 — Implement remote result verification/import**
+  - Deliverable: `crates/kernel/src/remote/result.rs`
+  - Depends on: `RLM-10-daemon-remote-release-010`, `RLM-03-policy-workspace-020`
+  - Goal: Verify worker identity/lease/artifact hashes and required verifier evidence before importing patch/results into local workflow.
+- [ ] **RLM-10-daemon-remote-release-012 — Implement telemetry event/span sink**
+  - Deliverable: `crates/telemetry/src/lib.rs`
+  - Depends on: `RLM-01-foundation-014`, `RLM-07-sandbox-security-013`
+  - Goal: Emit content-minimized structured traces/metrics with correlation IDs and pluggable local/OTLP sinks.
+- [ ] **RLM-10-daemon-remote-release-013 — Implement trace artifact export**
+  - Deliverable: `crates/telemetry/src/export.rs`
+  - Depends on: `RLM-10-daemon-remote-release-012`, `RLM-01-foundation-012`
+  - Goal: Create user-previewable redacted diagnostic bundle manifest and referenced local trace artifacts.
+- [ ] **RLM-10-daemon-remote-release-014 — Implement database migration compatibility tests**
+  - Deliverable: `crates/event-ledger/tests/migrations_compat.rs`
+  - Depends on: `RLM-02-kernel-ledger-003`, `RLM-02-kernel-ledger-008`
+  - Goal: Test upgrade/downgrade handling across at least two prior schema fixture versions and refuse unknown future schema.
+- [ ] **RLM-10-daemon-remote-release-015 — Implement signed update manifest verifier**
+  - Deliverable: `crates/kernel/src/update/verify.rs`
+  - Depends on: `RLM-01-foundation-005`
+  - Goal: Parse/verify release manifest signatures, platform artifact hash and anti-rollback version policy.
+- [ ] **RLM-10-daemon-remote-release-016 — Implement atomic binary updater**
+  - Deliverable: `crates/kernel/src/update/install.rs`
+  - Depends on: `RLM-10-daemon-remote-release-015`, `RLM-01-foundation-012`
+  - Goal: Download/copy verified artifact to staging, fsync, atomically replace/side-install and retain one rollback build.
+- [ ] **RLM-10-daemon-remote-release-017 — Add reproducible packaging metadata**
+  - Deliverable: `.github/workflows/release.yml, scripts/release/`
+  - Depends on: `RLM-01-foundation-016`, `RLM-10-daemon-remote-release-015`
+  - Goal: Configure platform build/package metadata, SBOM generation hooks and deterministic release manifest inputs.
+- [ ] **RLM-10-daemon-remote-release-018 — Implement provenance/SBOM release attestations**
+  - Deliverable: `scripts/release/attest.rs or equivalent release tooling`
+  - Depends on: `RLM-10-daemon-remote-release-017`
+  - Goal: Generate SBOM and build provenance referencing source revision, lockfiles, toolchain and artifact hashes.
+- [ ] **RLM-10-daemon-remote-release-019 — Implement rapid doctor command**
+  - Deliverable: `apps/rapid/src/doctor.rs`
+  - Depends on: `RLM-07-sandbox-security-020`, `RLM-10-daemon-remote-release-004`, `RLM-04-context-engine-010`, `RLM-05-agent-llm-goal-005`, `RLM-09-protocols-extensions-016`
+  - Goal: Aggregate config/storage/auth/sandbox/context/provider/daemon/plugin health into safe actionable diagnostics.
+- [ ] **RLM-10-daemon-remote-release-020 — Add install/upgrade smoke harness**
+  - Deliverable: `scripts/test-install.sh, scripts/test-install.ps1`
+  - Depends on: `RLM-10-daemon-remote-release-016`, `RLM-10-daemon-remote-release-017`, `RLM-10-daemon-remote-release-019`
+  - Goal: Test fresh install, upgrade from previous fixture, daemon/TUI/headless startup, signature verification and uninstall path in clean temp environments.
+
+## 11-evals-hardening — Eval harness & production hardening
+
+- [ ] **RLM-11-evals-hardening-001 — Define eval case manifest schema**
+  - Deliverable: `crates/harness/src/case.rs`
+  - Depends on: `RLM-01-foundation-004`, `RLM-03-policy-workspace-001`
+  - Goal: Implement versioned eval manifest for repo snapshot/task/capabilities/verifier/forbidden changes/budgets/tags.
+- [ ] **RLM-11-evals-hardening-002 — Implement deterministic fixture provider**
+  - Deliverable: `crates/harness/src/providers/scripted.rs`
+  - Depends on: `RLM-05-agent-llm-goal-001`, `RLM-11-evals-hardening-001`
+  - Goal: Create scripted model provider that replays configured text/tool calls/errors/usage for runtime contract tests.
+- [ ] **RLM-11-evals-hardening-003 — Implement event/tool record-replay**
+  - Deliverable: `crates/harness/src/replay.rs`
+  - Depends on: `RLM-11-evals-hardening-002`, `RLM-02-kernel-ledger-006`, `RLM-05-agent-llm-goal-012`
+  - Goal: Record sanitized model/tool boundary fixtures and replay them against kernel for deterministic regression tests.
+- [ ] **RLM-11-evals-hardening-004 — Implement repository eval runner**
+  - Deliverable: `crates/harness/src/runner.rs`
+  - Depends on: `RLM-11-evals-hardening-001`, `RLM-11-evals-hardening-003`, `RLM-03-policy-workspace-013`, `RLM-05-agent-llm-goal-022`
+  - Goal: Materialize immutable repo fixture, create isolated view/session, run case under budgets, invoke verifier and collect metrics/artifacts.
+- [ ] **RLM-11-evals-hardening-005 — Implement eval result metric schema**
+  - Deliverable: `crates/harness/src/metrics.rs`
+  - Depends on: `RLM-11-evals-hardening-004`, `RLM-05-agent-llm-goal-009`
+  - Goal: Aggregate success/evidence, tokens/cost, time, tool calls, approvals, unsafe actions and patch stats.
+- [ ] **RLM-11-evals-hardening-006 — Implement eval comparison report**
+  - Deliverable: `crates/harness/src/compare.rs`
+  - Depends on: `RLM-11-evals-hardening-005`
+  - Goal: Compare two run sets by matched case ID with deltas/confidence-friendly aggregates and regression thresholds.
+- [ ] **RLM-11-evals-hardening-007 — Create agent/goal golden scenarios**
+  - Deliverable: `evals/agent/*.json`
+  - Depends on: `RLM-11-evals-hardening-004`, `RLM-05-agent-llm-goal-023`
+  - Goal: Author executable cases for single-file, multi-module, blocked, budget, parallel, crash/resume and evidence-gated completion.
+- [ ] **RLM-11-evals-hardening-008 — Create context gold-query corpus**
+  - Deliverable: `evals/context/*.jsonl`
+  - Depends on: `RLM-04-context-engine-019`
+  - Goal: Author cross-language/multi-repo queries with relevant file/symbol/range judgments and rg/vector baselines.
+- [ ] **RLM-11-evals-hardening-009 — Create policy/prompt-injection corpus**
+  - Deliverable: `evals/security/injection/*.json`
+  - Depends on: `RLM-07-sandbox-security-021`, `RLM-09-protocols-extensions-019`, `RLM-08-computer-mobile-017`
+  - Goal: Author adversarial content/capability cases across repo, terminal, web, MCP and plugin sources with canary secrets/side effects.
+- [ ] **RLM-11-evals-hardening-010 — Create browser/mobile eval corpus**
+  - Deliverable: `evals/computer-mobile/*.json`
+  - Depends on: `RLM-08-computer-mobile-017`, `RLM-11-evals-hardening-004`
+  - Goal: Author deterministic fixture tasks for browser semantic targeting, stale observations, Android actions and iOS capability availability.
+- [ ] **RLM-11-evals-hardening-011 — Create router property/eval suite**
+  - Deliverable: `crates/harness/tests/router_prompt.rs`
+  - Depends on: `RLM-05-agent-llm-goal-008`, `RLM-05-agent-llm-goal-013`, `RLM-11-evals-hardening-002`
+  - Goal: Test hard filters, scoring/fallback and prompt bundle stability using synthetic catalogs/providers.
+- [ ] **RLM-11-evals-hardening-012 — Add policy/parser fuzz targets**
+  - Deliverable: `fuzz/ or crates/*/fuzz targets`
+  - Depends on: `RLM-03-policy-workspace-006`, `RLM-05-agent-llm-goal-011`, `RLM-02-kernel-ledger-004`
+  - Goal: Fuzz policy TOML/command normalization/path normalization/tool JSON and event decoding for panics/bypass inconsistencies.
+- [ ] **RLM-11-evals-hardening-013 — Add event-ledger crash/property tests**
+  - Deliverable: `crates/event-ledger/tests/properties.rs`
+  - Depends on: `RLM-02-kernel-ledger-008`, `RLM-02-kernel-ledger-017`
+  - Goal: Property-test event ordering/projection replay and failure-inject SQLite append/checkpoint boundaries.
+- [ ] **RLM-11-evals-hardening-014 — Add workspace merge/property tests**
+  - Deliverable: `crates/workspace/tests/properties.rs`
+  - Depends on: `RLM-03-policy-workspace-019`
+  - Goal: Property-test semantic patch preimages, isolated sibling merges, rollback and external mutation conflicts.
+- [ ] **RLM-11-evals-hardening-015 — Implement performance benchmark suite**
+  - Deliverable: `benches/README.md and crate benchmark targets`
+  - Depends on: `RLM-06-cli-tui-017`, `RLM-04-context-engine-019`, `RLM-07-sandbox-security-009`, `RLM-05-agent-llm-goal-016`, `RLM-02-kernel-ledger-005`
+  - Goal: Benchmark startup, event append, indexing, retrieval, TUI frame, sandbox startup and agent scheduling against dossier SLOs.
+- [ ] **RLM-11-evals-hardening-016 — Implement end-to-end golden workflow**
+  - Deliverable: `tests/e2e/golden_goal.rs`
+  - Depends on: `RLM-11-evals-hardening-003`, `RLM-11-evals-hardening-007`, `RLM-06-cli-tui-018`, `RLM-07-sandbox-security-018`
+  - Goal: Run a mock-provider session from CLI through context→model→tool→policy→workspace→test evidence→goal complete and replay it.
+- [ ] **RLM-11-evals-hardening-017 — Implement release gate aggregator**
+  - Deliverable: `scripts/release/gate.rs`
+  - Depends on: `RLM-11-evals-hardening-006`, `RLM-11-evals-hardening-009`, `RLM-11-evals-hardening-010`, `RLM-11-evals-hardening-015`, `RLM-10-daemon-remote-release-020`, `RLM-10-daemon-remote-release-018`
+  - Goal: Aggregate CI/contracts/security/eval/performance/migration/install/signature results into machine-readable release decision.
+- [ ] **RLM-11-evals-hardening-018 — Generate requirements traceability check**
+  - Deliverable: `scripts/check-traceability.py, requirements-traceability.md`
+  - Depends on: `RLM-11-evals-hardening-017`
+  - Goal: Validate each PRD functional requirement maps to architecture, implementation task(s) and test/eval evidence.
+
+## 12-managed-agent-runtime — V2 Managed Agent Runtime
+
+- [ ] **RLM-12-managed-agent-runtime-001 — Define V2 managed-agent protocol types**
+  - Deliverable: `crates/protocol/src/agent_v2.rs`
+  - Depends on: `RLM-05-agent-llm-goal-015`
+  - Goal: Implement TaskEnvelope, AgentMessage, BackgroundAgentSpec, AgentResultV2 and related IDs/enums as stable serialized protocol types.
+- [ ] **RLM-12-managed-agent-runtime-002 — Define typed AgentMailbox topics and cursors**
+  - Deliverable: `crates/protocol/src/agent_mail.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-001`
+  - Goal: Implement bounded typed mailbox topics, message IDs, cursor pagination and recipient addressing.
+- [ ] **RLM-12-managed-agent-runtime-003 — Add persistent AgentPool projection schema**
+  - Deliverable: `crates/event-ledger/src/projections/agent_pool.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-001`, `RLM-02-kernel-ledger-008`
+  - Goal: Persist/rebuild background-agent lifecycle, managed child topology and mailbox cursor projections from V2 events.
+- [ ] **RLM-12-managed-agent-runtime-004 — Implement AgentPool service lifecycle**
+  - Deliverable: `crates/agent-runtime/src/agent/pool.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-003`, `RLM-05-agent-llm-goal-016`
+  - Goal: Create/ensure/park/resume persistent session-long background agents with bounded state and restart policy.
+- [ ] **RLM-12-managed-agent-runtime-005 — Implement background-agent restart and idle parking policy**
+  - Deliverable: `crates/agent-runtime/src/agent/background_policy.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-004`
+  - Goal: Restart crashed background agents from durable summaries within budget and park agents whose measured utility is below threshold.
+- [ ] **RLM-12-managed-agent-runtime-006 — Implement TaskEnvelope builder**
+  - Deliverable: `crates/agent-runtime/src/agent/task_envelope.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-001`, `RLM-05-agent-llm-goal-021`, `RLM-04-context-engine-015`
+  - Goal: Build a child TaskEnvelope from Goal node, acceptance criteria, capability ceiling, selected context/knowledge and result schema.
+- [ ] **RLM-12-managed-agent-runtime-007 — Implement clean-context child compiler**
+  - Deliverable: `crates/agent-runtime/src/agent/child_context.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-006`, `RLM-05-agent-llm-goal-013`
+  - Goal: Compile child prompt/context from TaskEnvelope without cloning unrelated parent conversation history.
+- [ ] **RLM-12-managed-agent-runtime-008 — Implement managed worker spawn service**
+  - Deliverable: `crates/agent-runtime/src/agent/managed_spawn.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-007`, `RLM-05-agent-llm-goal-017`
+  - Goal: Spawn bounded managed workers using clean context, policy ceiling, model route and scheduler registration.
+- [ ] **RLM-12-managed-agent-runtime-009 — Implement isolated writer WorkspaceAllocator**
+  - Deliverable: `crates/agent-runtime/src/agent/workspace_allocator.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-008`, `RLM-03-policy-workspace-013`
+  - Goal: Allocate read-only shared views for background agents and unique isolated writable views for managed writer agents.
+- [ ] **RLM-12-managed-agent-runtime-010 — Link child sessions and events to parent task graph**
+  - Deliverable: `crates/agent-runtime/src/agent/lineage.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-003`, `RLM-12-managed-agent-runtime-008`
+  - Goal: Record parent agent/task/goal lineage for child event streams and expose replay-safe ancestry queries.
+- [ ] **RLM-12-managed-agent-runtime-011 — Implement durable AgentMailbox store**
+  - Deliverable: `crates/agent-runtime/src/agent/mailbox.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-002`, `RLM-02-kernel-ledger-005`
+  - Goal: Persist typed agent messages with bounded inline content, artifact refs and replay-safe cursors.
+- [ ] **RLM-12-managed-agent-runtime-012 — Implement mailbox quotas and backpressure**
+  - Deliverable: `crates/agent-runtime/src/agent/mailbox_limits.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-011`
+  - Goal: Enforce per-agent/topic queue limits, rate limits and artifact-spooling guidance to prevent mailbox floods.
+- [ ] **RLM-12-managed-agent-runtime-013 — Implement coordinator task decomposition adapter**
+  - Deliverable: `crates/agent-runtime/src/agent/coordinator.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-006`, `RLM-05-agent-llm-goal-022`
+  - Goal: Convert runnable Goal DAG nodes into TaskEnvelopes and accept only verified AgentResults.
+- [ ] **RLM-12-managed-agent-runtime-014 — Extend scheduler with dependency DAG readiness**
+  - Deliverable: `crates/agent-runtime/src/agent/scheduler_v2.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-013`, `RLM-05-agent-llm-goal-016`
+  - Goal: Schedule managed workers by explicit task dependencies, priority and readiness while preserving V1 concurrency constraints.
+- [ ] **RLM-12-managed-agent-runtime-015 — Implement delegation value/spawn policy**
+  - Deliverable: `crates/agent-runtime/src/agent/spawn_policy.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-014`, `RLM-04-context-engine-019`
+  - Goal: Decide whether to delegate based on expected parallel benefit, specialist quality gain, duplicated context, merge conflict and spawn cost.
+- [ ] **RLM-12-managed-agent-runtime-016 — Implement per-agent budget controller**
+  - Deliverable: `crates/agent-runtime/src/agent/budget_v2.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-014`, `RLM-05-agent-llm-goal-009`
+  - Goal: Track/enforce token, cost, active time and tool-call budgets independently for each managed/background agent.
+- [ ] **RLM-12-managed-agent-runtime-017 — Implement scheduler fairness and provider concurrency adaptation**
+  - Deliverable: `crates/agent-runtime/src/agent/fairness.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-016`, `RLM-05-agent-llm-goal-008`
+  - Goal: Prevent one goal/provider from monopolizing workers and adapt concurrency after provider throttling.
+- [ ] **RLM-12-managed-agent-runtime-018 — Implement managed agent pause/sleep/resume/cancel**
+  - Deliverable: `crates/agent-runtime/src/agent/control.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-004`, `RLM-12-managed-agent-runtime-008`
+  - Goal: Add explicit lifecycle controls for managed/background agents with durable state transitions and safe process/model cancellation.
+- [ ] **RLM-12-managed-agent-runtime-019 — Implement observable child trajectory summary**
+  - Deliverable: `crates/agent-runtime/src/agent/trajectory_summary.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-010`, `RLM-01-foundation-012`
+  - Goal: Summarize child events into decisions/actions/evidence/usage timeline for parent inspection without hidden chain-of-thought.
+- [ ] **RLM-12-managed-agent-runtime-020 — Implement AgentResult verifier and integration gate**
+  - Deliverable: `crates/agent-runtime/src/agent/result_v2.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-019`, `RLM-03-policy-workspace-020`, `RLM-05-agent-llm-goal-021`
+  - Goal: Validate child result schema, evidence freshness, ChangeSet ownership and capability/provenance invariants before coordinator integration.
+- [ ] **RLM-12-managed-agent-runtime-021 — Extend Agents Panel hierarchy projection**
+  - Deliverable: `crates/tui/src/panels/agents_v2.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-003`, `RLM-06-cli-tui-001`
+  - Goal: Render coordinator, persistent background agents and managed workers with state/model/budget/view/verification/control-owner fields.
+- [ ] **RLM-12-managed-agent-runtime-022 — Implement Agents Panel detail/trajectory view**
+  - Deliverable: `crates/tui/src/panels/agent_detail.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-019`, `RLM-12-managed-agent-runtime-021`
+  - Goal: Display TaskEnvelope, context/knowledge summary, capability ceiling, observable trajectory, messages, evidence and ChangeSet for selected agent.
+- [ ] **RLM-12-managed-agent-runtime-023 — Implement default persistent Explorer role**
+  - Deliverable: `crates/agent-runtime/src/agent/roles/explorer_bg.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-004`, `RLM-12-managed-agent-runtime-011`, `RLM-04-context-engine-013`
+  - Goal: Provide a read-only background Explorer that maintains fresh repo findings/read-set and sends only materially useful messages.
+- [ ] **RLM-12-managed-agent-runtime-024 — Add deterministic managed-agent end-to-end suite**
+  - Deliverable: `tests/e2e/managed_agents_v2.rs`
+  - Depends on: `RLM-12-managed-agent-runtime-020`, `RLM-12-managed-agent-runtime-023`, `RLM-11-evals-hardening-004`
+  - Goal: Verify clean-context delegation, persistent Explorer benefit, isolated writers, mailbox, budgets, child crash/recovery and verified integration.
+
+## 13-handoff-knowledge-playbooks — V2 Handoff, Human Control, Knowledge & Playbooks
+
+- [ ] **RLM-13-handoff-knowledge-playbooks-001 — Define handoff/control/knowledge protocol identifiers**
+  - Deliverable: `crates/protocol/src/v2_ids.rs`
+  - Depends on: `RLM-01-foundation-003`
+  - Goal: Add HandoffId, RestoreId, RuntimeId, ControlLeaseId, KnowledgeId, PlaybookId and TrajectoryId UUIDv7 newtypes.
+- [ ] **RLM-13-handoff-knowledge-playbooks-002 — Implement SessionExecutionLease store**
+  - Deliverable: `crates/kernel/src/handoff/execution_lease.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-001`, `RLM-02-kernel-ledger-005`
+  - Goal: Implement generation-based single-writer session execution ownership with transactional compare-and-swap transfer.
+- [ ] **RLM-13-handoff-knowledge-playbooks-003 — Implement handoff source quiescence**
+  - Deliverable: `crates/kernel/src/handoff/quiesce.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-002`, `RLM-07-sandbox-security-005`
+  - Goal: Stop new model/tool/write dispatch and reach a safe handoff checkpoint while preserving resumability.
+- [ ] **RLM-13-handoff-knowledge-playbooks-004 — Implement HandoffBundle manifest builder**
+  - Deliverable: `crates/kernel/src/handoff/bundle.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-003`, `RLM-12-managed-agent-runtime-003`, `RLM-03-policy-workspace-020`
+  - Goal: Build portable content-addressed handoff manifest from ledger, goals, task graph, agents, repos, ChangeSets, context state, Knowledge and artifacts.
+- [ ] **RLM-13-handoff-knowledge-playbooks-005 — Implement HandoffBundle signature and encryption envelope**
+  - Deliverable: `crates/kernel/src/handoff/crypto.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-004`, `RLM-01-foundation-010`
+  - Goal: Sign bundle manifest, validate expiry/generation and optionally encrypt sensitive artifact envelope for transfer.
+- [ ] **RLM-13-handoff-knowledge-playbooks-006 — Implement handoff artifact transfer transport**
+  - Deliverable: `crates/kernel/src/handoff/transfer.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-005`, `RLM-10-daemon-remote-release-007`
+  - Goal: Transfer missing content-addressed bundle artifacts with resumable checksums and bounded concurrency.
+- [ ] **RLM-13-handoff-knowledge-playbooks-007 — Implement target handoff compatibility verifier**
+  - Deliverable: `crates/kernel/src/handoff/target_verify.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-005`, `RLM-10-daemon-remote-release-008`
+  - Goal: Verify schema/runtime version, worker attestation/platform/sandbox/data-region constraints and bundle authenticity before restore.
+- [ ] **RLM-13-handoff-knowledge-playbooks-008 — Implement repository and ChangeSet restore**
+  - Deliverable: `crates/kernel/src/handoff/restore_workspace.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-006`, `RLM-13-handoff-knowledge-playbooks-007`, `RLM-03-policy-workspace-019`
+  - Goal: Restore exact repo revisions/snapshots and apply uncommitted ChangeSets using preimage validation.
+- [ ] **RLM-13-handoff-knowledge-playbooks-009 — Implement context/artifact restore**
+  - Deliverable: `crates/kernel/src/handoff/restore_context.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-006`, `RLM-04-context-engine-008`
+  - Goal: Restore read-set/content hashes, pinned context and artifact references without assuming local absolute paths.
+- [ ] **RLM-13-handoff-knowledge-playbooks-010 — Implement goal/agent restore as paused**
+  - Deliverable: `crates/kernel/src/handoff/restore_runtime.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-008`, `RLM-13-handoff-knowledge-playbooks-009`, `RLM-12-managed-agent-runtime-003`
+  - Goal: Reconstruct goal/task/managed-agent projections on target in paused state until execution lease and resume policy allow work.
+- [ ] **RLM-13-handoff-knowledge-playbooks-011 — Implement execution lease transfer commit**
+  - Deliverable: `crates/kernel/src/handoff/commit.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-002`, `RLM-13-handoff-knowledge-playbooks-010`
+  - Goal: Atomically commit target readiness and SessionExecutionLease generation transfer, then mark source non-owner.
+- [ ] **RLM-13-handoff-knowledge-playbooks-012 — Implement handoff abort and recovery state machine**
+  - Deliverable: `crates/kernel/src/handoff/recovery.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-011`, `RLM-02-kernel-ledger-013`
+  - Goal: Recover/abort handoffs across crashes and network partitions without split-brain ownership.
+- [ ] **RLM-13-handoff-knowledge-playbooks-013 — Implement remote-to-local return handoff**
+  - Deliverable: `crates/kernel/src/handoff/return_local.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-012`
+  - Goal: Use the same handoff protocol to return a remote session to local/daemon execution with compatibility and policy checks.
+- [ ] **RLM-13-handoff-knowledge-playbooks-014 — Add /handoff CLI and headless commands**
+  - Deliverable: `apps/rapid/src/commands/handoff.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-011`, `RLM-06-cli-tui-018`
+  - Goal: Expose prepare/status/abort/attach/return handoff operations with machine-readable headless events.
+- [ ] **RLM-13-handoff-knowledge-playbooks-015 — Implement TUI handoff progress view**
+  - Deliverable: `crates/tui/src/panels/handoff.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-014`, `RLM-06-cli-tui-001`
+  - Goal: Render source parking, transfer bytes, target restore/validation, execution generation and recovery actions.
+- [ ] **RLM-13-handoff-knowledge-playbooks-016 — Define ControlLease protocol types**
+  - Deliverable: `crates/protocol/src/control_lease.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-001`
+  - Goal: Implement control domains, actor, generation and lease events separate from CapabilityLease.
+- [ ] **RLM-13-handoff-knowledge-playbooks-017 — Implement ControlLease manager**
+  - Deliverable: `crates/kernel/src/control_lease.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-016`, `RLM-02-kernel-ledger-005`
+  - Goal: Provide generation-based exclusive acquisition/transfer/release of mutable control domains.
+- [ ] **RLM-13-handoff-knowledge-playbooks-018 — Implement human workspace-write takeover**
+  - Deliverable: `crates/workspace/src/human_takeover.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-017`, `RLM-03-policy-workspace-017`
+  - Goal: Pause conflicting agent writers, checkpoint diff, grant human workspace control and journal external edits with attribution.
+- [ ] **RLM-13-handoff-knowledge-playbooks-019 — Implement human terminal-input takeover**
+  - Deliverable: `crates/process-supervisor/src/human_input.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-017`, `RLM-07-sandbox-security-004`
+  - Goal: Transfer stdin/control of interactive PTY/job to human while preserving output/event capture.
+- [ ] **RLM-13-handoff-knowledge-playbooks-020 — Implement human Computer Use takeover bridge**
+  - Deliverable: `crates/computer-use/src/human_takeover.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-017`, `RLM-08-computer-mobile-007`
+  - Goal: Transfer pointer/keyboard control to human for browser/desktop/mobile surfaces and require fresh Observation on return.
+- [ ] **RLM-13-handoff-knowledge-playbooks-021 — Implement takeover resume mutation reconciliation**
+  - Deliverable: `crates/kernel/src/control_reconcile.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-018`, `RLM-13-handoff-knowledge-playbooks-019`, `RLM-13-handoff-knowledge-playbooks-020`
+  - Goal: Compute workspace/process/UI deltas after human control and build bounded HumanTakeoverSummary before agent resume.
+- [ ] **RLM-13-handoff-knowledge-playbooks-022 — Implement KnowledgeItem persistence schema**
+  - Deliverable: `crates/context-engine/src/knowledge/store.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-001`, `RLM-04-context-engine-004`
+  - Goal: Persist versioned Knowledge items, triggers, scope, owner, evidence, status, freshness and supersession.
+- [ ] **RLM-13-handoff-knowledge-playbooks-023 — Implement Knowledge trigger matcher**
+  - Deliverable: `crates/context-engine/src/knowledge/matcher.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-022`, `RLM-04-context-engine-011`
+  - Goal: Rank Knowledge candidates using trigger/scope/path/semantic/freshness features after hard filters.
+- [ ] **RLM-13-handoff-knowledge-playbooks-024 — Integrate Knowledge into Context Compiler**
+  - Deliverable: `crates/context-engine/src/compile/knowledge.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-023`, `RLM-04-context-engine-015`
+  - Goal: Inject approved Knowledge under an independent token budget with provenance/freshness/reason metadata.
+- [ ] **RLM-13-handoff-knowledge-playbooks-025 — Implement Knowledge proposal and governance flow**
+  - Deliverable: `crates/context-engine/src/knowledge/governance.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-022`
+  - Goal: Create draft Knowledge candidates from explicit correction/Insights and require configured approval before shared activation.
+- [ ] **RLM-13-handoff-knowledge-playbooks-026 — Add Knowledge CLI/TUI inspector**
+  - Deliverable: `apps/rapid/src/commands/knowledge.rs, crates/tui/src/panels/knowledge.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-024`, `RLM-13-handoff-knowledge-playbooks-025`
+  - Goal: Expose search/inspect/propose/approve/deprecate and show why Knowledge entered current context.
+- [ ] **RLM-13-handoff-knowledge-playbooks-027 — Define and validate Playbook schema**
+  - Deliverable: `crates/automation/src/playbook/schema.rs`
+  - Depends on: `RLM-01-foundation-007`
+  - Goal: Implement immutable versioned Playbook DAG schema with inputs, steps, dependencies, roles, evidence gates and capability intents.
+- [ ] **RLM-13-handoff-knowledge-playbooks-028 — Implement Playbook DAG runner**
+  - Deliverable: `crates/automation/src/playbook/runner.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-027`, `RLM-12-managed-agent-runtime-013`
+  - Goal: Materialize a Playbook version into Goal/Task DAG runtime nodes and execute through existing coordinator/tool/policy contracts.
+- [ ] **RLM-13-handoff-knowledge-playbooks-029 — Implement Automation trigger cursor and dedup state**
+  - Deliverable: `crates/automation/src/state.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-028`, `RLM-07-sandbox-security-006`
+  - Goal: Persist recurring automation cursor, event idempotency keys and bounded cross-run state without reusing unbounded chat history.
+- [ ] **RLM-13-handoff-knowledge-playbooks-030 — Add V2 handoff/knowledge/playbook end-to-end suite**
+  - Deliverable: `tests/e2e/handoff_knowledge_playbook_v2.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-13`, `RLM-13-handoff-knowledge-playbooks-21`, `RLM-13-handoff-knowledge-playbooks-29`, `RLM-11-evals-hardening-004`
+  - Goal: Exercise handoff fault phases, human takeover reconciliation, trigger-scoped Knowledge and scheduled Playbook safety.
+
+## 14-trajectory-insights — V2 Trajectory Learning & Session Insights
+
+- [ ] **RLM-14-trajectory-insights-001 — Define observable trajectory protocol schema**
+  - Deliverable: `crates/protocol/src/trajectory.rs`
+  - Depends on: `RLM-13-handoff-knowledge-playbooks-001`, `RLM-11-evals-hardening-005`
+  - Goal: Implement TrainingTrajectoryRef, EnvironmentManifestRef, ContextSelectionRecord, RewardVector and privacy labels without chain-of-thought fields.
+- [ ] **RLM-14-trajectory-insights-002 — Implement trajectory collector from Event Ledger**
+  - Deliverable: `crates/harness/src/trajectory/collect.rs`
+  - Depends on: `RLM-14-trajectory-insights-001`, `RLM-11-evals-hardening-003`
+  - Goal: Collect observable session/eval events and artifact refs into a canonical trajectory record with exact sequence bounds.
+- [ ] **RLM-14-trajectory-insights-003 — Implement trajectory environment/context serializer**
+  - Deliverable: `crates/harness/src/trajectory/environment.rs`
+  - Depends on: `RLM-14-trajectory-insights-002`, `RLM-04-context-engine-019`
+  - Goal: Serialize reproducible environment manifest, prompt bundle versions and selected/rejected context candidates under data policy.
+- [ ] **RLM-14-trajectory-insights-004 — Implement trajectory redaction pipeline**
+  - Deliverable: `crates/harness/src/trajectory/redact.rs`
+  - Depends on: `RLM-14-trajectory-insights-002`, `RLM-07-sandbox-security-013`
+  - Goal: Redact secrets, sensitive URLs/identifiers and disallowed raw content before export while preserving hashes/structure for replay where possible.
+- [ ] **RLM-14-trajectory-insights-005 — Implement trajectory data-policy export gate**
+  - Deliverable: `crates/harness/src/trajectory/policy.rs`
+  - Depends on: `RLM-14-trajectory-insights-004`, `RLM-01-foundation-009`
+  - Goal: Enforce local-only/replay/eval/training-candidate purposes and explicit consent/policy before trajectory leaves local store.
+- [ ] **RLM-14-trajectory-insights-006 — Implement multi-objective RewardVector calculators**
+  - Deliverable: `crates/harness/src/trajectory/reward.rs`
+  - Depends on: `RLM-14-trajectory-insights-001`, `RLM-11-evals-hardening-005`
+  - Goal: Calculate normalized correctness, verification, security, patch quality, context/token/tool/latency/autonomy/cost metrics.
+- [ ] **RLM-14-trajectory-insights-007 — Implement deterministic outcome graders**
+  - Deliverable: `crates/harness/src/graders/deterministic.rs`
+  - Depends on: `RLM-11-evals-hardening-004`, `RLM-14-trajectory-insights-006`
+  - Goal: Grade tests/build/lint/security/diff/evidence/computer assertions before any optional LLM judge.
+- [ ] **RLM-14-trajectory-insights-008 — Implement candidate trajectory ranker**
+  - Deliverable: `crates/harness/src/trajectory/rank.rs`
+  - Depends on: `RLM-14-trajectory-insights-006`, `RLM-14-trajectory-insights-007`
+  - Goal: Rank candidate runs using hard correctness/security gates then Pareto/weighted efficiency objectives.
+- [ ] **RLM-14-trajectory-insights-009 — Implement rejection-sampled dataset exporter**
+  - Deliverable: `crates/harness/src/trajectory/export.rs`
+  - Depends on: `RLM-14-trajectory-insights-005`, `RLM-14-trajectory-insights-008`
+  - Goal: Select high-quality eligible trajectories and emit immutable dataset manifest with lineage, split and privacy metadata.
+- [ ] **RLM-14-trajectory-insights-010 — Implement experiment registry**
+  - Deliverable: `crates/harness/src/experiment/registry.rs`
+  - Depends on: `RLM-14-trajectory-insights-008`
+  - Goal: Persist baseline/candidate config versions, suite, seeds, repetitions, metrics and promotion decision.
+- [ ] **RLM-14-trajectory-insights-011 — Implement paired baseline statistics**
+  - Deliverable: `crates/harness/src/experiment/stats.rs`
+  - Depends on: `RLM-14-trajectory-insights-010`, `RLM-11-evals-hardening-006`
+  - Goal: Compare matched case/seed runs with confidence intervals and regression thresholds for stochastic model-live evaluation.
+- [ ] **RLM-14-trajectory-insights-012 — Define synthetic task environment generator interface**
+  - Deliverable: `crates/harness/src/generator/mod.rs`
+  - Depends on: `RLM-14-trajectory-insights-010`
+  - Goal: Provide a pluggable interface to propose coding fixtures/tasks/criteria while keeping generation isolated from held-out evaluation.
+- [ ] **RLM-14-trajectory-insights-013 — Implement synthetic fixture builder with hidden verifier**
+  - Deliverable: `crates/harness/src/generator/builder.rs`
+  - Depends on: `RLM-14-trajectory-insights-012`, `RLM-01-foundation-012`
+  - Goal: Materialize generated repo/service fixture and independent hidden verifier/tests in content-addressed form.
+- [ ] **RLM-14-trajectory-insights-014 — Implement generated-task solvability/adversarial validator**
+  - Deliverable: `crates/harness/src/generator/validate.rs`
+  - Depends on: `RLM-14-trajectory-insights-013`, `RLM-14-trajectory-insights-007`
+  - Goal: Reject trivial, impossible, ambiguous, leaked-answer or nondeterministic generated scenarios before dataset use.
+- [ ] **RLM-14-trajectory-insights-015 — Implement long-horizon endurance runner**
+  - Deliverable: `crates/harness/src/endurance/runner.rs`
+  - Depends on: `RLM-11-evals-hardening-004`, `RLM-13-handoff-knowledge-playbooks-12`, `RLM-12-managed-agent-runtime-24`
+  - Goal: Run 1h/4h/12h/24h scenarios with minimum tool-call counts, durable checkpoints and bounded artifact retention.
+- [ ] **RLM-14-trajectory-insights-016 — Implement endurance fault scheduler**
+  - Deliverable: `crates/harness/src/endurance/faults.rs`
+  - Depends on: `RLM-14-trajectory-insights-015`
+  - Goal: Inject daemon restart, provider throttling, compaction, background-agent crash, sandbox restart, handoff and flaky dependency faults at deterministic boundaries.
+- [ ] **RLM-14-trajectory-insights-017 — Implement context/compaction drift metrics**
+  - Deliverable: `crates/harness/src/endurance/drift.rs`
+  - Depends on: `RLM-14-trajectory-insights-015`, `RLM-04-context-engine-019`, `RLM-05-agent-llm-goal-024`
+  - Goal: Measure repeated reads, lost constraints, rediscovery after compaction, context inflation and goal/evidence drift over long runs.
+- [ ] **RLM-14-trajectory-insights-018 — Implement deterministic Session Insights analyzers**
+  - Deliverable: `crates/harness/src/insights/analyzers.rs`
+  - Depends on: `RLM-14-trajectory-insights-002`, `RLM-14-trajectory-insights-017`
+  - Goal: Analyze completed sessions for context waste, tool loops, agent topology, policy friction, verification gaps, Computer Use inefficiency and recovery issues.
+- [ ] **RLM-14-trajectory-insights-019 — Implement governed improvement candidate generator**
+  - Deliverable: `crates/harness/src/insights/proposals.rs`
+  - Depends on: `RLM-14-trajectory-insights-018`, `RLM-13-handoff-knowledge-playbooks-25`, `RLM-14-trajectory-insights-010`
+  - Goal: Translate supported Insights into draft Knowledge/Playbook/prompt/router/context experiment candidates without auto-applying them.
+- [ ] **RLM-14-trajectory-insights-020 — Add Session Insights CLI/TUI report**
+  - Deliverable: `apps/rapid/src/commands/insights.rs, crates/tui/src/panels/insights.rs`
+  - Depends on: `RLM-14-trajectory-insights-18`, `RLM-14-trajectory-insights-19`
+  - Goal: Expose offline report generation, evidence-linked timeline and improvement candidates with explicit review actions.
+- [ ] **RLM-14-trajectory-insights-021 — Add trajectory privacy and experiment regression tests**
+  - Deliverable: `crates/harness/tests/trajectory_v2.rs`
+  - Depends on: `RLM-14-trajectory-insights-009`, `RLM-14-trajectory-insights-011`, `RLM-14-trajectory-insights-14`
+  - Goal: Test no-COT schema, privacy export denial, secret redaction, ranking hard gates and held-out split separation.
+- [ ] **RLM-14-trajectory-insights-022 — Add >=1000-tool-call endurance integration scenario**
+  - Deliverable: `evals/endurance/kernel-24h-v1.yaml`
+  - Depends on: `RLM-14-trajectory-insights-016`, `RLM-14-trajectory-insights-017`, `RLM-11-evals-hardening-017`
+  - Goal: Create long-horizon scenario with >=1000 tool calls and deterministic restart/compaction/handoff/sandbox/provider faults plus final evidence gates.
+
+## 15-computer-use-v2 — V2 Full Computer Use
+
+- [ ] **RLM-15-computer-use-v2-001 — Define V2 Computer Use Surface protocol**
+  - Deliverable: `crates/protocol/src/computer_surface.rs`
+  - Depends on: `RLM-08-computer-mobile-007`, `RLM-13-handoff-knowledge-playbooks-001`
+  - Goal: Implement SurfaceRef/SurfaceKind, generation, WindowRef and ComputerSessionSpec serialized contracts.
+- [ ] **RLM-15-computer-use-v2-002 — Implement ComputerSessionManager**
+  - Deliverable: `crates/computer-use/src/session.rs`
+  - Depends on: `RLM-15-computer-use-v2-001`, `RLM-07-sandbox-security-001`
+  - Goal: Own browser/desktop/TUI/mobile Computer Use session lifecycle, cancellation, worker binding and control ownership.
+- [ ] **RLM-15-computer-use-v2-003 — Implement SurfaceRegistry and generation tracking**
+  - Deliverable: `crates/computer-use/src/surface_registry.rs`
+  - Depends on: `RLM-15-computer-use-v2-002`
+  - Goal: Track tabs/windows/displays/TUIs/emulators and invalidate targets on generation/geometry/lifecycle changes.
+- [ ] **RLM-15-computer-use-v2-004 — Implement Linux isolated virtual desktop backend**
+  - Deliverable: `crates/computer-use/src/platform/linux_desktop.rs`
+  - Depends on: `RLM-15-computer-use-v2-002`, `RLM-07-sandbox-security-009`
+  - Goal: Start controlled Linux virtual desktop/compositor with AT-SPI, explicit resolution, clipboard/app/file/network bounds and sandbox integration.
+- [ ] **RLM-15-computer-use-v2-005 — Implement Windows desktop worker adapter**
+  - Deliverable: `crates/computer-use/src/platform/windows.rs`
+  - Depends on: `RLM-15-computer-use-v2-002`, `RLM-10-daemon-remote-release-010`
+  - Goal: Connect to verified Windows worker desktop, normalize UIA access and bounded input injection for native GUI tests.
+- [ ] **RLM-15-computer-use-v2-006 — Implement macOS desktop/accessibility adapter V2**
+  - Deliverable: `crates/computer-use/src/platform/macos.rs`
+  - Depends on: `RLM-15-computer-use-v2-002`, `RLM-08-computer-mobile-008`
+  - Goal: Integrate macOS AX/screen observation/input under explicit OS permissions and controlled local/remote worker policy.
+- [ ] **RLM-15-computer-use-v2-007 — Define normalized AccessibilitySnapshot schema**
+  - Deliverable: `crates/protocol/src/accessibility.rs`
+  - Depends on: `RLM-15-computer-use-v2-001`
+  - Goal: Implement cross-platform role/name/state/bounds/actions/tree refs with stable node identity per Observation.
+- [ ] **RLM-15-computer-use-v2-008 — Implement DOM/accessibility observation merger**
+  - Deliverable: `crates/computer-use/src/observe/semantic.rs`
+  - Depends on: `RLM-15-computer-use-v2-007`, `RLM-08-computer-mobile-002`
+  - Goal: Build compact interactive-node view combining browser DOM/accessibility or native accessibility tree with stable semantic locators.
+- [ ] **RLM-15-computer-use-v2-009 — Implement PTY/TUI observer**
+  - Deliverable: `crates/computer-use/src/tui/observer.rs`
+  - Depends on: `RLM-15-computer-use-v2-001`, `RLM-07-sandbox-security-004`
+  - Goal: Expose interactive terminal screen/cursor/alternate-screen/region model as a Computer Use surface.
+- [ ] **RLM-15-computer-use-v2-010 — Implement ObservationBuilder V2**
+  - Deliverable: `crates/computer-use/src/observe/mod.rs`
+  - Depends on: `RLM-15-computer-use-v2-003`, `RLM-15-computer-use-v2-008`, `RLM-15-computer-use-v2-009`
+  - Goal: Combine semantic tree, screenshot, focused window, visual delta, pointer and state hash into canonical Observation.
+- [ ] **RLM-15-computer-use-v2-011 — Implement VisualDelta engine**
+  - Deliverable: `crates/computer-use/src/observe/visual_delta.rs`
+  - Depends on: `RLM-15-computer-use-v2-010`, `RLM-01-foundation-012`
+  - Goal: Compute changed screen regions and low-cost visual summaries between compatible observations.
+- [ ] **RLM-15-computer-use-v2-012 — Implement semantic TargetResolver**
+  - Deliverable: `crates/computer-use/src/target/semantic.rs`
+  - Depends on: `RLM-15-computer-use-v2-008`, `RLM-15-computer-use-v2-010`
+  - Goal: Resolve role/name/test-id/text/native/TUI semantic queries to unique TargetRef with ranked ambiguity output.
+- [ ] **RLM-15-computer-use-v2-013 — Implement stale and ambiguous target guard**
+  - Deliverable: `crates/computer-use/src/target/guard.rs`
+  - Depends on: `RLM-15-computer-use-v2-003`, `RLM-15-computer-use-v2-012`
+  - Goal: Reject targets tied to stale Observation/surface generation or insufficient uniqueness before Capability Broker/action executor.
+- [ ] **RLM-15-computer-use-v2-014 — Implement bounded vision fallback adapter**
+  - Deliverable: `crates/computer-use/src/target/vision.rs`
+  - Depends on: `RLM-15-computer-use-v2-011`, `RLM-05-agent-llm-goal-007`
+  - Goal: Ask a vision-capable routed model to identify a bounded visual region only when semantic resolution is insufficient.
+- [ ] **RLM-15-computer-use-v2-015 — Implement guarded coordinate fallback**
+  - Deliverable: `crates/computer-use/src/target/coordinate.rs`
+  - Depends on: `RLM-15-computer-use-v2-13`, `RLM-15-computer-use-v2-14`
+  - Goal: Create coordinate TargetRef only from current Observation, geometry and explicit fallback reason with elevated risk metadata.
+- [ ] **RLM-15-computer-use-v2-016 — Implement pointer/click/scroll action executor**
+  - Deliverable: `crates/computer-use/src/action/pointer.rs`
+  - Depends on: `RLM-15-computer-use-v2-13`, `RLM-03-policy-workspace-009`
+  - Goal: Execute move/click/double/right-click/scroll against controlled surface after ControlLease and CapabilityLease validation.
+- [ ] **RLM-15-computer-use-v2-017 — Implement keyboard/chord/type action executor**
+  - Deliverable: `crates/computer-use/src/action/keyboard.rs`
+  - Depends on: `RLM-15-computer-use-v2-16`
+  - Goal: Execute key/chord/text input with layout-aware behavior and SecretAwareString support.
+- [ ] **RLM-15-computer-use-v2-018 — Implement drag/drop and window action executor**
+  - Deliverable: `crates/computer-use/src/action/window.rs`
+  - Depends on: `RLM-15-computer-use-v2-16`, `RLM-15-computer-use-v2-003`
+  - Goal: Execute drag, focus, resize, close and multi-window operations with surface-generation updates.
+- [ ] **RLM-15-computer-use-v2-019 — Implement controlled app launch/focus manager**
+  - Deliverable: `crates/computer-use/src/action/app.rs`
+  - Depends on: `RLM-15-computer-use-v2-004`, `RLM-15-computer-use-v2-005`, `RLM-15-computer-use-v2-006`
+  - Goal: Launch/focus allowed applications inside GUI sandbox/worker and register resulting windows/surfaces.
+- [ ] **RLM-15-computer-use-v2-020 — Upgrade browser lifecycle into SurfaceRegistry**
+  - Deliverable: `crates/computer-use/src/browser/session_v2.rs`
+  - Depends on: `RLM-15-computer-use-v2-002`, `RLM-08-computer-mobile-001`
+  - Goal: Map Playwright contexts/pages/frames into Computer Use sessions/surfaces with ephemeral profile default and event-derived lifecycle.
+- [ ] **RLM-15-computer-use-v2-021 — Implement browser origin/upload/download policy adapter**
+  - Deliverable: `crates/computer-use/src/browser/policy.rs`
+  - Depends on: `RLM-15-computer-use-v2-20`, `RLM-03-policy-workspace-004`
+  - Goal: Normalize navigation, upload/download, clipboard and external publication intents into dedicated capability requests and staged artifacts.
+- [ ] **RLM-15-computer-use-v2-022 — Implement SecretHandle UI input injector**
+  - Deliverable: `crates/computer-use/src/security/secret_input.rs`
+  - Depends on: `RLM-15-computer-use-v2-17`, `RLM-01-foundation-010`
+  - Goal: Resolve SecretHandle only at final trusted executor boundary after matching approved app/origin/field target.
+- [ ] **RLM-15-computer-use-v2-023 — Implement screen-recording secret redaction zones**
+  - Deliverable: `crates/computer-use/src/recording/redaction.rs`
+  - Depends on: `RLM-15-computer-use-v2-22`, `RLM-01-foundation-011`
+  - Goal: Mask secret entry targets and configured sensitive regions in live/final recordings and screenshots.
+- [ ] **RLM-15-computer-use-v2-024 — Implement SensitiveUiClassifier**
+  - Deliverable: `crates/computer-use/src/security/classifier.rs`
+  - Depends on: `RLM-15-computer-use-v2-10`, `RLM-03-policy-workspace-003`
+  - Goal: Classify auth/MFA/CAPTCHA/payment/publication/destructive/OS-permission/upload/download/secret/clipboard UI intents before authorization.
+- [ ] **RLM-15-computer-use-v2-025 — Implement Computer Use postcondition verifier**
+  - Deliverable: `crates/computer-use/src/verify.rs`
+  - Depends on: `RLM-15-computer-use-v2-16`, `RLM-15-computer-use-v2-10`
+  - Goal: Re-observe after action and evaluate expected UiAssertions, stale-state and action-specific success conditions.
+- [ ] **RLM-15-computer-use-v2-026 — Implement ComputerEvidence builder**
+  - Deliverable: `crates/computer-use/src/evidence.rs`
+  - Depends on: `RLM-15-computer-use-v2-25`, `RLM-05-agent-llm-goal-021`
+  - Goal: Build evidence nodes from before/action/after observations, assertions, logs, screenshots and recording refs and attach to Goal criteria.
+- [ ] **RLM-15-computer-use-v2-027 — Implement diff-aware UiTestPlanner**
+  - Deliverable: `crates/computer-use/src/test_plan.rs`
+  - Depends on: `RLM-15-computer-use-v2-26`, `RLM-03-policy-workspace-020`
+  - Goal: Generate focused UI verification plan from Goal criteria, ChangeSet/diff and affected surfaces with explicit assertions and sensitive-step flags.
+- [ ] **RLM-15-computer-use-v2-028 — Implement annotated video recorder**
+  - Deliverable: `crates/computer-use/src/recording/video.rs`
+  - Depends on: `RLM-15-computer-use-v2-23`, `RLM-15-computer-use-v2-25`
+  - Goal: Capture bounded desktop/browser/mobile recording with timestamped action markers, optional pointer highlight and artifact metadata.
+- [ ] **RLM-15-computer-use-v2-029 — Implement browser E2E test runner**
+  - Deliverable: `crates/computer-use/src/testing/browser_runner.rs`
+  - Depends on: `RLM-15-computer-use-v2-21`, `RLM-15-computer-use-v2-27`, `RLM-15-computer-use-v2-28`
+  - Goal: Execute UiTestPlan against local/fixture browser surface, collecting assertions, traces, logs and recording evidence.
+- [ ] **RLM-15-computer-use-v2-030 — Implement desktop/TUI E2E test runner**
+  - Deliverable: `crates/computer-use/src/testing/desktop_runner.rs`
+  - Depends on: `RLM-15-computer-use-v2-18`, `RLM-15-computer-use-v2-19`, `RLM-15-computer-use-v2-27`, `RLM-15-computer-use-v2-28`
+  - Goal: Execute UiTestPlan across native/Electron/TUI surfaces using semantic targets and bounded fallback while recording evidence.
+- [ ] **RLM-15-computer-use-v2-031 — Integrate Android ADB + visual Computer Use bridge**
+  - Deliverable: `crates/mobile/src/android/computer_bridge.rs`
+  - Depends on: `RLM-08-computer-mobile-012`, `RLM-15-computer-use-v2-02`
+  - Goal: Register emulator window as Computer Use surface while using ADB for deterministic install/start/log/screenshot/test setup.
+- [ ] **RLM-15-computer-use-v2-032 — Integrate iOS Simulator + Computer Use bridge**
+  - Deliverable: `crates/mobile/src/ios/computer_bridge.rs`
+  - Depends on: `RLM-08-computer-mobile-014`, `RLM-15-computer-use-v2-06`, `RLM-15-computer-use-v2-02`
+  - Goal: Register iOS simulator window on macOS worker and combine simctl/XCTest/accessibility with visual interaction/evidence.
+- [ ] **RLM-15-computer-use-v2-033 — Add Computer Use TUI panel and human takeover controls**
+  - Deliverable: `crates/tui/src/panels/computer_use_v2.rs`
+  - Depends on: `RLM-15-computer-use-v2-26`, `RLM-15-computer-use-v2-28`, `RLM-13-handoff-knowledge-playbooks-20`
+  - Goal: Show current surface, observation strategy, action/assertion timeline, recording, risk/control owner and takeover/resume actions.
+- [ ] **RLM-15-computer-use-v2-034 — Add Computer Use V2 deterministic and safety eval suite**
+  - Deliverable: `tests/e2e/computer_use_v2.rs, evals/computer-v2/`
+  - Depends on: `RLM-15-computer-use-v2-24`, `RLM-15-computer-use-v2-29`, `RLM-15-computer-use-v2-30`, `RLM-15-computer-use-v2-31`, `RLM-15-computer-use-v2-33`, `RLM-11-evals-hardening-004`
+  - Goal: Create browser/dynamic-DOM/desktop/TUI/Android/auth-payment-prompt-injection/human-takeover fixtures and release metrics.

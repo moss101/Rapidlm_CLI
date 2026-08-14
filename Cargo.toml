@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/rapid",
+    "crates/protocol",
+    "crates/kernel",
+    "crates/event-ledger",
+    "crates/agent-runtime",
+    "crates/agent-pool",
+    "crates/scheduler",
+    "crates/context-engine",
+    "crates/knowledge",
+    "crates/playbooks",
+    "crates/tool-gateway",
+    "crates/capability-broker",
+    "crates/process-supervisor",
+    "crates/sandbox",
+    "crates/workspace",
+    "crates/vcs",
+    "crates/llm-router",
+    "crates/handoff",
+    "crates/harness",
+    "crates/trajectory",
+    "crates/insights",
+    "crates/computer-use",
+    "crates/mobile-sim",
+    "crates/security",
+    "crates/auth",
+    "crates/mcp",
+    "crates/acp",
+    "crates/plugin-host",
+    "crates/telemetry",
+    "crates/tui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+
+[workspace.dependencies]
+anyhow = "1"
