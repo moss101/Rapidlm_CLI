@@ -1,27 +1,36 @@
-# Capability Broker and Policy API
+# API Contract — Capability, Policy and Approval API
 
-## Normalize → decide → approve if needed → lease → execute → audit
+Normalize privileged actions, evaluate layered policy and issue/verify scoped leases.
 
-```rust
-pub struct ActionRequest {
-    pub principal: PrincipalRef,
-    pub session_id: SessionId,
-    pub capability: Capability,
-    pub resource: ResourceDescriptor,
-    pub normalized_action: CanonicalAction,
-    pub reason: String,
-}
+## Types
 
-pub enum Decision { Allow(LeaseConstraints), Ask(ApprovalSpec), Deny(DenyReason) }
+### `Capability`
+typed fs/proc/net/git/secret/browser/desktop/mobile/mcp/plugin/external actions
 
-#[async_trait]
-pub trait CapabilityBroker {
-    async fn evaluate(&self, req: ActionRequest) -> Result<Decision, PolicyError>;
-    async fn issue(&self, approved: ApprovedAction) -> Result<CapabilityLease, PolicyError>;
-    async fn validate_use(&self, lease: &CapabilityLease, actual: &CanonicalAction) -> Result<(), PolicyError>;
-}
-```
+### `PolicyDecision`
+allow/ask/deny + normalized reason
 
-The canonical action resolves command executable/path, normalized argv, effective cwd, resolved filesystem targets, URL origin/IP class, environment variable names, target MCP server/tool and sandbox tier. The action hash is calculated only after normalization.
+### `CapabilityLease`
+subject/action hash/scope/expiry/uses/signature
 
-A lease default is one use and <=60 seconds. Approval UI may issue narrower/broader repeated leases only from predefined safe scopes. Executors fail closed if broker is unavailable or policy revision changed incompatibly.
+### `ApprovalRequest`
+normalized action, risk, options, expiry
+
+## Operations
+
+- `policy.evaluate(request, generations)`
+- `broker.authorize(request)`
+- `approval.resolve(id, decision)`
+- `lease.verify(lease, action)`
+- `policy.explain(action)`
+
+## Error/recovery semantics
+
+`dont-ask` maps Ask→Deny. Expired/stale-generation lease is invalid. Higher-level deny cannot be overridden.
+
+## Versioning/compatibility
+
+Capability names are stable/versioned; policy readers reject unknown privilege-broadening semantics.
+
+## Security
+All calls are evaluated in the caller/session scope. API availability never implies authorization; privileged execution requires current policy/lease enforcement. External/untrusted payloads retain trust metadata.

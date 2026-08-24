@@ -1,0 +1,3 @@
+# Walkthrough — Smaller/Open Model Tool Repair
+
+Model emits a tool argument with optional field `null` and a stringified array. Original validation fails. Validator identifies exact issue paths. Repair engine removes the allowed optional null and parses the collection only because schema/rule permits it; revalidation succeeds. RepairRecord is attached to tool result/telemetry. If the malformed value had been a destructive path/approval/network target, RapidLM would return structured correction rather than guess. Evaluation compares task success and semantic corruption across model×tool cohorts.

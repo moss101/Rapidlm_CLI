@@ -1,3 +1,3 @@
-# prompts.md compatibility pointer
+# Compatibility pointer
 
-The canonical V2 atomic execution library is [`prompts.md`](prompts.md). Do not duplicate task definitions here.
+See [`prompts.md`](prompts.md).

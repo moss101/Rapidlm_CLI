@@ -1,23 +1,31 @@
-# MCP, ACP and SDK Boundary Contracts
+# API Contract — MCP, ACP and SDK Contract
 
-## MCP
+External interoperability without policy/kernel bypass.
 
-RapidLM targets MCP `2026-07-28`. The MCP client maintains a deterministic server/tool catalog outside the model-visible tool schema and exposes calls through `external.call`. Tool discovery changes update the catalog cache, not the model tool names. Server trust, tool risk classification and credential scope are policy inputs.
+## Types
 
-RapidLM can also expose selected tools/resources as an MCP server; server mode never leaks host-only capabilities that policy did not explicitly publish.
+### `McpCatalogRevision`
+server tools/resources/prompts + trust/auth metadata
 
-## ACP
+### `AcpSession`
+session/run mapping and progress capabilities
 
-ACP runs over stdio by default. Implement version/capability negotiation for ACP v1 and v2. ACP is a frontend adapter over `KernelClient`; it does not own sessions or permissions independently.
+### `SdkClient`
+typed KernelClient facade
 
-## TypeScript SDK
+## Operations
 
-```ts
-const client = await RapidClient.connect({ transport: 'local' });
-const session = await client.sessions.create({ project: process.cwd() });
-for await (const event of session.run({ prompt: 'Fix the failing test' })) {
-  // typed Event union
-}
-```
+- `mcp.list/call/refresh`
+- `rapid acp`
+- `sdk.sessions/runs/graphs/events/approvals`
 
-SDK semver tracks wire compatibility, not Rust crate internals. Generated schemas are checked into `sdk/typescript/src/generated` and contract-tested against Rust fixtures.
+## Error/recovery semantics
+
+Disconnect/catalog mismatch is typed; stdio stdout remains framing-only. Reconnect uses cursors where possible.
+
+## Versioning/compatibility
+
+Protocol version negotiation isolated in adapters; kernel domain model does not encode vendor protocol versions.
+
+## Security
+All calls are evaluated in the caller/session scope. API availability never implies authorization; privileged execution requires current policy/lease enforcement. External/untrusted payloads retain trust metadata.

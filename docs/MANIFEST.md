@@ -1,53 +1,22 @@
-# RapidLM CLI / TUI Software Development Dossier V2 — Manifest
+# RapidLM CLI / TUI V3 Dossier Manifest
 
-**Version:** 2.0 architecture baseline  
-**Date:** 2026-08-14  
-**Package root:** `RapidLM-CLI-Software-Development-Dossier-V2/`
-
-## Coverage summary
-
-- **125 files** total.
-- **123 Markdown documents**.
-- **33 architecture documents**, including first-class managed agents, execution handoff, human takeover, Knowledge, Playbooks/Automations, trajectory learning, Session Insights, and full Computer Use.
-- **15 API-contract documents** and canonical domain/event/SQLite/config models.
-- **8 evaluation specifications** and **17 runtime system-prompt documents**.
-- **19 ADRs** (V2 adds ADRs 0013–0019).
-- **320 atomic implementation tasks** in `prompts.md` / `task-manifest.json`; 110 are new V2 tasks.
-- **146 PRD functional requirements**, all mapped in `requirements-traceability.md`.
-
-## Entry points
-
-- `00-README.md` — master index and V2 product/architecture thesis.
-- `01-PRD.md` — product requirements.
-- `02-SDD.md` — overall software/system design.
-- `03-Development-Plan-and-Roadmap.md` — phased delivery plan.
-- `04-Task-Breakdown.md` — hierarchical WBS.
-- `prompts.md` — canonical atomic agent implementation library.
-- `AGENTS.md` / `SKILLS.md` — development governance.
-- `V2-CHANGELOG.md` — exact V1→V2 revision.
-- `research/feature-inspiration-matrix.md` — source/inspiration mapping.
-- `architecture/computer-use.md` — full Computer Use V2 architecture.
-- `architecture/eval-and-agent-harness.md` — production/eval harness + learning architecture.
-- `requirements-traceability.md` — requirement→design→task→verification mapping.
-- `validation-report.md` — generated structural QA results.
-- `SHA256SUMS` — integrity hashes for every package file except itself.
+**Version:** 3.0
+**Date:** 2026-08-24
+**Validation:** PASS
+**Atomic tasks:** 412
+**PRD requirements:** 97
 
 ## Directory counts
 
 | Area | Files |
 |---|---:|
-| `<root>` | 18 |
-| `adrs` | 19 |
-| `api-contracts` | 15 |
-| `architecture` | 33 |
-| `data-models` | 4 |
-| `evaluation-specs` | 8 |
-| `operations` | 4 |
-| `reference` | 4 |
-| `research` | 3 |
+| `<root>` | 22 |
+| `agents` | 9 |
+| `docs` | 106 |
+| `skills` | 8 |
 | `system-prompts` | 17 |
 
-## Complete file inventory
+## Complete inventory
 
 ```text
 00-README.md
@@ -57,122 +26,161 @@
 04-Task-Breakdown.md
 05-prompts.md
 AGENTS.md
-Agents.md
-MANIFEST.md
-SHA256SUMS
+PRD.md
+README.md
+SDD.md
 SKILLS.md
-Skills.md
-V2-CHANGELOG.md
-adrs/0001-rust-first-runtime.md
-adrs/0002-event-sourced-sessions.md
-adrs/0003-stable-tool-gateway.md
-adrs/0004-hybrid-context-engine.md
-adrs/0005-capability-leases.md
-adrs/0006-transactional-workspace-views.md
-adrs/0007-evidence-backed-goals.md
-adrs/0008-tiered-sandbox.md
-adrs/0009-wasm-plugin-default.md
-adrs/0010-mcp-acp-boundaries.md
-adrs/0011-provenance-layer-over-git.md
-adrs/0012-local-first-telemetry.md
-adrs/0013-persistent-background-agent-pool.md
-adrs/0014-managed-clean-context-workers.md
-adrs/0015-execution-handoff-protocol.md
-adrs/0016-knowledge-separate-from-memory.md
-adrs/0017-trajectory-learning-without-hidden-cot.md
-adrs/0018-full-computer-use-evidence.md
-adrs/0019-human-agent-control-leases.md
-api-contracts/agent-scheduler-api.md
-api-contracts/capability-policy-api.md
-api-contracts/computer-mobile-api.md
-api-contracts/context-engine-api.md
-api-contracts/execution-handoff-api.md
-api-contracts/headless-jsonl.md
-api-contracts/kernel-api.md
-api-contracts/knowledge-playbook-api.md
-api-contracts/llm-provider-api.md
-api-contracts/managed-agent-api.md
-api-contracts/mcp-acp-sdk.md
-api-contracts/sandbox-process-api.md
-api-contracts/tool-gateway-api.md
-api-contracts/trajectory-insights-api.md
-api-contracts/workspace-api.md
-architecture/agent-pool-and-managed-agents.md
-architecture/agents-panel.md
-architecture/artifact-store.md
-architecture/authentication-and-identity.md
-architecture/capability-broker-and-policy.md
-architecture/cli-tui.md
-architecture/computer-use.md
-architecture/context-engine.md
-architecture/eval-and-agent-harness.md
-architecture/event-ledger-and-sessions.md
-architecture/execution-handoff.md
-architecture/goal-dag-and-evidence.md
-architecture/human-agent-control-handoff.md
-architecture/ide.md
-architecture/kernel.md
-architecture/knowledge-registry.md
-architecture/llm-router.md
-architecture/mcp-acp-and-sdk.md
-architecture/mobile-simulator.md
-architecture/playbooks-and-automations.md
-architecture/plugins-skills-and-hooks.md
-architecture/process-supervisor-and-jobs.md
-architecture/project-and-config.md
-architecture/prompt-runtime.md
-architecture/remote-workers-and-daemon.md
-architecture/sandbox.md
-architecture/security-scanners.md
-architecture/session-insights.md
-architecture/telemetry-and-observability.md
-architecture/trajectory-learning-and-optimization.md
-architecture/updates-and-release.md
-architecture/vcs-provenance-and-attestations.md
-architecture/workspace-vcs-and-semantic-patch.md
-data-models/config-schema.md
-data-models/domain-model.md
-data-models/event-schema.md
-data-models/sqlite-schema.sql.md
-evaluation-specs/agent-evals.md
-evaluation-specs/computer-mobile-evals.md
-evaluation-specs/computer-use-v2-evals.md
-evaluation-specs/context-evals.md
-evaluation-specs/managed-agent-handoff-evals.md
-evaluation-specs/router-prompt-evals.md
-evaluation-specs/security-evals.md
-evaluation-specs/trajectory-long-horizon-evals.md
-operations/incident-recovery.md
-operations/observability.md
-operations/release-and-supply-chain.md
-operations/testing-strategy.md
+V3-CHANGELOG.md
+agents.md
+agents/coder.md
+agents/computer-operator.md
+agents/context-scout.md
+agents/main.md
+agents/planner.md
+agents/reviewer.md
+agents/security-reviewer.md
+agents/tester.md
+agents/verifier.md
+development-ledger.md
+development-plan.md
+docs/adrs/0001-rust-first-runtime.md
+docs/adrs/0002-event-sourced-durable-state.md
+docs/adrs/0003-operation-journal.md
+docs/adrs/0004-graph-native-orchestration.md
+docs/adrs/0005-specialized-graph-fabrics.md
+docs/adrs/0006-context-compiler.md
+docs/adrs/0007-context-scout.md
+docs/adrs/0008-repairable-tool-contracts.md
+docs/adrs/0009-cross-tool-invariants.md
+docs/adrs/0010-capability-leases.md
+docs/adrs/0011-transactional-workspaces.md
+docs/adrs/0012-evidence-backed-goals.md
+docs/adrs/0013-independent-verifier.md
+docs/adrs/0014-resource-pool.md
+docs/adrs/0015-wake-on-event.md
+docs/adrs/0016-computer-observation-generation.md
+docs/adrs/0017-wasm-plugin-default.md
+docs/adrs/0018-protocol-adapters-not-authorities.md
+docs/adrs/0019-preference-as-soft-evidence.md
+docs/adrs/0020-migration-over-rewrite.md
+docs/api-contracts/agent-executor-api.md
+docs/api-contracts/artifact-api.md
+docs/api-contracts/capability-policy-api.md
+docs/api-contracts/computer-use-api.md
+docs/api-contracts/context-api.md
+docs/api-contracts/goal-evidence-api.md
+docs/api-contracts/graph-runtime-api.md
+docs/api-contracts/handoff-control-api.md
+docs/api-contracts/headless-jsonl.md
+docs/api-contracts/hooks-plugins-api.md
+docs/api-contracts/kernel-api.md
+docs/api-contracts/mcp-acp-sdk.md
+docs/api-contracts/process-trigger-api.md
+docs/api-contracts/sandbox-resource-api.md
+docs/api-contracts/tool-gateway-api.md
+docs/api-contracts/tool-repair-api.md
+docs/api-contracts/workspace-api.md
+docs/architecture/agent-harness.md
+docs/architecture/artifacts-provenance-attestations.md
+docs/architecture/auth-credentials-identity.md
+docs/architecture/build-release-supply-chain.md
+docs/architecture/capability-broker-policy-projection.md
+docs/architecture/cli-tui.md
+docs/architecture/computer-use.md
+docs/architecture/context-engineering.md
+docs/architecture/eval-harness.md
+docs/architecture/event-ledger-operation-journal.md
+docs/architecture/goals-evidence-verification.md
+docs/architecture/graph-engineering.md
+docs/architecture/kernel-runtime.md
+docs/architecture/llm-router.md
+docs/architecture/mcp-acp-sdk-external-agents.md
+docs/architecture/memory-knowledge-preference.md
+docs/architecture/plugins-skills-hooks.md
+docs/architecture/preference-learning-trajectory.md
+docs/architecture/preview-visual-verification.md
+docs/architecture/process-background-trigger-runtime.md
+docs/architecture/project-config-trust.md
+docs/architecture/prompt-runtime.md
+docs/architecture/remote-workers-handoff-control.md
+docs/architecture/sandbox-resource-pool.md
+docs/architecture/security-scanners.md
+docs/architecture/sessions-checkpoints-time-travel.md
+docs/architecture/telemetry-session-insights.md
+docs/architecture/tool-contract-and-recovery.md
+docs/architecture/workspace-vcs-semantic-patch.md
+docs/data-models/config-schema.md
+docs/data-models/domain-model.md
+docs/data-models/event-schema.md
+docs/data-models/sqlite-schema.sql.md
+docs/evaluation-specs/agent-harness-evals.md
+docs/evaluation-specs/computer-use-evals.md
+docs/evaluation-specs/context-evals.md
+docs/evaluation-specs/goal-verification-evals.md
+docs/evaluation-specs/graph-runtime-evals.md
+docs/evaluation-specs/long-horizon-chaos-evals.md
+docs/evaluation-specs/performance-token-evals.md
+docs/evaluation-specs/preference-trajectory-evals.md
+docs/evaluation-specs/process-resource-evals.md
+docs/evaluation-specs/protocol-extension-evals.md
+docs/evaluation-specs/security-evals.md
+docs/evaluation-specs/tool-contract-evals.md
+docs/evaluation-specs/workspace-evals.md
+docs/operations/build-and-ci.md
+docs/operations/data-retention-privacy.md
+docs/operations/incident-recovery.md
+docs/operations/observability-slo.md
+docs/operations/release-and-supply-chain.md
+docs/operations/testing-strategy.md
+docs/reference/build-system.md
+docs/reference/cli-command-reference.md
+docs/reference/computer-use-command-reference.md
+docs/reference/definition-of-done.md
+docs/reference/error-codes.md
+docs/reference/event-catalog.md
+docs/reference/glossary.md
+docs/reference/graph-node-edge-catalog.md
+docs/research/adoption-not-copying.md
+docs/research/feature-inspiration-matrix.md
+docs/research/migration-v2-to-v3.md
+docs/research/source-ledger.md
+docs/security/threat-model.md
+docs/walkthroughs/end-to-end-code-change.md
+docs/walkthroughs/long-running-goal-recovery.md
+docs/walkthroughs/open-model-tool-repair.md
+docs/walkthroughs/visual-debugging.md
 prompts.md
-reference/cli-command-reference.md
-reference/definition-of-done.md
-reference/error-codes.md
-reference/glossary.md
 requirements-traceability.md
-research/competitive-analysis.md
-research/feature-inspiration-matrix.md
-research/technology-decisions.md
-system-prompts/00-core-system.md
+skills.md
+skills/computer-use.md
+skills/context-scout.md
+skills/goal-verification.md
+skills/graph-engineering.md
+skills/release.md
+skills/repo-archaeology.md
+skills/security-review.md
+skills/tool-contracts.md
+system-prompts/00-core-constitution.md
+system-prompts/01-main-agent.md
 system-prompts/background-explorer.md
 system-prompts/coder.md
 system-prompts/compaction.md
 system-prompts/computer-use.md
 system-prompts/context-curator.md
-system-prompts/explorer.md
-system-prompts/goal-driver.md
-system-prompts/managed-coordinator.md
-system-prompts/mobile-use.md
-system-prompts/planner.md
-system-prompts/prompt-policy.md
+system-prompts/context-scout.md
+system-prompts/debugger.md
+system-prompts/independent-verifier.md
+system-prompts/planner-architect.md
+system-prompts/repair-agent.md
 system-prompts/reviewer.md
 system-prompts/security-reviewer.md
 system-prompts/session-insights.md
-system-prompts/subagent-supervisor.md
-system-prompts/verifier.md
+system-prompts/system-prompt-composition.md
+system-prompts/tester.md
 task-manifest.json
+tasks.md
 threat-model-and-security.md
 validation-report.md
+MANIFEST.md
+SHA256SUMS
 ```

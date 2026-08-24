@@ -1,48 +1,32 @@
-# Stable Tool Gateway Contract
+# API Contract — Tool Gateway API
 
-The model sees a deliberately small and stable catalog. Provider adapters map native function-calling formats to these canonical requests.
+Stable model-visible gateway tools and internal ToolRegistry execution boundary.
 
-## Tool request
+## Types
 
-```json
-{
-  "schema": 1,
-  "call_id": "call_7",
-  "tool": "repo.search",
-  "arguments": {"query":"CapabilityLease","repos":["main"],"limit":20}
-}
-```
+### `ToolDescriptor`
+stable name, schema version, safety class, output budget
 
-## Stable tools
+### `ToolInvocation`
+tool id/schema/input/node/agent/context refs
 
-| Tool | Purpose | Privilege boundary |
-|---|---|---|
-| `repo.search` | hybrid/lexical/structural search | read scope |
-| `repo.read` | bounded file/range/symbol read | read scope |
-| `workspace.patch` | stage semantic patch | write scope |
-| `workspace.status` | diff/view/checkpoint state | read scope |
-| `shell.exec` | supervised command execution | command + fs + network capability |
-| `agent.spawn` | create isolated subagent | scheduler/policy |
-| `agent.result` | inspect/merge typed subagent result | view/merge policy |
-| `goal.update` | machine goal lifecycle/evidence linkage | main-agent-only |
-| `browser.act` | observe/act/verify browser | browser origin/action policy |
-| `mobile.act` | simulator actions | device/simulator policy |
-| `external.call` | MCP/plugin capability proxy | external server/tool policy |
-| `evidence.record` | attach verifiable evidence | evidence validation |
+### `ToolOutcome`
+Success/Recovered/Partial/Retryable/Denied/Failed
 
-## Result envelope
+## Operations
 
-```json
-{
-  "schema":1,
-  "call_id":"call_7",
-  "status":"ok",
-  "summary":"12 matches",
-  "data":{},
-  "artifacts":[],
-  "truncated":false,
-  "continuation":null
-}
-```
+- `tools.project(role,node,mode,policy,model)`
+- `tools.validate(invocation)`
+- `tools.execute(invocation)`
+- `tools.describe(name,version)`
 
-Large output is placed in an artifact and represented with a bounded excerpt. Tool implementations MUST NOT return hidden system prompts, raw credentials, or capability tokens to the model.
+## Error/recovery semantics
+
+Unknown/invalid call is returned as structured model-repairable error; kernel crash is not faked as tool failure. Large output is artifact + excerpt.
+
+## Versioning/compatibility
+
+Model-visible names stay stable within major version; schemas are versioned and compatible aliases explicit.
+
+## Security
+All calls are evaluated in the caller/session scope. API availability never implies authorization; privileged execution requires current policy/lease enforcement. External/untrusted payloads retain trust metadata.

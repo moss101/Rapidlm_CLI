@@ -1,22 +1,35 @@
-# Headless JSONL Protocol
+# API Contract — Headless JSONL Protocol
 
-`rapid run --jsonl` writes only protocol records to stdout. Logs/diagnostics use stderr. UTF-8, one JSON object per line, no pretty printing.
+Machine-readable execution stream for CI/scripts with clean stdout.
 
-## Base record
+## Types
 
-```json
-{"schema":1,"type":"session.started","session_id":"...","seq":1,"time":"...","data":{}}
-```
+### `rapid.schema`
+first event with protocol/version/capabilities
 
-Required types include `session.*`, `turn.*`, `assistant.delta`, `assistant.message`, `tool.*`, `approval.required`, `agent.*`, `goal.*`, `evidence.*`, `artifact.created`, `error`, and `session.finished`.
+### `rapid.event`
+durable semantic event projection
 
-Exit codes:
-- `0`: requested run completed successfully;
-- `2`: usage/config error;
-- `3`: policy/approval prevented requested operation;
-- `4`: provider/auth unavailable;
-- `5`: runtime/internal failure;
-- `6`: goal blocked/incomplete under `--require-complete`;
-- `130`: user/host interrupt.
+### `rapid.delta`
+optional transient stream delta
 
-Unknown record types must be ignorable by v1 consumers. `assistant.delta` may be disabled with `--no-stream-events` without changing semantic lifecycle events.
+### `rapid.result`
+terminal run result/exit class
+
+## Operations
+
+- `rapid exec --jsonl`
+- `rapid run --jsonl`
+- `rapid inspect --json`
+- `rapid export --jsonl`
+
+## Error/recovery semantics
+
+Protocol mode writes no human prose/ANSI to stdout; diagnostics to stderr. Consumers resume using cursor/sequence when transport supports it.
+
+## Versioning/compatibility
+
+Semantic version in schema event; readers must ignore unknown additive fields and handle declared event versions.
+
+## Security
+All calls are evaluated in the caller/session scope. API availability never implies authorization; privileged execution requires current policy/lease enforcement. External/untrusted payloads retain trust metadata.

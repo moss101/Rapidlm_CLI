@@ -1,0 +1,3 @@
+# Walkthrough — Long Goal, Crash, Resume and Handoff
+
+A daemon-owned goal runs Context→Agent→Process nodes. A package test remains background and Monitor waits without LLM polling. Daemon crashes after an external effect enters `executing`. On restart, Event Ledger replays graph, Operation Journal reconciles the effect, live process/resource state is inspected and the user-launched active goal parks paused. User resumes; new attempts inherit graph/evidence state but receive fresh context/tool leases. Later `/handoff remote` quiesces writes, restores a HandoffBundle, verifies target state and transfers session generation before issuing target-local credentials. At no point are two writers valid.

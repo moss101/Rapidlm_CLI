@@ -1,16 +1,16 @@
-# ADR 0001 — Rust-first core with TypeScript SDK
+# ADR 0001 — Rust-first runtime
 
-**Status:** Accepted for v1 baseline  
-**Decision:** Use Rust for kernel/TUI/execution/persistence and expose a transport-level TypeScript SDK.
+**Status:** Accepted for V3 baseline  
+**Date:** 2026-08-24
 
-## Context
+## Decision
 
-Single-binary startup, process/sandbox/filesystem safety and long-lived async work favor Rust; ecosystem integrations favor TypeScript.
+Use Rust for kernel/TUI/control plane; SDK/tooling may use TypeScript.
+
+## Rationale
+
+Process/fs/network/sandbox/SQLite/concurrency benefit from memory safety and single-binary distribution.
 
 ## Consequences
 
-Do not duplicate business logic in SDK; generate wire types and contract fixtures.
-
-## Revisit when
-
-Revisit only with measured evidence from production/evals or a protocol/platform constraint that invalidates the assumptions. A replacement ADR must describe migration and compatibility impact.
+Implementation tasks must preserve this decision unless a superseding ADR records new evidence, migration and compatibility/security impact.

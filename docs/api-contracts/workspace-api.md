@@ -1,16 +1,36 @@
-# Workspace / VCS Transaction API
+# API Contract — Workspace and Transaction API
 
-```rust
-#[async_trait]
-pub trait WorkspaceManager {
-    async fn create_view(&self, req: CreateView) -> Result<WorkspaceView, WorkspaceError>;
-    async fn stage_patch(&self, view: WorkspaceViewId, patch: SemanticPatch) -> Result<StagedPatch, WorkspaceError>;
-    async fn detect_external_mutations(&self, view: WorkspaceViewId) -> Result<Vec<ExternalMutation>, WorkspaceError>;
-    async fn checkpoint(&self, view: WorkspaceViewId, label: String) -> Result<Checkpoint, WorkspaceError>;
-    async fn merge_view(&self, req: MergeView) -> Result<MergePreview, WorkspaceError>;
-    async fn commit_transaction(&self, tx: TransactionId) -> Result<CommitReceipt, WorkspaceError>;
-    async fn rollback(&self, tx: TransactionId) -> Result<(), WorkspaceError>;
-}
-```
+Workspace view allocation, reads/status, patch transaction, merge, rewind/fork.
 
-`stage_patch` is atomic: all preimage hashes are checked before any logical patch becomes staged. Merge into a parent runs in an overlay/staging view first. Conflicts return machine-readable path/op conflicts; no lossy auto-resolution is hidden.
+## Types
+
+### `WorkspaceView`
+backend/base/scope/owner/generation
+
+### `WorkspaceTransaction`
+base hashes, patch ops, attribution, state
+
+### `ExternalMutation`
+detected changed path/hash without first-party attribution
+
+## Operations
+
+- `workspace.create_view(spec)`
+- `workspace.read/status/diff`
+- `workspace.propose(transaction)`
+- `workspace.apply(transaction)`
+- `workspace.reject(transaction)`
+- `workspace.integrate(child,parent)`
+- `workspace.checkpoint`
+- `workspace.fork(checkpoint)`
+
+## Error/recovery semantics
+
+Preimage mismatch returns Conflict. Failed verification leaves staged/reviewable transaction. No partial multi-file commit acknowledgment.
+
+## Versioning/compatibility
+
+Transaction format versioned; textual Git diff remains interoperability/export layer.
+
+## Security
+All calls are evaluated in the caller/session scope. API availability never implies authorization; privileged execution requires current policy/lease enforcement. External/untrusted payloads retain trust metadata.
