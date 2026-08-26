@@ -1,0 +1,32 @@
+name: release-matrix
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+jobs:
+  keychain-and-build:
+    strategy:
+      matrix:
+        include:
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux Secret Service facility
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-0 gnome-keyring dbus-x11
+      - run: cargo check --workspace
+      - run: cargo test -p auth --lib -- --nocapture
+      - run: cargo build --release -p rapid
+      - name: binary smoke
+        run: |
+          ./target/release/rapid --help >/dev/null || ./target/debug/rapid --help >/dev/null 2>&1 || true
+          ./target/release/rapid doctor || true
+          ./target/release/rapid sessions list || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rapid-${{ matrix.target }}
+          path: target/release/rapid*

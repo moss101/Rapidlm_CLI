@@ -4,6 +4,7 @@ pub mod broker;
 pub mod env_identity;
 pub mod file_keychain;
 pub mod os_keychain;
+pub mod os_keychain_other;
 pub mod local_daemon;
 pub mod mtls;
 pub mod secret;
