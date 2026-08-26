@@ -126,7 +126,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-002",
@@ -141,7 +142,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-003",
@@ -156,7 +158,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-004",
@@ -171,7 +174,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-005",
@@ -184,7 +188,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-006",
@@ -197,7 +202,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-007",
@@ -210,7 +216,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-008",
@@ -223,7 +230,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-009",
@@ -236,7 +244,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-010",
@@ -249,7 +258,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-011",
@@ -262,7 +272,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-012",
@@ -275,7 +286,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-013",
@@ -288,7 +300,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-014",
@@ -301,7 +314,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-015",
@@ -314,7 +328,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-016",
@@ -327,7 +342,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-017",
@@ -340,7 +356,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-018",
@@ -353,7 +370,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-019",
@@ -366,7 +384,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-020",
@@ -379,7 +398,8 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "HISTORICAL_SUPERSEDED",
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P0-GATE",
@@ -413,8 +433,9 @@
         "SDD.md",
         "docs/research/migration-v2-to-v3.md"
       ],
-      "status": "NOT_STARTED",
-      "gate": true
+      "status": "HISTORICAL_SUPERSEDED",
+      "gate": true,
+      "disposition": "V2->V3 migration executed via calibration/ archive + docs/architecture/phase-0-migration-matrix.md; superseded by V3 phases P5-P13"
     },
     {
       "id": "P1-001",
@@ -430,7 +451,8 @@
         "docs/architecture/kernel-runtime.md",
         "docs/architecture/artifacts-provenance-attestations.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/protocol/{id.rs,error.rs} + kernel shutdown/crash-recovery; verified under P7-P10 gates"
     },
     {
       "id": "P1-002",
@@ -447,7 +469,8 @@
         "docs/architecture/kernel-runtime.md",
         "docs/architecture/artifacts-provenance-attestations.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/protocol/{id.rs,error.rs} + kernel shutdown/crash-recovery; verified under P7-P10 gates"
     },
     {
       "id": "P1-003",
@@ -785,7 +808,8 @@
         "docs/architecture/kernel-runtime.md",
         "docs/architecture/artifacts-provenance-attestations.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/protocol/{id.rs,error.rs} + kernel shutdown/crash-recovery; verified under P7-P10 gates"
     },
     {
       "id": "P1-024",
@@ -801,7 +825,8 @@
         "docs/architecture/kernel-runtime.md",
         "docs/architecture/artifacts-provenance-attestations.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/protocol/{id.rs,error.rs} + kernel shutdown/crash-recovery; verified under P7-P10 gates"
     },
     {
       "id": "P1-GATE",
@@ -855,7 +880,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-002",
@@ -870,7 +896,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-003",
@@ -885,7 +912,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-004",
@@ -900,7 +928,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-005",
@@ -914,7 +943,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-006",
@@ -928,7 +958,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-007",
@@ -942,7 +973,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-008",
@@ -956,7 +988,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-009",
@@ -970,7 +1003,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-010",
@@ -984,7 +1018,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-011",
@@ -998,7 +1033,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-012",
@@ -1012,7 +1048,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-013",
@@ -1026,7 +1063,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-014",
@@ -1040,7 +1078,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-015",
@@ -1054,7 +1093,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-016",
@@ -1068,7 +1108,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-017",
@@ -1082,7 +1123,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-018",
@@ -1096,7 +1138,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-019",
@@ -1110,7 +1153,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-020",
@@ -1124,7 +1168,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-021",
@@ -1138,7 +1183,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-022",
@@ -1152,7 +1198,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-023",
@@ -1166,7 +1213,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-024",
@@ -1180,7 +1228,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-025",
@@ -1194,7 +1243,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-026",
@@ -1208,7 +1258,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-027",
@@ -1222,7 +1273,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-028",
@@ -1236,7 +1288,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-029",
@@ -1250,7 +1303,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-030",
@@ -1264,7 +1318,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-031",
@@ -1278,7 +1333,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-032",
@@ -1292,7 +1348,8 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED"
+      "status": "SATISFIED_BY_V3",
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P2-GATE",
@@ -1337,8 +1394,9 @@
         "docs/architecture/graph-engineering.md",
         "docs/api-contracts/graph-runtime-api.md"
       ],
-      "status": "NOT_STARTED",
-      "gate": true
+      "status": "SATISFIED_BY_V3",
+      "gate": true,
+      "disposition": "contract implemented and tested in crates/scheduler/src/{graph.rs,kinds.rs} + proposal.rs/service.rs; verified under P7-P10 gates"
     },
     {
       "id": "P3-001",
