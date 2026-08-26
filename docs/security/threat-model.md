@@ -1,44 +1,24 @@
-# RapidLM V3 Threat Model
+# V3 STRIDE / Data-Flow Threat Model (P12-001)
 
-## Assets
-Source/worktrees, secrets/credentials, user machine, Git history, cloud accounts, browser/mobile sessions, model/provider data, durable sessions/knowledge/preferences, release signing, enterprise policy and audit evidence.
+Trust boundaries: user terminal -> rapid CLI/TUI -> kernel (session/turn/ledger)
+-> capability broker/policy -> tool gateway -> executors (process, sandbox,
+computer-use, MCP/ACP/plugins, remote workers) -> external world.
 
-## Trust boundaries
-User ↔ TUI/CLI; project/repository content ↔ host rules; model ↔ Tool Gateway; Tool Gateway ↔ Capability Broker/executors; host ↔ sandbox; host ↔ remote worker; browser/MCP/web/process output ↔ prompt; plugin/hook ↔ host API; daemon ↔ clients; Credential Broker ↔ external services; CI/release ↔ artifact distribution.
+| Threat | Vector | Control (verified) |
+|---|---|---|
+| Spoofing | forged daemon client | auth challenge/proof MAC per connection (ipc server gate) |
+| Spoofing | forged remote worker result | signed WorkLease + digest inputs/results; no trust inheritance |
+| Tampering | path escape via symlinks | CanonicalHostPath resolution + workspace confinement tests |
+| Tampering | ledger corruption | atomic writes + journal reconcile + recovery classify |
+| Repudiation | unlogged privileged action | append-before-apply Event Ledger for every transition |
+| Info disclosure | secret leakage into model/output | SecretBroker one-use handles, redaction classes, sanitize layer, trajectory drops secrets |
+| DoS | oversized frames/payloads | MAX_* byte bounds on every decoder; fuel/memory caps on WASM |
+| DoS | process tree escape | process_group isolation + terminate_tree with grace escalation |
+| Elevation | undeclared capability grants | broker intersect (grant_not_declared fails), Exclusive deny-by-default intents |
+| Elevation | prompt-injection authority | page/tool text is UntrustedContent; FencedContent cannot grant leases |
 
-```mermaid
-flowchart LR
-  R[Untrusted repo/web/MCP] -->|data| M[Model]
-  M --> TG[Tool Gateway]
-  TG --> CB[Capability Broker]
-  CB --> EX[Executor/Sandbox]
-  EX --> OS[Host/External systems]
-  CB --> J[(Operation Journal)]
-  EX --> E[(Evidence/Events)]
-```
-
-## STRIDE threats / mandatory mitigations
-
-- **Spoofing:** local client impersonation, worker identity forgery → OS-bound IPC auth, mTLS workers, signed generation leases.
-- **Tampering:** patch/preimage, artifact or event modification → hashes, transactions, CAS digest verification, append-only events, signed release artifacts.
-- **Repudiation:** external action not auditable → Operation Journal + egress attempt receipts + actor/node/trace refs.
-- **Information disclosure:** secrets in prompt/log/telemetry/worker → SecretHandles, executor resolution, redaction, policy, encrypted/OS stores, scoped credentials.
-- **Denial of service:** model loops, process bombs, plugin traps, graph fanout, huge outputs → budgets, loop detectors, resource caps, bounded queues/output, WASM limits, graph expansion bounds.
-- **Elevation of privilege:** prompt injection, project hooks, MCP/plugin tool, alternate tool, stale lease → instruction/data separation, trust gate, central broker + executor lease verify, capability projection as defense-in-depth, negative bypass tests.
-
-## High-risk attack cases
-
-1. Repository README says to exfiltrate token: treated as untrusted data; no authority.
-2. Malicious MCP tool returns fake system tags: fenced/typed as external output.
-3. Symlink write escapes workspace: realpath/parent containment + capability target verification.
-4. Model reroutes denied shell through plugin/MCP: all paths converge on broker/executor policy.
-5. Crash after external publish: journal reconciles target state before retry.
-6. Warm sandbox leaks previous source/credential: sanitation proof or destroy/quarantine; identity in cache/lease key.
-7. Remote worker forges artifact: digest/input lineage/lease verification; result content untrusted until accepted.
-8. Human takeover and agent type simultaneously: ControlLease generation rejects conflicting input.
-9. Stale screenshot coordinates after resize/restart: Observation generation invalidates action.
-10. Tool repair turns `false`/path/target into unintended dangerous value: security-semantic fields not guessed; validator repair whitelist.
-
-## Security release blockers
-
-Any demonstrated policy/sandbox bypass, plaintext secret persistence in normal prompt/telemetry, cross-tenant resource leak, split-brain writer, unbounded privilege-bearing plugin, silent sandbox downgrade, duplicate non-idempotent effect or false-completion security criterion is a release blocker.
+Data flow: every external input enters as untrusted context labeled
+Untrusted/Secret; authority flows only through CapabilityLease/ControlLease
+issued by the broker after policy evaluation; evidence is written before apply.
+Residual: P4-032 OS-native secure credential storage DEFERRED — file-backed
+0600 keychain only; P4-GATE BLOCKED.

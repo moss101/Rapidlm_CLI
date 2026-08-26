@@ -1,0 +1,7 @@
+{
+  "code": "policy.denied",
+  "message": "Action denied by project policy",
+  "retryable": false,
+  "trace_id": "018f3c8a-7e2b-7a10-8c4d-0123456789ab",
+  "details": {}
+}

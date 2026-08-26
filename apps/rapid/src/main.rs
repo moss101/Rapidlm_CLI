@@ -2,6 +2,13 @@
 
 #![forbid(unsafe_code)]
 
-fn main() -> anyhow::Result<()> {
-    Ok(())
+fn main() {
+    match rapid::run() {
+        Ok(0) => {}
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(err.exit_code());
+        }
+    }
 }

@@ -4,3 +4,28 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+
+[dependencies]
+# protocol: ArtifactId (sha256 digest), RepoPath, ErrorCode/ApiError,
+# SandboxTier (explicit hook sandbox profile; no silent downgrade).
+protocol = { path = "../protocol" }
+# capability-broker: closed v1 capability/resource taxonomy and cancellation.
+# Plugin requested_caps must map 1:1 onto broker types (T-006).
+# Hook spawn consumes a proc.exec LeaseUseGuard issued by the caller.
+capability-broker = { path = "../capability-broker" }
+# process-supervisor: argv-first supervised spawn; parent env/stdin/pgid
+# are not inherited. Timeout vs cancel stay distinct (RLM-07-001/003).
+process-supervisor = { path = "../process-supervisor" }
+# sandbox: SandboxNetwork / no-downgrade profile bounds. Stronger tiers
+# fail closed here; this runner does not silently drop to host-restricted.
+sandbox = { path = "../sandbox" }
+# serde: MIT/Apache-2.0; versioned manifest wire objects.
+serde = { version = "1", features = ["derive"] }
+# serde_json: MIT/Apache-2.0; closed-schema decode so unknown fields/caps fail.
+serde_json = "1"
+
+# rustix: Apache-2.0/MIT; openat + O_NOFOLLOW so untrusted SKILL.md resource
+# paths cannot follow intermediate directory or swapped-file symlinks (T-003).
+# Already present in the workspace lockfile.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }

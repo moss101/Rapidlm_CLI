@@ -4,3 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+
+[dependencies]
+# protocol: SandboxTier / ErrorCode / RepoPath / LeaseId / RuntimeId are the
+# v1 wire and identity contracts used by backend selection and handles.
+protocol = { path = "../protocol" }
+# capability-broker: CapabilityLease is re-checked at prepare/exec; CancellationToken
+# is the cooperative cancel contract; CanonicalHostPath / SecretHandle are
+# already-normalized mount sources and opaque secret ids.
+capability-broker = { path = "../capability-broker" }

@@ -4,3 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+
+[dependencies]
+# protocol: WorkspaceViewId / AgentId / RepoId are the v1 typed identity contract.
+protocol = { path = "../protocol" }
+# serde: MIT/Apache-2.0; versioned workspace-view wire objects.
+serde = { version = "1", features = ["derive"] }
+# serde_json: MIT/Apache-2.0; closed-schema decode so unknown fields/kinds fail.
+serde_json = "1"

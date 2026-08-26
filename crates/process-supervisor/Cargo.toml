@@ -4,3 +4,26 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+
+[dependencies]
+# protocol: JobId is the v1 lifecycle identity; ErrorCode maps spawn failures.
+# ArtifactId hashes the executor-side action digest so spawn can re-check the
+# lease action_hash without calling crate-private ActionFingerprint::of.
+protocol = { path = "../protocol" }
+# capability-broker: LeaseUseGuard is consumed immediately before spawn
+# (RLM-03-policy-workspace-009). CanonicalHostPath / CancellationToken /
+# ShellMode are the normalized argv-first exec contract.
+capability-broker = { path = "../capability-broker" }
+# auth: SecretAwareValue is the SecretOrValue env binding (RLM-01-foundation-010).
+# Handles stay opaque; spawn fails closed instead of inheriting or resolving them.
+auth = { path = "../auth" }
+# event-ledger: ArtifactStore is the immutable digest sink for overflow
+# (RLM-01-foundation-012). Spill temps live under the store root, not OS tempdir.
+# JobRegistry journals job.started/completed through EventLedger (RLM-02-kernel-ledger-005).
+event-ledger = { path = "../event-ledger" }
+# serde: MIT/Apache-2.0; versioned job records and running tombstones on disk.
+serde = { version = "1", features = ["derive"] }
+# serde_json: MIT/Apache-2.0; ledger payloads and job-file encode/decode.
+serde_json = "1"
+# rustix: safe POSIX openpt/grantpt/unlockpt/ptsname for PTY allocation (P7-003).
+rustix = { version = "0.38", features = ["pty", "termios", "std"] }

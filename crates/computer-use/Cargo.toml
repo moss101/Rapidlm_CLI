@@ -4,3 +4,19 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+
+[dependencies]
+# protocol: RuntimeId / ArtifactRef / ErrorCode / RedactionClass for session
+# identity, preserved traces, and public error mapping.
+protocol = { path = "../protocol" }
+# event-ledger: ArtifactStore persists requested Playwright traces (RLM-01-foundation-012).
+event-ledger = { path = "../event-ledger" }
+# capability-broker: CancellationToken is the cooperative cancel contract used
+# at session launch and crash cleanup.
+capability-broker = { path = "../capability-broker" }
+
+[dev-dependencies]
+# Integration fixtures name ArtifactStore / lease / ErrorCode types directly.
+capability-broker = { path = "../capability-broker" }
+event-ledger = { path = "../event-ledger" }
+protocol = { path = "../protocol" }

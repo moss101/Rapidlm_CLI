@@ -4,3 +4,19 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+
+[dependencies]
+# protocol: ErrorCode / TraceContext / ArtifactRef are the v1 public contracts
+# (RLM-01-foundation-004, RLM-01-foundation-014).
+protocol = { path = "../protocol" }
+# auth: CredentialStore / SecretRef. Router resolves handles only; plaintext
+# stays out of model/config objects (RLM-01-foundation-011).
+auth = { path = "../auth" }
+# serde: MIT/Apache-2.0; versioned provider/model wire objects.
+serde = { version = "1", features = ["derive"] }
+# serde_json: MIT/Apache-2.0; usage objects retain unknown provider fields.
+serde_json = "1"
+
+[dev-dependencies]
+# proptest: MIT/Apache-2.0; required by hard-filter exclusion property tests.
+proptest = "1"

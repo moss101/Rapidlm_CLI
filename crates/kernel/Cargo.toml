@@ -4,3 +4,32 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+
+[dependencies]
+# protocol: workspace RapidConfig schema and typed decode used after merge.
+# TraceContext is the start-context correlation handle for lifecycle services.
+protocol = { path = "../protocol" }
+# event-ledger: EventEnvelope/EventKind are the replay input. Kernel projects
+# them; event-ledger does not depend on kernel.
+event-ledger = { path = "../event-ledger" }
+# auth: OS-user-bound daemon token challenge/proof gate on IPC connections.
+auth = { path = "../auth" }
+# serde: MIT/Apache-2.0; HealthSnapshot and SessionSnapshot are versioned
+# kernel contracts. derive is used for the projection document.
+serde = { version = "1", features = ["derive"] }
+# serde_json: MIT/Apache-2.0; merge walks the same JSON object tree
+# that protocol::RapidConfig validates. No smaller std alternative.
+serde_json = "1"
+# toml: MIT/Apache-2.0; user/workspace files are TOML. Protocol decodes
+# JSON only so this crate owns the file-format boundary.
+toml = "0.8"
+
+[dev-dependencies]
+# event-ledger / protocol / serde_json: already runtime deps; listed so the
+# crash-recovery integration test can open the same file-backed ledger as the
+# child fixture (Cargo does not expose [dependencies] to tests/*.rs).
+event-ledger = { path = "../event-ledger" }
+# auth: OS-user-bound daemon token challenge/proof gate on IPC connections.
+auth = { path = "../auth" }
+protocol = { path = "../protocol" }
+serde_json = "1"

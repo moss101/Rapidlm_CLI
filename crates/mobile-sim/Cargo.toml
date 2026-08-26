@@ -4,3 +4,18 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+
+[dependencies]
+# protocol: RuntimeId / ErrorCode identify device handles and public errors.
+protocol = { path = "../protocol" }
+# event-ledger: ArtifactStore persists bounded mobile trace manifests/logs
+# (RLM-01-foundation-012).
+event-ledger = { path = "../event-ledger" }
+# capability-broker: CancellationToken is the cooperative cancel contract used
+# at acquire/boot/stop. MobileScope/DeviceId inform serial identity bounds.
+capability-broker = { path = "../capability-broker" }
+
+[dev-dependencies]
+# Integration fixtures name CancellationToken / ErrorCode on production mocks.
+capability-broker = { path = "../capability-broker" }
+protocol = { path = "../protocol" }

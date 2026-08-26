@@ -909,10 +909,11 @@ let verify_jobs = [];
 let vmap = [];
 let vi = 0;
 for t in ready {
+    // execute: run cargo/tests. Do not use read-only; cargo writes target/ and Shell is denied.
     verify_jobs.push(#{
         prompt: verify_prompt(t, impls[vi], mode),
         label: "verify:" + as_str(t.task_id),
-        capability_mode: "read-only",
+        capability_mode: "execute",
         output_schema: verify_schema,
     });
     vmap.push(#{ kind: "verify", index: vi });
@@ -921,7 +922,7 @@ for t in ready {
         verify_jobs.push(#{
             prompt: security_review_prompt(t, impls[vi]),
             label: "security:" + as_str(t.task_id),
-            capability_mode: "read-only",
+            capability_mode: "execute",
             output_schema: verify_schema,
         });
         vmap.push(#{ kind: "security", index: vi });
@@ -1010,7 +1011,7 @@ if repair_jobs.len() > 0 {
         re_jobs.push(#{
             prompt: verify_prompt(ready[idx], impls[idx], mode),
             label: "reverify:" + as_str(ready[idx].task_id),
-            capability_mode: "read-only",
+            capability_mode: "execute",
             output_schema: verify_schema,
         });
     }
@@ -1067,7 +1068,7 @@ for t in ready {
 
 let ledger_path = write_scratch_file("ledger.json", json_encode(ledger));
 
-if passed.len() > 0 && mode != "verify" {
+if passed.len() > 0 {
     log("Integrating " + passed.len().to_string() + " verifier-passed tasks");
     let integ = agent(
         integrate_prompt(passed, mode),
@@ -1091,7 +1092,7 @@ if run_gate {
     log("Launching fresh phase-gate verifier for " + phase_id);
     let gate = agent(
         phase_gate_prompt(phase_id, completed_ids),
-        #{ label: "phase-gate:" + phase_id, capability_mode: "read-only", output_schema: phase_gate_schema },
+        #{ label: "phase-gate:" + phase_id, capability_mode: "execute", output_schema: phase_gate_schema },
     );
     let gate_status = "unavailable";
     if gate != () && gate.success && gate.output != () { gate_status = as_str(gate.output.verification); }

@@ -11,6 +11,8 @@
   "scripts": {
     "build": "pnpm --filter @rapidlm/sdk build",
     "typecheck": "pnpm --filter @rapidlm/sdk typecheck",
+    "generate": "pnpm --filter @rapidlm/sdk generate",
+    "generate:check": "pnpm --filter @rapidlm/sdk generate:check",
     "test": "pnpm --filter @rapidlm/sdk test"
   }
 }

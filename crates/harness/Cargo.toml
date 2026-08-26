@@ -4,3 +4,15 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+
+[dependencies]
+# agent-runtime: verified orchestration supervisor and typed contracts.
+agent-runtime = { path = "../agent-runtime" }
+# event-ledger: durable append path for orchestration transitions.
+event-ledger = { path = "../event-ledger" }
+# protocol: session/actor identifiers and RapidConfig activation flag.
+protocol = { path = "../protocol" }
+# serde_json: MIT/Apache-2.0; orchestration event payloads.
+serde_json = "1"
+# serde: MIT/Apache-2.0; versioned Scenario/Fixture wire schemas.
+serde = { version = "1", features = ["derive"] }

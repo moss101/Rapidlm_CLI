@@ -1,0 +1,96 @@
+# Baseline PR/push CI: fmt, lint, test, schema fixtures, SDK typecheck/test.
+# Toolchains/lockfiles are pinned (rust-toolchain.toml 1.97.1, Node 24.19.0,
+# pnpm 11.20.0, Cargo.lock, pnpm-lock.yaml). This workflow never maps
+# secrets.* — pull_request jobs must not receive signing or provider credentials.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUST_TOOLCHAIN: "1.97.1"
+  NODE_VERSION: "24.19.0"
+  PNPM_VERSION: "11.20.0"
+  # Schema goldens must never rewrite in CI.
+  UPDATE_SCHEMA_FIXTURES: "0"
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal --no-self-update --component rustfmt --component clippy
+          rustup override set "${RUST_TOOLCHAIN}"
+          rustc --version
+          cargo --version
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Schema fixtures
+        run: cargo test --locked -p protocol --test schema_fixtures
+
+  sdk:
+    name: sdk
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Enable pinned pnpm
+        run: |
+          corepack enable
+          corepack prepare "pnpm@${PNPM_VERSION}" --activate
+          pnpm --version
+
+      - name: Install SDK workspace
+        run: pnpm install --frozen-lockfile
+
+      - name: Check generated SDK wire types
+        run: pnpm generate:check
+
+      - name: Typecheck SDK
+        run: pnpm typecheck
+
+      - name: Test SDK
+        run: pnpm test

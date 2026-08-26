@@ -4,3 +4,16 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+
+[dependencies]
+# protocol: AgentId / EvidenceId / WorkspaceViewId / ArtifactRef / ModelPolicyName
+# are the v1 identity and artifact contracts this lifecycle model serializes.
+protocol = { path = "../protocol" }
+# workspace: ViewRegistry / GitWorktreeStore allocate isolated child views.
+workspace = { path = "../workspace" }
+# serde: MIT/Apache-2.0; versioned AgentSpec / AgentResult wire objects.
+serde = { version = "1", features = ["derive"] }
+# serde_json: MIT/Apache-2.0; closed-schema decode so unknown fields/kinds fail.
+serde_json = "1"
+# sha2: MIT/Apache-2.0; attestation digests are content-addressed SHA-256.
+sha2 = "0.10"

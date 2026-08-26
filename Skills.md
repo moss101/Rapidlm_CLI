@@ -1,3 +1,3 @@
-# Skills.md
+# SKILLS.md
 
-Canonical development skills and activation rules live in [`SKILLS.md`](SKILLS.md).
+Canonical skill governance is [`skills.md`](skills.md).

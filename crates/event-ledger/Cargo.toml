@@ -4,3 +4,39 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+
+[dependencies]
+# protocol: workspace ArtifactId / ArtifactRef / RedactionClass wire types.
+protocol = { path = "../protocol" }
+# rusqlite: MIT, small, maintained SQLite bindings. `bundled` avoids a system libsqlite3
+# trust/deploy dependency. Alternative (sqlx) is async-first and heavier than this sync apply().
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+# serde: MIT/Apache-2.0; required for the event envelope / kind registry wire contract.
+serde = { version = "1", features = ["derive"] }
+# serde_json: MIT/Apache-2.0; erased payload Value and golden fixture serialization.
+serde_json = "1"
+# sha2: MIT/Apache-2.0, tiny, maintained. Streaming content-address uses SHA-256;
+# std has no SHA-256 and DefaultHasher is not a content-address algorithm.
+sha2 = "0.10"
+# flate2: MIT/Apache-2.0; deflate for hashed projection checkpoints.
+# rust_backend avoids a C libz deploy/trust dependency. Alternative (zstd)
+# is larger and not needed at this snapshot size.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[dev-dependencies]
+# rusqlite: same bundled SQLite as the crate; used to stamp frozen prior-schema
+# fixtures. Cargo does not expose [dependencies] to tests/*.rs.
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+# protocol: SessionId / ProjectId / TraceId / RedactionClass for fixture rows
+# and post-migrate replay through the public ledger API.
+protocol = { path = "../protocol" }
+# serde_json: MIT/Apache-2.0; projection invariant documents compared after
+# open→migrate→replay.
+serde_json = "1"
+
+# criterion: MIT/Apache-2.0; P10-030 replay/render micro-benchmark harness.
+criterion = "0.5"
+
+[[bench]]
+name = "replay"
+harness = false

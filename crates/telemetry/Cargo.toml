@@ -4,3 +4,16 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+
+[dependencies]
+# protocol: TraceContext / TelemetryConfig / typed correlation IDs. This crate
+# sits beside auth/event-ledger and must not depend on security/sandbox.
+protocol = { path = "../protocol" }
+# serde: MIT/Apache-2.0; local and OTLP-shaped records are JSON objects.
+serde = { version = "1", features = ["derive"] }
+# serde_json: MIT/Apache-2.0; already a protocol dep. Used to serialize
+# redacted records for local/OTLP sinks (never to parse untrusted prompts).
+serde_json = "1"
+# sha2: MIT/Apache-2.0, tiny, maintained. Canary fingerprints identify a
+# redaction hit without logging plaintext. std has no SHA-256.
+sha2 = "0.10"

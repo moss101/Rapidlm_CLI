@@ -4,3 +4,32 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+
+[dependencies]
+# crossterm: MIT. Terminal raw-mode / alternate-screen / cursor control used by
+# the production backend. termion is Unix-only; ncurses requires unsafe FFI.
+crossterm = "0.28"
+# protocol: typed Session/Agent/Goal/Job IDs used as projection map keys.
+protocol = { path = "../protocol" }
+# event-ledger: ErasedEventEnvelope / EventKind are the kernel event inputs.
+# event-ledger does not depend on this crate.
+event-ledger = { path = "../event-ledger" }
+# kernel: SessionSnapshot is the durable projection this frontend caches.
+# TUI never mutates kernel state; it only folds snapshots/events.
+kernel = { path = "../kernel" }
+# workspace: MergePreview / ExternalMutation / PatchOp are observational
+# change-set inputs. The diff panel projects them and never applies them.
+workspace = { path = "../workspace" }
+# context-engine: ContextPacket is the compiled-context observation the
+# inspector projects. The panel never compiles or writes pins itself.
+context-engine = { path = "../context-engine" }
+# llm-router: CatalogSnapshot / RouteRequest / hard_constraints are the
+# model-selector observations. The panel never routes or persists pins.
+llm-router = { path = "../llm-router" }
+# agent-runtime: PatchSummary is the compact AgentResult change-set
+# observation accepted by DiffViewModel.
+agent-runtime = { path = "../agent-runtime" }
+# serde: MIT/Apache-2.0; AppState golden replay compares serialized form.
+serde = { version = "1", features = ["derive"] }
+# serde_json: MIT/Apache-2.0; event payloads are erased JSON objects.
+serde_json = "1"

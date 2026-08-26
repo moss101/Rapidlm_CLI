@@ -4,3 +4,25 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+
+[dependencies]
+# uuid: MIT/Apache-2.0, maintained UUIDv7 generator; no smaller std alternative.
+uuid = { version = "1", features = ["v7"] }
+# serde: MIT/Apache-2.0; required for the wire contract (lowercase UUID strings).
+serde = { version = "1", features = ["derive"] }
+# serde_json: MIT/Apache-2.0; already used for protocol goldens. Config documents
+# are walked as JSON objects so unknown keys are detectable for strict validation
+# without adding a TOML parser to this crate (workspace files stay TOML at load).
+serde_json = "1"
+# sha2: MIT/Apache-2.0, tiny, maintained. ArtifactId is sha256:<hex>; std has no
+# SHA-256 and DefaultHasher is not a content-address algorithm.
+sha2 = "0.10"
+
+[dev-dependencies]
+# proptest: MIT/Apache-2.0; required by the ID round-trip property tests.
+proptest = "1"
+# serde/serde_json: already runtime deps; listed so the schema-fixture
+# integration test can serialize public wire types (Cargo does not expose
+# [dependencies] to tests/*.rs).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

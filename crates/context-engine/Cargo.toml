@@ -4,3 +4,90 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+
+[dependencies]
+# protocol: workspace RepoId contract used as the stable repository identity.
+protocol = { path = "../protocol" }
+# rusqlite: MIT, small, maintained SQLite bindings. `bundled` avoids a system
+# libsqlite3 trust/deploy dependency. Same crate/version as event-ledger so the
+# FTS5 cache matches the normative `context_chunks` / `context_fts` schema.
+# Alternative (sqlx) is async-first and heavier than this sync writer.
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+# serde: MIT/Apache-2.0; decode the workspace TOML object tree so unknown keys
+# are detectable before validation. No smaller std alternative.
+serde = { version = "1", features = ["derive"] }
+# serde_json: MIT/Apache-2.0; already in the workspace lockfile. Used only as
+# the structured-text JSON strategy (validity, not a second parser family).
+serde_json = "1"
+# sha2: MIT/Apache-2.0, tiny, maintained. RepoId is derived from the
+# canonical root; std has no SHA-256 and DefaultHasher is not stable.
+sha2 = "0.10"
+# regex: MIT/Apache-2.0; already in the workspace lockfile. In-process
+# ripgrep-compatible exact/regex search so lexical retrieval does not depend
+# on a host `rg` binary. Alternative (std) has no regex engine.
+regex = "1"
+# toml: MIT/Apache-2.0; workspace manifests are TOML. Protocol decodes JSON
+# only so this crate owns the file-format boundary. Also the TOML
+# structured-text parse strategy.
+toml = "0.8"
+# tree-sitter: MIT, maintained incremental CST library required by ADR 0004 /
+# FR-CTX-002. Language grammars are optional Cargo features so unsupported
+# languages degrade explicitly instead of inventing a parser.
+tree-sitter = "0.24.7"
+tree-sitter-go = { version = "0.23.4", optional = true }
+tree-sitter-javascript = { version = "0.23.1", optional = true }
+tree-sitter-python = { version = "0.23.6", optional = true }
+# 0.23.3 is ABI 14, matching tree-sitter 0.24.7. 0.24.2 is ABI 15 and
+# is rejected by set_language.
+tree-sitter-rust = { version = "0.23.3", optional = true }
+tree-sitter-typescript = { version = "0.23.2", optional = true }
+
+[features]
+default = ["parsers-tier1"]
+# Tier-1 parsers are explicit features. Missing grammar crates still have
+# registry entries and return a structured degraded outcome.
+parsers-tier1 = [
+    "lang-rust",
+    "lang-typescript",
+    "lang-javascript",
+    "lang-python",
+    "lang-go",
+    "lang-java",
+    "lang-c",
+    "lang-cpp",
+    "lang-csharp",
+    "lang-kotlin",
+    "lang-swift",
+    "lang-ruby",
+    "lang-bash",
+    "structured-text",
+]
+lang-rust = ["dep:tree-sitter-rust"]
+lang-typescript = ["dep:tree-sitter-typescript"]
+lang-javascript = ["dep:tree-sitter-javascript"]
+lang-python = ["dep:tree-sitter-python"]
+lang-go = ["dep:tree-sitter-go"]
+lang-java = []
+lang-c = []
+lang-cpp = []
+lang-csharp = []
+lang-kotlin = []
+lang-swift = []
+lang-ruby = []
+lang-bash = []
+structured-text = []
+
+[dev-dependencies]
+# serde_json is a runtime dep; tests reuse it for goldens.
+
+# Gold-query runner (JSONL in, machine-readable metrics artifact out).
+# Custom harness: this is an eval runner, not a libtest micro-bench.
+[[bench]]
+name = "eval_queries"
+harness = false
+
+# Same runner under `cargo test` so metric invariants run in CI.
+[[test]]
+name = "eval_queries"
+path = "benches/eval_queries.rs"
+harness = false

@@ -9,5 +9,48 @@ publish = false
 name = "rapid"
 path = "src/main.rs"
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 anyhow.workspace = true
+# agent-runtime: canonical AgentExecutor + ContextController/ContextRetryPolicy
+# recovery seam. The composition root is the host that owns live context.
+agent-runtime = { path = "../../crates/agent-runtime" }
+acp = { path = "../../crates/acp" }
+# context-engine: single Context Fabric authority (compile + compact_packet)
+# reused by the live-context recovery host.
+context-engine = { path = "../../crates/context-engine" }
+# process-supervisor + agent-pool: P7 process/monitor/trigger/resource-pool
+# runtime subsystems composed by the HostRuntime.
+process-supervisor = { path = "../../crates/process-supervisor" }
+agent-pool = { path = "../../crates/agent-pool" }
+scheduler = { path = "../../crates/scheduler" }
+mcp = { path = "../../crates/mcp" }
+security = { path = "../../crates/security" }
+insights = { path = "../../crates/insights" }
+knowledge = { path = "../../crates/knowledge" }
+# capability-broker: Capability/Policy/Lease authority for tool dispatch.
+capability-broker = { path = "../../crates/capability-broker" }
+# computer-use: browser/desktop/mobile observation+action leaf systems.
+computer-use = { path = "../../crates/computer-use" }
+mobile-sim = { path = "../../crates/mobile-sim" }
+# protocol: SessionId / ApiError / ErrorCode are the JSONL record and exit-code surface.
+protocol = { path = "../../crates/protocol" }
+# event-ledger: ErasedEventEnvelope / EventKind are the kernel event inputs mapped
+# onto JSONL records. event-ledger does not depend on this crate.
+event-ledger = { path = "../../crates/event-ledger" }
+# kernel: in-process KernelClient, project trust, config load, and service graph.
+# This crate is a composition root and does not own those domain rules.
+kernel = { path = "../../crates/kernel" }
+# tui: terminal lifecycle, reducer, and slash-command dispatch. Domain state
+# stays in the kernel; this crate only projects and forwards commands.
+tui = { path = "../../crates/tui" }
+# crossterm: MIT. Production interactive input poll after TerminalGuard raw mode.
+# The tui crate already uses this backend; tests inject a scripted source.
+crossterm = "0.28"
+# serde: MIT/Apache-2.0; JsonlRecord is a versioned stdout wire contract.
+serde = { version = "1", features = ["derive"] }
+# serde_json: MIT/Apache-2.0; compact one-object-per-line encoding.
+# `raw_value` keeps ApiError field order inside `data` instead of sorting keys.
+serde_json = { version = "1", features = ["raw_value"] }

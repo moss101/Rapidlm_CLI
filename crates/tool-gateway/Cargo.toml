@@ -4,3 +4,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+
+[dependencies]
+# protocol: ArtifactId content-address and ToolInvalidArguments (RLM-01-foundation-004/005).
+protocol = { path = "../protocol" }
+# capability-broker: evaluate/issue/validate_use on the privileged dispatch path
+# (RLM-03-policy-workspace-009). LeaseUseGuard is consumed by executors.
+capability-broker = { path = "../capability-broker" }
+# serde: MIT/Apache-2.0; canonical catalog hash document field order.
+serde = { version = "1", features = ["derive"] }
+# serde_json: MIT/Apache-2.0; model-visible JSON Schema objects.
+serde_json = "1"
