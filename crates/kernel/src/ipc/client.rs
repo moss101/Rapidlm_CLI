@@ -1008,11 +1008,21 @@ fn set_timeouts(
     read: Option<Duration>,
     limits: IpcLimits,
 ) -> Result<(), IpcError> {
-    stream.set_nonblocking(false).map_err(|_| IpcError::Io)?;
-    stream.set_read_timeout(read).map_err(|_| IpcError::Io)?;
-    stream
-        .set_write_timeout(Some(limits.io_timeout()))
-        .map_err(|_| IpcError::Io)?;
+    // Once the peer has closed (EOF), macOS/BSD reject SO_RCVTIMEO and
+    // SO_SNDTIMEO with EINVAL even though the fd is valid and queued bytes
+    // remain readable. All durations here are internally controlled (limits
+    // are validated, and this stream's options were first set at dial time),
+    // so InvalidInput can only reflect that peer-closed state. Re-arming a
+    // timeout is flow control, not correctness: the next read still yields
+    // the queued bytes and then EOF, driving the normal resume path.
+    let tolerate = |res: std::io::Result<()>| match res {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+        Err(err) => Err(err),
+    };
+    tolerate(stream.set_nonblocking(false)).map_err(|_| IpcError::Io)?;
+    tolerate(stream.set_read_timeout(read)).map_err(|_| IpcError::Io)?;
+    tolerate(stream.set_write_timeout(Some(limits.io_timeout()))).map_err(|_| IpcError::Io)?;
     Ok(())
 }
 

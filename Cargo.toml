@@ -10,7 +10,6 @@ members = [
     "crates/scheduler",
     "crates/context-engine",
     "crates/knowledge",
-    "crates/playbooks",
     "crates/tool-gateway",
     "crates/capability-broker",
     "crates/process-supervisor",

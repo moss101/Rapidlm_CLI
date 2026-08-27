@@ -29,4 +29,6 @@ Negative claims (MISSING/STUB) cite search: empty `src/lib.rs` (`#![forbid(unsaf
 | harness | ADAPT | CODE-VERIFIED | eval surface | re-exports supervisor + ledger sink |
 | handoff, agent-pool, trajectory, knowledge, insights, playbooks | INVESTIGATE/BUILD | CODE-VERIFIED empty | as named | do not DELETE working primitives elsewhere |
 
+**Status update (2026-08-27):** the empty-crate observations above are point-in-time (2026-08-24) and have since been resolved: `handoff`, `trajectory`, `knowledge`, `insights`, and `agent-pool` are implemented and tested (P7–P13 gates VERIFIED), and the still-empty `playbooks` crate was removed from the workspace — the PlaybookCompiler lives in `crates/scheduler/src/playbook.rs`. The matrix text is retained as the phase-0 record.
+
 **REPLACE/DELETE:** none. `agent-pool` remains INVESTIGATE (overlap with `agent-runtime` scheduler).
