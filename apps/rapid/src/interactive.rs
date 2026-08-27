@@ -34,14 +34,15 @@ use tui::{
     RecordingBackend, TerminalError, TerminalGuard, dispatch, parse_command, reduce,
 };
 
-use crate::goal_host::{GOAL_FILE, GoalHost};
+use crate::goal_host::{EVIDENCE_FILE, GOAL_FILE, SESSIONS_DB_FILE, GoalHost};
 use crate::headless::jsonl::JsonlExitCode;
 use crate::host::{NoopTools, PreservedLiveContext, UnconfiguredModel, run_live_exec};
 use crate::model::{ConfiguredModel, SelectedModel};
 use crate::user_config::ModelSelection;
 use agent_runtime::{
-    AgentExecutionRequest, AgentRole, AgentSpec, AgentTerminalStatus, ContextRetryPolicy, GoalActor,
-    GoalBudget, GoalCommand, GoalSnapshot, GoalSpec, GoalState,
+    AgentExecutionRequest, AgentRole, AgentSpec, AgentTerminalStatus, ContextRetryPolicy,
+    EvidenceKind, EvidenceLedgerRef, EvidenceProducer, EvidenceSpec, EvidenceStatus, GoalActor,
+    GoalBudget, GoalCommand, GoalSnapshot, GoalSpec, GoalState, TEST_PASSED,
 };
 
 /// Bound on ancestors inspected while locating `.rapidlm` / `.git`.
@@ -312,6 +313,7 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
     };
     let cancel = agent_runtime::CancellationToken::new();
     let path = Path::new(PROJECT_MARKER).join(GOAL_FILE);
+    let evidence_path = Path::new(PROJECT_MARKER).join(EVIDENCE_FILE);
     let mut host = match GoalHost::load(&path) {
         Ok(host) => host.unwrap_or_else(GoalHost::new),
         Err(err) => {
@@ -319,6 +321,18 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
             return Ok(1);
         }
     };
+    // Durable-ledger backing for agent-produced evidence citations. Without
+    // the ledger the gate stays fail-closed for agent records; human and
+    // system records are unaffected.
+    match event_ledger::ledger::EventLedger::open(Path::new(PROJECT_MARKER).join(SESSIONS_DB_FILE))
+    {
+        Ok(ledger) => host.install_backing(ledger),
+        Err(err) => eprintln!("ledger unavailable ({err}); agent evidence cannot be backed"),
+    }
+    if let Err(err) = host.load_evidence(&evidence_path) {
+        eprintln!("{err}");
+        return Ok(1);
+    }
 
     let result = match sub {
         "create" | "replace" => {
@@ -368,8 +382,39 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
             Ok(0)
         }
         "verify" => {
-            println!("complete: {}", host.can_complete(&cancel));
+            if host.snapshot().is_none() {
+                println!("no active goal");
+                return Ok(1);
+            }
+            let allowed = host.can_complete(&cancel);
+            println!("complete: {allowed}");
+            if let Some(verdicts) = host.validate(&cancel) {
+                for verdict in verdicts.verdicts() {
+                    if verdict.satisfied() {
+                        println!("- criterion {}: satisfied", verdict.criterion_id());
+                    } else {
+                        let reason = verdict
+                            .reason()
+                            .map(|r| r.as_str())
+                            .unwrap_or("unsatisfied");
+                        println!(
+                            "- criterion {}: unsatisfied ({reason})",
+                            verdict.criterion_id()
+                        );
+                    }
+                }
+            }
             Ok(0)
+        }
+        "evidence" => {
+            let Some(action) = args.get(1).map(String::as_str) else {
+                return Err(InteractiveError::Usage);
+            };
+            match action {
+                "record" => goal_evidence_record(&mut host, &args[2..]),
+                "list" => goal_evidence_list(&host),
+                _ => Err(InteractiveError::Usage),
+            }
         }
         _ => Err(InteractiveError::Usage),
     }?;
@@ -378,7 +423,160 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
         eprintln!("{err}");
         return Ok(1);
     }
+    if let Err(err) = host.save_evidence(&evidence_path) {
+        eprintln!("{err}");
+        return Ok(1);
+    }
     Ok(result)
+}
+
+/// Parse `--key value` pairs into a map. Unknown shapes are a usage error.
+fn parse_flags(args: &[String]) -> Result<std::collections::BTreeMap<String, String>, InteractiveError> {
+    let mut flags = std::collections::BTreeMap::new();
+    let mut idx = 0;
+    while idx < args.len() {
+        let key = args[idx]
+            .strip_prefix("--")
+            .filter(|k| !k.is_empty())
+            .ok_or(InteractiveError::Usage)?;
+        let value = args.get(idx + 1).ok_or(InteractiveError::Usage)?;
+        flags.insert(key.to_owned(), value.clone());
+        idx += 2;
+    }
+    Ok(flags)
+}
+
+fn goal_evidence_record(host: &mut GoalHost, args: &[String]) -> Result<i32, InteractiveError> {
+    let flags = parse_flags(args)?;
+    let Some(snapshot) = host.snapshot() else {
+        println!("no active goal");
+        return Ok(1);
+    };
+    let kind: EvidenceKind = flags
+        .get("kind")
+        .ok_or(InteractiveError::Usage)?
+        .parse()
+        .map_err(|_| InteractiveError::Usage)?;
+    let status = match flags.get("status") {
+        Some(raw) => raw
+            .parse::<EvidenceStatus>()
+            .map_err(|_| InteractiveError::Usage)?,
+        None => EvidenceStatus::Passed,
+    };
+    let producer = match flags.get("producer").map(String::as_str) {
+        None | Some("human") => EvidenceProducer::Human,
+        Some("system") => EvidenceProducer::System,
+        Some(role @ ("main-agent" | "subagent")) => {
+            let agent_id = flags
+                .get("agent-id")
+                .map(|id| id.parse::<protocol::AgentId>())
+                .transpose()
+                .map_err(|_| InteractiveError::Usage)?;
+            let agent_id = agent_id.ok_or(InteractiveError::Usage)?;
+            if role == "main-agent" {
+                EvidenceProducer::MainAgent { agent_id }
+            } else {
+                EvidenceProducer::Subagent { agent_id }
+            }
+        }
+        Some(_) => return Err(InteractiveError::Usage),
+    };
+    // `test_passed` is reserved for passing test evidence; anything else is
+    // stamped with its kind so the record stays descriptive but honest.
+    let assertion = match flags.get("assertion") {
+        Some(text) => text.clone(),
+        None if kind == EvidenceKind::Test => TEST_PASSED.to_owned(),
+        None => kind.as_str().to_owned(),
+    };
+    let subject = flags.get("subject").cloned().unwrap_or_else(|| "goal".to_owned());
+    let source_hash = protocol::ArtifactId::from_bytes(
+        flags
+            .get("source-hash")
+            .unwrap_or(&assertion)
+            .as_bytes(),
+    );
+    let mut spec = EvidenceSpec::new(
+        protocol::EvidenceId::new(),
+        snapshot.id(),
+        kind,
+        assertion,
+        producer,
+        agent_runtime::EvidenceSource::new(source_hash),
+        status,
+        subject,
+    )
+    .map_err(|err| {
+        eprintln!("{err}");
+        InteractiveError::Usage
+    })?;
+    if let Some(criterion) = flags.get("criterion") {
+        spec = spec.with_criterion_id(criterion.clone()).map_err(|err| {
+            eprintln!("{err}");
+            InteractiveError::Usage
+        })?;
+    }
+    if let Some(command) = flags.get("command") {
+        spec = spec.with_command(command.clone()).map_err(|err| {
+            eprintln!("{err}");
+            InteractiveError::Usage
+        })?;
+    }
+    match (
+        flags.get("session"),
+        flags.get("seq"),
+        flags.get("event-id"),
+    ) {
+        (None, None, None) => {}
+        (Some(session), Some(seq), Some(event_id)) => {
+            let session = session
+                .parse::<protocol::SessionId>()
+                .map_err(|_| InteractiveError::Usage)?;
+            let seq = seq.parse::<u64>().map_err(|_| InteractiveError::Usage)?;
+            let citation = EvidenceLedgerRef::new(session, event_id.clone(), seq).map_err(|err| {
+                eprintln!("{err}");
+                InteractiveError::Usage
+            })?;
+            spec = spec.with_ledger_ref(citation);
+        }
+        _ => return Err(InteractiveError::Usage),
+    }
+    let record = host.record_evidence(spec).map_err(|err| {
+        eprintln!("{err}");
+        InteractiveError::Internal
+    })?;
+    println!(
+        "recorded {} kind={} status={} producer={}",
+        record.id(),
+        record.kind(),
+        record.status(),
+        record.producer()
+    );
+    Ok(0)
+}
+
+fn goal_evidence_list(host: &GoalHost) -> Result<i32, InteractiveError> {
+    let store = host.evidence().store();
+    if store.is_empty() {
+        println!("no evidence recorded");
+        return Ok(1);
+    }
+    for record in store.records() {
+        let criterion = record.criterion_id().unwrap_or("-");
+        println!(
+            "{} kind={} status={} freshness={} producer={} criterion={}{}",
+            record.id(),
+            record.kind(),
+            record.status(),
+            record.freshness(),
+            record.producer(),
+            criterion,
+            record
+                .ledger_ref()
+                .map(|_| " backed=ledger")
+                .unwrap_or(""),
+        );
+    }
+    Ok(0)
 }
 
 fn goal_lifecycle(

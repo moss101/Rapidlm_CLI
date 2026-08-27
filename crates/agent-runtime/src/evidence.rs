@@ -8,7 +8,7 @@ use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
 
-use protocol::{AgentId, ArtifactId, ArtifactRef, ErrorCode, EvidenceId, GoalId};
+use protocol::{AgentId, ArtifactId, ArtifactRef, ErrorCode, EvidenceId, GoalId, SessionId};
 use serde::de::{self, Deserializer};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
@@ -61,9 +61,12 @@ const RECORD_FIELDS: &[&str] = &[
     "subject_ref",
     "artifact_ref",
     "command",
+    "ledger_ref",
 ];
 
 const SOURCE_FIELDS: &[&str] = &["hash", "locator"];
+
+const LEDGER_REF_FIELDS: &[&str] = &["session_id", "event_id", "seq"];
 
 const PRODUCER_FIELDS: &[&str] = &["kind", "agent_id"];
 
@@ -145,6 +148,7 @@ pub enum CriterionUnsatisfied {
     MissingCommand,
     InvalidTestPassed,
     UnknownKind,
+    UnbackedEvidence,
 }
 
 /// Content-addressed origin of an observation. Hash is required.
@@ -153,6 +157,82 @@ pub struct EvidenceSource {
     hash: ArtifactId,
     locator: Option<String>,
 }
+
+/// Maximum UTF-8 bytes for a wire-form ledger event id (UUID text is 36).
+pub const MAX_EVENT_REF_BYTES: usize = 64;
+
+/// Durable ledger location an agent-produced record must cite. The gate
+/// resolves it against the real event ledger; a reference that does not
+/// resolve (wrong session, missing row, non-tool kind) is not evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct EvidenceLedgerRef {
+    session_id: SessionId,
+    event_id: String,
+    seq: u64,
+}
+
+impl EvidenceLedgerRef {
+    pub fn new(
+        session_id: SessionId,
+        event_id: impl Into<String>,
+        seq: u64,
+    ) -> Result<Self, EvidenceError> {
+        let event_id = event_id.into();
+        if event_id.is_empty() || event_id.len() > MAX_EVENT_REF_BYTES {
+            return Err(EvidenceError::InvalidLedgerRef);
+        }
+        if seq == 0 {
+            return Err(EvidenceError::InvalidLedgerRef);
+        }
+        Ok(Self {
+            session_id,
+            event_id,
+            seq,
+        })
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
+/// Why a ledger reference does not back a record. Fail-closed: every
+/// resolution failure is equivalent to "not evidence".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackingError {
+    NotFound,
+    NotABackingEvent,
+    Unavailable,
+}
+
+impl fmt::Display for BackingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound => f.write_str("ledger event not found"),
+            Self::NotABackingEvent => f.write_str("ledger event is not a tool result"),
+            Self::Unavailable => f.write_str("ledger unavailable"),
+        }
+    }
+}
+
+impl Error for BackingError {}
+
+/// Port over the durable event ledger. Implemented by the composition root,
+/// which owns both the evidence service and the ledger.
+pub trait BackingResolver: Send + Sync {
+    fn resolve(&self, ledger_ref: &EvidenceLedgerRef) -> Result<(), BackingError>;
+}
+
+/// Thread-safe resolver handle installed on an [`EvidenceService`].
+pub type SharedBackingResolver = std::sync::Arc<dyn BackingResolver>;
 
 /// Create payload for a typed evidence record.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -170,6 +250,7 @@ pub struct EvidenceSpec {
     subject_ref: String,
     artifact_ref: Option<ArtifactRef>,
     command: Option<String>,
+    ledger_ref: Option<EvidenceLedgerRef>,
 }
 
 /// Durable typed proof node.
@@ -188,6 +269,7 @@ pub struct EvidenceRecord {
     subject_ref: String,
     artifact_ref: Option<ArtifactRef>,
     command: Option<String>,
+    ledger_ref: Option<EvidenceLedgerRef>,
 }
 
 /// In-process bounded store of typed evidence.
@@ -197,10 +279,21 @@ pub struct EvidenceStore {
     by_id: BTreeMap<EvidenceId, usize>,
 }
 
-/// Store plus runtime criterion evaluation.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Store plus runtime criterion evaluation. Holds the optional ledger
+/// resolver used to back agent-produced records.
+#[derive(Clone, Default)]
 pub struct EvidenceService {
     store: EvidenceStore,
+    backing: Option<SharedBackingResolver>,
+}
+
+impl fmt::Debug for EvidenceService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EvidenceService")
+            .field("records", &self.store.len())
+            .field("backing_installed", &self.backing.is_some())
+            .finish()
+    }
 }
 
 /// Deterministic criterion/evidence checks. Holds no state.
@@ -249,6 +342,7 @@ pub enum EvidenceError {
     UnknownVariant,
     UnsupportedSchema,
     UnsupportedSchemaVersion,
+    InvalidLedgerRef,
 }
 
 impl EvidenceKind {
@@ -356,6 +450,13 @@ impl EvidenceProducer {
             Self::MainAgent { agent_id } | Self::Subagent { agent_id } => Some(agent_id),
         }
     }
+
+    /// Agents cannot vouch for themselves: their records must cite a real
+    /// ledger event to satisfy a criterion. Human and System records are
+    /// exempt because neither actor can fabricate ledger rows to pass a gate.
+    pub const fn requires_ledger_backing(self) -> bool {
+        matches!(self, Self::MainAgent { .. } | Self::Subagent { .. })
+    }
 }
 
 impl EvidenceEventKind {
@@ -385,6 +486,7 @@ impl CriterionUnsatisfied {
             Self::MissingCommand => "missing_command",
             Self::InvalidTestPassed => "invalid_test_passed",
             Self::UnknownKind => "unknown_kind",
+            Self::UnbackedEvidence => "unbacked_evidence",
         }
     }
 }
@@ -452,6 +554,7 @@ impl EvidenceSpec {
             subject_ref,
             artifact_ref: None,
             command: None,
+            ledger_ref: None,
         })
     }
 
@@ -491,6 +594,13 @@ impl EvidenceSpec {
         Ok(self)
     }
 
+    /// Cite the durable ledger event that backs this observation. Required
+    /// for agent-produced records; ignored for human/system records.
+    pub fn with_ledger_ref(mut self, ledger_ref: EvidenceLedgerRef) -> Self {
+        self.ledger_ref = Some(ledger_ref);
+        self
+    }
+
     fn finish(self) -> Result<EvidenceRecord, EvidenceError> {
         if self.kind.requires_command() && self.command.is_none() {
             return Err(EvidenceError::MissingCommand);
@@ -512,6 +622,7 @@ impl EvidenceSpec {
             subject_ref: self.subject_ref,
             artifact_ref: self.artifact_ref,
             command: self.command,
+            ledger_ref: self.ledger_ref,
         })
     }
 }
@@ -567,6 +678,10 @@ impl EvidenceRecord {
 
     pub fn command(&self) -> Option<&str> {
         self.command.as_deref()
+    }
+
+    pub fn ledger_ref(&self) -> Option<&EvidenceLedgerRef> {
+        self.ledger_ref.as_ref()
     }
 }
 
@@ -633,6 +748,25 @@ impl EvidenceStore {
         n
     }
 
+    /// Insert an already-decoded record (bounds-checked). Persistence hosts
+    /// restore a validated doc with this; decoding already ran the full spec
+    /// validation, so no second pass is performed here.
+    pub fn restore(&mut self, record: EvidenceRecord) -> Result<&EvidenceRecord, EvidenceError> {
+        if self.records.len() >= MAX_EVIDENCE_RECORDS {
+            return Err(EvidenceError::TooManyRecords {
+                limit: MAX_EVIDENCE_RECORDS,
+            });
+        }
+        if self.by_id.contains_key(&record.id) {
+            return Err(EvidenceError::DuplicateId { id: record.id });
+        }
+        let idx = self.records.len();
+        let id = record.id;
+        self.records.push(record);
+        self.by_id.insert(id, idx);
+        Ok(&self.records[idx])
+    }
+
     fn for_goal(&self, goal_id: GoalId) -> impl Iterator<Item = &EvidenceRecord> {
         self.records.iter().filter(move |r| r.goal_id == goal_id)
     }
@@ -642,7 +776,19 @@ impl EvidenceService {
     pub const fn new() -> Self {
         Self {
             store: EvidenceStore::new(),
+            backing: None,
         }
+    }
+
+    /// Install the ledger resolver used to back agent-produced records.
+    /// Without a resolver, agent-produced records never satisfy a criterion
+    /// (fail closed); human and system records are unaffected.
+    pub fn set_backing_resolver(&mut self, backing: SharedBackingResolver) {
+        self.backing = Some(backing);
+    }
+
+    fn backing(&self) -> Option<&SharedBackingResolver> {
+        self.backing.as_ref()
     }
 
     pub fn store(&self) -> &EvidenceStore {
@@ -665,9 +811,15 @@ impl EvidenceService {
         self.store.invalidate_subject(subject_ref)
     }
 
-    /// Check status, source, artifact, and command evidence for `goal`.
+    /// Restore an already-decoded record (bounds-checked). See
+    /// [`EvidenceStore::restore`].
+    pub fn restore(&mut self, record: EvidenceRecord) -> Result<&EvidenceRecord, EvidenceError> {
+        self.store.restore(record)
+    }
+
+    /// Check status, source, artifact, command, and ledger backing for `goal`.
     pub fn validate_goal(&self, goal: &GoalSnapshot) -> CriterionVerdicts {
-        CriterionEvaluator::evaluate(goal, &self.store)
+        CriterionEvaluator::evaluate_with_backing(goal, &self.store, self.backing())
     }
 
     pub fn validate_goal_with_cancel(
@@ -675,7 +827,7 @@ impl EvidenceService {
         goal: &GoalSnapshot,
         cancel: &CancellationToken,
     ) -> Result<CriterionVerdicts, EvidenceError> {
-        CriterionEvaluator::evaluate_with_cancel(goal, &self.store, cancel)
+        CriterionEvaluator::evaluate_with_cancel(goal, &self.store, self.backing(), cancel)
     }
 
     pub fn can_complete(&self, goal: &GoalSnapshot) -> CompletionCheck {
@@ -685,7 +837,17 @@ impl EvidenceService {
 
 impl CriterionEvaluator {
     pub fn evaluate(goal: &GoalSnapshot, store: &EvidenceStore) -> CriterionVerdicts {
-        match Self::evaluate_with_cancel(goal, store, &CancellationToken::new()) {
+        Self::evaluate_with_backing(goal, store, None)
+    }
+
+    /// Same checks, with agent-produced records additionally resolved against
+    /// the durable ledger. `None` keeps the fail-closed no-resolver stance.
+    pub fn evaluate_with_backing(
+        goal: &GoalSnapshot,
+        store: &EvidenceStore,
+        backing: Option<&SharedBackingResolver>,
+    ) -> CriterionVerdicts {
+        match Self::evaluate_with_cancel(goal, store, backing, &CancellationToken::new()) {
             Ok(verdicts) => verdicts,
             // Fresh token cannot be cancelled; treat any other error as fail-closed.
             Err(_) => CriterionVerdicts {
@@ -705,6 +867,7 @@ impl CriterionEvaluator {
     pub fn evaluate_with_cancel(
         goal: &GoalSnapshot,
         store: &EvidenceStore,
+        backing: Option<&SharedBackingResolver>,
         cancel: &CancellationToken,
     ) -> Result<CriterionVerdicts, EvidenceError> {
         if cancel.is_cancelled() {
@@ -715,7 +878,7 @@ impl CriterionEvaluator {
             if i % CANCEL_STRIDE == 0 && cancel.is_cancelled() {
                 return Err(EvidenceError::Cancelled);
             }
-            verdicts.push(evaluate_criterion(goal, criterion.id(), store));
+            verdicts.push(evaluate_criterion(goal, criterion.id(), store, backing));
         }
         Ok(CriterionVerdicts { verdicts })
     }
@@ -780,6 +943,7 @@ impl EvidenceError {
             | Self::InvalidCommand
             | Self::InvalidLocator
             | Self::InvalidCriterion
+            | Self::InvalidLedgerRef
             | Self::TooManyRecords { .. }
             | Self::UnknownVariant
             | Self::UnsupportedSchema
@@ -792,6 +956,7 @@ fn evaluate_criterion(
     goal: &GoalSnapshot,
     criterion_id: &str,
     store: &EvidenceStore,
+    backing: Option<&SharedBackingResolver>,
 ) -> CriterionVerdict {
     let required = required_kinds(goal, criterion_id);
     if required.is_empty() {
@@ -812,7 +977,8 @@ fn evaluate_criterion(
                 };
             }
             Some(kind) => {
-                if let Some(reason) = evaluate_kind(goal.id(), criterion_id, kind, store)
+                if let Some(reason) =
+                    evaluate_kind(goal.id(), criterion_id, kind, store, backing)
                     && first_fail.is_none()
                 {
                     first_fail = Some(reason);
@@ -852,6 +1018,7 @@ fn evaluate_kind(
     criterion_id: &str,
     kind: EvidenceKind,
     store: &EvidenceStore,
+    backing: Option<&SharedBackingResolver>,
 ) -> Option<CriterionUnsatisfied> {
     let mut seen = false;
     let mut first_fail = None;
@@ -860,20 +1027,49 @@ fn evaluate_kind(
             continue;
         }
         seen = true;
-        match validate_record(record, kind) {
-            Ok(()) => return None,
-            Err(reason) => {
-                if first_fail.is_none() {
-                    first_fail = Some(reason);
-                }
+        if let Err(reason) = validate_record(record, kind) {
+            if first_fail.is_none() {
+                first_fail = Some(reason);
             }
+            continue;
         }
+        if let Err(reason) = check_backing(record, backing) {
+            if first_fail.is_none() {
+                first_fail = Some(reason);
+            }
+            continue;
+        }
+        return None;
     }
     if !seen {
         Some(CriterionUnsatisfied::MissingEvidence)
     } else {
         Some(first_fail.unwrap_or(CriterionUnsatisfied::MissingEvidence))
     }
+}
+
+/// Anti-self-assertion gate: an agent-produced record must cite a real
+/// ledger event, resolved through the host-installed resolver. Every
+/// failure mode (no citation, no resolver, unresolved citation) collapses
+/// to the same unsatisfied reason; the verdict never says "almost".
+fn check_backing(
+    record: &EvidenceRecord,
+    backing: Option<&SharedBackingResolver>,
+) -> Result<(), CriterionUnsatisfied> {
+    if !record.producer.requires_ledger_backing() {
+        return Ok(());
+    }
+    let ledger_ref = match record.ledger_ref() {
+        Some(r) => r,
+        None => return Err(CriterionUnsatisfied::UnbackedEvidence),
+    };
+    let resolver = match backing {
+        Some(resolver) => resolver,
+        None => return Err(CriterionUnsatisfied::UnbackedEvidence),
+    };
+    resolver
+        .resolve(ledger_ref)
+        .map_err(|_| CriterionUnsatisfied::UnbackedEvidence)
 }
 
 fn applies_to(record: &EvidenceRecord, criterion_id: &str, kind: EvidenceKind) -> bool {
@@ -1026,6 +1222,7 @@ impl fmt::Display for EvidenceError {
             Self::UnknownVariant => f.write_str("unknown evidence variant"),
             Self::UnsupportedSchema => f.write_str("unsupported evidence schema"),
             Self::UnsupportedSchemaVersion => f.write_str("unsupported evidence schema version"),
+            Self::InvalidLedgerRef => f.write_str("ledger reference is empty or exceeds bound"),
         }
     }
 }
@@ -1194,6 +1391,31 @@ impl<'de> Deserialize<'de> for EvidenceSource {
     }
 }
 
+impl Serialize for EvidenceLedgerRef {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state =
+            serializer.serialize_struct("EvidenceLedgerRef", LEDGER_REF_FIELDS.len())?;
+        state.serialize_field("session_id", &self.session_id)?;
+        state.serialize_field("event_id", &self.event_id)?;
+        state.serialize_field("seq", &self.seq)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for EvidenceLedgerRef {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            session_id: SessionId,
+            event_id: String,
+            seq: u64,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Self::new(raw.session_id, raw.event_id, raw.seq).map_err(de::Error::custom)
+    }
+}
+
 impl Serialize for EvidenceRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut state = serializer.serialize_struct("EvidenceRecord", RECORD_FIELDS.len())?;
@@ -1212,6 +1434,7 @@ impl Serialize for EvidenceRecord {
         state.serialize_field("subject_ref", &self.subject_ref)?;
         state.serialize_field("artifact_ref", &self.artifact_ref)?;
         state.serialize_field("command", &self.command)?;
+        state.serialize_field("ledger_ref", &self.ledger_ref)?;
         state.end()
     }
 }
@@ -1236,6 +1459,7 @@ impl<'de> Deserialize<'de> for EvidenceRecord {
             subject_ref: String,
             artifact_ref: Option<ArtifactRef>,
             command: Option<String>,
+            ledger_ref: Option<EvidenceLedgerRef>,
         }
         let raw = Raw::deserialize(deserializer)?;
         if raw.schema != EVIDENCE_RECORD_SCHEMA {
@@ -1267,6 +1491,9 @@ impl<'de> Deserialize<'de> for EvidenceRecord {
         }
         if let Some(command) = raw.command {
             spec = spec.with_command(command).map_err(de::Error::custom)?;
+        }
+        if let Some(ledger_ref) = raw.ledger_ref {
+            spec = spec.with_ledger_ref(ledger_ref);
         }
         spec.finish().map_err(de::Error::custom)
     }
@@ -1347,7 +1574,7 @@ mod tests {
         r#""producer":{"kind":"system"},"#,
         r#""source":{"hash":"sha256:31f5eaafcc4c25ba2bae5a484032da391707bcc1ba6494abd1353a70143ad69e","locator":"cargo test"},"#,
         r#""observed_at":1,"status":"passed","freshness":"fresh","#,
-        r#""subject_ref":"src/lib.rs","artifact_ref":null,"command":"cargo test"}"#
+        r#""subject_ref":"src/lib.rs","artifact_ref":null,"command":"cargo test","ledger_ref":null}"#
     );
 
     fn parse_id<T: FromStr>(raw: &str) -> T
@@ -1369,6 +1596,32 @@ mod tests {
         EvidenceSource::new(ArtifactId::from_bytes(b"rapidlm-evidence-fixture"))
             .with_locator("cargo test")
             .expect("locator")
+    }
+
+    /// Stub resolver: only the session below, event "evt-ok", seq 3 resolves.
+    const REF_SESSION: &str = "018f3c8a-7e2b-7a10-8c4d-0123456789ac";
+
+    fn ref_session() -> SessionId {
+        parse_id(REF_SESSION)
+    }
+
+    fn backed_ref() -> EvidenceLedgerRef {
+        EvidenceLedgerRef::new(ref_session(), "evt-ok", 3).expect("ledger ref")
+    }
+
+    struct StubResolver;
+
+    impl BackingResolver for StubResolver {
+        fn resolve(&self, ledger_ref: &EvidenceLedgerRef) -> Result<(), BackingError> {
+            if ledger_ref.event_id() == "evt-ok"
+                && ledger_ref.seq() == 3
+                && ledger_ref.session_id() == ref_session()
+            {
+                Ok(())
+            } else {
+                Err(BackingError::NotFound)
+            }
+        }
     }
 
     fn passing_test() -> EvidenceSpec {
@@ -1704,6 +1957,7 @@ mod tests {
                 .with_artifact(artifact),
             )
             .expect("record artifact");
+        service.set_backing_resolver(std::sync::Arc::new(StubResolver));
         service
             .record(
                 EvidenceSpec::new(
@@ -1720,7 +1974,8 @@ mod tests {
                 )
                 .expect("command")
                 .with_command("cargo test")
-                .expect("cmd"),
+                .expect("cmd")
+                .with_ledger_ref(backed_ref()),
             )
             .expect("record command");
         assert!(service.validate_goal(&goal).allowed());
@@ -1768,5 +2023,141 @@ mod tests {
         let text = err.to_string();
         assert!(!text.contains(TEST_PASSED));
         assert!(!text.contains("src/lib.rs"));
+    }
+
+    fn agent_command_record() -> EvidenceSpec {
+        EvidenceSpec::new(
+            evidence_id(),
+            goal_id(),
+            EvidenceKind::Command,
+            "command_ran",
+            EvidenceProducer::MainAgent {
+                agent_id: parse_id(AGENT_ID),
+            },
+            source(),
+            EvidenceStatus::Passed,
+            "src/lib.rs",
+        )
+        .expect("spec")
+        .with_criterion_id("c1")
+        .expect("criterion")
+        .with_command("cargo test")
+        .expect("command")
+    }
+
+    #[test]
+    fn agent_evidence_without_ledger_ref_fails_closed() {
+        let goal = goal_with_kinds(&["command"]);
+        let mut service = EvidenceService::new();
+        service.record(agent_command_record()).expect("record");
+        let verdicts = service.validate_goal(&goal);
+        assert!(!verdicts.allowed());
+        assert_eq!(
+            verdicts.verdicts()[0].reason(),
+            Some(CriterionUnsatisfied::UnbackedEvidence)
+        );
+        assert!(!service.can_complete(&goal).allowed());
+    }
+
+    #[test]
+    fn agent_evidence_without_resolver_fails_closed() {
+        let goal = goal_with_kinds(&["command"]);
+        let mut service = EvidenceService::new();
+        let spec = agent_command_record().with_ledger_ref(backed_ref());
+        service.record(spec).expect("record");
+        let verdicts = service.validate_goal(&goal);
+        assert!(!verdicts.allowed());
+        assert_eq!(
+            verdicts.verdicts()[0].reason(),
+            Some(CriterionUnsatisfied::UnbackedEvidence)
+        );
+    }
+
+    #[test]
+    fn agent_evidence_with_unresolvable_ref_is_rejected() {
+        let goal = goal_with_kinds(&["command"]);
+        let mut service = EvidenceService::new();
+        service.set_backing_resolver(std::sync::Arc::new(StubResolver));
+        let stale_ref = EvidenceLedgerRef::new(ref_session(), "evt-gone", 9).expect("ref");
+        let spec = agent_command_record().with_ledger_ref(stale_ref);
+        service.record(spec).expect("record");
+        let verdicts = service.validate_goal(&goal);
+        assert!(!verdicts.allowed());
+        assert_eq!(
+            verdicts.verdicts()[0].reason(),
+            Some(CriterionUnsatisfied::UnbackedEvidence)
+        );
+    }
+
+    #[test]
+    fn agent_evidence_with_resolved_ref_satisfies() {
+        let goal = goal_with_kinds(&["command"]);
+        let mut service = EvidenceService::new();
+        service.set_backing_resolver(std::sync::Arc::new(StubResolver));
+        let spec = agent_command_record().with_ledger_ref(backed_ref());
+        service.record(spec).expect("record");
+        assert!(service.validate_goal(&goal).allowed());
+        assert!(service.can_complete(&goal).allowed());
+    }
+
+    #[test]
+    fn human_and_system_records_are_exempt_from_backing() {
+        let goal = goal_with_test_requirement();
+        // No resolver installed: a System record must still satisfy c1.
+        let mut service = EvidenceService::new();
+        service.record(passing_test()).expect("record");
+        assert!(service.validate_goal(&goal).allowed());
+
+        let confirm_goal = goal_with_kinds(&["user_confirmation"]);
+        let human = EvidenceSpec::new(
+            parse_id("018f3c8a-7e2b-7a10-8c4d-0123456789a5"),
+            goal_id(),
+            EvidenceKind::UserConfirmation,
+            "confirmed",
+            EvidenceProducer::Human,
+            source(),
+            EvidenceStatus::Passed,
+            "goal",
+        )
+        .expect("spec");
+        service.record(human).expect("record");
+        assert!(service.validate_goal(&confirm_goal).allowed());
+    }
+
+    #[test]
+    fn ledger_ref_rejects_empty_overlong_or_zero_seq() {
+        assert_eq!(
+            EvidenceLedgerRef::new(ref_session(), "", 1),
+            Err(EvidenceError::InvalidLedgerRef)
+        );
+        assert_eq!(
+            EvidenceLedgerRef::new(ref_session(), "e".repeat(MAX_EVENT_REF_BYTES + 1), 1),
+            Err(EvidenceError::InvalidLedgerRef)
+        );
+        assert_eq!(
+            EvidenceLedgerRef::new(ref_session(), "evt-ok", 0),
+            Err(EvidenceError::InvalidLedgerRef)
+        );
+        let long_ok = "e".repeat(MAX_EVENT_REF_BYTES);
+        assert!(EvidenceLedgerRef::new(ref_session(), long_ok, 1).is_ok());
+    }
+
+    #[test]
+    fn ledger_ref_round_trips_and_old_payloads_still_decode() {
+        let goal = goal_with_kinds(&["command"]);
+        let mut service = EvidenceService::new();
+        let spec = agent_command_record().with_ledger_ref(backed_ref());
+        let record = service.record(spec).expect("record").clone();
+        let json = serde_json::to_string(&record).expect("serialize");
+        assert!(json.contains(r#""ledger_ref":{"session_id":"018f3c8a-7e2b-7a10-8c4d-0123456789ac","event_id":"evt-ok","seq":3}"#));
+        let decoded: EvidenceRecord = serde_json::from_str(&json).expect("decode");
+        assert_eq!(decoded.ledger_ref(), Some(&backed_ref()));
+
+        // Additive compatibility: a v1 payload written before the field
+        // existed still decodes, with no citation (and thus no backing).
+        let legacy = GOLDEN_RECORD.replace(r#","ledger_ref":null}"#, "}");
+        let decoded: EvidenceRecord = serde_json::from_str(&legacy).expect("decode legacy");
+        assert!(decoded.ledger_ref().is_none());
+        let _ = goal;
     }
 }

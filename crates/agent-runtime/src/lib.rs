@@ -97,12 +97,13 @@ pub use compaction::{
     EventRange, ReadHash, UnresolvedBlocker, compact,
 };
 pub use evidence::{
-    COMPLETION_CHECK_SCHEMA, CRITERION_VERDICTS_SCHEMA, CompletionCheck, CriterionEvaluator,
-    CriterionUnsatisfied, CriterionVerdict, CriterionVerdicts, EVIDENCE_RECORD_SCHEMA,
-    EVIDENCE_SCHEMA_VERSION, EvidenceError, EvidenceEventKind, EvidenceFreshness, EvidenceKind,
-    EvidenceProducer, EvidenceRecord, EvidenceService, EvidenceSource, EvidenceSpec,
-    EvidenceStatus, EvidenceStore, MAX_ASSERTION_BYTES, MAX_COMMAND_BYTES, MAX_EVIDENCE_RECORDS,
-    MAX_SUBJECT_BYTES, TEST_PASSED,
+    BackingError, BackingResolver, COMPLETION_CHECK_SCHEMA, CRITERION_VERDICTS_SCHEMA,
+    CompletionCheck, CriterionEvaluator, CriterionUnsatisfied, CriterionVerdict,
+    CriterionVerdicts, EVIDENCE_RECORD_SCHEMA, EVIDENCE_SCHEMA_VERSION, EvidenceError,
+    EvidenceEventKind, EvidenceFreshness, EvidenceKind, EvidenceLedgerRef, EvidenceProducer,
+    EvidenceRecord, EvidenceService, EvidenceSource, EvidenceSpec, EvidenceStatus, EvidenceStore,
+    MAX_ASSERTION_BYTES, MAX_COMMAND_BYTES, MAX_EVIDENCE_RECORDS, MAX_EVENT_REF_BYTES,
+    MAX_SUBJECT_BYTES, SharedBackingResolver, TEST_PASSED,
 };
 pub use goal::budget::{
     BudgetDimension, CONVERGENCE_DENOMINATOR, CONVERGENCE_NUMERATOR, ConvergenceHint,

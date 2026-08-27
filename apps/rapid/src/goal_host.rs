@@ -3,20 +3,70 @@
 //! Wraps the single goal-lifecycle authority ([`GoalStateMachine`]) plus the
 //! evidence service, and persists the goal snapshot to a project JSON file so a
 //! `goal create/show/pause/resume/cancel` command works across invocations. The
-//! host owns the contract; completion still requires the evidence gate.
+//! host owns the contract; completion still requires the evidence gate, and
+//! agent-produced evidence must cite a real event-ledger row.
 
 use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use agent_runtime::{
-    CancellationToken, EvidenceService, GoalActor, GoalCommand, GoalEffect, GoalSnapshot,
+    BackingError, BackingResolver, CancellationToken, EvidenceError, EvidenceLedgerRef,
+    EvidenceRecord, EvidenceService, GoalActor, GoalCommand, GoalEffect, GoalSnapshot,
     GoalStateError, GoalStateMachine,
 };
+use event_ledger::ledger::{CancellationToken as LedgerCancel, EventLedger, LedgerError};
 
 /// Canonical persisted-goal file name under the project `.rapidlm/` dir.
 pub const GOAL_FILE: &str = "goal.json";
+
+/// Canonical persisted evidence doc file name under the project `.rapidlm/` dir.
+pub const EVIDENCE_FILE: &str = "goal-evidence.json";
+
+/// Canonical session ledger db name; evidence citations resolve against it.
+pub const SESSIONS_DB_FILE: &str = "sessions.sqlite";
+
+/// Closed host schema for the persisted evidence doc.
+const EVIDENCE_DOC_SCHEMA: &str = "rapidlm.goal_host_evidence";
+
+/// v1 of [`EVIDENCE_DOC_SCHEMA`].
+const EVIDENCE_DOC_VERSION: u16 = 1;
+
+/// Ledger event kinds accepted as evidence backing: a completed tool call or
+/// job carries a real observed result; other rows do not.
+const BACKING_EVENT_KINDS: &[&str] = &["tool.completed", "job.completed"];
+
+/// Resolve evidence citations against the real event ledger. Lives in the
+/// composition root because only `apps/rapid` depends on both agent-runtime
+/// (the gate) and event-ledger (the durable rows).
+struct LedgerEventBacking {
+    ledger: EventLedger,
+    cancel: LedgerCancel,
+}
+
+impl BackingResolver for LedgerEventBacking {
+    fn resolve(&self, ledger_ref: &EvidenceLedgerRef) -> Result<(), BackingError> {
+        let envelope = self
+            .ledger
+            .get(ledger_ref.session_id(), ledger_ref.seq(), &self.cancel)
+            .map_err(|err| match err {
+                LedgerError::EventNotFound { .. } => BackingError::NotFound,
+                _ => BackingError::Unavailable,
+            })?;
+        if envelope.session_id() != ledger_ref.session_id()
+            || envelope.event_id().to_string() != ledger_ref.event_id()
+        {
+            return Err(BackingError::NotFound);
+        }
+        if BACKING_EVENT_KINDS.contains(&envelope.kind().as_str()) {
+            Ok(())
+        } else {
+            Err(BackingError::NotABackingEvent)
+        }
+    }
+}
 
 /// Typed host persistence failure. Display never echoes goal text.
 #[derive(Debug)]
@@ -56,6 +106,29 @@ impl GoalHost {
             machine: GoalStateMachine::from_snapshot(snapshot),
             evidence: EvidenceService::new(),
         }
+    }
+
+    /// Install the durable-ledger resolver. Agent-produced evidence must cite
+    /// a real ledger row; without this resolver such records never satisfy a
+    /// criterion (fail closed). Human and system records are unaffected.
+    pub fn install_backing(&mut self, ledger: EventLedger) {
+        self.evidence.set_backing_resolver(Arc::new(LedgerEventBacking {
+            ledger,
+            cancel: LedgerCancel::new(),
+        }));
+    }
+
+    /// Evidence service view (verdicts, store) for CLI rendering.
+    pub fn evidence(&self) -> &EvidenceService {
+        &self.evidence
+    }
+
+    /// Record one evidence observation. Fails closed on any spec violation.
+    pub fn record_evidence(
+        &mut self,
+        spec: agent_runtime::EvidenceSpec,
+    ) -> Result<&EvidenceRecord, EvidenceError> {
+        self.evidence.record(spec)
     }
 
     /// Apply a lifecycle command. Subagent actors are rejected; only a human /
@@ -147,6 +220,72 @@ impl GoalHost {
             Err(_) => Err(GoalPersistError::Io),
         }
     }
+
+    /// Persist evidence records to the closed host doc. An empty store drops
+    /// the stale file (mirrors [`GoalHost::save`]).
+    pub fn save_evidence(&self, path: &Path) -> Result<(), GoalPersistError> {
+        if self.evidence.store().is_empty() {
+            return match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(_) => Err(GoalPersistError::Io),
+            };
+        }
+        let records = self
+            .evidence
+            .store()
+            .records()
+            .iter()
+            .map(|record| serde_json::to_value(record).map_err(|_| GoalPersistError::Json))
+            .collect::<Result<Vec<_>, _>>()?;
+        let doc = serde_json::json!({
+            "schema": EVIDENCE_DOC_SCHEMA,
+            "schema_version": EVIDENCE_DOC_VERSION,
+            "records": records,
+        });
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|_| GoalPersistError::Io)?;
+        }
+        let json = serde_json::to_string_pretty(&doc).map_err(|_| GoalPersistError::Json)?;
+        fs::write(path, json).map_err(|_| GoalPersistError::Io)
+    }
+
+    /// Restore persisted evidence records. Returns the loaded count (`Ok(0)`
+    /// when no doc exists yet). Records decode through the typed evidence
+    /// deserializer — the full spec validation — and are bounds-checked on
+    /// insert. Ledger citations are re-resolved live at every validation, so
+    /// a restored record is only as good as its citation.
+    pub fn load_evidence(&mut self, path: &Path) -> Result<usize, GoalPersistError> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            schema: String,
+            schema_version: u16,
+            records: Vec<EvidenceRecord>,
+        }
+        match fs::read(path) {
+            Ok(bytes) => {
+                let raw: Raw =
+                    serde_json::from_slice(&bytes).map_err(|_| GoalPersistError::Json)?;
+                if raw.schema != EVIDENCE_DOC_SCHEMA || raw.schema_version != EVIDENCE_DOC_VERSION
+                {
+                    return Err(GoalPersistError::Json);
+                }
+                let mut count = 0;
+                for record in raw.records {
+                    self.evidence
+                        .restore(record)
+                        .map_err(|_| GoalPersistError::Json)?;
+                    count += 1;
+                }
+                Ok(count)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(_) => Err(GoalPersistError::Io),
+        }
+    }
 }
 
 impl Default for GoalHost {
@@ -159,9 +298,11 @@ impl Default for GoalHost {
 mod tests {
     use super::*;
     use agent_runtime::{
-        Criterion, EvidenceRequirement, GoalBudget, GoalCommand, GoalEventKind, GoalSpec,
+        Criterion, EvidenceKind, EvidenceLedgerRef, EvidenceProducer, EvidenceRequirement,
+        EvidenceSpec, EvidenceSource, EvidenceStatus, GoalBudget, GoalCommand, GoalEventKind,
+        GoalSpec, TEST_PASSED,
     };
-    use protocol::GoalId;
+    use protocol::{AgentId, ArtifactId, EvidenceId, GoalId, ProjectId, SessionId};
 
     fn spec(statement: &str) -> GoalSpec {
         GoalSpec::new(
@@ -170,6 +311,17 @@ mod tests {
             vec![Criterion::new("c1", "tests pass").expect("criterion")],
             GoalBudget::new(Some(10), Some(100_000), None, None),
             vec![EvidenceRequirement::new("c1", vec!["test".to_owned()]).expect("req")],
+        )
+        .expect("spec")
+    }
+
+    fn spec_requiring(kind: &str) -> GoalSpec {
+        GoalSpec::new(
+            GoalId::new(),
+            "ship auth",
+            vec![Criterion::new("c1", "work verified").expect("criterion")],
+            GoalBudget::new(Some(10), Some(100_000), None, None),
+            vec![EvidenceRequirement::new("c1", vec![kind.to_owned()]).expect("req")],
         )
         .expect("spec")
     }
@@ -255,5 +407,181 @@ mod tests {
                 .expect("attestation")
                 .starts_with("sha256:")
         );
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = scratch(name);
+        fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    fn system_test_record(goal_id: GoalId) -> EvidenceSpec {
+        EvidenceSpec::new(
+            EvidenceId::new(),
+            goal_id,
+            EvidenceKind::Test,
+            TEST_PASSED,
+            EvidenceProducer::System,
+            EvidenceSource::new(ArtifactId::from_bytes(b"rapidlm-host-evidence")),
+            EvidenceStatus::Passed,
+            "src/lib.rs",
+        )
+        .expect("spec")
+        .with_criterion_id("c1")
+        .expect("criterion")
+        .with_command("cargo test")
+        .expect("command")
+    }
+
+    fn agent_record(
+        goal_id: GoalId,
+        session: SessionId,
+        event_id: &str,
+        seq: u64,
+    ) -> EvidenceSpec {
+        let citation = EvidenceLedgerRef::new(session, event_id, seq).expect("ref");
+        EvidenceSpec::new(
+            EvidenceId::new(),
+            goal_id,
+            EvidenceKind::Command,
+            "command_ran",
+            EvidenceProducer::MainAgent {
+                agent_id: AgentId::new(),
+            },
+            EvidenceSource::new(ArtifactId::from_bytes(b"rapidlm-host-agent-evidence")),
+            EvidenceStatus::Passed,
+            "src/lib.rs",
+        )
+        .expect("spec")
+        .with_criterion_id("c1")
+        .expect("criterion")
+        .with_command("cargo test")
+        .expect("command")
+        .with_ledger_ref(citation)
+    }
+
+    #[test]
+    fn evidence_doc_round_trips_and_gates_completion() {
+        let dir = scratch_dir("evidence-doc");
+        let goal_path = dir.join(GOAL_FILE);
+        let evidence_path = dir.join(EVIDENCE_FILE);
+
+        let mut host = GoalHost::new();
+        host.apply(
+            GoalCommand::Create(spec("ship auth")),
+            &human(),
+            &CancellationToken::new(),
+        )
+        .expect("create");
+        let goal_id = host.snapshot().expect("snap").id();
+        host.record_evidence(system_test_record(goal_id))
+            .expect("record");
+        // System-produced records are exempt from ledger backing.
+        assert!(host.can_complete(&CancellationToken::new()));
+        host.save(&goal_path).expect("save goal");
+        host.save_evidence(&evidence_path).expect("save evidence");
+
+        let mut reloaded = GoalHost::load(&goal_path).expect("load").expect("some");
+        assert_eq!(
+            reloaded
+                .load_evidence(&evidence_path)
+                .expect("load evidence"),
+            1
+        );
+        assert!(reloaded.can_complete(&CancellationToken::new()));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn agent_record_requires_real_ledger_row() {
+        use event_ledger::event::{ActorKind, ActorRef, EventKind};
+        use event_ledger::ledger::AppendOptions;
+
+        let dir = scratch_dir("agent-backed");
+        let db = dir.join(SESSIONS_DB_FILE);
+        let ledger = EventLedger::open(&db).expect("open ledger");
+        let session = SessionId::new();
+        let cancel = LedgerCancel::new();
+        ledger
+            .create_session(session, ProjectId::new(), &cancel)
+            .expect("session row");
+        let envelope = ledger
+            .append(
+                session,
+                ActorRef::new(ActorKind::System, &protocol::EventId::new().to_string())
+                    .expect("actor"),
+                EventKind::ToolCompleted,
+                serde_json::json!({"outcome": "passed"}),
+                &AppendOptions {
+                    redaction: protocol::RedactionClass::Project,
+                    trace_id: protocol::TraceId::new(),
+                    expected_seq: None,
+                },
+                &cancel,
+            )
+            .expect("append tool.completed");
+        let event_id = envelope.event_id().to_string();
+        let seq = envelope.seq();
+
+        let goal_path = dir.join(GOAL_FILE);
+        let evidence_path = dir.join(EVIDENCE_FILE);
+
+        let mut host = GoalHost::new();
+        host.install_backing(ledger.clone());
+        host.apply(
+            GoalCommand::Create(spec_requiring("command")),
+            &human(),
+            &CancellationToken::new(),
+        )
+        .expect("create");
+        let goal_id = host.snapshot().expect("snap").id();
+        host.record_evidence(agent_record(goal_id, session, &event_id, seq))
+            .expect("record");
+        // Citation resolves against the real ledger row: complete.
+        assert!(host.can_complete(&CancellationToken::new()));
+        host.save(&goal_path).expect("save goal");
+        host.save_evidence(&evidence_path).expect("save evidence");
+
+        // Reload with backing: the citation re-resolves, still complete.
+        let mut backed = GoalHost::load(&goal_path).expect("load").expect("some");
+        backed.install_backing(EventLedger::open(&db).expect("reopen"));
+        backed
+            .load_evidence(&evidence_path)
+            .expect("load evidence");
+        assert!(backed.can_complete(&CancellationToken::new()));
+
+        // Fresh host without a resolver: fail closed despite a valid citation.
+        let mut unbacked = GoalHost::load(&goal_path).expect("load").expect("some");
+        unbacked
+            .load_evidence(&evidence_path)
+            .expect("load evidence");
+        assert!(!unbacked.can_complete(&CancellationToken::new()));
+
+        // Forged citation (unknown event id) fails the live re-resolution.
+        let tampered = fs::read_to_string(&evidence_path)
+            .expect("read")
+            .replace(&event_id, &protocol::EventId::new().to_string());
+        fs::write(&evidence_path, tampered).expect("write tampered");
+        let mut forged = GoalHost::load(&goal_path).expect("load").expect("some");
+        forged.install_backing(EventLedger::open(&db).expect("reopen"));
+        forged.load_evidence(&evidence_path).expect("load evidence");
+        assert!(!forged.can_complete(&CancellationToken::new()));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_evidence_doc_is_rejected() {
+        let dir = scratch_dir("corrupt");
+        let evidence_path = dir.join(EVIDENCE_FILE);
+        fs::write(&evidence_path, "{ not json").expect("write");
+        let mut host = GoalHost::new();
+        assert!(host.load_evidence(&evidence_path).is_err());
+        fs::write(
+            &evidence_path,
+            r#"{"schema":"rapidlm.goal_host_evidence","schema_version":1,"records":[]}"#,
+        )
+        .expect("write");
+        assert_eq!(host.load_evidence(&evidence_path).expect("empty doc"), 0);
+        fs::remove_dir_all(&dir).ok();
     }
 }
