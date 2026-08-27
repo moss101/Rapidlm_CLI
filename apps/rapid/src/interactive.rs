@@ -336,18 +336,62 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
 
     let result = match sub {
         "create" | "replace" => {
-            let statement = args[1..].join(" ");
+            // Statement words come first; `--key value` flags follow.
+            let flag_start = args[1..]
+                .iter()
+                .position(|arg| arg.starts_with("--"))
+                .map(|i| i + 1);
+            let (statement_words, flag_args) = match flag_start {
+                Some(i) => (&args[1..i], &args[i..]),
+                None => (&args[1..], &args[args.len()..]),
+            };
+            let statement = statement_words.join(" ");
             if statement.is_empty() {
                 return Err(InteractiveError::Usage);
             }
+            let flags = parse_flags(flag_args)?;
+            let mut criteria = Vec::new();
+            for entry in flags.get("criterion").into_iter().flatten() {
+                let Some((id, text)) = entry.split_once('=') else {
+                    return Err(InteractiveError::Usage);
+                };
+                criteria.push(agent_runtime::Criterion::new(id, text).map_err(|err| {
+                    eprintln!("{err}");
+                    InteractiveError::Usage
+                })?);
+            }
+            let mut requirements = Vec::new();
+            for entry in flags.get("requires").into_iter().flatten() {
+                let Some((id, kinds)) = entry.split_once('=') else {
+                    return Err(InteractiveError::Usage);
+                };
+                let kinds: Vec<String> = kinds.split(',').map(str::to_owned).collect();
+                requirements.push(
+                    agent_runtime::EvidenceRequirement::new(id, kinds).map_err(|err| {
+                        eprintln!("{err}");
+                        InteractiveError::Usage
+                    })?,
+                );
+            }
+            let max_steps = match one(&flags, "max-steps") {
+                Some(raw) => Some(raw.parse::<u64>().map_err(|_| InteractiveError::Usage)?),
+                None => None,
+            };
+            let max_tokens = match one(&flags, "max-tokens") {
+                Some(raw) => Some(raw.parse::<u64>().map_err(|_| InteractiveError::Usage)?),
+                None => None,
+            };
             let spec = GoalSpec::new(
                 protocol::GoalId::new(),
                 statement,
-                Vec::new(),
-                GoalBudget::new(None, None, None, None),
-                Vec::new(),
+                criteria,
+                GoalBudget::new(max_steps, max_tokens, None, None),
+                requirements,
             )
-            .map_err(|_| InteractiveError::Internal)?;
+            .map_err(|err| {
+                eprintln!("{err}");
+                InteractiveError::Usage
+            })?;
             let command = if sub == "create" {
                 GoalCommand::Create(spec)
             } else {
@@ -430,8 +474,11 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
     Ok(result)
 }
 
-/// Parse `--key value` pairs into a map. Unknown shapes are a usage error.
-fn parse_flags(args: &[String]) -> Result<std::collections::BTreeMap<String, String>, InteractiveError> {
+/// Parse `--key value` pairs. Repeated keys accumulate; unknown shapes are a
+/// usage error.
+fn parse_flags(
+    args: &[String],
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, InteractiveError> {
     let mut flags = std::collections::BTreeMap::new();
     let mut idx = 0;
     while idx < args.len() {
@@ -440,10 +487,15 @@ fn parse_flags(args: &[String]) -> Result<std::collections::BTreeMap<String, Str
             .filter(|k| !k.is_empty())
             .ok_or(InteractiveError::Usage)?;
         let value = args.get(idx + 1).ok_or(InteractiveError::Usage)?;
-        flags.insert(key.to_owned(), value.clone());
+        flags.entry(key.to_owned()).or_insert(Vec::new()).push(value.clone());
         idx += 2;
     }
     Ok(flags)
+}
+
+/// First value of a flag, for single-value flags.
+fn one<'a>(flags: &'a std::collections::BTreeMap<String, Vec<String>>, key: &str) -> Option<&'a str> {
+    flags.get(key).and_then(|values| values.first()).map(String::as_str)
 }
 
 fn goal_evidence_record(host: &mut GoalHost, args: &[String]) -> Result<i32, InteractiveError> {
@@ -452,27 +504,25 @@ fn goal_evidence_record(host: &mut GoalHost, args: &[String]) -> Result<i32, Int
         println!("no active goal");
         return Ok(1);
     };
-    let kind: EvidenceKind = flags
-        .get("kind")
+    let kind: EvidenceKind = one(&flags, "kind")
         .ok_or(InteractiveError::Usage)?
         .parse()
         .map_err(|_| InteractiveError::Usage)?;
-    let status = match flags.get("status") {
+    let status = match one(&flags, "status") {
         Some(raw) => raw
             .parse::<EvidenceStatus>()
             .map_err(|_| InteractiveError::Usage)?,
         None => EvidenceStatus::Passed,
     };
-    let producer = match flags.get("producer").map(String::as_str) {
+    let producer = match one(&flags, "producer") {
         None | Some("human") => EvidenceProducer::Human,
         Some("system") => EvidenceProducer::System,
         Some(role @ ("main-agent" | "subagent")) => {
-            let agent_id = flags
-                .get("agent-id")
+            let agent_id = one(&flags, "agent-id")
                 .map(|id| id.parse::<protocol::AgentId>())
                 .transpose()
-                .map_err(|_| InteractiveError::Usage)?;
-            let agent_id = agent_id.ok_or(InteractiveError::Usage)?;
+                .map_err(|_| InteractiveError::Usage)?
+                .ok_or(InteractiveError::Usage)?;
             if role == "main-agent" {
                 EvidenceProducer::MainAgent { agent_id }
             } else {
@@ -483,18 +533,16 @@ fn goal_evidence_record(host: &mut GoalHost, args: &[String]) -> Result<i32, Int
     };
     // `test_passed` is reserved for passing test evidence; anything else is
     // stamped with its kind so the record stays descriptive but honest.
-    let assertion = match flags.get("assertion") {
-        Some(text) => text.clone(),
+    let assertion = match one(&flags, "assertion") {
+        Some(text) => text.to_owned(),
         None if kind == EvidenceKind::Test => TEST_PASSED.to_owned(),
         None => kind.as_str().to_owned(),
     };
-    let subject = flags.get("subject").cloned().unwrap_or_else(|| "goal".to_owned());
-    let source_hash = protocol::ArtifactId::from_bytes(
-        flags
-            .get("source-hash")
-            .unwrap_or(&assertion)
-            .as_bytes(),
-    );
+    let subject = one(&flags, "subject")
+        .unwrap_or("goal")
+        .to_owned();
+    let source_hash =
+        protocol::ArtifactId::from_bytes(one(&flags, "source-hash").unwrap_or(&assertion).as_bytes());
     let mut spec = EvidenceSpec::new(
         protocol::EvidenceId::new(),
         snapshot.id(),
@@ -509,33 +557,32 @@ fn goal_evidence_record(host: &mut GoalHost, args: &[String]) -> Result<i32, Int
         eprintln!("{err}");
         InteractiveError::Usage
     })?;
-    if let Some(criterion) = flags.get("criterion") {
-        spec = spec.with_criterion_id(criterion.clone()).map_err(|err| {
+    if let Some(criterion) = one(&flags, "criterion") {
+        spec = spec
+            .with_criterion_id(criterion.to_owned())
+            .map_err(|err| {
+                eprintln!("{err}");
+                InteractiveError::Usage
+            })?;
+    }
+    if let Some(command) = one(&flags, "command") {
+        spec = spec.with_command(command.to_owned()).map_err(|err| {
             eprintln!("{err}");
             InteractiveError::Usage
         })?;
     }
-    if let Some(command) = flags.get("command") {
-        spec = spec.with_command(command.clone()).map_err(|err| {
-            eprintln!("{err}");
-            InteractiveError::Usage
-        })?;
-    }
-    match (
-        flags.get("session"),
-        flags.get("seq"),
-        flags.get("event-id"),
-    ) {
+    match (one(&flags, "session"), one(&flags, "seq"), one(&flags, "event-id")) {
         (None, None, None) => {}
         (Some(session), Some(seq), Some(event_id)) => {
             let session = session
                 .parse::<protocol::SessionId>()
                 .map_err(|_| InteractiveError::Usage)?;
             let seq = seq.parse::<u64>().map_err(|_| InteractiveError::Usage)?;
-            let citation = EvidenceLedgerRef::new(session, event_id.clone(), seq).map_err(|err| {
-                eprintln!("{err}");
-                InteractiveError::Usage
-            })?;
+            let citation =
+                EvidenceLedgerRef::new(session, event_id.to_owned(), seq).map_err(|err| {
+                    eprintln!("{err}");
+                    InteractiveError::Usage
+                })?;
             spec = spec.with_ledger_ref(citation);
         }
         _ => return Err(InteractiveError::Usage),
@@ -1582,6 +1629,28 @@ mod tests {
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
     static TERMINAL_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn parse_flags_accumulates_repeated_keys_and_rejects_bad_shapes() {
+        let args: Vec<String> = [
+            "--criterion",
+            "c1=tests pass",
+            "--criterion",
+            "c2=build green",
+            "--kind",
+            "test",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let flags = parse_flags(&args).expect("flags");
+        assert_eq!(flags.get("criterion").expect("multi").len(), 2);
+        assert_eq!(one(&flags, "kind"), Some("test"));
+        assert_eq!(one(&flags, "missing"), None);
+        // A value without its flag, and a flag without its value, both fail.
+        assert!(parse_flags(&["kind".to_owned(), "test".to_owned()]).is_err());
+        assert!(parse_flags(&["--kind".to_owned()]).is_err());
+    }
 
     struct TempEnv {
         root: PathBuf,
