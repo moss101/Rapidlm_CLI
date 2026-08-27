@@ -37,6 +37,8 @@ use tui::{
 use crate::goal_host::{GOAL_FILE, GoalHost};
 use crate::headless::jsonl::JsonlExitCode;
 use crate::host::{NoopTools, PreservedLiveContext, UnconfiguredModel, run_live_exec};
+use crate::model::{ConfiguredModel, SelectedModel};
+use crate::user_config::ModelSelection;
 use agent_runtime::{
     AgentExecutionRequest, AgentRole, AgentSpec, AgentTerminalStatus, ContextRetryPolicy, GoalActor,
     GoalBudget, GoalCommand, GoalSnapshot, GoalSpec, GoalState,
@@ -398,9 +400,17 @@ fn goal_lifecycle(
     Ok(0)
 }
 
+/// stderr guidance for the typed no-config fallback (mirrors the Grok Build
+/// onboarding: a small user TOML selects provider, model, and credential).
+const NOT_CONFIGURED_HINT: &str = "no model configured: add a [models] default and a [model.<id>] \
+table (provider, model, base_url) to ~/.rapidlm/config.toml or point RAPIDLM_CONFIG at one; \
+see docs/configuration.md";
+
 /// Build the live-context host around the prompt and run one agent turn through
-/// the recovery-capable executor. No provider is configured in the bare CLI, so
-/// a model step is a typed provider failure (never a synthetic completion).
+/// the recovery-capable executor. The backing model is resolved Grok-style:
+/// `RAPIDLM_CONFIG`/`RAPIDLM_MODEL` env overrides, then the user config file,
+/// then the typed unconfigured fallback (a model step stays a typed provider
+/// failure — never a synthetic completion).
 fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
     let prompt = args.join(" ");
     if prompt.is_empty() {
@@ -427,9 +437,35 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
     let request = AgentExecutionRequest::new(spec, protocol::SessionId::new());
     let cancel = agent_runtime::CancellationToken::new();
     let mut events: Vec<agent_runtime::TurnEvent> = Vec::new();
+
+    // Layered model selection (env overrides > user config > typed fallback).
+    // The store outlives the model, which borrows it for the router resolver.
+    let credential_store = auth::InMemoryCredentialStore::new();
+    let backing = match crate::user_config::select_from_process_env() {
+        Ok(ModelSelection::Configured { active, warnings }) => {
+            for warning in warnings {
+                eprintln!("warning: unknown config key '{warning}'");
+            }
+            match ConfiguredModel::build(&active, &credential_store) {
+                Ok(model) => SelectedModel::Configured(Box::new(model)),
+                Err(err) => {
+                    eprintln!("model configuration error: {err}");
+                    return Ok(1);
+                }
+            }
+        }
+        Ok(ModelSelection::Unconfigured { .. }) => {
+            eprintln!("{NOT_CONFIGURED_HINT}");
+            SelectedModel::Unconfigured(UnconfiguredModel)
+        }
+        Err(err) => {
+            eprintln!("model configuration error: {err}");
+            return Ok(1);
+        }
+    };
     match run_live_exec(
         preserved,
-        UnconfiguredModel,
+        backing,
         &request,
         &mut NoopTools,
         &mut events,

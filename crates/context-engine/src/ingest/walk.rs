@@ -299,7 +299,9 @@ impl FileWalker<'_> {
     }
 
     fn open_next_repo(&mut self) -> bool {
-        while self.next_repo < self.repos.len() {
+        // Every branch below returns, so this opens at most one repo per call;
+        // failures are surfaced once via `pending` (fail-closed), not skipped.
+        if self.next_repo < self.repos.len() {
             let spec = self.repos[self.next_repo];
             self.next_repo += 1;
             match start_repo(spec, self.limits) {

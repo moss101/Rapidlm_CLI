@@ -5,7 +5,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 | Command | Purpose |
 |---|---|
 | `rapid` | interactive TUI |
-| `rapid exec <prompt>` | one-shot/headless task |
+| `rapid exec <prompt>` | one-shot/headless task (uses the configured model; see [model-configuration.md](model-configuration.md)) |
 | `rapid run <goal/playbook>` | durable graph run |
 | `rapid goal create|show|pause|resume|cancel|budget|verify` | goal lifecycle |
 | `rapid resume [session/run]` | resume durable session/run |

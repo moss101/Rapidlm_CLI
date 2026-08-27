@@ -37,6 +37,14 @@ computer-use = { path = "../../crates/computer-use" }
 mobile-sim = { path = "../../crates/mobile-sim" }
 # protocol: SessionId / ApiError / ErrorCode are the JSONL record and exit-code surface.
 protocol = { path = "../../crates/protocol" }
+# auth: credential handles (SecretRef/SecretValue) and the process-local
+# InMemoryCredentialStore backing the router's fail-closed credential resolver.
+auth = { path = "../../crates/auth" }
+# llm-router: provider adapters (OpenAI-compatible / Anthropic) behind the
+# LiveModelCall bridge; its transport is plain HTTP/1.1 only (no TLS).
+llm-router = { path = "../../crates/llm-router" }
+# toml: MIT/Apache-2.0; Grok-style user model config document parsing.
+toml = "0.8"
 # event-ledger: ErasedEventEnvelope / EventKind are the kernel event inputs mapped
 # onto JSONL records. event-ledger does not depend on this crate.
 event-ledger = { path = "../../crates/event-ledger" }

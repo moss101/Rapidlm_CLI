@@ -1010,6 +1010,7 @@ dependencies = [
  "agent-pool",
  "agent-runtime",
  "anyhow",
+ "auth",
  "capability-broker",
  "computer-use",
  "context-engine",
@@ -1018,6 +1019,7 @@ dependencies = [
  "insights",
  "kernel",
  "knowledge",
+ "llm-router",
  "mcp",
  "mobile-sim",
  "process-supervisor",
@@ -1026,6 +1028,7 @@ dependencies = [
  "security",
  "serde",
  "serde_json",
+ "toml",
  "tui",
 ]
 
