@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod credentials;
 pub mod fallback;
+pub mod phase;
 pub mod provider;
 pub mod providers {
     pub mod anthropic;
@@ -28,6 +29,10 @@ pub use fallback::{
     FALLBACK_POLICY_VERSION, FallbackAction, FallbackController, FallbackError, FallbackPlan,
     FallbackPolicy, FallbackTrigger, FailureClass, MAX_EXPLICIT_ALTERNATES, MAX_FALLBACK_MODELS,
     MAX_SAME_MODEL_RETRIES, StopReason,
+};
+pub use phase::{
+    parse_purpose_name, purpose_name, PhaseRoute, PHASE_ROUTE_SCHEMA, ReasoningEffort,
+    ReasoningEffortParseError, REASONING_EFFORT_NAMES,
 };
 pub use provider::{
     CANONICAL_MODEL_REQUEST_SCHEMA, CancellationToken, CanonicalMessage, CanonicalModelRequest,

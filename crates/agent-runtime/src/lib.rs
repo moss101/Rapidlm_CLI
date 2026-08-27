@@ -2,6 +2,7 @@
 
 pub mod agent {
     pub mod model;
+    pub mod ops;
     pub mod result;
     pub mod scheduler;
     pub mod spawn;
@@ -9,11 +10,13 @@ pub mod agent {
 
 pub mod agent_executor;
 
+pub mod agent_defs;
 pub mod compaction;
 pub mod context_recovery;
 pub mod delegation;
 pub mod evidence;
 pub mod loop_guard;
+pub mod reminders;
 pub mod role_profile;
 pub mod rules_loader;
 pub mod specialist;

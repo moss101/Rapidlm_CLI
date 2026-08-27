@@ -2,6 +2,7 @@
 
 pub mod chunk;
 pub mod compact;
+pub mod compact_policy;
 pub mod compile;
 pub mod need;
 pub mod index {
@@ -41,6 +42,10 @@ pub use chunk::{
 };
 pub use compact::{
     CompactError, CompactMethod, CompactedContext, PacketSummarizer, compact_packet,
+};
+pub use compact_policy::{
+    CompactPolicyError, CompactionEvidence, CompactionPolicy, CompactionOutcome,
+    CompactionStrategy, PolicyValidationError, ThresholdDecision, classify, compact_with_policy,
 };
 pub use compile::{
     CompileContext, CompileError, CompileInput, CompileLimits, CompileReason, ContextBlock,

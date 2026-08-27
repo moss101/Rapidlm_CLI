@@ -9,6 +9,7 @@ pub mod headless;
 pub mod host;
 pub mod host_runtime;
 pub mod interactive;
+pub mod managed_config;
 pub mod model;
 pub mod p9_commands;
 pub mod preview;

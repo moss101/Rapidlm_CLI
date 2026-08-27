@@ -47,6 +47,8 @@ pub const MAX_EVIDENCE: usize = 64;
 pub const MAX_ARTIFACTS: usize = 64;
 /// Byte cap for a compaction summary block.
 pub const MAX_COMPACTION_SUMMARY: usize = 8 * 1024;
+/// Byte cap for the rendered active-reminders block.
+pub const MAX_REMINDERS_BLOCK_BYTES: usize = 8 * 1024;
 
 /// Typed host-construction failure. Display never echoes block text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,6 +71,7 @@ pub struct PreservedLiveContext {
     artifacts: Vec<ArtifactRef>,
     context_limit: u32,
     output_reserve: u32,
+    reminders_block: Option<String>,
 }
 
 impl PreservedLiveContext {
@@ -105,12 +108,29 @@ impl PreservedLiveContext {
             artifacts: Vec::new(),
             context_limit,
             output_reserve,
+            reminders_block: None,
         })
     }
 
     pub fn with_workspace_view(mut self, view: WorkspaceViewId) -> Self {
         self.workspace_view = Some(view);
         self
+    }
+
+    /// Attach the rendered active-reminders block for this turn. Empty
+    /// blocks are ignored (no block, no packet entry).
+    pub fn with_reminders_block(mut self, block: Option<String>) -> Self {
+        let within_bounds = block
+            .as_ref()
+            .is_none_or(|text| !text.is_empty() && text.len() <= MAX_REMINDERS_BLOCK_BYTES);
+        if within_bounds {
+            self.reminders_block = block;
+        }
+        self
+    }
+
+    pub fn reminders_block(&self) -> Option<&str> {
+        self.reminders_block.as_deref()
     }
 
     pub fn with_evidence(mut self, evidence: Vec<EvidenceId>) -> Self {
@@ -406,6 +426,9 @@ pub fn build_packet(
         && !summary.is_empty() {
             ctx = ctx.memory(CompileInput::new("context/compaction", summary.to_owned()));
         }
+    if let Some(reminders) = preserved.reminders_block() {
+        ctx = ctx.system(CompileInput::new("reminders/active", reminders.to_owned()));
+    }
     compile(&ctx)
 }
 
@@ -520,6 +543,28 @@ mod tests {
             &mut events,
             &CancellationToken::new(),
         )
+    }
+
+    #[test]
+    fn reminders_block_is_compiled_into_the_packet_as_a_system_block() {
+        let block = "reminders schema=rapidlm.reminders.v1 feeds=ops\n\
+                     [ops/budget-guard floor=medium] stay under the time budget\n";
+        let with_reminders = preserved().with_reminders_block(Some(block.to_owned()));
+        let packet = build_packet(&with_reminders, None).expect("packet");
+        let reminders = packet
+            .blocks()
+            .iter()
+            .find(|b| b.text().contains("budget-guard"))
+            .expect("reminders block in packet");
+        assert_eq!(reminders.source(), context_engine::compile::ContextSource::System);
+        // Out-of-bounds blocks are refused: nothing enters the packet.
+        let oversized = "x".repeat(MAX_REMINDERS_BLOCK_BYTES + 1);
+        let with_oversized = preserved().with_reminders_block(Some(oversized));
+        let packet = build_packet(&with_oversized, None).expect("packet");
+        assert!(packet.blocks().iter().all(|b| !b.text().contains("reminders schema")));
+        // None adds no block.
+        let packet = build_packet(&preserved(), None).expect("packet");
+        assert!(packet.blocks().iter().all(|b| !b.text().contains("reminders schema")));
     }
 
     #[test]

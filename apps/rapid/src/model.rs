@@ -29,6 +29,7 @@ use agent_runtime::{
 use auth::{CredentialKind, CredentialPut, CredentialStore, InMemoryCredentialStore, SecretRef, SecretValue};
 use context_engine::compile::{ContextBlock, ContextSource};
 use llm_router::credentials::{ProfileId, ProviderProfile};
+use llm_router::phase::ReasoningEffort;
 use llm_router::provider::{
     CanonicalMessage, CanonicalModelRequest, CatalogRevision, ContentPart, MessageRole, ModelId,
     ModelPurpose, ModelRequestId, ModelRef, ModelStream, ModelStreamEvent, NormalizedUsage,
@@ -125,6 +126,7 @@ pub struct ConfiguredModel<'store> {
     provider: ProviderId,
     model: ModelId,
     max_output_tokens: Option<u32>,
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl<'store> ConfiguredModel<'store> {
@@ -244,6 +246,7 @@ impl<'store> ConfiguredModel<'store> {
             provider,
             model,
             max_output_tokens: active.entry.max_tokens,
+            reasoning_effort: active.entry.reasoning_effort,
         })
     }
 }
@@ -380,7 +383,7 @@ fn build_request(
     let catalog_revision =
         CatalogRevision::new(1).map_err(|_| ModelStepError::Failed)?;
     let router_cancel = llm_router::provider::CancellationToken::new();
-    CanonicalModelRequest::new(
+    let request = CanonicalModelRequest::new(
         request_id,
         model_ref,
         ModelPurpose::Chat,
@@ -391,7 +394,14 @@ fn build_request(
         TraceContext::root(),
         &router_cancel,
     )
-    .map_err(map_provider_error)
+    .map_err(map_provider_error)?;
+    // The Anthropic adapter does not send thinking budgets yet; a configured
+    // effort there is validated and carried but inert (documented at
+    // llm_router::phase).
+    Ok(match model.reasoning_effort {
+        Some(effort) => request.with_reasoning_effort(effort),
+        None => request,
+    })
 }
 
 fn next_request_id() -> Result<ModelRequestId, ModelStepError> {
@@ -481,10 +491,15 @@ mod tests {
             env_key: Vec::new(),
             max_tokens: None,
             context_window: None,
+            reasoning_effort: None,
         }
     }
 
     fn active(model: &str, base_url: &str, profile_id: &str) -> ActiveModel {
+        // Some tests deliberately pass invalid profile ids; the route only
+        // needs a syntactically valid placeholder for those to reach build().
+        let route_profile = llm_router::ProfileId::parse(profile_id)
+            .unwrap_or_else(|_| llm_router::ProfileId::parse("placeholder").expect("id"));
         ActiveModel {
             profile_id: profile_id.to_owned(),
             entry: entry(model, base_url),
@@ -492,6 +507,7 @@ mod tests {
                 plaintext: Some("test-key".to_owned()),
                 source: CredentialSource::InlineApiKey,
             },
+            phase_route: llm_router::PhaseRoute::new(route_profile),
         }
     }
 

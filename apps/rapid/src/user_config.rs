@@ -7,7 +7,10 @@
 //!     `$HOME/.rapidlm/config.toml`, `$USERPROFILE/.rapidlm/config.toml`.
 //!   - Schema: `[models] default = "<profile-id>"` plus one `[model.<id>]`
 //!     table per model (`provider`, `model`, `base_url`, optional `name`,
-//!     `api_key`, `env_key`, `max_tokens`, `context_window`).
+//!     `api_key`, `env_key`, `max_tokens`, `context_window`,
+//!     `reasoning_effort`), and an optional `[phases]` table mapping
+//!     request purposes (`chat`, `compact`, …) to `[model.<id>]` ids so
+//!     auxiliary phases can ride a cheaper model.
 //!   - Precedence: env override `RAPIDLM_MODEL` > `[models].default`.
 //!   - Credentials: inline `api_key` wins, else the first set, non-empty
 //!     `env_key` entry, else keyless (for local servers without auth).
@@ -21,6 +24,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use llm_router::{parse_purpose_name, purpose_name, PhaseRoute, ReasoningEffort};
 
 /// Env var holding an explicit config file path (Grok: `GROK_CONFIG`).
 pub const CONFIG_PATH_ENV: &str = "RAPIDLM_CONFIG";
@@ -46,8 +51,17 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserConfig {
     pub models: ModelsSection,
+    /// `[phases]` purpose → model-id overrides for auxiliary model calls.
+    pub phases: PhasesSection,
     /// Dotted key paths that were present but not part of the schema.
     pub unknown_keys: Vec<String>,
+}
+
+/// `[phases]` section: purpose-name → `[model.<id>]` id.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PhasesSection {
+    /// Keyed by canonical llm-router purpose name (`chat`, `compact`, …).
+    pub overrides: BTreeMap<String, String>,
 }
 
 /// `[models]` section.
@@ -73,7 +87,7 @@ impl ConfigProvider {
         }
     }
 
-    fn parse(raw: &str) -> Option<Self> {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw {
             "openai-compatible" => Some(Self::OpenAiCompatible),
             "anthropic" => Some(Self::Anthropic),
@@ -98,6 +112,8 @@ pub struct ModelEntry {
     pub env_key: Vec<String>,
     pub max_tokens: Option<u32>,
     pub context_window: Option<u32>,
+    /// Reasoning-effort request override; `None` means the provider default.
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// The configured model the exec path should drive.
@@ -107,6 +123,10 @@ pub struct ActiveModel {
     pub profile_id: String,
     pub entry: ModelEntry,
     pub credential: ResolvedCredential,
+    /// Purpose → profile routing: overrides from `[phases]`, main = the
+    /// selected model (so auxiliary phases fail open to the conversation
+    /// model when unconfigured).
+    pub phase_route: PhaseRoute,
 }
 
 /// Credential resolution outcome for an [`ActiveModel`].
@@ -150,6 +170,8 @@ pub enum UserConfigError {
     NoModelsDefined,
     NoDefaultModel { available: Vec<String> },
     UnknownDefaultModel { id: String, available: Vec<String> },
+    /// A `[phases]` override names a `[model.<id>]` that does not exist.
+    UnknownPhaseModel { key: String, id: String, available: Vec<String> },
 }
 
 impl fmt::Display for UserConfigError {
@@ -184,6 +206,11 @@ impl fmt::Display for UserConfigError {
             Self::UnknownDefaultModel { id, available } => write!(
                 f,
                 "default model '{id}' has no [model.{id}] table; defined models: {}",
+                join_ids(available)
+            ),
+            Self::UnknownPhaseModel { key, id, available } => write!(
+                f,
+                "{key} names model '{id}' which has no [model.{id}] table; defined models: {}",
                 join_ids(available)
             ),
         }
@@ -243,7 +270,7 @@ pub fn resolve_config_source(env: &[(String, String)]) -> ConfigSource {
     )
 }
 
-fn env_value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
+pub(crate) fn env_value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
     env.iter()
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.as_str())
@@ -300,7 +327,7 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
 
     let mut unknown_keys = Vec::new();
     for key in root.keys() {
-        if key != "models" && key != "model" {
+        if key != "models" && key != "model" && key != "phases" {
             unknown_keys.push(key.clone());
         }
     }
@@ -334,8 +361,22 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
         }
     }
 
+    let mut phases = PhasesSection::default();
+    if let Some(section) = root.get("phases") {
+        let table = expect_table(section, "phases")?;
+        for (key, value) in table {
+            let Some(purpose) = parse_purpose_name(key) else {
+                unknown_keys.push(format!("phases.{key}"));
+                continue;
+            };
+            let id = expect_non_empty_str(value, &format!("phases.{key}"))?.to_owned();
+            phases.overrides.insert(purpose_name(purpose).to_owned(), id);
+        }
+    }
+
     Ok(UserConfig {
         models,
+        phases,
         unknown_keys,
     })
 }
@@ -355,6 +396,7 @@ fn parse_model_entry(
         "env_key",
         "max_tokens",
         "context_window",
+        "reasoning_effort",
     ];
     for key in table.keys() {
         if !known.contains(&key.as_str()) {
@@ -427,6 +469,18 @@ fn parse_model_entry(
         None => None,
         Some(value) => Some(positive_u32(value, &format!("{prefix}.context_window"))?),
     };
+    let reasoning_effort = match table.get("reasoning_effort") {
+        None => None,
+        Some(value) => {
+            let raw = value.as_str().ok_or(UserConfigError::TypeMismatch {
+                key: format!("{prefix}.reasoning_effort"),
+            })?;
+            Some(ReasoningEffort::parse(raw).map_err(|_| UserConfigError::InvalidValue {
+                key: format!("{prefix}.reasoning_effort"),
+                reason: "expected none|minimal|low|medium|high|xhigh|ultra".to_owned(),
+            })?)
+        }
+    };
 
     Ok(ModelEntry {
         provider,
@@ -437,6 +491,7 @@ fn parse_model_entry(
         env_key,
         max_tokens,
         context_window,
+        reasoning_effort,
     })
 }
 
@@ -527,10 +582,66 @@ pub fn resolve_active(env: &[(String, String)], config: &UserConfig) -> Result<A
             id: default_id.clone(),
             available: available.clone(),
         })?;
+    // `[phases]` overrides must name defined models; an unknown purpose name
+    // was already demoted to a warning at parse time (typo tolerance), but a
+    // missing target model is a hard error, like the default model.
+    let mut route = llm_router::ProfileId::parse(&default_id)
+        .map(PhaseRoute::new)
+        .map_err(|_| UserConfigError::InvalidValue {
+            key: format!("[models] default '{default_id}'"),
+            reason: "must satisfy the llm-router profile alphabet".to_owned(),
+        })?;
+    for (purpose_name, id) in &config.phases.overrides {
+        if !config.models.entries.contains_key(id) {
+            return Err(UserConfigError::UnknownPhaseModel {
+                key: format!("phases.{purpose_name}"),
+                id: id.clone(),
+                available: available.clone(),
+            });
+        }
+        if let Some(purpose) = parse_purpose_name(purpose_name) {
+            let profile = llm_router::ProfileId::parse(id).map_err(|_| {
+                UserConfigError::InvalidValue {
+                    key: format!("phases.{purpose_name}"),
+                    reason: "must satisfy the llm-router profile alphabet".to_owned(),
+                }
+            })?;
+            route = route.with_override(purpose, profile);
+        }
+    }
     Ok(ActiveModel {
         profile_id: default_id,
         entry: entry.clone(),
         credential: resolve_credential(entry, env),
+        phase_route: route,
+    })
+}
+
+/// Resolve the model driving one request purpose: the `[phases]` override
+/// entry when configured, else the default model. Auxiliary phases fail open
+/// to the conversation model by construction of [`ActiveModel::phase_route`].
+pub fn resolve_purpose_model(
+    env: &[(String, String)],
+    config: &UserConfig,
+    purpose: llm_router::provider::ModelPurpose,
+) -> Result<ActiveModel, UserConfigError> {
+    let active = resolve_active(env, config)?;
+    let routed = active.phase_route.route(purpose).as_str();
+    if routed == active.profile_id {
+        return Ok(active);
+    }
+    let entry = config.models.entries.get(routed).ok_or_else(|| {
+        UserConfigError::UnknownPhaseModel {
+            key: format!("phases.{}", llm_router::purpose_name(purpose)),
+            id: routed.to_owned(),
+            available: config.models.entries.keys().cloned().collect(),
+        }
+    })?;
+    Ok(ActiveModel {
+        profile_id: routed.to_owned(),
+        entry: entry.clone(),
+        credential: resolve_credential(entry, env),
+        phase_route: active.phase_route,
     })
 }
 
@@ -571,7 +682,11 @@ pub fn select_active_model(env: &[(String, String)]) -> Result<ModelSelection, U
     let Some(config) = load_config(&source)? else {
         return Ok(ModelSelection::Unconfigured { searched });
     };
-    let warnings = config.unknown_keys.clone();
+    let warnings = config
+        .unknown_keys
+        .iter()
+        .map(|key| format!("unknown config key '{key}'"))
+        .collect();
     let active = Box::new(resolve_active(env, &config)?);
     Ok(ModelSelection::Configured { active, warnings })
 }
@@ -580,6 +695,44 @@ pub fn select_active_model(env: &[(String, String)]) -> Result<ModelSelection, U
 pub fn select_from_process_env() -> Result<ModelSelection, UserConfigError> {
     let env: Vec<(String, String)> = std::env::vars().collect();
     select_active_model(&env)
+}
+
+/// Managed-policy-aware selection: the enterprise layer (`RAPIDLM_MANAGED_CONFIG`)
+/// gates the resolution after the normal user resolution. Gate enforcement is
+/// reported as warnings; allowlist violations are typed field errors.
+pub fn select_active_model_gated(
+    env: &[(String, String)],
+) -> Result<ModelSelection, crate::managed_config::GatedConfigError> {
+    let source = resolve_config_source(env);
+    let searched = match &source {
+        ConfigSource::ExplicitPath(path) | ConfigSource::HomeFallback(path) => {
+            vec![path.display().to_string()]
+        }
+    };
+    let Some(config) = load_config(&source)? else {
+        return Ok(ModelSelection::Unconfigured { searched });
+    };
+    let mut warnings = config
+        .unknown_keys
+        .iter()
+        .map(|key| format!("unknown config key '{key}'"))
+        .collect::<Vec<_>>();
+    let policy = crate::managed_config::load_policy(env)?;
+    let gated = crate::managed_config::resolve_gated(env, &config, policy.as_ref())?;
+    for report in &gated.reports {
+        warnings.push(format!("managed gate: {report}"));
+    }
+    Ok(ModelSelection::Configured {
+        active: Box::new(gated.active),
+        warnings,
+    })
+}
+
+/// Process-env entry point for the managed-policy-aware selection.
+pub fn select_from_process_env_gated(
+) -> Result<ModelSelection, crate::managed_config::GatedConfigError> {
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    select_active_model_gated(&env)
 }
 
 #[allow(dead_code)]
@@ -649,6 +802,135 @@ env_ky = "X"
         let config = parse_config_document(doc, "test.toml").expect("parse");
         assert_eq!(config.unknown_keys, vec!["models.typo_key", "model.a.env_ky"]);
     }
+
+    #[test]
+    fn parse_reasoning_effort_and_phase_overrides() {
+        let doc = r#"
+[models]
+default = "local"
+
+[phases]
+compact = "cloud"
+review = "local"
+
+[model.local]
+provider = "openai-compatible"
+model = "llama3.2"
+base_url = "http://127.0.0.1:11434/v1"
+reasoning_effort = "high"
+
+[model.cloud]
+provider = "anthropic"
+model = "claude-3-5-sonnet"
+base_url = "http://gateway.internal:8080"
+api_key = "inline-secret"
+"#;
+        let config = parse_config_document(doc, "test.toml").expect("parse");
+        assert_eq!(
+            config.models.entries["local"].reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(config.phases.overrides.len(), 2);
+        assert_eq!(config.phases.overrides["compact"], "cloud");
+        assert!(config.unknown_keys.is_empty());
+    }
+
+    #[test]
+    fn phases_unknown_purpose_name_is_a_warning_not_an_error() {
+        let doc = r#"
+[models]
+default = "a"
+
+[phases]
+sumarize = "a"
+
+[model.a]
+provider = "openai-compatible"
+model = "m"
+base_url = "http://127.0.0.1:1"
+"#;
+        let config = parse_config_document(doc, "test.toml").expect("parse");
+        assert_eq!(config.unknown_keys, vec!["phases.sumarize"]);
+        assert!(config.phases.overrides.is_empty());
+    }
+
+    #[test]
+    fn reasoning_effort_invalid_value_is_typed() {
+        let doc = r#"
+[model.a]
+provider = "openai-compatible"
+model = "m"
+base_url = "http://127.0.0.1:1"
+reasoning_effort = "maximum"
+"#;
+        let err = parse_config_document(doc, "test.toml").expect_err("invalid effort");
+        assert!(err.to_string().contains("model.a.reasoning_effort"));
+    }
+
+    #[test]
+    fn resolve_active_builds_phase_route_and_validates_targets() {
+        let config =
+            parse_config_document(PHASES_DOC, "test.toml").expect("parse");
+        let active = resolve_active(&[], &config).expect("resolve");
+        assert_eq!(active.profile_id, "local");
+        assert_eq!(
+            active.phase_route.route(llm_router::provider::ModelPurpose::Compact)
+                .as_str(),
+            "cloud"
+        );
+        assert_eq!(
+            active.phase_route.route(llm_router::provider::ModelPurpose::Chat).as_str(),
+            "local"
+        );
+        // The default-model env override also re-roots the phase route.
+        let env = env(&[("RAPIDLM_MODEL", "cloud")]);
+        let active = resolve_active(&env, &config).expect("resolve override");
+        assert_eq!(
+            active.phase_route.route(llm_router::provider::ModelPurpose::Chat).as_str(),
+            "cloud"
+        );
+    }
+
+    #[test]
+    fn phase_override_to_undefined_model_is_a_hard_error() {
+        let doc = r#"
+[models]
+default = "local"
+
+[phases]
+compact = "missing"
+
+[model.local]
+provider = "openai-compatible"
+model = "llama3.2"
+base_url = "http://127.0.0.1:11434/v1"
+"#;
+        let config = parse_config_document(doc, "test.toml").expect("parse");
+        let err = resolve_active(&[], &config).expect_err("unknown phase target");
+        assert!(err
+            .to_string()
+            .contains("phases.compact names model 'missing'"));
+    }
+
+    /// Two-model document with a compact-phase override to the cloud entry.
+    const PHASES_DOC: &str = r#"
+[models]
+default = "local"
+
+[phases]
+compact = "cloud"
+
+[model.local]
+provider = "openai-compatible"
+model = "llama3.2"
+base_url = "http://127.0.0.1:11434/v1"
+
+[model.cloud]
+provider = "anthropic"
+model = "claude-3-5-sonnet"
+base_url = "http://gateway.internal:8080"
+api_key = "inline-secret"
+"#;
 
     #[test]
     fn parse_rejects_unknown_provider_and_bad_scalars() {

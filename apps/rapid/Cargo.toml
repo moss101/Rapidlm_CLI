@@ -48,6 +48,9 @@ toml = "0.8"
 # event-ledger: ErasedEventEnvelope / EventKind are the kernel event inputs mapped
 # onto JSONL records. event-ledger does not depend on this crate.
 event-ledger = { path = "../../crates/event-ledger" }
+# plugin-host: manifest parse/validate + extension trust catalog + hook specs.
+# The plugins CLI drives those production APIs; trust decisions stay fail-closed.
+plugin-host = { path = "../../crates/plugin-host" }
 # kernel: in-process KernelClient, project trust, config load, and service graph.
 # This crate is a composition root and does not own those domain rules.
 kernel = { path = "../../crates/kernel" }

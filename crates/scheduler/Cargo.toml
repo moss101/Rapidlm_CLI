@@ -12,6 +12,11 @@ protocol = { path = "../protocol" }
 event-ledger = { path = "../event-ledger" }
 # agent-runtime: KEEP existing verified-orchestration supervisor; do not fork.
 agent-runtime = { path = "../agent-runtime" }
+# process-supervisor: Schedule is the five-field cron parser; the facade
+# validates and re-derives fire times through it at claim time.
+process-supervisor = { path = "../process-supervisor" }
+# capability-broker: CancellationToken consumed by Schedule::next_fire_after.
+capability-broker = { path = "../capability-broker" }
 # serde: MIT/Apache-2.0; graph proposal/snapshot wire objects.
 serde = { version = "1", features = ["derive"] }
 # serde_json: MIT/Apache-2.0; ledger payloads.

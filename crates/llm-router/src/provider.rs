@@ -412,6 +412,7 @@ pub struct CanonicalModelRequest {
     max_output_tokens: Option<u32>,
     catalog_revision: CatalogRevision,
     trace: TraceContext,
+    reasoning_effort: Option<crate::phase::ReasoningEffort>,
 }
 
 /// Normalized stream event. Large payloads become artifacts upstream.
@@ -1314,6 +1315,7 @@ impl CanonicalModelRequest {
             max_output_tokens,
             catalog_revision,
             trace,
+            reasoning_effort: None,
         })
     }
 
@@ -1340,6 +1342,19 @@ impl CanonicalModelRequest {
     }
     pub fn trace(&self) -> &TraceContext {
         &self.trace
+    }
+    /// Reasoning-effort request override; `None` means the provider default.
+    pub const fn reasoning_effort(&self) -> Option<crate::phase::ReasoningEffort> {
+        self.reasoning_effort
+    }
+    /// Builder-style effort override for requests from phases that want more
+    /// or less deliberation than the provider default.
+    pub fn with_reasoning_effort(
+        mut self,
+        effort: crate::phase::ReasoningEffort,
+    ) -> Self {
+        self.reasoning_effort = Some(effort);
+        self
     }
 }
 

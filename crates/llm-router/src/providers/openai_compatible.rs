@@ -545,6 +545,12 @@ fn encode_chat_completions(
     if let Some(max_output) = req.max_output_tokens() {
         payload.insert("max_tokens".to_owned(), Value::from(max_output));
     }
+    if let Some(effort) = req.reasoning_effort() {
+        payload.insert(
+            "reasoning_effort".to_owned(),
+            Value::String(effort.name().to_owned()),
+        );
+    }
 
     let mut messages = Vec::with_capacity(req.messages().len());
     for (i, message) in req.messages().iter().enumerate() {
@@ -2290,6 +2296,23 @@ mod tests {
         assert_eq!(payload["model"], "gpt-4.1");
         assert_eq!(payload["messages"][0]["role"], "system");
         assert_eq!(payload["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn reasoning_effort_is_emitted_only_when_set() {
+        let plain = request(false, false);
+        let encoded =
+            encode_provider_payload(&plain, OpenAiApiStyle::ChatCompletions, &live())
+                .expect("encode plain");
+        assert!(encoded.get("reasoning_effort").is_none());
+
+        let effort = request(false, false).with_reasoning_effort(
+            crate::phase::ReasoningEffort::High,
+        );
+        let encoded =
+            encode_provider_payload(&effort, OpenAiApiStyle::ChatCompletions, &live())
+                .expect("encode effort");
+        assert_eq!(encoded["reasoning_effort"], "high");
     }
 
     #[test]

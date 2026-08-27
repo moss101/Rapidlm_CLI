@@ -9,6 +9,7 @@ pub mod panels {
     pub mod goals;
     pub mod approval;
     pub mod context;
+    pub mod control_room;
     pub mod diff;
     pub mod memory;
     pub mod model;
@@ -40,6 +41,11 @@ pub use panels::agents::{
     AgentCancelIntent, AgentHandoffObservation, AgentInspectIntent, AgentMergeIntent,
     AgentMergeState, AgentRowView, AgentsFrame, AgentsPanelError, AgentsSelection, AgentsViewModel,
     MAX_AGENT_TEXT_BYTES, MAX_AGENTS, MAX_AGENTS_COLS, MAX_AGENTS_ROWS,
+};
+pub use panels::control_room::{
+    ControlRoomError, ControlRoomFrame, ControlRoomViewModel, MAX_PHASES, MAX_ROOM_COLS,
+    MAX_ROOM_ROWS, MAX_STREAMS, RoomGoal, RoomPhase, RoomPhaseState, RoomStream, goal_row,
+    phase_row, stream_row,
 };
 pub use panels::approval::{
     ApprovalActionSpec, ApprovalClock, ApprovalFrame, ApprovalLeaseFields, ApprovalModalChoice,

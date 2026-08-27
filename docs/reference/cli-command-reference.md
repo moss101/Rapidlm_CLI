@@ -17,11 +17,13 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 | `rapid context show|explain|compact|search` | context inspection |
 | `rapid evidence show|verify|export` | evidence/verification |
 | `rapid agents list|inspect|cancel` | agent attempts |
+| `rapid agents list|validate|scaffold` | project agent definitions (`.rapidlm/agents/*.toml`) validated against role tool surfaces |
+| `rapid cron add|list|remove|poll` | durable prompt cron over the event ledger (claim-lease firing, corruption quarantine) |
 | `rapid process list|logs|input|cancel|monitor` | supervised tasks |
 | `rapid computer ...` | computer/browser/mobile actions |
 | `rapid sandbox status|doctor` | isolation diagnostics |
 | `rapid mcp list|add|remove|auth|refresh` | MCP integration |
-| `rapid plugins list|install|enable|disable|update` | plugins |
+| `rapid plugins validate|register|list|approve|reject|hook-test` | plugin manifest validation, trust ledger (register stores untrusted; only explicit approve grants capabilities), and hook dry-run against a fixture event |
 | `rapid hooks list|test|enable|disable` | lifecycle hooks |
 | `rapid skills list|show|enable|disable` | skills |
 | `rapid eval run|compare|report` | evaluation harness |

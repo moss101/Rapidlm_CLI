@@ -7,11 +7,17 @@
 #![forbid(unsafe_code)]
 
 pub mod graph;
+pub mod cron;
 pub mod playbook;
 pub mod kinds;
 pub mod orch;
 pub mod proposal;
 pub mod service;
+
+pub use cron::{
+    CronError, DuePrompt, PollReport, PromptCron, CRON_FACADE_SCHEMA, FIRING_LEASE_TIMEOUT_MS,
+    MAX_POLL_BATCH, QUARANTINE_UNPARSEABLE_SCHEDULE,
+};
 
 pub use graph::{Edge, EdgeCondition, GraphDiff, Node, NodeExplain, ReadyContext, RuntimeGraph};
 pub use kinds::{EdgeKind, NodeKind, NodeState};

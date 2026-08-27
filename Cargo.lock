@@ -31,6 +31,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "toml",
  "workspace",
 ]
 
@@ -1022,6 +1023,7 @@ dependencies = [
  "llm-router",
  "mcp",
  "mobile-sim",
+ "plugin-host",
  "process-supervisor",
  "protocol",
  "scheduler",
@@ -1218,7 +1220,9 @@ name = "scheduler"
 version = "0.1.0"
 dependencies = [
  "agent-runtime",
+ "capability-broker",
  "event-ledger",
+ "process-supervisor",
  "protocol",
  "serde",
  "serde_json",

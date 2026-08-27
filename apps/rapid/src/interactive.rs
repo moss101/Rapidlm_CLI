@@ -202,11 +202,12 @@ usage: rapid [subcommand]
   rapid computer ...            computer/browser/mobile
   rapid sandbox status|doctor
   rapid mcp list|add|remove|auth|refresh
-  rapid plugins list|install|enable|disable|update
+  rapid plugins validate|register|list|approve|reject|hook-test
   rapid hooks list|test|enable|disable
   rapid skills list|show|enable|disable
   rapid eval run|compare|report
   rapid inspect <session/run>
+  rapid cron add|list|remove|poll   durable prompt cron (claim-lease firing)
   rapid export
   rapid doctor
   rapid update
@@ -291,6 +292,9 @@ fn run_subcommand(args: &[String]) -> Result<i32, InteractiveError> {
         Some("doctor") => p9(&args[1..], crate::p9_commands::run_doctor),
         Some("sessions") => p9(&args[1..], crate::p9_commands::run_sessions),
         Some("inspect-export") => p9(&args[1..], crate::p9_commands::run_inspect_export),
+        Some("cron") => p9(&args[1..], crate::p9_commands::run_cron),
+        Some("agents") => p9(&args[1..], crate::p9_commands::run_agents),
+        Some("plugins") => p9(&args[1..], crate::p9_commands::run_plugins),
         Some("completions") => p9(&args[1..], crate::p9_commands::run_completions),
         Some("man") => p9(&args[1..], crate::p9_commands::run_man),
         Some("insights") => p9(&args[1..], crate::p9_commands::run_insights),
@@ -406,6 +410,52 @@ const NOT_CONFIGURED_HINT: &str = "no model configured: add a [models] default a
 table (provider, model, base_url) to ~/.rapidlm/config.toml or point RAPIDLM_CONFIG at one; \
 see docs/configuration.md";
 
+/// Load `.rapidlm/reminders.toml` and admit the always-on feeds. Returns the
+/// rendered block plus the strongest reminder floor, or `None` when there is
+/// no roster or nothing was admitted.
+fn load_active_reminders(
+) -> Result<Option<(String, agent_runtime::reminders::ReminderFloor)>, agent_runtime::reminders::ReminderError>
+{
+    let path = std::path::Path::new(".rapidlm").join("reminders.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    let roster = agent_runtime::reminders::ReminderRoster::parse(&text)?;
+    let nominated: Vec<String> = roster
+        .feeds()
+        .iter()
+        .filter(|feed| feed.requires.is_none())
+        .map(|feed| feed.name.clone())
+        .collect();
+    let active = agent_runtime::reminders::ActiveReminders::admit(&roster, &nominated);
+    Ok(active
+        .render()
+        .map(|block| (block, active.effort_floor())))
+}
+
+/// Raise the configured reasoning effort to the reminders' floor. The roster
+/// stores the semantics; the composition root maps them onto the router's
+/// effort ladder. A configured effort already at or above the floor wins.
+fn apply_reminder_floor(
+    mut active: crate::user_config::ActiveModel,
+    floor: agent_runtime::reminders::ReminderFloor,
+) -> crate::user_config::ActiveModel {
+    use agent_runtime::reminders::ReminderFloor;
+    use llm_router::ReasoningEffort;
+    let mapped = match floor {
+        ReminderFloor::Baseline => return active,
+        ReminderFloor::Low => ReasoningEffort::Low,
+        ReminderFloor::Medium => ReasoningEffort::Medium,
+        ReminderFloor::High => ReasoningEffort::High,
+        ReminderFloor::Max => ReasoningEffort::Ultra,
+    };
+    active.entry.reasoning_effort = Some(match active.entry.reasoning_effort {
+        Some(current) if current >= mapped => current,
+        _ => mapped,
+    });
+    active
+}
+
 /// Build the live-context host around the prompt and run one agent turn through
 /// the recovery-capable executor. The backing model is resolved Grok-style:
 /// `RAPIDLM_CONFIG`/`RAPIDLM_MODEL` env overrides, then the user config file,
@@ -425,6 +475,22 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
         256,
     )
     .map_err(|_| InteractiveError::Internal)?;
+    // Reminder feeds: load the project roster if present and admit the
+    // always-on feeds (the CLI host grants no capabilities, so feeds gated
+    // on a capability stay inactive). A broken roster warns and the turn
+    // continues without reminders — advisory context, kept not loaded.
+    let mut reminder_floor = agent_runtime::reminders::ReminderFloor::Baseline;
+    let preserved = match load_active_reminders() {
+        Ok(Some((block, floor))) => {
+            reminder_floor = floor;
+            preserved.with_reminders_block(Some(block))
+        }
+        Ok(None) => preserved,
+        Err(err) => {
+            eprintln!("warning: reminders not loaded: {err}");
+            preserved
+        }
+    };
     let spec = AgentSpec::builder(
         protocol::AgentId::new(),
         AgentRole::Coder,
@@ -441,12 +507,15 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
     // Layered model selection (env overrides > user config > typed fallback).
     // The store outlives the model, which borrows it for the router resolver.
     let credential_store = auth::InMemoryCredentialStore::new();
-    let backing = match crate::user_config::select_from_process_env() {
+    let backing = match crate::user_config::select_from_process_env_gated() {
         Ok(ModelSelection::Configured { active, warnings }) => {
             for warning in warnings {
-                eprintln!("warning: unknown config key '{warning}'");
+                eprintln!("warning: {warning}");
             }
-            match ConfiguredModel::build(&active, &credential_store) {
+            match ConfiguredModel::build(
+                &apply_reminder_floor(*active, reminder_floor),
+                &credential_store,
+            ) {
                 Ok(model) => SelectedModel::Configured(Box::new(model)),
                 Err(err) => {
                     eprintln!("model configuration error: {err}");

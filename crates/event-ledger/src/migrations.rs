@@ -10,7 +10,7 @@ use std::time::Duration;
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 /// Schema version written after the latest bundled migration succeeds.
-pub const CURRENT_SCHEMA_VERSION: i32 = 3;
+pub const CURRENT_SCHEMA_VERSION: i32 = 4;
 
 /// Bounded SQLite lock wait. Matches the ledger busy-timeout recovery rule.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
@@ -374,6 +374,24 @@ CREATE INDEX idx_operation_journal_session ON operation_journal(session_id, stat
 CREATE INDEX idx_approvals_pending ON approvals(session_id, state);
 ";
 
+/// v4: prompt cron jobs with claim-lease firing state and quarantine.
+const V4_CRON_SQL: &str = "
+CREATE TABLE cron_jobs (
+  id TEXT PRIMARY KEY,
+  prompt TEXT NOT NULL,
+  session_id TEXT,
+  schedule TEXT NOT NULL,
+  status TEXT NOT NULL,
+  next_fire_at_ms INTEGER NOT NULL,
+  last_claim_ms INTEGER,
+  quarantine_reason TEXT,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+
+CREATE INDEX idx_cron_jobs_due ON cron_jobs(status, next_fire_at_ms);
+";
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -386,6 +404,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 3,
         sql: V3_JOURNAL_SQL,
+    },
+    Migration {
+        version: 4,
+        sql: V4_CRON_SQL,
     },
 ];
 
@@ -621,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_from_v2_applies_v3_only() {
+    fn upgrade_from_v2_applies_v3_and_v4() {
         let db = TempDb::create();
         db.conn()
             .execute_batch(V1_CORE_SQL)
@@ -635,10 +657,11 @@ mod tests {
 
         let applied = MigrationRunner::apply(db.conn()).expect("upgrade from v2");
         assert_eq!(applied.from, SchemaVersion(2));
-        assert_eq!(applied.to, SchemaVersion(3));
+        assert_eq!(applied.to, SchemaVersion(CURRENT_SCHEMA_VERSION));
         assert!(table_exists(db.conn(), "agent_pool"));
         assert!(table_exists(db.conn(), "operation_journal"));
         assert!(table_exists(db.conn(), "approvals"));
+        assert!(table_exists(db.conn(), "cron_jobs"));
     }
 
     #[test]
