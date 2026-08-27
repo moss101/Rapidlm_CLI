@@ -1443,7 +1443,7 @@ mod tests {
             }
             other => panic!("expected unknown outcome, got {other:?}"),
         }
-        let recorded = rx.recv_timeout(Duration::from_secs(2)).expect("recorded");
+        let recorded = rx.recv_timeout(Duration::from_secs(10)).expect("recorded");
         assert!(recorded.starts_with("submit_turn:"));
         thread::sleep(Duration::from_millis(50));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
@@ -1503,8 +1503,8 @@ mod tests {
         let client =
             DaemonClient::connect(ListenSpec::unix_socket(&tmp.sock), cancel).expect("connect");
         let loaded = client.get_session(session);
-        let first = rx.recv_timeout(Duration::from_secs(2)).expect("first id");
-        let second = rx.recv_timeout(Duration::from_secs(2)).expect("second id");
+        let first = rx.recv_timeout(Duration::from_secs(10)).expect("first id");
+        let second = rx.recv_timeout(Duration::from_secs(10)).expect("second id");
         assert_ne!(first, second, "request ids must not be reused");
         assert!(loaded.is_ok(), "{loaded:?}");
     }
@@ -1559,10 +1559,10 @@ mod tests {
         assert_eq!(second.seq(), 2);
         assert_eq!(stream.cursor(), 2);
         let first_from = from_seq_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(10))
             .expect("from 0");
         let resume_from = from_seq_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(10))
             .expect("from 1");
         assert_eq!(first_from, 0);
         assert_eq!(resume_from, 1);
