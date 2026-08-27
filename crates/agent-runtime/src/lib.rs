@@ -125,7 +125,7 @@ pub use orchestration::{
     TaskContract, VerificationVerdict, WorkspaceIdentity,
 };
 pub use prompt::{
-    CORE_SYSTEM_V1, CORE_SYSTEM_V1_HASH, CORE_SYSTEM_VERSION, DEFAULT_COMPILE_TIMEOUT,
+    CORE_SYSTEM_V2, CORE_SYSTEM_V2_HASH, CORE_SYSTEM_VERSION, DEFAULT_COMPILE_TIMEOUT,
     DEFAULT_MAX_CONTEXT_BLOCK_BYTES, DEFAULT_MAX_CONTEXT_BLOCKS, DEFAULT_MAX_LOCATOR_BYTES,
     DEFAULT_MAX_SECTION_BYTES, FragmentVersion, PROMPT_BUNDLE_SCHEMA, PROMPT_SCHEMA_VERSION,
     PromptBundle, PromptCompiler, PromptContextBlock, PromptError, PromptInputs, PromptLimits,
