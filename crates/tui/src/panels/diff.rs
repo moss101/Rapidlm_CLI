@@ -1091,6 +1091,15 @@ fn check_cancel(cancel: &CancellationToken) -> Result<(), DiffError> {
 }
 
 #[cfg(test)]
+fn check_file_bound_for_test(n: usize) -> Result<(), DiffError> {
+    if n > MAX_DIFF_FILES {
+        Err(DiffError::BoundExceeded)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use protocol::{AgentId, ArtifactId, RepoId, RepoPath};
@@ -1507,14 +1516,5 @@ preimage:sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
             Err(DiffError::BoundExceeded)
         );
         assert_eq!(super::check_file_bound_for_test(0), Ok(()));
-    }
-}
-
-#[cfg(test)]
-fn check_file_bound_for_test(n: usize) -> Result<(), DiffError> {
-    if n > MAX_DIFF_FILES {
-        Err(DiffError::BoundExceeded)
-    } else {
-        Ok(())
     }
 }

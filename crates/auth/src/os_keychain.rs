@@ -4,7 +4,7 @@
 
 use std::process::Command;
 
-use crate::store::{CancellationToken, KeychainItemMeta, KeychainProbe, PlatformKeychain, PlatformKeychainKind, StoreError};
+use crate::store::{KeychainItemMeta, KeychainProbe, PlatformKeychain, PlatformKeychainKind, StoreError};
 
 /// Production macOS Keychain-backed store. Secrets live only inside the
 /// login keychain; nothing is written to disk by this type.
@@ -144,7 +144,7 @@ impl PlatformKeychain for MacosKeychain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::CredentialKind;
+    use crate::store::{CancellationToken, CredentialKind};
 
     fn item() -> KeychainItemMeta {
         let secret_ref = crate::secret::SecretRef::from_id("018f3c8a-7e2b-7a10-8c4d-0123456789ab")

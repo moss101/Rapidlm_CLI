@@ -1562,7 +1562,7 @@ mod tests {
         let second = replay_ok(&events);
         let folded = events
             .iter()
-            .fold(AppState::new(), |state, event| reduce(state, event));
+            .fold(AppState::new(), reduce);
         let a = serde_json::to_vec(&first).expect("bytes a");
         let b = serde_json::to_vec(&second).expect("bytes b");
         let c = serde_json::to_vec(&folded).expect("bytes c");
@@ -1658,7 +1658,7 @@ mod tests {
         ));
         let blocked = events
             .iter()
-            .fold(AppState::new(), |state, event| reduce(state, event));
+            .fold(AppState::new(), reduce);
         assert!(blocked.actions_blocked());
         assert!(blocked.protocol_error().is_some());
         assert!(

@@ -1221,7 +1221,7 @@ mod tests {
         let policy = ScanGatePolicy::new(GatePhase::PreAction)
             .require(ScannerId::command(), FindingsDisposition::Block)
             .expect("require");
-        let blocked = evaluate_scan_gate(&policy, &[result.clone()]);
+        let blocked = evaluate_scan_gate(&policy, std::slice::from_ref(&result));
         assert_eq!(blocked.phase(), GatePhase::PreAction);
         assert_eq!(blocked.disposition(), GateDisposition::Block);
         assert!(!blocked.allows_apply());

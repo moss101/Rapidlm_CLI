@@ -411,7 +411,7 @@ impl<'a> McpGateway<'a> {
         chain.observe(MiddlewareStage::PreHook, ctx)?;
 
         // Policy/secret resolve: evaluate policy, validate + consume lease.
-        let mut guard = self.authorize_policy(request, &authorized, cancel)?;
+        let guard = self.authorize_policy(request, &authorized, cancel)?;
         chain.observe(MiddlewareStage::PolicySecretResolve, ctx)?;
         let _consumed = guard.consume();
         cancel_check(cancel)?;
@@ -1703,10 +1703,10 @@ capability = "mcp.invoke"
         let ident = identity("docs");
         let request = ExternalCallRequest::new(&call, revision, &ident, &actor, &lease, 9, now);
 
-        let recorder = std::sync::Arc::new(StageRecorder::new(None));
+        let recorder = StageRecorder::new(None);
         let evidence = std::sync::Arc::new(EvidenceCollector::new());
         let gateway = McpGateway::new(&catalog, &store, &policies, &validator).with_middleware(vec![
-            Box::new(std::sync::Arc::clone(&recorder)),
+            Box::new(recorder.clone()),
             Box::new(std::sync::Arc::clone(&evidence)),
         ]);
         let mut transport = CountingTransport::new(tools_result(
@@ -1758,10 +1758,10 @@ capability = "mcp.invoke"
         let ident = identity("docs");
         let request = ExternalCallRequest::new(&call, revision, &ident, &actor, &lease, 11, now);
 
-        let recorder = std::sync::Arc::new(StageRecorder::new(Some(MiddlewareStage::PreHook)));
+        let recorder = StageRecorder::new(Some(MiddlewareStage::PreHook));
         let evidence = std::sync::Arc::new(EvidenceCollector::new());
         let gateway = McpGateway::new(&catalog, &store, &policies, &validator).with_middleware(vec![
-            Box::new(std::sync::Arc::clone(&recorder)),
+            Box::new(recorder.clone()),
             Box::new(std::sync::Arc::clone(&evidence)),
         ]);
         let mut transport = CountingTransport::new(tools_result(

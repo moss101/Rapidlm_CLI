@@ -349,14 +349,14 @@ pub fn classify_browser_action(
         BrowserGateAction::Upload { target, source } => {
             if let Some(selector) = target {
                 let resolved = require_target(observation, selector, cancel)?;
-                reject_challenge(&resolved)?;
+                reject_challenge(resolved)?;
             }
             classify_upload(source, cancel)
         }
         BrowserGateAction::Download { target, url, dest } => {
             if let Some(selector) = target {
                 let resolved = require_target(observation, selector, cancel)?;
-                reject_challenge(&resolved)?;
+                reject_challenge(resolved)?;
             }
             classify_download(url, dest, &current, cancel)
         }
@@ -506,15 +506,15 @@ fn classify_type(
     cancel: &CancellationToken,
 ) -> Result<Vec<CapabilityIntent>, SecurityError> {
     let resolved = require_target(observation, target, cancel)?;
-    reject_challenge(&resolved)?;
-    let sensitive_field = resolved.is_sensitive() || is_credential_target(&resolved);
+    reject_challenge(resolved)?;
+    let sensitive_field = resolved.is_sensitive() || is_credential_target(resolved);
     match value {
         SecretAwareString::Literal(_) if sensitive_field => {
             Err(SecurityError::CredentialRequiresHandle)
         }
         SecretAwareString::SecretHandle(handle) => {
             let mut intents = vec![secret_intent(handle, current)?];
-            if is_auth_target(&resolved) {
+            if is_auth_target(resolved) {
                 intents.push(CapabilityIntent::exclusive(
                     SensitiveClass::AuthSecurityAccount,
                 ));
@@ -523,7 +523,7 @@ fn classify_type(
         }
         SecretAwareString::Literal(_) => {
             let mut intents = Vec::new();
-            push_target_classes(&mut intents, &resolved, current);
+            push_target_classes(&mut intents, resolved, current);
             if intents.is_empty() {
                 intents.push(navigate_intent(SensitiveClass::Navigate, current));
             }
@@ -539,19 +539,19 @@ fn classify_targeted(
     cancel: &CancellationToken,
 ) -> Result<Vec<CapabilityIntent>, SecurityError> {
     let resolved = require_target(observation, target, cancel)?;
-    reject_challenge(&resolved)?;
-    if resolved.is_sensitive() || is_credential_target(&resolved) {
+    reject_challenge(resolved)?;
+    if resolved.is_sensitive() || is_credential_target(resolved) {
         return Err(SecurityError::CredentialRequiresHandle);
     }
-    if looks_like_file_chooser(&resolved) {
+    if looks_like_file_chooser(resolved) {
         // Opening a chooser without a normalized path would skip fs policy.
         return Err(SecurityError::PathInvalid);
     }
     let mut intents = Vec::new();
-    if looks_like_download(&resolved) {
+    if looks_like_download(resolved) {
         intents.push(download_intent(current, DOWNLOAD_STAGING_PATH)?);
     }
-    push_target_classes(&mut intents, &resolved, current);
+    push_target_classes(&mut intents, resolved, current);
     if intents.is_empty() {
         intents.push(navigate_intent(SensitiveClass::Navigate, current));
     }
@@ -1568,13 +1568,13 @@ capability = "{capability}"
 
         let upload = BrowserGateAction::upload_artifact(None, artifact());
         assert_eq!(
-            authorize(&upload, &obs, &[nav.clone()], now).unwrap_err(),
+            authorize(&upload, &obs, std::slice::from_ref(&nav), now).unwrap_err(),
             SecurityError::PolicyDenied
         );
 
         let sign_in = BrowserGateAction::from_ui(UiAction::click(target(&obs, "sign-in")));
         assert_eq!(
-            authorize(&sign_in, &obs, &[nav.clone()], now).unwrap_err(),
+            authorize(&sign_in, &obs, std::slice::from_ref(&nav), now).unwrap_err(),
             SecurityError::PolicyDenied
         );
 

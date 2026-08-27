@@ -33,7 +33,7 @@ mod tests {
     fn acp_decoder_survives_hostile_inputs_without_panicking() {
         let oversized = vec![b'x'; 4096];
         let bomb_line = format!("{}{}", "{\"a\":".repeat(500), "1".to_owned() + &"}".repeat(500));
-        let mut cases: Vec<&[u8]> = vec![
+        let cases: Vec<&[u8]> = vec![
             b"",                                     // empty
             b"\n\n\n",                               // blank lines
             b"{\"jsonrpc\":\"2.0\"}\n",              // incomplete but well-formed JSON line

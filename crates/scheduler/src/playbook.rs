@@ -44,7 +44,7 @@ impl core::fmt::Display for PlaybookError {
             Self::LabelTooLong => "step label exceeds the byte bound",
             Self::DuplicateStepKey => "playbook declares a duplicate step key",
             Self::TooManyDependencies => "step exceeds the dependency bound",
-            Self::UnknownDependency { key, missing } => {
+            Self::UnknownDependency { key, missing: _ } => {
                 let _ = key;
                 "step depends on an undeclared step"
             }
@@ -208,7 +208,7 @@ pub fn compile(
 ) -> Result<RuntimeGraph, PlaybookError> {
     template.validate()?;
     let steps = &template.steps;
-    let order = topo_order(steps)?;
+    let _order = topo_order(steps)?;
 
     // Entry is the first declared step and must reach every other step.
     let entry_index = 0usize;

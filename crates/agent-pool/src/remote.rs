@@ -11,7 +11,7 @@
 //! `protocol::remote_worker` messages. No second remote-worker protocol is
 //! introduced here.
 
-use crate::{EnvironmentState, PoolBackend, PoolError, Provisioner};
+use crate::{PoolBackend, PoolError, Provisioner};
 
 /// A remote-worker transport seam. Production impls wrap the real
 /// remote-worker protocol client; test impls use scripted fixtures.

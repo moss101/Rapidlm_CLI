@@ -1651,11 +1651,10 @@ impl<B: DesktopBackend> DesktopActor<B> {
         }
         require_healthy(&self.backend, request.cancel())?;
         self.backend.supports(request.action())?;
-        if let Some(bound) = request.action().bound_observation() {
-            if bound != request.observation_id() {
+        if let Some(bound) = request.action().bound_observation()
+            && bound != request.observation_id() {
                 return Err(DesktopError::StaleObservation);
             }
-        }
         let stored = self.require_current(
             session,
             request.observation_id(),
@@ -2064,11 +2063,9 @@ fn commit_observation<B>(
         .sessions
         .get(&session)
         .and_then(|cursor| cursor.current)
-    {
-        if let Some(stored) = ledger.observations.get_mut(&previous) {
+        && let Some(stored) = ledger.observations.get_mut(&previous) {
             stored.superseded = true;
         }
-    }
     ledger.sessions.insert(
         session,
         SessionCursor {

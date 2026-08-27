@@ -814,6 +814,12 @@ impl SandboxSpecBuilder {
     }
 }
 
+impl Default for SandboxId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SandboxId {
     pub fn new() -> Self {
         Self(RuntimeId::new())
@@ -1597,7 +1603,7 @@ capability = "fs.read"
             let rank = isolation_rank(*tier).expect("rank");
             let isolation = IsolationStrength::of_tier(*tier).expect("isolation");
             assert_eq!(isolation, IsolationStrength::of_tier(*tier).unwrap());
-            assert_eq!(meets_required_isolation(*tier, *tier), true);
+            assert!(meets_required_isolation(*tier, *tier));
             let _ = rank;
         }
         assert!(IsolationStrength::ProcessPolicy.doctor_warning().is_some());

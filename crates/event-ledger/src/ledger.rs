@@ -275,7 +275,7 @@ impl EventLedger {
         &self,
         cancel: &CancellationToken,
     ) -> Result<Vec<SessionSummary>, LedgerError> {
-        use rusqlite::Connection;
+        
         cancel.check()?;
         let conn = self.connect()?;
         let mut stmt = conn.prepare(

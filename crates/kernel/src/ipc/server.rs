@@ -743,7 +743,7 @@ fn auth_handshake(
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
     fn unhex(text: &str) -> Option<Vec<u8>> {
-        if text.len() % 2 != 0 {
+        if !text.len().is_multiple_of(2) {
             return None;
         }
         (0..text.len())
@@ -1696,7 +1696,6 @@ mod tests {
     }
 
 
-    use super::*;
     use auth::{DaemonAuth, DaemonTokenHandle};
 
     static AUTH_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1772,7 +1771,7 @@ mod tests {
     #[test]
     fn wrong_proof_fails_closed_and_correct_proof_serves_requests() {
         let tmp = TempIpc::create();
-        let cancel = CancellationToken::new();
+        let _cancel = CancellationToken::new();
         let runtime = temp_runtime("happy");
         let auth_cancel = auth::CancellationToken::new();
         let daemon = DaemonAuth::open(&runtime, &auth_cancel).expect("open");

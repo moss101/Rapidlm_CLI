@@ -478,7 +478,6 @@ mod tests {
         let a = pool
             .acquire(PoolBackend::Container, "o", 1, &mut good)
             .expect("a");
-        drop(good);
         pool.release(a.id(), false, 200, &mut FailingSanitize)
             .expect("dirty release");
         assert_eq!(pool.quarantined_count(), 1);
@@ -563,7 +562,7 @@ mod tests {
         let mut pool = ResourcePool::new(4);
         let mut p = prov();
         let a = pool.acquire(PoolBackend::Container, "o", 100, &mut p).expect("a");
-        let b = pool.acquire(PoolBackend::Container, "o", 200, &mut p).expect("b");
+        let _b = pool.acquire(PoolBackend::Container, "o", 200, &mut p).expect("b");
         // "Restart": release all, snapshot warm set.
         pool.release(a.id(), true, 300, &mut p).expect("release a");
         let snapshot: Vec<_> = pool.snapshot();

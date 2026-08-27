@@ -310,9 +310,9 @@ mod pool_tests {
         // Every admitted specialist is read-only and cannot mutate the workspace.
         for id in [a, b] {
             let s = pool.get(id).expect("specialist");
-            assert!(s.can_mutate_workspace() == false);
-            assert!(s.inherits_parent_lease() == false);
-            assert!(s.can_complete_goal() == false);
+            assert!(!s.can_mutate_workspace());
+            assert!(!s.inherits_parent_lease());
+            assert!(!s.can_complete_goal());
             assert!(s.profile().read_only());
         }
     }

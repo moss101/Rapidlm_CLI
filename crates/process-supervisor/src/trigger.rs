@@ -103,6 +103,12 @@ pub struct JobLease {
     heartbeat_at: UnitTime,
 }
 
+impl Default for TriggerCursor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TriggerCursor {
     pub const fn new() -> Self {
         Self {

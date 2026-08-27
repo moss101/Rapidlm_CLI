@@ -710,11 +710,10 @@ impl BrowserObserver {
             .sessions
             .get(&session_id)
             .and_then(|cursor| cursor.current);
-        if let Some(previous) = previous {
-            if let Some(stored) = ledger.observations.get_mut(&previous) {
+        if let Some(previous) = previous
+            && let Some(stored) = ledger.observations.get_mut(&previous) {
                 stored.superseded = true;
             }
-        }
         let generation = {
             let cursor = ledger.sessions.entry(session_id).or_insert(SessionCursor {
                 generation: 0,
@@ -1166,16 +1165,14 @@ fn is_sensitive_node(node: &PageNode) -> bool {
     matches!(node.role.as_str(), "password" | "current-password")
 }
 
-fn derive_targets(
-    nodes: &[PageNode],
-) -> Result<
-    (
-        Vec<SemanticTarget>,
-        Option<AccessibilitySnapshotRef>,
-        Option<DomSnapshotRef>,
-    ),
-    ObserveError,
-> {
+/// Targets derived from one page plus the snapshot refs they came from.
+type DerivedTargets = (
+    Vec<SemanticTarget>,
+    Option<AccessibilitySnapshotRef>,
+    Option<DomSnapshotRef>,
+);
+
+fn derive_targets(nodes: &[PageNode]) -> Result<DerivedTargets, ObserveError> {
     let mut ax_nodes = 0u32;
     let mut ax_interactive = 0u32;
     let mut dom_nodes = 0u32;

@@ -314,24 +314,21 @@ impl MemoryObservation {
 
     fn validate_scope(&self) -> Result<(), MemoryInspectError> {
         self.validate_core()?;
-        if let Some(project_id) = self.project_id.as_deref() {
-            if !bounded_id(project_id) {
+        if let Some(project_id) = self.project_id.as_deref()
+            && !bounded_id(project_id) {
                 return Err(MemoryInspectError::InvalidField);
             }
-        }
-        if let Some(session_id) = self.session_id.as_deref() {
-            if !bounded_id(session_id) {
+        if let Some(session_id) = self.session_id.as_deref()
+            && !bounded_id(session_id) {
                 return Err(MemoryInspectError::InvalidField);
             }
-        }
         if !bounded_timestamp(&self.created_at) {
             return Err(MemoryInspectError::InvalidField);
         }
-        if let Some(expires) = self.expires_at.as_deref() {
-            if !bounded_timestamp(expires) || expires.is_empty() {
+        if let Some(expires) = self.expires_at.as_deref()
+            && (!bounded_timestamp(expires) || expires.is_empty()) {
                 return Err(MemoryInspectError::InvalidField);
             }
-        }
         match self.scope {
             MemoryScopeKind::User => Ok(()),
             MemoryScopeKind::Project => {
@@ -427,11 +424,10 @@ impl MemoryViewModel {
         cancel: &CancellationToken,
     ) -> Result<Self, MemoryInspectError> {
         check_cancel(cancel)?;
-        if let Some(now) = now {
-            if !bounded_timestamp(now) || now.is_empty() {
+        if let Some(now) = now
+            && (!bounded_timestamp(now) || now.is_empty()) {
                 return Err(MemoryInspectError::InvalidField);
             }
-        }
         if observations.len() > MAX_MEMORY_ITEMS {
             return Err(MemoryInspectError::BoundExceeded);
         }

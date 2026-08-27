@@ -564,12 +564,10 @@ pub fn detect_checked(
     cancel: &CancellationToken,
 ) -> Result<Vec<ExternalMutation>, MutationError> {
     check_cancel(cancel)?;
-    let mut seen = 0usize;
-    for _ in before.files.keys().chain(after.files.keys()) {
+    for (seen, _) in before.files.keys().chain(after.files.keys()).enumerate() {
         if seen.is_multiple_of(CANCEL_STRIDE) {
             check_cancel(cancel)?;
         }
-        seen += 1;
     }
     Ok(detect(before, after))
 }
@@ -625,6 +623,7 @@ fn hint_matches(hint: &ReconcileHint, mutation: &ExternalMutation) -> bool {
     hint.path == mutation.path && hint.before == mutation.before && hint.after == mutation.after
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_dir(
     root: &Path,
     dir: &Path,

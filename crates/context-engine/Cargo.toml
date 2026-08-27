@@ -1,5 +1,9 @@
 [package]
 name = "context-engine"
+# The eval_queries runner is registered explicitly below as both a bench and a
+# test target; auto-discovery would register it a third time.
+autobenches = false
+autotests = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -86,8 +90,9 @@ structured-text = []
 name = "eval_queries"
 harness = false
 
-# Same runner under `cargo test` so metric invariants run in CI.
+# Same runner under `cargo test` so its metric invariants run in CI. The shim
+# file is separate from the bench source to avoid the duplicate-target warning.
 [[test]]
 name = "eval_queries"
-path = "benches/eval_queries.rs"
+path = "tests/eval_queries.rs"
 harness = false

@@ -366,11 +366,10 @@ impl ProjectTrustStore {
                 observed: bytes.len() as u64,
             });
         }
-        if let Some(parent) = self.catalog.parent() {
-            if !parent.as_os_str().is_empty() {
+        if let Some(parent) = self.catalog.parent()
+            && !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
             }
-        }
         let tmp = part_path(&self.catalog);
         let write_result = (|| {
             cancel.check().map_err(|_| ProjectTrustError::Cancelled)?;

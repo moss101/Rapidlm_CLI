@@ -22,7 +22,6 @@ pub const MAX_PTY_READ: usize = 4096;
 /// Output is captured from the master side; input can be written to stdin.
 pub struct PtySession {
     child: Child,
-    output_buffer: Vec<u8>,
 }
 
 /// Typed PTY failure.
@@ -72,10 +71,7 @@ impl PtySession {
         })?;
         // Close stdin so the child sees EOF on its terminal input.
         drop(child.stdin.take());
-        Ok(Self {
-            child,
-            output_buffer: Vec::new(),
-        })
+        Ok(Self { child })
     }
 
     /// Read available output from the PTY session (non-blocking poll).
@@ -135,10 +131,6 @@ impl PtySession {
         self.child.wait()?;
         Ok(())
     }
-}
-
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]

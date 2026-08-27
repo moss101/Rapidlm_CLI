@@ -1422,7 +1422,7 @@ fn find_ascii_ignore_case(hay: &[u8], needle: &[u8]) -> Option<usize> {
         window
             .iter()
             .zip(needle.iter())
-            .all(|(left, right)| left.to_ascii_lowercase() == right.to_ascii_lowercase())
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
     })
 }
 

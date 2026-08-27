@@ -290,11 +290,10 @@ enum Step {
 impl FileWalker<'_> {
     fn check_cancel(&mut self) -> Result<(), WalkError> {
         self.steps = self.steps.wrapping_add(1);
-        if self.steps == 1 || self.steps.is_multiple_of(CANCEL_STRIDE) {
-            if self.cancel.is_cancelled() {
+        if (self.steps == 1 || self.steps.is_multiple_of(CANCEL_STRIDE))
+            && self.cancel.is_cancelled() {
                 return Err(WalkError::Cancelled);
             }
-        }
         Ok(())
     }
 
@@ -357,6 +356,9 @@ impl FileWalker<'_> {
     }
 }
 
+// Private, hot-path iterator state; boxing the large variant would allocate
+// per entry, so the size skew is accepted.
+#[allow(clippy::large_enum_variant)]
 enum FrameNext {
     Pop(usize),
     Io,
@@ -969,7 +971,7 @@ mod tests {
     fn oversized_and_binary_files_are_metadata_only() {
         let ws = TempWorkspace::new();
         ws.write_file("core/small.rs", b"fn x() {}");
-        ws.write_file("core/huge.rs", &vec![b'a'; 64]);
+        ws.write_file("core/huge.rs", &[b'a'; 64]);
         ws.write_file("core/blob.bin", &[0x00, 0x01, 0x02, 0x00]);
         let manifest = parse_manifest(&ws, &[("core", "core")]);
         let limits = WalkLimits::new().max_file_bytes(16).binary_probe_bytes(8);

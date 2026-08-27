@@ -758,6 +758,51 @@ fn truncate_diff(text: &str) -> String {
     text[..end].to_owned()
 }
 
+/// Test-only canonical command pair with distinct argv.
+#[cfg(test)]
+impl CanonicalCommand {
+    fn try_from_parts_for_test() -> (Self, Self) {
+        use crate::normalize::command::{
+            CommandNormalizeError, ExecIntent, Resolver, normalize_exec,
+        };
+
+        struct Fixed;
+
+        impl Resolver for Fixed {
+            fn resolve_cwd(
+                &self,
+                requested: &str,
+            ) -> Result<crate::normalize::command::CanonicalHostPath, CommandNormalizeError>
+            {
+                crate::normalize::command::CanonicalHostPath::from_resolved(requested)
+            }
+
+            fn resolve_executable(
+                &self,
+                requested: &str,
+                _cwd: &crate::normalize::command::CanonicalHostPath,
+            ) -> Result<crate::normalize::command::CanonicalHostPath, CommandNormalizeError>
+            {
+                crate::normalize::command::CanonicalHostPath::from_resolved(requested)
+            }
+        }
+
+        let a = normalize_exec(
+            &ExecIntent::argv(["/usr/bin/git", "status"], "/repo", None::<String>),
+            &Fixed,
+            &CancellationToken::new(),
+        )
+        .expect("git status");
+        let b = normalize_exec(
+            &ExecIntent::argv(["/usr/bin/git", "push"], "/repo", None::<String>),
+            &Fixed,
+            &CancellationToken::new(),
+        )
+        .expect("git push");
+        (a, b)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1224,50 +1269,5 @@ capability = "secret.use"
         )
         .expect("b");
         assert_eq!(ActionFingerprint::of(&a), ActionFingerprint::of(&b));
-    }
-}
-
-/// Test-only canonical command pair with distinct argv.
-#[cfg(test)]
-impl CanonicalCommand {
-    fn try_from_parts_for_test() -> (Self, Self) {
-        use crate::normalize::command::{
-            CommandNormalizeError, ExecIntent, Resolver, normalize_exec,
-        };
-
-        struct Fixed;
-
-        impl Resolver for Fixed {
-            fn resolve_cwd(
-                &self,
-                requested: &str,
-            ) -> Result<crate::normalize::command::CanonicalHostPath, CommandNormalizeError>
-            {
-                crate::normalize::command::CanonicalHostPath::from_resolved(requested)
-            }
-
-            fn resolve_executable(
-                &self,
-                requested: &str,
-                _cwd: &crate::normalize::command::CanonicalHostPath,
-            ) -> Result<crate::normalize::command::CanonicalHostPath, CommandNormalizeError>
-            {
-                crate::normalize::command::CanonicalHostPath::from_resolved(requested)
-            }
-        }
-
-        let a = normalize_exec(
-            &ExecIntent::argv(["/usr/bin/git", "status"], "/repo", None::<String>),
-            &Fixed,
-            &CancellationToken::new(),
-        )
-        .expect("git status");
-        let b = normalize_exec(
-            &ExecIntent::argv(["/usr/bin/git", "push"], "/repo", None::<String>),
-            &Fixed,
-            &CancellationToken::new(),
-        )
-        .expect("git push");
-        (a, b)
     }
 }

@@ -663,7 +663,7 @@ impl FusedCandidate {
 
     fn cmp_tiebreak(&self, other: &Self) -> Ordering {
         path_key(self.path.as_ref())
-            .cmp(&path_key(other.path.as_ref()))
+            .cmp(path_key(other.path.as_ref()))
             .then_with(|| {
                 self.start_byte
                     .unwrap_or(u32::MAX)

@@ -709,7 +709,7 @@ fn open_questions(
     {
         push("callers not enumerated".to_string());
     }
-    if need.need_tests() && !hits.iter().any(|h| path_looks_like_test(h)) {
+    if need.need_tests() && !hits.iter().any(path_looks_like_test) {
         push("tests not located".to_string());
     }
     if need.need_types()
@@ -719,7 +719,7 @@ fn open_questions(
     {
         push("types not located".to_string());
     }
-    if need.need_config() && !hits.iter().any(|h| path_looks_like_config(h)) {
+    if need.need_config() && !hits.iter().any(path_looks_like_config) {
         push("config not located".to_string());
     }
     out
@@ -765,11 +765,10 @@ fn negative_confidence(need: &InformationNeed, broadened: bool) -> NegativeConfi
 fn broaden_scope_paths(requested: &[String]) -> Vec<String> {
     let mut out: Vec<String> = requested.to_vec();
     for path in requested {
-        if let Some((parent, _)) = path.rsplit_once('/') {
-            if !parent.is_empty() {
+        if let Some((parent, _)) = path.rsplit_once('/')
+            && !parent.is_empty() {
                 out.push(parent.to_string());
             }
-        }
     }
     for prefix in BROADEN_PREFIXES {
         out.push((*prefix).to_string());

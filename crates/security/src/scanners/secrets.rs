@@ -2101,7 +2101,7 @@ mod tests {
             ScanStatus::Error,
             "error and clean stay distinct"
         );
-        assert_eq!(err.retryable(), false);
+        assert!(!err.retryable());
         assert_eq!(err.code(), "security.secret_scan_bound_exceeded");
     }
 

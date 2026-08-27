@@ -1673,7 +1673,7 @@ mod tests {
     #[test]
     fn symbol_node_round_trips_without_display_text() {
         let node = ProvenanceNode::Symbol(symbol_hash());
-        let value = serde_json::to_value(&node).expect("serialize");
+        let value = serde_json::to_value(node).expect("serialize");
         assert_eq!(value["kind"], "symbol");
         assert_eq!(value["id"], symbol_hash().to_string());
         let decoded: ProvenanceNode = serde_json::from_str(&value.to_string()).expect("decode");

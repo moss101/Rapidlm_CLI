@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use event_ledger::event::ErasedEventEnvelope;
-use protocol::{ApiError, SessionId, TraceId, TurnId};
+use protocol::{ApiError, SessionId, TurnId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -542,12 +542,11 @@ impl DaemonEventStream {
         }
         #[cfg(unix)]
         {
-            if let Some(conn) = self.conn.as_mut() {
-                if set_timeouts(&mut conn.stream, Some(STREAM_POLL), self.client.limits).is_err() {
+            if let Some(conn) = self.conn.as_mut()
+                && set_timeouts(&mut conn.stream, Some(STREAM_POLL), self.client.limits).is_err() {
                     self.drop_conn();
                     return Ok(None);
                 }
-            }
         }
         match self.read_stream_frame() {
             Ok(Inbound::Event { id, event, cursor }) => {
@@ -1073,7 +1072,7 @@ mod tests {
     use crate::ipc::server::IpcServer;
     use crate::{InProcessKernelClient, InterruptReason};
     use event_ledger::event::{ActorKind, ActorRef, EventKind};
-    use protocol::{EventId, ProjectId};
+    use protocol::{EventId, ProjectId, TraceId};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};

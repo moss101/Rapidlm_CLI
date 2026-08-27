@@ -426,7 +426,7 @@ impl SupervisedCliRunner {
         cwd: PathBuf,
         principal: PrincipalRef,
         session_id: SessionId,
-        cancel: CancellationToken,
+        _cancel: CancellationToken,
     ) -> Result<Self, ExternalAgentError> {
         if argv.is_empty() {
             return Err(ExternalAgentError::InvalidTask);
@@ -485,7 +485,7 @@ impl CliRunner for SupervisedCliRunner {
             .map_err(|_| ExternalAgentError::Supervised("await".into()))?;
         // Bounded stdout drain from the child pipe (mirrors hook capture).
         let stdout_bytes = match handle.child_mut().stdout.take() {
-            Some(mut pipe) => {
+            Some(pipe) => {
                 use std::io::Read;
                 let mut buf = Vec::new();
                 let cap = self.output_limit as usize;
@@ -536,11 +536,10 @@ mod tests {
             _request: &JsonRpcMessage,
             _cancel: &CancellationToken,
         ) -> Result<Vec<u8>, ExternalAgentError> {
-            if let Some(after) = self.closed_after {
-                if self.served >= after {
+            if let Some(after) = self.closed_after
+                && self.served >= after {
                     return Err(ExternalAgentError::ChannelClosed);
                 }
-            }
             let response = self
                 .responses
                 .get(self.served)

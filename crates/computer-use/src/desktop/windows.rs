@@ -174,17 +174,17 @@ impl WindowsUiaPattern {
     }
 
     pub const fn supports(self, kind: ActionKind) -> bool {
-        match (self, kind) {
+        matches!(
+            (self, kind),
             (
                 Self::Invoke | Self::Toggle | Self::SelectionItem | Self::ExpandCollapse,
-                ActionKind::Click,
-            ) => true,
-            (Self::Value | Self::Text | Self::RangeValue, ActionKind::TypeText) => true,
-            (Self::Scroll, ActionKind::Scroll) => true,
-            (Self::Window, ActionKind::FocusWindow | ActionKind::CloseWindow) => true,
-            (Self::Transform | Self::Window, ActionKind::ResizeWindow) => true,
-            _ => false,
-        }
+                ActionKind::Click
+            )
+                | (Self::Value | Self::Text | Self::RangeValue, ActionKind::TypeText)
+                | (Self::Scroll, ActionKind::Scroll)
+                | (Self::Window, ActionKind::FocusWindow | ActionKind::CloseWindow)
+                | (Self::Transform | Self::Window, ActionKind::ResizeWindow)
+        )
     }
 
     pub const fn is_interactive(self) -> bool {
@@ -421,6 +421,7 @@ impl WindowsUiaWindow {
 }
 
 impl WindowsUiaNode {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: &str,
         window_id: &str,
@@ -851,11 +852,10 @@ impl WindowsUiaHost for ScriptedWindowsUiaHost {
         if !state.windows_os || !state.uia {
             return Err(DesktopError::HealthFailed);
         }
-        if let Some(target) = resolved.node().or(resolved.window()) {
-            if !state.live_elements.contains(target) {
+        if let Some(target) = resolved.node().or(resolved.window())
+            && !state.live_elements.contains(target) {
                 return Err(DesktopError::StaleObservation);
             }
-        }
         let patterns = patterns_for(&state, resolved)?.to_vec();
         if !uia_pattern_supports_action(&patterns, action.kind()) {
             // No Invoke/Value/Window/… match and no PowerShell SendKeys path.

@@ -950,7 +950,7 @@ mod tests {
 
     fn block_on<F: Future>(fut: F) -> F::Output {
         let waker = Waker::noop();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(waker);
         let mut fut = std::pin::pin!(fut);
         loop {
             match fut.as_mut().poll(&mut cx) {

@@ -1023,7 +1023,7 @@ mod tests {
             .collect()
     }
 
-    fn message<'a>(bundle: &'a PromptBundle, section: PromptSection) -> &'a PromptMessage {
+    fn message(bundle: &PromptBundle, section: PromptSection) -> &PromptMessage {
         bundle
             .messages()
             .iter()

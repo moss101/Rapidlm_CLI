@@ -944,9 +944,9 @@ impl ExternalScannerAdapter {
         };
 
         match kind {
-            ExternalExecKind::Cancelled => return Err(ExternalScanError::Cancelled),
+            ExternalExecKind::Cancelled => Err(ExternalScanError::Cancelled),
             ExternalExecKind::Unavailable => {
-                return Ok(status_report(
+                Ok(status_report(
                     ExternalScanStatus::Unavailable,
                     evidence,
                     Vec::new(),
@@ -957,10 +957,10 @@ impl ExternalScannerAdapter {
                     vec![ExternalScanError::Unavailable],
                     &request.config,
                     None,
-                ));
+                ))
             }
             ExternalExecKind::TimedOut => {
-                return Ok(status_report(
+                Ok(status_report(
                     ExternalScanStatus::Error,
                     evidence,
                     Vec::new(),
@@ -971,10 +971,10 @@ impl ExternalScannerAdapter {
                     vec![ExternalScanError::TimedOut],
                     &request.config,
                     None,
-                ));
+                ))
             }
             ExternalExecKind::Crashed => {
-                return Ok(status_report(
+                Ok(status_report(
                     ExternalScanStatus::Error,
                     evidence,
                     Vec::new(),
@@ -985,7 +985,7 @@ impl ExternalScannerAdapter {
                     vec![ExternalScanError::Crashed],
                     &request.config,
                     None,
-                ));
+                ))
             }
             ExternalExecKind::Completed { exit_code } => {
                 let parsed = match parse_sarif(sarif, request.config.kind, cancel) {
@@ -1052,6 +1052,7 @@ impl ExternalScannerAdapter {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn status_report(
     status: ExternalScanStatus,
     sandbox: ExternalSandboxEvidence,
@@ -1767,9 +1768,7 @@ mod tests {
             assert_ne!(report.status(), ExternalScanStatus::Passed);
             assert!(
                 report
-                    .errors()
-                    .iter()
-                    .any(|err| *err == ExternalScanError::MalformedSarif),
+                    .errors().contains(&ExternalScanError::MalformedSarif),
                 "missing malformed error for {body:?}"
             );
             if !body.is_empty() {

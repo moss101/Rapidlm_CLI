@@ -240,6 +240,9 @@ impl OwnershipIndicator {
     }
 
     /// Apply a control event: "takeover", "return", or "generation:N".
+    // The unit error is deliberate: callers render one generic
+    // "unrecognized event" notice, so a dedicated type adds no information.
+    #[allow(clippy::result_unit_err)]
     pub fn observe(&mut self, event: &str) -> Result<(), ()> {
         match event {
             "takeover" => {

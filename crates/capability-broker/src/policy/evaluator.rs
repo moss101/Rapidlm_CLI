@@ -581,15 +581,12 @@ fn resource_matches(
         return false;
     }
     match pattern {
-        ResourcePattern::Any => match action {
+        ResourcePattern::Any => !matches!(
+            action,
             CanonicalAction::Network(net)
                 if net.ip_classes().contains(&IpClass::MetadataLike)
-                    && effect != PolicyEffect::Deny =>
-            {
-                false
-            }
-            _ => true,
-        },
+                    && effect != PolicyEffect::Deny
+        ),
         ResourcePattern::Filesystem { root, glob } => match resource {
             ResourceDescriptor::Filesystem(scope) => {
                 absent_or_eq(root.as_ref(), &scope.root())

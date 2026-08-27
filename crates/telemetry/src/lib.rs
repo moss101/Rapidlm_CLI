@@ -769,7 +769,7 @@ impl TelemetryRecord {
 impl LocalSink {
     pub fn bounded(bound: usize) -> Self {
         Self {
-            bound: bound.min(MAX_LOCAL_QUEUE).max(1),
+            bound: bound.clamp(1, MAX_LOCAL_QUEUE),
             queue: Mutex::new(VecDeque::new()),
             dropped: AtomicU64::new(0),
         }
@@ -1682,7 +1682,7 @@ mod tests {
             assert!(rec.attributes.get(key).is_none(), "exported {key}");
         }
         assert_eq!(rec.attributes.get("provider"), Some("openai"));
-        let json = serialized(&[rec.clone()]);
+        let json = serialized(std::slice::from_ref(rec));
         assert!(!json.contains(CANARY));
         assert!(!json.contains("fn main"));
     }
@@ -1817,7 +1817,7 @@ mod tests {
         let rec = &local.snapshot().expect("snap")[0];
         assert!(rec.attributes.get("prompt").is_none());
         assert_eq!(rec.attributes.get("backend"), Some("container"));
-        assert!(!serialized(&[rec.clone()]).contains(CANARY));
+        assert!(!serialized(std::slice::from_ref(rec)).contains(CANARY));
 
         for i in 0..(MAX_METRIC_SERIES + 4) {
             let _ = tel.emit_metric(
@@ -1897,7 +1897,7 @@ mod tests {
         let status = rec.attributes.get("status").expect("status");
         assert!(status.contains("[REDACTED:secret:"));
         assert!(!status.contains(CANARY));
-        assert!(!serialized(&[rec.clone()]).contains(CANARY));
+        assert!(!serialized(std::slice::from_ref(rec)).contains(CANARY));
     }
 
     #[test]

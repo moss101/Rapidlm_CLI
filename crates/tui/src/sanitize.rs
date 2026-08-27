@@ -178,8 +178,8 @@ fn skip_control_string(mut rest: &str) -> &str {
         }
         if c == ESC {
             let after_esc = &rest[ESC.len_utf8()..];
-            if after_esc.starts_with('\\') {
-                return &after_esc[1..];
+            if let Some(after_backslash) = after_esc.strip_prefix('\\') {
+                return after_backslash;
             }
             return rest;
         }

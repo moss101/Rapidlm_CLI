@@ -1259,7 +1259,7 @@ mod tests {
         for _ in 0..32 {
             nested.push_str("{\"a\":");
         }
-        nested.push_str("1");
+        nested.push('1');
         for _ in 0..32 {
             nested.push('}');
         }

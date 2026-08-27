@@ -10,7 +10,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use agent_runtime::{InspectedResult, MergeStatus, PatchSummary};
-use protocol::{AgentId, ArtifactRef, EvidenceId, RedactionClass, WorkspaceViewId};
+use protocol::{AgentId, ArtifactRef, EvidenceId, WorkspaceViewId};
 
 use crate::sanitize::sanitize_untrusted;
 use crate::state::{
@@ -642,7 +642,7 @@ fn project_row(
         parent_id: agent.parent_id(),
         depth,
         display_id: short_id(&agent.id().to_string()),
-        role: agent.role().map(|role| sanitize_preview(role)),
+        role: agent.role().map(sanitize_preview),
         worker_class: agent.worker_class(),
         state: agent.state(),
         action: match agent.current_operation() {
@@ -912,7 +912,7 @@ mod tests {
     use super::*;
     use crate::state::{LocalUiEvent, UiEvent, reduce, replay};
     use event_ledger::event::{ActorKind, ActorRef, EventEnvelope, EventKind, RecordedAt};
-    use protocol::{EventId, TraceId};
+    use protocol::{EventId, RedactionClass, TraceId};
     use serde_json::Value;
 
     const GOLDEN_80: &str = "\
@@ -1377,7 +1377,7 @@ selected:000000000018
         ));
         let blocked = events
             .iter()
-            .fold(AppState::new(), |state, event| reduce(state, event));
+            .fold(AppState::new(), reduce);
         assert!(blocked.actions_blocked());
         let model = AgentsViewModel::from_state(
             &blocked,

@@ -738,10 +738,6 @@ impl SessionActionsViewModel {
         if !self.preview.can_apply {
             return Err(if self.preview.kind == SessionLifecycleKind::Rewind {
                 SessionActionError::RewindConflict
-            } else if self.preview.kind == SessionLifecycleKind::Fork
-                && self.preview.copies_active_goal
-            {
-                SessionActionError::GoalUnsafe
             } else {
                 SessionActionError::GoalUnsafe
             });

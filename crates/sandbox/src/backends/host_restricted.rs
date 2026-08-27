@@ -379,11 +379,10 @@ fn resolve_cwd(cwd: &RepoPath, mounts: &[SandboxMount]) -> Result<CanonicalHostP
         if !matches!(mount.mode(), MountMode::ReadOnly | MountMode::ReadWrite) {
             continue;
         }
-        if let Some(prefix_len) = target_covers(mount.target(), cwd) {
-            if best.is_none_or(|(_, len)| prefix_len > len) {
+        if let Some(prefix_len) = target_covers(mount.target(), cwd)
+            && best.is_none_or(|(_, len)| prefix_len > len) {
                 best = Some((mount, prefix_len));
             }
-        }
     }
     let (mount, _) = best.ok_or(SandboxError::ForbiddenMount)?;
     let source = mount.source().ok_or(SandboxError::InvalidSpec)?;
@@ -1041,11 +1040,10 @@ fn pgrep_group(pgid: u32) -> Option<Vec<u32>> {
         .ok()?;
     let mut pids = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if let Ok(pid) = line.trim().parse::<u32>() {
-            if pid >= 2 {
+        if let Ok(pid) = line.trim().parse::<u32>()
+            && pid >= 2 {
                 pids.push(pid);
             }
-        }
     }
     if pids.is_empty() {
         None
@@ -1366,13 +1364,11 @@ capability = "fs.read"
     fn wait_pid_file(path: &Path, budget: Duration) -> u32 {
         let deadline = Instant::now() + budget;
         loop {
-            if let Ok(text) = fs::read_to_string(path) {
-                if let Ok(pid) = text.trim().parse::<u32>() {
-                    if pid >= 2 {
+            if let Ok(text) = fs::read_to_string(path)
+                && let Ok(pid) = text.trim().parse::<u32>()
+                    && pid >= 2 {
                         return pid;
                     }
-                }
-            }
             if Instant::now() >= deadline {
                 panic!("pid file {} was not written", path.display());
             }

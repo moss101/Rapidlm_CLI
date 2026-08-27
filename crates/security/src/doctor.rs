@@ -496,6 +496,10 @@ impl PolicyDocumentInput {
     pub fn len(&self) -> usize {
         self.body.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.body.is_empty()
+    }
 }
 
 impl Debug for PolicyDocumentInput {

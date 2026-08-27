@@ -423,7 +423,7 @@ fn parse_host(raw: &str) -> Result<CanonicalNetHost, NetworkNormalizeError> {
     if raw.contains('%') {
         return Err(NetworkNormalizeError::InvalidHost);
     }
-    if raw.chars().any(|c| !c.is_ascii()) {
+    if !raw.is_ascii() {
         return Err(NetworkNormalizeError::InvalidHost);
     }
     if let Some(ip) = parse_literal_ip(raw)? {
@@ -1010,7 +1010,7 @@ mod tests {
     #[test]
     fn policy_bytes_are_stable_and_omit_userinfo() {
         let target = normalize("https://example.com:443/secret-path");
-        let expected = b"rapidlm.canonical_network.v1\0https\0example.com\0443\0ips\093.184.216.34\0classes\0public\0redirect\00\0";
+        let expected = b"rapidlm.canonical_network.v1\x00https\x00example.com\x00443\x00ips\x0093.184.216.34\x00classes\x00public\x00redirect\x000\x00";
         assert_eq!(target.policy_bytes(), expected);
         let text = String::from_utf8(target.policy_bytes()).expect("utf8");
         assert!(!text.contains("secret-path"));

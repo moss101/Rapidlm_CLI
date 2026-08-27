@@ -89,6 +89,12 @@ pub struct TakeoverReconciler {
     changes: Vec<SurfaceChange>,
 }
 
+impl Default for TakeoverReconciler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TakeoverReconciler {
     pub fn new() -> Self {
         Self {
@@ -170,15 +176,14 @@ impl TakeoverReconciler {
         }
         self.state = ReconciliationState::Reconciling;
         // URL changed → navigation → replan required.
-        if let (Some(expected), Some(actual)) = (expected_url, actual_url) {
-            if expected != actual {
+        if let (Some(expected), Some(actual)) = (expected_url, actual_url)
+            && expected != actual {
                 self.record_change(SurfaceChange::Navigated {
                     new_url: actual.to_owned(),
                 });
                 self.state = ReconciliationState::ReplanRequired;
                 return Ok(ReconciliationOutcome::Changed);
             }
-        }
         // Auth state changed → unsafe → block.
         if self
             .changes

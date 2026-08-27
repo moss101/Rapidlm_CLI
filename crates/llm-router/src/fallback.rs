@@ -689,7 +689,7 @@ fn build_chain(
         return Err(FallbackError::NoEligibleModel);
     }
     let selected = decision.model();
-    if !eligible.iter().any(|model| *model == selected) {
+    if !eligible.contains(&selected) {
         return Err(FallbackError::HardConstraintViolation);
     }
 

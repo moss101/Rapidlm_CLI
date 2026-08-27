@@ -1039,11 +1039,10 @@ impl ExtensionTrustStore {
                 observed: bytes.len() as u64,
             });
         }
-        if let Some(parent) = self.catalog.parent() {
-            if !parent.as_os_str().is_empty() {
+        if let Some(parent) = self.catalog.parent()
+            && !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
             }
-        }
         let tmp = part_path(&self.catalog);
         let write_result = (|| {
             cancel_check(cancel)?;
@@ -1072,11 +1071,10 @@ impl ExtensionTrustStore {
         stored: Option<&ExtensionTrustRecord>,
         cancel: &CancellationToken,
     ) -> Result<bool, TrustError> {
-        if let Some(stored) = stored {
-            if stored.identity.publisher_eq(identity) && stored.identity.package_eq(identity) {
+        if let Some(stored) = stored
+            && stored.identity.publisher_eq(identity) && stored.identity.package_eq(identity) {
                 return Ok(false);
             }
-        }
         let observations = self.load_quarantine(cancel)?;
         Ok(observations
             .iter()
@@ -1142,11 +1140,10 @@ impl ExtensionTrustStore {
             });
         }
         let path = self.quarantine_path();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
             }
-        }
         let tmp = part_path(&path);
         let write_result = (|| {
             cancel_check(cancel)?;

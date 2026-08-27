@@ -653,6 +653,7 @@ fn decode_preview(raw: RawMergePreview) -> Result<MergePreview, MergeError> {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accept_preview(
     child_view_id: WorkspaceViewId,
     parent_view_id: WorkspaceViewId,
@@ -676,11 +677,10 @@ fn accept_preview(
         &verification_plan.checks,
         cancel,
     )?;
-    if let Some(claimed) = claimed_hash {
-        if claimed != preview_hash {
+    if let Some(claimed) = claimed_hash
+        && claimed != preview_hash {
             return Err(MergeError::UnknownVariant);
         }
-    }
     Ok(MergePreview {
         child_view_id,
         parent_view_id,
@@ -897,6 +897,7 @@ fn patch_hash(patch: &SemanticPatch, cancel: &CancellationToken) -> Result<Artif
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hash_preview(
     child_view_id: WorkspaceViewId,
     parent_view_id: WorkspaceViewId,

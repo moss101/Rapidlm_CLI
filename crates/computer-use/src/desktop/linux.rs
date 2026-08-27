@@ -172,14 +172,17 @@ impl LinuxAtspiAction {
     }
 
     pub const fn supports(self, kind: ActionKind) -> bool {
-        match (self, kind) {
-            (Self::Click | Self::Press | Self::Toggle | Self::Activate, ActionKind::Click) => true,
-            (Self::SetText, ActionKind::TypeText) => true,
-            (Self::Scroll, ActionKind::Scroll) => true,
-            (Self::Activate, ActionKind::FocusWindow) => true,
-            (Self::Expand | Self::Collapse, ActionKind::Click) => true,
-            _ => false,
-        }
+        matches!(
+            (self, kind),
+            (
+                Self::Click | Self::Press | Self::Toggle | Self::Activate,
+                ActionKind::Click
+            )
+                | (Self::SetText, ActionKind::TypeText)
+                | (Self::Scroll, ActionKind::Scroll)
+                | (Self::Activate, ActionKind::FocusWindow)
+                | (Self::Expand | Self::Collapse, ActionKind::Click)
+        )
     }
 
     pub const fn is_interactive(self) -> bool {
@@ -347,6 +350,7 @@ impl LinuxAtspiWindow {
 }
 
 impl LinuxAtspiNode {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: &str,
         window_id: &str,
@@ -799,11 +803,10 @@ impl LinuxAtspiHost for ScriptedLinuxAtspiHost {
         if !state.linux || !state.session_bus || !state.atspi {
             return Err(DesktopError::HealthFailed);
         }
-        if let Some(target) = resolved.node().or(resolved.window()) {
-            if !state.live_elements.contains(target) {
+        if let Some(target) = resolved.node().or(resolved.window())
+            && !state.live_elements.contains(target) {
                 return Err(DesktopError::StaleObservation);
             }
-        }
         let actions = actions_for(&state, resolved)?.to_vec();
         if !atspi_action_supports_action(&actions, action.kind()) {
             // No AT-SPI click/settext/activate match and no xdotool path.

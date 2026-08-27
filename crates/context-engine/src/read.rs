@@ -323,11 +323,10 @@ pub fn read_repo(
     if request.start_line == 0 || request.line_window == 0 {
         return Err(ReadError::InvalidRequest);
     }
-    if let Some(cursor) = &request.cursor {
-        if cursor.path != request.path || cursor.next_line == 0 {
+    if let Some(cursor) = &request.cursor
+        && (cursor.path != request.path || cursor.next_line == 0) {
             return Err(ReadError::InvalidRequest);
         }
-    }
 
     let abs = resolve_file(root, &request.path)?;
     check_ready(limits, started)?;
@@ -361,6 +360,7 @@ pub fn read_repo(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn slice_text(
     repo_id: RepoId,
     path: RepoPath,
@@ -414,11 +414,10 @@ fn slice_text(
             break;
         }
         out.push_str(emitted);
-        if line_clamped && !emitted.ends_with('\n') && raw_line.ends_with('\n') {
-            if out.len().saturating_add(1) <= limits.max_bytes {
+        if line_clamped && !emitted.ends_with('\n') && raw_line.ends_with('\n')
+            && out.len().saturating_add(1) <= limits.max_bytes {
                 out.push('\n');
             }
-        }
 
         let tokens = estimator
             .estimate(TokenizerFamily::Unknown, &out)

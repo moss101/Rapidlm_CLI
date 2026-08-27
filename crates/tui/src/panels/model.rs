@@ -669,6 +669,7 @@ unavailable:
         llm_router::CancellationToken::new()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn caps(
         context_limit: u32,
         max_output: u32,
@@ -705,6 +706,7 @@ unavailable:
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spec(
         provider: &str,
         model: &str,

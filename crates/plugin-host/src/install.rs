@@ -516,21 +516,19 @@ impl PluginInstaller {
         if manifest.digest() != package_hash {
             return Err(InstallError::HashMismatch);
         }
-        if let Some(expected) = request.policy.expected_hash {
-            if expected != package_hash {
+        if let Some(expected) = request.policy.expected_hash
+            && expected != package_hash {
                 return Err(InstallError::HashMismatch);
             }
-        }
         if request.policy.signature_required() && request.signature.is_none() {
             self.record_quarantine(&manifest, request, package_hash, cancel)?;
             return Err(InstallError::Quarantined);
         }
-        if let Some(expected) = request.policy.expected_signature {
-            if request.signature != Some(expected) {
+        if let Some(expected) = request.policy.expected_signature
+            && request.signature != Some(expected) {
                 self.record_quarantine(&manifest, request, package_hash, cancel)?;
                 return Err(InstallError::Quarantined);
             }
-        }
         check_policy(&manifest, &request.policy)?;
         let mut identity = ExtensionIdentity::from_binding(&manifest.trust_binding());
         if let Some(signature) = request.signature {

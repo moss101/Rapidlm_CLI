@@ -199,7 +199,7 @@ pub struct FileDiff {
 
 impl FileDiff {
     pub fn new(path: impl Into<String>, unified: impl Into<String>) -> Option<Self> {
-        let mut path = path.into();
+        let path = path.into();
         let mut unified = unified.into();
         if path.is_empty() || path.len() > MAX_DIFF_PATH_BYTES {
             return None;
@@ -1227,7 +1227,7 @@ mod tests {
     fn block_on<F: Future>(future: F) -> F::Output {
         let mut future = std::pin::pin!(future);
         let waker = std::task::Waker::noop();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(waker);
         match future.as_mut().poll(&mut cx) {
             Poll::Ready(output) => output,
             Poll::Pending => panic!("in-process kernel future stayed pending"),

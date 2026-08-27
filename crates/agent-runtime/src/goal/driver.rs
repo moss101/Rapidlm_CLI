@@ -58,6 +58,9 @@ pub struct GoalDriver {
 }
 
 /// Result of one driver iteration.
+// `Continued` legitimately carries a full turn's payloads while `Stopped`
+// carries none; boxing the large variant would only add indirection.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GoalDriverOutcome {
     /// Goal remains active. The caller may invoke [`GoalDriver::next`] again.

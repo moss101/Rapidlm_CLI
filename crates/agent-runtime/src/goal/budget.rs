@@ -287,11 +287,10 @@ fn check_cancel(cancel: &CancellationToken) -> Result<(), GoalBudgetError> {
 
 fn first_exhausted(budget: GoalBudget, usage: GoalUsage) -> Option<BudgetDimension> {
     for (used, limit, dimension) in dimension_values(budget, usage) {
-        if let Some(limit) = limit {
-            if used >= limit {
+        if let Some(limit) = limit
+            && used >= limit {
                 return Some(dimension);
             }
-        }
     }
     None
 }

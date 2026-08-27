@@ -296,6 +296,10 @@ impl ExposedSecret<'_> {
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
 }
 
 impl SecretError {
@@ -468,16 +472,14 @@ impl<'de> Deserialize<'de> for SecretRef {
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        if let Some(schema) = wire.schema.as_deref() {
-            if schema != SECRET_REF_SCHEMA {
+        if let Some(schema) = wire.schema.as_deref()
+            && schema != SECRET_REF_SCHEMA {
                 return Err(D::Error::custom("unsupported SecretRef schema"));
             }
-        }
-        if let Some(version) = wire.schema_version {
-            if version != SCHEMA_VERSION {
+        if let Some(version) = wire.schema_version
+            && version != SCHEMA_VERSION {
                 return Err(D::Error::custom("unsupported SecretRef schema_version"));
             }
-        }
         match (wire.id.as_deref(), wire.alias.as_deref()) {
             (Some(id), Some(alias)) => {
                 SecretRef::from_id_and_alias(id, alias).map_err(D::Error::custom)
@@ -549,18 +551,16 @@ impl<'de> Deserialize<'de> for SecretAwareValue {
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        if let Some(schema) = wire.schema.as_deref() {
-            if schema != SECRET_AWARE_SCHEMA {
+        if let Some(schema) = wire.schema.as_deref()
+            && schema != SECRET_AWARE_SCHEMA {
                 return Err(D::Error::custom("unsupported SecretAwareValue schema"));
             }
-        }
-        if let Some(version) = wire.schema_version {
-            if version != SCHEMA_VERSION {
+        if let Some(version) = wire.schema_version
+            && version != SCHEMA_VERSION {
                 return Err(D::Error::custom(
                     "unsupported SecretAwareValue schema_version",
                 ));
             }
-        }
         match wire.kind.as_str() {
             "plaintext" => {
                 let value = wire

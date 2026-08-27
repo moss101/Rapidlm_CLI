@@ -113,7 +113,7 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
 fn block_on<F: Future>(future: F) -> F::Output {
     let mut future = std::pin::pin!(future);
     let waker = std::task::Waker::noop();
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(waker);
     match future.as_mut().poll(&mut cx) {
         Poll::Ready(output) => output,
         Poll::Pending => panic!("in-process kernel future stayed pending"),

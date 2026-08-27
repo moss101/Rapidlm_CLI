@@ -67,7 +67,7 @@ pub fn settle_policy(action: &UiAction) -> SettlePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browser::action::{KeyCode, MouseButton, SecretAwareString, TargetSelector};
+    use crate::browser::action::{KeyCode, MouseButton, TargetSelector};
 
     fn click() -> UiAction {
         UiAction::Click {

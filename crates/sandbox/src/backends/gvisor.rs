@@ -780,11 +780,10 @@ fn resolve_cwd(cwd: &RepoPath, mounts: &[SandboxMount]) -> Result<CanonicalHostP
         if !matches!(mount.mode(), MountMode::ReadOnly | MountMode::ReadWrite) {
             continue;
         }
-        if let Some(prefix_len) = target_covers(mount.target(), cwd) {
-            if best.is_none_or(|(_, len)| prefix_len > len) {
+        if let Some(prefix_len) = target_covers(mount.target(), cwd)
+            && best.is_none_or(|(_, len)| prefix_len > len) {
                 best = Some((mount, prefix_len));
             }
-        }
     }
     let (mount, _) = best.ok_or(SandboxError::ForbiddenMount)?;
     let source = mount.source().ok_or(SandboxError::InvalidSpec)?;
@@ -970,7 +969,7 @@ fn is_docker_socket(path: &str) -> bool {
     if trimmed == "docker.sock" || trimmed.ends_with("/docker.sock") {
         return true;
     }
-    DOCKER_SOCKET_NAMES.iter().any(|socket| trimmed == *socket)
+    DOCKER_SOCKET_NAMES.contains(&trimmed)
 }
 
 fn is_proxy_env_name(name: &str) -> bool {
@@ -1175,8 +1174,8 @@ fn host_sensitive_visible(
                 return Ok(true);
             }
         }
-        if let Ok(home) = std::env::var("HOME") {
-            if !home.is_empty()
+        if let Ok(home) = std::env::var("HOME")
+            && !home.is_empty()
                 && run_probe_bundle(
                     program,
                     platform,
@@ -1191,7 +1190,6 @@ fn host_sensitive_visible(
             {
                 return Ok(true);
             }
-        }
         return Ok(false);
     }
     if let Some(ls) = first_existing(LS_PROGRAMS) {
@@ -1234,6 +1232,7 @@ fn system_ro_binds() -> Vec<PlannedBind> {
     binds
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_probe_bundle(
     program: &str,
     platform: &str,
@@ -2027,11 +2026,10 @@ fn pgrep_group(pgid: u32) -> Option<Vec<u32>> {
         .ok()?;
     let mut pids = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if let Ok(pid) = line.trim().parse::<u32>() {
-            if pid >= 2 {
+        if let Ok(pid) = line.trim().parse::<u32>()
+            && pid >= 2 {
                 pids.push(pid);
             }
-        }
     }
     if pids.is_empty() {
         None
@@ -2594,8 +2592,8 @@ capability = "fs.read"
             SandboxError::ForbiddenMount
         );
 
-        if let Ok(home) = std::env::var("HOME") {
-            if !home.is_empty() && Path::new(&home).is_dir() {
+        if let Ok(home) = std::env::var("HOME")
+            && !home.is_empty() && Path::new(&home).is_dir() {
                 let home_ws = TempWorkspace::new();
                 let via_home = home_ws.path.join("via");
                 std::os::unix::fs::symlink(&home, &via_home).expect("symlink home");
@@ -2615,7 +2613,6 @@ capability = "fs.read"
                     SandboxError::ForbiddenMount
                 );
             }
-        }
 
         let cwd_ws = TempWorkspace::new();
         std::os::unix::fs::symlink("/etc", cwd_ws.path.join("escape")).expect("cwd symlink");
@@ -2636,15 +2633,14 @@ capability = "fs.read"
         let ws = TempWorkspace::new();
         let spec = gvisor_spec(&ws);
         let plan = GvisorPlan::from_spec(&spec).expect("plan");
-        if let Ok(home) = std::env::var("HOME") {
-            if !home.is_empty() {
+        if let Ok(home) = std::env::var("HOME")
+            && !home.is_empty() {
                 assert!(
                     plan.bind_sources().all(|src| src != home.as_str()
                         && !src.starts_with(&format!("{}/", home.trim_end_matches('/')))),
                     "host home must not be a bind source"
                 );
             }
-        }
         assert!(!plan.uses_docker_socket());
         assert!(!plan.shares_host_network());
         assert!(!plan.uses_host_rootfs());
@@ -2700,12 +2696,11 @@ capability = "fs.read"
             && !src.starts_with("/etc/")
             && src != "/private/etc"
             && !src.starts_with("/private/etc/")));
-        if let Ok(home) = std::env::var("HOME") {
-            if !home.is_empty() {
+        if let Ok(home) = std::env::var("HOME")
+            && !home.is_empty() {
                 assert!(plan.bind_sources().all(|src| src != home.as_str()
                     && !src.starts_with(&format!("{}/", home.trim_end_matches('/')))));
             }
-        }
 
         let live = CancellationToken::new();
         let Some(_) = live_runtime(&backend) else {

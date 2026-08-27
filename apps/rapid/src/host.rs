@@ -402,11 +402,10 @@ pub fn build_packet(
     for criterion in &preserved.completion_criteria {
         ctx = ctx.goal_block(CompileInput::new("criterion", criterion.clone()));
     }
-    if let Some(summary) = summary {
-        if !summary.is_empty() {
+    if let Some(summary) = summary
+        && !summary.is_empty() {
             ctx = ctx.memory(CompileInput::new("context/compaction", summary.to_owned()));
         }
-    }
     compile(&ctx)
 }
 

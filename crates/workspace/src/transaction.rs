@@ -504,15 +504,14 @@ impl TransactionManager {
     }
 
     fn rollback_on_failure(&self, tx: TransactionId) {
-        if let Ok(mut inner) = self.lock() {
-            if inner
+        if let Ok(mut inner) = self.lock()
+            && inner
                 .txs
                 .get(&tx)
                 .is_some_and(|stored| stored.meta.state == TransactionState::Staged)
             {
                 abort_staged(&mut inner, tx);
             }
-        }
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Inner>, TransactionError> {
@@ -764,13 +763,12 @@ fn verify_required_checks(
                 }
             }
             VerificationCheck::Preimage => {
-                if let Some(staged) = staged {
-                    if staged.view_id() != preview.parent_view_id()
-                        || staged.base_revision() != preview.parent_revision()
+                if let Some(staged) = staged
+                    && (staged.view_id() != preview.parent_view_id()
+                        || staged.base_revision() != preview.parent_revision())
                     {
                         return Err(TransactionError::Preimage);
                     }
-                }
             }
         }
     }

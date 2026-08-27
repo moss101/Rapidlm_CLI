@@ -985,7 +985,7 @@ impl StreamCoalescer {
     }
 
     pub fn pending_bytes(&self) -> usize {
-        self.current.bytes().len() + self.sealed.iter().map(|c| c.len()).sum::<usize>()
+        self.current.len() + self.sealed.iter().map(|c| c.len()).sum::<usize>()
     }
 
     /// Merge one delta. Empty deltas are ignored; sealed-chunk overflow
@@ -997,7 +997,7 @@ impl StreamCoalescer {
         // Reject before mutating whenever this delta could need a new slot.
         if self.pending_chunks() >= self.max_pending_chunks
             && (!self.current.is_empty()
-                || self.current.bytes().len() + delta.len() >= self.max_chunk_bytes)
+                || self.current.len() + delta.len() >= self.max_chunk_bytes)
         {
             return Err(TranscriptError::BackPressure);
         }

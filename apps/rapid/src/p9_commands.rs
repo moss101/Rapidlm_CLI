@@ -487,7 +487,7 @@ pub fn run_sessions(args: &[String]) -> Result<i32, P9CommandError> {
         }
         i += 1;
     }
-    let mode = rest.first().ok_or(P9CommandError::Usage)?;
+    let _mode = rest.first().ok_or(P9CommandError::Usage)?;
     let needle = rest.get(1).cloned();
     let db_path = db.unwrap_or_else(|| {
         PathBuf::from(".rapidlm").join("sessions.sqlite")
@@ -506,11 +506,10 @@ pub fn run_sessions(args: &[String]) -> Result<i32, P9CommandError> {
         .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
     println!("schema=rapidlm.sessions count={}", sessions.len());
     for summary in &sessions {
-        if let Some(text) = &needle {
-            if !summary.session_id.contains(text.as_str()) {
+        if let Some(text) = &needle
+            && !summary.session_id.contains(text.as_str()) {
                 continue;
             }
-        }
         println!(
             "session={} last_seq={} first_seen={}",
             summary.session_id, summary.last_seq, summary.first_seen
@@ -798,10 +797,8 @@ mod release_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let art = dir.join("app.bin");
         std::fs::write(&art, b"release-payload").unwrap();
-        let code = run_release_manifest(&vec![
-            "1.0.0".to_owned(),
-            art.to_string_lossy().into_owned(),
-        ])
+        let code = run_release_manifest(&["1.0.0".to_owned(),
+            art.to_string_lossy().into_owned()])
         .expect("manifest command");
         assert_eq!(code, 0);
         // Digest must equal the real ArtifactId of the file contents.
@@ -813,9 +810,9 @@ mod release_tests {
 
     #[test]
     fn release_manifest_requires_version_and_artifacts() {
-        assert!(matches!(run_release_manifest(&vec![]), Err(P9CommandError::Usage)));
+        assert!(matches!(run_release_manifest(&[]), Err(P9CommandError::Usage)));
         assert!(matches!(
-            run_release_manifest(&vec!["1.0.0".to_owned()]),
+            run_release_manifest(&["1.0.0".to_owned()]),
             Err(P9CommandError::Usage)
         ));
     }

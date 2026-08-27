@@ -161,14 +161,13 @@ pub fn classify_inflight(projection: &InflightProjection) -> RecoveryActions {
         actions.push(RecoveryAction::InterruptTurn { turn_id });
     }
 
-    if let Some(goal) = projection.snapshot.top_level_goal() {
-        if goal.state() == GoalState::Active {
+    if let Some(goal) = projection.snapshot.top_level_goal()
+        && goal.state() == GoalState::Active {
             actions.push(RecoveryAction::PauseGoal {
                 goal_id: goal.id(),
                 reason: GoalStopReason::ProcessRecovered,
             });
         }
-    }
 
     RecoveryActions { actions }
 }

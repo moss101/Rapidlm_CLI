@@ -678,8 +678,8 @@ pub fn discover(roots: &SkillRoots, limits: &SkillLimits) -> Result<Vec<SkillRec
             &mut found,
         )?;
     }
-    if let Some(project) = &roots.project_root {
-        if roots.project_trust.is_trusted() {
+    if let Some(project) = &roots.project_root
+        && roots.project_trust.is_trusted() {
             scan_root(
                 project,
                 PROJECT_SKILLS_DIR,
@@ -690,7 +690,6 @@ pub fn discover(roots: &SkillRoots, limits: &SkillLimits) -> Result<Vec<SkillRec
                 &mut found,
             )?;
         }
-    }
     merge_records(found, limits)
 }
 
@@ -838,7 +837,7 @@ fn scan_root(
     };
     let mut seen = 0usize;
     for entry in entries {
-        if seen % CANCEL_STRIDE == 0 {
+        if seen.is_multiple_of(CANCEL_STRIDE) {
             check_limits(limits, started)?;
         }
         seen = seen.saturating_add(1);
@@ -1056,16 +1055,14 @@ fn origin_rank(origin: SkillOrigin) -> u8 {
 }
 
 fn not_found_or_untrusted(id: &SkillId, roots: &SkillRoots) -> SkillError {
-    if !roots.project_trust.is_trusted() {
-        if let Some(project) = &roots.project_root {
+    if !roots.project_trust.is_trusted()
+        && let Some(project) = &roots.project_root {
             let dir = join_rel(project, PROJECT_SKILLS_DIR).join(id.as_str());
-            if let Ok(meta) = fs::symlink_metadata(&dir) {
-                if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+            if let Ok(meta) = fs::symlink_metadata(&dir)
+                && meta.file_type().is_dir() && !meta.file_type().is_symlink() {
                     return SkillError::ProjectUntrusted;
                 }
-            }
         }
-    }
     SkillError::NotFound
 }
 
@@ -1269,11 +1266,10 @@ fn instructions_locator(
 ) -> Result<RepoPath, SkillError> {
     match origin {
         SkillOrigin::Project => {
-            if let Some(project) = project_root {
-                if let Some(rel) = strip_prefix_path(skill_file, project) {
+            if let Some(project) = project_root
+                && let Some(rel) = strip_prefix_path(skill_file, project) {
                     return parse_repo_path(&rel);
                 }
-            }
             parse_repo_path(&format!(
                 "{PROJECT_SKILLS_DIR}/{dir_name}/{SKILL_FILE_NAME}"
             ))
@@ -1443,13 +1439,12 @@ fn parse_list_item(line: &str) -> Option<Result<String, SkillError>> {
         rest
     } else if let Some(rest) = line.strip_prefix("\t- ") {
         rest
-    } else if let Some(rest) = line.strip_prefix("- ") {
+    } else {
+        let rest = line.strip_prefix("- ")?;
         if line.starts_with('-') && !line.starts_with(' ') && !line.starts_with('\t') {
             return Some(Err(SkillError::InvalidFrontmatter));
         }
         rest
-    } else {
-        return None;
     };
     Some(parse_yaml_scalar(trimmed.trim()))
 }

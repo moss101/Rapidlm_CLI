@@ -181,6 +181,7 @@ pub trait AgentExecutor {
     ///
     /// Implementations without a recovery owner fall back to plain [`execute`]
     /// (no recovery) — the default keeps the trait single-authority and safe.
+    #[allow(clippy::too_many_arguments)]
     fn execute_with_context_recovery<C, M, T, E>(
         &mut self,
         request: &AgentExecutionRequest,

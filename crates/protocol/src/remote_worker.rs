@@ -630,7 +630,11 @@ impl ProtocolVersion {
         }
         Ok(Self {
             major: REMOTE_WORKER_PROTOCOL_MAJOR,
-            minor: self.minor.min(REMOTE_WORKER_PROTOCOL_MINOR),
+            // Negotiation caps the offered minor at the supported minor. The
+            // cap is degenerate while the supported minor is 0 (u16.min(0));
+            // restore `self.minor.min(REMOTE_WORKER_PROTOCOL_MINOR)` when the
+            // supported minor is bumped above 0.
+            minor: REMOTE_WORKER_PROTOCOL_MINOR,
         })
     }
 }
@@ -954,6 +958,7 @@ impl<'de> Deserialize<'de> for CapabilityLimits {
 }
 
 impl WorkerSandboxSpec {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tier: SandboxTier,
         image: ArtifactRef,
@@ -1527,10 +1532,10 @@ impl WorkProgress {
         artifact: Option<ArtifactRef>,
     ) -> Result<Self, RemoteWorkerError> {
         let protocol = protocol.negotiate()?;
-        if let Some(percent) = percent {
-            if percent > 100 {
-                return Err(RemoteWorkerError::PercentInvalid);
-            }
+        if let Some(percent) = percent
+            && percent > 100
+        {
+            return Err(RemoteWorkerError::PercentInvalid);
         }
         if let Some(artifact) = &artifact {
             validate_artifact(artifact)?;
@@ -1647,6 +1652,7 @@ impl<'de> Deserialize<'de> for ResourceUsage {
 }
 
 impl WorkResult {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         protocol: ProtocolVersion,
         trace_id: TraceId,

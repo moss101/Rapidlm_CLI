@@ -1984,6 +1984,7 @@ mod tests {
     const PACKAGE_FIXTURE: &[u8] = b"fixture-plugin-wasm";
 
     struct RecordingHost {
+        #[allow(clippy::type_complexity)] // compact test recorder for one call site
         calls: Arc<Mutex<Vec<(Capability, Vec<u8>)>>>,
         response: Vec<u8>,
     }

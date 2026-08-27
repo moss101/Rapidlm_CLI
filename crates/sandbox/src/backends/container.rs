@@ -630,11 +630,10 @@ fn validate_mount(mount: &SandboxMount) -> Result<(), SandboxError> {
 fn require_cwd_covered(cwd: &RepoPath, mounts: &[SandboxMount]) -> Result<(), SandboxError> {
     let mut best: Option<usize> = None;
     for mount in mounts {
-        if let Some(prefix_len) = target_covers(mount.target(), cwd) {
-            if best.is_none_or(|len| prefix_len > len) {
+        if let Some(prefix_len) = target_covers(mount.target(), cwd)
+            && best.is_none_or(|len| prefix_len > len) {
                 best = Some(prefix_len);
             }
-        }
     }
     best.ok_or(SandboxError::ForbiddenMount).map(|_| ())
 }
@@ -751,7 +750,7 @@ fn is_docker_socket(path: &str) -> bool {
     }
     DOCKER_SOCKET_NAMES
         .iter()
-        .any(|socket| trimmed == *socket || trimmed.ends_with(&format!("{socket}")))
+        .any(|socket| trimmed == *socket || trimmed.ends_with(&socket.to_string()))
 }
 
 fn is_proxy_env_name(name: &str) -> bool {
@@ -828,7 +827,7 @@ fn probe_rootless_namespaces(program: &str, cancel: &CancellationToken) -> Resul
         Ok(child) => child,
         Err(_) => return Ok(false),
     };
-    Ok(wait_probe(&mut child, cancel)?)
+    wait_probe(&mut child, cancel)
 }
 
 fn probe_seccomp(program: &str, cancel: &CancellationToken) -> Result<bool, SandboxError> {
@@ -871,7 +870,7 @@ fn probe_seccomp(program: &str, cancel: &CancellationToken) -> Result<bool, Sand
             return Ok(false);
         }
     }
-    Ok(wait_probe(&mut child, cancel)?)
+    wait_probe(&mut child, cancel)
 }
 
 fn wait_probe(child: &mut Child, cancel: &CancellationToken) -> Result<bool, SandboxError> {
@@ -1351,11 +1350,10 @@ fn pgrep_group(pgid: u32) -> Option<Vec<u32>> {
         .ok()?;
     let mut pids = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if let Ok(pid) = line.trim().parse::<u32>() {
-            if pid >= 2 {
+        if let Ok(pid) = line.trim().parse::<u32>()
+            && pid >= 2 {
                 pids.push(pid);
             }
-        }
     }
     if pids.is_empty() {
         None
@@ -1954,15 +1952,14 @@ capability = "fs.read"
         let ws = TempWorkspace::new();
         let spec = container_spec(&ws);
         let plan = ContainerPlan::from_spec(&spec).expect("plan");
-        if let Ok(home) = std::env::var("HOME") {
-            if !home.is_empty() {
+        if let Ok(home) = std::env::var("HOME")
+            && !home.is_empty() {
                 assert!(
                     plan.bind_sources().all(|src| src != home.as_str()
                         && !src.starts_with(&format!("{}/", home.trim_end_matches('/')))),
                     "host home must not be a bind source"
                 );
             }
-        }
         assert!(plan.bind_sources().all(|src| !is_home_root(
             &src.to_ascii_lowercase()
                 .split('/')

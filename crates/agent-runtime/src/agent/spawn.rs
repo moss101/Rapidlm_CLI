@@ -200,6 +200,7 @@ impl ChildPrincipal {
 }
 
 impl SpawnRequest {
+    #[allow(clippy::too_many_arguments)]
     pub fn builder(
         parent: AgentId,
         role: AgentRole,

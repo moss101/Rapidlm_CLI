@@ -167,11 +167,10 @@ impl ResultStore {
         if result.agent_id() != agent.spec().id() {
             return Err(ResultError::from(AgentModelError::ResultAgentMismatch));
         }
-        if let Some(view) = result.workspace_view() {
-            if view != agent.spec().workspace_view_id() {
+        if let Some(view) = result.workspace_view()
+            && view != agent.spec().workspace_view_id() {
                 return Err(ResultError::from(AgentModelError::ResultViewMismatch));
             }
-        }
 
         {
             let inner = self.lock()?;

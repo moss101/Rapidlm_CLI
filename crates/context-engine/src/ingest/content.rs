@@ -543,11 +543,10 @@ fn read_bounded_file(
     let mut steps = 0u32;
     loop {
         steps = steps.wrapping_add(1);
-        if steps == 1 || steps.is_multiple_of(CANCEL_STRIDE) {
-            if cancel.is_cancelled() {
+        if (steps == 1 || steps.is_multiple_of(CANCEL_STRIDE))
+            && cancel.is_cancelled() {
                 return Err(ContentError::Cancelled);
             }
-        }
         let n = file.read(&mut chunk).map_err(ContentError::from_io)?;
         if n == 0 {
             break;
@@ -570,11 +569,10 @@ fn hash_file_streaming(
     let mut steps = 0u32;
     loop {
         steps = steps.wrapping_add(1);
-        if steps == 1 || steps.is_multiple_of(CANCEL_STRIDE) {
-            if cancel.is_cancelled() {
+        if (steps == 1 || steps.is_multiple_of(CANCEL_STRIDE))
+            && cancel.is_cancelled() {
                 return Err(ContentError::Cancelled);
             }
-        }
         let n = file.read(&mut chunk).map_err(ContentError::from_io)?;
         if n == 0 {
             break;
@@ -869,7 +867,7 @@ mod tests {
         let ws = TempWorkspace::new();
         ws.write_file("core/src/lib.rs", b"pub fn x() {}");
         ws.write_file("core/blob.bin", &[0x00, 0x01, 0x02, 0x00]);
-        ws.write_file("core/huge.rs", &vec![b'a'; 64]);
+        ws.write_file("core/huge.rs", &[b'a'; 64]);
         let manifest = parse_manifest(&ws);
         let repo = manifest.repo_by_alias("core").expect("repo");
         let walk_limits = WalkLimits::new().max_file_bytes(16).binary_probe_bytes(8);
@@ -912,7 +910,7 @@ mod tests {
                     assert_eq!(loaded.text(), None);
                     assert_eq!(
                         loaded.content_hash(),
-                        ContentHash::from_bytes(&vec![b'a'; 64])
+                        ContentHash::from_bytes(&[b'a'; 64])
                     );
                 }
                 ".keep" => {}

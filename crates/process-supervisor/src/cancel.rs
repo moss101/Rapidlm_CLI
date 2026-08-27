@@ -277,11 +277,10 @@ pub fn await_exit(
         if cancel.is_cancelled() {
             return terminate_tree(job, GracePeriod::user_cancel(grace)?);
         }
-        if let Some(deadline) = deadline {
-            if Instant::now() >= deadline {
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline {
                 return terminate_tree(job, GracePeriod::timeout(grace)?);
             }
-        }
 
         let slice = match deadline {
             Some(deadline) => POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
@@ -681,13 +680,11 @@ capability = "proc.exec"
     fn wait_pid_file(path: &Path, budget: Duration) -> u32 {
         let deadline = Instant::now() + budget;
         loop {
-            if let Ok(text) = fs::read_to_string(path) {
-                if let Ok(pid) = text.trim().parse::<u32>() {
-                    if pid >= 2 {
+            if let Ok(text) = fs::read_to_string(path)
+                && let Ok(pid) = text.trim().parse::<u32>()
+                    && pid >= 2 {
                         return pid;
                     }
-                }
-            }
             if Instant::now() >= deadline {
                 panic!("pid file {} was not written", path.display());
             }

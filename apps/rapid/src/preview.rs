@@ -11,10 +11,8 @@
 
 use std::error::Error;
 use std::fmt;
-use std::io::{self, Read};
 use std::process::{Child, Command, Stdio};
 
-use agent_pool::{EnvironmentState, PoolBackend, PoolError, Provisioner, ResourcePool};
 
 /// Maximum bytes captured from dev server output.
 pub const MAX_PREVIEW_OUTPUT: usize = 64 * 1024;
@@ -92,7 +90,6 @@ pub struct PreviewSupervisor {
     info: PreviewInfo,
     child: Option<Child>,
     max_readiness_polls: u32,
-    poll_interval_ms: u64,
 }
 
 impl PreviewSupervisor {
@@ -113,7 +110,6 @@ impl PreviewSupervisor {
             },
             child: None,
             max_readiness_polls: 30,
-            poll_interval_ms: 200,
         }
     }
 
@@ -217,10 +213,4 @@ mod tests {
             }
         }
     }
-}
-
-fn now_ready() -> bool {
-    // In a real implementation, this would probe the HTTP endpoint.
-    // For testing purposes, we consider the process alive as ready.
-    true
 }

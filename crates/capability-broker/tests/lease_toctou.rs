@@ -95,12 +95,12 @@ fn run_mutation(world: &World, mutation: Mutation, canary: &Canary) -> PolicyErr
             let (lease, _) = world.issue_command(&world.approved_command(), now);
             let mutated =
                 world.normalize_command(["git", "push", "--force"], world.view_a.as_path());
-            execute(&world, &lease, &world.agent(), &mutated, now, canary).expect_err("argv")
+            execute(world, &lease, &world.agent(), &mutated, now, canary).expect_err("argv")
         }
         Mutation::Cwd => {
             let (lease, _) = world.issue_command(&world.approved_command(), now);
             let mutated = world.normalize_command(["git", "status"], world.view_b.as_path());
-            execute(&world, &lease, &world.agent(), &mutated, now, canary).expect_err("cwd")
+            execute(world, &lease, &world.agent(), &mutated, now, canary).expect_err("cwd")
         }
         Mutation::Symlink => {
             let approved_path = world.view_a.join("src").join("out");
@@ -109,7 +109,7 @@ fn run_mutation(world: &World, mutation: Mutation, canary: &Canary) -> PolicyErr
             std::os::unix::fs::symlink(&world.canary_file, &approved_path)
                 .expect("retarget symlink at canary");
             let mutated = world.normalize_fs_write(&approved_path);
-            execute(&world, &lease, &world.agent(), &mutated, now, canary).expect_err("symlink")
+            execute(world, &lease, &world.agent(), &mutated, now, canary).expect_err("symlink")
         }
         Mutation::Redirect => {
             let (lease, approved) = world.issue_net(now);
@@ -122,31 +122,31 @@ fn run_mutation(world: &World, mutation: Mutation, canary: &Canary) -> PolicyErr
                 normalize_network(&intent, &world.net, &CancellationToken::new())
                     .expect("redirect normalize"),
             );
-            execute(&world, &lease, &world.agent(), &mutated, now, canary).expect_err("redirect")
+            execute(world, &lease, &world.agent(), &mutated, now, canary).expect_err("redirect")
         }
         Mutation::AgentId => {
             let (lease, approved) = world.issue_command(&world.approved_command(), now);
-            execute(&world, &lease, &world.attacker(), &approved, now, canary).expect_err("agent")
+            execute(world, &lease, &world.attacker(), &approved, now, canary).expect_err("agent")
         }
         Mutation::WorkspaceView => {
             let approved_path = world.view_a.join("src").join("safe.txt");
             let (lease, _) = world.issue_fs_write(&approved_path, now);
             let other = world.view_b.join("src").join("safe.txt");
             let mutated = world.normalize_fs_write(&other);
-            execute(&world, &lease, &world.agent(), &mutated, now, canary)
+            execute(world, &lease, &world.agent(), &mutated, now, canary)
                 .expect_err("workspace view")
         }
         Mutation::Expiry => {
             let (lease, approved) = world.issue_command(&world.approved_command(), now);
             let later = now + Duration::from_secs(u64::from(DEFAULT_LEASE_TTL_SECS));
-            execute(&world, &lease, &world.agent(), &approved, later, canary).expect_err("expiry")
+            execute(world, &lease, &world.agent(), &approved, later, canary).expect_err("expiry")
         }
         Mutation::UseReplay => {
             let (lease, approved) = world.issue_command(&world.approved_command(), now);
             let first = Canary::bind(&world.tmp.join("first-use.canary"));
-            execute(&world, &lease, &world.agent(), &approved, now, &first).expect("first use");
+            execute(world, &lease, &world.agent(), &approved, now, &first).expect("first use");
             assert!(first.tripped(), "first use must execute");
-            execute(&world, &lease, &world.agent(), &approved, now, canary).expect_err("use replay")
+            execute(world, &lease, &world.agent(), &approved, now, canary).expect_err("use replay")
         }
     }
 }
@@ -170,7 +170,7 @@ fn execute(
             now,
         )
         .map_err(PolicyError::from)?;
-    let guard = validate_use(&world.validator, lease, &actual, now, &cancel)?;
+    let guard = validate_use(&world.validator, lease, actual, now, &cancel)?;
     let _consumed = guard.consume();
     canary.trip();
     Ok(())
