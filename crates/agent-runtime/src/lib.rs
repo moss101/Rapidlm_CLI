@@ -50,9 +50,13 @@ pub use loop_guard::{
 pub use role_profile::{
     RoleModelPolicy, RoleProfile, RoleRegistry, RoleToolClass, RoleToolSurface,
 };
+pub use prompt_stack::{
+    MAX_ENVIRONMENT_BYTES, MAX_SYSTEM_PROMPT_BYTES, POST_COMPACTION_SYSTEM_PROMPT,
+    PromptContext, PromptStackError, TrustPosture, render_system_prompt,
+};
 pub use rules_loader::{
-    AGENTS_FILE, MAX_AGENTS_BYTES, MAX_AGENTS_FILES, RuleEntry, RulesBundle, RulesError,
-    load_agents,
+    AGENTS_FILE, COMPAT_RULES_DIRS, INSTRUCTION_FILE_NAMES, MAX_AGENTS_BYTES, MAX_AGENTS_FILES,
+    RuleEntry, RulesBundle, RulesError, discover_instructions, load_agents,
 };
 pub use specialist::{
     DEFAULT_SPECIALIST_MAILBOX, DEFAULT_SPECIALIST_SUMMARY_BYTES, PersistentSpecialist,
@@ -61,6 +65,7 @@ pub use specialist::{
 
 pub mod orchestration;
 pub mod prompt;
+pub mod prompt_stack;
 pub mod turn;
 
 pub use agent::model::{
@@ -142,7 +147,8 @@ pub use prompt::{
 pub use turn::{
     BoundedAssistantOutput, FailureCause, MAX_ARGUMENT_BYTES, MAX_CALL_ID_BYTES, MAX_MODEL_STEPS,
     MAX_TEXT_BYTES, MAX_TOOL_CALLS_PER_STEP, MAX_TOOL_NAME_BYTES, MAX_TURN_EVENTS, ModelDriver,
-    ModelStepError, ModelStepInput, ModelStepOutput, ProposedToolCall, ToolDriver, ToolStepError,
-    ToolStepResult, TurnBudget, TurnError, TurnEvent, TurnEventKind, TurnEventSink, TurnResult,
-    ToolSurface, TurnSpec, TurnStatus, TurnStopReason, TurnUsage, ValidatedToolCall, run_turn,
+    ModelStepError, ModelStepInput, ModelStepOutput, ProposedToolCall, ToolDriver, ToolKind,
+    ToolStepError, ToolStepResult, TurnBudget, TurnError, TurnEvent, TurnEventKind, TurnEventSink,
+    TurnResult, ToolSurface, TurnSpec, TurnStatus, TurnStopReason, TurnUsage, ValidatedToolCall,
+    run_turn,
 };

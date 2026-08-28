@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_runtime::{
-    CancellationToken, FailureCause, ModelStepError, ModelStepOutput, ProposedToolCall,
-    ToolStepResult, ToolSurface,
+    CancellationToken, FailureCause, ModelStepError, ModelStepInput, ModelStepOutput,
+    ProposedToolCall, ToolStepResult,
 };
 use auth::{CredentialKind, CredentialPut, CredentialStore, InMemoryCredentialStore, SecretRef, SecretValue};
 use context_engine::compile::{ContextBlock, ContextSource};
@@ -35,7 +35,7 @@ use llm_router::provider::{
     CanonicalMessage, CanonicalModelRequest, CanonicalToolSpec, CatalogRevision, ContentPart,
     MessageRole, ModelId, ModelPurpose, ModelRequestId, ModelRef, ModelStream, ModelStreamEvent,
     NormalizedUsage, ProviderCapabilities, ProviderError, ProviderId, ReasoningSupport,
-    ToolName, UsageFieldSet,
+    ToolCall, ToolCallId, ToolName, UsageFieldSet,
 };
 use llm_router::providers::anthropic::{
     AnthropicAdapter, AnthropicConfig, AnthropicEndpoint,
@@ -280,14 +280,13 @@ impl LiveModelCall for ConfiguredModel<'_> {
     fn step(
         &mut self,
         blocks: &[ContextBlock],
-        prior_tools: &[ToolStepResult],
-        tool_surface: &[ToolSurface],
+        input: &ModelStepInput<'_>,
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError> {
         if cancel.is_cancelled() {
             return Err(ModelStepError::Cancelled);
         }
-        let request = build_request(self, blocks, prior_tools, tool_surface)?;
+        let request = build_request(self, blocks, input)?;
         // The agent token is checked on entry and exit; the blocking HTTP
         // call itself is bounded by the transport timeout.
         let router_cancel = llm_router::provider::CancellationToken::new();
@@ -314,13 +313,12 @@ impl LiveModelCall for SelectedModel<'_> {
     fn step(
         &mut self,
         blocks: &[ContextBlock],
-        prior_tools: &[ToolStepResult],
-        tool_surface: &[ToolSurface],
+        input: &ModelStepInput<'_>,
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError> {
         match self {
-            Self::Configured(model) => model.step(blocks, prior_tools, tool_surface, cancel),
-            Self::Unconfigured(fallback) => fallback.step(blocks, prior_tools, tool_surface, cancel),
+            Self::Configured(model) => model.step(blocks, input, cancel),
+            Self::Unconfigured(fallback) => fallback.step(blocks, input, cancel),
         }
     }
 }
@@ -330,10 +328,11 @@ impl LiveModelCall for SelectedModel<'_> {
 fn build_request(
     model: &ConfiguredModel<'_>,
     blocks: &[ContextBlock],
-    prior_tools: &[ToolStepResult],
-    tool_surface: &[ToolSurface],
+    input: &ModelStepInput<'_>,
 ) -> Result<CanonicalModelRequest, ModelStepError> {
-    let mut messages = Vec::with_capacity(blocks.len().saturating_add(1));
+    let prior_tools = input.prior_tools();
+    let pending_calls = input.pending_calls();
+    let mut messages = Vec::with_capacity(blocks.len().saturating_add(pending_calls.len() + 1));
     for block in blocks {
         let role = if matches!(block.source(), ContextSource::System) {
             MessageRole::System
@@ -346,26 +345,33 @@ fn build_request(
                 .map_err(|_| ModelStepError::BoundExceeded)?,
         );
     }
-    if !prior_tools.is_empty() {
-        let mut report = String::from("tool results:\n");
-        for tool in prior_tools {
-            let line = match tool {
-                ToolStepResult::Succeeded { call_id, summary } => {
-                    format!("- {call_id}: succeeded: {summary}\n")
-                }
-                ToolStepResult::Failed { call_id, handled } => {
-                    format!("- {call_id}: failed (handled: {handled})\n")
-                }
-                ToolStepResult::Denied { call_id } => format!("- {call_id}: denied\n"),
-                ToolStepResult::ApprovalRequired { call_id } => {
-                    format!("- {call_id}: approval required\n")
-                }
-            };
-            report.push_str(&line);
-        }
-        let part = ContentPart::text(report).map_err(|_| ModelStepError::BoundExceeded)?;
+    // Per-call tool-result channel: the assistant tool-call message that
+    // produced the results, then one tool-role message per executed call
+    // bearing that call's id and text outcome. This replaces the single flat
+    // "tool results:" user report.
+    if !pending_calls.is_empty() {
+        let tool_calls = pending_calls
+            .iter()
+            .map(|call| {
+                Ok(ToolCall::new(
+                    ToolCallId::parse(call.call_id()).map_err(map_provider_error)?,
+                    ToolName::parse(call.tool()).map_err(map_provider_error)?,
+                    call.arguments(),
+                )
+                .map_err(map_provider_error)?)
+            })
+            .collect::<Result<Vec<_>, ModelStepError>>()?;
         messages.push(
-            CanonicalMessage::new(MessageRole::User, vec![part], None, Vec::new())
+            CanonicalMessage::new(MessageRole::Assistant, Vec::new(), None, tool_calls)
+                .map_err(|_| ModelStepError::BoundExceeded)?,
+        );
+    }
+    for tool in prior_tools {
+        let (call_id, text) = tool_result_text(tool);
+        let call_id = ToolCallId::parse(call_id).map_err(map_provider_error)?;
+        let part = ContentPart::text(text).map_err(|_| ModelStepError::BoundExceeded)?;
+        messages.push(
+            CanonicalMessage::new(MessageRole::Tool, vec![part], Some(call_id), Vec::new())
                 .map_err(|_| ModelStepError::BoundExceeded)?,
         );
     }
@@ -378,8 +384,8 @@ fn build_request(
     // The driver's tool surface becomes structured provider tool schemas, so
     // tool-capable models can propose calls through the tool-call channel
     // instead of prose. Failures here are typed provider failures.
-    let mut tools = Vec::with_capacity(tool_surface.len());
-    for spec in tool_surface {
+    let mut tools = Vec::with_capacity(input.tool_surface().len());
+    for spec in input.tool_surface() {
         let name = ToolName::parse(spec.name()).map_err(map_provider_error)?;
         tools.push(
             CanonicalToolSpec::new(
@@ -418,6 +424,38 @@ fn next_request_id() -> Result<ModelRequestId, ModelStepError> {
         .unwrap_or(0);
     let seq = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     ModelRequestId::parse(format!("live-{nanos:x}-{seq}")).map_err(|_| ModelStepError::Failed)
+}
+
+/// Model-visible text for one tool outcome. This is the per-call tool-result
+/// content the next request carries; a denial keeps its typed reason so a
+/// headless refusal is never a silent pass.
+fn tool_result_text(tool: &ToolStepResult) -> (&str, String) {
+    match tool {
+        ToolStepResult::Succeeded { call_id, summary } => (call_id, summary.clone()),
+        ToolStepResult::Failed {
+            call_id,
+            handled,
+            detail,
+        } => (
+            call_id,
+            match (handled, detail.as_deref()) {
+                (true, Some(detail)) => format!("failed: {detail}"),
+                (true, None) => "failed (the model can correct and retry)".to_owned(),
+                (false, _) => "failed (unhandled; the turn will stop)".to_owned(),
+            },
+        ),
+        ToolStepResult::Denied { call_id, detail } => (
+            call_id,
+            match detail.as_deref() {
+                Some(detail) => format!("denied: {detail}"),
+                None => "denied by permission policy".to_owned(),
+            },
+        ),
+        ToolStepResult::ApprovalRequired { call_id } => (
+            call_id,
+            "approval required: the user must approve this call".to_owned(),
+        ),
+    }
 }
 
 /// Typed provider → step error mapping. `ContextTooLarge` keeps its meaning
@@ -754,7 +792,7 @@ mod tests {
         cancel.cancel();
         let packet_blocks: Vec<ContextBlock> = Vec::new();
         let err = configured
-            .step(&packet_blocks, &[], &[], &cancel)
+            .step(&packet_blocks, &ModelStepInput::without_tools(1), &cancel)
             .expect_err("cancelled");
         assert_eq!(err, ModelStepError::Cancelled);
     }
@@ -765,7 +803,9 @@ mod tests {
         let cancel = CancellationToken::new();
         let blocks: Vec<ContextBlock> = Vec::new();
         assert_eq!(
-            selected.step(&blocks, &[], &[], &cancel).expect_err("fallback"),
+            selected
+                .step(&blocks, &ModelStepInput::without_tools(1), &cancel)
+                .expect_err("fallback"),
             ModelStepError::Failed
         );
     }
@@ -790,7 +830,8 @@ mod tests {
         let store = InMemoryCredentialStore::new();
         let active = active("test-model", "http://127.0.0.1:1", "local");
         let configured = ConfiguredModel::build(&active, &store).expect("build");
-        let built = build_request(&configured, blocks, &[], &[]).expect("request");
+        let built =
+            build_request(&configured, blocks, &ModelStepInput::without_tools(1)).expect("request");
         assert!(!built.messages().is_empty());
         assert!(built.tools().is_empty());
     }
@@ -800,16 +841,99 @@ mod tests {
         let store = InMemoryCredentialStore::new();
         let active = active("test-model", "http://127.0.0.1:1", "local");
         let configured = ConfiguredModel::build(&active, &store).expect("build");
-        let surface = vec![ToolSurface::new(
+        let surface = vec![agent_runtime::ToolSurface::new(
             "workspace.write",
             "create a file",
             serde_json::json!({"type": "object", "required": ["path", "content"]}),
         )];
-        let built =
-            build_request(&configured, &[], &[], &surface).expect("request");
+        let input = ModelStepInput::new(1, &[], &[], &surface);
+        let built = build_request(&configured, &[], &input).expect("request");
         assert_eq!(built.tools().len(), 1);
         assert_eq!(built.tools()[0].name().as_str(), "workspace.write");
         assert_eq!(built.tools()[0].description(), "create a file");
         assert!(built.tools()[0].parameters().is_object());
+    }
+
+    #[test]
+    fn tool_results_become_one_tool_role_message_per_call() {
+        // Two executed calls in the prior step: the next request must carry
+        // the assistant tool-call message followed by one tool-role message
+        // per call, each with its own call id and text outcome — and no flat
+        // "tool results:" user report.
+        let store = InMemoryCredentialStore::new();
+        let active = active("test-model", "http://127.0.0.1:1", "local");
+        let configured = ConfiguredModel::build(&active, &store).expect("build");
+        let pending = vec![
+            ProposedToolCall::new("c1", "repo.read", r#"{"path":"a.txt"}"#).expect("c1"),
+            ProposedToolCall::new(
+                "c2",
+                "workspace.patch",
+                r#"{"path":"b.txt","old":"x","new":"y"}"#,
+            )
+            .expect("c2"),
+        ];
+        let prior = vec![
+            ToolStepResult::Succeeded {
+                call_id: "c1".to_owned(),
+                summary: "file body".to_owned(),
+            },
+            ToolStepResult::Denied {
+                call_id: "c2".to_owned(),
+                detail: Some("workspace.patch denied: denied by an explicit deny rule".to_owned()),
+            },
+        ];
+        let input = ModelStepInput::new(2, &prior, &pending, &[]);
+        let built = build_request(&configured, &[], &input).expect("request");
+        let messages = built.messages();
+        // No flat user report.
+        for message in messages {
+            for part in message.parts() {
+                assert!(
+                    !part_text(part).contains("tool results:"),
+                    "flat report must be gone"
+                );
+            }
+        }
+        // Assistant tool-call message echoes the proposals in order.
+        let assistant = messages
+            .iter()
+            .find(|message| message.role() == MessageRole::Assistant)
+            .expect("assistant tool-call message");
+        assert_eq!(assistant.tool_calls().len(), 2);
+        assert_eq!(assistant.tool_calls()[0].call_id().as_str(), "c1");
+        assert_eq!(assistant.tool_calls()[0].name().as_str(), "repo.read");
+        assert_eq!(assistant.tool_calls()[1].call_id().as_str(), "c2");
+        // One tool-role message per call, in call order, with per-call text.
+        let tool_messages: Vec<&CanonicalMessage> = messages
+            .iter()
+            .filter(|message| message.role() == MessageRole::Tool)
+            .collect();
+        assert_eq!(tool_messages.len(), 2);
+        assert_eq!(tool_messages[0].tool_call_id().map(|id| id.as_str()), Some("c1"));
+        assert_eq!(part_text(&tool_messages[0].parts()[0]), "file body");
+        assert_eq!(tool_messages[1].tool_call_id().map(|id| id.as_str()), Some("c2"));
+        let denied_text = part_text(&tool_messages[1].parts()[0]);
+        assert!(denied_text.starts_with("denied: "), "{denied_text}");
+        assert!(denied_text.contains("deny rule"), "{denied_text}");
+
+        // A step with no prior tool results adds neither assistant nor tool
+        // messages.
+        let built = build_request(&configured, &[], &ModelStepInput::without_tools(1))
+            .expect("request");
+        assert!(built
+            .messages()
+            .iter()
+            .all(|message| message.role() != MessageRole::Tool));
+        assert!(built
+            .messages()
+            .iter()
+            .all(|message| message.role() != MessageRole::Assistant));
+    }
+
+    fn part_text(part: &ContentPart) -> &str {
+        match part {
+            ContentPart::Text { text } => text,
+            ContentPart::Image { .. } => "",
+        }
     }
 }

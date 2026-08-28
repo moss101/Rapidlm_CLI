@@ -831,6 +831,102 @@ fn describe_turn_failure(result: &AgentResult, cause: Option<FailureCause>) -> S
     }
 }
 
+/// Env var overriding the permission mode for one exec run.
+const PERMISSION_MODE_ENV: &str = "RAPIDLM_PERMISSION_MODE";
+/// Project settings documents consulted for the permission lattice, in
+/// precedence order (RapidLM's own first, then the Claude-compat path).
+const PROJECT_SETTINGS_FILES: [&str; 2] = [".rapidlm/settings.json", ".claude/settings.json"];
+/// Persisted per-project allow grants consulted before any ask.
+const PERMISSIONS_STORE_NAME: &str = "project-permissions.json";
+/// Maximum rule entries admitted across all settings documents.
+const MAX_WIRED_RULES: usize = crate::permissions::MAX_RULES;
+
+/// Resolve the permission lattice for one exec run: mode precedence is env >
+/// project settings > Claude-compat `defaultMode` > `default`; rules merge
+/// from every settings document that exists (deny rules always apply). A
+/// corrupt settings document refuses the run typed rather than silently
+/// dropping its deny rules; a corrupt grants file simply yields no grants
+/// (fail-closed in the permissive direction).
+fn exec_permission_lattice(
+    canonical_root: Option<&Path>,
+) -> Result<crate::permissions::PermissionLattice, String> {
+    use crate::permissions::{
+        PermissionLattice, PermissionMode, ProjectSettings, ToolPattern, parse_grants,
+        parse_settings,
+    };
+    let mut mode: Option<PermissionMode> = None;
+    if let Ok(raw) = std::env::var(PERMISSION_MODE_ENV)
+        && !raw.is_empty()
+    {
+        mode = Some(PermissionMode::parse(&raw).ok_or_else(|| {
+            format!(
+                "{PERMISSION_MODE_ENV} must be one of: {}",
+                crate::permissions::MODE_NAMES.join(", ")
+            )
+        })?);
+    }
+    let mut rules: Vec<crate::permissions::ToolRule> = Vec::new();
+    let mut loaded_settings: Vec<ProjectSettings> = Vec::new();
+    for file_name in PROJECT_SETTINGS_FILES {
+        let Ok(text) = fs::read_to_string(file_name) else {
+            continue;
+        };
+        let settings = parse_settings(&text).map_err(|err| {
+            format!("{} could not be loaded: {}", file_name, err.as_str())
+        })?;
+        if mode.is_none() {
+            mode = settings.mode;
+        }
+        loaded_settings.push(settings);
+    }
+    for settings in &loaded_settings {
+        for rule in settings.rules.clone() {
+            if rules.len() >= MAX_WIRED_RULES {
+                break;
+            }
+            rules.push(rule);
+        }
+    }
+    let mode = mode.unwrap_or(PermissionMode::Default);
+    let mut lattice = PermissionLattice::new(mode).with_rules(rules);
+    // Persisted grants, keyed by canonical project root.
+    if let (Some(root), Some(home)) = (canonical_root, exec_user_home()) {
+        let store_path = home.join(PERMISSIONS_STORE_NAME);
+        if let Ok(text) = fs::read_to_string(&store_path)
+            && let Ok(canonical) = fs::canonicalize(root)
+            && let Ok(grants) = parse_grants(&text)
+        {
+            let allow = grants.for_root(&canonical.to_string_lossy());
+            let patterns: Vec<ToolPattern> = allow;
+            lattice = lattice.with_grants(patterns);
+        }
+    }
+    Ok(lattice)
+}
+
+/// Discover project instructions (AGENTS.md convention + `.claude`/`.cursor`
+/// compat paths) for the exec run, root-first and bounded. Failures are
+/// advisory here (the turn continues without rules) but are reported.
+fn exec_discover_rules(cwd: &Path, root: &Path) -> Option<String> {
+    let cancel = agent_runtime::CancellationToken::new();
+    match agent_runtime::discover_instructions(root, cwd, &cancel) {
+        Ok(bundle) if !bundle.is_empty() => {
+            let composed = bundle.composed();
+            if composed.len() <= crate::host::MAX_RULES_BYTES {
+                Some(composed)
+            } else {
+                eprintln!("warning: project instructions exceed the byte bound; not loaded");
+                None
+            }
+        }
+        Ok(_) => None,
+        Err(err) => {
+            eprintln!("warning: project instructions not loaded: {}", err.as_str());
+            None
+        }
+    }
+}
+
 /// Build the live-context host around the prompt and run one agent turn through
 /// the recovery-capable executor. The backing model is resolved Grok-style:
 /// `RAPIDLM_CONFIG`/`RAPIDLM_MODEL` env overrides, then the user config file,
@@ -843,15 +939,56 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
         return Err(InteractiveError::Usage);
     };
     let prompt = parsed.prompt;
+    // Workspace detection and trust: any resolution failure stays untrusted.
+    let workspace_cancel = CancellationToken::new();
+    let workspace = exec_workspace(&workspace_cancel);
+    let trusted = matches!(&workspace, Some((_, TrustStatus::Trusted)));
+
+    // Prompt/context stack: project instructions (AGENTS.md convention +
+    // compat paths) and the conditional-section system prompt (environment,
+    // trust posture, token budget).
+    let agents_rules = workspace
+        .as_ref()
+        .and_then(|(root, _)| {
+            let cwd = std::env::current_dir().ok()?;
+            exec_discover_rules(&cwd, root)
+        })
+        .unwrap_or_default();
+    let mut system_prompt_context = agent_runtime::PromptContext::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = agent_runtime::PromptContext::new().with_environment(format!(
+            "cwd {}; os {}",
+            cwd.display(),
+            std::env::consts::OS
+        ));
+        if let Ok(with_env) = candidate {
+            system_prompt_context = with_env;
+        }
+    }
+    system_prompt_context = system_prompt_context.with_trust(if trusted {
+        agent_runtime::TrustPosture::Trusted
+    } else {
+        agent_runtime::TrustPosture::Untrusted
+    });
+    // The exec packet's token budget (mirrors the preserved context values).
+    system_prompt_context = system_prompt_context.with_token_budget(8192, 256);
     let preserved = PreservedLiveContext::new(
         prompt.clone(),
         Vec::new(),
-        String::new(),
+        agents_rules,
         String::new(),
         8192,
         256,
     )
-    .map_err(|_| InteractiveError::Internal)?;
+    .map_err(|_| InteractiveError::Internal)?
+    .with_system_prompt(Some(
+        agent_runtime::render_system_prompt(&system_prompt_context)
+            .map_err(|err| {
+                eprintln!("warning: system prompt not rendered: {}", err.as_str());
+                InteractiveError::Internal
+            })
+            .unwrap_or_default(),
+    ));
     // Reminder feeds: load the project roster if present and admit the
     // always-on feeds (the CLI host grants no capabilities, so feeds gated
     // on a capability stay inactive). A broken roster warns and the turn
@@ -881,14 +1018,19 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
     let cancel = agent_runtime::CancellationToken::new();
     let mut events: Vec<agent_runtime::TurnEvent> = Vec::new();
 
-    // Tools stay fail-closed: workspace file tools are granted only when the
-    // project is explicitly trusted and its root still resolves; every other
+    // Tools stay fail-closed: workspace tools are granted only when the
+    // project is explicitly trusted and its root still resolves, and every
+    // call then passes the six-mode permission lattice (deny rules, persisted
+    // grants, mode table; headless asks become typed denials). Every other
     // surface refuses all proposed tool calls.
-    let workspace_cancel = CancellationToken::new();
-    let workspace = exec_workspace(&workspace_cancel);
-    let mut tools = match &workspace {
-        Some((root, TrustStatus::Trusted)) => {
-            ExecTools::workspace(root).unwrap_or_else(|_| ExecTools::noop())
+    let mut tools = match (&workspace, exec_permission_lattice(workspace.as_ref().map(|(root, _)| root.as_path()))) {
+        (Some((root, TrustStatus::Trusted)), Ok(lattice)) => {
+            ExecTools::workspace_with_permissions(root, lattice)
+                .unwrap_or_else(|_| ExecTools::noop())
+        }
+        (_, Err(reason)) => {
+            eprintln!("permission configuration error: {reason}");
+            return Ok(1);
         }
         _ => ExecTools::noop(),
     };

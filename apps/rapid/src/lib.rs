@@ -14,6 +14,7 @@ pub mod interactive;
 pub mod managed_config;
 pub mod model;
 pub mod p9_commands;
+pub mod permissions;
 pub mod preview;
 pub mod user_config;
 

@@ -37,8 +37,6 @@ pub const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 /// Maximum UTF-8 bytes accepted in terminal assistant text.
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 
-const CANCEL_STRIDE: usize = 8;
-
 /// Kernel event kinds this loop emits. Wire names match `EventKind`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
@@ -188,19 +186,40 @@ pub struct ValidatedToolCall {
 }
 
 /// Input for one model step. Tool results from the previous step, if any.
+/// `pending_calls` are the proposed calls that produced `prior_tools` (empty
+/// when the last step proposed no calls), so the request layer can echo the
+/// assistant tool-call message next to its per-call results.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelStepInput<'a> {
     step: u32,
     prior_tools: &'a [ToolStepResult],
+    pending_calls: &'a [ProposedToolCall],
     tool_surface: &'a [ToolSurface],
 }
 
 impl<'a> ModelStepInput<'a> {
+    /// Build a step input from its parts (public so request-construction
+    /// tests can drive the same shape the loop produces).
+    pub fn new(
+        step: u32,
+        prior_tools: &'a [ToolStepResult],
+        pending_calls: &'a [ProposedToolCall],
+        tool_surface: &'a [ToolSurface],
+    ) -> Self {
+        Self {
+            step,
+            prior_tools,
+            pending_calls,
+            tool_surface,
+        }
+    }
+
     /// Harness seam: step input with no prior tool results (eval drivers).
     pub fn without_tools(step: u32) -> Self {
         Self {
             step,
             prior_tools: &[],
+            pending_calls: &[],
             tool_surface: &[],
         }
     }
@@ -225,12 +244,14 @@ pub enum ModelStepOutput {
 }
 
 /// Structured tool outcome. [`ToolStepResult::Failed`] with `handled: false`
-/// is an unhandled failure and cannot complete the turn.
+/// is an unhandled failure and cannot complete the turn. `Denied` carries the
+/// typed refusal reason text so a headless denial is model-visible, never a
+/// silent pass; detail text is bounded by the producing driver.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ToolStepResult {
     Succeeded { call_id: String, summary: String },
-    Failed { call_id: String, handled: bool },
-    Denied { call_id: String },
+    Failed { call_id: String, handled: bool, detail: Option<String> },
+    Denied { call_id: String, detail: Option<String> },
     ApprovalRequired { call_id: String },
 }
 
@@ -400,6 +421,40 @@ pub trait ToolDriver {
     fn tool_surface(&self) -> Vec<ToolSurface> {
         Vec::new()
     }
+
+    /// Dispatch class of one advertised tool. Defaults to write: unknown or
+    /// unclassified tools never run concurrently.
+    fn tool_kind(&self, tool: &str) -> ToolKind {
+        let _ = tool;
+        ToolKind::Write
+    }
+
+    /// Execute an already-validated batch, returning one outcome per call in
+    /// proposal order. The default runs the calls sequentially; drivers whose
+    /// calls are independent override this to dispatch concurrently, with
+    /// same-path (or otherwise conflicting) writes serialized inside the
+    /// override. A per-call failure is a `ToolStepResult`, never a batch
+    /// abort.
+    fn execute_batch(
+        &mut self,
+        calls: &[ValidatedToolCall],
+        cancel: &CancellationToken,
+    ) -> Vec<Result<ToolStepResult, ToolStepError>> {
+        calls
+            .iter()
+            .map(|call| self.execute(call, cancel))
+            .collect()
+    }
+}
+
+/// Read/write classification the parallel dispatcher uses to decide what may
+/// run concurrently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum ToolKind {
+    /// Pure read: may run concurrently with reads and writes.
+    Read,
+    /// Mutates workspace state (file write/patch, process execution).
+    Write,
 }
 
 /// Model-visible description of one tool a driver can execute. Carried as
@@ -453,8 +508,26 @@ struct LoopState {
 }
 
 enum StepDecision {
-    Continue(Vec<ToolStepResult>),
+    Continue(ToolExchange),
     Stop(TurnResult),
+}
+
+/// Tool exchange carried between model steps: the calls proposed in the last
+/// tool step and their per-call results, kept as an ordered pair so the
+/// request layer can echo the assistant tool-call message with its results.
+#[derive(Clone)]
+struct ToolExchange {
+    calls: Vec<ProposedToolCall>,
+    results: Vec<ToolStepResult>,
+}
+
+impl ToolExchange {
+    const fn empty() -> Self {
+        Self {
+            calls: Vec::new(),
+            results: Vec::new(),
+        }
+    }
 }
 
 impl TurnEventKind {
@@ -674,6 +747,11 @@ impl ModelStepInput<'_> {
     pub fn prior_tools(&self) -> &[ToolStepResult] {
         self.prior_tools
     }
+
+    /// The calls proposed in the step that produced [`ModelStepInput::prior_tools`].
+    pub fn pending_calls(&self) -> &[ProposedToolCall] {
+        self.pending_calls
+    }
 }
 
 impl ToolStepResult {
@@ -681,7 +759,7 @@ impl ToolStepResult {
         match self {
             Self::Succeeded { call_id, .. }
             | Self::Failed { call_id, .. }
-            | Self::Denied { call_id }
+            | Self::Denied { call_id, .. }
             | Self::ApprovalRequired { call_id } => call_id,
         }
     }
@@ -847,10 +925,10 @@ where
         },
     )?;
 
-    let mut prior_tools: Vec<ToolStepResult> = Vec::new();
+    let mut exchange = ToolExchange::empty();
     loop {
-        match run_model_step(&mut state, model, tools, events, &prior_tools, cancel)? {
-            StepDecision::Continue(next) => prior_tools = next,
+        match run_model_step(&mut state, model, tools, events, &exchange, cancel)? {
+            StepDecision::Continue(next) => exchange = next,
             StepDecision::Stop(result) => return Ok(result),
         }
     }
@@ -861,7 +939,7 @@ fn run_model_step<M, T, E>(
     model: &mut M,
     tools: &mut T,
     events: &mut E,
-    prior_tools: &[ToolStepResult],
+    exchange: &ToolExchange,
     cancel: &CancellationToken,
 ) -> Result<StepDecision, TurnError>
 where
@@ -899,7 +977,8 @@ where
     let surface = tools.tool_surface();
     let input = ModelStepInput {
         step,
-        prior_tools,
+        prior_tools: &exchange.results,
+        pending_calls: &exchange.calls,
         tool_surface: &surface,
     };
     let output = match model.step(&input, cancel) {
@@ -1023,9 +1102,13 @@ where
         state.empty_responses = state.empty_responses.saturating_add(1);
         if state.empty_responses <= EMPTY_RESPONSE_RETRY_LIMIT {
             // Bounded retry: re-invoke the model for the same step with the same
-            // prior tool results, consuming model budget. An empty response is
-            // never fabricated into assistant content.
-            return Ok(StepDecision::Continue(prior_tools.to_vec()));
+            // tool exchange (calls and results stay an ordered pair), consuming
+            // model budget. An empty response is never fabricated into
+            // assistant content.
+            return Ok(StepDecision::Continue(ToolExchange {
+                calls: exchange.calls.clone(),
+                results: exchange.results.clone(),
+            }));
         }
         return Ok(StepDecision::Stop(fail(
             state,
@@ -1054,9 +1137,40 @@ where
                     TurnStopReason::ModelFailed,
                 )?));
             }
-            run_tool_steps(state, tools, events, calls, cancel)
+            let proposed = calls.clone();
+            match run_tool_steps(state, tools, events, calls, cancel)? {
+                ToolBatchOutcome::Stopped(stop) => Ok(StepDecision::Stop(stop)),
+                ToolBatchOutcome::Completed(results) => {
+                    Ok(StepDecision::Continue(ToolExchange {
+                        calls: proposed,
+                        results,
+                    }))
+                }
+            }
         }
     }
+}
+
+/// Outcome of one dispatched tool batch: either every accepted call produced
+/// a result, or the turn stopped.
+enum ToolBatchOutcome {
+    Completed(Vec<ToolStepResult>),
+    Stopped(TurnResult),
+}
+
+/// Why a proposed call was refused before dispatch, applied after the calls
+/// accepted ahead of it have run (per-call budget/loop semantics are kept).
+struct StepRefusal {
+    /// The refused call, when its `tool.requested`/`tool.failed` events must
+    /// still be emitted (validation refusals).
+    call: Option<ProposedToolCall>,
+    /// The turn stop the refusal produces.
+    action: RefusalAction,
+}
+
+enum RefusalAction {
+    Interrupt,
+    Fail(TurnStopReason),
 }
 
 fn run_tool_steps<T, E>(
@@ -1065,169 +1179,198 @@ fn run_tool_steps<T, E>(
     events: &mut E,
     calls: Vec<ProposedToolCall>,
     cancel: &CancellationToken,
-) -> Result<StepDecision, TurnError>
+) -> Result<ToolBatchOutcome, TurnError>
 where
     T: ToolDriver,
     E: TurnEventSink,
 {
-    let mut results = Vec::new();
-    for (index, call) in calls.into_iter().enumerate() {
-        if index.is_multiple_of(CANCEL_STRIDE)
-            && let Some(stop) = stop_if_cancelled(state, events, cancel)?
-        {
-            return Ok(StepDecision::Stop(stop));
+    // Phase 1: per-call gates and validation, in proposal order. The first
+    // refusal is recorded; calls accepted ahead of it still dispatch.
+    let mut prepared: Vec<(ProposedToolCall, ValidatedToolCall)> = Vec::new();
+    let mut refusal: Option<StepRefusal> = None;
+    for call in calls {
+        if cancel.is_cancelled() {
+            refusal = Some(StepRefusal {
+                call: None,
+                action: RefusalAction::Interrupt,
+            });
+            break;
         }
-        if tool_budget_exhausted(state) {
-            return Ok(StepDecision::Stop(fail(
-                state,
-                events,
-                TurnStopReason::BudgetExhausted,
-            )?));
+        // The budget gate counts calls already accepted in this batch, so a
+        // proposal beyond the remaining budget is refused before executing.
+        if tool_budget_exhausted(state.usage.tool_calls, prepared.len(), state.budget) {
+            refusal = Some(StepRefusal {
+                call: None,
+                action: RefusalAction::Fail(TurnStopReason::BudgetExhausted),
+            });
+            break;
         }
         state.loop_detector.observe(call.tool(), call.arguments());
         if state.loop_detector.is_looping() {
-            return Ok(StepDecision::Stop(fail(
-                state,
-                events,
-                TurnStopReason::RepeatedToolCall,
-            )?));
+            refusal = Some(StepRefusal {
+                call: None,
+                action: RefusalAction::Fail(TurnStopReason::RepeatedToolCall),
+            });
+            break;
         }
-        match run_one_tool(state, tools, events, call, cancel)? {
-            StepDecision::Continue(mut batch) => results.append(&mut batch),
-            stop => return Ok(stop),
+        emit(
+            events,
+            TurnEvent::ToolRequested {
+                turn_id: state.turn_id,
+                call_id: call.call_id.clone(),
+                tool: call.tool.clone(),
+            },
+        )?;
+
+        if let Err(err) = validate_proposed(&call) {
+            let interrupting = matches!(err, TurnError::Cancelled);
+            if !interrupting {
+                state.unhandled_tool_failure = true;
+            }
+            refusal = Some(if interrupting {
+                StepRefusal {
+                    call: Some(call),
+                    action: RefusalAction::Interrupt,
+                }
+            } else {
+                StepRefusal {
+                    call: Some(call),
+                    action: RefusalAction::Fail(TurnStopReason::ToolFailed),
+                }
+            });
+            break;
+        }
+
+        let validated = match tools.validate(&call, cancel) {
+            Ok(validated) => validated,
+            Err(ToolStepError::Cancelled) => {
+                refusal = Some(StepRefusal {
+                    call: Some(call),
+                    action: RefusalAction::Interrupt,
+                });
+                break;
+            }
+            Err(ToolStepError::Invalid | ToolStepError::Failed) => {
+                state.unhandled_tool_failure = true;
+                refusal = Some(StepRefusal {
+                    call: Some(call),
+                    action: RefusalAction::Fail(TurnStopReason::ToolFailed),
+                });
+                break;
+            }
+        };
+
+        if validated.call_id != call.call_id || validated.tool != call.tool {
+            state.unhandled_tool_failure = true;
+            refusal = Some(StepRefusal {
+                call: Some(call),
+                action: RefusalAction::Fail(TurnStopReason::ToolFailed),
+            });
+            break;
+        }
+        prepared.push((call, validated));
+    }
+
+    // Phase 2 + 3: dispatch the accepted calls, then apply the refusal (if
+    // any) so an accepted prefix still runs, as the per-call loop did.
+    let mut results = Vec::new();
+    if !prepared.is_empty() {
+        match dispatch_prepared(state, tools, events, prepared, cancel)? {
+            ToolBatchOutcome::Stopped(stop) => return Ok(ToolBatchOutcome::Stopped(stop)),
+            ToolBatchOutcome::Completed(completed) => results = completed,
         }
     }
+    if let Some(refusal) = refusal {
+        if let Some(call) = &refusal.call {
+            emit_tool_failed(state, events, call)?;
+        }
+        let stop = match refusal.action {
+            RefusalAction::Interrupt => interrupt(state, events)?,
+            RefusalAction::Fail(reason) => fail(state, events, reason)?,
+        };
+        return Ok(ToolBatchOutcome::Stopped(stop));
+    }
     if state.unhandled_tool_failure {
-        return Ok(StepDecision::Stop(fail(
+        return Ok(ToolBatchOutcome::Stopped(fail(
             state,
             events,
             TurnStopReason::ToolFailed,
         )?));
     }
-    Ok(StepDecision::Continue(results))
+    Ok(ToolBatchOutcome::Completed(results))
 }
 
-fn run_one_tool<T, E>(
+/// Phase 2: mark the batch started and dispatch it to the driver at once
+/// (independent calls may run concurrently inside the driver). Phase 3
+/// accounts per-call outcomes in proposal order.
+fn dispatch_prepared<T, E>(
     state: &mut LoopState,
     tools: &mut T,
     events: &mut E,
-    call: ProposedToolCall,
+    prepared: Vec<(ProposedToolCall, ValidatedToolCall)>,
     cancel: &CancellationToken,
-) -> Result<StepDecision, TurnError>
+) -> Result<ToolBatchOutcome, TurnError>
 where
     T: ToolDriver,
     E: TurnEventSink,
 {
-    if let Some(stop) = stop_if_cancelled(state, events, cancel)? {
-        return Ok(StepDecision::Stop(stop));
+    for (call, _) in &prepared {
+        emit(
+            events,
+            TurnEvent::ToolStarted {
+                turn_id: state.turn_id,
+                call_id: call.call_id.clone(),
+                tool: call.tool.clone(),
+            },
+        )?;
     }
+    if let Some(stop) = stop_if_cancelled(state, events, cancel)? {
+        return Ok(ToolBatchOutcome::Stopped(stop));
+    }
+    let validated: Vec<ValidatedToolCall> =
+        prepared.iter().map(|(_, validated)| validated.clone()).collect();
+    let outcomes = tools.execute_batch(&validated, cancel);
 
-    emit(
-        events,
-        TurnEvent::ToolRequested {
-            turn_id: state.turn_id,
-            call_id: call.call_id.clone(),
-            tool: call.tool.clone(),
-        },
-    )?;
-
-    if let Err(err) = validate_proposed(&call) {
-        emit_tool_failed(state, events, &call)?;
-        state.unhandled_tool_failure = true;
-        return match err {
-            TurnError::Cancelled => Ok(StepDecision::Stop(interrupt(state, events)?)),
-            _ => Ok(StepDecision::Stop(fail(
-                state,
-                events,
-                TurnStopReason::ToolFailed,
-            )?)),
+    let mut results = Vec::new();
+    for ((call, _), outcome) in prepared.iter().zip(outcomes) {
+        let result = match outcome {
+            Ok(result) => result,
+            Err(ToolStepError::Cancelled) => {
+                emit_tool_failed(state, events, call)?;
+                return Ok(ToolBatchOutcome::Stopped(interrupt(state, events)?));
+            }
+            Err(ToolStepError::Invalid | ToolStepError::Failed) => {
+                emit_tool_failed(state, events, call)?;
+                state.unhandled_tool_failure = true;
+                return Ok(ToolBatchOutcome::Stopped(fail(
+                    state,
+                    events,
+                    TurnStopReason::ToolFailed,
+                )?));
+            }
         };
-    }
 
-    if let Some(stop) = stop_if_cancelled(state, events, cancel)? {
-        return Ok(StepDecision::Stop(stop));
-    }
+        state.usage.tool_calls = state.usage.tool_calls.saturating_add(1);
+        emit_tool_result(state, events, call, &result)?;
+        results.push(result.clone());
 
-    let validated = match tools.validate(&call, cancel) {
-        Ok(validated) => validated,
-        Err(ToolStepError::Cancelled) => {
-            emit_tool_failed(state, events, &call)?;
-            return Ok(StepDecision::Stop(interrupt(state, events)?));
+        if matches!(result, ToolStepResult::ApprovalRequired { .. }) {
+            return Ok(ToolBatchOutcome::Stopped(fail(
+                state,
+                events,
+                TurnStopReason::ApprovalRequired,
+            )?));
         }
-        Err(ToolStepError::Invalid | ToolStepError::Failed) => {
-            emit_tool_failed(state, events, &call)?;
+        if result.is_unhandled_failure() {
             state.unhandled_tool_failure = true;
-            return Ok(StepDecision::Stop(fail(
+            return Ok(ToolBatchOutcome::Stopped(fail(
                 state,
                 events,
                 TurnStopReason::ToolFailed,
             )?));
         }
-    };
-
-    if validated.call_id != call.call_id || validated.tool != call.tool {
-        emit_tool_failed(state, events, &call)?;
-        state.unhandled_tool_failure = true;
-        return Ok(StepDecision::Stop(fail(
-            state,
-            events,
-            TurnStopReason::ToolFailed,
-        )?));
     }
-
-    emit(
-        events,
-        TurnEvent::ToolStarted {
-            turn_id: state.turn_id,
-            call_id: call.call_id.clone(),
-            tool: call.tool.clone(),
-        },
-    )?;
-
-    if let Some(stop) = stop_if_cancelled(state, events, cancel)? {
-        return Ok(StepDecision::Stop(stop));
-    }
-
-    let result = match tools.execute(&validated, cancel) {
-        Ok(result) => result,
-        Err(ToolStepError::Cancelled) => {
-            emit_tool_failed(state, events, &call)?;
-            return Ok(StepDecision::Stop(interrupt(state, events)?));
-        }
-        Err(ToolStepError::Invalid | ToolStepError::Failed) => {
-            emit_tool_failed(state, events, &call)?;
-            state.unhandled_tool_failure = true;
-            return Ok(StepDecision::Stop(fail(
-                state,
-                events,
-                TurnStopReason::ToolFailed,
-            )?));
-        }
-    };
-
-    if let Some(stop) = stop_if_cancelled(state, events, cancel)? {
-        return Ok(StepDecision::Stop(stop));
-    }
-
-    state.usage.tool_calls = state.usage.tool_calls.saturating_add(1);
-    emit_tool_result(state, events, &call, &result)?;
-
-    if matches!(result, ToolStepResult::ApprovalRequired { .. }) {
-        return Ok(StepDecision::Stop(fail(
-            state,
-            events,
-            TurnStopReason::ApprovalRequired,
-        )?));
-    }
-    if result.is_unhandled_failure() {
-        state.unhandled_tool_failure = true;
-        return Ok(StepDecision::Stop(fail(
-            state,
-            events,
-            TurnStopReason::ToolFailed,
-        )?));
-    }
-    Ok(StepDecision::Continue(vec![result]))
+    Ok(ToolBatchOutcome::Completed(results))
 }
 
 fn emit_tool_result<E: TurnEventSink>(
@@ -1378,9 +1521,11 @@ fn model_budget_exhausted(state: &LoopState) -> bool {
     false
 }
 
-fn tool_budget_exhausted(state: &LoopState) -> bool {
-    match state.budget.max_tool_calls {
-        Some(limit) => state.usage.tool_calls >= limit,
+fn tool_budget_exhausted(used: u32, pending_in_batch: usize, budget: TurnBudget) -> bool {
+    match budget.max_tool_calls {
+        Some(limit) => {
+            (used as usize).saturating_add(pending_in_batch) >= limit as usize
+        }
         None => false,
     }
 }
@@ -1647,10 +1792,10 @@ mod tests {
         events.iter().map(|event| event.kind().as_str()).collect()
     }
 
-    fn run(
+    fn run<M: ModelDriver, T: ToolDriver>(
         budget: TurnBudget,
-        model: &mut ScriptedModel,
-        tools: &mut ScriptedTools,
+        model: &mut M,
+        tools: &mut T,
         events: &mut Vec<TurnEvent>,
         cancel: &CancellationToken,
     ) -> Result<TurnResult, TurnError> {
@@ -1666,6 +1811,43 @@ mod tests {
             ),
             cancel,
         )
+    }
+
+    /// The driver only implements `execute_batch`; the sequential `execute`
+    /// path signals failure, so a completed turn proves the loop used the
+    /// batch seam and kept per-call ids and outcomes.
+    struct BatchOnlyTools;
+    impl ToolDriver for BatchOnlyTools {
+        fn validate(
+            &mut self,
+            call: &ProposedToolCall,
+            _cancel: &CancellationToken,
+        ) -> Result<ValidatedToolCall, ToolStepError> {
+            Ok(ValidatedToolCall::from_proposed(call))
+        }
+        fn execute(
+            &mut self,
+            call: &ValidatedToolCall,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolStepResult, ToolStepError> {
+            let _ = call;
+            Err(ToolStepError::Failed)
+        }
+        fn execute_batch(
+            &mut self,
+            calls: &[ValidatedToolCall],
+            _cancel: &CancellationToken,
+        ) -> Vec<Result<ToolStepResult, ToolStepError>> {
+            calls
+                .iter()
+                .map(|call| {
+                    Ok(ToolStepResult::Succeeded {
+                        call_id: call.call_id().to_owned(),
+                        summary: format!("batch:{}", call.call_id()),
+                    })
+                })
+                .collect()
+        }
     }
 
     #[test]
@@ -1863,6 +2045,135 @@ mod tests {
     }
 
     #[test]
+    fn one_step_calls_dispatch_as_a_batch_with_per_call_results() {
+        let mut model = ScriptedModel::new(vec![
+            tools_out(
+                vec![
+                    call("c1", "repo.read"),
+                    call("c2", "repo.search"),
+                    call("c3", "repo.read"),
+                ],
+                2,
+            ),
+            terminal("done", 1),
+        ]);
+        let mut tools = BatchOnlyTools;
+        let mut events = Vec::new();
+        let result = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(result.status(), TurnStatus::Completed);
+        assert_eq!(result.usage().tool_calls(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind() == TurnEventKind::ToolCompleted)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn continuation_step_sees_the_pending_calls_next_to_their_results() {
+        struct PairRecordingModel {
+            seen: Vec<(Vec<String>, Vec<String>)>,
+        }
+        impl ModelDriver for PairRecordingModel {
+            fn step(
+                &mut self,
+                input: &ModelStepInput<'_>,
+                _cancel: &CancellationToken,
+            ) -> Result<ModelStepOutput, ModelStepError> {
+                self.seen.push((
+                    input
+                        .pending_calls()
+                        .iter()
+                        .map(|call| call.call_id().to_owned())
+                        .collect(),
+                    input
+                        .prior_tools()
+                        .iter()
+                        .map(|result| result.call_id().to_owned())
+                        .collect(),
+                ));
+                if input.prior_tools().is_empty() {
+                    Ok(tools_out(
+                        vec![call("c1", "repo.read"), call("c2", "repo.read")],
+                        1,
+                    )
+                    .expect("calls"))
+                } else {
+                    terminal("paired", 1)
+                }
+            }
+        }
+        let mut model = PairRecordingModel { seen: Vec::new() };
+        let mut tools = ScriptedTools::new(vec![
+            Ok(ToolStepResult::Succeeded {
+                call_id: "c1".to_owned(),
+                summary: "one".to_owned(),
+            }),
+            Ok(ToolStepResult::Succeeded {
+                call_id: "c2".to_owned(),
+                summary: "two".to_owned(),
+            }),
+        ]);
+        let mut events = Vec::new();
+        let result = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(result.status(), TurnStatus::Completed);
+        assert_eq!(model.seen.len(), 2);
+        assert_eq!(model.seen[0], (vec![], vec![]));
+        assert_eq!(
+            model.seen[1],
+            (
+                vec!["c1".to_owned(), "c2".to_owned()],
+                vec!["c1".to_owned(), "c2".to_owned()]
+            )
+        );
+    }
+
+    #[test]
+    fn proposal_above_the_per_step_cap_is_refused_before_any_execution() {
+        // 17 proposed calls in one step exceed MAX_TOOL_CALLS_PER_STEP: the
+        // step fails typed and none of the calls reach the driver.
+        let calls: Vec<ProposedToolCall> = (0..=MAX_TOOL_CALLS_PER_STEP)
+            .map(|index| call(&format!("c{index}"), "repo.read"))
+            .collect();
+        let mut model = ScriptedModel::new(vec![tools_out(calls, 1)]);
+        let mut tools = BatchOnlyTools;
+        let mut events = Vec::new();
+        let result = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(result.status(), TurnStatus::Failed);
+        assert_eq!(result.reason(), Some(TurnStopReason::ModelFailed));
+        assert_eq!(result.usage().tool_calls(), 0, "no call may execute");
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind() == TurnEventKind::ToolStarted),
+            "refused calls never reach dispatch"
+        );
+    }
+
+    #[test]
     fn unhandled_tool_failure_never_emits_completed() {
         let mut model = ScriptedModel::new(vec![
             tools_out(vec![call("c1", "shell.exec")], 1),
@@ -1871,6 +2182,7 @@ mod tests {
         let mut tools = ScriptedTools::new(vec![Ok(ToolStepResult::Failed {
             call_id: "c1".to_owned(),
             handled: false,
+            detail: None,
         })]);
         let mut events = Vec::new();
         let result = run(
@@ -2171,6 +2483,7 @@ mod tests {
         let mut tools = ScriptedTools::new(vec![Ok(ToolStepResult::Failed {
             call_id: "c1".to_owned(),
             handled: true,
+            detail: None,
         })]);
         let mut events = Vec::new();
         let result = run(

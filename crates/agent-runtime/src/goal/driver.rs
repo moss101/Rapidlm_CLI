@@ -666,6 +666,7 @@ impl<T: ToolDriver> ToolDriver for GoalLifecycleTools<'_, T> {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
+                detail: None,
             });
         };
         let command = match kind {
@@ -698,11 +699,13 @@ impl<T: ToolDriver> ToolDriver for GoalLifecycleTools<'_, T> {
                 Ok(ToolStepResult::Failed {
                     call_id: call.call_id().to_owned(),
                     handled: true,
+                    detail: None,
                 })
             }
             Err(_) => Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
+                detail: None,
             }),
         }
     }

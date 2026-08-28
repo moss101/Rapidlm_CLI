@@ -7,8 +7,10 @@
 //! model cannot use to override higher authority. This is not ad-hoc Markdown
 //! concatenation — locators, ordering, bounds and path confinement are typed.
 //!
-//! Not every markdown file is an instruction: only `AGENTS.md` at a directory
-//! boundary is loaded.
+//! Not every markdown file is an instruction: only the instruction file names
+//! ([`AGENTS_FILE`] and the [`INSTRUCTION_FILE_NAMES`] convention set) at a
+//! directory boundary are loaded, plus the `.claude`/`.cursor` compat rule
+//! directories ([`discover_instructions`]).
 
 use std::error::Error;
 use std::fmt;
@@ -19,6 +21,21 @@ use crate::agent::model::CancellationToken;
 
 /// The only file considered part of the instruction hierarchy.
 pub const AGENTS_FILE: &str = "AGENTS.md";
+
+/// Instruction file names recognized per directory, in precedence order
+/// (canonical name first, then the vendor-compat conventions).
+pub const INSTRUCTION_FILE_NAMES: &[&str] = &[
+    "AGENTS.md",
+    "Agents.md",
+    "AGENT.md",
+    "CLAUDE.md",
+    "Claude.md",
+    "CLAUDE.local.md",
+];
+
+/// Per-directory compat rule directories whose `*.md` files load (sorted by
+/// file name), after the instruction files above.
+pub const COMPAT_RULES_DIRS: &[&str] = &[".claude/rules", ".cursor/rules"];
 
 /// Maximum AGENTS.md files accepted in one hierarchy.
 pub const MAX_AGENTS_FILES: usize = 16;
@@ -136,32 +153,7 @@ pub fn load_agents(
         return Err(RulesError::Cancelled);
     }
     let root = canonical_dir(root)?;
-    // The scope may be a task file that does not exist yet, so walk directories:
-    // the scope directory is the scope path itself when it is a directory,
-    // otherwise its parent.
-    let scope_dir = resolve_scope_dir(scope)?;
-    if !scope_dir.starts_with(&root) {
-        return Err(RulesError::PathEscape);
-    }
-
-    // Collect directories root-first down to the scope directory (inclusive).
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    let mut cursor = scope_dir;
-    loop {
-        dirs.push(cursor.clone());
-        if cursor == root {
-            break;
-        }
-        let Some(parent) = cursor.parent() else {
-            return Err(RulesError::PathEscape);
-        };
-        if parent == cursor || !parent.starts_with(&root) {
-            return Err(RulesError::PathEscape);
-        }
-        cursor = parent.to_path_buf();
-    }
-    dirs.reverse();
-
+    let dirs = collect_scope_dirs(&root, scope)?;
     let mut entries = Vec::new();
     let mut total = 0usize;
     for dir in dirs {
@@ -184,18 +176,139 @@ pub fn load_agents(
         if total > MAX_AGENTS_BYTES || entries.len() >= MAX_AGENTS_FILES {
             return Err(RulesError::BoundExceeded);
         }
-        let rel = dir
-            .strip_prefix(&root)
-            .map_err(|_| RulesError::PathEscape)?
-            .to_path_buf();
-        let locator = if rel.as_os_str().is_empty() {
-            AGENTS_FILE.to_owned()
-        } else {
-            format!("{}/{}", rel.to_string_lossy(), AGENTS_FILE)
-        };
+        let locator = scoped_locator(&root, &dir, AGENTS_FILE)?;
         entries.push(RuleEntry::new(locator, text));
     }
     Ok(RulesBundle::new(entries))
+}
+
+/// Discover the full AGENTS.md-style instruction hierarchy for `scope` under
+/// `root`: root→nearer directories accumulate, and every directory may
+/// contribute any of the [`INSTRUCTION_FILE_NAMES`] files plus the
+/// `.claude`/`.cursor` compat rule directories (their `*.md` files, sorted by
+/// name). Missing files and directories are skipped; unreadable or non-UTF-8
+/// content fails closed; file-count and byte bounds apply to the whole bundle.
+pub fn discover_instructions(
+    root: &Path,
+    scope: &Path,
+    cancel: &CancellationToken,
+) -> Result<RulesBundle, RulesError> {
+    if cancel.is_cancelled() {
+        return Err(RulesError::Cancelled);
+    }
+    let root = canonical_dir(root)?;
+    let dirs = collect_scope_dirs(&root, scope)?;
+    let mut entries = Vec::new();
+    let mut total = 0usize;
+    // A case-insensitive filesystem makes several convention names resolve to
+    // one file; admit each real file once.
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let admit = |path: PathBuf,
+                     text: String,
+                     locator: String,
+                     entries: &mut Vec<RuleEntry>,
+                     total: &mut usize,
+                     seen: &mut Vec<PathBuf>|
+     -> Result<(), RulesError> {
+        let canonical = fs::canonicalize(&path).unwrap_or(path);
+        if seen.contains(&canonical) {
+            return Ok(());
+        }
+        seen.push(canonical);
+        *total = total.checked_add(text.len()).ok_or(RulesError::BoundExceeded)?;
+        if *total > MAX_AGENTS_BYTES || entries.len() >= MAX_AGENTS_FILES {
+            return Err(RulesError::BoundExceeded);
+        }
+        entries.push(RuleEntry::new(locator, text));
+        Ok(())
+    };
+    for dir in dirs {
+        if cancel.is_cancelled() {
+            return Err(RulesError::Cancelled);
+        }
+        for file_name in INSTRUCTION_FILE_NAMES {
+            let path = dir.join(file_name);
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let bytes = fs::read(&path).map_err(|_| RulesError::Unreadable)?;
+            let text = String::from_utf8(bytes).map_err(|_| RulesError::Malformed)?;
+            let locator = scoped_locator(&root, &dir, file_name)?;
+            admit(path.clone(), text, locator, &mut entries, &mut total, &mut seen)?;
+        }
+        for compat_dir in COMPAT_RULES_DIRS {
+            let dir_path = dir.join(compat_dir);
+            let Ok(listing) = fs::read_dir(&dir_path) else {
+                continue;
+            };
+            let mut files: Vec<PathBuf> = listing
+                .flatten()
+                .filter(|entry| {
+                    entry.path().extension().is_some_and(|ext| ext == "md")
+                        && fs::metadata(entry.path()).map(|meta| meta.is_file()).unwrap_or(false)
+                })
+                .map(|entry| entry.path())
+                .collect();
+            files.sort();
+            for path in files {
+                if cancel.is_cancelled() {
+                    return Err(RulesError::Cancelled);
+                }
+                let bytes = fs::read(&path).map_err(|_| RulesError::Unreadable)?;
+                let text = String::from_utf8(bytes).map_err(|_| RulesError::Malformed)?;
+                let file_name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .ok_or(RulesError::PathEscape)?;
+                let locator = scoped_locator(&root, &dir, &format!("{compat_dir}/{file_name}"))?;
+                admit(path.clone(), text, locator, &mut entries, &mut total, &mut seen)?;
+            }
+        }
+    }
+    Ok(RulesBundle::new(entries))
+}
+
+/// Directories from `root` down to `scope`'s directory, root-first. The scope
+/// may be a task file that does not exist yet, so its directory is the scope.
+fn collect_scope_dirs(root: &Path, scope: &Path) -> Result<Vec<PathBuf>, RulesError> {
+    let scope_dir = resolve_scope_dir(scope)?;
+    if !scope_dir.starts_with(root) {
+        return Err(RulesError::PathEscape);
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut cursor = scope_dir;
+    loop {
+        dirs.push(cursor.clone());
+        if cursor == root {
+            break;
+        }
+        let Some(parent) = cursor.parent() else {
+            return Err(RulesError::PathEscape);
+        };
+        if parent == cursor || !parent.starts_with(root) {
+            return Err(RulesError::PathEscape);
+        }
+        cursor = parent.to_path_buf();
+    }
+    dirs.reverse();
+    Ok(dirs)
+}
+
+/// Locator for one loaded file: repo-relative directory plus file name, so
+/// precedence stays explicit in the composed text.
+fn scoped_locator(root: &Path, dir: &Path, file_name: &str) -> Result<String, RulesError> {
+    let rel = dir
+        .strip_prefix(root)
+        .map_err(|_| RulesError::PathEscape)?
+        .to_path_buf();
+    Ok(if rel.as_os_str().is_empty() {
+        file_name.to_owned()
+    } else {
+        format!("{}/{file_name}", rel.to_string_lossy())
+    })
 }
 
 fn canonical_dir(path: &Path) -> Result<PathBuf, RulesError> {
@@ -344,5 +457,108 @@ mod tests {
         assert!(root_at < nested_at, "root must come first");
         assert!(text.contains("# AGENTS/AGENTS.md"));
         assert!(text.contains("# AGENTS/nested/AGENTS.md"));
+    }
+
+    #[test]
+    fn discovery_accumulates_compat_file_names_per_directory() {
+        let fx = Fixture::new();
+        fs::create_dir_all(fx.0.join("sub")).expect("mkdir");
+        fs::write(fx.0.join("AGENTS.md"), "root agents").expect("root");
+        fs::write(fx.0.join("CLAUDE.md"), "root claude").expect("root claude");
+        fs::write(fx.0.join("CLAUDE.local.md"), "root claude local").expect("root local");
+        // Only names that stay distinct on a case-insensitive filesystem
+        // (no AGENTS.md + Agents.md pair in one directory).
+        fs::write(fx.0.join("sub/AGENT.md"), "sub agent").expect("sub agent");
+        fs::write(fx.0.join("sub/Claude.md"), "sub claude").expect("sub claude");
+        let bundle = discover_instructions(&fx.0, &fx.0.join("sub/a.rs"), &cancel()).expect("load");
+        let text = bundle.composed();
+        // Root-first accumulation across both directories.
+        assert!(text.contains("root agents"));
+        assert!(text.contains("root claude"));
+        assert!(text.contains("root claude local"));
+        assert!(text.contains("sub agent"));
+        assert!(text.contains("sub claude"));
+        assert_eq!(bundle.len(), 5);
+        assert!(text.contains("# AGENTS/AGENTS.md"));
+        assert!(text.contains("# AGENTS/CLAUDE.md"));
+        assert!(text.contains("# AGENTS/sub/AGENT.md"));
+        // On a case-insensitive filesystem sub/Claude.md is admitted once,
+        // under the first convention name that matched (canonical spelling).
+        assert!(text.contains("# AGENTS/sub/CLAUDE.md"));
+        let root_pos = text.find("root agents").expect("root");
+        let sub_pos = text.find("sub agent").expect("sub");
+        assert!(root_pos < sub_pos);
+    }
+
+    #[test]
+    fn discovery_loads_claude_and_cursor_compat_rule_directories() {
+        let fx = Fixture::new();
+        fs::create_dir_all(fx.0.join(".claude/rules")).expect("mkdir");
+        fs::create_dir_all(fx.0.join(".cursor/rules")).expect("mkdir");
+        fs::write(fx.0.join(".claude/rules/always-b.md"), "claude rule b").expect("b");
+        fs::write(fx.0.join(".claude/rules/always-a.md"), "claude rule a").expect("a");
+        fs::write(fx.0.join(".cursor/rules/style.md"), "cursor rule").expect("cursor");
+        // Non-markdown files are ignored.
+        fs::write(fx.0.join(".claude/rules/notes.txt"), "not an instruction").expect("txt");
+        let bundle = discover_instructions(&fx.0, &fx.0.join("x.rs"), &cancel()).expect("load");
+        let text = bundle.composed();
+        assert!(text.contains("claude rule a"));
+        assert!(text.contains("claude rule b"));
+        assert!(text.contains("cursor rule"));
+        assert!(!text.contains("not an instruction"));
+        // Sorted by file name within a compat dir.
+        let a_pos = text.find("claude rule a").expect("a");
+        let b_pos = text.find("claude rule b").expect("b");
+        assert!(a_pos < b_pos);
+        assert!(text.contains("# AGENTS/.claude/rules/always-a.md"));
+        assert!(text.contains("# AGENTS/.cursor/rules/style.md"));
+    }
+
+    #[test]
+    fn discovery_is_bounded_and_scope_isolated() {
+        let fx = Fixture::new();
+        fs::create_dir_all(fx.0.join("src/other")).expect("mkdir");
+        // Sibling AGENTS.md outside the scope chain is not pulled in.
+        fs::write(fx.0.join("src/other/CLAUDE.md"), "sibling").expect("sibling");
+        fs::write(fx.0.join("AGENTS.md"), "root").expect("root");
+        // An oversized file fails the bundle bound instead of truncating.
+        fs::write(fx.0.join("src/HUGE.md"), "").ok(); // placeholder not in name set
+        let bundle = discover_instructions(&fx.0, &fx.0.join("src/a.rs"), &cancel()).expect("load");
+        let text = bundle.composed();
+        assert!(text.contains("root"));
+        assert!(!text.contains("sibling"));
+
+        // A file past the byte bound fails closed.
+        let big = Fixture::new();
+        fs::create_dir_all(&big.0).expect("mkdir");
+        fs::write(big.0.join("AGENTS.md"), "x".repeat(MAX_AGENTS_BYTES + 1)).expect("big");
+        assert_eq!(
+            discover_instructions(&big.0, &big.0.join("a.rs"), &cancel()),
+            Err(RulesError::BoundExceeded)
+        );
+
+        // A file count past the bound fails closed (compat dirs count too):
+        // MAX_AGENTS_FILES files fit, the next one refuses the whole load.
+        let many = Fixture::new();
+        fs::create_dir_all(many.0.join(".claude/rules")).expect("mkdir");
+        for index in 0..=MAX_AGENTS_FILES {
+            fs::write(
+                many.0.join(format!(".claude/rules/r{index:03}.md")),
+                format!("rule {index}"),
+            )
+            .expect("rule");
+        }
+        assert_eq!(
+            discover_instructions(&many.0, &many.0.join("a.rs"), &cancel()),
+            Err(RulesError::BoundExceeded)
+        );
+
+        // Cancellation stays typed.
+        let token = cancel();
+        token.cancel();
+        assert_eq!(
+            discover_instructions(&fx.0, &fx.0.join("src/a.rs"), &token),
+            Err(RulesError::Cancelled)
+        );
     }
 }

@@ -141,7 +141,11 @@ fn configured_model_step_reaches_loopback_openai_server() {
             .expect("preserved");
     let packet = build_packet(&preserved, None).expect("packet");
     let output = model
-        .step(packet.blocks(), &[], &[], &CancellationToken::new())
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &CancellationToken::new(),
+        )
         .expect("step");
     match output {
         ModelStepOutput::Terminal { text, tokens } => {
@@ -167,7 +171,11 @@ fn configured_model_step_parses_sse_stream() {
     let preserved = PreservedLiveContext::new("goal", Vec::new(), "", "", 1024, 64).expect("p");
     let packet = build_packet(&preserved, None).expect("packet");
     let output = model
-        .step(packet.blocks(), &[], &[], &CancellationToken::new())
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &CancellationToken::new(),
+        )
         .expect("step");
     match output {
         ModelStepOutput::Terminal { text, tokens } => {
@@ -189,7 +197,11 @@ fn provider_auth_failure_is_a_typed_step_failure() {
     let preserved = PreservedLiveContext::new("goal", Vec::new(), "", "", 1024, 64).expect("p");
     let packet = build_packet(&preserved, None).expect("packet");
     let err = model
-        .step(packet.blocks(), &[], &[], &CancellationToken::new())
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &CancellationToken::new(),
+        )
         .expect_err("typed failure");
     // A 401 keeps its cause class instead of collapsing into a bare failure.
     assert_eq!(
@@ -230,7 +242,11 @@ fn anthropic_provider_builds_and_reaches_the_loopback_server() {
     let preserved = PreservedLiveContext::new("goal", Vec::new(), "", "", 1024, 64).expect("p");
     let packet = build_packet(&preserved, None).expect("packet");
     let output = model
-        .step(packet.blocks(), &[], &[], &CancellationToken::new())
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &CancellationToken::new(),
+        )
         .expect("step");
     match output {
         ModelStepOutput::Terminal { text, tokens } => {
@@ -360,7 +376,323 @@ fn selection_is_unconfigured_when_no_config_exists_anywhere() {
         ModelSelection::Configured { .. } => panic!("unexpected configured selection"),
     };
     let err = selected
-        .step(&[], &[], &[], &CancellationToken::new())
+        .step(&[], &agent_runtime::ModelStepInput::without_tools(1), &CancellationToken::new())
         .expect_err("typed fallback");
     assert_eq!(err, ModelStepError::Failed);
+}
+
+// ---------------------------------------------------------------------------
+// Per-call tool-result channel: the request after a tool step carries one
+// tool-role/`tool_result` entry per executed call, each with its own id and
+// text, and the flat "tool results:" report is gone. Asserted on the wire for
+// both provider encoders.
+// ---------------------------------------------------------------------------
+
+/// SSE chat-completions stream proposing two tool calls.
+fn openai_tool_call_body() -> String {
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"repo.read\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\
+     \n\
+     data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"workspace.patch\",\"arguments\":\"{\\\"path\\\":\\\"b.txt\\\",\\\"old\\\":\\\"x\\\",\\\"new\\\":\\\"y\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
+     \n\
+     data: [DONE]\n\n"
+    .to_owned()
+}
+
+fn terminal_body(text: &str) -> String {
+    format!(
+        r#"{{"choices":[{{"message":{{"role":"assistant","content":"{text}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":3,"completion_tokens":4}}}}"#
+    )
+}
+
+fn tool_workspace(tag: &str) -> PathBuf {
+    let dir = temp_dir(tag);
+    std::fs::write(dir.join("a.txt"), "alpha\n").expect("seed a");
+    std::fs::write(dir.join("b.txt"), "x\n").expect("seed b");
+    dir
+}
+
+fn exec_request_for(goal: &str) -> agent_runtime::AgentExecutionRequest {
+    use protocol::{AgentId, SessionId, WorkspaceViewId};
+    let spec = agent_runtime::AgentSpec::builder(
+        AgentId::new(),
+        agent_runtime::AgentRole::Coder,
+        goal.to_owned(),
+        WorkspaceViewId::new(),
+    )
+    .permissions_profile("work")
+    .build()
+    .expect("spec");
+    agent_runtime::AgentExecutionRequest::new(spec, SessionId::new())
+}
+
+fn bypass_tools(workspace: &PathBuf) -> rapid::exec_tools::ExecTools {
+    rapid::exec_tools::ExecTools::workspace_with_permissions(
+        workspace,
+        rapid::permissions::PermissionLattice::new(
+            rapid::permissions::PermissionMode::BypassPermissions,
+        ),
+    )
+    .expect("tools")
+}
+
+#[test]
+fn openai_tool_results_reach_the_provider_one_tool_message_per_call() {
+    let server = spawn_scripted_server(vec![
+        (200, openai_tool_call_body()),
+        (200, terminal_body("patched and read")),
+    ]);
+    let doc = config_doc(&format!("http://{}/v1", server.addr));
+    let store: &'static InMemoryCredentialStore =
+        Box::leak(Box::new(InMemoryCredentialStore::new()));
+    let mut model = ConfiguredModel::build(&active_from_doc(&doc), store).expect("build");
+    let workspace = tool_workspace("tool-channel-openai");
+    let mut tools = bypass_tools(&workspace);
+    let preserved =
+        PreservedLiveContext::new("patch the file", Vec::new(), "", "", 8192, 256).expect("p");
+    let mut events = Vec::new();
+    let outcome = rapid::host::run_live_exec(
+        preserved,
+        model,
+        &exec_request_for("patch the file"),
+        &mut tools,
+        &mut events,
+        &CancellationToken::new(),
+        agent_runtime::ContextRetryPolicy::new(2),
+        None,
+    )
+    .expect("execute");
+    assert_eq!(outcome.result.summary(), "patched and read");
+
+    let requests = server.requests.lock().expect("requests");
+    assert_eq!(requests.len(), 2, "one request per model step");
+    let second = &requests[1];
+    // Per-call tool messages with ids and text content, in call order.
+    let call_one = second.matches("\"tool_call_id\":\"call_1\"").count();
+    let call_two = second.matches("\"tool_call_id\":\"call_2\"").count();
+    assert_eq!(call_one, 1, "exactly one tool message per call: {second}");
+    assert_eq!(call_two, 1, "exactly one tool message per call: {second}");
+    assert!(
+        second.contains("alpha\\n"),
+        "the first call's text result is carried: {second}"
+    );
+    // The assistant message echoes the proposals.
+    assert!(second.contains("\"tool_calls\""), "{second}");
+    assert!(second.contains("workspace.patch"), "{second}");
+    // The flat report is gone everywhere.
+    assert!(!second.contains("tool results:"), "{second}");
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn anthropic_tool_results_reach_the_provider_one_tool_result_per_call() {
+    let first = r#"{"content":[{"type":"tool_use","id":"call_1","name":"repo.read","input":{"path":"a.txt"}}],"stop_reason":"tool_use","usage":{"input_tokens":4,"output_tokens":2}}"#.to_owned();
+    let second = r#"{"content":[{"type":"text","text":"read done"}],"usage":{"input_tokens":9,"output_tokens":2},"stop_reason":"end_turn"}"#.to_owned();
+    let server = spawn_scripted_server(vec![(200, first), (200, second)]);
+    let doc = format!(
+        "[models]\ndefault = \"gw\"\n\
+         \n\
+         [model.gw]\n\
+         provider = \"anthropic\"\n\
+         model = \"claude-3-5-sonnet\"\n\
+         base_url = \"http://{}\"\n\
+         env_key = \"GW_API_KEY\"\n",
+        server.addr
+    );
+    let config = parse_config_document(&doc, "gw.toml").expect("parse");
+    let active = resolve_active(
+        &[("GW_API_KEY".to_owned(), "gw-key".to_owned())],
+        &config,
+    )
+    .expect("resolve");
+    let store = InMemoryCredentialStore::new();
+    let mut model = ConfiguredModel::build(&active, &store).expect("build");
+    let workspace = tool_workspace("tool-channel-anthropic");
+    let mut tools = bypass_tools(&workspace);
+    let preserved = PreservedLiveContext::new("goal", Vec::new(), "", "", 8192, 256).expect("p");
+    let mut events = Vec::new();
+    let outcome = rapid::host::run_live_exec(
+        preserved,
+        model,
+        &exec_request_for("goal"),
+        &mut tools,
+        &mut events,
+        &CancellationToken::new(),
+        agent_runtime::ContextRetryPolicy::new(2),
+        None,
+    )
+    .expect("execute");
+    assert_eq!(outcome.result.summary(), "read done");
+
+    let requests = server.requests.lock().expect("requests");
+    assert_eq!(requests.len(), 2);
+    let second_request = &requests[1];
+    assert!(
+        second_request.contains("\"tool_use_id\":\"call_1\""),
+        "per-call tool_result block missing: {second_request}"
+    );
+    assert!(
+        second_request.contains("\"type\":\"tool_result\""),
+        "{second_request}"
+    );
+    assert!(
+        second_request.contains("\"tool_use\""),
+        "assistant echo missing: {second_request}"
+    );
+    assert!(!second_request.contains("tool results:"), "{second_request}");
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+// ---------------------------------------------------------------------------
+// Real-binary end-to-end: the actual `rapid` binary drives the new coding
+// tools through a scripted loopback provider, with the six-mode lattice
+// active (acceptEdits auto-approves the file edit; default mode denies it).
+// ---------------------------------------------------------------------------
+
+fn patch_tool_call_body() -> String {
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"workspace.patch\",\"arguments\":\"{\\\"path\\\":\\\"notes.txt\\\",\\\"old\\\":\\\"alpha\\\",\\\"new\\\":\\\"beta\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
+     \n\
+     data: [DONE]\n\n"
+    .to_owned()
+}
+
+/// One trusted project plus a HOME that grants it trust.
+struct TrustedProject {
+    home: PathBuf,
+    project: PathBuf,
+}
+
+impl TrustedProject {
+    fn new(tag: &str) -> Self {
+        let home = temp_dir(&format!("{tag}-home"));
+        let project = temp_dir(&format!("{tag}-proj"));
+        std::fs::create_dir_all(project.join(".rapidlm")).expect("project marker");
+        std::fs::write(project.join("notes.txt"), "alpha\n").expect("seed");
+        let root = std::fs::canonicalize(&project).expect("canon");
+        let identity = kernel::ProjectIdentity::new(root, None).expect("identity");
+        let store = kernel::ProjectTrustStore::open(home.join(".rapidlm/project-trust.json"));
+        store
+            .set(
+                &identity,
+                kernel::TrustStatus::Trusted,
+                &kernel::CancellationToken::new(),
+            )
+            .expect("grant trust");
+        Self { home, project }
+    }
+}
+
+impl Drop for TrustedProject {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.home);
+        let _ = std::fs::remove_dir_all(&self.project);
+    }
+}
+
+fn run_rapid_in(
+    project: &PathBuf,
+    home: &PathBuf,
+    config_path: &PathBuf,
+    permission_mode: Option<&str>,
+) -> (Option<i32>, String, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rapid"));
+    command
+        .args(["exec", "patch notes.txt by replacing alpha with beta"])
+        .current_dir(project)
+        .env("HOME", home)
+        .env_remove("RAPIDLM_HOME")
+        .env_remove("RAPIDLM_MODEL")
+        .env("RAPIDLM_CONFIG", config_path);
+    if let Some(mode) = permission_mode {
+        command.env("RAPIDLM_PERMISSION_MODE", mode);
+    } else {
+        command.env_remove("RAPIDLM_PERMISSION_MODE");
+    }
+    let output = command.output().expect("run rapid");
+    // Durable proof: persist the real binary's per-run output when the
+    // evidence directory is provided (verification harness sets it).
+    if let Ok(dir) = std::env::var("RAPIDLM_EVIDENCE_DIR") {
+        let mode_tag = permission_mode.unwrap_or("default");
+        let base = std::path::Path::new(&dir).join(format!("launch-{mode_tag}"));
+        let _ = std::fs::write(
+            format!("{}-{}.out.log", base.to_string_lossy(), std::process::id()),
+            &output.stdout,
+        );
+        let _ = std::fs::write(
+            format!("{}-{}.err.log", base.to_string_lossy(), std::process::id()),
+            &output.stderr,
+        );
+    }
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn binary_exec_applies_workspace_patch_end_to_end_in_accept_edits_mode() {
+    for round in 0..2 {
+        let server = spawn_scripted_server(vec![
+            (200, patch_tool_call_body()),
+            (200, terminal_body("patched notes.txt")),
+        ]);
+        let env = TrustedProject::new(&format!("bin-patch-{round}"));
+        let config_path = env.home.join("config.toml");
+        std::fs::write(
+            &config_path,
+            config_doc(&format!("http://{}/v1", server.addr)),
+        )
+        .expect("write config");
+        let (code, stdout, stderr) =
+            run_rapid_in(&env.project, &env.home, &config_path, Some("acceptEdits"));
+        assert_eq!(code, Some(0), "round {round} stderr: {stderr}");
+        assert!(
+            stdout.contains("patched notes.txt"),
+            "round {round}: stdout must carry the final model text: {stdout}"
+        );
+        // The workspace effect actually occurred on disk.
+        let content = std::fs::read_to_string(env.project.join("notes.txt"))
+            .expect("patched file exists");
+        assert_eq!(content, "beta\n", "round {round}: patch must have landed");
+        // The follow-up request carried the per-call tool result.
+        let requests = server.requests.lock().expect("requests");
+        assert!(requests.len() >= 2, "round {round}: expected a tool step");
+        assert!(
+            requests[requests.len() - 1].contains("\"tool_call_id\":\"call_1\""),
+            "round {round}: per-call tool message missing"
+        );
+        assert!(
+            !requests[requests.len() - 1].contains("tool results:"),
+            "round {round}: flat report must be gone"
+        );
+    }
+}
+
+#[test]
+fn binary_exec_in_default_mode_denies_the_patch_and_keeps_disk_intact() {
+    let server = spawn_scripted_server(vec![
+        (200, patch_tool_call_body()),
+        (200, terminal_body("nothing to change")),
+    ]);
+    let env = TrustedProject::new("bin-patch-denied");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let (code, stdout, _stderr) = run_rapid_in(&env.project, &env.home, &config_path, None);
+    assert_eq!(code, Some(0));
+    assert!(stdout.contains("nothing to change"));
+    // default mode asks; headless exec denies the edit typed — the disk is
+    // untouched and the model saw the denial.
+    let content =
+        std::fs::read_to_string(env.project.join("notes.txt")).expect("file still present");
+    assert_eq!(content, "alpha\n", "a default-mode edit must be denied");
+    let requests = server.requests.lock().expect("requests");
+    let last = requests.last().expect("at least one request");
+    assert!(
+        last.contains("\"tool_call_id\":\"call_1\""),
+        "the denial must be a model-visible tool result: {last}"
+    );
 }

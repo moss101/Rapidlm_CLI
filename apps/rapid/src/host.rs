@@ -21,7 +21,7 @@ use agent_runtime::{
     AgentExecutionError, AgentExecutionRequest, AgentExecutor, AgentOutcome, AgentResult,
     CancellationToken, ContextController, ContextOverflow, ContextRecoveryDecision,
     ContextRetryPolicy, ContextRevision, FailureCause, ModelDriver, ModelStepError, ModelStepInput,
-    ModelStepOutput, ProposedToolCall, ToolDriver, ToolStepError, ToolStepResult, ToolSurface,
+    ModelStepOutput, ProposedToolCall, ToolDriver, ToolStepError, ToolStepResult,
     TurnAgentExecutor, TurnEventSink, ValidatedToolCall,
 };
 use context_engine::CancellationToken as CeCancel;
@@ -39,6 +39,8 @@ pub const MAX_CRITERIA: usize = 64;
 pub const MAX_CRITERION_BYTES: usize = 4 * 1024;
 /// Byte cap for composed AGENTS/rules text.
 pub const MAX_RULES_BYTES: usize = 32 * 1024;
+/// Byte cap for the rendered system-prompt block.
+pub const MAX_SYSTEM_PROMPT_BLOCK_BYTES: usize = 32 * 1024;
 /// Byte cap for composed selected-skills text.
 pub const MAX_SKILLS_BYTES: usize = 16 * 1024;
 /// Maximum retained evidence ids.
@@ -85,6 +87,7 @@ pub struct PreservedLiveContext {
     context_limit: u32,
     output_reserve: u32,
     reminders_block: Option<String>,
+    system_prompt: Option<String>,
 }
 
 impl PreservedLiveContext {
@@ -122,7 +125,24 @@ impl PreservedLiveContext {
             context_limit,
             output_reserve,
             reminders_block: None,
+            system_prompt: None,
         })
+    }
+
+    /// Attach the rendered dynamic system prompt for this turn. Empty or
+    /// oversized blocks are refused at the caller; None adds no block.
+    pub fn with_system_prompt(mut self, system_prompt: Option<String>) -> Self {
+        let within_bounds = system_prompt.as_ref().is_none_or(|text| {
+            !text.is_empty() && text.len() <= MAX_SYSTEM_PROMPT_BLOCK_BYTES
+        });
+        if within_bounds {
+            self.system_prompt = system_prompt;
+        }
+        self
+    }
+
+    pub fn system_prompt(&self) -> Option<&str> {
+        self.system_prompt.as_deref()
     }
 
     pub fn with_workspace_view(mut self, view: WorkspaceViewId) -> Self {
@@ -187,8 +207,7 @@ pub trait LiveModelCall {
     fn step(
         &mut self,
         blocks: &[ContextBlock],
-        prior_tools: &[ToolStepResult],
-        tool_surface: &[ToolSurface],
+        input: &ModelStepInput<'_>,
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError>;
 }
@@ -210,12 +229,7 @@ impl<B: LiveModelCall> ModelDriver for LiveContextModelDriver<B> {
             return Err(ModelStepError::Cancelled);
         }
         let live = self.live.borrow();
-        self.backing.step(
-            live.packet().blocks(),
-            input.prior_tools(),
-            input.tool_surface(),
-            cancel,
-        )
+        self.backing.step(live.packet().blocks(), input, cancel)
     }
 }
 
@@ -387,8 +401,7 @@ impl LiveModelCall for UnconfiguredModel {
     fn step(
         &mut self,
         _blocks: &[ContextBlock],
-        _prior_tools: &[ToolStepResult],
-        _tool_surface: &[ToolSurface],
+        _input: &ModelStepInput<'_>,
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError> {
         if cancel.is_cancelled() {
@@ -540,13 +553,12 @@ impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
     fn step(
         &mut self,
         blocks: &[context_engine::compile::ContextBlock],
-        prior_tools: &[agent_runtime::ToolStepResult],
-        tool_surface: &[ToolSurface],
+        input: &ModelStepInput<'_>,
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError> {
         let mut attempt: u32 = 0;
         loop {
-            let result = self.inner.step(blocks, prior_tools, tool_surface, cancel);
+            let result = self.inner.step(blocks, input, cancel);
             match &result {
                 Err(ModelStepError::ProviderFailed {
                     cause: FailureCause::Transient { retry_after_ms },
@@ -663,6 +675,12 @@ pub fn build_packet(
     let mut ctx = CompileContext::new(preserved.context_limit, preserved.output_reserve)
         .task("live agent turn")
         .goal(preserved.goal_statement.clone());
+    if let Some(system_prompt) = preserved.system_prompt() {
+        ctx = ctx.system(CompileInput::new(
+            "system/prompt",
+            system_prompt.to_owned(),
+        ));
+    }
     if !preserved.agents_rules.is_empty() {
         ctx = ctx.system(CompileInput::new(
             "rules/agents",
@@ -725,8 +743,7 @@ mod tests {
         fn step(
             &mut self,
             blocks: &[ContextBlock],
-            _prior_tools: &[ToolStepResult],
-            _tool_surface: &[ToolSurface],
+            _input: &ModelStepInput<'_>,
             cancel: &CancellationToken,
         ) -> Result<ModelStepOutput, ModelStepError> {
             if cancel.is_cancelled() {
@@ -1207,8 +1224,7 @@ mod tests {
             fn step(
                 &mut self,
                 _blocks: &[ContextBlock],
-                _prior_tools: &[ToolStepResult],
-                _tool_surface: &[ToolSurface],
+                _input: &ModelStepInput<'_>,
                 cancel: &CancellationToken,
             ) -> Result<ModelStepOutput, ModelStepError> {
                 cancel.cancel();
