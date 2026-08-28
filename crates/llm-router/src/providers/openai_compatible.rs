@@ -11,8 +11,11 @@ use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde_json::{Map, Value};
 
 use crate::credentials::{CredentialResolver, EphemeralCredential, ProviderProfile};
@@ -116,6 +119,49 @@ pub struct Http1Transport<A> {
     auth: A,
     timeout: Duration,
     max_response_bytes: usize,
+}
+
+/// Mozilla CA set for https provider origins. Static; no custom CAs, no
+/// dynamic trust store.
+static TLS_CLIENT_CONFIG: LazyLock<Arc<ClientConfig>> = LazyLock::new(|| {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+});
+
+/// Plain TCP or TLS-wrapped carrier for one HTTP/1.1 exchange.
+enum MaybeTlsStream {
+    Plain(TcpStream),
+    Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+}
+
+impl Read for MaybeTlsStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.read(buf),
+            Self::Tls(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for MaybeTlsStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.write(buf),
+            Self::Tls(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
+        }
+    }
 }
 
 /// Streaming adapter for one provider profile.
@@ -338,9 +384,6 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         }
 
         let parsed = parse_http_url(request.url)?;
-        if parsed.scheme != UrlScheme::Http {
-            return Err(ProviderError::InvalidRequest);
-        }
         if host_is_blocked(&parsed.host) {
             return Err(ProviderError::InvalidRequest);
         }
@@ -369,17 +412,26 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         }
 
         cancel.check()?;
-        let mut stream = TcpStream::connect_timeout(&addr, self.timeout)
+        let tcp = TcpStream::connect_timeout(&addr, self.timeout)
             .map_err(|_| ProviderError::Transient)?;
-        stream
-            .set_read_timeout(Some(slice_timeout(self.timeout)))
+        tcp.set_read_timeout(Some(slice_timeout(self.timeout)))
             .map_err(|_| ProviderError::Transient)?;
-        stream
-            .set_write_timeout(Some(slice_timeout(self.timeout)))
+        tcp.set_write_timeout(Some(slice_timeout(self.timeout)))
             .map_err(|_| ProviderError::Transient)?;
-        stream
-            .set_nodelay(true)
-            .map_err(|_| ProviderError::Transient)?;
+        tcp.set_nodelay(true).map_err(|_| ProviderError::Transient)?;
+
+        // TLS is negotiated lazily on first write/read against the Mozilla
+        // root set; the same deadline/SSRF guards bound the handshake.
+        let mut stream = match parsed.scheme {
+            UrlScheme::Http => MaybeTlsStream::Plain(tcp),
+            UrlScheme::Https => {
+                let server_name = ServerName::try_from(parsed.host.to_string())
+                    .map_err(|_| ProviderError::InvalidRequest)?;
+                let connection = ClientConnection::new(Arc::clone(&TLS_CLIENT_CONFIG), server_name)
+                    .map_err(|_| ProviderError::Transient)?;
+                MaybeTlsStream::Tls(Box::new(StreamOwned::new(connection, tcp)))
+            }
+        };
 
         let deadline = Instant::now() + self.timeout;
         write_http_request(
@@ -1551,8 +1603,8 @@ fn slice_timeout(total: Duration) -> Duration {
     if total < slice { total } else { slice }
 }
 
-fn write_http_request(
-    stream: &mut TcpStream,
+fn write_http_request<S: Read + Write>(
+    stream: &mut S,
     url: &ParsedUrl,
     headers: &[(String, String)],
     body: &[u8],
@@ -1599,8 +1651,8 @@ fn is_safe_header(name: &str, value: &str) -> bool {
         && value.len() <= MAX_HEADER_LINE_BYTES
 }
 
-fn read_http_response(
-    stream: &mut TcpStream,
+fn read_http_response<S: Read + Write>(
+    stream: &mut S,
     max_body: usize,
     cancel: &CancellationToken,
     deadline: Instant,
@@ -1615,6 +1667,7 @@ fn read_http_response(
     let status = parse_status_line(status_line)?;
     let mut headers = Vec::new();
     let mut content_length = None;
+    let mut chunked = false;
     for line in lines {
         if line.is_empty() {
             continue;
@@ -1633,12 +1686,27 @@ fn read_http_response(
             );
         }
         if name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked") {
-            return Err(ProviderError::Permanent);
+            chunked = true;
         }
         headers.push((name, value));
     }
 
-    let mut body = body_prefix.to_vec();
+    let mut body = if chunked {
+        // Cloud-fronted SSE responses arrive with `Transfer-Encoding: chunked`;
+        // decode the framing to the plain event stream the adapters parse.
+        decode_chunked(
+            &mut PrefixedStream {
+                prefix: body_prefix,
+                pos: 0,
+                stream,
+            },
+            max_body,
+            cancel,
+            deadline,
+        )?
+    } else {
+        body_prefix.to_vec()
+    };
     if let Some(length) = content_length {
         if length > max_body {
             return Err(ProviderError::BoundExceeded);
@@ -1656,7 +1724,7 @@ fn read_http_response(
         if body.len() > length {
             body.truncate(length);
         }
-    } else {
+    } else if !chunked {
         // No Content-Length: read until EOF, deadline, or max. A prefix is not success.
         loop {
             if body.len() > max_body {
@@ -1689,6 +1757,108 @@ fn read_http_response(
     ProviderHttpResponse::new(status, headers, body)
 }
 
+/// Serves already-buffered bytes (anything past the header split that arrived
+/// with the header block) before delegating to the live stream.
+struct PrefixedStream<'a, S: Read> {
+    prefix: &'a [u8],
+    pos: usize,
+    stream: &'a mut S,
+}
+
+impl<S: Read> Read for PrefixedStream<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos < self.prefix.len() {
+            let n = (self.prefix.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.prefix[self.pos..self.pos + n]);
+            self.pos += n;
+            return Ok(n);
+        }
+        self.stream.read(buf)
+    }
+}
+
+/// Decode a chunked transfer body to its plain content. Success requires the
+/// terminating zero chunk; a truncated stream fails closed.
+fn decode_chunked(
+    input: &mut dyn Read,
+    max_body: usize,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<Vec<u8>, ProviderError> {
+    let mut body = Vec::new();
+    loop {
+        cancel.check()?;
+        check_deadline(deadline)?;
+        let size_line = read_line_crlf(input, cancel, deadline)?;
+        let size = size_line.split(';').next().unwrap_or("").trim();
+        let len = usize::from_str_radix(size, 16).map_err(|_| ProviderError::Permanent)?;
+        if len == 0 {
+            // Trailers end with the terminating empty line.
+            loop {
+                if read_line_crlf(input, cancel, deadline)?.is_empty() {
+                    break;
+                }
+            }
+            break;
+        }
+        if body.len() + len > max_body {
+            return Err(ProviderError::BoundExceeded);
+        }
+        let start = body.len();
+        body.resize(start + len, 0);
+        read_exact_some(input, &mut body[start..], cancel, deadline)?;
+        if !read_line_crlf(input, cancel, deadline)?.is_empty() {
+            return Err(ProviderError::Permanent);
+        }
+    }
+    Ok(body)
+}
+
+/// Read one CRLF-terminated line (terminator stripped), bounded.
+fn read_line_crlf(
+    input: &mut dyn Read,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<String, ProviderError> {
+    let mut line = Vec::new();
+    loop {
+        cancel.check()?;
+        check_deadline(deadline)?;
+        let mut byte = [0u8; 1];
+        if read_some(input, &mut byte, cancel, deadline)? == 0 {
+            return Err(ProviderError::Permanent);
+        }
+        if byte[0] == b'\n' {
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return String::from_utf8(line).map_err(|_| ProviderError::Permanent);
+        }
+        line.push(byte[0]);
+        if line.len() > MAX_HEADER_LINE_BYTES {
+            return Err(ProviderError::BoundExceeded);
+        }
+    }
+}
+
+/// Fill `out` completely; a peer that closes short fails closed.
+fn read_exact_some(
+    input: &mut dyn Read,
+    out: &mut [u8],
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<(), ProviderError> {
+    let mut filled = 0;
+    while filled < out.len() {
+        let n = read_some(input, &mut out[filled..], cancel, deadline)?;
+        if n == 0 {
+            return Err(ProviderError::Permanent);
+        }
+        filled += n;
+    }
+    Ok(())
+}
+
 fn parse_status_line(line: &str) -> Result<u16, ProviderError> {
     let mut parts = line.split(' ');
     let version = parts.next().ok_or(ProviderError::Permanent)?;
@@ -1703,8 +1873,8 @@ fn find_header_body_split(raw: &[u8]) -> Option<usize> {
     raw.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-fn read_until_limit(
-    stream: &mut TcpStream,
+fn read_until_limit<S: Read + Write>(
+    stream: &mut S,
     limit: usize,
     cancel: &CancellationToken,
     deadline: Instant,
@@ -1727,8 +1897,8 @@ fn read_until_limit(
     Ok(buf)
 }
 
-fn read_some(
-    stream: &mut TcpStream,
+fn read_some<S: Read + ?Sized>(
+    stream: &mut S,
     buf: &mut [u8],
     cancel: &CancellationToken,
     deadline: Instant,
@@ -1753,8 +1923,8 @@ fn read_some(
     }
 }
 
-fn write_all_deadline(
-    stream: &mut TcpStream,
+fn write_all_deadline<S: Read + Write>(
+    stream: &mut S,
     mut data: &[u8],
     cancel: &CancellationToken,
     deadline: Instant,
@@ -2563,26 +2733,6 @@ mod tests {
             .style(),
             OpenAiApiStyle::ChatCompletions
         );
-        let store = store_with_canary();
-        let transport = Http1Transport::new(StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"));
-        let adapter = OpenAiCompatibleAdapter::new(
-            OpenAiCompatibleConfig::new(
-                profile(),
-                OpenAiCompatibleEndpoint::new(
-                    "https://api.openai.com/v1",
-                    OpenAiApiStyle::ChatCompletions,
-                )
-                .expect("https"),
-                caps(false, false),
-            )
-            .expect("cfg"),
-            transport,
-            &store,
-        );
-        let err = adapter
-            .invoke_sync(request(false, false), &live())
-            .expect_err("no tls");
-        assert_eq!(err, ProviderError::InvalidRequest);
     }
 
     #[test]
@@ -2815,5 +2965,48 @@ mod tests {
                 "encoded IMDS host {host} must fail closed at execute"
             );
         }
+    }
+
+    #[test]
+    fn chunked_bodies_decode_to_plain_content() {
+        let cancel = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut wire: &[u8] = b"4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\n\r\n";
+        let body = decode_chunked(&mut wire, 1024, &cancel, deadline).expect("decode");
+        assert_eq!(body, b"Wikipedia");
+
+        // Buffered prefix bytes (arrived with the headers) participate.
+        let mut sink = std::io::empty();
+        let mut prefixed = PrefixedStream {
+            prefix: b"2\r\nok\r\n0\r\n\r\n".as_slice(),
+            pos: 0,
+            stream: &mut sink,
+        };
+        let body = decode_chunked(&mut prefixed, 1024, &cancel, deadline).expect("prefixed");
+        assert_eq!(body, b"ok");
+    }
+
+    #[test]
+    fn truncated_or_oversized_chunked_bodies_fail_closed() {
+        let cancel = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // Truncated stream (no terminating zero chunk) is a failure.
+        let mut truncated: &[u8] = b"4\r\nWiki\r\n";
+        assert_eq!(
+            decode_chunked(&mut truncated, 1024, &cancel, deadline),
+            Err(ProviderError::Permanent)
+        );
+        // Non-hex size line is a failure.
+        let mut garbage: &[u8] = b"zz\r\n";
+        assert_eq!(
+            decode_chunked(&mut garbage, 1024, &cancel, deadline),
+            Err(ProviderError::Permanent)
+        );
+        // Declared size beyond the bound never completes.
+        let huge = format!("{:x}\r\n", 4096).into_bytes();
+        assert_eq!(
+            decode_chunked(&mut huge.as_slice(), 1024, &cancel, deadline),
+            Err(ProviderError::BoundExceeded)
+        );
     }
 }

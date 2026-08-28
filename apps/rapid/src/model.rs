@@ -14,9 +14,9 @@
 //!     plus prior tool results, and typed folding of the provider stream back
 //!     into [`ModelStepOutput`].
 //!
-//! The HTTP transport is plain HTTP/1.1 only; HTTPS is rejected fail-closed
-//! upstream (there is no TLS stack in the workspace), and that constraint is
-//! surfaced as a typed configuration error, never a silent downgrade.
+//! The HTTP transport speaks HTTP/1.1 over plain TCP (local servers) or TLS
+//! (https provider origins, verified against the static Mozilla root set;
+//! there is no custom-CA or dynamic trust surface).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -144,9 +144,9 @@ impl<'store> ConfiguredModel<'store> {
         })?;
         let model = ModelId::parse(&active.entry.model).map_err(|_| ModelConfigError::ModelId {
             model: active.entry.model.clone(),
-            reason: "the canonical layer allows alphanumerics with single '-', '_', '.' \
-                     separators (for an Ollama tag like gpt-oss:20b, alias it first: \
-                     `ollama cp gpt-oss:20b gpt-oss-20b`)"
+            reason: "the canonical layer allows alphanumerics with single '-', '_', '.', '/', \
+                     ':' separators (provider-side ids like vendor/model:tag are carried \
+                     verbatim)"
                 .to_owned(),
         })?;
         // Validate the profile id first: it names both the router profile and
@@ -193,19 +193,6 @@ impl<'store> ConfiguredModel<'store> {
             None => Box::new(Http1Transport::new(NoWireAuth)),
         };
 
-        // Eager scheme pin: the endpoint parsers accept both schemes, but the
-        // transport rejects HTTPS fail-closed at request time. Reject here so
-        // exec fails typed before any turn is attempted.
-        let base_url = active.entry.base_url.trim().to_ascii_lowercase();
-        if base_url.starts_with("https://") {
-            return Err(ModelConfigError::BaseUrl {
-                base_url: active.entry.base_url.clone(),
-                reason: "the transport has no TLS; only plain http:// origins are supported \
-                         (https:// is rejected fail-closed)"
-                    .to_owned(),
-            });
-        }
-
         let backend = match active.entry.provider {
             ConfigProvider::OpenAiCompatible => {
                 let endpoint = OpenAiCompatibleEndpoint::new(
@@ -214,8 +201,8 @@ impl<'store> ConfiguredModel<'store> {
                 )
                 .map_err(|_| ModelConfigError::BaseUrl {
                     base_url: active.entry.base_url.clone(),
-                    reason: "expected a plain http:// origin (the transport has no TLS; \
-                             https:// is rejected fail-closed)"
+                    reason: "expected an http:// or https:// origin without userinfo or \
+                             metadata hosts"
                         .to_owned(),
                 })?;
                 let config = OpenAiCompatibleConfig::new(profile, endpoint, capabilities)
@@ -228,8 +215,8 @@ impl<'store> ConfiguredModel<'store> {
                 let endpoint = AnthropicEndpoint::new(&active.entry.base_url).map_err(|_| {
                     ModelConfigError::BaseUrl {
                         base_url: active.entry.base_url.clone(),
-                        reason: "expected a plain http:// origin (the transport has no TLS; \
-                                 https:// is rejected fail-closed)"
+                        reason: "expected an http:// or https:// origin without userinfo or \
+                                 metadata hosts"
                             .to_owned(),
                     }
                 })?;
@@ -524,7 +511,7 @@ mod tests {
     #[test]
     fn build_rejects_model_ids_outside_the_canonical_alphabet() {
         let store = InMemoryCredentialStore::new();
-        let model_local = active("gpt-oss:20b", "http://127.0.0.1:11434/v1", "local");
+        let model_local = active("gpt 4", "http://127.0.0.1:11434/v1", "local");
         let err = match ConfiguredModel::build(&model_local, &store) {
             Err(err) => err,
             Ok(_) => panic!("expected ModelId rejection"),
@@ -533,8 +520,8 @@ mod tests {
         let rendered = format!("{err}");
         match err {
             ModelConfigError::ModelId { model, reason } => {
-                assert_eq!(model, "gpt-oss:20b");
-                assert!(reason.contains("ollama cp"), "hint missing: {reason}");
+                assert_eq!(model, "gpt 4");
+                assert!(reason.contains("separators"), "hint missing: {reason}");
             }
             other => panic!("expected ModelId error, got {other:?}"),
         }
@@ -542,15 +529,15 @@ mod tests {
     }
 
     #[test]
-    fn build_rejects_https_base_urls_as_typed_configuration_failure() {
+    fn build_accepts_provider_style_model_ids_and_https_origins() {
         let store = InMemoryCredentialStore::new();
-        let model_https = active("test-model", "https://api.example.com/v1", "local");
-        let err = match ConfiguredModel::build(&model_https, &store) {
-            Err(err) => err,
-            Ok(_) => panic!("expected BaseUrl rejection"),
-        };
-        assert!(matches!(err, ModelConfigError::BaseUrl { .. }));
-        assert!(format!("{err}").contains("http://"));
+        // OpenRouter-style vendor/tag id over a TLS origin.
+        let remote = active(
+            "inclusionai/ling-3.0-flash-fin:free",
+            "https://openrouter.ai/api/v1",
+            "openrouter",
+        );
+        ConfiguredModel::build(&remote, &store).expect("remote build");
     }
 
     #[test]

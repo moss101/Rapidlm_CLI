@@ -96,16 +96,16 @@ RAPIDLM_MODEL=gateway rapid exec "summarize the diff"
 These are typed, fail-closed properties of the current transport — surfaced at
 configuration time or as typed provider failures, never silent downgrades:
 
-- **Plain HTTP only.** The workspace has no TLS stack; the HTTP/1.1 transport
-  rejects `https://` (and cloud metadata / link-local targets) fail-closed.
-  Point `base_url` at local or gateway plain-HTTP endpoints.
+- **Transport.** HTTP/1.1 over plain TCP (local/gateway servers) or over TLS
+  for `https://` origins, verified against the static Mozilla root set
+  (rustls; no custom CAs, no dynamic trust store). Cloud metadata /
+  link-local targets stay rejected fail-closed.
 - **Bearer auth only.** Requests carry `Authorization: Bearer <key>` (or no
   auth header token when keyless). The Anthropic path suits gateways that
-  accept bearer auth over plain HTTP.
+  accept bearer auth.
 - **Canonical model id alphabet.** `model` allows alphanumerics with single
-  `-`, `_`, `.` separators. Ollama tags use `:` (e.g. `gpt-oss:20b`); alias
-  the model first (`ollama cp gpt-oss:20b gpt-oss-20b`) and configure the
-  alias.
+  `-`, `_`, `.`, `/`, `:` separators — provider-side ids like
+  `vendor/model:tag` (OpenRouter, Ollama tags) are carried verbatim.
 - **Exec is one turn with no tools.** `rapid exec` runs a single agent turn
   over the live context with no tool schemas advertised; models that answer
   with tool calls produce a typed failure instead of a fabricated completion.
@@ -117,7 +117,7 @@ Configuration and provider failures are typed and exit `1`:
 - `RAPIDLM_CONFIG points at a missing config file: <path>`
 - `config key has the wrong type: model.<id>.max_tokens`
 - `default model 'x' has no [model.x] table; defined models: …`
-- `config base_url '…' is invalid: the transport has no TLS; only plain http:// origins are supported`
+- `config base_url '…' is invalid: expected an http:// or https:// origin without userinfo or metadata hosts`
 - `model configuration error: …` (before any request is sent)
 - `agent turn failed: failed` (provider-side failure after a typed attempt)
 

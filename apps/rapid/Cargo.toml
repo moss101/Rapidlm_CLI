@@ -41,7 +41,7 @@ protocol = { path = "../../crates/protocol" }
 # InMemoryCredentialStore backing the router's fail-closed credential resolver.
 auth = { path = "../../crates/auth" }
 # llm-router: provider adapters (OpenAI-compatible / Anthropic) behind the
-# LiveModelCall bridge; its transport is plain HTTP/1.1 only (no TLS).
+# LiveModelCall bridge; its transport speaks HTTP/1.1 over TCP or rustls TLS.
 llm-router = { path = "../../crates/llm-router" }
 # toml: MIT/Apache-2.0; Grok-style user model config document parsing.
 toml = "0.8"

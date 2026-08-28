@@ -571,8 +571,11 @@ impl ProviderId {
 }
 
 impl ModelId {
+    /// Provider-side model id, sent verbatim in the request body. Accepts
+    /// vendor/tag forms (`vendor/model:tag`) in addition to the canonical
+    /// `-/_.` separators.
     pub fn parse(raw: impl AsRef<str>) -> Result<Self, ProviderError> {
-        parse_token(raw.as_ref(), MAX_MODEL_ID_BYTES, TokenAlphabet::Model).map(Self)
+        parse_token(raw.as_ref(), MAX_MODEL_ID_BYTES, TokenAlphabet::ProviderModel).map(Self)
     }
 
     pub fn as_str(&self) -> &str {
@@ -2293,6 +2296,10 @@ impl<'de> Deserialize<'de> for ModelStreamEvent {
 enum TokenAlphabet {
     Ident,
     Model,
+    /// Provider-side model ids keep their vendor namespace and tag markers
+    /// (`vendor/model:tag`, e.g. OpenRouter). Carried verbatim inside JSON
+    /// bodies; never used as a URL path or header value.
+    ProviderModel,
 }
 
 fn parse_token(
@@ -2312,7 +2319,7 @@ fn parse_token(
     };
     let first_ok = match alphabet {
         TokenAlphabet::Ident => first.is_ascii_lowercase(),
-        TokenAlphabet::Model => first.is_ascii_alphanumeric(),
+        TokenAlphabet::Model | TokenAlphabet::ProviderModel => first.is_ascii_alphanumeric(),
     };
     if !first_ok {
         return Err(ProviderError::InvalidRequest);
@@ -2322,17 +2329,20 @@ fn parse_token(
         let sep = match alphabet {
             TokenAlphabet::Ident => ch == '-',
             TokenAlphabet::Model => matches!(ch, '-' | '_' | '.'),
+            TokenAlphabet::ProviderModel => matches!(ch, '-' | '_' | '.' | '/' | ':'),
         };
         let ok = match alphabet {
             TokenAlphabet::Ident => ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-',
-            TokenAlphabet::Model => ch.is_ascii_alphanumeric() || sep,
+            TokenAlphabet::Model | TokenAlphabet::ProviderModel => {
+                ch.is_ascii_alphanumeric() || sep
+            }
         };
         if !ok || (sep && prev_sep) {
             return Err(ProviderError::InvalidRequest);
         }
         prev_sep = sep;
     }
-    if raw.ends_with('-') || raw.ends_with('.') || raw.ends_with('_') {
+    if raw.ends_with(['-', '_', '.', '/', ':']) {
         return Err(ProviderError::InvalidRequest);
     }
     Ok(raw.to_owned())
@@ -2778,5 +2788,30 @@ mod tests {
     #[test]
     fn zero_catalog_revision_is_rejected() {
         assert_eq!(CatalogRevision::new(0), Err(ProviderError::InvalidRequest));
+    }
+
+    #[test]
+    fn model_ids_accept_vendor_and_tag_separators() {
+        // OpenRouter-style ids ride the wire verbatim inside JSON bodies.
+        ModelId::parse("inclusionai/ling-3.0-flash-fin:free").expect("vendor:tag form");
+        ModelId::parse("meta-llama/llama-3.1-8b-instruct").expect("vendor form");
+        // Separator discipline still holds: no doubles, none trailing.
+        assert_eq!(
+            ModelId::parse("vendor//model"),
+            Err(ProviderError::InvalidRequest)
+        );
+        assert_eq!(
+            ModelId::parse("vendor/model:"),
+            Err(ProviderError::InvalidRequest)
+        );
+        assert_eq!(
+            ModelId::parse("ven od/model"),
+            Err(ProviderError::InvalidRequest)
+        );
+        // Tool names keep the strict alphabet (no vendor/tag separators).
+        assert_eq!(
+            ToolName::parse("read/file"),
+            Err(ProviderError::InvalidRequest)
+        );
     }
 }

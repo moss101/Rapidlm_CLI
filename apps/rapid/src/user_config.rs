@@ -102,7 +102,8 @@ pub struct ModelEntry {
     pub provider: ConfigProvider,
     /// Provider-side model id sent on the wire (e.g. `gpt-4.1`, `llama3.2`).
     pub model: String,
-    /// Plain-HTTP origin for the provider (e.g. `http://127.0.0.1:11434/v1`).
+    /// Provider origin (http for local servers, https for TLS-verified
+    /// remotes; e.g. `http://127.0.0.1:11434/v1`).
     pub base_url: String,
     /// Optional display name (Grok: `name`).
     pub name: Option<String>,

@@ -990,12 +990,9 @@ mod tests {
         ModelRequestId, ProviderId, ReasoningSupport, ToolCall, ToolCallId, ToolName,
         UsageFieldSet,
     };
-    use crate::providers::openai_compatible::{
-        Http1Transport, ProviderHttpResponse, StaticWireAuth,
-    };
+    use crate::providers::openai_compatible::ProviderHttpResponse;
 
     const CANARY: &str = "canary-secret-PLAINTEXT-do-not-leak-9f3c2a";
-    const FIXTURE_TOKEN: &str = "fixture-test-token";
     const REF_ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
     const TRACE: &str = "0193e0f6-6c3a-7d1e-8b2c-4d5e6f708192";
 
@@ -1471,22 +1468,6 @@ mod tests {
             ProviderError::InvalidRequest
         );
         assert!(AnthropicEndpoint::new("https://api.anthropic.com/v1").is_ok());
-        let store = store_with_canary();
-        let transport = Http1Transport::new(StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"));
-        let adapter = AnthropicAdapter::new(
-            AnthropicConfig::new(
-                profile(),
-                AnthropicEndpoint::new("https://api.anthropic.com/v1").expect("https"),
-                caps(false, false),
-            )
-            .expect("cfg"),
-            transport,
-            &store,
-        );
-        let err = adapter
-            .invoke_sync(request(false, false), &live())
-            .expect_err("no tls");
-        assert_eq!(err, ProviderError::InvalidRequest);
     }
 
     #[test]
