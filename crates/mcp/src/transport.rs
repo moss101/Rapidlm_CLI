@@ -240,6 +240,21 @@ pub struct McpSession<T> {
     closed: bool,
 }
 
+/// One tool advertised by a server in `tools/list`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpToolDescriptor {
+    pub name: String,
+    pub description: Option<String>,
+    pub input_schema: Value,
+}
+
+/// Result of `tools/call`: concatenated text content plus the error flag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpToolCallOutput {
+    pub text: String,
+    pub is_error: bool,
+}
+
 /// Typed transport / handshake failure. Display never echoes raw frames/URLs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum TransportError {
@@ -257,6 +272,7 @@ pub enum TransportError {
     CapabilityDenied,
     NotInitialized,
     AlreadyInitialized,
+    ToolFailed,
     Closed,
     RedirectDenied,
     Io,
@@ -880,6 +896,41 @@ impl<T: McpTransport> McpSession<T> {
             .ok_or(TransportError::HandshakeFailed)
     }
 
+    /// List the tools the server advertises (`tools/list`).
+    pub fn tools_list(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<McpToolDescriptor>, TransportError> {
+        check_open(self.closed, cancel)?;
+        if self.handshake.is_none() {
+            return Err(TransportError::NotInitialized);
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        let request = encode_tools_list(id)?;
+        let response = self.transport.call(&request, cancel)?;
+        parse_tools_list_result(&response, id)
+    }
+
+    /// Invoke one server tool (`tools/call`); returns its text content and
+    /// error flag. A JSON-RPC error response maps to [`TransportError::ToolFailed`].
+    pub fn tools_call(
+        &mut self,
+        name: &str,
+        arguments: &Value,
+        cancel: &CancellationToken,
+    ) -> Result<McpToolCallOutput, TransportError> {
+        check_open(self.closed, cancel)?;
+        if self.handshake.is_none() {
+            return Err(TransportError::NotInitialized);
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        let request = encode_tools_call(id, name, arguments)?;
+        let response = self.transport.call(&request, cancel)?;
+        parse_tools_call_result(&response, id)
+    }
+
     pub fn close(&mut self, cancel: &CancellationToken) -> Result<(), TransportError> {
         self.closed = true;
         self.transport.close(cancel)
@@ -940,6 +991,130 @@ fn encode_initialized() -> Result<Vec<u8>, TransportError> {
     );
     body.insert("params".to_owned(), Value::Object(Map::new()));
     encode_json(Value::Object(body))
+}
+
+const TOOLS_LIST_METHOD: &str = "tools/list";
+const TOOLS_CALL_METHOD: &str = "tools/call";
+
+fn encode_tools_list(id: u64) -> Result<Vec<u8>, TransportError> {
+    let mut body = Map::new();
+    body.insert(
+        "jsonrpc".to_owned(),
+        Value::String(JSONRPC_VERSION.to_owned()),
+    );
+    body.insert("id".to_owned(), Value::from(id));
+    body.insert(
+        "method".to_owned(),
+        Value::String(TOOLS_LIST_METHOD.to_owned()),
+    );
+    body.insert("params".to_owned(), Value::Object(Map::new()));
+    encode_json(Value::Object(body))
+}
+
+fn encode_tools_call(id: u64, name: &str, arguments: &Value) -> Result<Vec<u8>, TransportError> {
+    let mut params = Map::new();
+    params.insert("name".to_owned(), Value::String(name.to_owned()));
+    params.insert("arguments".to_owned(), arguments.clone());
+    let mut body = Map::new();
+    body.insert(
+        "jsonrpc".to_owned(),
+        Value::String(JSONRPC_VERSION.to_owned()),
+    );
+    body.insert("id".to_owned(), Value::from(id));
+    body.insert(
+        "method".to_owned(),
+        Value::String(TOOLS_CALL_METHOD.to_owned()),
+    );
+    body.insert("params".to_owned(), Value::Object(params));
+    encode_json(Value::Object(body))
+}
+
+/// Shared JSON-RPC response checks: version, id match, error mapping.
+fn parse_rpc_response(
+    bytes: &[u8],
+    expected_id: u64,
+    error_variant: TransportError,
+) -> Result<Value, TransportError> {
+    let value = parse_json_object(bytes)?;
+    if value.get("jsonrpc").and_then(Value::as_str) != Some(JSONRPC_VERSION) {
+        return Err(TransportError::InvalidFrame);
+    }
+    if value.get("error").is_some() {
+        return Err(error_variant);
+    }
+    let id_ok = match value.get("id") {
+        Some(Value::Number(n)) => n.as_u64() == Some(expected_id),
+        Some(Value::String(s)) => s.parse::<u64>().ok() == Some(expected_id),
+        _ => false,
+    };
+    if !id_ok {
+        return Err(TransportError::InvalidFrame);
+    }
+    value
+        .get("result")
+        .and_then(Value::as_object)
+        .map(|object| Value::Object(object.clone()))
+        .ok_or(error_variant)
+}
+
+fn parse_tools_list_result(
+    bytes: &[u8],
+    expected_id: u64,
+) -> Result<Vec<McpToolDescriptor>, TransportError> {
+    let result = parse_rpc_response(bytes, expected_id, TransportError::InvalidFrame)?;
+    let tools = result
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or(TransportError::InvalidFrame)?;
+    let mut descriptors = Vec::new();
+    for tool in tools {
+        let Some(object) = tool.as_object() else {
+            continue;
+        };
+        let Some(name) = object.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        descriptors.push(McpToolDescriptor {
+            name: name.to_owned(),
+            description: object
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            input_schema: object
+                .get("inputSchema")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Map::new())),
+        });
+    }
+    Ok(descriptors)
+}
+
+fn parse_tools_call_result(
+    bytes: &[u8],
+    expected_id: u64,
+) -> Result<McpToolCallOutput, TransportError> {
+    let result = parse_rpc_response(bytes, expected_id, TransportError::ToolFailed)?;
+    let is_error = result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut text = String::new();
+    if let Some(content) = result.get("content").and_then(Value::as_array) {
+        for part in content {
+            if part.get("type").and_then(Value::as_str) == Some("text")
+                && let Some(piece) = part.get("text").and_then(Value::as_str)
+            {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(piece);
+            }
+        }
+    }
+    Ok(McpToolCallOutput { text, is_error })
 }
 
 fn encode_json(value: Value) -> Result<Vec<u8>, TransportError> {
@@ -1311,7 +1486,8 @@ impl TransportError {
             | Self::HandshakeFailed
             | Self::NotInitialized
             | Self::AlreadyInitialized
-            | Self::Closed => Some(ErrorCode::ToolInvalidArguments),
+            | Self::Closed
+            | Self::ToolFailed => Some(ErrorCode::ToolInvalidArguments),
             Self::Io => Some(ErrorCode::InternalUnexpected),
         }
     }
@@ -1333,6 +1509,7 @@ impl TransportError {
             Self::CapabilityDenied => "MCP remote HTTP requires net.connect",
             Self::NotInitialized => "MCP session is not initialized",
             Self::AlreadyInitialized => "MCP session is already initialized",
+            Self::ToolFailed => "MCP tool call failed on the server",
             Self::Closed => "MCP transport is closed",
             Self::RedirectDenied => "MCP HTTP redirect was denied",
             Self::Io => UNKNOWN_INTERNAL_MESSAGE,
@@ -1376,6 +1553,7 @@ impl fmt::Display for TransportError {
             Self::CapabilityDenied => "MCP remote HTTP requires net.connect",
             Self::NotInitialized => "MCP session is not initialized",
             Self::AlreadyInitialized => "MCP session is already initialized",
+            Self::ToolFailed => "MCP tool call failed on the server",
             Self::Closed => "MCP transport is closed",
             Self::RedirectDenied => "MCP HTTP redirect denied",
             Self::Io => "MCP transport I/O failed",
@@ -1528,6 +1706,111 @@ mod tests {
             ),
             &CancellationToken::new(),
         )
+    }
+
+    #[test]
+    fn tools_list_parses_advertised_descriptors() {
+        let mut transport = LoopbackTransport::new(TransportKind::Stdio, IoBounds::standard());
+        transport.push_inbound(initialize_ok(MCP_PROTOCOL_VERSION)).expect("inbound");
+        let mut session = McpSession::new(
+            transport,
+            ImplementationInfo::rapidlm(),
+            ClientCapabilities::new(true),
+        );
+        session.initialize(&CancellationToken::new()).expect("init");
+        session.transport_mut()
+            .push_inbound(
+                r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[
+                    {"name":"echo","description":"echoes input","inputSchema":{"type":"object"}},
+                    {"name":"noname"},
+                    {"name":"calc","inputSchema":{"type":"object"}}
+                ]}}"#
+                    .as_bytes()
+                    .to_vec(),
+            )
+            .expect("inbound");
+        let tools = session.tools_list(&CancellationToken::new()).expect("list");
+        assert_eq!(tools.len(), 3, "nameless entry skipped, named kept");
+        assert_eq!(tools[0].name, "echo");
+        assert_eq!(tools[0].description.as_deref(), Some("echoes input"));
+        assert_eq!(tools[1].name, "noname", "schema-less entry keeps default schema");
+        assert_eq!(tools[1].input_schema, serde_json::json!({}));
+        assert_eq!(tools[2].name, "calc");
+        assert_eq!(tools[2].description, None);
+        let request = String::from_utf8(session.transport().outbound()[2].clone()).expect("utf8");
+        assert!(request.contains(TOOLS_LIST_METHOD));
+    }
+
+    #[test]
+    fn tools_call_returns_text_content_and_error_flag() {
+        let mut transport = LoopbackTransport::new(TransportKind::Stdio, IoBounds::standard());
+        transport.push_inbound(initialize_ok(MCP_PROTOCOL_VERSION)).expect("inbound");
+        let mut session = McpSession::new(
+            transport,
+            ImplementationInfo::rapidlm(),
+            ClientCapabilities::new(true),
+        );
+        session.initialize(&CancellationToken::new()).expect("init");
+        session.transport_mut()
+            .push_inbound(
+                r#"{"jsonrpc":"2.0","id":2,"result":{"content":[
+                    {"type":"text","text":"part one"},
+                    {"type":"text","text":"part two"}
+                ]}}"#
+                    .as_bytes()
+                    .to_vec(),
+            )
+            .expect("inbound");
+        let output = session
+            .tools_call(
+                "echo",
+                &serde_json::json!({"message": "hi"}),
+                &CancellationToken::new(),
+            )
+            .expect("call");
+        assert_eq!(output.text, "part one\npart two");
+        assert!(!output.is_error);
+        let request = String::from_utf8(session.transport().outbound()[2].clone()).expect("utf8");
+        assert!(request.contains(TOOLS_CALL_METHOD));
+        assert!(request.contains("\"echo\""));
+    }
+
+    #[test]
+    fn tools_call_maps_server_error_to_typed_tool_failed() {
+        let mut transport = LoopbackTransport::new(TransportKind::Stdio, IoBounds::standard());
+        transport.push_inbound(initialize_ok(MCP_PROTOCOL_VERSION)).expect("inbound");
+        let mut session = McpSession::new(
+            transport,
+            ImplementationInfo::rapidlm(),
+            ClientCapabilities::new(true),
+        );
+        session.initialize(&CancellationToken::new()).expect("init");
+        session.transport_mut()
+            .push_inbound(
+                r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"boom"}}"#
+                    .as_bytes()
+                    .to_vec(),
+            )
+            .expect("inbound");
+        assert_eq!(
+            session
+                .tools_call("echo", &serde_json::json!({}), &CancellationToken::new()),
+            Err(TransportError::ToolFailed)
+        );
+    }
+
+    #[test]
+    fn tools_list_before_initialize_is_not_initialized() {
+        let mut transport = LoopbackTransport::new(TransportKind::Stdio, IoBounds::standard());
+        let mut session = McpSession::new(
+            transport,
+            ImplementationInfo::rapidlm(),
+            ClientCapabilities::default(),
+        );
+        assert_eq!(
+            session.tools_list(&CancellationToken::new()),
+            Err(TransportError::NotInitialized)
+        );
     }
 
     #[test]
