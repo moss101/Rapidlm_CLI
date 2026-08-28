@@ -852,6 +852,34 @@ const MAX_WIRED_RULES: usize = crate::permissions::MAX_RULES;
 /// corrupt settings document refuses the run typed rather than silently
 /// dropping its deny rules; a corrupt grants file simply yields no grants
 /// (fail-closed in the permissive direction).
+/// Resolve the permission mode for one exec run: env override > project
+/// settings > Claude-compat `defaultMode` > `default`.
+fn exec_permission_mode() -> Result<crate::permissions::PermissionMode, String> {
+    use crate::permissions::{PermissionMode, parse_settings};
+    if let Ok(raw) = std::env::var(PERMISSION_MODE_ENV)
+        && !raw.is_empty()
+    {
+        return PermissionMode::parse(&raw).ok_or_else(|| {
+            format!(
+                "{PERMISSION_MODE_ENV} must be one of: {}",
+                crate::permissions::MODE_NAMES.join(", ")
+            )
+        });
+    }
+    for file_name in PROJECT_SETTINGS_FILES {
+        let Ok(text) = fs::read_to_string(file_name) else {
+            continue;
+        };
+        let settings = parse_settings(&text).map_err(|err| {
+            format!("{} could not be loaded: {}", file_name, err.as_str())
+        })?;
+        if let Some(mode) = settings.mode {
+            return Ok(mode);
+        }
+    }
+    Ok(PermissionMode::Default)
+}
+
 fn exec_permission_lattice(
     canonical_root: Option<&Path>,
 ) -> Result<crate::permissions::PermissionLattice, String> {
@@ -859,17 +887,7 @@ fn exec_permission_lattice(
         PermissionLattice, PermissionMode, ProjectSettings, ToolPattern, parse_grants,
         parse_settings,
     };
-    let mut mode: Option<PermissionMode> = None;
-    if let Ok(raw) = std::env::var(PERMISSION_MODE_ENV)
-        && !raw.is_empty()
-    {
-        mode = Some(PermissionMode::parse(&raw).ok_or_else(|| {
-            format!(
-                "{PERMISSION_MODE_ENV} must be one of: {}",
-                crate::permissions::MODE_NAMES.join(", ")
-            )
-        })?);
-    }
+    let mut mode: Option<PermissionMode> = exec_permission_mode().ok();
     let mut rules: Vec<crate::permissions::ToolRule> = Vec::new();
     let mut loaded_settings: Vec<ProjectSettings> = Vec::new();
     for file_name in PROJECT_SETTINGS_FILES {
@@ -907,6 +925,72 @@ fn exec_permission_lattice(
         }
     }
     Ok(lattice)
+}
+
+/// Runs child agents for `task_spawn`: builds a fresh model adapter from the
+/// same user config and a depth-restricted tool surface (children never get
+/// the spawn tool, so the depth limit is structural). explore/plan scopes are
+/// read-only.
+struct LiveSubagentRunner {
+    active: crate::user_config::ActiveModel,
+    root: PathBuf,
+    mode: crate::permissions::PermissionMode,
+}
+
+impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
+    fn run(&self, prompt: &str, agent_type: &str) -> Result<String, String> {
+        use crate::exec_tools::ExecTools;
+        let store = auth::InMemoryCredentialStore::new();
+        let model = crate::model::ConfiguredModel::build(&self.active, &store)
+            .map_err(|err| err.to_string())?;
+        let mut tools = if agent_type == "explore" || agent_type == "plan" {
+            ExecTools::read_only(&self.root)
+        } else {
+            ExecTools::workspace_with_permissions(
+                &self.root,
+                crate::permissions::PermissionLattice::new(self.mode),
+            )
+        }
+        .map_err(|err| err.to_string())?;
+        let preserved = PreservedLiveContext::new(
+            prompt,
+            Vec::new(),
+            String::new(),
+            String::new(),
+            8192,
+            256,
+        )
+        .map_err(|_| "child context rejected".to_owned())?;
+        let spec = AgentSpec::builder(
+            protocol::AgentId::new(),
+            AgentRole::Coder,
+            prompt.to_owned(),
+            protocol::WorkspaceViewId::new(),
+        )
+        .permissions_profile("subagent")
+        .build()
+        .map_err(|_| "child spec rejected".to_owned())?;
+        let request = AgentExecutionRequest::new(spec, protocol::SessionId::new());
+        let mut events = Vec::new();
+        let outcome = run_live_exec(
+            preserved,
+            model,
+            &request,
+            &mut tools,
+            &mut events,
+            &agent_runtime::CancellationToken::new(),
+            ContextRetryPolicy::default(),
+            None,
+        )
+        .map_err(|err| err.to_string())?;
+        if outcome.result.status() != AgentTerminalStatus::Succeeded {
+            return Err(format!(
+                "subagent turn {}",
+                outcome.result.status().as_str()
+            ));
+        }
+        Ok(outcome.result.summary().to_owned())
+    }
 }
 
 /// Discover project instructions (AGENTS.md convention + `.claude`/`.cursor`
@@ -994,6 +1078,11 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
             })
             .unwrap_or_default(),
     ));
+    // Memory index: .rapidlm/MEMORY.md is always loaded (bounded, advisory).
+    let memory_index = workspace
+        .as_ref()
+        .and_then(|(root, _)| crate::host::load_memory_index(root));
+    let preserved = preserved.with_memory_index(memory_index);
     // Reminder feeds: load the project roster if present and admit the
     // always-on feeds (the CLI host grants no capabilities, so feeds gated
     // on a capability stay inactive). A broken roster warns and the turn
@@ -1044,12 +1133,14 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
     // The store outlives the model, which borrows it for the router resolver.
     let credential_store = auth::InMemoryCredentialStore::new();
     let mut base_url = String::from("unconfigured");
+    let mut child_model_config: Option<crate::user_config::ActiveModel> = None;
     let backing = match crate::user_config::select_from_process_env_gated() {
         Ok(ModelSelection::Configured { active, warnings }) => {
             for warning in warnings {
                 eprintln!("warning: {warning}");
             }
             base_url = active.entry.base_url.clone();
+            child_model_config = Some(active.as_ref().clone());
             match ConfiguredModel::build(
                 &apply_reminder_floor(*active, reminder_floor),
                 &credential_store,
@@ -1070,6 +1161,19 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
             return Ok(1);
         }
     };
+    // Subagents: with a configured model, task_spawn runs child agents with
+    // the same provider config and a depth-restricted read-only-capable tool
+    // surface. Memory index: .rapidlm/MEMORY.md is always loaded (bounded).
+    if let (Some(active), Some((root, TrustStatus::Trusted))) =
+        (child_model_config.as_ref(), workspace.as_ref())
+    {
+        let mode = exec_permission_mode().unwrap_or(crate::permissions::PermissionMode::Default);
+        tools.set_subagent_runner(std::sync::Arc::new(LiveSubagentRunner {
+            active: active.clone(),
+            root: root.clone(),
+            mode,
+        }));
+    }
     let diag = parsed.verbose.then(|| StepDiag::stderr(&base_url));
     match run_live_exec(
         preserved,

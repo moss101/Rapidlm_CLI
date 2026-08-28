@@ -15,6 +15,8 @@
 //! tool effects (the executor's recovery loop fails closed when `tool_calls > 0`).
 
 use std::cell::RefCell;
+use std::fs;
+use std::path::Path;
 use std::rc::Rc;
 
 use agent_runtime::{
@@ -41,6 +43,10 @@ pub const MAX_CRITERION_BYTES: usize = 4 * 1024;
 pub const MAX_RULES_BYTES: usize = 32 * 1024;
 /// Byte cap for the rendered system-prompt block.
 pub const MAX_SYSTEM_PROMPT_BLOCK_BYTES: usize = 32 * 1024;
+/// Always-loaded memory index bounds (Claude MEMORY.md parity: 200 lines /
+/// 25 KB).
+pub const MAX_MEMORY_INDEX_LINES: usize = 200;
+pub const MAX_MEMORY_INDEX_BYTES: usize = 25 * 1024;
 /// Byte cap for composed selected-skills text.
 pub const MAX_SKILLS_BYTES: usize = 16 * 1024;
 /// Maximum retained evidence ids.
@@ -88,6 +94,7 @@ pub struct PreservedLiveContext {
     output_reserve: u32,
     reminders_block: Option<String>,
     system_prompt: Option<String>,
+    memory_index: Option<String>,
 }
 
 impl PreservedLiveContext {
@@ -126,7 +133,23 @@ impl PreservedLiveContext {
             output_reserve,
             reminders_block: None,
             system_prompt: None,
+            memory_index: None,
         })
+    }
+
+    /// Attach the always-loaded memory index (`.rapidlm/MEMORY.md`).
+    pub fn with_memory_index(mut self, memory: Option<String>) -> Self {
+        let within_bounds = memory.as_ref().is_none_or(|text| {
+            !text.is_empty() && text.len() <= MAX_MEMORY_INDEX_BYTES
+        });
+        if within_bounds {
+            self.memory_index = memory;
+        }
+        self
+    }
+
+    pub fn memory_index(&self) -> Option<&str> {
+        self.memory_index.as_deref()
     }
 
     /// Attach the rendered dynamic system prompt for this turn. Empty or
@@ -559,8 +582,6 @@ impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
         // Connection and transient failures are retryable for a model step: a
         // step that failed committed no tool effects, so re-invoking is safe
         // (bounded retry ceiling).
-        let retryable =
-            |cause: &FailureCause| matches!(cause, FailureCause::Transient { .. } | FailureCause::Connection);
         let mut attempt: u32 = 0;
         loop {
             let result = self.inner.step(blocks, input, cancel);
@@ -682,6 +703,25 @@ where
     })
 }
 
+/// Load the project memory index (`.rapidlm/MEMORY.md`): a bounded,
+/// always-loaded pointer file the model can rely on (Claude MEMORY.md
+/// parity). Missing file → None; oversized content is truncated to the line
+/// and byte bounds rather than dropped entirely.
+pub fn load_memory_index(root: &Path) -> Option<String> {
+    let path = root.join(".rapidlm").join("MEMORY.md");
+    let text = fs::read_to_string(path).ok()?;
+    let mut bounded: Vec<&str> = text.lines().take(MAX_MEMORY_INDEX_LINES).collect();
+    let mut size = bounded.iter().map(|line| line.len() + 1).sum::<usize>();
+    while size > MAX_MEMORY_INDEX_BYTES && !bounded.is_empty() {
+        size -= bounded.last().map(|line| line.len() + 1).unwrap_or(0);
+        bounded.pop();
+    }
+    if bounded.is_empty() {
+        return None;
+    }
+    Some(bounded.join("\n"))
+}
+
 /// Compile a live [`ContextPacket`] from preserved state + optional compaction
 /// summary. This is the single Context-Fabric rebuild path.
 pub fn build_packet(
@@ -695,6 +735,12 @@ pub fn build_packet(
         ctx = ctx.system(CompileInput::new(
             "system/prompt",
             system_prompt.to_owned(),
+        ));
+    }
+    if let Some(memory) = preserved.memory_index() {
+        ctx = ctx.system(CompileInput::new(
+            "memory/index",
+            memory.to_owned(),
         ));
     }
     if !preserved.agents_rules.is_empty() {

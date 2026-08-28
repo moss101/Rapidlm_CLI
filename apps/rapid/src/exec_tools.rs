@@ -13,7 +13,11 @@
 //! result, never a silent pass.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agent_runtime::{
@@ -47,6 +51,35 @@ pub const MAX_TODO_CONTENT_BYTES: usize = 512;
 pub const MAX_TODOS: usize = 50;
 /// Workspace-relative path of the persisted task list.
 pub const TODOS_PATH: &str = ".rapidlm/todos.json";
+/// Tool name for entering plan mode (Claude `EnterPlanMode` parity).
+pub const PLAN_ENTER_TOOL: &str = "plan_enter";
+/// Tool name for exiting plan mode with the written plan (Claude `ExitPlanMode`).
+pub const PLAN_EXIT_TOOL: &str = "plan_exit";
+/// Tool name for spawning a subagent (Claude `Agent`/`Task` parity).
+pub const TASK_SPAWN_TOOL: &str = "task_spawn";
+/// Tool name for background job status (Claude `TaskOutput`/`TaskStop` parity).
+pub const JOB_STATUS_TOOL: &str = "job_status";
+/// Tool name for reading background job output.
+pub const JOB_OUTPUT_TOOL: &str = "job_output";
+/// Workspace-relative path of the plan file (the only writable file in plan
+/// mode — Claude's plan-file carve-out).
+pub const PLAN_PATH: &str = ".rapidlm/plan.md";
+/// Maximum live background jobs per run.
+pub const MAX_BACKGROUND_JOBS: usize = 16;
+/// Poll interval for background job supervision.
+pub const JOB_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Hard byte cap on one background job's spooled output.
+pub const MAX_JOB_OUTPUT_BYTES: usize = 64 * 1024;
+/// Default wall-clock budget for one background job.
+pub const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(600);
+/// Hard byte cap on one subagent prompt.
+pub const MAX_SPAWN_PROMPT_BYTES: usize = 16 * 1024;
+/// Hard byte cap on one subagent's returned report.
+pub const MAX_SUBAGENT_REPORT_BYTES: usize = 16 * 1024;
+/// Hard byte cap for the plan file.
+pub const MAX_PLAN_BYTES: usize = 16 * 1024;
+/// Adopted subagent types (the names both reference CLIs standardized on).
+pub const AGENT_TYPES: &[&str] = &["general-purpose", "explore", "plan"];
 /// Hard byte cap on one tool call's JSON arguments.
 pub const MAX_TOOL_ARGUMENTS_BYTES: usize = 8 * 1024;
 /// Hard byte cap on a relative workspace path.
@@ -108,11 +141,304 @@ impl std::fmt::Display for ToolSetupError {
     }
 }
 
+/// A background command: a spooled output buffer, a cancel flag the owner
+/// sets on shutdown, and the terminal state. All shared state sits behind
+/// mutexes/atomics so the supervising thread and tool calls never block each
+/// other for long.
+#[derive(Clone)]
+struct JobShared {
+    cancelled: Arc<AtomicBool>,
+    output: Arc<Mutex<Vec<u8>>>,
+    overflow: Arc<AtomicBool>,
+    state: Arc<Mutex<JobState>>,
+    child: Arc<Mutex<Option<std::process::Child>>>,
+}
+
+enum JobState {
+    Running,
+    Completed(i32),
+    Failed(String),
+}
+
+impl JobState {
+    fn as_text(&self) -> String {
+        match self {
+            Self::Running => "running".to_owned(),
+            Self::Completed(code) => format!("completed exit {code}"),
+            Self::Failed(reason) => format!("failed: {reason}"),
+        }
+    }
+}
+
+/// Registry of background commands started by `shell.exec` with
+/// `background: true`. Children are killed when the registry drops, so no
+/// command outlives the CLI run.
+#[derive(Clone, Default)]
+pub struct JobRegistry {
+    jobs: Arc<Mutex<BTreeMap<String, JobShared>>>,
+    seq: Arc<AtomicU64>,
+}
+
+impl JobRegistry {
+    /// Start `argv` in `cwd` as a detached supervised job; returns its id.
+    /// The supervisor thread enforces the timeout, honors cancellation, spools
+    /// combined output up to [`MAX_JOB_OUTPUT_BYTES`], and records the exit.
+    fn start(
+        &self,
+        argv: &[String],
+        cwd: &Path,
+        timeout: Duration,
+    ) -> Result<String, ToolStepError> {
+        {
+            let jobs = self.jobs.lock().map_err(|_| ToolStepError::Failed)?;
+            let live = jobs
+                .values()
+                .filter(|job| {
+                    job.state
+                        .lock()
+                        .map(|state| matches!(*state, JobState::Running))
+                        .unwrap_or(false)
+                })
+                .count();
+            if live >= MAX_BACKGROUND_JOBS {
+                return Err(ToolStepError::Failed);
+            }
+        }
+        let id = format!("job-{}", self.seq.fetch_add(1, Ordering::SeqCst) + 1);
+        let shared = JobShared {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            output: Arc::new(Mutex::new(Vec::new())),
+            overflow: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(Mutex::new(JobState::Running)),
+            child: Arc::new(Mutex::new(None)),
+        };
+        self.jobs
+            .lock()
+            .map_err(|_| ToolStepError::Failed)?
+            .insert(id.clone(), shared.clone());
+
+        // Everything the supervisor touches is owned and 'static: the job
+        // must outlive the tool call (and even a batch dispatch thread).
+        let program = argv[0].clone();
+        let rest: Vec<String> = argv[1..].to_vec();
+        let dir = cwd.to_path_buf();
+        let env_pairs: Vec<(String, String)> = ["PATH", "HOME", "LANG", "TMPDIR"]
+            .iter()
+            .filter_map(|key| {
+                std::env::var(key)
+                    .ok()
+                    .map(|value| ((*key).to_owned(), value))
+            })
+            .collect();
+        let worker = shared.clone();
+        let spawned = std::thread::Builder::new()
+            .name("rapidlm-job".to_owned())
+            .spawn(move || {
+                let started = Instant::now();
+                // Spawn under the child lock (scoped: the guard must drop
+                // before the loop re-locks to publish the child).
+                let spawned_child = {
+                    let mut slot = worker.child.lock().ok();
+                    slot.as_mut().and_then(|_slot| {
+                        let mut command = std::process::Command::new(&program);
+                        command
+                            .args(&rest)
+                            .current_dir(&dir)
+                            .env_clear()
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::piped());
+                        for (key, value) in &env_pairs {
+                            let _ = command.env(key, value);
+                        }
+                        command.spawn().ok()
+                    })
+                };
+                let mut child = match spawned_child {
+                    Some(child) => child,
+                    None => {
+                        if let Ok(mut state) = worker.state.lock() {
+                            *state = JobState::Failed("spawn failed".to_owned());
+                        }
+                        return;
+                    }
+                };
+                // Take the pipes first, then publish the child so kill-all and
+                // the supervision loop can see it.
+                let pipes: Vec<Box<dyn Read + Send>> = vec![
+                    Box::new(child.stdout.take().expect("stdout piped")),
+                    Box::new(child.stderr.take().expect("stderr piped")),
+                ];
+                if let Ok(mut slot) = worker.child.lock() {
+                    *slot = Some(child);
+                }
+                let mut readers = Vec::new();
+                for pipe in pipes {
+                    let output = Arc::clone(&worker.output);
+                    let overflow = Arc::clone(&worker.overflow);
+                    readers.push(std::thread::spawn(move || {
+                        let mut pipe = pipe;
+                        let mut chunk = [0u8; 2048];
+                        loop {
+                            match pipe.read(&mut chunk) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    let Ok(mut spool) = output.lock() else {
+                                        return;
+                                    };
+                                    if spool.len() >= MAX_JOB_OUTPUT_BYTES {
+                                        overflow.store(true, Ordering::SeqCst);
+                                        return;
+                                    }
+                                    let take = n.min(MAX_JOB_OUTPUT_BYTES - spool.len());
+                                    spool.extend_from_slice(&chunk[..take]);
+                                    if take < n {
+                                        overflow.store(true, Ordering::SeqCst);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }));
+                }
+                // Supervise: exit, cancellation, or timeout — whichever first.
+                loop {
+                    // Scope the lock guard: try_wait borrows the slot.
+                    let done = {
+                        let mut slot = worker.child.lock().ok();
+                        slot.as_mut()
+                            .and_then(|child| child.as_mut())
+                            .and_then(|child| child.try_wait().ok())
+                            .flatten()
+                    };
+                    if let Some(status) = done {
+                        if let Ok(mut state) = worker.state.lock() {
+                            *state = JobState::Completed(status.code().unwrap_or(-1));
+                        }
+                        break;
+                    }
+                    if worker.cancelled.load(Ordering::SeqCst) {
+                        if let Ok(mut slot) = worker.child.lock() {
+                            if let Some(child) = slot.as_mut() {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                            }
+                        }
+                        if let Ok(mut state) = worker.state.lock() {
+                            *state = JobState::Failed("cancelled at shutdown".to_owned());
+                        }
+                        break;
+                    }
+                    if started.elapsed() > timeout {
+                        if let Ok(mut slot) = worker.child.lock() {
+                            if let Some(child) = slot.as_mut() {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                            }
+                        }
+                        if let Ok(mut state) = worker.state.lock() {
+                            *state = JobState::Failed("timed out".to_owned());
+                        }
+                        break;
+                    }
+                    std::thread::sleep(JOB_POLL_INTERVAL);
+                }
+                for reader in readers {
+                    let _ = reader.join();
+                }
+            });
+        if spawned.is_err() {
+            // The supervisor thread could not start; retract the job.
+            if let Ok(mut jobs) = self.jobs.lock() {
+                jobs.remove(&id);
+            }
+            return Err(ToolStepError::Failed);
+        }
+        self.prune();
+        Ok(id)
+    }
+
+    fn snapshot(&self, id: &str) -> Option<String> {
+        let jobs = self.jobs.lock().ok()?;
+        jobs.get(id)
+            .map(|job| job.state.lock().ok().map(|state| state.as_text()))
+            .flatten()
+    }
+
+    /// Bounded slice of spooled output starting at `offset`; returns the text,
+    /// whether the job is finished, and the next offset to read from.
+    fn output(&self, id: &str, offset: usize) -> Option<(String, bool, usize, String)> {
+        let jobs = self.jobs.lock().ok()?;
+        let job = jobs.get(id)?;
+        let buffer = job.output.lock().ok()?;
+        let start = offset.min(buffer.len());
+        let end = (start + MAX_SHELL_OUTPUT_BYTES).min(buffer.len());
+        let text = String::from_utf8_lossy(&buffer[start..end]).into_owned();
+        let next = start + (end - start);
+        let state = job.state.lock().ok()?;
+        let done = !matches!(*state, JobState::Running);
+        Some((text, done, next, state.as_text()))
+    }
+
+    fn kill_all(&self) {
+        let Ok(jobs) = self.jobs.lock() else {
+            return;
+        };
+        for job in jobs.values() {
+            job.cancelled.store(true, Ordering::SeqCst);
+            if let Ok(mut child) = job.child.try_lock() {
+                if let Some(child) = child.as_mut() {
+                    let _ = child.kill();
+                }
+            }
+        }
+    }
+
+    /// Retain only live jobs once finished ones exceed the registry bound.
+    fn prune(&self) {
+        let Ok(mut jobs) = self.jobs.lock() else {
+            return;
+        };
+        let finished: Vec<String> = jobs
+            .iter()
+            .filter(|(_, job)| {
+                job.state
+                    .lock()
+                    .map(|state| !matches!(*state, JobState::Running))
+                    .unwrap_or(false)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let excess = jobs.len().saturating_sub(MAX_BACKGROUND_JOBS);
+        for id in finished.into_iter().take(excess) {
+            jobs.remove(&id);
+        }
+    }
+}
+
+impl Drop for JobRegistry {
+    fn drop(&mut self) {
+        self.kill_all();
+    }
+}
+
+/// Subagent execution seam: `task_spawn` hands the prompt to this runner,
+/// which owns the child model and a depth-restricted tool surface. Adopted
+/// from the reference CLIs: types are general-purpose | explore | plan, and
+/// children never get the spawn tool (depth limit 1).
+pub trait SubagentRunner: Send + Sync {
+    fn run(&self, prompt: &str, agent_type: &str) -> Result<String, String>;
+}
+
 /// Bounded tools rooted at one canonical workspace directory, with the
 /// permission lattice that gates every call.
 pub struct WorkspaceTools {
     root: PathBuf,
     permissions: PermissionLattice,
+    jobs: JobRegistry,
+    plan_mode: Arc<AtomicBool>,
+    read_only: bool,
+    subagents: Option<Arc<dyn SubagentRunner>>,
 }
 
 impl WorkspaceTools {
@@ -131,7 +457,28 @@ impl WorkspaceTools {
             return Err(ToolSetupError::RootNotADirectory);
         }
         let root = root.canonicalize().map_err(|_| ToolSetupError::RootUnresolvable)?;
-        Ok(Self { root, permissions })
+        Ok(Self {
+            root,
+            permissions,
+            jobs: JobRegistry::default(),
+            plan_mode: Arc::new(AtomicBool::new(false)),
+            read_only: false,
+            subagents: None,
+        })
+    }
+
+    /// Read-only driver for subagent explore/plan scopes: write-classified
+    /// tools are not advertised and any write attempt is refused.
+    pub fn open_read_only(root: &Path) -> Result<Self, ToolSetupError> {
+        let mut tools = Self::open(root)?;
+        tools.read_only = true;
+        Ok(tools)
+    }
+
+    /// Attach the subagent runner (composition root only; children are built
+    /// without one, which enforces the depth limit structurally).
+    pub fn set_subagent_runner(&mut self, runner: Arc<dyn SubagentRunner>) {
+        self.subagents = Some(runner);
     }
 
     fn root(&self) -> &Path {
@@ -157,23 +504,40 @@ impl WorkspaceTools {
     /// file tools, the joined argv for `shell_exec`.
     fn rule_subject(tool: &str, arguments: &str) -> Option<String> {
         match tool {
-            WORKSPACE_WRITE_TOOL | WORKSPACE_READ_TOOL | REPO_READ_TOOL => {
-                parse_path_argument(arguments)
-            }
+            WORKSPACE_WRITE_TOOL => parse_write_args(arguments).ok().map(|args| args.path),
+            WORKSPACE_READ_TOOL | REPO_READ_TOOL => parse_path_argument(arguments),
             WORKSPACE_PATCH_TOOL => parse_patch_args(arguments).ok().map(|args| args.path),
             SHELL_EXEC_TOOL => parse_shell_args(arguments).ok().map(|args| args.argv.join(" ")),
             REPO_GLOB_TOOL => parse_repo_glob_args(arguments).ok().map(|args| args.pattern),
             TODO_WRITE_TOOL => Some(TODOS_PATH.to_owned()),
+            PLAN_ENTER_TOOL => Some(PLAN_ENTER_TOOL.to_owned()),
+            PLAN_EXIT_TOOL => Some(PLAN_EXIT_TOOL.to_owned()),
+            TASK_SPAWN_TOOL => Some(TASK_SPAWN_TOOL.to_owned()),
             _ => None,
         }
     }
 
     /// Permission decision for one validated call. Total: every call of a
-    /// known tool gets a decision.
+    /// known tool gets a decision. While plan mode is active the decision is
+    /// additionally gated: only read-only calls and writes to the plan file
+    /// pass (Claude's plan-file carve-out).
     fn permission_for(&self, call: &ValidatedToolCall) -> Decision {
         let subject =
             Self::rule_subject(call.tool(), call.arguments()).unwrap_or_default();
-        self.permissions.evaluate(call.tool(), &subject, tool_class(call.tool()))
+        let decision = self
+            .permissions
+            .evaluate(call.tool(), &subject, tool_class(call.tool()));
+        if !decision.is_allowed() {
+            return decision;
+        }
+        if self.plan_mode.load(Ordering::SeqCst)
+            && tool_class(call.tool()) != ToolClass::ReadOnly
+            && !matches!(call.tool(), PLAN_ENTER_TOOL | PLAN_EXIT_TOOL)
+            && subject != PLAN_PATH
+        {
+            return Decision::Deny(crate::permissions::DecisionReason::PlanModeDeny);
+        }
+        decision
     }
 
     /// Execute one validated call against the workspace. Inherent `&self` so
@@ -209,6 +573,14 @@ impl WorkspaceTools {
                 ))),
             });
         }
+        if self.read_only && tool_kind(call.tool()) == ToolKind::Write {
+            return Ok(ToolStepResult::Denied {
+                call_id: call.call_id().to_owned(),
+                detail: Some(bounded_detail(
+                    "this subagent scope is read-only; write tools are unavailable",
+                )),
+            });
+        }
         let arguments_parseable = match call.tool() {
             WORKSPACE_WRITE_TOOL => parse_write_args(call.arguments()).is_ok(),
             WORKSPACE_READ_TOOL => parse_path_argument(call.arguments()).is_some(),
@@ -218,6 +590,10 @@ impl WorkspaceTools {
             SHELL_EXEC_TOOL => parse_shell_args(call.arguments()).is_ok(),
             REPO_GLOB_TOOL => parse_repo_glob_args(call.arguments()).is_ok(),
             TODO_WRITE_TOOL => parse_todo_args(call.arguments()).is_ok(),
+            PLAN_ENTER_TOOL | PLAN_EXIT_TOOL => parse_empty_args(call.arguments()).is_ok(),
+            JOB_STATUS_TOOL => parse_job_id_args(call.arguments(), false).is_ok(),
+            JOB_OUTPUT_TOOL => parse_job_id_args(call.arguments(), true).is_ok(),
+            TASK_SPAWN_TOOL => parse_task_args(call.arguments()).is_ok(),
             _ => return Err(ToolStepError::Invalid),
         };
         if !arguments_parseable {
@@ -239,6 +615,11 @@ impl WorkspaceTools {
             SHELL_EXEC_TOOL => self.execute_shell(call, cancel),
             REPO_GLOB_TOOL => self.execute_repo_glob(call, cancel),
             TODO_WRITE_TOOL => self.execute_todo_write(call, cancel),
+            PLAN_ENTER_TOOL => self.execute_plan_enter(call, cancel),
+            PLAN_EXIT_TOOL => self.execute_plan_exit(call, cancel),
+            JOB_STATUS_TOOL => self.execute_job_status(call, cancel),
+            JOB_OUTPUT_TOOL => self.execute_job_output(call, cancel),
+            TASK_SPAWN_TOOL => self.execute_task_spawn(call, cancel),
             _ => Err(ToolStepError::Invalid),
         }
     }
@@ -470,6 +851,17 @@ impl WorkspaceTools {
         cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_shell_args(call.arguments())?;
+        if args.background {
+            let job_id = self.jobs.start(&args.argv, self.root(), args.timeout)?;
+            return Ok(ToolStepResult::Succeeded {
+                call_id: call.call_id().to_owned(),
+                summary: format!(
+                    "started background job {job_id}: {} (timeout {}s); poll with job_status / read with job_output",
+                    args.argv.join(" "),
+                    args.timeout.as_secs()
+                ),
+            });
+        }
         let mut command = std::process::Command::new(&args.argv[0]);
         command
             .args(&args.argv[1..])
@@ -685,6 +1077,157 @@ impl WorkspaceTools {
             .collect()
     }
 
+    /// `plan_enter`: activate read-only enforcement with the plan-file
+    /// carve-out (Claude `EnterPlanMode` parity).
+    fn execute_plan_enter(
+        &self,
+        call: &ValidatedToolCall,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        self.plan_mode.store(true, Ordering::SeqCst);
+        Ok(ToolStepResult::Succeeded {
+            call_id: call.call_id().to_owned(),
+            summary: format!(
+                "Plan mode active: only read-only calls and writes to {PLAN_PATH} are                  allowed. Research, write the plan to {PLAN_PATH}, then call plan_exit."
+            ),
+        })
+    }
+
+    /// `plan_exit`: present the written plan and leave plan mode (Claude
+    /// `ExitPlanMode` parity — the plan is read from disk, not from memory).
+    fn execute_plan_exit(
+        &self,
+        call: &ValidatedToolCall,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        if !self.plan_mode.load(Ordering::SeqCst) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail("plan mode is not active")),
+            });
+        }
+        let target = self.resolve_in_root(PLAN_PATH)?;
+        let bytes = match fs::read(&target) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&format!(
+                        "write the plan to {PLAN_PATH} with workspace_write before plan_exit"
+                    ))),
+                })
+            }
+            Err(_) => return Err(ToolStepError::Failed),
+        };
+        if bytes.is_empty() {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail("the plan file is empty")),
+            });
+        }
+        self.plan_mode.store(false, Ordering::SeqCst);
+        let text = String::from_utf8_lossy(&bytes);
+        let excerpt: String = text.chars().take(400).collect();
+        Ok(ToolStepResult::Succeeded {
+            call_id: call.call_id().to_owned(),
+            summary: format!(
+                "Plan accepted ({} bytes). Plan mode off.\n--- plan ---\n{excerpt}",
+                bytes.len()
+            ),
+        })
+    }
+
+    /// `job_status`: background job state without reading its output.
+    fn execute_job_status(
+        &self,
+        call: &ValidatedToolCall,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        let args = parse_job_id_args(call.arguments(), false)?;
+        match self.jobs.snapshot(&args.job_id) {
+            Some(state) => Ok(ToolStepResult::Succeeded {
+                call_id: call.call_id().to_owned(),
+                summary: format!("{}: {state}", args.job_id),
+            }),
+            None => Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "{}: unknown job id",
+                    args.job_id
+                ))),
+            }),
+        }
+    }
+
+    /// `job_output`: bounded window into a background job's spooled output.
+    fn execute_job_output(
+        &self,
+        call: &ValidatedToolCall,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        let args = parse_job_id_args(call.arguments(), true)?;
+        let offset = args.offset.unwrap_or(0);
+        let Some((text, done, next, state)) = self.jobs.output(&args.job_id, offset) else {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "{}: unknown job id",
+                    args.job_id
+                ))),
+            });
+        };
+        let mut summary = text;
+        if done {
+            summary.push_str(&format!("\n[job finished: {state}]"));
+        } else {
+            summary.push_str(&format!("\n[job {state}; continue at offset {next}]"));
+        }
+        Ok(ToolStepResult::Succeeded {
+            call_id: call.call_id().to_owned(),
+            summary,
+        })
+    }
+
+    /// `task_spawn`: run a subagent (depth 1) and return its final report.
+    fn execute_task_spawn(
+        &self,
+        call: &ValidatedToolCall,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        let args = parse_task_args(call.arguments())?;
+        let Some(runner) = self.subagents.as_ref() else {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(
+                    "subagents are not available in this run",
+                )),
+            });
+        };
+        match runner.run(&args.prompt, &args.agent_type) {
+            Ok(report) => {
+                let report = bounded_text(report.as_bytes(), MAX_SUBAGENT_REPORT_BYTES);
+                Ok(ToolStepResult::Succeeded {
+                    call_id: call.call_id().to_owned(),
+                    summary: format!("subagent ({}) report:\n{}", args.agent_type, report),
+                })
+            }
+            Err(reason) => Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "subagent ({}) failed: {reason}",
+                    args.agent_type
+                ))),
+            }),
+        }
+    }
+
     /// Group key for write-class calls: same key ⇒ serialized in proposal
     /// order. All `shell_exec` calls share one key (a process may touch any
     /// path); file writes serialize per resolved relative path.
@@ -705,16 +1248,16 @@ impl WorkspaceTools {
 /// run concurrently with everything; writes serialize per target.
 pub fn tool_kind(tool: &str) -> ToolKind {
     match tool {
-        WORKSPACE_READ_TOOL | REPO_READ_TOOL | REPO_SEARCH_TOOL | REPO_GLOB_TOOL => {
-            ToolKind::Read
-        }
+        WORKSPACE_READ_TOOL | REPO_READ_TOOL | REPO_SEARCH_TOOL | REPO_GLOB_TOOL
+        | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL => ToolKind::Read,
         _ => ToolKind::Write,
     }
 }
 
 fn tool_class(tool: &str) -> ToolClass {
     match tool {
-        WORKSPACE_READ_TOOL | REPO_READ_TOOL | REPO_SEARCH_TOOL | REPO_GLOB_TOOL => {
+        WORKSPACE_READ_TOOL | REPO_READ_TOOL | REPO_SEARCH_TOOL | REPO_GLOB_TOOL
+        | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL | PLAN_ENTER_TOOL | PLAN_EXIT_TOOL => {
             ToolClass::ReadOnly
         }
         WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL | TODO_WRITE_TOOL => ToolClass::FileEdit,
@@ -881,12 +1424,25 @@ struct PatchArgs {
 struct ShellArgs {
     argv: Vec<String>,
     timeout: Duration,
+    background: bool,
 }
 
 struct RepoGlobArgs {
     pattern: String,
     head_limit: usize,
 }
+
+struct JobIdArgs {
+    job_id: String,
+    offset: Option<usize>,
+}
+
+struct TaskSpawnArgs {
+    prompt: String,
+    agent_type: String,
+}
+
+struct EmptyArgs;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TodoEntry {
@@ -1073,6 +1629,84 @@ fn parse_todo_args(raw: &str) -> Result<TodoArgs, ToolStepError> {
     Ok(TodoArgs { todos })
 }
 
+/// Parse bounded `{"job_id", "offset"?}` background-job arguments.
+fn parse_job_id_args(raw: &str, with_offset: bool) -> Result<JobIdArgs, ToolStepError> {
+    const ALLOWED: &[&str] = &["job_id", "offset"];
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
+    let object = value.as_object().ok_or(ToolStepError::Invalid)?;
+    let allowed: &[&str] = if with_offset {
+        ALLOWED
+    } else {
+        &["job_id"]
+    };
+    if !object.keys().all(|key| allowed.contains(&key.as_str()))
+        || !object.contains_key("job_id")
+    {
+        return Err(ToolStepError::Invalid);
+    }
+    let job_id = object
+        .get("job_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ToolStepError::Invalid)?;
+    if job_id.is_empty() || job_id.len() > 64 {
+        return Err(ToolStepError::Invalid);
+    }
+    let offset = match object.get("offset") {
+        Some(value) => {
+            let offset = value.as_u64().ok_or(ToolStepError::Invalid)?;
+            offset as usize
+        }
+        None => 0,
+    };
+    Ok(JobIdArgs {
+        job_id: job_id.to_owned(),
+        offset: Some(offset),
+    })
+}
+
+/// Parse `{}` — plan mode switches take no arguments.
+fn parse_empty_args(raw: &str) -> Result<EmptyArgs, ToolStepError> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
+    if !value.as_object().is_some_and(|object| object.is_empty()) {
+        return Err(ToolStepError::Invalid);
+    }
+    Ok(EmptyArgs)
+}
+
+/// Parse bounded `{"prompt", "type"?, "description"?}` subagent arguments.
+/// Types adopt the reference-CLI standard: general-purpose | explore | plan.
+fn parse_task_args(raw: &str) -> Result<TaskSpawnArgs, ToolStepError> {
+    const ALLOWED: &[&str] = &["prompt", "type", "description"];
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
+    let object = value.as_object().ok_or(ToolStepError::Invalid)?;
+    if !object.keys().all(|key| ALLOWED.contains(&key.as_str()))
+        || !object.contains_key("prompt")
+    {
+        return Err(ToolStepError::Invalid);
+    }
+    let prompt = object
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ToolStepError::Invalid)?;
+    if prompt.is_empty() || prompt.len() > MAX_SPAWN_PROMPT_BYTES {
+        return Err(ToolStepError::Invalid);
+    }
+    let agent_type = match object.get("type") {
+        Some(value) => {
+            let raw_type = value.as_str().ok_or(ToolStepError::Invalid)?;
+            if !AGENT_TYPES.contains(&raw_type) {
+                return Err(ToolStepError::Invalid);
+            }
+            raw_type.to_owned()
+        }
+        None => "general-purpose".to_owned(),
+    };
+    Ok(TaskSpawnArgs {
+        prompt: prompt.to_owned(),
+        agent_type,
+    })
+}
+
 /// Segment-aware path glob: `**` matches zero or more whole directories,
 /// `*`/`?` stay inside one segment. `*.rs` matches top-level Rust files only;
 /// `**/*.rs` matches Rust files at any depth.
@@ -1134,7 +1768,8 @@ pub fn glob_path_match(pattern: &str, path: &str) -> bool {
 fn parse_shell_args(raw: &str) -> Result<ShellArgs, ToolStepError> {
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
     let object = value.as_object().ok_or(ToolStepError::Invalid)?;
-    let expected = if object.contains_key("timeout_ms") { 2 } else { 1 };
+    let expected = 1 + usize::from(object.contains_key("timeout_ms"))
+        + usize::from(object.contains_key("background"));
     if object.len() != expected {
         return Err(ToolStepError::Invalid);
     }
@@ -1166,7 +1801,15 @@ fn parse_shell_args(raw: &str) -> Result<ShellArgs, ToolStepError> {
         }
         None => DEFAULT_SHELL_TIMEOUT,
     };
-    Ok(ShellArgs { argv: tokens, timeout })
+    let background = match object.get("background") {
+        Some(value) => value.as_bool().ok_or(ToolStepError::Invalid)?,
+        None => false,
+    };
+    Ok(ShellArgs {
+        argv: tokens,
+        timeout,
+        background,
+    })
 }
 
 /// Parse bounded `{"path", "offset"?, "limit"?}` paginated-read arguments.
@@ -1276,6 +1919,18 @@ impl ExecTools {
         Ok(Self::Workspace(WorkspaceTools::open(root)?))
     }
 
+    /// Read-only trusted surface (subagent explore/plan scopes).
+    pub fn read_only(root: &Path) -> Result<Self, ToolSetupError> {
+        Ok(Self::Workspace(WorkspaceTools::open_read_only(root)?))
+    }
+
+    /// Attach the subagent runner (no-op on the fail-closed no-op surface).
+    pub fn set_subagent_runner(&mut self, runner: std::sync::Arc<dyn SubagentRunner>) {
+        if let Self::Workspace(tools) = self {
+            tools.set_subagent_runner(runner);
+        }
+    }
+
     /// The trusted workspace surface with an explicit permission lattice.
     pub fn workspace_with_permissions(
         root: &Path,
@@ -1305,6 +1960,16 @@ fn arguments_schema(
 }
 
 impl ToolDriver for WorkspaceTools {
+    fn tool_surface(&self) -> Vec<ToolSurface> {
+        // Read-only scopes (subagent explore/plan) advertise only
+        // read-classified tools.
+        let mut surface = self.full_surface_impl();
+        if self.read_only {
+            surface.retain(|tool| tool_kind(tool.name()) == ToolKind::Read);
+        }
+        surface
+    }
+
     fn validate(
         &mut self,
         call: &ProposedToolCall,
@@ -1324,139 +1989,17 @@ impl ToolDriver for WorkspaceTools {
                 | SHELL_EXEC_TOOL
                 | REPO_GLOB_TOOL
                 | TODO_WRITE_TOOL
+                | PLAN_ENTER_TOOL
+                | PLAN_EXIT_TOOL
+                | JOB_STATUS_TOOL
+                | JOB_OUTPUT_TOOL
+                | TASK_SPAWN_TOOL
         ) {
             return Err(ToolStepError::Invalid);
         }
         Ok(ValidatedToolCall::from_proposed(call))
     }
 
-    fn tool_surface(&self) -> Vec<ToolSurface> {
-        vec![
-            ToolSurface::new(
-                WORKSPACE_WRITE_TOOL,
-                "Create or overwrite a UTF-8 text file inside the trusted workspace. \
-                 Arguments JSON: {\"path\":\"<workspace-relative path>\",\"content\":\"<text>\"}.",
-                arguments_schema(
-                    "Write a workspace file",
-                    serde_json::json!({
-                        "path": {"type": "string", "description": "workspace-relative file path"},
-                        "content": {"type": "string"}
-                    }),
-                    &["path", "content"],
-                ),
-            ),
-            ToolSurface::new(
-                WORKSPACE_READ_TOOL,
-                "Read a UTF-8 text file inside the trusted workspace; the returned \
-                 content is bounded. Arguments JSON: {\"path\":\"<workspace-relative path>\"}.",
-                arguments_schema(
-                    "Read a workspace file",
-                    serde_json::json!({
-                        "path": {"type": "string", "description": "workspace-relative file path"}
-                    }),
-                    &["path"],
-                ),
-            ),
-            ToolSurface::new(
-                REPO_READ_TOOL,
-                "Read a bounded window of lines from a workspace file, 1-indexed. \
-                 Arguments JSON: {\"path\":\"<file>\",\"offset\":<first line, default 1>,\
-                 \"limit\":<lines, default 200, max 1000>}.",
-                arguments_schema(
-                    "Read a line window of a workspace file",
-                    serde_json::json!({
-                        "path": {"type": "string", "description": "workspace-relative file path"},
-                        "offset": {"type": "integer", "description": "1-indexed first line"},
-                        "limit": {"type": "integer", "description": "lines to return"}
-                    }),
-                    &["path"],
-                ),
-            ),
-            ToolSurface::new(
-                REPO_SEARCH_TOOL,
-                "Search workspace text files for an exact substring; returns \
-                 \"path:line: text\" hits paginated by head_limit/offset. Arguments JSON: \
-                 {\"pattern\":\"<exact text>\",\"head_limit\":<default 20, max 100>,\
-                 \"offset\":<default 0>}.",
-                arguments_schema(
-                    "Search workspace files",
-                    serde_json::json!({
-                        "pattern": {"type": "string", "description": "exact substring to find"},
-                        "head_limit": {"type": "integer", "description": "hits to return"},
-                        "offset": {"type": "integer", "description": "hits to skip"}
-                    }),
-                    &["pattern"],
-                ),
-            ),
-            ToolSurface::new(
-                WORKSPACE_PATCH_TOOL,
-                "Replace an exact substring in a workspace file. old must match exactly \
-                 once unless replace_all is true, and must differ from new; old and new are \
-                 each capped at 3072 bytes. Arguments JSON: \
-                 {\"path\":\"<file>\",\"old\":\"<exact text>\",\"new\":\"<replacement>\",\
-                 \"replace_all\":<optional bool>}.",
-                arguments_schema(
-                    "Edit a workspace file by exact match",
-                    serde_json::json!({
-                        "path": {"type": "string", "description": "workspace-relative file path"},
-                        "old": {"type": "string", "description": "exact text to replace"},
-                        "new": {"type": "string", "description": "replacement text"},
-                        "replace_all": {"type": "boolean", "description": "replace every occurrence"}
-                    }),
-                    &["path", "old", "new"],
-                ),
-            ),
-            ToolSurface::new(
-                REPO_GLOB_TOOL,
-                "Find workspace files by glob pattern: `**/*.rs` matches at any depth,                  `*.rs` only at the workspace root; results capped at 100. Arguments JSON:                  {\"pattern\":\"**/*.rs\",\"head_limit\":<optional, max 100>}.",
-                arguments_schema(
-                    "Find files by glob pattern",
-                    serde_json::json!({
-                        "pattern": {"type": "string", "description": "glob such as **/*.rs"},
-                        "head_limit": {"type": "integer", "description": "results to return"}
-                    }),
-                    &["pattern"],
-                ),
-            ),
-            ToolSurface::new(
-                TODO_WRITE_TOOL,
-                "Maintain your task list for this workspace: pass the full set of tasks with                  status pending | in_progress | completed | cancelled; entries with an id                  update that task, entries without one are added. Arguments JSON:                  {\"todos\":[{\"id\":\"1\",\"content\":\"...\",\"status\":\"in_progress\"}]}.",
-                arguments_schema(
-                    "Update the task list",
-                    serde_json::json!({
-                        "todos": {"type": "array", "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {"type": "string"},
-                                "content": {"type": "string"},
-                                "status": {"type": "string",
-                                           "enum": ["pending", "in_progress",
-                                                    "completed", "cancelled"]}
-                            },
-                            "required": ["content", "status"]
-                        }, "description": "full task list (merge-by-id)"}
-                    }),
-                    &["todos"],
-                ),
-            ),
-            ToolSurface::new(
-                SHELL_EXEC_TOOL,
-                "Run one command inside the workspace root (argv form, no shell). Bounded \
-                 output capture and a wall-clock timeout. Arguments JSON: \
-                 {\"argv\":[\"<program>\",\"<arg>\",...],\"timeout_ms\":<optional, \
-                 default 60000, max 600000>}.",
-                arguments_schema(
-                    "Run a supervised command",
-                    serde_json::json!({
-                        "argv": {"type": "array", "items": {"type": "string"},
-                                 "description": "program and arguments, argv form"},
-                        "timeout_ms": {"type": "integer", "description": "wall-clock timeout"}
-                    }),
-                    &["argv"],
-                ),
-            ),
-        ]
-    }
 
     fn execute(
         &mut self,
@@ -1585,6 +2128,184 @@ impl ToolDriver for ExecTools {
         batch_dispatch(tools, calls, cancel)
     }
 }
+impl WorkspaceTools {
+    fn full_surface_impl(&self) -> Vec<ToolSurface> {
+        vec![
+            ToolSurface::new(
+                WORKSPACE_WRITE_TOOL,
+                "Create or overwrite a UTF-8 text file inside the trusted workspace. \
+                 Arguments JSON: {\"path\":\"<workspace-relative path>\",\"content\":\"<text>\"}.",
+                arguments_schema(
+                    "Write a workspace file",
+                    serde_json::json!({
+                        "path": {"type": "string", "description": "workspace-relative file path"},
+                        "content": {"type": "string"}
+                    }),
+                    &["path", "content"],
+                ),
+            ),
+            ToolSurface::new(
+                WORKSPACE_READ_TOOL,
+                "Read a UTF-8 text file inside the trusted workspace; the returned \
+                 content is bounded. Arguments JSON: {\"path\":\"<workspace-relative path>\"}.",
+                arguments_schema(
+                    "Read a workspace file",
+                    serde_json::json!({
+                        "path": {"type": "string", "description": "workspace-relative file path"}
+                    }),
+                    &["path"],
+                ),
+            ),
+            ToolSurface::new(
+                REPO_READ_TOOL,
+                "Read a bounded window of lines from a workspace file, 1-indexed. \
+                 Arguments JSON: {\"path\":\"<file>\",\"offset\":<first line, default 1>,\
+                 \"limit\":<lines, default 200, max 1000>}.",
+                arguments_schema(
+                    "Read a line window of a workspace file",
+                    serde_json::json!({
+                        "path": {"type": "string", "description": "workspace-relative file path"},
+                        "offset": {"type": "integer", "description": "1-indexed first line"},
+                        "limit": {"type": "integer", "description": "lines to return"}
+                    }),
+                    &["path"],
+                ),
+            ),
+            ToolSurface::new(
+                REPO_SEARCH_TOOL,
+                "Search workspace text files for an exact substring; returns \
+                 \"path:line: text\" hits paginated by head_limit/offset. Arguments JSON: \
+                 {\"pattern\":\"<exact text>\",\"head_limit\":<default 20, max 100>,\
+                 \"offset\":<default 0>}.",
+                arguments_schema(
+                    "Search workspace files",
+                    serde_json::json!({
+                        "pattern": {"type": "string", "description": "exact substring to find"},
+                        "head_limit": {"type": "integer", "description": "hits to return"},
+                        "offset": {"type": "integer", "description": "hits to skip"}
+                    }),
+                    &["pattern"],
+                ),
+            ),
+            ToolSurface::new(
+                WORKSPACE_PATCH_TOOL,
+                "Replace an exact substring in a workspace file. old must match exactly \
+                 once unless replace_all is true, and must differ from new; old and new are \
+                 each capped at 3072 bytes. Arguments JSON: \
+                 {\"path\":\"<file>\",\"old\":\"<exact text>\",\"new\":\"<replacement>\",\
+                 \"replace_all\":<optional bool>}.",
+                arguments_schema(
+                    "Edit a workspace file by exact match",
+                    serde_json::json!({
+                        "path": {"type": "string", "description": "workspace-relative file path"},
+                        "old": {"type": "string", "description": "exact text to replace"},
+                        "new": {"type": "string", "description": "replacement text"},
+                        "replace_all": {"type": "boolean", "description": "replace every occurrence"}
+                    }),
+                    &["path", "old", "new"],
+                ),
+            ),
+            ToolSurface::new(
+                REPO_GLOB_TOOL,
+                "Find workspace files by glob pattern: `**/*.rs` matches at any depth,                  `*.rs` only at the workspace root; results capped at 100. Arguments JSON:                  {\"pattern\":\"**/*.rs\",\"head_limit\":<optional, max 100>}.",
+                arguments_schema(
+                    "Find files by glob pattern",
+                    serde_json::json!({
+                        "pattern": {"type": "string", "description": "glob such as **/*.rs"},
+                        "head_limit": {"type": "integer", "description": "results to return"}
+                    }),
+                    &["pattern"],
+                ),
+            ),
+            ToolSurface::new(
+                TODO_WRITE_TOOL,
+                "Maintain your task list for this workspace: pass the full set of tasks with                  status pending | in_progress | completed | cancelled; entries with an id                  update that task, entries without one are added. Arguments JSON:                  {\"todos\":[{\"id\":\"1\",\"content\":\"...\",\"status\":\"in_progress\"}]}.",
+                arguments_schema(
+                    "Update the task list",
+                    serde_json::json!({
+                        "todos": {"type": "array", "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "content": {"type": "string"},
+                                "status": {"type": "string",
+                                           "enum": ["pending", "in_progress",
+                                                    "completed", "cancelled"]}
+                            },
+                            "required": ["content", "status"]
+                        }, "description": "full task list (merge-by-id)"}
+                    }),
+                    &["todos"],
+                ),
+            ),
+            ToolSurface::new(
+                PLAN_ENTER_TOOL,
+                "Enter plan mode: research freely, but every write except the plan file                  (.rapidlm/plan.md) is refused. Write the plan with workspace_write to that                  path, then call plan_exit. Arguments JSON: {}.",
+                arguments_schema("Enter plan mode", serde_json::json!({}), &[]),
+            ),
+            ToolSurface::new(
+                PLAN_EXIT_TOOL,
+                "Leave plan mode: the plan is read from .rapidlm/plan.md on disk (must exist                  and be non-empty) and returned for approval. Arguments JSON: {}.",
+                arguments_schema("Exit plan mode with the written plan", serde_json::json!({}), &[]),
+            ),
+            ToolSurface::new(
+                JOB_STATUS_TOOL,
+                "Check a background job started with shell_exec background=true: returns                  running/completed/failed. Arguments JSON: {\"job_id\":\"job-1\"}.",
+                arguments_schema(
+                    "Check background job status",
+                    serde_json::json!({
+                        "job_id": {"type": "string", "description": "job id such as job-1"}
+                    }),
+                    &["job_id"],
+                ),
+            ),
+            ToolSurface::new(
+                JOB_OUTPUT_TOOL,
+                "Read the spooled output of a background job from `offset`. Arguments JSON:                  {\"job_id\":\"job-1\",\"offset\":0}.",
+                arguments_schema(
+                    "Read background job output",
+                    serde_json::json!({
+                        "job_id": {"type": "string", "description": "job id such as job-1"},
+                        "offset": {"type": "integer", "description": "byte offset to read from"}
+                    }),
+                    &["job_id"],
+                ),
+            ),
+            ToolSurface::new(
+                TASK_SPAWN_TOOL,
+                "Spawn a subagent (depth 1: it cannot spawn further agents) for a focused                  task and return its final report. Types: general-purpose (full tools),                  explore (read-only), plan (read-only). Arguments JSON:                  {\"prompt\":\"<task>\",\"type\":\"explore\"}.",
+                arguments_schema(
+                    "Spawn a subagent for a focused task",
+                    serde_json::json!({
+                        "prompt": {"type": "string", "description": "the subagent's task"},
+                        "type": {"type": "string",
+                                 "enum": ["general-purpose", "explore", "plan"],
+                                 "description": "subagent type"},
+                        "description": {"type": "string", "description": "short label"}
+                    }),
+                    &["prompt"],
+                ),
+            ),
+            ToolSurface::new(
+                SHELL_EXEC_TOOL,
+                "Run one command inside the workspace root (argv form, no shell). Bounded \
+                 output capture and a wall-clock timeout. Arguments JSON: \
+                 {\"argv\":[\"<program>\",\"<arg>\",...],\"timeout_ms\":<optional, \
+                 default 60000, max 600000>}.",
+                arguments_schema(
+                    "Run a supervised command",
+                    serde_json::json!({
+                        "argv": {"type": "array", "items": {"type": "string"},
+                                 "description": "program and arguments, argv form"},
+                        "timeout_ms": {"type": "integer", "description": "wall-clock timeout"}
+                    }),
+                    &["argv"],
+                ),
+            ),
+        ]
+    }
+}
+
 /// A [`ToolDriver`] with no tool gateway configured. Structural tool calls are
 /// never executed; used when the project is not trusted (fail-closed).
 pub struct NoopTools;
@@ -1611,7 +2332,7 @@ mod tests {
     use super::*;
     use crate::host::{PreservedLiveContext, run_live_exec};
     use crate::permissions::{
-        DecisionReason, RuleEffect, ToolPattern, ToolRule,
+        RuleEffect, ToolPattern, ToolRule,
     };
     use agent_runtime::{
         AgentExecutionRequest, AgentRole, AgentSpec, AgentTerminalStatus, ContextRetryPolicy,
@@ -1620,7 +2341,7 @@ mod tests {
     use protocol::{AgentId, SessionId, WorkspaceViewId};
     use std::collections::VecDeque;
     use std::sync::mpsc;
-    use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex};
 
     /// Temp workspace root removed on drop.
     struct TempRoot(PathBuf);
@@ -2271,7 +2992,7 @@ mod tests {
             let call = ProposedToolCall::new("c1", SHELL_EXEC_TOOL, arguments).expect("call");
             let validated = tools.validate(&call, &cancel).expect("known tool validates");
             match tools.execute(&validated, &cancel).expect("handled") {
-                ToolStepResult::Failed { handled, .. } => {}
+                ToolStepResult::Failed { handled: true, .. } => {}
                 other => panic!("expected handled refusal for {arguments}, got {other:?}"),
             }
         }
@@ -2760,7 +3481,254 @@ mod tests {
     }
 
     #[test]
-    fn tool_surface_advertises_all_eight_tools_with_json_schemas() {
+    fn background_jobs_run_report_and_cancel() {
+        let root = TempRoot::new("bg");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        // A fast job completes with its output spooled.
+        let call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["sh","-c","echo job-output-marker"],"background":true}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        let job_id = match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                let word = summary
+                    .split_whitespace()
+                    .find(|word| word.starts_with("job-"))
+                    .expect("job id in summary");
+                word.trim_end_matches(':').to_owned()
+            }
+            other => panic!("expected background start, got {other:?}"),
+        };
+        let mut completed = false;
+        for _ in 0..50 {
+            if let ToolStepResult::Succeeded { summary, .. } = {
+                let status_call = make_call("s1", JOB_STATUS_TOOL, &format!(r#"{{"job_id":"{job_id}"}}"#));
+                let validated = tools.validate(&status_call, &cancel).expect("validate");
+                tools.execute(&validated, &cancel).expect("execute")
+            } {
+                if summary.contains("completed exit 0") {
+                    completed = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(completed, "background job must complete");
+        let output_call = make_call(
+            "o1",
+            JOB_OUTPUT_TOOL,
+            &format!(r#"{{"job_id":"{job_id}","offset":0}}"#),
+        );
+        let validated = tools.validate(&output_call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("job-output-marker"), "{summary}");
+                assert!(summary.contains("[job finished"), "{summary}");
+            }
+            other => panic!("expected output, got {other:?}"),
+        }
+
+        // A long job is observable as running, then cancelled at shutdown.
+        let call = make_call(
+            "c2",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["sleep","30"],"background":true}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        let long_id = match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                let word = summary
+                    .split_whitespace()
+                    .find(|word| word.starts_with("job-"))
+                    .expect("job id in summary");
+                word.trim_end_matches(':').to_owned()
+            }
+            other => panic!("expected background start, got {other:?}"),
+        };
+        {
+            let status_call =
+                make_call("s2", JOB_STATUS_TOOL, &format!(r#"{{"job_id":"{long_id}"}}"#));
+            let validated = tools.validate(&status_call, &cancel).expect("validate");
+            match tools.execute(&validated, &cancel).expect("execute") {
+                ToolStepResult::Succeeded { summary, .. } => {
+                    assert!(summary.contains("running"), "{summary}");
+                }
+                other => panic!("expected running, got {other:?}"),
+            }
+        }
+        // Shutdown path: drop the registry clone to cancel + kill the child.
+        drop(JobRegistry::default());
+        let unknown = make_call("s3", JOB_STATUS_TOOL, r#"{"job_id":"job-missing"}"#);
+        let validated = tools.validate(&unknown, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("handled") {
+            ToolStepResult::Failed { handled, .. } => assert!(handled),
+            other => panic!("expected unknown-job failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_mode_enforces_read_only_with_plan_file_carve_out() {
+        let root = TempRoot::new("plan-mode");
+        fs::write(root.0.join("code.rs"), "fn before() {}\n").expect("seed");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        let enter = make_call("p1", PLAN_ENTER_TOOL, "{}");
+        let validated = tools.validate(&enter, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("Plan mode active"), "{summary}");
+            }
+            other => panic!("expected enter success, got {other:?}"),
+        }
+
+        // Reads stay allowed; writes outside the plan file are denied with
+        // the plan reason; writing the plan file itself is allowed.
+        let read_call = make_call("r1", REPO_READ_TOOL, r#"{"path":"code.rs"}"#);
+        let validated = tools.validate(&read_call, &cancel).expect("validate");
+        assert!(matches!(
+            tools.execute(&validated, &cancel).expect("execute"),
+            ToolStepResult::Succeeded { .. }
+        ));
+
+        let patch = make_call(
+            "p2",
+            WORKSPACE_PATCH_TOOL,
+            r#"{"path":"code.rs","old":"before","new":"after"}"#,
+        );
+        let validated = tools.validate(&patch, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Denied { detail, .. } => {
+                assert!(detail.unwrap().contains("plan mode is read-only"));
+            }
+            other => panic!("expected plan denial, got {other:?}"),
+        }
+        assert!(
+            fs::read_to_string(root.0.join("code.rs"))
+                .expect("read")
+                .contains("before"),
+            "plan mode must keep the workspace intact"
+        );
+
+        let plan_write = make_call(
+            "w1",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":".rapidlm/plan.md","content":"1. rename\n2. test"}"#,
+        );
+        let validated = tools.validate(&plan_write, &cancel).expect("validate");
+        assert!(matches!(
+            tools.execute(&validated, &cancel).expect("execute"),
+            ToolStepResult::Succeeded { .. }
+        ));
+
+        // Exit reads the plan from disk and leaves plan mode.
+        let exit = make_call("p3", PLAN_EXIT_TOOL, "{}");
+        let validated = tools.validate(&exit, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("Plan accepted"), "{summary}");
+                assert!(summary.contains("1. rename"));
+            }
+            other => panic!("expected exit success, got {other:?}"),
+        }
+
+        // Writes work again after exit.
+        let patch = make_call(
+            "p4",
+            WORKSPACE_PATCH_TOOL,
+            r#"{"path":"code.rs","old":"before","new":"after"}"#,
+        );
+        let validated = tools.validate(&patch, &cancel).expect("validate");
+        assert!(matches!(
+            tools.execute(&validated, &cancel).expect("execute"),
+            ToolStepResult::Succeeded { .. }
+        ));
+
+        // Exiting while not in plan mode is a handled failure.
+        let exit = make_call("p5", PLAN_EXIT_TOOL, "{}");
+        let validated = tools.validate(&exit, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("handled") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.unwrap().contains("not active"));
+            }
+            other => panic!("expected handled double-exit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_spawn_uses_the_runner_and_enforces_depth_one() {
+        use std::sync::Mutex as StdMutex;
+        struct FakeRunner {
+            calls: Arc<StdMutex<Vec<(String, String)>>>,
+        }
+        impl crate::exec_tools::SubagentRunner for FakeRunner {
+            fn run(&self, prompt: &str, agent_type: &str) -> Result<String, String> {
+                self.calls
+                    .lock()
+                    .expect("lock")
+                    .push((prompt.to_owned(), agent_type.to_owned()));
+                Ok("child finished the task".to_owned())
+            }
+        }
+
+        let root = TempRoot::new("spawn");
+        let mut tools = permissive_workspace(&root.0);
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let runner = Arc::new(FakeRunner {
+            calls: Arc::clone(&calls),
+        });
+        tools.subagents = Some(runner as Arc<dyn SubagentRunner>);
+
+        let call = make_call(
+            "c1",
+            TASK_SPAWN_TOOL,
+            r#"{"prompt":"count the tests","type":"explore"}"#,
+        );
+        let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
+        match tools.execute(&validated, &CancellationToken::new()).expect("e") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("subagent (explore)"), "{summary}");
+                assert!(summary.contains("child finished the task"));
+            }
+            other => panic!("expected spawn success, got {other:?}"),
+        }
+        let recorded = calls.lock().expect("lock").clone();
+        assert_eq!(
+            recorded,
+            vec![("count the tests".to_owned(), "explore".to_owned())]
+        );
+
+        // Unknown agent types are handled failures (never a dead turn).
+        let bad = make_call(
+            "c2",
+            TASK_SPAWN_TOOL,
+            r#"{"prompt":"x","type":"ninja"}"#,
+        );
+        let validated = tools.validate(&bad, &CancellationToken::new()).expect("v");
+        match tools.execute(&validated, &CancellationToken::new()).expect("handled") {
+            ToolStepResult::Failed { handled, .. } => assert!(handled),
+            other => panic!("expected handled type refusal, got {other:?}"),
+        }
+
+        // Read-only drivers never offer spawn tools: depth limit is structural.
+        let child = WorkspaceTools::open_read_only(&root.0).expect("child");
+        let surface_owned: Vec<String> = child
+            .tool_surface()
+            .iter()
+            .map(|tool| tool.name().to_owned())
+            .collect();
+        let surface: Vec<&str> = surface_owned.iter().map(|name| name.as_str()).collect();
+        assert!(!surface.contains(&TASK_SPAWN_TOOL), "depth 1 enforced: {surface:?}");
+        assert!(surface.contains(&REPO_READ_TOOL), "reads stay available");
+    }
+
+    #[test]
+    fn tool_surface_advertises_all_fourteen_tools_with_json_schemas() {
         let root = TempRoot::new("surface");
         let tools = ExecTools::workspace(&root.0).expect("tools");
         let surface = tools.tool_surface();
@@ -2775,6 +3743,11 @@ mod tests {
                 WORKSPACE_PATCH_TOOL,
                 REPO_GLOB_TOOL,
                 TODO_WRITE_TOOL,
+                PLAN_ENTER_TOOL,
+                PLAN_EXIT_TOOL,
+                JOB_STATUS_TOOL,
+                JOB_OUTPUT_TOOL,
+                TASK_SPAWN_TOOL,
                 SHELL_EXEC_TOOL,
             ]
         );
@@ -2799,6 +3772,10 @@ mod tests {
         assert_eq!(tool_kind(SHELL_EXEC_TOOL), ToolKind::Write);
         assert_eq!(tool_kind(REPO_GLOB_TOOL), ToolKind::Read);
         assert_eq!(tool_kind(TODO_WRITE_TOOL), ToolKind::Write);
+        assert_eq!(tool_kind(JOB_STATUS_TOOL), ToolKind::Read);
+        assert_eq!(tool_kind(JOB_OUTPUT_TOOL), ToolKind::Read);
+        assert_eq!(tool_kind(PLAN_ENTER_TOOL), ToolKind::Write);
+        assert_eq!(tool_kind(TASK_SPAWN_TOOL), ToolKind::Write);
         assert_eq!(tool_kind("unknown"), ToolKind::Write, "unknown tools stay write-class");
     }
 }

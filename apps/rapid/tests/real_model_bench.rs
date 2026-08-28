@@ -237,3 +237,33 @@ fn temp_dir(tag: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }
+
+#[test]
+fn real_s4_subagent_explore_task() {
+    // task_spawn routes through the injected subagent runner: the child gets
+    // a depth-1 read-only tool surface and its report returns to the parent.
+    if std::env::var(REAL_BENCH_ENV).is_err() {
+        return skipped("set RAPIDLM_REAL_BENCH=1 to run against the real model");
+    }
+    let project = match RealProject::new("s4") {
+        Ok(project) => project,
+        Err(reason) => return skipped(&reason),
+    };
+    project.seed("secret-note.txt", "the launch code is BLUE-7\n");
+    let run = run_real(
+        &project.project,
+        &project.home,
+        "Use task_spawn with type explore and the prompt 'read secret-note.txt with \
+         workspace_read and report its full content verbatim'. Then create report.txt with \
+         workspace_write containing exactly what the subagent reported, and state the code.",
+        "S4_subagent",
+    );
+    assert!(!run.timed_out, "run exceeded {}s: {}", RUN_DEADLINE.as_secs(), run.stderr);
+    assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
+    let content = project.read("report.txt");
+    assert!(
+        content.contains("BLUE-7"),
+        "report.txt must carry the subagent's finding: {content:?}"
+    );
+    assert!(run.stdout.contains("BLUE-7"), "final answer must carry the code");
+}
