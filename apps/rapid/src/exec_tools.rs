@@ -442,6 +442,7 @@ pub struct WorkspaceTools {
     read_only: bool,
     subagents: Option<Arc<dyn SubagentRunner>>,
     fetch_allowlist: Vec<String>,
+    hooks: crate::hooks::HooksConfig,
 }
 
 impl WorkspaceTools {
@@ -468,12 +469,18 @@ impl WorkspaceTools {
             read_only: false,
             subagents: None,
             fetch_allowlist: Vec::new(),
+            hooks: crate::hooks::HooksConfig::default(),
         })
     }
 
     /// Hosts web_fetch may fetch despite resolving private (local fixtures).
     pub fn set_fetch_allowlist(&mut self, allowlist: Vec<String>) {
         self.fetch_allowlist = allowlist;
+    }
+
+    /// Attach project hook commands (pre/post tool stages).
+    pub fn set_hooks(&mut self, hooks: crate::hooks::HooksConfig) {
+        self.hooks = hooks;
     }
 
     /// Read-only driver for subagent explore/plan scopes: write-classified
@@ -590,6 +597,26 @@ impl WorkspaceTools {
                 )),
             });
         }
+        // Pre-tool-use hooks: the first denial wins and is model-visible.
+        if !self.hooks.pre_tool_use.is_empty() {
+            match crate::hooks::run_pre_tool_hooks(
+                &self.hooks.pre_tool_use,
+                call.tool(),
+                call.arguments(),
+                crate::hooks::HOOK_TIMEOUT,
+            ) {
+                crate::hooks::PreHookOutcome::Denied { reason } => {
+                    return Ok(ToolStepResult::Denied {
+                        call_id: call.call_id().to_owned(),
+                        detail: Some(bounded_detail(&format!(
+                            "{} blocked by pre_tool_use hook: {reason}",
+                            call.tool()
+                        ))),
+                    });
+                }
+                crate::hooks::PreHookOutcome::Allowed => {}
+            }
+        }
         let arguments_parseable = match call.tool() {
             WORKSPACE_WRITE_TOOL => parse_write_args(call.arguments()).is_ok(),
             WORKSPACE_READ_TOOL => parse_path_argument(call.arguments()).is_some(),
@@ -616,7 +643,7 @@ impl WorkspaceTools {
                 ))),
             });
         }
-        match call.tool() {
+        let result = match call.tool() {
             WORKSPACE_WRITE_TOOL => self.execute_write(call, cancel),
             WORKSPACE_READ_TOOL => self.execute_read(call, cancel),
             REPO_READ_TOOL => self.execute_repo_read(call, cancel),
@@ -632,7 +659,28 @@ impl WorkspaceTools {
             TASK_SPAWN_TOOL => self.execute_task_spawn(call, cancel),
             WEB_FETCH_TOOL => self.execute_web_fetch(call, cancel),
             _ => Err(ToolStepError::Invalid),
+        }?;
+        // Post-tool-use hooks observe the completed call; their output is
+        // recorded on the result the model sees.
+        if !self.hooks.post_tool_use.is_empty() {
+            if let ToolStepResult::Succeeded { call_id, summary } = &result {
+                let recorded = crate::hooks::run_post_tool_hooks(
+                    &self.hooks.post_tool_use,
+                    call.tool(),
+                    summary,
+                    crate::hooks::HOOK_TIMEOUT,
+                );
+                if !recorded.is_empty() {
+                    return Ok(ToolStepResult::Succeeded {
+                        call_id: call_id.clone(),
+                        summary: bounded_detail(&format!(
+                            "{summary}\n[post_tool_use: {recorded}]"
+                        )),
+                    });
+                }
+            }
         }
+        Ok(result)
     }
 
     fn execute_write(
