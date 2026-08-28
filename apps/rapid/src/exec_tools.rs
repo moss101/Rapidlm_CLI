@@ -35,6 +35,18 @@ pub const REPO_SEARCH_TOOL: &str = "repo.search";
 pub const WORKSPACE_PATCH_TOOL: &str = "workspace.patch";
 /// Tool name for supervised command execution (gateway name `shell.exec`).
 pub const SHELL_EXEC_TOOL: &str = "shell.exec";
+/// Tool name for file-pattern search (Claude `Glob` parity).
+pub const REPO_GLOB_TOOL: &str = "repo.glob";
+/// Tool name for the model-callable task list (Claude `TodoWrite` parity).
+pub const TODO_WRITE_TOOL: &str = "todo.write";
+/// Hard cap on `repo.glob` results (Claude truncates Glob at 100 files).
+pub const MAX_GLOB_RESULTS: usize = 100;
+/// Hard cap on one task-list entry.
+pub const MAX_TODO_CONTENT_BYTES: usize = 512;
+/// Hard cap on retained task-list entries.
+pub const MAX_TODOS: usize = 50;
+/// Workspace-relative path of the persisted task list.
+pub const TODOS_PATH: &str = ".rapidlm/todos.json";
 /// Hard byte cap on one tool call's JSON arguments.
 pub const MAX_TOOL_ARGUMENTS_BYTES: usize = 8 * 1024;
 /// Hard byte cap on a relative workspace path.
@@ -150,6 +162,8 @@ impl WorkspaceTools {
             }
             WORKSPACE_PATCH_TOOL => parse_patch_args(arguments).ok().map(|args| args.path),
             SHELL_EXEC_TOOL => parse_shell_args(arguments).ok().map(|args| args.argv.join(" ")),
+            REPO_GLOB_TOOL => parse_repo_glob_args(arguments).ok().map(|args| args.pattern),
+            TODO_WRITE_TOOL => Some(TODOS_PATH.to_owned()),
             _ => None,
         }
     }
@@ -202,6 +216,8 @@ impl WorkspaceTools {
             REPO_SEARCH_TOOL => parse_repo_search_args(call.arguments()).is_ok(),
             WORKSPACE_PATCH_TOOL => parse_patch_args(call.arguments()).is_ok(),
             SHELL_EXEC_TOOL => parse_shell_args(call.arguments()).is_ok(),
+            REPO_GLOB_TOOL => parse_repo_glob_args(call.arguments()).is_ok(),
+            TODO_WRITE_TOOL => parse_todo_args(call.arguments()).is_ok(),
             _ => return Err(ToolStepError::Invalid),
         };
         if !arguments_parseable {
@@ -221,6 +237,8 @@ impl WorkspaceTools {
             REPO_SEARCH_TOOL => self.execute_repo_search(call, cancel),
             WORKSPACE_PATCH_TOOL => self.execute_patch(call, cancel),
             SHELL_EXEC_TOOL => self.execute_shell(call, cancel),
+            REPO_GLOB_TOOL => self.execute_repo_glob(call, cancel),
+            TODO_WRITE_TOOL => self.execute_todo_write(call, cancel),
             _ => Err(ToolStepError::Invalid),
         }
     }
@@ -340,7 +358,7 @@ impl WorkspaceTools {
         let args = parse_repo_search_args(call.arguments())?;
         let mut all_hits: Vec<String> = Vec::new();
         let mut walked = 0usize;
-        walk_text_files(self.root(), 0, &mut walked, &mut |path, contents| {
+        walk_text_files(self.root(), self.root(), 0, &mut walked, &mut |path, contents| {
             if cancel.is_cancelled() {
                 return;
             }
@@ -514,6 +532,159 @@ impl WorkspaceTools {
         }
     }
 
+    /// `repo.glob`: file-pattern search over workspace paths with `**` /
+    /// `*` / `?` semantics (Claude `Glob` parity), capped results.
+    fn execute_repo_glob(
+        &self,
+        call: &ValidatedToolCall,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        let args = parse_repo_glob_args(call.arguments())?;
+        let mut matches: Vec<String> = Vec::new();
+        let mut walked = 0usize;
+        let mut total = 0usize;
+        walk_all_files(self.root(), self.root(), 0, &mut walked, &mut |relative| {
+            if glob_path_match(&args.pattern, relative) {
+                total += 1;
+                if matches.len() < args.head_limit {
+                    matches.push(relative.to_owned());
+                }
+            }
+        });
+        if matches.is_empty() {
+            return Ok(ToolStepResult::Succeeded {
+                call_id: call.call_id().to_owned(),
+                summary: format!("no files match {:?}", args.pattern),
+            });
+        }
+        let mut summary = matches.join("\n");
+        if total > matches.len() {
+            summary.push_str(&format!(
+                "{TRUNCATION_MARKER} (showing {} of {total} matches)",
+                matches.len()
+            ));
+        }
+        Ok(ToolStepResult::Succeeded {
+            call_id: call.call_id().to_owned(),
+            summary,
+        })
+    }
+
+    /// `todo.write`: merge-by-id model task list (Claude `TodoWrite` parity),
+    /// persisted to `.rapidlm/todos.json` so the list survives across turns.
+    fn execute_todo_write(
+        &self,
+        call: &ValidatedToolCall,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        let args = parse_todo_args(call.arguments())?;
+        let existing = self.load_todos();
+        let mut todos = existing.clone();
+        for entry in &args.todos {
+            match entry.id.as_deref() {
+                Some(id) => {
+                    if let Some(slot) = todos.iter_mut().find(|todo| todo.id.as_deref() == Some(id)) {
+                        slot.content = entry.content.clone();
+                        slot.status = entry.status.clone();
+                    } else {
+                        todos.push(TodoEntry {
+                            id: Some(id.to_owned()),
+                            content: entry.content.clone(),
+                            status: entry.status.clone(),
+                        });
+                    }
+                }
+                None => {
+                    // Id-less entries are appended with the next free numeric
+                    // id so later writes can address them by id.
+                    let mut next = 1usize;
+                    while todos
+                        .iter()
+                        .any(|todo| todo.id.as_deref() == Some(next.to_string().as_str()))
+                    {
+                        next += 1;
+                    }
+                    todos.push(TodoEntry {
+                        id: Some(next.to_string()),
+                        content: entry.content.clone(),
+                        status: entry.status.clone(),
+                    });
+                }
+            }
+        }
+        if todos.len() > MAX_TODOS {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "task list exceeds {MAX_TODOS} entries; mark old tasks completed first"
+                ))),
+            });
+        }
+        let target = self.resolve_in_root(TODOS_PATH)?;
+        let document = serde_json::json!({
+            "schema": 1,
+            "todos": todos.iter().map(|todo| serde_json::json!({
+                "id": todo.id,
+                "content": todo.content,
+                "status": todo.status,
+            })).collect::<Vec<_>>(),
+        });
+        fs::write(
+            &target,
+            serde_json::to_vec_pretty(&document).map_err(|_| ToolStepError::Failed)?,
+        )
+        .map_err(|_| ToolStepError::Failed)?;
+        let count = |status: &str| {
+            todos
+                .iter()
+                .filter(|todo| todo.status == status)
+                .count()
+        };
+        let mut summary = format!(
+            "{} task(s): {} pending, {} in_progress, {} completed",
+            todos.len(),
+            count("pending"),
+            count("in_progress"),
+            count("completed")
+        );
+        for todo in todos.iter().filter(|todo| todo.status == "in_progress") {
+            summary.push_str(&format!("\n→ {}", todo.content));
+        }
+        Ok(ToolStepResult::Succeeded {
+            call_id: call.call_id().to_owned(),
+            summary,
+        })
+    }
+
+    fn load_todos(&self) -> Vec<TodoEntry> {
+        let Ok(target) = self.resolve_in_root(TODOS_PATH) else {
+            return Vec::new();
+        };
+        let Ok(bytes) = fs::read(&target) else {
+            return Vec::new();
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return Vec::new();
+        };
+        let Some(entries) = value.get("todos").and_then(serde_json::Value::as_array) else {
+            return Vec::new();
+        };
+        entries
+            .iter()
+            .filter_map(|entry| {
+                let id = entry.get("id")?.as_str()?.to_owned();
+                let content = entry.get("content")?.as_str()?.to_owned();
+                let status = entry.get("status")?.as_str()?.to_owned();
+                Some(TodoEntry {
+                    id: Some(id),
+                    content,
+                    status,
+                })
+            })
+            .collect()
+    }
+
     /// Group key for write-class calls: same key ⇒ serialized in proposal
     /// order. All `shell.exec` calls share one key (a process may touch any
     /// path); file writes serialize per resolved relative path.
@@ -524,6 +695,7 @@ impl WorkspaceTools {
                 parse_write_args(call.arguments()).ok().map(|args| args.path)
             }
             WORKSPACE_PATCH_TOOL => parse_patch_args(call.arguments()).ok().map(|a| a.path),
+            TODO_WRITE_TOOL => Some(TODOS_PATH.to_owned()),
             _ => None,
         }
     }
@@ -533,15 +705,19 @@ impl WorkspaceTools {
 /// run concurrently with everything; writes serialize per target.
 pub fn tool_kind(tool: &str) -> ToolKind {
     match tool {
-        WORKSPACE_READ_TOOL | REPO_READ_TOOL | REPO_SEARCH_TOOL => ToolKind::Read,
+        WORKSPACE_READ_TOOL | REPO_READ_TOOL | REPO_SEARCH_TOOL | REPO_GLOB_TOOL => {
+            ToolKind::Read
+        }
         _ => ToolKind::Write,
     }
 }
 
 fn tool_class(tool: &str) -> ToolClass {
     match tool {
-        WORKSPACE_READ_TOOL | REPO_READ_TOOL | REPO_SEARCH_TOOL => ToolClass::ReadOnly,
-        WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL => ToolClass::FileEdit,
+        WORKSPACE_READ_TOOL | REPO_READ_TOOL | REPO_SEARCH_TOOL | REPO_GLOB_TOOL => {
+            ToolClass::ReadOnly
+        }
+        WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL | TODO_WRITE_TOOL => ToolClass::FileEdit,
         _ => ToolClass::Other,
     }
 }
@@ -549,6 +725,7 @@ fn tool_class(tool: &str) -> ToolClass {
 /// Walk workspace text files depth-first (skipping vendored/build dirs),
 /// invoking `visit` with each file's contents; bounded by [`MAX_SEARCH_FILES`].
 fn walk_text_files(
+    root: &Path,
     dir: &Path,
     depth: usize,
     walked: &mut usize,
@@ -573,7 +750,7 @@ fn walk_text_files(
         let name = name.to_string_lossy().into_owned();
         if file_type.is_dir() {
             if !SEARCH_SKIP_DIRS.contains(&name.as_str()) && !name.starts_with('.') {
-                walk_text_files(&entry.path(), depth + 1, walked, visit);
+                walk_text_files(root, &entry.path(), depth + 1, walked, visit);
             }
             continue;
         }
@@ -591,10 +768,55 @@ fn walk_text_files(
         }
         let relative = entry
             .path()
-            .strip_prefix(dir)
+            .strip_prefix(root)
             .map(|rel| rel.to_string_lossy().into_owned())
             .unwrap_or(name.clone());
         visit(&relative, &String::from_utf8_lossy(&bytes));
+    }
+}
+
+/// Walk ALL regular files (no text filter) depth-first for `repo.glob`,
+/// skipping vendored/build/hidden directories; bounded by [`MAX_SEARCH_FILES`].
+fn walk_all_files(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    walked: &mut usize,
+    visit: &mut impl FnMut(&str),
+) {
+    if depth > 16 || *walked >= MAX_SEARCH_FILES {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        if *walked >= MAX_SEARCH_FILES {
+            return;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy().into_owned();
+        if file_type.is_dir() {
+            if !SEARCH_SKIP_DIRS.contains(&name.as_str()) && !name.starts_with('.') {
+                walk_all_files(root, &entry.path(), depth + 1, walked, visit);
+            }
+            continue;
+        }
+        if file_type.is_symlink() || name.starts_with('.') {
+            continue;
+        }
+        *walked += 1;
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .map(|rel| rel.to_string_lossy().into_owned())
+            .unwrap_or(name.clone());
+        visit(&relative);
     }
 }
 
@@ -659,6 +881,22 @@ struct PatchArgs {
 struct ShellArgs {
     argv: Vec<String>,
     timeout: Duration,
+}
+
+struct RepoGlobArgs {
+    pattern: String,
+    head_limit: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TodoEntry {
+    id: Option<String>,
+    content: String,
+    status: String,
+}
+
+struct TodoArgs {
+    todos: Vec<TodoEntry>,
 }
 
 struct RepoReadArgs {
@@ -749,6 +987,145 @@ fn parse_patch_args(raw: &str) -> Result<PatchArgs, ToolStepError> {
         new: new.to_owned(),
         replace_all,
     })
+}
+
+/// Parse bounded `{"pattern", "head_limit"?}` glob arguments (Claude `Glob`:
+/// head_limit capped at 100; `**` crosses directories, `*` stays in one).
+fn parse_repo_glob_args(raw: &str) -> Result<RepoGlobArgs, ToolStepError> {
+    const ALLOWED: &[&str] = &["pattern", "head_limit"];
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
+    let object = value.as_object().ok_or(ToolStepError::Invalid)?;
+    if !object.keys().all(|key| ALLOWED.contains(&key.as_str()))
+        || !object.contains_key("pattern")
+    {
+        return Err(ToolStepError::Invalid);
+    }
+    let pattern = object
+        .get("pattern")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ToolStepError::Invalid)?;
+    if pattern.is_empty() || pattern.len() > 256 || pattern.starts_with('/') {
+        return Err(ToolStepError::Invalid);
+    }
+    let head_limit = match object.get("head_limit") {
+        Some(value) => {
+            let head_limit = value.as_u64().ok_or(ToolStepError::Invalid)?;
+            if head_limit == 0 || head_limit as usize > MAX_GLOB_RESULTS {
+                return Err(ToolStepError::Invalid);
+            }
+            head_limit as usize
+        }
+        None => MAX_GLOB_RESULTS,
+    };
+    Ok(RepoGlobArgs {
+        pattern: pattern.to_owned(),
+        head_limit,
+    })
+}
+
+/// Parse bounded `{"todos": [...]}` task-list arguments. Each entry carries
+/// `content` (bounded) and `status`; `id` is optional (merge-by-id when
+/// present). Unknown keys, unknown statuses, and bound violations are refused.
+fn parse_todo_args(raw: &str) -> Result<TodoArgs, ToolStepError> {
+    const STATUSES: &[&str] = &["pending", "in_progress", "completed", "cancelled"];
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
+    let object = value.as_object().ok_or(ToolStepError::Invalid)?;
+    if !object.contains_key("todos") || object.len() != 1 {
+        return Err(ToolStepError::Invalid);
+    }
+    let entries = object
+        .get("todos")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(ToolStepError::Invalid)?;
+    if entries.is_empty() || entries.len() > MAX_TODOS {
+        return Err(ToolStepError::Invalid);
+    }
+    let mut todos = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let entry = entry.as_object().ok_or(ToolStepError::Invalid)?;
+        if entry.len() > 3 {
+            return Err(ToolStepError::Invalid);
+        }
+        let content = entry
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ToolStepError::Invalid)?;
+        if content.is_empty() || content.len() > MAX_TODO_CONTENT_BYTES {
+            return Err(ToolStepError::Invalid);
+        }
+        let status = entry
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ToolStepError::Invalid)?;
+        if !STATUSES.contains(&status) {
+            return Err(ToolStepError::Invalid);
+        }
+        let id = match entry.get("id") {
+            Some(id) => Some(id.as_str().ok_or(ToolStepError::Invalid)?.to_owned()),
+            None => None,
+        };
+        todos.push(TodoEntry {
+            id,
+            content: content.to_owned(),
+            status: status.to_owned(),
+        });
+    }
+    Ok(TodoArgs { todos })
+}
+
+/// Segment-aware path glob: `**` matches zero or more whole directories,
+/// `*`/`?` stay inside one segment. `*.rs` matches top-level Rust files only;
+/// `**/*.rs` matches Rust files at any depth.
+pub fn glob_path_match(pattern: &str, path: &str) -> bool {
+    fn match_segments(pattern: &[&str], path: &[&str]) -> bool {
+        match pattern.split_first() {
+            None => path.is_empty(),
+            Some((segment, rest)) if *segment == "**" => {
+                for skip in 0..=path.len() {
+                    if match_segments(rest, &path[skip..]) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Some((segment, rest)) => {
+                let Some(first) = path.split_first() else {
+                    return false;
+                };
+                segment_glob(segment, first.0) && match_segments(rest, first.1)
+            }
+        }
+    }
+    fn segment_glob(pattern: &str, value: &str) -> bool {
+        let pattern: Vec<char> = pattern.chars().collect();
+        let value: Vec<char> = value.chars().collect();
+        let (mut p, mut v) = (0usize, 0usize);
+        let mut star: Option<usize> = None;
+        let mut star_v = 0usize;
+        while v < value.len() {
+            if p < pattern.len() && (pattern[p] == '?' || pattern[p] == value[v]) {
+                p += 1;
+                v += 1;
+            } else if p < pattern.len() && pattern[p] == '*' {
+                star = Some(p);
+                star_v = v;
+                p += 1;
+            } else if let Some(star_p) = star {
+                p = star_p + 1;
+                star_v += 1;
+                v = star_v;
+            } else {
+                return false;
+            }
+        }
+        while p < pattern.len() && pattern[p] == '*' {
+            p += 1;
+        }
+        p == pattern.len()
+    }
+    let pattern: Vec<&str> = pattern.split('/').filter(|part| !part.is_empty()).collect();
+    let path: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    match_segments(&pattern, &path)
 }
 
 /// Parse bounded `{"argv": [...], "timeout_ms"?}` arguments. Argv-only: a
@@ -945,6 +1322,8 @@ impl ToolDriver for WorkspaceTools {
                 | REPO_SEARCH_TOOL
                 | WORKSPACE_PATCH_TOOL
                 | SHELL_EXEC_TOOL
+                | REPO_GLOB_TOOL
+                | TODO_WRITE_TOOL
         ) {
             return Err(ToolStepError::Invalid);
         }
@@ -1025,6 +1404,39 @@ impl ToolDriver for WorkspaceTools {
                         "replace_all": {"type": "boolean", "description": "replace every occurrence"}
                     }),
                     &["path", "old", "new"],
+                ),
+            ),
+            ToolSurface::new(
+                REPO_GLOB_TOOL,
+                "Find workspace files by glob pattern: `**/*.rs` matches at any depth,                  `*.rs` only at the workspace root; results capped at 100. Arguments JSON:                  {\"pattern\":\"**/*.rs\",\"head_limit\":<optional, max 100>}.",
+                arguments_schema(
+                    "Find files by glob pattern",
+                    serde_json::json!({
+                        "pattern": {"type": "string", "description": "glob such as **/*.rs"},
+                        "head_limit": {"type": "integer", "description": "results to return"}
+                    }),
+                    &["pattern"],
+                ),
+            ),
+            ToolSurface::new(
+                TODO_WRITE_TOOL,
+                "Maintain your task list for this workspace: pass the full set of tasks with                  status pending | in_progress | completed | cancelled; entries with an id                  update that task, entries without one are added. Arguments JSON:                  {\"todos\":[{\"id\":\"1\",\"content\":\"...\",\"status\":\"in_progress\"}]}.",
+                arguments_schema(
+                    "Update the task list",
+                    serde_json::json!({
+                        "todos": {"type": "array", "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "content": {"type": "string"},
+                                "status": {"type": "string",
+                                           "enum": ["pending", "in_progress",
+                                                    "completed", "cancelled"]}
+                            },
+                            "required": ["content", "status"]
+                        }, "description": "full task list (merge-by-id)"}
+                    }),
+                    &["todos"],
                 ),
             ),
             ToolSurface::new(
@@ -2204,7 +2616,127 @@ mod tests {
     }
 
     #[test]
-    fn tool_surface_advertises_all_six_tools_with_json_schemas() {
+    fn repo_glob_matches_patterns_and_caps_results() {
+        let root = TempRoot::new("glob");
+        fs::create_dir_all(root.0.join("src/deep")).expect("mkdir");
+        fs::write(root.0.join("a.rs"), "a").expect("seed");
+        fs::write(root.0.join("b.txt"), "b").expect("seed");
+        fs::write(root.0.join("src/c.rs"), "c").expect("seed");
+        fs::write(root.0.join("src/deep/d.rs"), "d").expect("seed");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        // `*.rs` matches only the top level.
+        let call = make_call("c1", REPO_GLOB_TOOL, r#"{"pattern":"*.rs"}"#);
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("a.rs"), "{summary}");
+                assert!(!summary.contains("c.rs"), "star must not cross directories: {summary}");
+            }
+            other => panic!("expected glob success, got {other:?}"),
+        }
+
+        // `**/*.rs` matches at any depth, sorted, all three.
+        let call = make_call("c2", REPO_GLOB_TOOL, r#"{"pattern":"**/*.rs"}"#);
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("a.rs") && summary.contains("c.rs") && summary.contains("d.rs"));
+            }
+            other => panic!("expected deep glob success, got {other:?}"),
+        }
+
+        // No match is a typed empty result; bad bounds are handled failures.
+        let call = make_call("c3", REPO_GLOB_TOOL, r#"{"pattern":"*.zig"}"#);
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("no files match"));
+            }
+            other => panic!("expected empty glob, got {other:?}"),
+        }
+        let call = make_call("c4", REPO_GLOB_TOOL, r#"{"pattern":"*.rs","head_limit":0}"#);
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("handled") {
+            ToolStepResult::Failed { handled, .. } => assert!(handled),
+            other => panic!("expected bound refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn glob_path_match_semantics() {
+        assert!(glob_path_match("*", "a.txt"));
+        assert!(!glob_path_match("*", "src/a.txt"), "* stays in one segment");
+        assert!(glob_path_match("**", "src/deep/a.rs"));
+        assert!(glob_path_match("**/*.rs", "src/deep/a.rs"));
+        assert!(glob_path_match("**/*.rs", "a.rs"), "star-star matches zero segments");
+        assert!(glob_path_match("src/*.rs", "src/a.rs"));
+        assert!(!glob_path_match("src/*.rs", "other/a.rs"));
+        assert!(glob_path_match("src/?.rs", "src/a.rs"));
+        assert!(!glob_path_match("src/?.rs", "src/ab.rs"));
+    }
+
+    #[test]
+    fn todo_write_merges_by_id_and_persists() {
+        let root = TempRoot::new("todo");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        // First write: two tasks without ids.
+        let call = make_call(
+            "c1",
+            TODO_WRITE_TOOL,
+            r#"{"todos":[{"content":"scan tests","status":"completed"},{"content":"fix bug","status":"in_progress"}]}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("2 task(s)"), "{summary}");
+                assert!(summary.contains("→ fix bug"), "{summary}");
+            }
+            other => panic!("expected todo success, got {other:?}"),
+        }
+
+        // Second write: update by id and add a third task.
+        let call = make_call(
+            "c2",
+            TODO_WRITE_TOOL,
+            r#"{"todos":[{"id":"2","content":"fix bug","status":"completed"},{"content":"write docs","status":"pending"}]}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("3 task(s)"), "{summary}");
+                assert!(summary.contains("0 in_progress"), "{summary}");
+            }
+            other => panic!("expected merge success, got {other:?}"),
+        }
+        let persisted = fs::read_to_string(root.0.join(TODOS_PATH)).expect("persisted");
+        let value: serde_json::Value = serde_json::from_str(&persisted).expect("json");
+        let todos = value["todos"].as_array().expect("todos array");
+        assert_eq!(todos.len(), 3);
+        assert_eq!(todos[1]["id"], "2");
+        assert_eq!(todos[1]["status"], "completed");
+
+        // Unknown statuses and empty content are handled per-call failures.
+        for arguments in [
+            r#"{"todos":[{"content":"x","status":"done"}]}"#,
+            r#"{"todos":[{"content":"","status":"pending"}]}"#,
+            r#"{"todos":[]}"#,
+            r#"{"items":[]}"#,
+        ] {
+            let call = make_call("c3", TODO_WRITE_TOOL, arguments);
+            let validated = tools.validate(&call, &cancel).expect("known tool validates");
+            match tools.execute(&validated, &cancel).expect("handled") {
+                ToolStepResult::Failed { handled, .. } => assert!(handled, "{arguments}"),
+                other => panic!("expected handled refusal for {arguments}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn tool_surface_advertises_all_eight_tools_with_json_schemas() {
         let root = TempRoot::new("surface");
         let tools = ExecTools::workspace(&root.0).expect("tools");
         let surface = tools.tool_surface();
@@ -2217,6 +2749,8 @@ mod tests {
                 REPO_READ_TOOL,
                 REPO_SEARCH_TOOL,
                 WORKSPACE_PATCH_TOOL,
+                REPO_GLOB_TOOL,
+                TODO_WRITE_TOOL,
                 SHELL_EXEC_TOOL,
             ]
         );
@@ -2239,6 +2773,8 @@ mod tests {
         assert_eq!(tool_kind(WORKSPACE_WRITE_TOOL), ToolKind::Write);
         assert_eq!(tool_kind(WORKSPACE_PATCH_TOOL), ToolKind::Write);
         assert_eq!(tool_kind(SHELL_EXEC_TOOL), ToolKind::Write);
+        assert_eq!(tool_kind(REPO_GLOB_TOOL), ToolKind::Read);
+        assert_eq!(tool_kind(TODO_WRITE_TOOL), ToolKind::Write);
         assert_eq!(tool_kind("unknown"), ToolKind::Write, "unknown tools stay write-class");
     }
 }

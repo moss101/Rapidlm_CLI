@@ -1165,12 +1165,28 @@ mod tests {
             let mut workers: Vec<JoinHandle<()>> = Vec::new();
             while !thread_cancel.is_cancelled() {
                 match listener.accept() {
-                    Ok((stream, _)) => {
-                        let handler = Arc::clone(&on_conn);
-                        if let Ok(handle) = thread::Builder::new()
-                            .name("scripted-ipc-conn".to_owned())
-                            .spawn(move || handler(stream))
-                        {
+                    Ok((mut stream, _)) => {
+                        // The accepted stream can inherit the listener's
+                        // non-blocking state (platform-dependent), which makes
+                        // the handler's first read fail while the client's
+                        // request is still in flight. Restore blocking mode.
+                        let _ = stream.set_nonblocking(false);
+                        // Spawn failure must never silently drop the accepted
+                        // connection: under thread pressure that raced the
+                        // client's read and flaked tests. Duplicate the fd so
+                        // the fallback keeps the original stream.
+                        let peer = stream.try_clone().ok();
+                        let inline = peer.is_none();
+                        let spawned = peer.and_then(|peer| {
+                            let handler = Arc::clone(&on_conn);
+                            thread::Builder::new()
+                                .name("scripted-ipc-conn".to_owned())
+                                .spawn(move || handler(peer))
+                                .ok()
+                        });
+                        if inline {
+                            on_conn(stream);
+                        } else if let Some(handle) = spawned {
                             workers.push(handle);
                         }
                     }
@@ -1417,7 +1433,12 @@ mod tests {
             hits_thread.fetch_add(1, Ordering::SeqCst);
             let body = match read_frame(&mut stream, MAX_FRAME_BYTES) {
                 Ok(body) => body,
-                Err(_) => return,
+                Err(err) => {
+                    // Diagnose instead of silently dropping: report WHY the
+                    // frame was not read.
+                    let _ = tx.send(format!("read_err:{err:?}"));
+                    return;
+                }
             };
             let parsed: Value = serde_json::from_slice(&body).expect("json");
             let id = parsed["id"].as_str().unwrap_or_default().to_owned();
@@ -1443,8 +1464,14 @@ mod tests {
             }
             other => panic!("expected unknown outcome, got {other:?}"),
         }
-        let recorded = rx.recv_timeout(Duration::from_secs(10)).expect("recorded");
-        assert!(recorded.starts_with("submit_turn:"));
+        // Wait as long as the client's own I/O deadline: under parallel test
+        // load the scripted worker may only be scheduled late, but it always
+        // runs (spawn failure falls back to inline handling above).
+        let recorded = rx.recv_timeout(Duration::from_secs(30)).expect("recorded");
+        assert!(
+            recorded.starts_with("submit_turn:"),
+            "recorded: {recorded}"
+        );
         thread::sleep(Duration::from_millis(50));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }

@@ -14,6 +14,8 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
+# regex: repo.search regex mode + repo.glob pattern matching (Claude parity).
+regex = "1"
 # agent-runtime: canonical AgentExecutor + ContextController/ContextRetryPolicy
 # recovery seam. The composition root is the host that owns live context.
 agent-runtime = { path = "../../crates/agent-runtime" }
