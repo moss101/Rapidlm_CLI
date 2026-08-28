@@ -32,10 +32,10 @@ pub use transport::{
     ClientCapabilities, DEFAULT_IO_TIMEOUT, HttpAuthScope, HttpConnectRequest, HttpRequest,
     HttpResponse, ImplementationInfo, IoBounds, LoopbackTransport, MAX_FRAME_BYTES,
     MAX_IMPLEMENTATION_NAME_BYTES, MAX_IMPLEMENTATION_VERSION_BYTES, MAX_IO_TIMEOUT,
-    MAX_MCP_SESSION_ID_BYTES, MCP_PRIOR_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION, McpSession,
-    McpSessionId, McpTransport, NegotiatedHandshake, ProtocolVersion, SECRET_TARGET_PREFIX,
-    ServerCapabilities, StdioTransport, StreamableHttpIo, StreamableHttpTransport, TransportError,
-    TransportKind,
+    MAX_MCP_SESSION_ID_BYTES, MCP_PRIOR_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION,
+    McpToolCallOutput, McpToolDescriptor, McpSession, McpSessionId, McpTransport,
+    NegotiatedHandshake, ProtocolVersion, SECRET_TARGET_PREFIX, ServerCapabilities,
+    StdioTransport, StreamableHttpIo, StreamableHttpTransport, TransportError, TransportKind,
 };
 pub use trust::{
     EndpointFingerprint, MAX_ALLOWED_CAPABILITIES, MAX_ALLOWED_TOOLS, MAX_FINGERPRINT_BYTES,
