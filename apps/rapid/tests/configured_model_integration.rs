@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use agent_runtime::{CancellationToken, ModelStepError, ModelStepOutput};
+use agent_runtime::{CancellationToken, FailureCause, ModelStepError, ModelStepOutput};
 use auth::InMemoryCredentialStore;
 use rapid::host::{LiveModelCall, PreservedLiveContext, UnconfiguredModel, build_packet};
 use rapid::model::{ConfiguredModel, SelectedModel};
@@ -141,7 +141,7 @@ fn configured_model_step_reaches_loopback_openai_server() {
             .expect("preserved");
     let packet = build_packet(&preserved, None).expect("packet");
     let output = model
-        .step(packet.blocks(), &[], &CancellationToken::new())
+        .step(packet.blocks(), &[], &[], &CancellationToken::new())
         .expect("step");
     match output {
         ModelStepOutput::Terminal { text, tokens } => {
@@ -167,7 +167,7 @@ fn configured_model_step_parses_sse_stream() {
     let preserved = PreservedLiveContext::new("goal", Vec::new(), "", "", 1024, 64).expect("p");
     let packet = build_packet(&preserved, None).expect("packet");
     let output = model
-        .step(packet.blocks(), &[], &CancellationToken::new())
+        .step(packet.blocks(), &[], &[], &CancellationToken::new())
         .expect("step");
     match output {
         ModelStepOutput::Terminal { text, tokens } => {
@@ -189,9 +189,15 @@ fn provider_auth_failure_is_a_typed_step_failure() {
     let preserved = PreservedLiveContext::new("goal", Vec::new(), "", "", 1024, 64).expect("p");
     let packet = build_packet(&preserved, None).expect("packet");
     let err = model
-        .step(packet.blocks(), &[], &CancellationToken::new())
+        .step(packet.blocks(), &[], &[], &CancellationToken::new())
         .expect_err("typed failure");
-    assert_eq!(err, ModelStepError::Failed);
+    // A 401 keeps its cause class instead of collapsing into a bare failure.
+    assert_eq!(
+        err,
+        ModelStepError::ProviderFailed {
+            cause: FailureCause::Auth
+        }
+    );
 }
 
 #[test]
@@ -224,7 +230,7 @@ fn anthropic_provider_builds_and_reaches_the_loopback_server() {
     let preserved = PreservedLiveContext::new("goal", Vec::new(), "", "", 1024, 64).expect("p");
     let packet = build_packet(&preserved, None).expect("packet");
     let output = model
-        .step(packet.blocks(), &[], &CancellationToken::new())
+        .step(packet.blocks(), &[], &[], &CancellationToken::new())
         .expect("step");
     match output {
         ModelStepOutput::Terminal { text, tokens } => {
@@ -354,7 +360,7 @@ fn selection_is_unconfigured_when_no_config_exists_anywhere() {
         ModelSelection::Configured { .. } => panic!("unexpected configured selection"),
     };
     let err = selected
-        .step(&[], &[], &CancellationToken::new())
+        .step(&[], &[], &[], &CancellationToken::new())
         .expect_err("typed fallback");
     assert_eq!(err, ModelStepError::Failed);
 }

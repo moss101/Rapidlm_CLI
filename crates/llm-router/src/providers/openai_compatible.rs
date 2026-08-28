@@ -390,7 +390,7 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
 
         let addrs = (parsed.host.as_str(), parsed.port)
             .to_socket_addrs()
-            .map_err(|_| ProviderError::Transient)?;
+            .map_err(|_| ProviderError::Connection)?;
         let mut selected = None;
         for addr in addrs {
             cancel.check()?;
@@ -401,7 +401,7 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
                 selected = Some(addr);
             }
         }
-        let addr = selected.ok_or(ProviderError::Transient)?;
+        let addr = selected.ok_or(ProviderError::Connection)?;
 
         let token = self.auth.bearer_token(request.credential, cancel)?;
         if token
@@ -413,12 +413,12 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
 
         cancel.check()?;
         let tcp = TcpStream::connect_timeout(&addr, self.timeout)
-            .map_err(|_| ProviderError::Transient)?;
+            .map_err(|_| ProviderError::Connection)?;
         tcp.set_read_timeout(Some(slice_timeout(self.timeout)))
-            .map_err(|_| ProviderError::Transient)?;
+            .map_err(|_| ProviderError::Connection)?;
         tcp.set_write_timeout(Some(slice_timeout(self.timeout)))
-            .map_err(|_| ProviderError::Transient)?;
-        tcp.set_nodelay(true).map_err(|_| ProviderError::Transient)?;
+            .map_err(|_| ProviderError::Connection)?;
+        tcp.set_nodelay(true).map_err(|_| ProviderError::Connection)?;
 
         // TLS is negotiated lazily on first write/read against the Mozilla
         // root set; the same deadline/SSRF guards bound the handshake.
@@ -428,7 +428,7 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
                 let server_name = ServerName::try_from(parsed.host.to_string())
                     .map_err(|_| ProviderError::InvalidRequest)?;
                 let connection = ClientConnection::new(Arc::clone(&TLS_CLIENT_CONFIG), server_name)
-                    .map_err(|_| ProviderError::Transient)?;
+                    .map_err(|_| ProviderError::Connection)?;
                 MaybeTlsStream::Tls(Box::new(StreamOwned::new(connection, tcp)))
             }
         };
@@ -1933,7 +1933,7 @@ fn write_all_deadline<S: Read + Write>(
         cancel.check()?;
         check_deadline(deadline)?;
         match stream.write(data) {
-            Ok(0) => return Err(ProviderError::Transient),
+            Ok(0) => return Err(ProviderError::Connection),
             Ok(n) => data = &data[n..],
             Err(err)
                 if matches!(
@@ -1953,18 +1953,18 @@ fn write_all_deadline<S: Read + Write>(
 
 fn check_deadline(deadline: Instant) -> Result<(), ProviderError> {
     if Instant::now() >= deadline {
-        Err(ProviderError::Transient)
+        // A stalled wire is a connection-class failure (check network /
+        // endpoint), distinct from a provider-reported transient condition.
+        Err(ProviderError::Connection)
     } else {
         Ok(())
     }
 }
 
-fn map_io_error(err: std::io::Error) -> ProviderError {
-    match err.kind() {
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => ProviderError::Transient,
-        std::io::ErrorKind::Interrupted => ProviderError::Transient,
-        _ => ProviderError::Transient,
-    }
+fn map_io_error(_err: std::io::Error) -> ProviderError {
+    // Transport I/O failures (broken pipe, reset, read timeout) are
+    // connection-class; Display never echoes the OS error text.
+    ProviderError::Connection
 }
 
 impl Debug for OpenAiCompatibleConfig {
@@ -2898,7 +2898,7 @@ mod tests {
     }
 
     #[test]
-    fn hanging_peer_times_out_as_transient() {
+    fn hanging_peer_times_out_as_connection_failure() {
         let server = FixtureServer::spawn_hanging();
         let store = store_with_canary();
         let transport = Http1Transport::with_limits(
@@ -2920,7 +2920,10 @@ mod tests {
             .invoke_sync(request(false, false), &live())
             .expect_err("hang");
         assert!(
-            matches!(err, ProviderError::Transient | ProviderError::Cancelled),
+            matches!(
+                err,
+                ProviderError::Connection | ProviderError::Transient | ProviderError::Cancelled
+            ),
             "hanging peer must not succeed: {err:?}"
         );
         assert!(

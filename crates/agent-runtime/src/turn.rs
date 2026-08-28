@@ -98,7 +98,52 @@ pub enum TurnError {
 pub enum ModelStepError {
     Cancelled,
     Failed,
+    /// Provider-classified failure. `cause` is operator-actionable and never
+    /// echoes provider bodies or credential material.
+    ProviderFailed { cause: FailureCause },
     BoundExceeded,
+}
+
+/// Operator-actionable class of a provider/model failure. Carried as data so
+/// provider distinctions survive the step → executor → CLI boundary instead
+/// of collapsing into one "failed" status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum FailureCause {
+    /// Credentials were rejected; fix the configured credential.
+    Auth,
+    /// The endpoint could not be reached or the connection broke; fix the
+    /// network or the configured base URL.
+    Connection,
+    /// The provider rejected the request; fix the model id or request shape.
+    Rejected,
+    /// Temporary provider-side condition; the step layer retries within bounds.
+    Transient { retry_after_ms: Option<u64> },
+    /// Cause not provider-classified (internal or unclassified stream failure).
+    Unspecified,
+}
+
+impl FailureCause {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auth => "authentication",
+            Self::Connection => "connection",
+            Self::Rejected => "provider rejection",
+            Self::Transient { .. } => "transient provider condition",
+            Self::Unspecified => "unspecified failure",
+        }
+    }
+
+    /// One-clause operator remedy. Static text only — never payload echo.
+    pub const fn remedy(self) -> &'static str {
+        match self {
+            Self::Auth => "check the configured API credential",
+            Self::Connection => "check network reachability and the configured base_url",
+            Self::Rejected => "check the model id and request shape",
+            Self::Transient { .. } => "bounded retries were exhausted; try again later",
+            Self::Unspecified => "no provider-classified detail is available",
+        }
+    }
 }
 
 /// Tool validate/execute failure that is never a structured model-visible result.
@@ -147,6 +192,7 @@ pub struct ValidatedToolCall {
 pub struct ModelStepInput<'a> {
     step: u32,
     prior_tools: &'a [ToolStepResult],
+    tool_surface: &'a [ToolSurface],
 }
 
 impl<'a> ModelStepInput<'a> {
@@ -155,7 +201,13 @@ impl<'a> ModelStepInput<'a> {
         Self {
             step,
             prior_tools: &[],
+            tool_surface: &[],
         }
+    }
+
+    /// The tool surface the driver advertises to the model for this turn.
+    pub fn tool_surface(&self) -> &'a [ToolSurface] {
+        self.tool_surface
     }
 }
 
@@ -303,6 +355,8 @@ pub struct TurnResult {
     /// Bounded final assistant-visible response, for an `AgentExecutor` to
     /// assemble a canonical `AgentResult`. Independent of `terminal_hash`.
     terminal_output: Option<BoundedAssistantOutput>,
+    /// Provider-classified cause when the turn failed on a model step.
+    failure_cause: Option<FailureCause>,
 }
 
 /// Collaborators and identity for one [`run_turn`].
@@ -338,6 +392,50 @@ pub trait ToolDriver {
         call: &ValidatedToolCall,
         cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError>;
+
+    /// Tools the driver can execute, advertised to the model so providers
+    /// receive them as structured tool schemas. An empty surface means the
+    /// turn sends no tool definitions (refusal stays fail-closed at
+    /// `validate`).
+    fn tool_surface(&self) -> Vec<ToolSurface> {
+        Vec::new()
+    }
+}
+
+/// Model-visible description of one tool a driver can execute. Carried as
+/// data so providers can advertise the driver's surface without the turn
+/// layer knowing tool semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolSurface {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+impl ToolSurface {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn parameters(&self) -> &serde_json::Value {
+        &self.parameters
+    }
 }
 
 /// Bounded sink for kernel turn/model/tool events.
@@ -442,6 +540,7 @@ impl ModelStepError {
         match self {
             Self::Cancelled => "model step cancelled",
             Self::Failed => "model step failed",
+            Self::ProviderFailed { .. } => "model step failed (provider cause)",
             Self::BoundExceeded => "model step bound exceeded",
         }
     }
@@ -656,6 +755,12 @@ impl TurnResult {
     pub fn terminal_output(&self) -> Option<&BoundedAssistantOutput> {
         self.terminal_output.as_ref()
     }
+
+    /// Provider-classified cause when the turn failed on a model step; `None`
+    /// for completed, interrupted, budget/tool, and unclassified stops.
+    pub const fn failure_cause(&self) -> Option<FailureCause> {
+        self.failure_cause
+    }
 }
 
 impl<'a, M, T, E> TurnSpec<'a, M, T, E> {
@@ -791,7 +896,12 @@ where
         return Ok(StepDecision::Stop(stop));
     }
 
-    let input = ModelStepInput { step, prior_tools };
+    let surface = tools.tool_surface();
+    let input = ModelStepInput {
+        step,
+        prior_tools,
+        tool_surface: &surface,
+    };
     let output = match model.step(&input, cancel) {
         Ok(output) => output,
         Err(ModelStepError::Cancelled) => {
@@ -812,10 +922,26 @@ where
                     request_id,
                 },
             )?;
-            return Ok(StepDecision::Stop(fail(
+            return Ok(StepDecision::Stop(fail_with_cause(
                 state,
                 events,
                 TurnStopReason::ModelFailed,
+                Some(FailureCause::Unspecified),
+            )?));
+        }
+        Err(ModelStepError::ProviderFailed { cause }) => {
+            emit(
+                events,
+                TurnEvent::ModelFailed {
+                    turn_id: state.turn_id,
+                    request_id,
+                },
+            )?;
+            return Ok(StepDecision::Stop(fail_with_cause(
+                state,
+                events,
+                TurnStopReason::ModelFailed,
+                Some(cause),
             )?));
         }
         Err(ModelStepError::BoundExceeded) => {
@@ -1171,6 +1297,7 @@ fn complete<E: TurnEventSink>(
         usage: state.usage,
         terminal_hash: terminal_text.map(|text| ArtifactId::from_bytes(text.as_bytes())),
         terminal_output: terminal_text.map(BoundedAssistantOutput::new),
+        failure_cause: None,
     })
 }
 
@@ -1178,6 +1305,18 @@ fn fail<E: TurnEventSink>(
     state: &LoopState,
     events: &mut E,
     reason: TurnStopReason,
+) -> Result<TurnResult, TurnError> {
+    fail_with_cause(state, events, reason, None)
+}
+
+/// Like [`fail`], but records the provider-classified cause that produced the
+/// stop so the executor and CLI can name it. Only provider-caused model stops
+/// carry a cause; budget/tool/empty-response stops do not.
+fn fail_with_cause<E: TurnEventSink>(
+    state: &LoopState,
+    events: &mut E,
+    reason: TurnStopReason,
+    cause: Option<FailureCause>,
 ) -> Result<TurnResult, TurnError> {
     emit(
         events,
@@ -1193,6 +1332,7 @@ fn fail<E: TurnEventSink>(
         usage: state.usage,
         terminal_hash: None,
         terminal_output: None,
+        failure_cause: cause,
     })
 }
 
@@ -1210,6 +1350,7 @@ fn interrupt<E: TurnEventSink>(state: &LoopState, events: &mut E) -> Result<Turn
         usage: state.usage,
         terminal_hash: None,
         terminal_output: None,
+        failure_cause: None,
     })
 }
 
@@ -1525,6 +1666,76 @@ mod tests {
             ),
             cancel,
         )
+    }
+
+    #[test]
+    fn tool_surface_flows_from_the_driver_into_model_input() {
+        struct SurfaceModel {
+            seen: Vec<Vec<String>>,
+        }
+        impl ModelDriver for SurfaceModel {
+            fn step(
+                &mut self,
+                input: &ModelStepInput<'_>,
+                _cancel: &CancellationToken,
+            ) -> Result<ModelStepOutput, ModelStepError> {
+                self.seen.push(
+                    input
+                        .tool_surface()
+                        .iter()
+                        .map(|entry| entry.name().to_owned())
+                        .collect(),
+                );
+                Ok(ModelStepOutput::Terminal {
+                    text: "done".to_owned(),
+                    tokens: 1,
+                })
+            }
+        }
+        struct SurfacedTools(ScriptedTools);
+        impl ToolDriver for SurfacedTools {
+            fn validate(
+                &mut self,
+                call: &ProposedToolCall,
+                cancel: &CancellationToken,
+            ) -> Result<ValidatedToolCall, ToolStepError> {
+                self.0.validate(call, cancel)
+            }
+
+            fn execute(
+                &mut self,
+                call: &ValidatedToolCall,
+                cancel: &CancellationToken,
+            ) -> Result<ToolStepResult, ToolStepError> {
+                self.0.execute(call, cancel)
+            }
+
+            fn tool_surface(&self) -> Vec<ToolSurface> {
+                vec![ToolSurface::new(
+                    "t.one",
+                    "does one thing",
+                    serde_json::json!({"type": "object"}),
+                )]
+            }
+        }
+        let mut model = SurfaceModel { seen: Vec::new() };
+        let mut tools = SurfacedTools(ScriptedTools::new(Vec::new()));
+        let mut events = Vec::new();
+        let result = run_turn(
+            TurnSpec::new(
+                TurnId::new(),
+                SessionId::new(),
+                AgentId::new(),
+                TurnBudget::unlimited_steps(),
+                &mut model,
+                &mut tools,
+                &mut events,
+            ),
+            &CancellationToken::new(),
+        )
+        .expect("turn");
+        assert_eq!(result.status(), TurnStatus::Completed);
+        assert_eq!(model.seen, vec![vec!["t.one".to_owned()]]);
     }
 
     #[test]

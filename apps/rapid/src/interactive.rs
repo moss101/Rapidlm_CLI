@@ -36,13 +36,15 @@ use tui::{
 
 use crate::goal_host::{EVIDENCE_FILE, GOAL_FILE, SESSIONS_DB_FILE, GoalHost};
 use crate::headless::jsonl::JsonlExitCode;
-use crate::host::{NoopTools, PreservedLiveContext, UnconfiguredModel, run_live_exec};
+use crate::exec_tools::ExecTools;
+use crate::host::{PreservedLiveContext, StepDiag, UnconfiguredModel, run_live_exec};
 use crate::model::{ConfiguredModel, SelectedModel};
 use crate::user_config::ModelSelection;
 use agent_runtime::{
-    AgentExecutionRequest, AgentRole, AgentSpec, AgentTerminalStatus, ContextRetryPolicy,
-    EvidenceKind, EvidenceLedgerRef, EvidenceProducer, EvidenceSpec, EvidenceStatus, GoalActor,
-    GoalBudget, GoalCommand, GoalSnapshot, GoalSpec, GoalState, TEST_PASSED,
+    AgentExecutionRequest, AgentResult, AgentRole, AgentSpec, AgentTerminalStatus,
+    ContextRetryPolicy, EvidenceKind, EvidenceLedgerRef, EvidenceProducer, EvidenceSpec,
+    EvidenceStatus, FailureCause, GoalActor, GoalBudget, GoalCommand, GoalSnapshot, GoalSpec,
+    GoalState, TEST_PASSED,
 };
 
 /// Bound on ancestors inspected while locating `.rapidlm` / `.git`.
@@ -761,16 +763,86 @@ fn apply_reminder_floor(
     active
 }
 
+/// Parsed `rapid exec` command line: the prompt plus the opt-in diagnostics
+/// flag. `--verbose` is a flag anywhere in the args, never prompt text.
+struct ExecArgs {
+    prompt: String,
+    verbose: bool,
+}
+
+fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
+    let mut verbose = false;
+    let mut words: Vec<&str> = Vec::new();
+    for arg in args {
+        if arg == "--verbose" {
+            verbose = true;
+        } else {
+            words.push(arg);
+        }
+    }
+    let prompt = words.join(" ");
+    if prompt.is_empty() {
+        return None;
+    }
+    Some(ExecArgs { prompt, verbose })
+}
+
+/// Locate the project for `rapid exec` from the process cwd and look up its
+/// trust status. Any resolution failure stays fail-closed: the caller treats
+/// "unknown" like untrusted.
+fn exec_workspace(cancel: &CancellationToken) -> Option<(PathBuf, TrustStatus)> {
+    let cwd = std::env::current_dir().ok()?;
+    let cwd = canonicalize_dir(&cwd).ok()?;
+    let root = detect_project_root(&cwd, cancel).ok()?;
+    let identity = ProjectIdentity::new(root.as_path(), None).ok()?;
+    let user_home = exec_user_home()?;
+    let trust = ProjectTrustStore::open(user_home.join(TRUST_CATALOG_NAME))
+        .get(&identity, cancel)
+        .ok()?;
+    Some((root, trust))
+}
+
+/// Resolve the RapidLM home directory from the process environment, mirroring
+/// the interactive `resolve_user_home` precedence: `RAPIDLM_HOME` names the
+/// home itself, `HOME`/`USERPROFILE` its parent.
+fn exec_user_home() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var(RAPIDLM_HOME_ENV)
+        && !home.is_empty()
+    {
+        return canonicalize_or_create(Path::new(&home)).ok();
+    }
+    for key in [HOME_ENV, USERPROFILE_ENV] {
+        if let Ok(home) = std::env::var(key)
+            && !home.is_empty()
+        {
+            return canonicalize_or_create(&PathBuf::from(home).join(".rapidlm")).ok();
+        }
+    }
+    None
+}
+
+/// Cause-classified failure line for a finished turn: a provider cause names
+/// the class and the first remedy; without one the terminal status stands
+/// alone (bounds, interrupts, tool failures).
+fn describe_turn_failure(result: &AgentResult, cause: Option<FailureCause>) -> String {
+    match cause {
+        Some(cause) => format!("agent turn failed: {}; {}", cause.as_str(), cause.remedy()),
+        None => format!("agent turn failed: {}", result.status().as_str()),
+    }
+}
+
 /// Build the live-context host around the prompt and run one agent turn through
 /// the recovery-capable executor. The backing model is resolved Grok-style:
 /// `RAPIDLM_CONFIG`/`RAPIDLM_MODEL` env overrides, then the user config file,
 /// then the typed unconfigured fallback (a model step stays a typed provider
-/// failure — never a synthetic completion).
+/// failure — never a synthetic completion). Workspace file tools are granted
+/// only when the project is explicitly trusted; anything else stays a
+/// fail-closed refusal. `--verbose` opts into bounded step diagnostics.
 fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
-    let prompt = args.join(" ");
-    if prompt.is_empty() {
+    let Some(parsed) = parse_exec_args(args) else {
         return Err(InteractiveError::Usage);
-    }
+    };
+    let prompt = parsed.prompt;
     let preserved = PreservedLiveContext::new(
         prompt.clone(),
         Vec::new(),
@@ -809,14 +881,28 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
     let cancel = agent_runtime::CancellationToken::new();
     let mut events: Vec<agent_runtime::TurnEvent> = Vec::new();
 
+    // Tools stay fail-closed: workspace file tools are granted only when the
+    // project is explicitly trusted and its root still resolves; every other
+    // surface refuses all proposed tool calls.
+    let workspace_cancel = CancellationToken::new();
+    let workspace = exec_workspace(&workspace_cancel);
+    let mut tools = match &workspace {
+        Some((root, TrustStatus::Trusted)) => {
+            ExecTools::workspace(root).unwrap_or_else(|_| ExecTools::noop())
+        }
+        _ => ExecTools::noop(),
+    };
+
     // Layered model selection (env overrides > user config > typed fallback).
     // The store outlives the model, which borrows it for the router resolver.
     let credential_store = auth::InMemoryCredentialStore::new();
+    let mut base_url = String::from("unconfigured");
     let backing = match crate::user_config::select_from_process_env_gated() {
         Ok(ModelSelection::Configured { active, warnings }) => {
             for warning in warnings {
                 eprintln!("warning: {warning}");
             }
+            base_url = active.entry.base_url.clone();
             match ConfiguredModel::build(
                 &apply_reminder_floor(*active, reminder_floor),
                 &credential_store,
@@ -837,22 +923,30 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
             return Ok(1);
         }
     };
+    let diag = parsed.verbose.then(|| StepDiag::stderr(&base_url));
     match run_live_exec(
         preserved,
         backing,
         &request,
-        &mut NoopTools,
+        &mut tools,
         &mut events,
         &cancel,
         ContextRetryPolicy::default(),
+        diag,
     ) {
-        Ok((result, tokens)) if result.status() == AgentTerminalStatus::Succeeded => {
-            println!("{}", result.summary());
-            eprintln!("tokens used: {tokens}");
+        Ok(outcome) if outcome.result.status() == AgentTerminalStatus::Succeeded => {
+            println!("{}", outcome.result.summary());
+            eprintln!("tokens used: {}", outcome.tokens);
             Ok(0)
         }
-        Ok((result, _tokens)) => {
-            eprintln!("agent turn failed: {}", result.status().as_str());
+        Ok(outcome) => {
+            let mut message = describe_turn_failure(&outcome.result, outcome.failure_cause);
+            if outcome.failure_cause.is_none()
+                && !matches!(&workspace, Some((_, TrustStatus::Trusted)))
+            {
+                message.push_str(" (workspace tools are disabled: project is not trusted)");
+            }
+            eprintln!("{message}");
             Ok(1)
         }
         Err(err) => {

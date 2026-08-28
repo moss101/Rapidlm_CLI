@@ -18,11 +18,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use agent_runtime::{
-    AgentExecutionError, AgentExecutionRequest, AgentExecutor, AgentResult, CancellationToken,
-    ContextController, ContextOverflow, ContextRecoveryDecision, ContextRetryPolicy,
-    ContextRevision, ModelDriver, ModelStepError, ModelStepInput, ModelStepOutput,
-    ProposedToolCall, ToolDriver, ToolStepError, ToolStepResult, TurnAgentExecutor, TurnEventSink,
-    ValidatedToolCall,
+    AgentExecutionError, AgentExecutionRequest, AgentExecutor, AgentOutcome, AgentResult,
+    CancellationToken, ContextController, ContextOverflow, ContextRecoveryDecision,
+    ContextRetryPolicy, ContextRevision, FailureCause, ModelDriver, ModelStepError, ModelStepInput,
+    ModelStepOutput, ProposedToolCall, ToolDriver, ToolStepError, ToolStepResult, ToolSurface,
+    TurnAgentExecutor, TurnEventSink, ValidatedToolCall,
 };
 use context_engine::CancellationToken as CeCancel;
 use context_engine::compact::compact_packet;
@@ -49,6 +49,19 @@ pub const MAX_ARTIFACTS: usize = 64;
 pub const MAX_COMPACTION_SUMMARY: usize = 8 * 1024;
 /// Byte cap for the rendered active-reminders block.
 pub const MAX_REMINDERS_BLOCK_BYTES: usize = 8 * 1024;
+
+/// Maximum retry attempts for a transient-class step failure; a turn makes at
+/// most `MAX_TRANSIENT_RETRIES + 1` step invocations per model step.
+pub const MAX_TRANSIENT_RETRIES: u32 = 3;
+/// Base backoff before the first retry; doubled per subsequent retry.
+pub const RETRY_BACKOFF_BASE_MS: u64 = 250;
+/// Backoff waits are polled in slices of this size so cancellation stays
+/// responsive without busy-spinning.
+const RETRY_SLEEP_SLICE_MS: u64 = 50;
+/// Maximum retained diagnostics lines per run; further lines are dropped.
+pub const MAX_DIAG_LINES: usize = 256;
+/// Maximum bytes for the endpoint host label in diagnostics lines.
+pub const MAX_DIAG_HOST_BYTES: usize = 128;
 
 /// Typed host-construction failure. Display never echoes block text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -168,11 +181,14 @@ impl LiveContext {
 }
 
 /// Provider-adapter contract: produce one model step from the live context.
+/// `tool_surface` is what the turn's tool driver advertises for structured
+/// tool schemas (empty = no tools advertised).
 pub trait LiveModelCall {
     fn step(
         &mut self,
         blocks: &[ContextBlock],
         prior_tools: &[ToolStepResult],
+        tool_surface: &[ToolSurface],
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError>;
 }
@@ -194,8 +210,12 @@ impl<B: LiveModelCall> ModelDriver for LiveContextModelDriver<B> {
             return Err(ModelStepError::Cancelled);
         }
         let live = self.live.borrow();
-        self.backing
-            .step(live.packet().blocks(), input.prior_tools(), cancel)
+        self.backing.step(
+            live.packet().blocks(),
+            input.prior_tools(),
+            input.tool_surface(),
+            cancel,
+        )
     }
 }
 
@@ -297,14 +317,16 @@ impl<B: LiveModelCall> LiveContextHost<B> {
         })
     }
 
-    /// Run one agent turn through the recovery-capable executor.
+    /// Run one agent turn through the recovery-capable executor. The outcome
+    /// carries the provider-classified failure cause, when the turn failed on
+    /// a model step.
     pub fn execute<T, E>(
         &mut self,
         request: &AgentExecutionRequest,
         tools: &mut T,
         events: &mut E,
         cancel: &CancellationToken,
-    ) -> Result<AgentResult, AgentExecutionError>
+    ) -> Result<AgentOutcome, AgentExecutionError>
     where
         T: ToolDriver,
         E: TurnEventSink,
@@ -366,6 +388,7 @@ impl LiveModelCall for UnconfiguredModel {
         &mut self,
         _blocks: &[ContextBlock],
         _prior_tools: &[ToolStepResult],
+        _tool_surface: &[ToolSurface],
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError> {
         if cancel.is_cancelled() {
@@ -376,35 +399,218 @@ impl LiveModelCall for UnconfiguredModel {
     }
 }
 
-/// Accumulates provider-reported usage across the turn's model steps.
-struct CountingModel<B> {
-    inner: B,
-    counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+/// Where bounded diagnostics lines go. `Quiet` is the default (zero output).
+#[derive(Clone)]
+pub enum DiagSink {
+    Quiet,
+    Stderr,
+    Buffer(Rc<RefCell<Vec<String>>>),
 }
 
-impl<B: LiveModelCall> LiveModelCall for CountingModel<B> {
+/// Per-run diagnostics configuration: an endpoint host label plus a sink.
+/// Lines are bounded and never carry prompt text, provider bodies, or
+/// credential material.
+#[derive(Clone)]
+pub struct StepDiag {
+    host: String,
+    sink: DiagSink,
+}
+
+impl StepDiag {
+    /// A disabled sink: every line is dropped, output stays byte-identical
+    /// to a run without diagnostics.
+    pub fn disabled() -> Self {
+        Self {
+            host: String::new(),
+            sink: DiagSink::Quiet,
+        }
+    }
+
+    /// Diagnostics to stderr, labelled with the endpoint host parsed from the
+    /// provider base URL.
+    pub fn stderr(base_url: &str) -> Self {
+        Self {
+            host: diag_host_from_base_url(base_url),
+            sink: DiagSink::Stderr,
+        }
+    }
+
+    /// Diagnostics into a shared buffer (test seam), with the buffer handed
+    /// back for inspection.
+    pub fn buffer(base_url: &str) -> (Self, Rc<RefCell<Vec<String>>>) {
+        let buffer = Rc::new(RefCell::new(Vec::new()));
+        (
+            Self {
+                host: diag_host_from_base_url(base_url),
+                sink: DiagSink::Buffer(Rc::clone(&buffer)),
+            },
+            buffer,
+        )
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    fn line(&self, text: String) {
+        match &self.sink {
+            DiagSink::Quiet => {}
+            DiagSink::Stderr => eprintln!("{text}"),
+            DiagSink::Buffer(buffer) => {
+                let mut buffer = buffer.borrow_mut();
+                if buffer.len() < MAX_DIAG_LINES {
+                    buffer.push(text);
+                }
+            }
+        }
+    }
+}
+
+/// Extract a bounded host label from a provider base URL
+/// (`scheme://host[:port]/...`). Userinfo, path, query, and fragment are
+/// dropped; the label is truncated to [`MAX_DIAG_HOST_BYTES`].
+pub fn diag_host_from_base_url(base_url: &str) -> String {
+    let rest = base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url);
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    host.chars().take(MAX_DIAG_HOST_BYTES).collect()
+}
+
+/// Short outcome tag for a failure cause in diagnostics lines.
+fn cause_tag(cause: FailureCause) -> &'static str {
+    match cause {
+        FailureCause::Auth => "auth",
+        FailureCause::Connection => "connection",
+        FailureCause::Rejected => "rejected",
+        FailureCause::Transient { .. } => "transient",
+        FailureCause::Unspecified => "unspecified",
+        // Future causes stay typed failures and classify as unspecified.
+        _ => "unspecified",
+    }
+}
+
+/// Wait out the bounded backoff before retry `attempt` (0-based), honoring a
+/// provider retry-after hint (never shorter than the doubling backoff) and
+/// staying cancellable in small slices. Returns false when cancelled.
+fn sleep_backoff(cancel: &CancellationToken, attempt: u32, retry_after_ms: Option<u64>) -> bool {
+    let doubling = RETRY_BACKOFF_BASE_MS << attempt.min(16);
+    let wait_ms = retry_after_ms.map_or(doubling, |after| after.max(doubling));
+    let mut waited = 0u64;
+    while waited < wait_ms {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        let slice = RETRY_SLEEP_SLICE_MS.min(wait_ms - waited);
+        std::thread::sleep(std::time::Duration::from_millis(slice));
+        waited += slice;
+    }
+    !cancel.is_cancelled()
+}
+
+/// Step-layer supervision over the provider backing: accumulates
+/// provider-reported tokens, retries transient-class step failures with
+/// bounded backoff (honoring provider retry-after hints and cancellation),
+/// and emits one diagnostics line per attempt when enabled.
+///
+/// Only the model-step invocation itself is retried, and a failed step
+/// proposed no tool calls — so already-committed tool effects are never
+/// replayed by a retry.
+struct SupervisedModel<B> {
+    inner: B,
+    counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    diag: Option<StepDiag>,
+}
+
+impl<B> SupervisedModel<B> {
+    fn diag_attempt(&self, attempt: u32, outcome: &str, tokens: u64) {
+        if let Some(diag) = &self.diag {
+            diag.line(format!(
+                "model step host={} attempt={attempt} outcome={outcome} tokens={tokens}",
+                diag.host()
+            ));
+        }
+    }
+}
+
+impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
     fn step(
         &mut self,
         blocks: &[context_engine::compile::ContextBlock],
         prior_tools: &[agent_runtime::ToolStepResult],
+        tool_surface: &[ToolSurface],
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError> {
-        let output = self.inner.step(blocks, prior_tools, cancel)?;
-        let tokens = match &output {
-            ModelStepOutput::Terminal { tokens, .. } | ModelStepOutput::ToolCalls { tokens, .. } => {
-                *tokens
+        let mut attempt: u32 = 0;
+        loop {
+            let result = self.inner.step(blocks, prior_tools, tool_surface, cancel);
+            match &result {
+                Err(ModelStepError::ProviderFailed {
+                    cause: FailureCause::Transient { retry_after_ms },
+                }) if attempt < MAX_TRANSIENT_RETRIES => {
+                    self.diag_attempt(attempt, "failed:transient", 0);
+                    if !sleep_backoff(cancel, attempt, *retry_after_ms) {
+                        return Err(ModelStepError::Cancelled);
+                    }
+                    attempt += 1;
+                }
+                Err(ModelStepError::ProviderFailed { cause }) => {
+                    let tag = cause_tag(*cause);
+                    self.diag_attempt(attempt, &format!("failed:{tag}"), 0);
+                    return result;
+                }
+                Err(ModelStepError::Failed) => {
+                    self.diag_attempt(attempt, "failed:unspecified", 0);
+                    return result;
+                }
+                Err(ModelStepError::BoundExceeded) => {
+                    self.diag_attempt(attempt, "bound_exceeded", 0);
+                    return result;
+                }
+                Err(ModelStepError::Cancelled) => {
+                    self.diag_attempt(attempt, "cancelled", 0);
+                    return result;
+                }
+                // Future ModelStepError variants stay typed failures (never
+                // panics) and are classified as unspecified.
+                Err(_) => {
+                    self.diag_attempt(attempt, "failed:unspecified", 0);
+                    return result;
+                }
+                Ok(
+                    ModelStepOutput::Terminal { tokens, .. }
+                    | ModelStepOutput::ToolCalls { tokens, .. },
+                ) => {
+                    let tokens = *tokens;
+                    self.counter
+                        .fetch_add(tokens, std::sync::atomic::Ordering::Relaxed);
+                    self.diag_attempt(attempt, "ok", tokens);
+                    return result;
+                }
             }
-        };
-        self.counter
-            .fetch_add(tokens, std::sync::atomic::Ordering::Relaxed);
-        Ok(output)
+        }
     }
+}
+
+/// What one `exec`/`goal` turn produced: the canonical result, the
+/// provider-classified failure cause (when the turn failed on a model step),
+/// and the provider-reported token total.
+#[derive(Clone, Debug)]
+pub struct ExecOutcome {
+    pub result: AgentResult,
+    pub failure_cause: Option<FailureCause>,
+    pub tokens: u64,
 }
 
 /// Production entry used by the CLI `exec`/`goal` command: build the
 /// context-owning host and run one agent turn through the recovery-capable
-/// executor. A real provider adapter is injected as the `backing`. Returns
-/// the result plus the provider-reported token total for the turn.
+/// executor. A real provider adapter is injected as the `backing`. Transient
+/// provider failures are retried at the step layer with bounded backoff;
+/// `diag` opts into bounded per-attempt diagnostics (off by default).
+#[allow(clippy::too_many_arguments)]
 pub fn run_live_exec<B, T, E>(
     preserved: PreservedLiveContext,
     backing: B,
@@ -413,22 +619,39 @@ pub fn run_live_exec<B, T, E>(
     events: &mut E,
     cancel: &CancellationToken,
     policy: ContextRetryPolicy,
-) -> Result<(AgentResult, u64), AgentExecutionError>
+    diag: Option<StepDiag>,
+) -> Result<ExecOutcome, AgentExecutionError>
 where
     B: LiveModelCall,
     T: ToolDriver,
     E: TurnEventSink,
 {
     let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let counting = CountingModel {
+    let turn_diag = diag.clone();
+    let supervised = SupervisedModel {
         inner: backing,
         counter: std::sync::Arc::clone(&counter),
+        diag,
     };
-    let mut host = LiveContextHost::build(preserved, counting, policy)
+    let mut host = LiveContextHost::build(preserved, supervised, policy)
         .map_err(|_| AgentExecutionError::InvalidRequest)?;
-    let result = host.execute(request, tools, events, cancel)?;
+    let outcome = host.execute(request, tools, events, cancel)?;
     let tokens = counter.load(std::sync::atomic::Ordering::Relaxed);
-    Ok((result, tokens))
+    if let Some(diag) = turn_diag {
+        let mut line = format!(
+            "turn outcome={} tokens={tokens}",
+            outcome.result.status().as_str()
+        );
+        if let Some(cause) = outcome.failure_cause {
+            line.push_str(&format!(" cause={}", cause_tag(cause)));
+        }
+        diag.line(line);
+    }
+    Ok(ExecOutcome {
+        result: outcome.result,
+        failure_cause: outcome.failure_cause,
+        tokens,
+    })
 }
 
 /// Compile a live [`ContextPacket`] from preserved state + optional compaction
@@ -475,15 +698,26 @@ mod tests {
     use protocol::{AgentId, SessionId};
     use std::collections::VecDeque;
 
+    /// Scripted backing whose call log is shared across clones, so a test can
+    /// hand the backing to `run_live_exec` by value and still observe how many
+    /// times each step was invoked.
     struct ScriptedBacking {
-        outputs: VecDeque<Result<ModelStepOutput, ModelStepError>>,
-        saw_blocks: Vec<usize>,
+        outputs: Rc<RefCell<VecDeque<Result<ModelStepOutput, ModelStepError>>>>,
+        saw_blocks: Rc<RefCell<Vec<usize>>>,
     }
     impl ScriptedBacking {
         fn new(outputs: Vec<Result<ModelStepOutput, ModelStepError>>) -> Self {
             Self {
-                outputs: outputs.into(),
-                saw_blocks: Vec::new(),
+                outputs: Rc::new(RefCell::new(outputs.into())),
+                saw_blocks: Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+    }
+    impl Clone for ScriptedBacking {
+        fn clone(&self) -> Self {
+            Self {
+                outputs: Rc::clone(&self.outputs),
+                saw_blocks: Rc::clone(&self.saw_blocks),
             }
         }
     }
@@ -491,17 +725,16 @@ mod tests {
         fn step(
             &mut self,
             blocks: &[ContextBlock],
-            prior_tools: &[ToolStepResult],
+            _prior_tools: &[ToolStepResult],
+            _tool_surface: &[ToolSurface],
             cancel: &CancellationToken,
         ) -> Result<ModelStepOutput, ModelStepError> {
             if cancel.is_cancelled() {
                 return Err(ModelStepError::Cancelled);
             }
-            self.saw_blocks.push(blocks.len());
-            if prior_tools.is_empty() {
-                // ignored; scripted outputs drive the scenario
-            }
+            self.saw_blocks.borrow_mut().push(blocks.len());
             self.outputs
+                .borrow_mut()
                 .pop_front()
                 .unwrap_or(Err(ModelStepError::Failed))
         }
@@ -567,7 +800,7 @@ mod tests {
 
     fn run_session(
         mut host: LiveContextHost<ScriptedBacking>,
-    ) -> Result<AgentResult, AgentExecutionError> {
+    ) -> Result<AgentOutcome, AgentExecutionError> {
         let request = AgentExecutionRequest::new(spec(), SessionId::new());
         let mut events = Vec::new();
         host.execute(
@@ -608,7 +841,7 @@ mod tests {
             ContextRetryPolicy::new(2),
         )
         .expect("host");
-        let result = run_session(host).expect("execute");
+        let result = run_session(host).expect("execute").result;
         assert_eq!(
             result.status(),
             agent_runtime::AgentTerminalStatus::Succeeded
@@ -633,7 +866,7 @@ mod tests {
             ContextRetryPolicy::new(2),
         )
         .expect("host");
-        let result = run_session(host).expect("execute");
+        let result = run_session(host).expect("execute").result;
         assert_eq!(result.summary(), "done");
         assert!(result.context_lineage().is_empty());
     }
@@ -664,7 +897,7 @@ mod tests {
         .expect("host");
         // Provider failure is typed `ModelFailed`, never `ContextBoundExceeded`,
         // so the recovery controller is not consulted (no compaction).
-        let result = run_session(host).expect("execute");
+        let result = run_session(host).expect("execute").result;
         assert_eq!(result.status(), agent_runtime::AgentTerminalStatus::Failed);
         assert!(result.context_lineage().is_empty());
     }
@@ -740,7 +973,7 @@ mod tests {
         // a goal/turn reaches the recovery-capable executor end-to-end.
         let request = AgentExecutionRequest::new(spec(), SessionId::new());
         let mut events = Vec::new();
-        let (result, tokens) = run_live_exec(
+        let outcome = run_live_exec(
             preserved(),
             overflow_then_terminal("wired recovery"),
             &request,
@@ -748,13 +981,15 @@ mod tests {
             &mut events,
             &CancellationToken::new(),
             ContextRetryPolicy::new(2),
+            None,
         )
         .expect("execute");
-        assert_eq!(result.summary(), "wired recovery");
-        assert_eq!(tokens, 1, "terminal step's provider tokens are reported");
-        assert_eq!(result.context_lineage().len(), 1);
+        assert_eq!(outcome.result.summary(), "wired recovery");
+        assert_eq!(outcome.tokens, 1, "terminal step's provider tokens are reported");
+        assert_eq!(outcome.failure_cause, None, "success carries no cause");
+        assert_eq!(outcome.result.context_lineage().len(), 1);
         assert_eq!(
-            result.context_lineage()[0].source(),
+            outcome.result.context_lineage()[0].source(),
             "context/live-recovery"
         );
     }
@@ -763,7 +998,7 @@ mod tests {
     fn unconfigured_provider_is_a_typed_failure_not_synthetic_completion() {
         let request = AgentExecutionRequest::new(spec(), SessionId::new());
         let mut events = Vec::new();
-        let (result, tokens) = run_live_exec(
+        let outcome = run_live_exec(
             preserved(),
             UnconfiguredModel,
             &request,
@@ -771,10 +1006,299 @@ mod tests {
             &mut events,
             &CancellationToken::new(),
             ContextRetryPolicy::new(2),
+            None,
         )
         .expect("execute");
-        assert_eq!(result.status(), agent_runtime::AgentTerminalStatus::Failed);
-        assert_eq!(tokens, 0, "failed turns report no provider tokens");
-        assert!(result.context_lineage().is_empty(), "no fake recovery");
+        assert_eq!(outcome.result.status(), agent_runtime::AgentTerminalStatus::Failed);
+        assert_eq!(outcome.tokens, 0, "failed turns report no provider tokens");
+        assert_eq!(
+            outcome.failure_cause,
+            Some(FailureCause::Unspecified),
+            "unconfigured backing is an unspecified provider failure"
+        );
+        assert!(outcome.result.context_lineage().is_empty(), "no fake recovery");
+    }
+
+    #[test]
+    fn transient_step_failure_retries_then_succeeds() {
+        let request = AgentExecutionRequest::new(spec(), SessionId::new());
+        let mut events = Vec::new();
+        // Sequence: transient blip → context overflow (recovery) → terminal ok.
+        let mut outputs = vec![Err(ModelStepError::ProviderFailed {
+            cause: FailureCause::Transient { retry_after_ms: None },
+        })];
+        outputs.push(Err(ModelStepError::BoundExceeded));
+        outputs.push(Ok(ModelStepOutput::Terminal {
+            text: "after transient blip".to_owned(),
+            tokens: 2,
+        }));
+        let backing = ScriptedBacking::new(outputs);
+        let witness = backing.clone();
+        let outcome = run_live_exec(
+            preserved(),
+            backing,
+            &request,
+            &mut CountingTools { executed: 0 },
+            &mut events,
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+        )
+        .expect("transient failure recovers without operator action");
+        assert_eq!(outcome.result.status(), agent_runtime::AgentTerminalStatus::Succeeded);
+        assert_eq!(outcome.result.summary(), "after transient blip");
+        assert_eq!(outcome.failure_cause, None);
+        assert_eq!(
+            witness.saw_blocks.borrow().len(),
+            3,
+            "transient step retried (plus one context recovery)"
+        );
+        assert_eq!(outcome.tokens, 2);
+    }
+
+    #[test]
+    fn exhausted_transient_retries_fail_with_transient_cause() {
+        let request = AgentExecutionRequest::new(spec(), SessionId::new());
+        let mut events = Vec::new();
+        let transient = || {
+            Err(ModelStepError::ProviderFailed {
+                cause: FailureCause::Transient {
+                    retry_after_ms: None,
+                },
+            })
+        };
+        let backing = ScriptedBacking::new(vec![transient(), transient(), transient(), transient(), transient()]);
+        let witness = backing.clone();
+        let outcome = run_live_exec(
+            preserved(),
+            backing,
+            &request,
+            &mut CountingTools { executed: 0 },
+            &mut events,
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+        )
+        .expect("bounded retry exhaustion is a typed Failed result");
+        assert_eq!(outcome.result.status(), agent_runtime::AgentTerminalStatus::Failed);
+        assert_eq!(
+            outcome.failure_cause,
+            Some(FailureCause::Transient { retry_after_ms: None }),
+            "the cause class survives to the CLI boundary"
+        );
+        assert_eq!(
+            witness.saw_blocks.borrow().len(),
+            MAX_TRANSIENT_RETRIES as usize + 1,
+            "initial attempt plus the bounded retries"
+        );
+        assert_eq!(outcome.tokens, 0);
+    }
+
+    #[test]
+    fn non_transient_provider_failure_is_not_retried() {
+        let request = AgentExecutionRequest::new(spec(), SessionId::new());
+        let mut events = Vec::new();
+        let backing = ScriptedBacking::new(vec![
+            Err(ModelStepError::ProviderFailed {
+                cause: FailureCause::Auth,
+            }),
+            Ok(ModelStepOutput::Terminal {
+                text: "never reached".to_owned(),
+                tokens: 1,
+            }),
+        ]);
+        let witness = backing.clone();
+        let outcome = run_live_exec(
+            preserved(),
+            backing,
+            &request,
+            &mut CountingTools { executed: 0 },
+            &mut events,
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+        )
+        .expect("execute");
+        assert_eq!(outcome.result.status(), agent_runtime::AgentTerminalStatus::Failed);
+        assert_eq!(outcome.failure_cause, Some(FailureCause::Auth));
+        assert_eq!(
+            witness.saw_blocks.borrow().len(),
+            1,
+            "auth failures are actionable, never auto-retried"
+        );
+    }
+
+    #[test]
+    fn connection_failure_is_not_retried_and_keeps_its_cause() {
+        let request = AgentExecutionRequest::new(spec(), SessionId::new());
+        let mut events = Vec::new();
+        let backing = ScriptedBacking::new(vec![
+            Err(ModelStepError::ProviderFailed {
+                cause: FailureCause::Connection,
+            }),
+            Ok(ModelStepOutput::Terminal {
+                text: "never reached".to_owned(),
+                tokens: 1,
+            }),
+        ]);
+        let witness = backing.clone();
+        let outcome = run_live_exec(
+            preserved(),
+            backing,
+            &request,
+            &mut CountingTools { executed: 0 },
+            &mut events,
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+        )
+        .expect("execute");
+        assert_eq!(outcome.failure_cause, Some(FailureCause::Connection));
+        assert_eq!(
+            witness.saw_blocks.borrow().len(),
+            1,
+            "connection failures surface immediately"
+        );
+    }
+
+    #[test]
+    fn transient_retry_never_replays_committed_tool_effects() {
+        let call = ProposedToolCall::new("c1", "repo.read", "{}").expect("call");
+        let request = AgentExecutionRequest::new(spec(), SessionId::new());
+        let mut events = Vec::new();
+        let mut tools = CountingTools { executed: 0 };
+        let backing = ScriptedBacking::new(vec![
+            Ok(ModelStepOutput::ToolCalls {
+                calls: vec![call],
+                tokens: 1,
+            }),
+            Err(ModelStepError::ProviderFailed {
+                cause: FailureCause::Transient { retry_after_ms: None },
+            }),
+            Ok(ModelStepOutput::Terminal {
+                text: "recovered after tools".to_owned(),
+                tokens: 2,
+            }),
+        ]);
+        let outcome = run_live_exec(
+            preserved(),
+            backing,
+            &request,
+            &mut tools,
+            &mut events,
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+        )
+        .expect("execute");
+        assert_eq!(outcome.result.status(), agent_runtime::AgentTerminalStatus::Succeeded);
+        assert_eq!(
+            tools.executed, 1,
+            "the committed tool effect ran exactly once; the retry re-asked the model only"
+        );
+    }
+
+    #[test]
+    fn cancellation_during_backoff_stops_the_turn() {
+        // The backing cancels the shared token while failing transiently, so
+        // the retry wait must observe cancellation instead of sleeping on.
+        struct CancelThenTransient;
+        impl LiveModelCall for CancelThenTransient {
+            fn step(
+                &mut self,
+                _blocks: &[ContextBlock],
+                _prior_tools: &[ToolStepResult],
+                _tool_surface: &[ToolSurface],
+                cancel: &CancellationToken,
+            ) -> Result<ModelStepOutput, ModelStepError> {
+                cancel.cancel();
+                Err(ModelStepError::ProviderFailed {
+                    cause: FailureCause::Transient { retry_after_ms: None },
+                })
+            }
+        }
+        let request = AgentExecutionRequest::new(spec(), SessionId::new());
+        let mut events = Vec::new();
+        let outcome = run_live_exec(
+            preserved(),
+            CancelThenTransient,
+            &request,
+            &mut CountingTools { executed: 0 },
+            &mut events,
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+        )
+        .expect("cancel during backoff is a typed cancelled turn");
+        // The backoff observed the cancel and stopped retrying: the turn ends
+        // with a typed Cancelled status, no tokens, no synthetic completion.
+        assert_eq!(
+            outcome.result.status(),
+            agent_runtime::AgentTerminalStatus::Cancelled,
+            "cancellation must end the turn, not error"
+        );
+        assert_eq!(outcome.tokens, 0);
+    }
+
+    #[test]
+    fn diagnostics_capture_host_attempts_outcomes_and_tokens() {
+        let request = AgentExecutionRequest::new(spec(), SessionId::new());
+        let mut events = Vec::new();
+        let mut outputs = vec![Err(ModelStepError::ProviderFailed {
+            cause: FailureCause::Transient { retry_after_ms: None },
+        })];
+        outputs.push(Ok(ModelStepOutput::Terminal {
+            text: "done".to_owned(),
+            tokens: 7,
+        }));
+        let backing = ScriptedBacking::new(outputs);
+        let (diag, lines) = StepDiag::buffer("https://api.example.com/v1");
+        let outcome = run_live_exec(
+            preserved(),
+            backing,
+            &request,
+            &mut CountingTools { executed: 0 },
+            &mut events,
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            Some(diag),
+        )
+        .expect("execute");
+        assert_eq!(outcome.result.summary(), "done");
+        let lines = lines.borrow().clone();
+        assert_eq!(
+            lines.len(),
+            3,
+            "one line per attempt plus the turn summary: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("host=api.example.com")
+                && lines[0].contains("attempt=0")
+                && lines[0].contains("outcome=failed:transient")
+                && lines[0].contains("tokens=0"),
+            "first attempt line: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("attempt=1") && lines[1].contains("outcome=ok tokens=7"),
+            "second attempt line: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("turn outcome=succeeded tokens=7"),
+            "turn line: {}",
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn diagnostics_lines_are_bounded_and_host_labels_never_carry_paths() {
+        let (diag, lines) = StepDiag::buffer("https://user:secret@api.example.com/v1/path?q=1");
+        for index in 0..(MAX_DIAG_LINES + 10) {
+            diag.line(format!("line {index}"));
+        }
+        let lines = lines.borrow().clone();
+        assert_eq!(lines.len(), MAX_DIAG_LINES, "extra lines are dropped, bounded");
+        assert_eq!(diag.host(), "api.example.com", "userinfo and path are stripped");
     }
 }

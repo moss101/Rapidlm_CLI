@@ -24,16 +24,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_runtime::{
-    CancellationToken, ModelStepError, ModelStepOutput, ProposedToolCall, ToolStepResult,
+    CancellationToken, FailureCause, ModelStepError, ModelStepOutput, ProposedToolCall,
+    ToolStepResult, ToolSurface,
 };
 use auth::{CredentialKind, CredentialPut, CredentialStore, InMemoryCredentialStore, SecretRef, SecretValue};
 use context_engine::compile::{ContextBlock, ContextSource};
 use llm_router::credentials::{ProfileId, ProviderProfile};
 use llm_router::phase::ReasoningEffort;
 use llm_router::provider::{
-    CanonicalMessage, CanonicalModelRequest, CatalogRevision, ContentPart, MessageRole, ModelId,
-    ModelPurpose, ModelRequestId, ModelRef, ModelStream, ModelStreamEvent, NormalizedUsage,
-    ProviderCapabilities, ProviderError, ProviderId, ReasoningSupport, UsageFieldSet,
+    CanonicalMessage, CanonicalModelRequest, CanonicalToolSpec, CatalogRevision, ContentPart,
+    MessageRole, ModelId, ModelPurpose, ModelRequestId, ModelRef, ModelStream, ModelStreamEvent,
+    NormalizedUsage, ProviderCapabilities, ProviderError, ProviderId, ReasoningSupport,
+    ToolName, UsageFieldSet,
 };
 use llm_router::providers::anthropic::{
     AnthropicAdapter, AnthropicConfig, AnthropicEndpoint,
@@ -279,12 +281,13 @@ impl LiveModelCall for ConfiguredModel<'_> {
         &mut self,
         blocks: &[ContextBlock],
         prior_tools: &[ToolStepResult],
+        tool_surface: &[ToolSurface],
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError> {
         if cancel.is_cancelled() {
             return Err(ModelStepError::Cancelled);
         }
-        let request = build_request(self, blocks, prior_tools)?;
+        let request = build_request(self, blocks, prior_tools, tool_surface)?;
         // The agent token is checked on entry and exit; the blocking HTTP
         // call itself is bounded by the transport timeout.
         let router_cancel = llm_router::provider::CancellationToken::new();
@@ -312,11 +315,12 @@ impl LiveModelCall for SelectedModel<'_> {
         &mut self,
         blocks: &[ContextBlock],
         prior_tools: &[ToolStepResult],
+        tool_surface: &[ToolSurface],
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError> {
         match self {
-            Self::Configured(model) => model.step(blocks, prior_tools, cancel),
-            Self::Unconfigured(fallback) => fallback.step(blocks, prior_tools, cancel),
+            Self::Configured(model) => model.step(blocks, prior_tools, tool_surface, cancel),
+            Self::Unconfigured(fallback) => fallback.step(blocks, prior_tools, tool_surface, cancel),
         }
     }
 }
@@ -327,6 +331,7 @@ fn build_request(
     model: &ConfiguredModel<'_>,
     blocks: &[ContextBlock],
     prior_tools: &[ToolStepResult],
+    tool_surface: &[ToolSurface],
 ) -> Result<CanonicalModelRequest, ModelStepError> {
     let mut messages = Vec::with_capacity(blocks.len().saturating_add(1));
     for block in blocks {
@@ -370,12 +375,27 @@ fn build_request(
     let catalog_revision =
         CatalogRevision::new(1).map_err(|_| ModelStepError::Failed)?;
     let router_cancel = llm_router::provider::CancellationToken::new();
+    // The driver's tool surface becomes structured provider tool schemas, so
+    // tool-capable models can propose calls through the tool-call channel
+    // instead of prose. Failures here are typed provider failures.
+    let mut tools = Vec::with_capacity(tool_surface.len());
+    for spec in tool_surface {
+        let name = ToolName::parse(spec.name()).map_err(map_provider_error)?;
+        tools.push(
+            CanonicalToolSpec::new(
+                name,
+                spec.description(),
+                spec.parameters().clone(),
+            )
+            .map_err(map_provider_error)?,
+        );
+    }
     let request = CanonicalModelRequest::new(
         request_id,
         model_ref,
         ModelPurpose::Chat,
         messages,
-        Vec::new(),
+        tools,
         model.max_output_tokens,
         catalog_revision,
         TraceContext::root(),
@@ -402,13 +422,31 @@ fn next_request_id() -> Result<ModelRequestId, ModelStepError> {
 
 /// Typed provider → step error mapping. `ContextTooLarge` keeps its meaning
 /// (`BoundExceeded`) so the host's context-recovery loop compacts and retries.
+/// Every other provider failure keeps its operator-actionable cause class;
+/// nothing collapses into an unspecified `Failed`.
 fn map_provider_error(err: ProviderError) -> ModelStepError {
     match err {
         ProviderError::Cancelled => ModelStepError::Cancelled,
         ProviderError::ContextTooLarge | ProviderError::BoundExceeded => {
             ModelStepError::BoundExceeded
         }
-        _ => ModelStepError::Failed,
+        ProviderError::AuthFailed => ModelStepError::ProviderFailed {
+            cause: FailureCause::Auth,
+        },
+        ProviderError::Connection => ModelStepError::ProviderFailed {
+            cause: FailureCause::Connection,
+        },
+        ProviderError::RateLimited { retry_after_ms } => ModelStepError::ProviderFailed {
+            cause: FailureCause::Transient { retry_after_ms },
+        },
+        ProviderError::Transient => ModelStepError::ProviderFailed {
+            cause: FailureCause::Transient { retry_after_ms: None },
+        },
+        ProviderError::InvalidRequest | ProviderError::Permanent | ProviderError::UnknownVariant => {
+            ModelStepError::ProviderFailed {
+                cause: FailureCause::Rejected,
+            }
+        }
     }
 }
 
@@ -436,7 +474,7 @@ fn fold_stream(stream: &ModelStream) -> Result<ModelStepOutput, ModelStepError> 
             }
             ModelStreamEvent::Usage(normalized) => usage = Some(normalized),
             ModelStreamEvent::Completed { usage: normalized, .. } => usage = Some(normalized),
-            ModelStreamEvent::Failed { .. } => return Err(ModelStepError::Failed),
+            ModelStreamEvent::Failed { error } => return Err(map_provider_error(error.clone())),
         }
     }
     let tokens = usage.map(usage_total_tokens).unwrap_or(0);
@@ -593,10 +631,52 @@ mod tests {
             map_provider_error(ProviderError::Cancelled),
             ModelStepError::Cancelled
         );
+    }
+
+    #[test]
+    fn provider_error_mapping_keeps_distinct_cause_classes() {
+        // Auth vs connection vs rejection vs transient must stay distinguishable:
+        // the CLI formats each into its own operator-actionable message.
         assert_eq!(
             map_provider_error(ProviderError::AuthFailed),
-            ModelStepError::Failed
+            ModelStepError::ProviderFailed {
+                cause: FailureCause::Auth
+            }
         );
+        assert_eq!(
+            map_provider_error(ProviderError::Connection),
+            ModelStepError::ProviderFailed {
+                cause: FailureCause::Connection
+            }
+        );
+        assert_eq!(
+            map_provider_error(ProviderError::RateLimited {
+                retry_after_ms: Some(900)
+            }),
+            ModelStepError::ProviderFailed {
+                cause: FailureCause::Transient {
+                    retry_after_ms: Some(900)
+                }
+            }
+        );
+        assert_eq!(
+            map_provider_error(ProviderError::Transient),
+            ModelStepError::ProviderFailed {
+                cause: FailureCause::Transient { retry_after_ms: None }
+            }
+        );
+        for rejected in [
+            ProviderError::InvalidRequest,
+            ProviderError::Permanent,
+            ProviderError::UnknownVariant,
+        ] {
+            assert_eq!(
+                map_provider_error(rejected),
+                ModelStepError::ProviderFailed {
+                    cause: FailureCause::Rejected
+                }
+            );
+        }
     }
 
     #[test]
@@ -674,7 +754,7 @@ mod tests {
         cancel.cancel();
         let packet_blocks: Vec<ContextBlock> = Vec::new();
         let err = configured
-            .step(&packet_blocks, &[], &cancel)
+            .step(&packet_blocks, &[], &[], &cancel)
             .expect_err("cancelled");
         assert_eq!(err, ModelStepError::Cancelled);
     }
@@ -685,7 +765,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let blocks: Vec<ContextBlock> = Vec::new();
         assert_eq!(
-            selected.step(&blocks, &[], &cancel).expect_err("fallback"),
+            selected.step(&blocks, &[], &[], &cancel).expect_err("fallback"),
             ModelStepError::Failed
         );
     }
@@ -710,8 +790,26 @@ mod tests {
         let store = InMemoryCredentialStore::new();
         let active = active("test-model", "http://127.0.0.1:1", "local");
         let configured = ConfiguredModel::build(&active, &store).expect("build");
-        let built = build_request(&configured, blocks, &[]).expect("request");
+        let built = build_request(&configured, blocks, &[], &[]).expect("request");
         assert!(!built.messages().is_empty());
         assert!(built.tools().is_empty());
+    }
+
+    #[test]
+    fn tool_surface_is_advertised_as_provider_tool_schemas() {
+        let store = InMemoryCredentialStore::new();
+        let active = active("test-model", "http://127.0.0.1:1", "local");
+        let configured = ConfiguredModel::build(&active, &store).expect("build");
+        let surface = vec![ToolSurface::new(
+            "workspace.write",
+            "create a file",
+            serde_json::json!({"type": "object", "required": ["path", "content"]}),
+        )];
+        let built =
+            build_request(&configured, &[], &[], &surface).expect("request");
+        assert_eq!(built.tools().len(), 1);
+        assert_eq!(built.tools()[0].name().as_str(), "workspace.write");
+        assert_eq!(built.tools()[0].description(), "create a file");
+        assert!(built.tools()[0].parameters().is_object());
     }
 }

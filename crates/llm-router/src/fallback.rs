@@ -242,7 +242,7 @@ pub fn classify_failure(trigger: &FallbackTrigger) -> FailureClass {
                 retry_after_ms: *retry_after_ms,
             },
             ProviderError::ContextTooLarge => FailureClass::ContextTooLarge,
-            ProviderError::Transient => FailureClass::Transient,
+            ProviderError::Transient | ProviderError::Connection => FailureClass::Transient,
             ProviderError::InvalidRequest
             | ProviderError::BoundExceeded
             | ProviderError::UnknownVariant => FailureClass::Config,

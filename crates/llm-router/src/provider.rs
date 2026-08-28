@@ -172,6 +172,10 @@ pub enum ProviderError {
     ContextTooLarge,
     InvalidRequest,
     Transient,
+    /// The endpoint could not be reached or the transport connection broke
+    /// (DNS, TCP connect, TLS handshake, I/O). Distinct from [`ProviderError::Transient`],
+    /// which is a provider-reported retryable condition on a working wire.
+    Connection,
     Permanent,
     BoundExceeded,
     UnknownVariant,
@@ -500,12 +504,17 @@ impl ProviderError {
             Self::AuthFailed => Some(ErrorCode::ProviderAuthFailed),
             Self::RateLimited { .. } => Some(ErrorCode::ProviderRateLimited),
             Self::ContextTooLarge => Some(ErrorCode::ProviderContextTooLarge),
-            Self::Transient | Self::Permanent => Some(ErrorCode::InternalUnexpected),
+            Self::Transient | Self::Permanent | Self::Connection => {
+                Some(ErrorCode::InternalUnexpected)
+            }
         }
     }
 
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::RateLimited { .. } | Self::Transient)
+        matches!(
+            self,
+            Self::RateLimited { .. } | Self::Transient | Self::Connection
+        )
     }
 
     /// Convert to the public envelope. Cancellation is not an API error.
@@ -516,6 +525,7 @@ impl ProviderError {
             Self::AuthFailed => "Provider authentication failed",
             Self::RateLimited { .. } => "Provider rate limited",
             Self::ContextTooLarge => "Provider context window exceeded",
+            Self::Connection => "Provider connection failed",
             Self::InvalidRequest => return None,
             Self::Transient | Self::Permanent | Self::BoundExceeded | Self::UnknownVariant => {
                 UNKNOWN_INTERNAL_MESSAGE
@@ -535,6 +545,7 @@ impl ProviderError {
             Self::ContextTooLarge => "context_too_large",
             Self::InvalidRequest => "invalid_request",
             Self::Transient => "transient",
+            Self::Connection => "connection",
             Self::Permanent => "permanent",
             Self::BoundExceeded => "bound_exceeded",
             Self::UnknownVariant => "unknown_variant",
@@ -551,6 +562,7 @@ impl fmt::Display for ProviderError {
             Self::ContextTooLarge => "provider context window exceeded",
             Self::InvalidRequest => "provider request is invalid",
             Self::Transient => "provider reported a transient failure",
+            Self::Connection => "provider connection failed",
             Self::Permanent => "provider reported a permanent failure",
             Self::BoundExceeded => "provider object exceeds a documented bound",
             Self::UnknownVariant => "unknown provider schema variant",
@@ -2461,6 +2473,7 @@ fn parse_error_kind(kind: &str) -> Result<ProviderError, ProviderError> {
         "context_too_large" => Ok(ProviderError::ContextTooLarge),
         "invalid_request" => Ok(ProviderError::InvalidRequest),
         "transient" => Ok(ProviderError::Transient),
+        "connection" => Ok(ProviderError::Connection),
         "permanent" => Ok(ProviderError::Permanent),
         "bound_exceeded" => Ok(ProviderError::BoundExceeded),
         "unknown_variant" => Ok(ProviderError::UnknownVariant),

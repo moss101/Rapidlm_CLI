@@ -29,8 +29,8 @@ pub mod goal {
 }
 
 pub use agent_executor::{
-    AgentExecutionError, AgentExecutionRequest, AgentExecutor, DEFAULT_RECOVERY_SOURCE,
-    TurnAgentExecutor,
+    AgentExecutionError, AgentExecutionRequest, AgentExecutor, AgentOutcome,
+    DEFAULT_RECOVERY_SOURCE, TurnAgentExecutor,
 };
 pub use context_recovery::{
     ContextController, ContextOverflow, ContextRecoveryDecision, ContextRecoveryError,
@@ -140,9 +140,9 @@ pub use prompt::{
     core_prefix_hash,
 };
 pub use turn::{
-    BoundedAssistantOutput, MAX_ARGUMENT_BYTES, MAX_CALL_ID_BYTES, MAX_MODEL_STEPS, MAX_TEXT_BYTES,
-    MAX_TOOL_CALLS_PER_STEP, MAX_TOOL_NAME_BYTES, MAX_TURN_EVENTS, ModelDriver, ModelStepError,
-    ModelStepInput, ModelStepOutput, ProposedToolCall, ToolDriver, ToolStepError, ToolStepResult,
-    TurnBudget, TurnError, TurnEvent, TurnEventKind, TurnEventSink, TurnResult, TurnSpec,
-    TurnStatus, TurnStopReason, TurnUsage, ValidatedToolCall, run_turn,
+    BoundedAssistantOutput, FailureCause, MAX_ARGUMENT_BYTES, MAX_CALL_ID_BYTES, MAX_MODEL_STEPS,
+    MAX_TEXT_BYTES, MAX_TOOL_CALLS_PER_STEP, MAX_TOOL_NAME_BYTES, MAX_TURN_EVENTS, ModelDriver,
+    ModelStepError, ModelStepInput, ModelStepOutput, ProposedToolCall, ToolDriver, ToolStepError,
+    ToolStepResult, TurnBudget, TurnError, TurnEvent, TurnEventKind, TurnEventSink, TurnResult,
+    ToolSurface, TurnSpec, TurnStatus, TurnStopReason, TurnUsage, ValidatedToolCall, run_turn,
 };

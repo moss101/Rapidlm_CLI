@@ -24,6 +24,7 @@ use crate::context_recovery::{
     ContextRetryPolicy, RetryOutcome, should_retry,
 };
 use crate::role_profile::RoleToolSurface;
+use crate::turn::{FailureCause};
 use crate::turn::{
     MAX_MODEL_STEPS, ModelDriver, ToolDriver, TurnBudget, TurnError, TurnEventSink, TurnResult,
     TurnSpec, TurnStatus, TurnStopReason, run_turn,
@@ -179,6 +180,9 @@ pub trait AgentExecutor {
     /// [`ContextRetryPolicy`], records a new [`ContextRevision`] in lineage, and
     /// never replays committed tool effects (it fails closed).
     ///
+    /// The outcome carries the provider-classified failure cause so hosts can
+    /// name auth/connection/rejection/transient classes at their boundary.
+    ///
     /// Implementations without a recovery owner fall back to plain [`execute`]
     /// (no recovery) — the default keeps the trait single-authority and safe.
     #[allow(clippy::too_many_arguments)]
@@ -191,7 +195,7 @@ pub trait AgentExecutor {
         tools: &mut T,
         events: &mut E,
         cancel: &CancellationToken,
-    ) -> Result<AgentResult, AgentExecutionError>
+    ) -> Result<AgentOutcome, AgentExecutionError>
     where
         C: ContextController,
         M: ModelDriver,
@@ -200,6 +204,10 @@ pub trait AgentExecutor {
     {
         let _ = (controller, policy);
         self.execute(request, model, tools, events, cancel)
+            .map(|result| AgentOutcome {
+                result,
+                failure_cause: None,
+            })
     }
 }
 
@@ -231,6 +239,16 @@ impl AgentExecutionError {
             | Self::ContextRecovery(_) => Some(protocol::ErrorCode::ProviderContextTooLarge),
         }
     }
+}
+
+/// Canonical execution outcome: the assembled [`AgentResult`] plus the
+/// provider-classified cause when the turn failed on a model step. The cause
+/// rides this in-memory struct — `AgentResult` is a wire type and stays
+/// unchanged.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentOutcome {
+    pub result: AgentResult,
+    pub failure_cause: Option<FailureCause>,
 }
 
 /// Default executor: runs a turn and assembles a canonical `AgentResult`.
@@ -379,7 +397,7 @@ impl AgentExecutor for TurnAgentExecutor {
         tools: &mut T,
         events: &mut E,
         cancel: &CancellationToken,
-    ) -> Result<AgentResult, AgentExecutionError>
+    ) -> Result<AgentOutcome, AgentExecutionError>
     where
         C: ContextController,
         M: ModelDriver,
@@ -390,6 +408,7 @@ impl AgentExecutor for TurnAgentExecutor {
         let mut attempt: u32 = 0;
         loop {
             let (turn, result) = Self::run_once(request, model, tools, events, cancel)?;
+            let cause = turn.failure_cause();
             let overflow = turn.status() == TurnStatus::Failed
                 && turn.reason() == Some(TurnStopReason::ContextBoundExceeded);
             if !overflow {
@@ -397,6 +416,10 @@ impl AgentExecutor for TurnAgentExecutor {
                 // lineage so recovered revisions are reflected in the result.
                 return result
                     .with_context_lineage(lineage)
+                    .map(|bound| AgentOutcome {
+                        result: bound,
+                        failure_cause: cause,
+                    })
                     .map_err(|_| AgentExecutionError::AgentResult);
             }
 
@@ -465,8 +488,8 @@ mod tests {
     use crate::agent::model::{AgentRole, AgentSpec};
     use crate::role_profile::{RoleRegistry, RoleToolClass};
     use crate::turn::{
-        ModelStepError, ModelStepInput, ModelStepOutput, ProposedToolCall, ToolStepError,
-        ValidatedToolCall,
+        FailureCause, ModelStepError, ModelStepInput, ModelStepOutput, ProposedToolCall,
+        ToolStepError, ValidatedToolCall,
     };
     use protocol::{AgentId, WorkspaceViewId};
     use std::collections::VecDeque;
@@ -681,7 +704,7 @@ mod tests {
         model: &mut Model,
         tools: &mut impl ToolDriver,
         cancel: &CancellationToken,
-    ) -> Result<AgentResult, AgentExecutionError> {
+    ) -> Result<AgentOutcome, AgentExecutionError> {
         let mut events = Vec::new();
         TurnAgentExecutor.execute_with_context_recovery(
             request,
@@ -713,7 +736,7 @@ mod tests {
         let request = AgentExecutionRequest::new(spec, SessionId::new());
         let mut controller = RecoveryController::new(ContextRecoveryDecision::Recovered);
         let mut model = terminal("done");
-        let result = run_recovering(
+        let outcome = run_recovering(
             &request,
             &mut controller,
             ContextRetryPolicy::new(2),
@@ -722,10 +745,12 @@ mod tests {
             &CancellationToken::new(),
         )
         .expect("execute");
+        let result = outcome.result;
         assert_eq!(result.status(), AgentTerminalStatus::Succeeded);
         assert_eq!(result.summary(), "done");
         assert_eq!(controller.calls, 0, "no overflow → no recovery consult");
         assert!(result.context_lineage().is_empty(), "lineage unchanged");
+        assert_eq!(outcome.failure_cause, None, "success carries no cause");
         // The bounded terminal output is exposed intact, never truncated.
         assert!(!result.summary().contains("chain-of-thought"));
     }
@@ -737,7 +762,7 @@ mod tests {
         let mut controller = RecoveryController::new(ContextRecoveryDecision::Recovered)
             .rebuilt(ContextRevision::new("context/compacted", None));
         let mut model = overflow_then("after rebuild");
-        let result = run_recovering(
+        let outcome = run_recovering(
             &request,
             &mut controller,
             ContextRetryPolicy::new(2),
@@ -746,6 +771,7 @@ mod tests {
             &CancellationToken::new(),
         )
         .expect("execute");
+        let result = outcome.result;
         assert_eq!(result.status(), AgentTerminalStatus::Succeeded);
         assert_eq!(result.summary(), "after rebuild");
         assert_eq!(controller.calls, 1, "one overflow triggers one recovery");
@@ -819,6 +845,45 @@ mod tests {
     }
 
     #[test]
+    fn recovery_surfaces_provider_failure_cause_on_failed_turns() {
+        let spec = spec(AgentRole::Coder, "implement", "work");
+        let request = AgentExecutionRequest::new(spec, SessionId::new());
+        let mut controller = RecoveryController::new(ContextRecoveryDecision::Recovered);
+        // Each cause class survives to the outcome; the controller is never
+        // consulted for a non-overflow failure.
+        for (cause, expected) in [
+            (FailureCause::Auth, Some(FailureCause::Auth)),
+            (FailureCause::Connection, Some(FailureCause::Connection)),
+            (FailureCause::Rejected, Some(FailureCause::Rejected)),
+            (
+                FailureCause::Transient {
+                    retry_after_ms: Some(1200),
+                },
+                Some(FailureCause::Transient {
+                    retry_after_ms: Some(1200),
+                }),
+            ),
+            (FailureCause::Unspecified, Some(FailureCause::Unspecified)),
+        ] {
+            let mut model = Model {
+                outputs: vec![Err(ModelStepError::ProviderFailed { cause })].into(),
+            };
+            let outcome = run_recovering(
+                &request,
+                &mut controller,
+                ContextRetryPolicy::new(2),
+                &mut model,
+                &mut Tools,
+                &CancellationToken::new(),
+            )
+            .expect("typed failure is an Ok(Failed) outcome");
+            assert_eq!(outcome.result.status(), AgentTerminalStatus::Failed);
+            assert_eq!(outcome.failure_cause, expected);
+            assert_eq!(controller.calls, 0, "no compaction for provider failure");
+        }
+    }
+
+    #[test]
     fn recovery_cancellation_during_rebuild_stops_execution() {
         // Controller reports cancellation → the host stops, never retries.
         let spec = spec(AgentRole::Coder, "implement", "work");
@@ -864,7 +929,7 @@ mod tests {
         let mut controller = RecoveryController::new(ContextRecoveryDecision::Recovered)
             .rebuilt(ContextRevision::new("context/compacted-2", None));
         let mut model = overflow_then("full final answer");
-        let result = run_recovering(
+        let outcome = run_recovering(
             &request,
             &mut controller,
             ContextRetryPolicy::new(2),
@@ -873,6 +938,7 @@ mod tests {
             &CancellationToken::new(),
         )
         .expect("execute");
+        let result = outcome.result;
         assert_eq!(result.summary(), "full final answer");
         assert_eq!(result.context_lineage().len(), 1);
     }
