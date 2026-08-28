@@ -267,3 +267,35 @@ fn real_s4_subagent_explore_task() {
     );
     assert!(run.stdout.contains("BLUE-7"), "final answer must carry the code");
 }
+
+
+#[test]
+fn real_s5_web_fetch_through_the_live_provider() {
+    // web_fetch rides the llm-router GET primitive with the SSRF guard; the
+    // real provider must propose the tool call and relay the extracted text.
+    if std::env::var(REAL_BENCH_ENV).is_err() {
+        return skipped("set RAPIDLM_REAL_BENCH=1 to run against the real model");
+    }
+    let project = match RealProject::new("s5") {
+        Ok(project) => project,
+        Err(reason) => return skipped(&reason),
+    };
+    let run = run_real(
+        &project.project,
+        &project.home,
+        "Use web_fetch to fetch https://example.com and then tell me the page's main          heading. After reporting the heading, create a file named heading.txt containing          just that heading text.",
+        "S5_web_fetch",
+    );
+    assert!(!run.timed_out, "run exceeded {}s: {}", RUN_DEADLINE.as_secs(), run.stderr);
+    assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
+    let content = project.read("heading.txt");
+    assert!(
+        content.contains("Example Domain"),
+        "heading.txt must carry the page heading: {content:?}"
+    );
+    assert!(
+        run.stdout.contains("Example Domain"),
+        "final answer must reference the fetched page: {}",
+        run.stdout
+    )
+}

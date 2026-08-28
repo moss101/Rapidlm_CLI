@@ -11,7 +11,7 @@
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -203,6 +203,7 @@ fn run_bench(
     config_path: &Path,
     scenario: &str,
     prompt: &str,
+    mode: &str,
 ) -> BenchRun {
     let started = Instant::now();
     let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
@@ -210,7 +211,7 @@ fn run_bench(
         .current_dir(project)
         .env("HOME", home)
         .env("RAPIDLM_CONFIG", config_path)
-        .env("RAPIDLM_PERMISSION_MODE", "acceptEdits")
+        .env("RAPIDLM_PERMISSION_MODE", mode)
         .env_remove("RAPIDLM_HOME")
         .env_remove("RAPIDLM_MODEL")
         .output()
@@ -308,6 +309,7 @@ fn bench_a_multi_phase_agentic_task() {
         &config,
         "A_multi_phase",
         "patch all modules and verify",
+        "acceptEdits",
     );
     assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
     assert!(run.stdout.contains("all three modules patched"));
@@ -337,6 +339,56 @@ fn bench_a_multi_phase_agentic_task() {
 }
 
 #[test]
+fn bench_f_drained_notification_reaches_the_provider_request() {
+    // Step 1 starts a background job; step 2 runs a foreground wait long
+    // enough for the job to finish; the step-3 request must carry the drained
+    // notification exchange (synthetic background_jobs call + tool result)
+    // so the model learns the outcome without polling.
+    let server = spawn_scripted_server(vec![
+        sse_tool_calls(&[(
+            "bg1",
+            "shell_exec",
+            r#"{"argv":["sh","-c","echo bg-done-marker"],"background":true,"timeout_ms":30000}"#,
+        )]),
+        sse_tool_calls(&[(
+            "wait1",
+            "shell_exec",
+            r#"{"argv":["sleep","1"],"timeout_ms":30000}"#,
+        )]),
+        sse_terminal("background job finished"),
+    ]);
+    let project = TrustedProject::new("bench-f");
+    let config = config_with(&server, &project);
+    let run = run_bench(
+        &project.project,
+        &project.home,
+        &config,
+        "F_notification",
+        "start a background job, wait a second, then tell me when it is done",
+        "bypassPermissions",
+    );
+    assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
+    assert!(run.stdout.contains("background job finished"), "{}", run.stdout);
+    let requests = server.requests.lock().expect("requests");
+    assert!(requests.len() >= 3, "expected at least three provider requests");
+    let third = &requests[2];
+    std::fs::write("/tmp/bench-f-third-request.txt", third).expect("dump");
+    for (index, request) in requests.iter().enumerate() {
+        let _ = std::fs::write(format!("/tmp/bench-f-all-{index}.txt"), request);
+    }
+    eprintln!("dumped {} requests", requests.len());
+    eprintln!("dumped third request ({} bytes)", third.len());
+    assert!(
+        third.contains("background_jobs"),
+        "synthetic background_jobs call missing from request"
+    );
+    assert!(
+        third.contains("bg-done-marker"),
+        "job output must reach the model without polling"
+    );
+}
+
+#[test]
 fn bench_b_sixteen_calls_at_the_per_step_cap() {
     // One step proposing the maximum 16 reads; every call must execute and
     // return its own result.
@@ -362,6 +414,7 @@ fn bench_b_sixteen_calls_at_the_per_step_cap() {
         &config,
         "B_cap16",
         "read all sixteen files",
+        "acceptEdits",
     );
     assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
     assert!(run.stdout.contains("read them all"));
@@ -391,6 +444,7 @@ fn bench_c_pagination_chain_over_a_long_file() {
         &project.home.join("config.toml"),
         "C_pagination",
         "read the long file in pages",
+        "acceptEdits",
     );
     let _ = config;
     assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
@@ -438,6 +492,7 @@ fn bench_d_verify_pattern_read_edit_reread() {
         &config,
         "D_verify_pattern",
         "edit notes twice with verification reads",
+        "acceptEdits",
     );
     assert_no_loop_stop(&run, "D_verify_pattern");
     assert!(run.stdout.contains("verified through both edits"), "{}", run.stdout);
@@ -474,6 +529,7 @@ fn bench_e_substantial_patch_payload() {
         &config,
         "E_patch_payload",
         "apply the refactor to big.rs",
+        "acceptEdits",
     );
     assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
     assert!(run.stdout.contains("refactor applied"));

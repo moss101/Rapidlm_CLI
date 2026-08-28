@@ -226,6 +226,7 @@ impl JobRegistry {
             .lock()
             .map_err(|_| ToolStepError::Failed)?
             .insert(id.clone(), shared.clone());
+        eprintln!("DEBUG jobs.start: spawning supervisor for {id}");
 
         // Everything the supervisor touches is owned and 'static: the job
         // must outlive the tool call (and even a batch dispatch thread).
@@ -244,7 +245,9 @@ impl JobRegistry {
         let spawned = std::thread::Builder::new()
             .name("rapidlm-job".to_owned())
             .spawn(move || {
+                let _ = std::fs::write("/tmp/supervisor-entered", "yes");
                 let started = Instant::now();
+                eprintln!("DEBUG supervisor entered");
                 // Spawn under the child lock (scoped: the guard must drop
                 // before the loop re-locks to publish the child).
                 let spawned_child = {
@@ -275,10 +278,11 @@ impl JobRegistry {
                 };
                 // Take the pipes first, then publish the child so kill-all and
                 // the supervision loop can see it.
-                let pipes: Vec<Box<dyn Read + Send>> = vec![
+                let pipes: Vec<Box<dyn std::io::Read + Send>> = vec![
                     Box::new(child.stdout.take().expect("stdout piped")),
                     Box::new(child.stderr.take().expect("stderr piped")),
                 ];
+                eprintln!("DEBUG supervisor: child spawned, pipes taken");
                 if let Ok(mut slot) = worker.child.lock() {
                     *slot = Some(child);
                 }
@@ -325,6 +329,7 @@ impl JobRegistry {
                         if let Ok(mut state) = worker.state.lock() {
                             *state = JobState::Completed(status.code().unwrap_or(-1));
                         }
+                        eprintln!("DEBUG supervisor: job completed {}", status.code().unwrap_or(-1));
                         break;
                     }
                     if worker.cancelled.load(Ordering::SeqCst) {
@@ -1110,6 +1115,10 @@ impl WorkspaceTools {
         cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_shell_args(call.arguments())?;
+        eprintln!(
+            "DEBUG execute_shell argv={:?} background={} sandbox={} timeout={:?}",
+            args.argv, args.background, args.sandbox, args.timeout
+        );
         if args.sandbox {
             // Seatbelt confinement (macOS): workspace writes allowed, other
             // writes denied. Unavailability is a typed handled failure.
@@ -2806,9 +2815,10 @@ impl ToolDriver for ExecTools {
         let Self::Workspace(tools) = self else {
             return Vec::new();
         };
-        tools
-            .jobs
-            .drain_notifications()
+        let notices = tools.jobs.drain_notifications();
+        eprintln!("DEBUG ExecTools drain: {} notices", notices.len());
+        notices
+            .into_iter()
             .into_iter()
             .map(|summary| {
                 let job_id = summary.split(':').next().unwrap_or("job").trim().to_owned();
