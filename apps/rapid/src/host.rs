@@ -376,9 +376,35 @@ impl LiveModelCall for UnconfiguredModel {
     }
 }
 
+/// Accumulates provider-reported usage across the turn's model steps.
+struct CountingModel<B> {
+    inner: B,
+    counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<B: LiveModelCall> LiveModelCall for CountingModel<B> {
+    fn step(
+        &mut self,
+        blocks: &[context_engine::compile::ContextBlock],
+        prior_tools: &[agent_runtime::ToolStepResult],
+        cancel: &CancellationToken,
+    ) -> Result<ModelStepOutput, ModelStepError> {
+        let output = self.inner.step(blocks, prior_tools, cancel)?;
+        let tokens = match &output {
+            ModelStepOutput::Terminal { tokens, .. } | ModelStepOutput::ToolCalls { tokens, .. } => {
+                *tokens
+            }
+        };
+        self.counter
+            .fetch_add(tokens, std::sync::atomic::Ordering::Relaxed);
+        Ok(output)
+    }
+}
+
 /// Production entry used by the CLI `exec`/`goal` command: build the
 /// context-owning host and run one agent turn through the recovery-capable
-/// executor. A real provider adapter is injected as the `backing`.
+/// executor. A real provider adapter is injected as the `backing`. Returns
+/// the result plus the provider-reported token total for the turn.
 pub fn run_live_exec<B, T, E>(
     preserved: PreservedLiveContext,
     backing: B,
@@ -387,15 +413,22 @@ pub fn run_live_exec<B, T, E>(
     events: &mut E,
     cancel: &CancellationToken,
     policy: ContextRetryPolicy,
-) -> Result<AgentResult, AgentExecutionError>
+) -> Result<(AgentResult, u64), AgentExecutionError>
 where
     B: LiveModelCall,
     T: ToolDriver,
     E: TurnEventSink,
 {
-    let mut host = LiveContextHost::build(preserved, backing, policy)
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counting = CountingModel {
+        inner: backing,
+        counter: std::sync::Arc::clone(&counter),
+    };
+    let mut host = LiveContextHost::build(preserved, counting, policy)
         .map_err(|_| AgentExecutionError::InvalidRequest)?;
-    host.execute(request, tools, events, cancel)
+    let result = host.execute(request, tools, events, cancel)?;
+    let tokens = counter.load(std::sync::atomic::Ordering::Relaxed);
+    Ok((result, tokens))
 }
 
 /// Compile a live [`ContextPacket`] from preserved state + optional compaction
@@ -707,7 +740,7 @@ mod tests {
         // a goal/turn reaches the recovery-capable executor end-to-end.
         let request = AgentExecutionRequest::new(spec(), SessionId::new());
         let mut events = Vec::new();
-        let result = run_live_exec(
+        let (result, tokens) = run_live_exec(
             preserved(),
             overflow_then_terminal("wired recovery"),
             &request,
@@ -718,6 +751,7 @@ mod tests {
         )
         .expect("execute");
         assert_eq!(result.summary(), "wired recovery");
+        assert_eq!(tokens, 1, "terminal step's provider tokens are reported");
         assert_eq!(result.context_lineage().len(), 1);
         assert_eq!(
             result.context_lineage()[0].source(),
@@ -729,7 +763,7 @@ mod tests {
     fn unconfigured_provider_is_a_typed_failure_not_synthetic_completion() {
         let request = AgentExecutionRequest::new(spec(), SessionId::new());
         let mut events = Vec::new();
-        let result = run_live_exec(
+        let (result, tokens) = run_live_exec(
             preserved(),
             UnconfiguredModel,
             &request,
@@ -740,6 +774,7 @@ mod tests {
         )
         .expect("execute");
         assert_eq!(result.status(), agent_runtime::AgentTerminalStatus::Failed);
+        assert_eq!(tokens, 0, "failed turns report no provider tokens");
         assert!(result.context_lineage().is_empty(), "no fake recovery");
     }
 }

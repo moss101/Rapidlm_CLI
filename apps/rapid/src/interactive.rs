@@ -846,11 +846,12 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
         &cancel,
         ContextRetryPolicy::default(),
     ) {
-        Ok(result) if result.status() == AgentTerminalStatus::Succeeded => {
+        Ok((result, tokens)) if result.status() == AgentTerminalStatus::Succeeded => {
             println!("{}", result.summary());
+            eprintln!("tokens used: {tokens}");
             Ok(0)
         }
-        Ok(result) => {
+        Ok((result, _tokens)) => {
             eprintln!("agent turn failed: {}", result.status().as_str());
             Ok(1)
         }
