@@ -276,6 +276,10 @@ impl TurnAgentExecutor {
     fn summarize(turn: &TurnResult) -> String {
         if let Some(output) = turn.terminal_output() {
             output.text().to_owned()
+        } else if let Some(reason) = turn.reason() {
+            // A failed turn names its typed stop reason so operators and the
+            // model can tell a loop guard trip from a budget or empty stop.
+            format!("agent turn failed: {}", reason.as_str())
         } else {
             format!("agent turn {}", turn.status().as_str())
         }
@@ -981,8 +985,8 @@ mod tests {
         );
         assert_eq!(
             result.summary(),
-            "agent turn failed",
-            "budget exhaustion is not a fabricated success"
+            "agent turn failed: budget_exhausted",
+            "budget exhaustion is typed and named, never a fabricated success"
         );
     }
 

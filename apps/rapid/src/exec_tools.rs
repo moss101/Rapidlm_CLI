@@ -57,8 +57,10 @@ pub const MAX_SEARCH_HEAD_LIMIT: usize = 100;
 pub const MAX_SEARCH_FILES: usize = 2_000;
 /// Hard byte cap on one `repo.search` result payload.
 pub const MAX_SEARCH_OUTPUT_BYTES: usize = 8 * 1024;
-/// Hard byte cap on one `workspace.patch` old/new text.
-pub const MAX_PATCH_TEXT_BYTES: usize = 8 * 1024;
+/// Hard byte cap on one `workspace.patch` old/new text. Two texts plus the
+/// path must fit the per-call argument payload bound (8 KiB), so each text is
+/// capped at 3 KiB.
+pub const MAX_PATCH_TEXT_BYTES: usize = 3 * 1024;
 /// Hard byte cap on one `shell.exec` argv.
 pub const MAX_SHELL_ARGV: usize = 64;
 /// Hard byte cap on one `shell.exec` argv token.
@@ -181,6 +183,37 @@ impl WorkspaceTools {
                 ))),
             });
         }
+        // Argument re-validation: a known tool with malformed or oversized
+        // arguments is a per-call handled failure the model can correct —
+        // never a dead turn. Unknown tools stay structural refusals.
+        if call.arguments().len() > MAX_TOOL_ARGUMENTS_BYTES {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "arguments exceed the {MAX_TOOL_ARGUMENTS_BYTES}-byte bound"
+                ))),
+            });
+        }
+        let arguments_parseable = match call.tool() {
+            WORKSPACE_WRITE_TOOL => parse_write_args(call.arguments()).is_ok(),
+            WORKSPACE_READ_TOOL => parse_path_argument(call.arguments()).is_some(),
+            REPO_READ_TOOL => parse_repo_read_args(call.arguments()).is_ok(),
+            REPO_SEARCH_TOOL => parse_repo_search_args(call.arguments()).is_ok(),
+            WORKSPACE_PATCH_TOOL => parse_patch_args(call.arguments()).is_ok(),
+            SHELL_EXEC_TOOL => parse_shell_args(call.arguments()).is_ok(),
+            _ => return Err(ToolStepError::Invalid),
+        };
+        if !arguments_parseable {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "invalid arguments for {} (JSON with the documented fields and bounds)",
+                    call.tool()
+                ))),
+            });
+        }
         match call.tool() {
             WORKSPACE_WRITE_TOOL => self.execute_write(call, cancel),
             WORKSPACE_READ_TOOL => self.execute_read(call, cancel),
@@ -257,7 +290,25 @@ impl WorkspaceTools {
         let end = start.saturating_add(args.limit).min(line_count);
         let window: Vec<&str> = text.lines().skip(start).take(end - start).collect();
         let mut summary = bounded_text(window.join("\n").as_bytes(), MAX_READ_BYTES);
-        if end < line_count {
+        // When the byte cap cut the page, report the window actually
+        // delivered — the model must never be told it has lines it cannot
+        // see — plus the line to continue from.
+        if summary.contains(TRUNCATION_MARKER) {
+            let delivered_text = summary.strip_suffix(TRUNCATION_MARKER).unwrap_or("");
+            let delivered = if delivered_text.is_empty() {
+                0
+            } else {
+                delivered_text.matches('\n').count() + 1
+            };
+            let delivered_end = start + delivered;
+            summary.push_str(&format!(
+                " (byte cap: lines {}-{} of {} delivered; continue at {})",
+                start + 1,
+                delivered_end,
+                line_count,
+                delivered_end + 1
+            ));
+        } else if end < line_count {
             summary.push_str(&format!(
                 "{TRUNCATION_MARKER} (lines {}-{} of {})",
                 start + 1,
@@ -877,6 +928,29 @@ fn arguments_schema(
 }
 
 impl ToolDriver for WorkspaceTools {
+    fn validate(
+        &mut self,
+        call: &ProposedToolCall,
+        cancel: &CancellationToken,
+    ) -> Result<ValidatedToolCall, ToolStepError> {
+        cancel.check().map_err(|_| ToolStepError::Cancelled)?;
+        // Known tools accept the call here even with malformed arguments:
+        // execute renders the failure as a per-call model-visible result the
+        // model can correct. Unknown tools are structural refusals.
+        if !matches!(
+            call.tool(),
+            WORKSPACE_WRITE_TOOL
+                | WORKSPACE_READ_TOOL
+                | REPO_READ_TOOL
+                | REPO_SEARCH_TOOL
+                | WORKSPACE_PATCH_TOOL
+                | SHELL_EXEC_TOOL
+        ) {
+            return Err(ToolStepError::Invalid);
+        }
+        Ok(ValidatedToolCall::from_proposed(call))
+    }
+
     fn tool_surface(&self) -> Vec<ToolSurface> {
         vec![
             ToolSurface::new(
@@ -938,7 +1012,8 @@ impl ToolDriver for WorkspaceTools {
             ToolSurface::new(
                 WORKSPACE_PATCH_TOOL,
                 "Replace an exact substring in a workspace file. old must match exactly \
-                 once unless replace_all is true, and must differ from new. Arguments JSON: \
+                 once unless replace_all is true, and must differ from new; old and new are \
+                 each capped at 3072 bytes. Arguments JSON: \
                  {\"path\":\"<file>\",\"old\":\"<exact text>\",\"new\":\"<replacement>\",\
                  \"replace_all\":<optional bool>}.",
                 arguments_schema(
@@ -969,39 +1044,6 @@ impl ToolDriver for WorkspaceTools {
                 ),
             ),
         ]
-    }
-
-    fn validate(
-        &mut self,
-        call: &ProposedToolCall,
-        cancel: &CancellationToken,
-    ) -> Result<ValidatedToolCall, ToolStepError> {
-        cancel.check().map_err(|_| ToolStepError::Cancelled)?;
-        if call.arguments().len() > MAX_TOOL_ARGUMENTS_BYTES {
-            return Err(ToolStepError::Invalid);
-        }
-        match call.tool() {
-            WORKSPACE_WRITE_TOOL => {
-                parse_write_args(call.arguments())?;
-            }
-            WORKSPACE_READ_TOOL => {
-                parse_path_argument(call.arguments()).ok_or(ToolStepError::Invalid)?;
-            }
-            REPO_READ_TOOL => {
-                parse_repo_read_args(call.arguments())?;
-            }
-            REPO_SEARCH_TOOL => {
-                parse_repo_search_args(call.arguments())?;
-            }
-            WORKSPACE_PATCH_TOOL => {
-                parse_patch_args(call.arguments())?;
-            }
-            SHELL_EXEC_TOOL => {
-                parse_shell_args(call.arguments())?;
-            }
-            _ => return Err(ToolStepError::Invalid),
-        }
-        Ok(ValidatedToolCall::from_proposed(call))
     }
 
     fn execute(
@@ -1322,6 +1364,8 @@ mod tests {
 
     #[test]
     fn traversal_absolute_and_oversize_arguments_are_refused() {
+        // Malformed or oversized arguments are per-call handled failures the
+        // model can correct; the turn survives and nothing is written.
         let root = TempRoot::new("refuse");
         let mut tools = permissive_workspace(&root.0);
         let cancel = CancellationToken::new();
@@ -1342,10 +1386,15 @@ mod tests {
         ] {
             let call =
                 ProposedToolCall::new("c1", WORKSPACE_WRITE_TOOL, arguments).expect("call");
-            assert!(
-                tools.validate(&call, &cancel).is_err(),
-                "arguments must be refused: {arguments}"
-            );
+            let validated = tools.validate(&call, &cancel).expect("known tool validates");
+            let outcome = tools.execute(&validated, &cancel).expect("handled");
+            match outcome {
+                ToolStepResult::Failed { handled, detail, .. } => {
+                    assert!(handled, "{arguments}");
+                    assert!(!detail.unwrap().is_empty(), "{arguments}");
+                }
+                other => panic!("expected handled refusal for {arguments}, got {other:?}"),
+            }
         }
         // Nothing was written anywhere.
         assert_eq!(fs::read_dir(&root.0).expect("root").count(), 0);
@@ -1433,7 +1482,8 @@ mod tests {
             other => panic!("expected clamped read, got {other:?}"),
         }
 
-        // Zero offset/limit are refused (offset is 1-indexed, limit > 0).
+        // Zero offset/limit and unknown keys are per-call handled failures
+        // (offset is 1-indexed, limit > 0, no unknown keys).
         for arguments in [
             r#"{"path":"lines.txt","offset":0}"#,
             r#"{"path":"lines.txt","limit":0}"#,
@@ -1441,7 +1491,54 @@ mod tests {
             r#"{"path":"lines.txt","extra":1}"#,
         ] {
             let call = make_call("c3", REPO_READ_TOOL, arguments);
-            assert!(tools.validate(&call, &cancel).is_err(), "{arguments}");
+            let validated = tools.validate(&call, &cancel).expect("known tool validates");
+            match tools.execute(&validated, &cancel).expect("handled") {
+                ToolStepResult::Failed { handled, .. } => assert!(handled, "{arguments}"),
+                other => panic!("expected handled refusal for {arguments}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn repo_read_byte_cut_reports_the_delivered_window_not_the_requested_one() {
+        // A page whose lines exceed the byte cap must report how many lines
+        // were actually delivered and where to continue — never claim the
+        // full requested window.
+        let root = TempRoot::new("repo-read-honest");
+        let lines: Vec<String> = (1..=100)
+            .map(|n| format!("line-{n:04} {}", "x".repeat(180)))
+            .collect();
+        fs::write(root.0.join("wide.txt"), lines.join("\n")).expect("seed");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let call = make_call(
+            "c1",
+            REPO_READ_TOOL,
+            r#"{"path":"wide.txt","offset":1,"limit":100}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("[truncated]"), "{summary}");
+                let last_line = summary.lines().last().expect("marker line");
+                // Shape: "[truncated] (byte cap: lines 1-<N> of 100
+                // delivered; continue at <N+1>)".
+                let delivered: usize = last_line
+                    .split("lines 1-")
+                    .nth(1)
+                    .and_then(|rest| rest.split(" of").next())
+                    .and_then(|number| number.parse::<usize>().ok())
+                    .expect("delivered window parseable");
+                assert!(delivered < 100, "the page must have been byte-cut");
+                assert!(
+                    last_line.contains(&format!(
+                        "lines 1-{delivered} of 100 delivered; continue at {}",
+                        delivered + 1
+                    )),
+                    "marker must name the delivered window: {last_line}"
+                );
+            }
+            other => panic!("expected capped read, got {other:?}"),
         }
     }
 
@@ -1518,7 +1615,7 @@ mod tests {
             other => panic!("expected offset page, got {other:?}"),
         }
 
-        // Bad bounds are refused.
+        // Bad bounds are per-call handled failures.
         for arguments in [
             r#"{"pattern":""}"#,
             r#"{"head_limit":0,"pattern":"x"}"#,
@@ -1527,7 +1624,11 @@ mod tests {
             r#"{"pattern":"x","extra":1}"#,
         ] {
             let call = make_call("c4", REPO_SEARCH_TOOL, arguments);
-            assert!(tools.validate(&call, &cancel).is_err(), "{arguments}");
+            let validated = tools.validate(&call, &cancel).expect("known tool validates");
+            match tools.execute(&validated, &cancel).expect("handled") {
+                ToolStepResult::Failed { handled, .. } => assert!(handled, "{arguments}"),
+                other => panic!("expected handled refusal for {arguments}, got {other:?}"),
+            }
         }
     }
 
@@ -1650,7 +1751,11 @@ mod tests {
             r#"{"path":"a.rs","old":"x","new":"y","extra":1}"#,
         ] {
             let call = make_call("c1", WORKSPACE_PATCH_TOOL, arguments);
-            assert!(tools.validate(&call, &cancel).is_err(), "{arguments}");
+            let validated = tools.validate(&call, &cancel).expect("known tool validates");
+            match tools.execute(&validated, &cancel).expect("handled") {
+                ToolStepResult::Failed { handled, .. } => assert!(handled, "{arguments}"),
+                other => panic!("expected handled refusal for {arguments}, got {other:?}"),
+            }
         }
     }
 
@@ -1752,7 +1857,11 @@ mod tests {
         let oversize = format!(r#"{{"argv":["{}"]}}"#, "x".repeat(MAX_SHELL_ARG_BYTES + 1));
         for arguments in bad_arguments.into_iter().chain(std::iter::once(oversize.as_str())) {
             let call = ProposedToolCall::new("c1", SHELL_EXEC_TOOL, arguments).expect("call");
-            assert!(tools.validate(&call, &cancel).is_err(), "{arguments}");
+            let validated = tools.validate(&call, &cancel).expect("known tool validates");
+            match tools.execute(&validated, &cancel).expect("handled") {
+                ToolStepResult::Failed { handled, .. } => {}
+                other => panic!("expected handled refusal for {arguments}, got {other:?}"),
+            }
         }
     }
 

@@ -89,14 +89,22 @@ impl ToolCallLoopDetector {
         }
     }
 
-    /// Whether the same exact call has been issued at least `threshold` times
-    /// within the retained window.
+    /// Whether the same exact call has been issued `threshold` times in a
+    /// row (the trailing run). Interleaved repeats — a read between two
+    /// edits, re-verifying a file — are legitimate agentic patterns and never
+    /// trip; only back-to-back identical repetition is a loop.
     pub fn is_looping(&self) -> bool {
-        let mut counts: HashMap<&ToolCallSignature, usize> = HashMap::new();
-        for signature in &self.history {
-            *counts.entry(signature).or_insert(0) += 1;
+        let Some(latest) = self.history.back() else {
+            return false;
+        };
+        let mut run = 0usize;
+        for signature in self.history.iter().rev() {
+            if signature != latest {
+                break;
+            }
+            run += 1;
         }
-        counts.values().any(|count| *count >= self.threshold)
+        run >= self.threshold
     }
 
     pub fn len(&self) -> usize {
@@ -251,11 +259,34 @@ mod tests {
         detector.observe("tool", "{\"a\":1}");
         detector.observe("tool", "{\"a\":1}");
         assert!(detector.is_looping());
-        // Fill the window with distinct calls so the repetition ages out.
+        // One distinct call breaks the run, so the repetition clears.
         detector.observe("b", "{}");
-        detector.observe("c", "{}");
-        assert_eq!(detector.len(), 3);
         assert!(!detector.is_looping());
+        assert_eq!(detector.len(), 3);
+    }
+
+    #[test]
+    fn interleaved_verify_patterns_are_never_a_loop() {
+        // read -> edit -> read -> edit -> read -> read is the core agentic
+        // verify pattern: identical reads interleaved with edits must not
+        // trip, even though each signature repeats within the window.
+        let mut detector = ToolCallLoopDetector::new();
+        let read = ("repo.read", "{\"path\":\"f\"}");
+        let edit_a = ("workspace.patch", "{\"old\":\"a\",\"new\":\"b\"}");
+        let edit_b = ("workspace.patch", "{\"old\":\"b\",\"new\":\"c\"}");
+        for (tool, arguments) in [
+            read,
+            edit_a,
+            read,
+            edit_b,
+            read,
+            read,
+            ("repo.search", "{\"pattern\":\"x\"}"),
+            read,
+        ] {
+            detector.observe(tool, arguments);
+            assert!(!detector.is_looping(), "{tool} {arguments} must not trip");
+        }
     }
 
     #[test]
