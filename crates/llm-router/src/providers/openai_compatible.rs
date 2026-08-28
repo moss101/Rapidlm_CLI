@@ -1603,6 +1603,106 @@ fn slice_timeout(total: Duration) -> Duration {
     if total < slice { total } else { slice }
 }
 
+/// Tool-facing bounded HTTP GET: the same SSRF guards, TLS root set, and
+/// response caps as the provider transport, without provider auth plumbing.
+/// `allow_private` opts loopback/private targets back in (callers must have
+/// their own allowlist policy — used by local fixtures).
+pub fn http_get(
+    url: &str,
+    allow_private: bool,
+    max_bytes: usize,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>, ProviderError> {
+    cancel.check()?;
+    let parsed = parse_http_url(url)?;
+    if !allow_private && host_is_blocked(&parsed.host) {
+        return Err(ProviderError::InvalidRequest);
+    }
+    if parsed.scheme != UrlScheme::Http && parsed.scheme != UrlScheme::Https {
+        return Err(ProviderError::InvalidRequest);
+    }
+    let addrs = (parsed.host.as_str(), parsed.port)
+        .to_socket_addrs()
+        .map_err(|_| ProviderError::Connection)?;
+    let mut selected = None;
+    for addr in addrs {
+        cancel.check()?;
+        if !allow_private && ip_is_blocked(addr.ip()) {
+            return Err(ProviderError::InvalidRequest);
+        }
+        if selected.is_none() {
+            selected = Some(addr);
+        }
+    }
+    let addr = selected.ok_or(ProviderError::Connection)?;
+
+    let tcp = TcpStream::connect_timeout(&addr, timeout).map_err(|_| ProviderError::Connection)?;
+    tcp.set_read_timeout(Some(slice_timeout(timeout)))
+        .map_err(|_| ProviderError::Connection)?;
+    tcp.set_write_timeout(Some(slice_timeout(timeout)))
+        .map_err(|_| ProviderError::Connection)?;
+    tcp.set_nodelay(true).map_err(|_| ProviderError::Connection)?;
+
+    let mut stream = match parsed.scheme {
+        UrlScheme::Http => MaybeTlsStream::Plain(tcp),
+        UrlScheme::Https => {
+            let server_name = ServerName::try_from(parsed.host.to_string())
+                .map_err(|_| ProviderError::InvalidRequest)?;
+            let connection = ClientConnection::new(Arc::clone(&TLS_CLIENT_CONFIG), server_name)
+                .map_err(|_| ProviderError::Connection)?;
+            MaybeTlsStream::Tls(Box::new(StreamOwned::new(connection, tcp)))
+        }
+    };
+
+    let deadline = Instant::now() + timeout;
+    cancel.check()?;
+    check_deadline(deadline)?;
+    let host_header = if (parsed.scheme == UrlScheme::Http && parsed.port == 80)
+        || (parsed.scheme == UrlScheme::Https && parsed.port == 443)
+    {
+        parsed.host.clone()
+    } else {
+        format!("{}:{}", parsed.host, parsed.port)
+    };
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: text/*,application/json;q=0.9,*/*;q=0.5\r\nUser-Agent: rapidlm-web-fetch\r\nConnection: close\r\n\r\n",
+        parsed.path, host_header
+    );
+    write_all_deadline(&mut stream, request.as_bytes(), cancel, deadline)?;
+    // Headers get slack above the body cap; the body is truncated to the cap.
+    let response =
+        read_http_response_opts(&mut stream, max_bytes, cancel, deadline, true)?;
+    let mut body = response.body;
+    if body.len() > max_bytes {
+        body.truncate(max_bytes);
+    }
+    Ok(body)
+}
+
+fn read_http_response_opts<S: Read + Write>(
+    stream: &mut S,
+    max_body: usize,
+    cancel: &CancellationToken,
+    deadline: Instant,
+    truncate: bool,
+) -> Result<ProviderHttpResponse, ProviderError> {
+    let raw =
+        read_until_limit_opts(stream, max_body + 16 * 1024, cancel, deadline, truncate)?;
+    let split = find_header_body_split(&raw).ok_or(ProviderError::Permanent)?;
+    let header_bytes = &raw[..split];
+    let header_text = std::str::from_utf8(header_bytes).map_err(|_| ProviderError::Permanent)?;
+    let status_line = header_text.split("\r\n").next().ok_or(ProviderError::Permanent)?;
+    let status = parse_status_line(status_line)?;
+    // Truncated responses carry whatever body bytes arrived.
+    let body = raw[split + 4..].to_vec();
+    Ok(ProviderHttpResponse {
+        status,
+        headers: Vec::new(),
+        body,
+    })
+}
+
 fn write_http_request<S: Read + Write>(
     stream: &mut S,
     url: &ParsedUrl,
@@ -1879,6 +1979,18 @@ fn read_until_limit<S: Read + Write>(
     cancel: &CancellationToken,
     deadline: Instant,
 ) -> Result<Vec<u8>, ProviderError> {
+    read_until_limit_opts(stream, limit, cancel, deadline, false)
+}
+
+/// `truncate` stops reading at the limit instead of failing: the tool-fetch
+/// path wants a capped prefix, the provider path wants a hard bound.
+fn read_until_limit_opts<S: Read + Write>(
+    stream: &mut S,
+    limit: usize,
+    cancel: &CancellationToken,
+    deadline: Instant,
+    truncate: bool,
+) -> Result<Vec<u8>, ProviderError> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 2048];
     loop {
@@ -1887,6 +1999,10 @@ fn read_until_limit<S: Read + Write>(
             break;
         }
         if buf.len() + n > limit {
+            if truncate {
+                buf.extend_from_slice(&chunk[..limit - buf.len()]);
+                break;
+            }
             return Err(ProviderError::BoundExceeded);
         }
         buf.extend_from_slice(&chunk[..n]);

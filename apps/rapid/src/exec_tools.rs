@@ -80,6 +80,8 @@ pub const MAX_SUBAGENT_REPORT_BYTES: usize = 16 * 1024;
 pub const MAX_PLAN_BYTES: usize = 16 * 1024;
 /// Adopted subagent types (the names both reference CLIs standardized on).
 pub const AGENT_TYPES: &[&str] = &["general-purpose", "explore", "plan"];
+/// Tool name for fetching a web page (Claude `WebFetch` parity).
+pub const WEB_FETCH_TOOL: &str = "web_fetch";
 /// Hard byte cap on one tool call's JSON arguments.
 pub const MAX_TOOL_ARGUMENTS_BYTES: usize = 8 * 1024;
 /// Hard byte cap on a relative workspace path.
@@ -439,6 +441,7 @@ pub struct WorkspaceTools {
     plan_mode: Arc<AtomicBool>,
     read_only: bool,
     subagents: Option<Arc<dyn SubagentRunner>>,
+    fetch_allowlist: Vec<String>,
 }
 
 impl WorkspaceTools {
@@ -464,7 +467,13 @@ impl WorkspaceTools {
             plan_mode: Arc::new(AtomicBool::new(false)),
             read_only: false,
             subagents: None,
+            fetch_allowlist: Vec::new(),
         })
+    }
+
+    /// Hosts web_fetch may fetch despite resolving private (local fixtures).
+    pub fn set_fetch_allowlist(&mut self, allowlist: Vec<String>) {
+        self.fetch_allowlist = allowlist;
     }
 
     /// Read-only driver for subagent explore/plan scopes: write-classified
@@ -594,6 +603,7 @@ impl WorkspaceTools {
             JOB_STATUS_TOOL => parse_job_id_args(call.arguments(), false).is_ok(),
             JOB_OUTPUT_TOOL => parse_job_id_args(call.arguments(), true).is_ok(),
             TASK_SPAWN_TOOL => parse_task_args(call.arguments()).is_ok(),
+            WEB_FETCH_TOOL => parse_web_fetch_args(call.arguments()).is_ok(),
             _ => return Err(ToolStepError::Invalid),
         };
         if !arguments_parseable {
@@ -620,6 +630,7 @@ impl WorkspaceTools {
             JOB_STATUS_TOOL => self.execute_job_status(call, cancel),
             JOB_OUTPUT_TOOL => self.execute_job_output(call, cancel),
             TASK_SPAWN_TOOL => self.execute_task_spawn(call, cancel),
+            WEB_FETCH_TOOL => self.execute_web_fetch(call, cancel),
             _ => Err(ToolStepError::Invalid),
         }
     }
@@ -1193,6 +1204,33 @@ impl WorkspaceTools {
         })
     }
 
+    /// `web_fetch`: SSRF-guarded page fetch, HTML stripped to bounded text.
+    fn execute_web_fetch(
+        &self,
+        call: &ValidatedToolCall,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        let (url, max_bytes) = parse_web_fetch_args(call.arguments())?;
+        match crate::web_fetch::fetch_page(&url, &self.fetch_allowlist, max_bytes) {
+            Ok(text) if text.is_empty() => Ok(ToolStepResult::Succeeded {
+                call_id: call.call_id().to_owned(),
+                summary: format!("fetched {url}: empty page"),
+            }),
+            Ok(text) => Ok(ToolStepResult::Succeeded {
+                call_id: call.call_id().to_owned(),
+                summary: bounded_detail(&format!("fetched {url}:\n{text}")),
+            }),
+            Err(refusal) => Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "web_fetch refused: {}",
+                    refusal.detail()
+                ))),
+            }),
+        }
+    }
+
     /// `task_spawn`: run a subagent (depth 1) and return its final report.
     fn execute_task_spawn(
         &self,
@@ -1249,7 +1287,7 @@ impl WorkspaceTools {
 pub fn tool_kind(tool: &str) -> ToolKind {
     match tool {
         WORKSPACE_READ_TOOL | REPO_READ_TOOL | REPO_SEARCH_TOOL | REPO_GLOB_TOOL
-        | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL => ToolKind::Read,
+        | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL | WEB_FETCH_TOOL => ToolKind::Read,
         _ => ToolKind::Write,
     }
 }
@@ -1257,9 +1295,8 @@ pub fn tool_kind(tool: &str) -> ToolKind {
 fn tool_class(tool: &str) -> ToolClass {
     match tool {
         WORKSPACE_READ_TOOL | REPO_READ_TOOL | REPO_SEARCH_TOOL | REPO_GLOB_TOOL
-        | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL | PLAN_ENTER_TOOL | PLAN_EXIT_TOOL => {
-            ToolClass::ReadOnly
-        }
+        | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL | PLAN_ENTER_TOOL | PLAN_EXIT_TOOL
+        | WEB_FETCH_TOOL => ToolClass::ReadOnly,
         WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL | TODO_WRITE_TOOL => ToolClass::FileEdit,
         _ => ToolClass::Other,
     }
@@ -1673,6 +1710,36 @@ fn parse_empty_args(raw: &str) -> Result<EmptyArgs, ToolStepError> {
     Ok(EmptyArgs)
 }
 
+/// Parse bounded `{"url", "max_bytes"?}` web-fetch arguments.
+fn parse_web_fetch_args(raw: &str) -> Result<(String, usize), ToolStepError> {
+    const ALLOWED: &[&str] = &["url", "max_bytes"];
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
+    let object = value.as_object().ok_or(ToolStepError::Invalid)?;
+    if !object.keys().all(|key| ALLOWED.contains(&key.as_str()))
+        || !object.contains_key("url")
+    {
+        return Err(ToolStepError::Invalid);
+    }
+    let url = object
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ToolStepError::Invalid)?;
+    if url.is_empty() || url.len() > 2048 {
+        return Err(ToolStepError::Invalid);
+    }
+    let max_bytes = match object.get("max_bytes") {
+        Some(value) => {
+            let max = value.as_u64().ok_or(ToolStepError::Invalid)?;
+            if max == 0 || max as usize > crate::web_fetch::MAX_FETCH_BYTES {
+                return Err(ToolStepError::Invalid);
+            }
+            max as usize
+        }
+        None => crate::web_fetch::MAX_FETCH_BYTES,
+    };
+    Ok((url.to_owned(), max_bytes))
+}
+
 /// Parse bounded `{"prompt", "type"?, "description"?}` subagent arguments.
 /// Types adopt the reference-CLI standard: general-purpose | explore | plan.
 fn parse_task_args(raw: &str) -> Result<TaskSpawnArgs, ToolStepError> {
@@ -1994,6 +2061,7 @@ impl ToolDriver for WorkspaceTools {
                 | JOB_STATUS_TOOL
                 | JOB_OUTPUT_TOOL
                 | TASK_SPAWN_TOOL
+                | WEB_FETCH_TOOL
         ) {
             return Err(ToolStepError::Invalid);
         }
@@ -2284,6 +2352,20 @@ impl WorkspaceTools {
                         "description": {"type": "string", "description": "short label"}
                     }),
                     &["prompt"],
+                ),
+            ),
+            ToolSurface::new(
+                WEB_FETCH_TOOL,
+                "Fetch a web page over http/https and return readable text (HTML stripped, \
+                 100 KB cap). Private/loopback hosts are refused unless allowlisted in \
+                 project settings. Arguments JSON: {\"url\":\"https://example.com\"}.",
+                arguments_schema(
+                    "Fetch a web page",
+                    serde_json::json!({
+                        "url": {"type": "string", "description": "http/https URL"},
+                        "max_bytes": {"type": "integer", "description": "byte cap"}
+                    }),
+                    &["url"],
                 ),
             ),
             ToolSurface::new(
@@ -3727,6 +3809,85 @@ use std::sync::{Arc, Mutex};
         assert!(surface.contains(&REPO_READ_TOOL), "reads stay available");
     }
 
+    /// One-shot loopback HTTP fixture: serves `body` then closes.
+    fn spawn_http_fixture(body: &'static str) -> std::net::SocketAddr {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn web_fetch_refuses_loopback_by_default_and_fetches_when_allowlisted() {
+        let root = TempRoot::new("web-fetch");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let addr = spawn_http_fixture("fixture body marker");
+        let url = format!("http://{addr}/page");
+
+        let call = make_call("w1", WEB_FETCH_TOOL, &format!(r#"{{"url":"{url}"}}"#));
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("handled") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(
+                    detail.unwrap().contains("private/loopback"),
+                    "SSRF refusal must be visible to the model"
+                );
+            }
+            other => panic!("expected SSRF refusal, got {other:?}"),
+        }
+
+        tools.set_fetch_allowlist(vec!["127.0.0.1".to_owned()]);
+        let call = make_call("w2", WEB_FETCH_TOOL, &format!(r#"{{"url":"{url}"}}"#));
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("fixture body marker"), "{summary}");
+            }
+            other => panic!("expected fetch success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn web_fetch_caps_oversized_responses() {
+        let root = TempRoot::new("web-cap");
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_fetch_allowlist(vec!["127.0.0.1".to_owned()]);
+        let cancel = CancellationToken::new();
+        let big: String = "x".repeat(5000);
+        let leaked: &'static str = Box::leak(big.into_boxed_str());
+        let addr = spawn_http_fixture(leaked);
+        let url = format!("http://{addr}/big");
+        let call = make_call(
+            "c1",
+            WEB_FETCH_TOOL,
+            &format!(r#"{{"url":"{url}","max_bytes":100}}"#),
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(
+                    summary.contains(crate::web_fetch::FETCH_TRUNCATION_MARKER),
+                    "cap marker missing: {summary}"
+                );
+            }
+            other => panic!("expected capped fetch, got {other:?}"),
+        }
+    }
+
     #[test]
     fn tool_surface_advertises_all_fourteen_tools_with_json_schemas() {
         let root = TempRoot::new("surface");
@@ -3748,6 +3909,7 @@ use std::sync::{Arc, Mutex};
                 JOB_STATUS_TOOL,
                 JOB_OUTPUT_TOOL,
                 TASK_SPAWN_TOOL,
+                WEB_FETCH_TOOL,
                 SHELL_EXEC_TOOL,
             ]
         );

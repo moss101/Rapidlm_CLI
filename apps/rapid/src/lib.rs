@@ -17,6 +17,7 @@ pub mod p9_commands;
 pub mod permissions;
 pub mod preview;
 pub mod user_config;
+pub mod web_fetch;
 
 pub use interactive::{
     CLI_USAGE, InteractiveError, InteractiveInput, InteractiveOptions, InteractiveOutcome,
