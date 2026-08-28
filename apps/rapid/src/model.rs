@@ -892,14 +892,14 @@ mod tests {
         let active = active("test-model", "http://127.0.0.1:1", "local");
         let configured = ConfiguredModel::build(&active, &store).expect("build");
         let surface = vec![agent_runtime::ToolSurface::new(
-            "workspace.write",
+            "workspace_write",
             "create a file",
             serde_json::json!({"type": "object", "required": ["path", "content"]}),
         )];
         let input = ModelStepInput::with_history(1, &[], &surface);
         let built = build_request(&configured, &[], &input).expect("request");
         assert_eq!(built.tools().len(), 1);
-        assert_eq!(built.tools()[0].name().as_str(), "workspace.write");
+        assert_eq!(built.tools()[0].name().as_str(), "workspace_write");
         assert_eq!(built.tools()[0].description(), "create a file");
         assert!(built.tools()[0].parameters().is_object());
     }
@@ -914,10 +914,10 @@ mod tests {
         let active = active("test-model", "http://127.0.0.1:1", "local");
         let configured = ConfiguredModel::build(&active, &store).expect("build");
         let pending = vec![
-            ProposedToolCall::new("c1", "repo.read", r#"{"path":"a.txt"}"#).expect("c1"),
+            ProposedToolCall::new("c1", "repo_read", r#"{"path":"a.txt"}"#).expect("c1"),
             ProposedToolCall::new(
                 "c2",
-                "workspace.patch",
+                "workspace_patch",
                 r#"{"path":"b.txt","old":"x","new":"y"}"#,
             )
             .expect("c2"),
@@ -929,7 +929,7 @@ mod tests {
             },
             ToolStepResult::Denied {
                 call_id: "c2".to_owned(),
-                detail: Some("workspace.patch denied: denied by an explicit deny rule".to_owned()),
+                detail: Some("workspace_patch denied: denied by an explicit deny rule".to_owned()),
             },
         ];
         let exchange = agent_runtime::ToolStepExchange::new(pending, prior);
@@ -953,7 +953,7 @@ mod tests {
             .expect("assistant tool-call message");
         assert_eq!(assistant.tool_calls().len(), 2);
         assert_eq!(assistant.tool_calls()[0].call_id().as_str(), "c1");
-        assert_eq!(assistant.tool_calls()[0].name().as_str(), "repo.read");
+        assert_eq!(assistant.tool_calls()[0].name().as_str(), "repo_read");
         assert_eq!(assistant.tool_calls()[1].call_id().as_str(), "c2");
         // One tool-role message per call, in call order, with per-call text.
         let tool_messages: Vec<&CanonicalMessage> = messages

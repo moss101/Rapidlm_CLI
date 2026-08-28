@@ -556,6 +556,11 @@ impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
         input: &ModelStepInput<'_>,
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError> {
+        // Connection and transient failures are retryable for a model step: a
+        // step that failed committed no tool effects, so re-invoking is safe
+        // (bounded retry ceiling).
+        let retryable =
+            |cause: &FailureCause| matches!(cause, FailureCause::Transient { .. } | FailureCause::Connection);
         let mut attempt: u32 = 0;
         loop {
             let result = self.inner.step(blocks, input, cancel);
@@ -568,6 +573,17 @@ impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
                         return Err(ModelStepError::Cancelled);
                     }
                     attempt += 1;
+                    continue;
+                }
+                Err(ModelStepError::ProviderFailed {
+                    cause: FailureCause::Connection,
+                }) if attempt < MAX_TRANSIENT_RETRIES => {
+                    self.diag_attempt(attempt, "failed:connection", 0);
+                    if !sleep_backoff(cancel, attempt, None) {
+                        return Err(ModelStepError::Cancelled);
+                    }
+                    attempt += 1;
+                    continue;
                 }
                 Err(ModelStepError::ProviderFailed { cause }) => {
                     let tag = cause_tag(*cause);
@@ -921,7 +937,7 @@ mod tests {
 
     #[test]
     fn committed_tool_effects_are_not_replayed_on_overflow() {
-        let call = ProposedToolCall::new("c1", "repo.read", "{}").expect("call");
+        let call = ProposedToolCall::new("c1", "repo_read", "{}").expect("call");
         let mut host = LiveContextHost::build(
             preserved(),
             ScriptedBacking::new(vec![
@@ -1146,7 +1162,10 @@ mod tests {
     }
 
     #[test]
-    fn connection_failure_is_not_retried_and_keeps_its_cause() {
+    fn connection_failure_is_retried_then_keeps_its_cause() {
+        // A failed model step committed no tool effects, so a connection drop
+        // is retried with bounded backoff; when retries exhaust, the typed
+        // cause is preserved and nothing is fabricated.
         let request = AgentExecutionRequest::new(spec(), SessionId::new());
         let mut events = Vec::new();
         let backing = ScriptedBacking::new(vec![
@@ -1154,8 +1173,40 @@ mod tests {
                 cause: FailureCause::Connection,
             }),
             Ok(ModelStepOutput::Terminal {
-                text: "never reached".to_owned(),
+                text: "recovered after reconnect".to_owned(),
                 tokens: 1,
+            }),
+        ]);
+        let witness = backing.clone();
+        let outcome = run_live_exec(
+            preserved(),
+            backing,
+            &request,
+            &mut CountingTools { executed: 0 },
+            &mut events,
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+        )
+        .expect("execute");
+        assert_eq!(outcome.result.summary(), "recovered after reconnect");
+        assert_eq!(outcome.failure_cause, None);
+        assert_eq!(witness.saw_blocks.borrow().len(), 2, "one retry, then success");
+
+        // Exhausted connection retries still surface the typed cause.
+        let mut events = Vec::new();
+        let backing = ScriptedBacking::new(vec![
+            Err(ModelStepError::ProviderFailed {
+                cause: FailureCause::Connection,
+            }),
+            Err(ModelStepError::ProviderFailed {
+                cause: FailureCause::Connection,
+            }),
+            Err(ModelStepError::ProviderFailed {
+                cause: FailureCause::Connection,
+            }),
+            Err(ModelStepError::ProviderFailed {
+                cause: FailureCause::Connection,
             }),
         ]);
         let witness = backing.clone();
@@ -1173,14 +1224,14 @@ mod tests {
         assert_eq!(outcome.failure_cause, Some(FailureCause::Connection));
         assert_eq!(
             witness.saw_blocks.borrow().len(),
-            1,
-            "connection failures surface immediately"
+            MAX_TRANSIENT_RETRIES as usize + 1,
+            "initial attempt plus the bounded retries"
         );
     }
 
     #[test]
     fn transient_retry_never_replays_committed_tool_effects() {
-        let call = ProposedToolCall::new("c1", "repo.read", "{}").expect("call");
+        let call = ProposedToolCall::new("c1", "repo_read", "{}").expect("call");
         let request = AgentExecutionRequest::new(spec(), SessionId::new());
         let mut events = Vec::new();
         let mut tools = CountingTools { executed: 0 };

@@ -264,18 +264,18 @@ fn bench_a_multi_phase_agentic_task() {
     }
     let server = spawn_scripted_server(vec![
         sse_tool_calls(&[
-            ("s1", "repo.search", r#"{"pattern":"target","head_limit":5}"#),
-            ("s2", "repo.search", r#"{"pattern":"needle","head_limit":5}"#),
-            ("r1", "repo.read", r#"{"path":"mod0.txt"}"#),
-            ("r2", "repo.read", r#"{"path":"mod1.txt"}"#),
+            ("s1", "repo_search", r#"{"pattern":"target","head_limit":5}"#),
+            ("s2", "repo_search", r#"{"pattern":"needle","head_limit":5}"#),
+            ("r1", "repo_read", r#"{"path":"mod0.txt"}"#),
+            ("r2", "repo_read", r#"{"path":"mod1.txt"}"#),
         ]),
         sse_tool_calls(&[
-            ("p1", "workspace.patch", r#"{"path":"mod0.txt","old":"target","new":"patched-0"}"#),
-            ("p2", "workspace.patch", r#"{"path":"mod1.txt","old":"target","new":"patched-1"}"#),
-            ("p3", "workspace.patch", r#"{"path":"mod2.txt","old":"target","new":"patched-2"}"#),
+            ("p1", "workspace_patch", r#"{"path":"mod0.txt","old":"target","new":"patched-0"}"#),
+            ("p2", "workspace_patch", r#"{"path":"mod1.txt","old":"target","new":"patched-1"}"#),
+            ("p3", "workspace_patch", r#"{"path":"mod2.txt","old":"target","new":"patched-2"}"#),
         ]),
-        sse_tool_calls(&[("sh1", "shell.exec", r#"{"argv":["./verify.sh"],"timeout_ms":30000}"#)]),
-        sse_tool_calls(&[("v1", "repo.read", r#"{"path":"mod0.txt"}"#)]),
+        sse_tool_calls(&[("sh1", "shell_exec", r#"{"argv":["./verify.sh"],"timeout_ms":30000}"#)]),
+        sse_tool_calls(&[("v1", "repo_read", r#"{"path":"mod0.txt"}"#)]),
         sse_terminal("all three modules patched and verified"),
     ]);
     let project = TrustedProject::new("bench-a");
@@ -344,7 +344,7 @@ fn bench_b_sixteen_calls_at_the_per_step_cap() {
     for index in 0..16 {
         calls.push((
             format!("r{index}").leak() as &str,
-            "repo.read",
+            "repo_read",
             format!(r#"{{"path":"f{index}.txt"}}"#).leak() as &str,
         ));
     }
@@ -377,8 +377,8 @@ fn bench_c_pagination_chain_over_a_long_file() {
     // honestly report its delivered window; page 2 (1001-1200) fits and
     // reaches EOF.
     let server = spawn_scripted_server(vec![
-        sse_tool_calls(&[("r1", "repo.read", r#"{"path":"long.txt","offset":1,"limit":1000}"#)]),
-        sse_tool_calls(&[("r2", "repo.read", r#"{"path":"long.txt","offset":1001,"limit":1000}"#)]),
+        sse_tool_calls(&[("r1", "repo_read", r#"{"path":"long.txt","offset":1,"limit":1000}"#)]),
+        sse_tool_calls(&[("r2", "repo_read", r#"{"path":"long.txt","offset":1001,"limit":1000}"#)]),
         sse_terminal("pagination complete"),
     ]);
     let project = TrustedProject::new("bench-c");
@@ -421,12 +421,12 @@ fn bench_d_verify_pattern_read_edit_reread() {
     // twice. The loop guard must tolerate repeated reads interleaved with
     // edits; only degenerate repetition (same call back-to-back) is a loop.
     let server = spawn_scripted_server(vec![
-        sse_tool_calls(&[("r1", "repo.read", r#"{"path":"notes.txt"}"#)]),
-        sse_tool_calls(&[("p1", "workspace.patch", r#"{"path":"notes.txt","old":"alpha","new":"beta"}"#)]),
-        sse_tool_calls(&[("r2", "repo.read", r#"{"path":"notes.txt"}"#)]),
-        sse_tool_calls(&[("p2", "workspace.patch", r#"{"path":"notes.txt","old":"beta","new":"gamma"}"#)]),
-        sse_tool_calls(&[("r3", "repo.read", r#"{"path":"notes.txt"}"#)]),
-        sse_tool_calls(&[("r4", "repo.read", r#"{"path":"notes.txt"}"#)]),
+        sse_tool_calls(&[("r1", "repo_read", r#"{"path":"notes.txt"}"#)]),
+        sse_tool_calls(&[("p1", "workspace_patch", r#"{"path":"notes.txt","old":"alpha","new":"beta"}"#)]),
+        sse_tool_calls(&[("r2", "repo_read", r#"{"path":"notes.txt"}"#)]),
+        sse_tool_calls(&[("p2", "workspace_patch", r#"{"path":"notes.txt","old":"beta","new":"gamma"}"#)]),
+        sse_tool_calls(&[("r3", "repo_read", r#"{"path":"notes.txt"}"#)]),
+        sse_tool_calls(&[("r4", "repo_read", r#"{"path":"notes.txt"}"#)]),
         sse_terminal("verified through both edits"),
     ]);
     let project = TrustedProject::new("bench-d");
@@ -462,7 +462,7 @@ fn bench_e_substantial_patch_payload() {
     );
     let arguments_leak: &str = Box::leak(arguments.into_boxed_str());
     let server = spawn_scripted_server(vec![
-        sse_tool_calls(&[("p1", "workspace.patch", arguments_leak)]),
+        sse_tool_calls(&[("p1", "workspace_patch", arguments_leak)]),
         sse_terminal("refactor applied"),
     ]);
     let project = TrustedProject::new("bench-e");

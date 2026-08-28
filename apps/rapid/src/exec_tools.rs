@@ -1,13 +1,13 @@
 //! Model-callable coding tools for the `exec` subcommand, gated on project
 //! trust (fail-closed): a bounded file write, a bounded file read, paginated
-//! `repo.read`, workspace `repo.search`, exact-match `workspace.patch`, and
-//! supervised `shell.exec`. Paths are relative and must resolve strictly
+//! `repo_read`, workspace `repo_search`, exact-match `workspace_patch`, and
+//! supervised `shell_exec`. Paths are relative and must resolve strictly
 //! inside the trusted workspace root — absolute paths, `..` components, and
 //! symlink escapes are refused, and all tool output is byte-capped.
 //!
 //! One model step's calls dispatch as a batch: read-classified calls run
 //! concurrently, write-classified calls serialize per target (all
-//! `shell.exec` calls serialize with each other), and results keep their
+//! `shell_exec` calls serialize with each other), and results keep their
 //! per-call ids and outcomes. Every call passes the six-mode permission
 //! lattice before execution; a headless denial is a typed model-visible
 //! result, never a silent pass.
@@ -24,22 +24,22 @@ use agent_runtime::{
 use crate::permissions::{Decision, PermissionLattice, PermissionMode, ToolClass};
 
 /// Tool name for a bounded workspace file write.
-pub const WORKSPACE_WRITE_TOOL: &str = "workspace.write";
+pub const WORKSPACE_WRITE_TOOL: &str = "workspace_write";
 /// Tool name for a bounded workspace file read.
-pub const WORKSPACE_READ_TOOL: &str = "workspace.read";
-/// Tool name for a paginated bounded file read (gateway name `repo.read`).
-pub const REPO_READ_TOOL: &str = "repo.read";
-/// Tool name for a bounded workspace text search (gateway name `repo.search`).
-pub const REPO_SEARCH_TOOL: &str = "repo.search";
-/// Tool name for an exact-match edit (gateway name `workspace.patch`).
-pub const WORKSPACE_PATCH_TOOL: &str = "workspace.patch";
-/// Tool name for supervised command execution (gateway name `shell.exec`).
-pub const SHELL_EXEC_TOOL: &str = "shell.exec";
+pub const WORKSPACE_READ_TOOL: &str = "workspace_read";
+/// Tool name for a paginated bounded file read (gateway name `repo_read`).
+pub const REPO_READ_TOOL: &str = "repo_read";
+/// Tool name for a bounded workspace text search (gateway name `repo_search`).
+pub const REPO_SEARCH_TOOL: &str = "repo_search";
+/// Tool name for an exact-match edit (gateway name `workspace_patch`).
+pub const WORKSPACE_PATCH_TOOL: &str = "workspace_patch";
+/// Tool name for supervised command execution (gateway name `shell_exec`).
+pub const SHELL_EXEC_TOOL: &str = "shell_exec";
 /// Tool name for file-pattern search (Claude `Glob` parity).
-pub const REPO_GLOB_TOOL: &str = "repo.glob";
+pub const REPO_GLOB_TOOL: &str = "repo_glob";
 /// Tool name for the model-callable task list (Claude `TodoWrite` parity).
-pub const TODO_WRITE_TOOL: &str = "todo.write";
-/// Hard cap on `repo.glob` results (Claude truncates Glob at 100 files).
+pub const TODO_WRITE_TOOL: &str = "todo_write";
+/// Hard cap on `repo_glob` results (Claude truncates Glob at 100 files).
 pub const MAX_GLOB_RESULTS: usize = 100;
 /// Hard cap on one task-list entry.
 pub const MAX_TODO_CONTENT_BYTES: usize = 512;
@@ -55,39 +55,39 @@ pub const MAX_TOOL_PATH_BYTES: usize = 512;
 pub const MAX_WRITE_BYTES: usize = 64 * 1024;
 /// Hard byte cap on one file read returned to the model.
 pub const MAX_READ_BYTES: usize = 4 * 1024;
-/// Default 1-indexed start line for `repo.read`.
+/// Default 1-indexed start line for `repo_read`.
 pub const DEFAULT_READ_OFFSET: usize = 1;
-/// Default line window for `repo.read`.
+/// Default line window for `repo_read`.
 pub const DEFAULT_READ_LINES: usize = 200;
-/// Hard ceiling on the `repo.read` line window.
+/// Hard ceiling on the `repo_read` line window.
 pub const MAX_READ_LINES: usize = 1_000;
-/// Default hit cap for `repo.search`.
+/// Default hit cap for `repo_search`.
 pub const DEFAULT_SEARCH_HEAD_LIMIT: usize = 20;
-/// Hard ceiling on the `repo.search` hit cap.
+/// Hard ceiling on the `repo_search` hit cap.
 pub const MAX_SEARCH_HEAD_LIMIT: usize = 100;
-/// Maximum files one `repo.search` may walk.
+/// Maximum files one `repo_search` may walk.
 pub const MAX_SEARCH_FILES: usize = 2_000;
-/// Hard byte cap on one `repo.search` result payload.
+/// Hard byte cap on one `repo_search` result payload.
 pub const MAX_SEARCH_OUTPUT_BYTES: usize = 8 * 1024;
-/// Hard byte cap on one `workspace.patch` old/new text. Two texts plus the
+/// Hard byte cap on one `workspace_patch` old/new text. Two texts plus the
 /// path must fit the per-call argument payload bound (8 KiB), so each text is
 /// capped at 3 KiB.
 pub const MAX_PATCH_TEXT_BYTES: usize = 3 * 1024;
-/// Hard byte cap on one `shell.exec` argv.
+/// Hard byte cap on one `shell_exec` argv.
 pub const MAX_SHELL_ARGV: usize = 64;
-/// Hard byte cap on one `shell.exec` argv token.
+/// Hard byte cap on one `shell_exec` argv token.
 pub const MAX_SHELL_ARG_BYTES: usize = 4 * 1024;
-/// Default wall-clock budget for one `shell.exec`.
+/// Default wall-clock budget for one `shell_exec`.
 pub const DEFAULT_SHELL_TIMEOUT: Duration = Duration::from_secs(60);
-/// Maximum wall-clock budget for one `shell.exec`.
+/// Maximum wall-clock budget for one `shell_exec`.
 pub const MAX_SHELL_TIMEOUT: Duration = Duration::from_secs(600);
-/// Hard byte cap on captured `shell.exec` output.
+/// Hard byte cap on captured `shell_exec` output.
 pub const MAX_SHELL_OUTPUT_BYTES: usize = 16 * 1024;
 /// Hard byte cap on model-visible per-call denial/failure detail text.
 pub const MAX_RESULT_DETAIL_BYTES: usize = 256;
 /// Marker appended when output was cut by a byte cap.
 pub const TRUNCATION_MARKER: &str = "\n[truncated]";
-/// Directories `repo.search` never descends into.
+/// Directories `repo_search` never descends into.
 const SEARCH_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".rapidlm"];
 
 /// Typed workspace-tools setup failure.
@@ -154,7 +154,7 @@ impl WorkspaceTools {
     }
 
     /// Rule-matching subject for one call: the workspace-relative path for
-    /// file tools, the joined argv for `shell.exec`.
+    /// file tools, the joined argv for `shell_exec`.
     fn rule_subject(tool: &str, arguments: &str) -> Option<String> {
         match tool {
             WORKSPACE_WRITE_TOOL | WORKSPACE_READ_TOOL | REPO_READ_TOOL => {
@@ -282,7 +282,7 @@ impl WorkspaceTools {
         }
     }
 
-    /// `repo.read`: bounded line window `[offset, offset+limit)` of a
+    /// `repo_read`: bounded line window `[offset, offset+limit)` of a
     /// workspace-relative text file, byte-capped, with a truncation marker.
     fn execute_repo_read(
         &self,
@@ -348,7 +348,7 @@ impl WorkspaceTools {
         })
     }
 
-    /// `repo.search`: bounded exact-substring search over workspace text
+    /// `repo_search`: bounded exact-substring search over workspace text
     /// files with `head_limit`/`offset` pagination over the hit list.
     fn execute_repo_search(
         &self,
@@ -411,7 +411,7 @@ impl WorkspaceTools {
         })
     }
 
-    /// `workspace.patch`: exact-match replacement; `old` must appear exactly
+    /// `workspace_patch`: exact-match replacement; `old` must appear exactly
     /// once unless `replace_all`, and must differ from `new`.
     fn execute_patch(
         &self,
@@ -461,7 +461,7 @@ impl WorkspaceTools {
         })
     }
 
-    /// `shell.exec`: supervised argv execution inside the workspace root with
+    /// `shell_exec`: supervised argv execution inside the workspace root with
     /// a wall-clock timeout, an allowlisted environment, empty stdin, and
     /// byte-captured combined output. No shell string is ever interpreted.
     fn execute_shell(
@@ -532,7 +532,7 @@ impl WorkspaceTools {
         }
     }
 
-    /// `repo.glob`: file-pattern search over workspace paths with `**` /
+    /// `repo_glob`: file-pattern search over workspace paths with `**` /
     /// `*` / `?` semantics (Claude `Glob` parity), capped results.
     fn execute_repo_glob(
         &self,
@@ -570,7 +570,7 @@ impl WorkspaceTools {
         })
     }
 
-    /// `todo.write`: merge-by-id model task list (Claude `TodoWrite` parity),
+    /// `todo_write`: merge-by-id model task list (Claude `TodoWrite` parity),
     /// persisted to `.rapidlm/todos.json` so the list survives across turns.
     fn execute_todo_write(
         &self,
@@ -686,7 +686,7 @@ impl WorkspaceTools {
     }
 
     /// Group key for write-class calls: same key ⇒ serialized in proposal
-    /// order. All `shell.exec` calls share one key (a process may touch any
+    /// order. All `shell_exec` calls share one key (a process may touch any
     /// path); file writes serialize per resolved relative path.
     fn write_group_key(call: &ValidatedToolCall) -> Option<String> {
         match call.tool() {
@@ -775,7 +775,7 @@ fn walk_text_files(
     }
 }
 
-/// Walk ALL regular files (no text filter) depth-first for `repo.glob`,
+/// Walk ALL regular files (no text filter) depth-first for `repo_glob`,
 /// skipping vendored/build/hidden directories; bounded by [`MAX_SEARCH_FILES`].
 fn walk_all_files(
     root: &Path,
@@ -1481,7 +1481,7 @@ impl ToolDriver for WorkspaceTools {
 
 /// Threaded batch dispatch over the workspace driver: read-classified calls
 /// run individually and concurrently, write-classified calls group by target
-/// key (all `shell.exec` together, file writes per relative path) so
+/// key (all `shell_exec` together, file writes per relative path) so
 /// same-path writes serialize in proposal order. Results keep per-call order,
 /// ids, and outcomes.
 fn batch_dispatch(
@@ -2317,7 +2317,7 @@ mod tests {
         let lattice = PermissionLattice::new(crate::permissions::PermissionMode::BypassPermissions)
             .with_rules(vec![ToolRule {
                 effect: RuleEffect::Deny,
-                pattern: ToolPattern::parse("repo.read(.env*)").expect("rule"),
+                pattern: ToolPattern::parse("repo_read(.env*)").expect("rule"),
             }]);
         let mut tools =
             ExecTools::workspace_with_permissions(&root.0, lattice).expect("tools");
@@ -2333,7 +2333,7 @@ mod tests {
     fn persisted_grant_suppresses_the_ask_in_the_driver() {
         let root = TempRoot::new("grant");
         let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default)
-            .with_grants(vec![ToolPattern::parse("workspace.patch").expect("grant")]);
+            .with_grants(vec![ToolPattern::parse("workspace_patch").expect("grant")]);
         let mut tools =
             ExecTools::workspace_with_permissions(&root.0, lattice).expect("tools");
         fs::write(root.0.join("a.rs"), "x").expect("seed");
@@ -2732,6 +2732,30 @@ mod tests {
                 ToolStepResult::Failed { handled, .. } => assert!(handled, "{arguments}"),
                 other => panic!("expected handled refusal for {arguments}, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn every_tool_name_is_provider_portable() {
+        // Providers disagree on tool-name alphabets: api.b.ai (and some other
+        // OpenAI-compatible servers) enforce `^[a-zA-Z0-9_-]+$` and reject
+        // dots, while OpenRouter tolerates them. Adopt the reference-CLI
+        // practice (Claude Code, Grok Build): tool names use only
+        // [a-zA-Z0-9_-], so one surface works with every provider.
+        let portable = |name: &str| {
+            !name.is_empty()
+                && name.len() <= 64
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        };
+        let root = TempRoot::new("portable-names");
+        for tool in ExecTools::workspace(&root.0).expect("tools").tool_surface() {
+            assert!(
+                portable(tool.name()),
+                "tool name {:?} is not provider-portable (use [a-zA-Z0-9_-] only)",
+                tool.name()
+            );
         }
     }
 

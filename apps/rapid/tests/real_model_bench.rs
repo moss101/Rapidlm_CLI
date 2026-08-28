@@ -166,8 +166,8 @@ fn real_s2_cross_step_memory_two_reads_then_sum() {
     let run = run_real(
         &project.project,
         &project.home,
-        "Do this in separate steps: FIRST use repo.read on a.txt only and wait for the \
-         result. THEN use repo.read on b.txt. THEN use workspace.write to create sum.txt \
+        "Do this in separate steps: FIRST use repo_read on a.txt only and wait for the \
+         result. THEN use repo_read on b.txt. THEN use workspace_write to create sum.txt \
          containing just the sum of the two numbers you read. Finally state the sum.",
         "S2_cross_step",
     );
@@ -209,7 +209,7 @@ fn real_s3_multi_file_rename_with_verification() {
         &project.project,
         &project.home,
         "Rename the function legacy_fn to modern_fn in every .rs file in this workspace \
-         (including comment mentions). When done, run ./check.sh with shell.exec to verify, \
+         (including comment mentions). When done, run ./check.sh with shell_exec to verify, \
          then report how many files you changed.",
         "S3_rename",
     );

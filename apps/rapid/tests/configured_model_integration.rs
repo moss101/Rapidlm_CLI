@@ -390,9 +390,9 @@ fn selection_is_unconfigured_when_no_config_exists_anywhere() {
 
 /// SSE chat-completions stream proposing two tool calls.
 fn openai_tool_call_body() -> String {
-    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"repo.read\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"repo_read\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\
      \n\
-     data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"workspace.patch\",\"arguments\":\"{\\\"path\\\":\\\"b.txt\\\",\\\"old\\\":\\\"x\\\",\\\"new\\\":\\\"y\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
+     data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"workspace_patch\",\"arguments\":\"{\\\"path\\\":\\\"b.txt\\\",\\\"old\\\":\\\"x\\\",\\\"new\\\":\\\"y\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
      \n\
      data: [DONE]\n\n"
     .to_owned()
@@ -477,7 +477,7 @@ fn openai_tool_results_reach_the_provider_one_tool_message_per_call() {
     );
     // The assistant message echoes the proposals.
     assert!(second.contains("\"tool_calls\""), "{second}");
-    assert!(second.contains("workspace.patch"), "{second}");
+    assert!(second.contains("workspace_patch"), "{second}");
     // The flat report is gone everywhere.
     assert!(!second.contains("tool results:"), "{second}");
     let _ = std::fs::remove_dir_all(&workspace);
@@ -485,7 +485,7 @@ fn openai_tool_results_reach_the_provider_one_tool_message_per_call() {
 
 #[test]
 fn anthropic_tool_results_reach_the_provider_one_tool_result_per_call() {
-    let first = r#"{"content":[{"type":"tool_use","id":"call_1","name":"repo.read","input":{"path":"a.txt"}}],"stop_reason":"tool_use","usage":{"input_tokens":4,"output_tokens":2}}"#.to_owned();
+    let first = r#"{"content":[{"type":"tool_use","id":"call_1","name":"repo_read","input":{"path":"a.txt"}}],"stop_reason":"tool_use","usage":{"input_tokens":4,"output_tokens":2}}"#.to_owned();
     let second = r#"{"content":[{"type":"text","text":"read done"}],"usage":{"input_tokens":9,"output_tokens":2},"stop_reason":"end_turn"}"#.to_owned();
     let server = spawn_scripted_server(vec![(200, first), (200, second)]);
     let doc = format!(
@@ -549,7 +549,7 @@ fn anthropic_tool_results_reach_the_provider_one_tool_result_per_call() {
 // ---------------------------------------------------------------------------
 
 fn patch_tool_call_body() -> String {
-    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"workspace.patch\",\"arguments\":\"{\\\"path\\\":\\\"notes.txt\\\",\\\"old\\\":\\\"alpha\\\",\\\"new\\\":\\\"beta\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"workspace_patch\",\"arguments\":\"{\\\"path\\\":\\\"notes.txt\\\",\\\"old\\\":\\\"alpha\\\",\\\"new\\\":\\\"beta\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
      \n\
      data: [DONE]\n\n"
     .to_owned()

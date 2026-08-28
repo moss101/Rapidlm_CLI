@@ -93,7 +93,7 @@ pub enum ToolClass {
 
 /// A `Tool(arg-glob)` rule: `Name` matches every call of the tool,
 /// `Name(pattern)` additionally matches the call subject (path for file
-/// tools, joined argv for `shell.exec`) with `*`/`?` glob semantics.
+/// tools, joined argv for `shell_exec`) with `*`/`?` glob semantics.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ToolRule {
     pub effect: RuleEffect,
@@ -316,7 +316,7 @@ impl PermissionLattice {
 
     /// Evaluate one call. `tool` is the gateway tool name, `subject` the
     /// rule-matching context (workspace-relative path for file tools, joined
-    /// argv for `shell.exec`).
+    /// argv for `shell_exec`).
     pub fn evaluate(&self, tool: &str, subject: &str, class: ToolClass) -> Decision {
         // 1. Rules, by precedence not insertion order: deny wins, then ask,
         // then allow.
@@ -534,7 +534,7 @@ mod tests {
     #[test]
     fn read_only_calls_auto_allow_in_default_mode() {
         let lattice = PermissionLattice::new(PermissionMode::Default);
-        for tool in ["repo.read", "repo.search", "workspace.read"] {
+        for tool in ["repo_read", "repo_search", "workspace_read"] {
             assert_eq!(
                 lattice.evaluate(tool, "src/lib.rs", ToolClass::ReadOnly),
                 Decision::Allow(DecisionReason::ReadOnlyAutoAllow),
@@ -543,11 +543,11 @@ mod tests {
         }
         // A write in default mode asks (a headless denial at the driver).
         assert_eq!(
-            lattice.evaluate("workspace.patch", "src/lib.rs", ToolClass::FileEdit),
+            lattice.evaluate("workspace_patch", "src/lib.rs", ToolClass::FileEdit),
             Decision::Ask(DecisionReason::ModeAsk)
         );
         assert_eq!(
-            lattice.evaluate("shell.exec", "git status", ToolClass::Other),
+            lattice.evaluate("shell_exec", "git status", ToolClass::Other),
             Decision::Ask(DecisionReason::ModeAsk)
         );
     }
@@ -581,7 +581,7 @@ mod tests {
         for (mode, expected) in cases {
             let lattice = PermissionLattice::new(mode);
             assert_eq!(
-                lattice.evaluate("workspace.patch", subject, ToolClass::FileEdit),
+                lattice.evaluate("workspace_patch", subject, ToolClass::FileEdit),
                 expected,
                 "{mode} file-edit decision"
             );
@@ -590,7 +590,7 @@ mod tests {
         for mode in [PermissionMode::AcceptEdits, PermissionMode::Auto] {
             let lattice = PermissionLattice::new(mode);
             assert_eq!(
-                lattice.evaluate("shell.exec", "rm -rf build", ToolClass::Other),
+                lattice.evaluate("shell_exec", "rm -rf build", ToolClass::Other),
                 Decision::Ask(DecisionReason::ModeAsk),
                 "{mode} shell decision"
             );
@@ -598,7 +598,7 @@ mod tests {
         // Plan mode allows reads.
         let plan = PermissionLattice::new(PermissionMode::Plan);
         assert!(plan
-            .evaluate("repo.read", "src/lib.rs", ToolClass::ReadOnly)
+            .evaluate("repo_read", "src/lib.rs", ToolClass::ReadOnly)
             .is_allowed());
     }
 
@@ -607,15 +607,15 @@ mod tests {
         // dontAsk denies everything not pre-approved (rules/grants/read-only).
         let lattice = PermissionLattice::new(PermissionMode::DontAsk);
         assert_eq!(
-            lattice.evaluate("shell.exec", "cargo test", ToolClass::Other),
+            lattice.evaluate("shell_exec", "cargo test", ToolClass::Other),
             Decision::Deny(DecisionReason::DontAskDeny)
         );
         // ...but a pre-approved grant still allows.
         let lattice = lattice.with_grants(vec![
-            ToolPattern::parse("shell.exec(cargo *)").expect("grant"),
+            ToolPattern::parse("shell_exec(cargo *)").expect("grant"),
         ]);
         assert_eq!(
-            lattice.evaluate("shell.exec", "cargo test", ToolClass::Other),
+            lattice.evaluate("shell_exec", "cargo test", ToolClass::Other),
             Decision::Allow(DecisionReason::PersistedGrant)
         );
 
@@ -623,14 +623,14 @@ mod tests {
         let lattice = PermissionLattice::new(PermissionMode::BypassPermissions).with_rules(vec![
             ToolRule {
                 effect: RuleEffect::Deny,
-                pattern: ToolPattern::parse("shell.exec(rm *)").expect("rule"),
+                pattern: ToolPattern::parse("shell_exec(rm *)").expect("rule"),
             },
         ]);
         assert!(lattice
-            .evaluate("workspace.patch", "any.rs", ToolClass::FileEdit)
+            .evaluate("workspace_patch", "any.rs", ToolClass::FileEdit)
             .is_allowed());
         assert_eq!(
-            lattice.evaluate("shell.exec", "rm -rf /", ToolClass::Other),
+            lattice.evaluate("shell_exec", "rm -rf /", ToolClass::Other),
             Decision::Deny(DecisionReason::DenyRule)
         );
     }
@@ -640,39 +640,39 @@ mod tests {
         let lattice = PermissionLattice::new(PermissionMode::BypassPermissions).with_rules(vec![
             ToolRule {
                 effect: RuleEffect::Allow,
-                pattern: ToolPattern::parse("shell.exec(git *)").expect("allow"),
+                pattern: ToolPattern::parse("shell_exec(git *)").expect("allow"),
             },
             ToolRule {
                 effect: RuleEffect::Ask,
-                pattern: ToolPattern::parse("shell.exec(git push*)").expect("ask"),
+                pattern: ToolPattern::parse("shell_exec(git push*)").expect("ask"),
             },
             ToolRule {
                 effect: RuleEffect::Deny,
-                pattern: ToolPattern::parse("shell.exec(git push --force*)").expect("deny"),
+                pattern: ToolPattern::parse("shell_exec(git push --force*)").expect("deny"),
             },
         ]);
         assert_eq!(
-            lattice.evaluate("shell.exec", "git push --force origin main", ToolClass::Other),
+            lattice.evaluate("shell_exec", "git push --force origin main", ToolClass::Other),
             Decision::Deny(DecisionReason::DenyRule),
             "deny must win over allow and ask"
         );
         assert_eq!(
-            lattice.evaluate("shell.exec", "git push origin main", ToolClass::Other),
+            lattice.evaluate("shell_exec", "git push origin main", ToolClass::Other),
             Decision::Ask(DecisionReason::AskRule),
             "ask must win over allow"
         );
         assert_eq!(
-            lattice.evaluate("shell.exec", "git status", ToolClass::Other),
+            lattice.evaluate("shell_exec", "git status", ToolClass::Other),
             Decision::Allow(DecisionReason::AllowRule)
         );
         // A deny rule beats read-only auto-allow too.
         let lattice =
             lattice.with_rules(vec![ToolRule {
                 effect: RuleEffect::Deny,
-                pattern: ToolPattern::parse("repo.read(.env*)").expect("deny"),
+                pattern: ToolPattern::parse("repo_read(.env*)").expect("deny"),
             }]);
         assert_eq!(
-            lattice.evaluate("repo.read", ".env.local", ToolClass::ReadOnly),
+            lattice.evaluate("repo_read", ".env.local", ToolClass::ReadOnly),
             Decision::Deny(DecisionReason::DenyRule)
         );
     }
@@ -680,20 +680,20 @@ mod tests {
     #[test]
     fn persisted_grant_suppresses_the_mode_ask() {
         let lattice = PermissionLattice::new(PermissionMode::Default).with_grants(vec![
-            ToolPattern::parse("shell.exec(git *)").expect("grant"),
-            ToolPattern::parse("workspace.patch").expect("grant"),
+            ToolPattern::parse("shell_exec(git *)").expect("grant"),
+            ToolPattern::parse("workspace_patch").expect("grant"),
         ]);
         assert_eq!(
-            lattice.evaluate("shell.exec", "git diff", ToolClass::Other),
+            lattice.evaluate("shell_exec", "git diff", ToolClass::Other),
             Decision::Allow(DecisionReason::PersistedGrant)
         );
         assert_eq!(
-            lattice.evaluate("workspace.patch", "src/a.rs", ToolClass::FileEdit),
+            lattice.evaluate("workspace_patch", "src/a.rs", ToolClass::FileEdit),
             Decision::Allow(DecisionReason::PersistedGrant)
         );
         // Un-granted calls still ask.
         assert_eq!(
-            lattice.evaluate("shell.exec", "make all", ToolClass::Other),
+            lattice.evaluate("shell_exec", "make all", ToolClass::Other),
             Decision::Ask(DecisionReason::ModeAsk)
         );
     }
@@ -703,14 +703,14 @@ mod tests {
         let lattice = PermissionLattice::new(PermissionMode::Default).with_rules(vec![
             ToolRule {
                 effect: RuleEffect::Deny,
-                pattern: ToolPattern::parse("shell.exec(sudo *)").expect("rule"),
+                pattern: ToolPattern::parse("shell_exec(sudo *)").expect("rule"),
             },
         ]);
         let decisions = [
-            lattice.evaluate("shell.exec", "sudo rm x", ToolClass::Other),
-            lattice.evaluate("shell.exec", "ls", ToolClass::Other),
-            lattice.evaluate("repo.read", "a.rs", ToolClass::ReadOnly),
-            lattice.evaluate("workspace.patch", "a.rs", ToolClass::FileEdit),
+            lattice.evaluate("shell_exec", "sudo rm x", ToolClass::Other),
+            lattice.evaluate("shell_exec", "ls", ToolClass::Other),
+            lattice.evaluate("repo_read", "a.rs", ToolClass::ReadOnly),
+            lattice.evaluate("workspace_patch", "a.rs", ToolClass::FileEdit),
         ];
         for decision in decisions {
             let reason = decision.reason();
@@ -739,21 +739,21 @@ mod tests {
     fn tool_pattern_parse_rejects_malformed_rules() {
         assert!(ToolPattern::parse("").is_none());
         assert!(ToolPattern::parse("(").is_none());
-        assert!(ToolPattern::parse("shell.exec(").is_none());
-        assert!(ToolPattern::parse("shell.exec()").is_none());
+        assert!(ToolPattern::parse("shell_exec(").is_none());
+        assert!(ToolPattern::parse("shell_exec()").is_none());
         assert!(ToolPattern::parse("(git *)").is_none());
         assert!(ToolPattern::parse("shell exec(git)").is_none());
-        let pattern = ToolPattern::parse("shell.exec(git *)").expect("ok");
-        assert_eq!(pattern.tool(), "shell.exec");
+        let pattern = ToolPattern::parse("shell_exec(git *)").expect("ok");
+        assert_eq!(pattern.tool(), "shell_exec");
         assert_eq!(pattern.arg_glob(), Some("git *"));
-        let bare = ToolPattern::parse("workspace.patch").expect("ok");
+        let bare = ToolPattern::parse("workspace_patch").expect("ok");
         assert_eq!(bare.arg_glob(), None);
     }
 
     #[test]
     fn settings_parse_reads_both_document_shapes() {
         let rapidlm = parse_settings(
-            r#"{"mode": "acceptEdits", "permissions": {"deny": ["shell.exec(rm *)"]}}"#,
+            r#"{"mode": "acceptEdits", "permissions": {"deny": ["shell_exec(rm *)"]}}"#,
         )
         .expect("rapidlm shape");
         assert_eq!(rapidlm.mode, Some(PermissionMode::AcceptEdits));
@@ -761,7 +761,7 @@ mod tests {
         assert_eq!(rapidlm.rules[0].effect, RuleEffect::Deny);
 
         let claude = parse_settings(
-            r#"{"permissions": {"defaultMode": "plan", "allow": ["Read(*)", "repo.read"],
+            r#"{"permissions": {"defaultMode": "plan", "allow": ["Read(*)", "repo_read"],
                "ask": ["Bash(git push*)"]}}"#,
         )
         .expect("claude shape");
@@ -805,7 +805,7 @@ mod tests {
     #[test]
     fn grants_parse_is_scoped_per_root_and_fails_closed() {
         let document = r#"{"schema": 1, "projects": [
-            {"root": "/work/a", "allow": ["shell.exec(cargo *)"]},
+            {"root": "/work/a", "allow": ["shell_exec(cargo *)"]},
             {"root": "/work/b", "allow": []}
         ]}"#;
         let grants = parse_grants(document).expect("grants");
