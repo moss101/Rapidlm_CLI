@@ -187,29 +187,52 @@ pub struct ValidatedToolCall {
 
 /// Input for one model step. Tool results from the previous step, if any.
 /// `pending_calls` are the proposed calls that produced `prior_tools` (empty
-/// when the last step proposed no calls), so the request layer can echo the
-/// assistant tool-call message next to its per-call results.
+/// One completed tool step: the calls the model proposed and their per-call
+/// results, kept as an ordered pair. The full sequence of exchanges within a
+/// turn is the model's working memory — each request carries every prior
+/// exchange (bounded by the request layer), not just the latest one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolStepExchange {
+    calls: Vec<ProposedToolCall>,
+    results: Vec<ToolStepResult>,
+}
+
+impl ToolStepExchange {
+    pub fn new(calls: Vec<ProposedToolCall>, results: Vec<ToolStepResult>) -> Self {
+        Self { calls, results }
+    }
+
+    pub fn calls(&self) -> &[ProposedToolCall] {
+        &self.calls
+    }
+
+    pub fn results(&self) -> &[ToolStepResult] {
+        &self.results
+    }
+}
+
+/// Input for one model step. `history` holds every completed tool exchange
+/// of the turn in order (empty before the first tool step), so the request
+/// layer can replay the whole assistant/tool conversation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelStepInput<'a> {
     step: u32,
-    prior_tools: &'a [ToolStepResult],
-    pending_calls: &'a [ProposedToolCall],
+    history: &'a [ToolStepExchange],
     tool_surface: &'a [ToolSurface],
 }
 
 impl<'a> ModelStepInput<'a> {
-    /// Build a step input from its parts (public so request-construction
-    /// tests can drive the same shape the loop produces).
-    pub fn new(
+    /// Build a step input from a full exchange history (public so
+    /// request-construction tests can drive the same shape the loop
+    /// produces).
+    pub fn with_history(
         step: u32,
-        prior_tools: &'a [ToolStepResult],
-        pending_calls: &'a [ProposedToolCall],
+        history: &'a [ToolStepExchange],
         tool_surface: &'a [ToolSurface],
     ) -> Self {
         Self {
             step,
-            prior_tools,
-            pending_calls,
+            history,
             tool_surface,
         }
     }
@@ -218,8 +241,7 @@ impl<'a> ModelStepInput<'a> {
     pub fn without_tools(step: u32) -> Self {
         Self {
             step,
-            prior_tools: &[],
-            pending_calls: &[],
+            history: &[],
             tool_surface: &[],
         }
     }
@@ -227,6 +249,27 @@ impl<'a> ModelStepInput<'a> {
     /// The tool surface the driver advertises to the model for this turn.
     pub fn tool_surface(&self) -> &'a [ToolSurface] {
         self.tool_surface
+    }
+
+    /// Every completed tool exchange of the turn, oldest first.
+    pub fn history(&self) -> &'a [ToolStepExchange] {
+        self.history
+    }
+
+    /// Results of the most recent tool step (empty before the first step).
+    pub fn prior_tools(&self) -> &'a [ToolStepResult] {
+        self.history
+            .last()
+            .map(|exchange| exchange.results.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Calls of the most recent tool step (empty before the first step).
+    pub fn pending_calls(&self) -> &'a [ProposedToolCall] {
+        self.history
+            .last()
+            .map(|exchange| exchange.calls.as_slice())
+            .unwrap_or(&[])
     }
 }
 
@@ -508,26 +551,11 @@ struct LoopState {
 }
 
 enum StepDecision {
-    Continue(ToolExchange),
+    /// A completed tool step: append its exchange to the turn history.
+    Continue(ToolStepExchange),
+    /// An empty response: re-invoke the model without appending anything.
+    Retry,
     Stop(TurnResult),
-}
-
-/// Tool exchange carried between model steps: the calls proposed in the last
-/// tool step and their per-call results, kept as an ordered pair so the
-/// request layer can echo the assistant tool-call message with its results.
-#[derive(Clone)]
-struct ToolExchange {
-    calls: Vec<ProposedToolCall>,
-    results: Vec<ToolStepResult>,
-}
-
-impl ToolExchange {
-    const fn empty() -> Self {
-        Self {
-            calls: Vec::new(),
-            results: Vec::new(),
-        }
-    }
 }
 
 impl TurnEventKind {
@@ -743,15 +771,6 @@ impl ModelStepInput<'_> {
     pub const fn step(&self) -> u32 {
         self.step
     }
-
-    pub fn prior_tools(&self) -> &[ToolStepResult] {
-        self.prior_tools
-    }
-
-    /// The calls proposed in the step that produced [`ModelStepInput::prior_tools`].
-    pub fn pending_calls(&self) -> &[ProposedToolCall] {
-        self.pending_calls
-    }
 }
 
 impl ToolStepResult {
@@ -925,10 +944,11 @@ where
         },
     )?;
 
-    let mut exchange = ToolExchange::empty();
+    let mut history: Vec<ToolStepExchange> = Vec::new();
     loop {
-        match run_model_step(&mut state, model, tools, events, &exchange, cancel)? {
-            StepDecision::Continue(next) => exchange = next,
+        match run_model_step(&mut state, model, tools, events, &history, cancel)? {
+            StepDecision::Continue(exchange) => history.push(exchange),
+            StepDecision::Retry => {}
             StepDecision::Stop(result) => return Ok(result),
         }
     }
@@ -939,7 +959,7 @@ fn run_model_step<M, T, E>(
     model: &mut M,
     tools: &mut T,
     events: &mut E,
-    exchange: &ToolExchange,
+    history: &[ToolStepExchange],
     cancel: &CancellationToken,
 ) -> Result<StepDecision, TurnError>
 where
@@ -977,8 +997,7 @@ where
     let surface = tools.tool_surface();
     let input = ModelStepInput {
         step,
-        prior_tools: &exchange.results,
-        pending_calls: &exchange.calls,
+        history,
         tool_surface: &surface,
     };
     let output = match model.step(&input, cancel) {
@@ -1101,14 +1120,10 @@ where
     if empty_response {
         state.empty_responses = state.empty_responses.saturating_add(1);
         if state.empty_responses <= EMPTY_RESPONSE_RETRY_LIMIT {
-            // Bounded retry: re-invoke the model for the same step with the same
-            // tool exchange (calls and results stay an ordered pair), consuming
-            // model budget. An empty response is never fabricated into
-            // assistant content.
-            return Ok(StepDecision::Continue(ToolExchange {
-                calls: exchange.calls.clone(),
-                results: exchange.results.clone(),
-            }));
+            // Bounded retry: re-invoke the model for the same step with an
+            // unchanged history, consuming model budget. An empty response is
+            // never fabricated into assistant content.
+            return Ok(StepDecision::Retry);
         }
         return Ok(StepDecision::Stop(fail(
             state,
@@ -1141,10 +1156,9 @@ where
             match run_tool_steps(state, tools, events, calls, cancel)? {
                 ToolBatchOutcome::Stopped(stop) => Ok(StepDecision::Stop(stop)),
                 ToolBatchOutcome::Completed(results) => {
-                    Ok(StepDecision::Continue(ToolExchange {
-                        calls: proposed,
-                        results,
-                    }))
+                    Ok(StepDecision::Continue(ToolStepExchange::new(
+                        proposed, results,
+                    )))
                 }
             }
         }
@@ -2041,6 +2055,73 @@ mod tests {
                 "model.completed",
                 "turn.completed",
             ]
+        );
+    }
+
+    #[test]
+    fn history_accumulates_across_steps_so_early_results_stay_visible() {
+        // Step 1 reads a.txt; step 2 reads b.txt; step 3 must still see BOTH
+        // exchanges — the model's request at step 3 carries the full turn
+        // history, not just the last exchange.
+        struct HistoryModel {
+            seen_histories: Vec<Vec<Vec<String>>>,
+        }
+        impl ModelDriver for HistoryModel {
+            fn step(
+                &mut self,
+                input: &ModelStepInput<'_>,
+                _cancel: &CancellationToken,
+            ) -> Result<ModelStepOutput, ModelStepError> {
+                self.seen_histories.push(
+                    input
+                        .history()
+                        .iter()
+                        .map(|exchange| {
+                            exchange
+                                .results()
+                                .iter()
+                                .map(|result| result.call_id().to_owned())
+                                .collect()
+                        })
+                        .collect(),
+                );
+                match self.seen_histories.len() {
+                    1 => tools_out(vec![call("ra", "repo.read")], 1),
+                    2 => tools_out(vec![call("rb", "repo.read")], 1),
+                    _ => terminal("have both", 1),
+                }
+            }
+        }
+        let mut model = HistoryModel {
+            seen_histories: Vec::new(),
+        };
+        let mut tools = ScriptedTools::new(vec![
+            Ok(ToolStepResult::Succeeded {
+                call_id: "ra".to_owned(),
+                summary: "17".to_owned(),
+            }),
+            Ok(ToolStepResult::Succeeded {
+                call_id: "rb".to_owned(),
+                summary: "25".to_owned(),
+            }),
+        ]);
+        let mut events = Vec::new();
+        let result = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(result.status(), TurnStatus::Completed);
+        assert_eq!(model.seen_histories.len(), 3);
+        assert_eq!(model.seen_histories[0].len(), 0, "first step: no history");
+        assert_eq!(model.seen_histories[1], vec![vec!["ra".to_owned()]]);
+        assert_eq!(
+            model.seen_histories[2],
+            vec![vec!["ra".to_owned()], vec!["rb".to_owned()]],
+            "step 3 must still see step 1's exchange"
         );
     }
 

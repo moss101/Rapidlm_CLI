@@ -822,12 +822,17 @@ fn exec_user_home() -> Option<PathBuf> {
 }
 
 /// Cause-classified failure line for a finished turn: a provider cause names
-/// the class and the first remedy; without one the terminal status stands
-/// alone (bounds, interrupts, tool failures).
+/// the class and the first remedy; otherwise the turn summary carries the
+/// typed stop reason (e.g. "agent turn failed: repeated_tool_call").
 fn describe_turn_failure(result: &AgentResult, cause: Option<FailureCause>) -> String {
+    let summary = result.summary();
     match cause {
-        Some(cause) => format!("agent turn failed: {}; {}", cause.as_str(), cause.remedy()),
-        None => format!("agent turn failed: {}", result.status().as_str()),
+        Some(cause) => format!(
+            "{summary} ({}; {})",
+            cause.as_str(),
+            cause.remedy()
+        ),
+        None => summary.to_owned(),
     }
 }
 

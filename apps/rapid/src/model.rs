@@ -330,9 +330,9 @@ fn build_request(
     blocks: &[ContextBlock],
     input: &ModelStepInput<'_>,
 ) -> Result<CanonicalModelRequest, ModelStepError> {
-    let prior_tools = input.prior_tools();
-    let pending_calls = input.pending_calls();
-    let mut messages = Vec::with_capacity(blocks.len().saturating_add(pending_calls.len() + 1));
+    let mut messages = Vec::with_capacity(
+        blocks.len() + input.history().len() * 2 + 1,
+    );
     for block in blocks {
         let role = if matches!(block.source(), ContextSource::System) {
             MessageRole::System
@@ -345,35 +345,42 @@ fn build_request(
                 .map_err(|_| ModelStepError::BoundExceeded)?,
         );
     }
-    // Per-call tool-result channel: the assistant tool-call message that
-    // produced the results, then one tool-role message per executed call
-    // bearing that call's id and text outcome. This replaces the single flat
+    // Per-call tool-result channel: replay every completed exchange of the
+    // turn — the assistant tool-call message followed by one tool-role
+    // message per executed call, each bearing its id and text outcome. The
+    // history is the model's working memory; dropping older exchanges makes
+    // multi-step tasks impossible, so only the byte budget prunes, and it
+    // prunes whole oldest exchanges. This replaces the single flat
     // "tool results:" user report.
-    if !pending_calls.is_empty() {
-        let tool_calls = pending_calls
-            .iter()
-            .map(|call| {
-                Ok(ToolCall::new(
-                    ToolCallId::parse(call.call_id()).map_err(map_provider_error)?,
-                    ToolName::parse(call.tool()).map_err(map_provider_error)?,
-                    call.arguments(),
-                )
-                .map_err(map_provider_error)?)
-            })
-            .collect::<Result<Vec<_>, ModelStepError>>()?;
-        messages.push(
-            CanonicalMessage::new(MessageRole::Assistant, Vec::new(), None, tool_calls)
-                .map_err(|_| ModelStepError::BoundExceeded)?,
-        );
-    }
-    for tool in prior_tools {
-        let (call_id, text) = tool_result_text(tool);
-        let call_id = ToolCallId::parse(call_id).map_err(map_provider_error)?;
-        let part = ContentPart::text(text).map_err(|_| ModelStepError::BoundExceeded)?;
-        messages.push(
-            CanonicalMessage::new(MessageRole::Tool, vec![part], Some(call_id), Vec::new())
-                .map_err(|_| ModelStepError::BoundExceeded)?,
-        );
+    let history = kept_history(input.history());
+    for exchange in history {
+        if !exchange.calls().is_empty() {
+            let tool_calls = exchange
+                .calls()
+                .iter()
+                .map(|call| {
+                    Ok(ToolCall::new(
+                        ToolCallId::parse(call.call_id()).map_err(map_provider_error)?,
+                        ToolName::parse(call.tool()).map_err(map_provider_error)?,
+                        call.arguments(),
+                    )
+                    .map_err(map_provider_error)?)
+                })
+                .collect::<Result<Vec<_>, ModelStepError>>()?;
+            messages.push(
+                CanonicalMessage::new(MessageRole::Assistant, Vec::new(), None, tool_calls)
+                    .map_err(|_| ModelStepError::BoundExceeded)?,
+            );
+        }
+        for result in exchange.results() {
+            let (call_id, text) = tool_result_text(result);
+            let call_id = ToolCallId::parse(call_id).map_err(map_provider_error)?;
+            let part = ContentPart::text(text).map_err(|_| ModelStepError::BoundExceeded)?;
+            messages.push(
+                CanonicalMessage::new(MessageRole::Tool, vec![part], Some(call_id), Vec::new())
+                    .map_err(|_| ModelStepError::BoundExceeded)?,
+            );
+        }
     }
 
     let request_id = next_request_id()?;
@@ -424,6 +431,49 @@ fn next_request_id() -> Result<ModelRequestId, ModelStepError> {
         .unwrap_or(0);
     let seq = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     ModelRequestId::parse(format!("live-{nanos:x}-{seq}")).map_err(|_| ModelStepError::Failed)
+}
+
+/// Hard bounds for the replayed tool-exchange history: the newest exchange
+/// is always kept, older ones are dropped wholesale once a bound is hit.
+const MAX_TOOL_HISTORY_EXCHANGES: usize = 12;
+const MAX_TOOL_HISTORY_BYTES: usize = 24 * 1024;
+
+fn exchange_wire_bytes(exchange: &agent_runtime::ToolStepExchange) -> usize {
+    let calls: usize = exchange
+        .calls()
+        .iter()
+        .map(|call| call.call_id().len() + call.tool().len() + call.arguments().len())
+        .sum();
+    let results: usize = exchange
+        .results()
+        .iter()
+        .map(|result| match result {
+            ToolStepResult::Succeeded { summary, .. } => summary.len(),
+            ToolStepResult::Failed { detail, .. } | ToolStepResult::Denied { detail, .. } => {
+                detail.as_deref().map_or(0, str::len)
+            }
+            ToolStepResult::ApprovalRequired { .. } => 0,
+        })
+        .sum();
+    calls + results + 128
+}
+
+fn kept_history(
+    history: &[agent_runtime::ToolStepExchange],
+) -> &[agent_runtime::ToolStepExchange] {
+    let mut start = history.len();
+    let mut kept = 0usize;
+    let mut budget = MAX_TOOL_HISTORY_BYTES;
+    while start > 0 {
+        let size = exchange_wire_bytes(&history[start - 1]);
+        if kept >= MAX_TOOL_HISTORY_EXCHANGES || (kept > 0 && size > budget) {
+            break;
+        }
+        start -= 1;
+        kept += 1;
+        budget = budget.saturating_sub(size);
+    }
+    &history[start..]
 }
 
 /// Model-visible text for one tool outcome. This is the per-call tool-result
@@ -846,7 +896,7 @@ mod tests {
             "create a file",
             serde_json::json!({"type": "object", "required": ["path", "content"]}),
         )];
-        let input = ModelStepInput::new(1, &[], &[], &surface);
+        let input = ModelStepInput::with_history(1, &[], &surface);
         let built = build_request(&configured, &[], &input).expect("request");
         assert_eq!(built.tools().len(), 1);
         assert_eq!(built.tools()[0].name().as_str(), "workspace.write");
@@ -882,7 +932,9 @@ mod tests {
                 detail: Some("workspace.patch denied: denied by an explicit deny rule".to_owned()),
             },
         ];
-        let input = ModelStepInput::new(2, &prior, &pending, &[]);
+        let exchange = agent_runtime::ToolStepExchange::new(pending, prior);
+        let history = vec![exchange];
+        let input = ModelStepInput::with_history(2, &history, &[]);
         let built = build_request(&configured, &[], &input).expect("request");
         let messages = built.messages();
         // No flat user report.

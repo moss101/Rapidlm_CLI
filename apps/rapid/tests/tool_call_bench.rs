@@ -318,15 +318,15 @@ fn bench_a_multi_phase_agentic_task() {
         assert!(content.contains(&format!("patched-{index}")), "{content}");
         assert!(!content.contains("target"), "old text gone: {content}");
     }
-    // Requests: 5 steps. Step 2's request carries 4 per-call results, step 3's
-    // carries 3, step 4's carries 1, step 5's carries 1.
+    // Requests: 5 steps. With full history replay each request carries the
+    // tool messages of EVERY completed exchange so far (cumulative).
     assert_eq!(server.requests.lock().expect("r").len(), 5);
     let requests = server.requests.lock().expect("requests").clone();
-    for (request, expected) in requests.iter().zip([0usize, 4, 3, 1, 1]) {
+    for (request, expected) in requests.iter().zip([0usize, 4, 7, 8, 9]) {
         let count = request.matches("\"role\":\"tool\"").count();
         assert_eq!(
             count, expected,
-            "per-call tool messages on request: {}",
+            "cumulative per-call tool messages on request: {}",
             request.lines().next().unwrap_or("")
         );
     }
