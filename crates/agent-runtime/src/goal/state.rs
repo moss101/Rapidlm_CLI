@@ -214,6 +214,7 @@ pub enum GoalStateError {
         existing: GoalId,
     },
     NotActive,
+    EvidenceMissing,
     GoalMismatch {
         expected: GoalId,
         found: GoalId,
@@ -760,6 +761,7 @@ impl GoalStateError {
             | Self::NotActive
             | Self::GoalMismatch { .. }
             | Self::InvalidTransition { .. } => Some(ErrorCode::GoalInvalidTransition),
+            Self::EvidenceMissing => Some(ErrorCode::GoalEvidenceMissing),
             Self::InvalidStatement
             | Self::InvalidCriterion
             | Self::TooManyCriteria { .. }
@@ -817,6 +819,9 @@ impl fmt::Display for GoalStateError {
                 write!(f, "session already has top-level goal {existing}")
             }
             Self::NotActive => f.write_str("session has no top-level goal"),
+            Self::EvidenceMissing => {
+                f.write_str("goal criteria are not all satisfied by recorded evidence")
+            }
             Self::GoalMismatch { expected, found } => {
                 write!(
                     f,

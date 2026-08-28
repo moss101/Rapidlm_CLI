@@ -4,6 +4,7 @@
 
 pub mod computer_runtime;
 pub mod external_agents;
+pub mod goal_claim;
 pub mod goal_host;
 pub mod headless;
 pub mod host;

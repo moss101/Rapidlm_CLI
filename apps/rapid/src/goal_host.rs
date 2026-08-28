@@ -132,13 +132,29 @@ impl GoalHost {
     }
 
     /// Apply a lifecycle command. Subagent actors are rejected; only a human /
-    /// system / main-agent may mutate the top-level contract.
+    /// system / main-agent may mutate the top-level contract. `Complete` is
+    /// gated on the evidence store (same rule as the agent-facing driver):
+    /// every criterion must be satisfied by recorded evidence.
     pub fn apply(
         &mut self,
         command: GoalCommand,
         actor: &GoalActor,
         cancel: &CancellationToken,
     ) -> Result<GoalEffect, GoalStateError> {
+        if let GoalCommand::Complete { goal_id } = &command {
+            let Some(snapshot) = self.machine.snapshot() else {
+                return Err(GoalStateError::NotActive);
+            };
+            if snapshot.id() != *goal_id {
+                return Err(GoalStateError::GoalMismatch {
+                    expected: snapshot.id(),
+                    found: *goal_id,
+                });
+            }
+            if !self.evidence.can_complete(snapshot).allowed() {
+                return Err(GoalStateError::EvidenceMissing);
+            }
+        }
         self.machine.apply_with_cancel(command, actor, cancel)
     }
 
@@ -490,6 +506,35 @@ mod tests {
         );
         assert!(reloaded.can_complete(&CancellationToken::new()));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn complete_command_is_gated_on_evidence() {
+        let mut host = GoalHost::new();
+        host.apply(
+            GoalCommand::Create(spec("ship auth")),
+            &human(),
+            &CancellationToken::new(),
+        )
+        .expect("create");
+        let goal_id = host.snapshot().expect("snap").id();
+        // No recorded evidence: Complete is refused at the host boundary.
+        let err = host
+            .apply(
+                GoalCommand::Complete { goal_id },
+                &human(),
+                &CancellationToken::new(),
+            )
+            .expect_err("incomplete goal cannot complete");
+        assert_eq!(err, GoalStateError::EvidenceMissing);
+        host.record_evidence(system_test_record(goal_id))
+            .expect("record");
+        host.apply(
+            GoalCommand::Complete { goal_id },
+            &human(),
+            &CancellationToken::new(),
+        )
+        .expect("complete");
     }
 
     #[test]

@@ -19,7 +19,7 @@ pub use checks::{
     CheckKind, CheckResult, CheckRunner, CheckStatus, MAX_CHECK_SUMMARY_BYTES, VerificationCheck,
 };
 pub use contract::{
-    AcceptanceCriterion, MAX_OBJECTIVE_BYTES, MAX_REQUIREMENTS, RequirementNode,
+    AcceptanceCriterion, MAX_ID_BYTES, MAX_OBJECTIVE_BYTES, MAX_REQUIREMENTS, RequirementNode,
     RequirementPriority, TaskContract, TaskContractError, WorkspacePolicy,
 };
 pub use events::{

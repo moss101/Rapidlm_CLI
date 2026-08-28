@@ -323,12 +323,20 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
     };
     // Durable-ledger backing for agent-produced evidence citations. Without
     // the ledger the gate stays fail-closed for agent records; human and
-    // system records are unaffected.
-    match event_ledger::ledger::EventLedger::open(Path::new(PROJECT_MARKER).join(SESSIONS_DB_FILE))
-    {
-        Ok(ledger) => host.install_backing(ledger),
-        Err(err) => eprintln!("ledger unavailable ({err}); agent evidence cannot be backed"),
-    }
+    // system records are unaffected. The handle is kept for `goal claim`,
+    // which appends its own audit events.
+    let claim_ledger =
+        match event_ledger::ledger::EventLedger::open(Path::new(PROJECT_MARKER).join(SESSIONS_DB_FILE))
+        {
+            Ok(ledger) => {
+                host.install_backing(ledger.clone());
+                Some(ledger)
+            }
+            Err(err) => {
+                eprintln!("ledger unavailable ({err}); agent evidence cannot be backed");
+                None
+            }
+        };
     if let Err(err) = host.load_evidence(&evidence_path) {
         eprintln!("{err}");
         return Ok(1);
@@ -417,6 +425,53 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
         "pause" => goal_lifecycle(&mut host, "pause", &cancel),
         "resume" => goal_lifecycle(&mut host, "resume", &cancel),
         "cancel" => goal_lifecycle(&mut host, "cancel", &cancel),
+        "complete" => goal_lifecycle(&mut host, "complete", &cancel),
+        "claim" => {
+            let Some(ledger) = claim_ledger.as_ref() else {
+                eprintln!("ledger unavailable; claims cannot be audited");
+                return Ok(1);
+            };
+            let flags = parse_flags(&args[1..])?;
+            let summary = one(&flags, "summary").ok_or(InteractiveError::Usage)?;
+            let timeout_secs = match one(&flags, "timeout-secs") {
+                Some(raw) => raw.parse::<u64>().map_err(|_| InteractiveError::Usage)?,
+                None => 60,
+            };
+            let mut checks = Vec::new();
+            for entry in flags.get("check").into_iter().flatten() {
+                let Some((requirement_id, command)) = entry.split_once('=') else {
+                    return Err(InteractiveError::Usage);
+                };
+                checks.push(crate::goal_claim::CheckSpec {
+                    requirement_id: requirement_id.to_owned(),
+                    command: command.to_owned(),
+                });
+            }
+            let claim = crate::goal_claim::GoalClaim::new(summary, checks, timeout_secs)
+                .map_err(|err| {
+                    eprintln!("{err}");
+                    InteractiveError::Usage
+                })?;
+            let outcome = crate::goal_claim::run_claim(&mut host, ledger, claim, &cancel)
+                .map_err(|err| {
+                    eprintln!("{err}");
+                    InteractiveError::Internal
+                })?;
+            for check in &outcome.checks {
+                let status = if check.timed_out {
+                    "timeout"
+                } else if check.passed {
+                    "pass"
+                } else {
+                    "fail"
+                };
+                println!("- check {}: {status}", check.requirement_id);
+            }
+            println!("evidence recorded: {}", outcome.evidence_recorded);
+            println!("verdict: {}", outcome.verdict.as_str());
+            println!("accepted: {}", outcome.accepted);
+            Ok(if outcome.accepted { 0 } else { 1 })
+        }
         "export" => {
             let Some(export) = host.export(&cancel) else {
                 println!("no active goal");
@@ -635,6 +690,10 @@ fn goal_lifecycle(
         println!("no active goal");
         return Ok(1);
     };
+    if kind == "complete" && !host.can_complete(cancel) {
+        println!("completion refused: criteria are not all satisfied by recorded evidence");
+        return Ok(1);
+    }
     let command = match kind {
         "pause" => GoalCommand::Pause {
             goal_id,
@@ -642,6 +701,7 @@ fn goal_lifecycle(
         },
         "resume" => GoalCommand::Resume { goal_id },
         "cancel" => GoalCommand::Cancel { goal_id },
+        "complete" => GoalCommand::Complete { goal_id },
         _ => return Err(InteractiveError::Usage),
     };
     host.apply(command, &GoalActor::Human, cancel)

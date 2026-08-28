@@ -7,7 +7,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 | `rapid` | interactive TUI |
 | `rapid exec <prompt>` | one-shot/headless task (uses the configured model; see [model-configuration.md](model-configuration.md)) |
 | `rapid run <goal/playbook>` | durable graph run |
-| `rapid goal create|show|pause|resume|cancel|budget|verify|evidence` | goal lifecycle; `goal evidence record` citations resolve against the session ledger |
+| `rapid goal create|show|pause|resume|cancel|complete|budget|verify|evidence|claim` | goal lifecycle; `goal evidence record` citations resolve against the session ledger; `goal complete` is gated on the evidence store; `goal claim --summary S --check crit=cmd [--timeout-secs N]` runs deterministic checks for real, cites each run in the ledger, and only accepts when the host supervisor verifies every criterion |
 | `rapid resume [session/run]` | resume durable session/run |
 | `rapid fork [checkpoint]` | non-destructive branch |
 | `rapid rewind` | restore/fork conversation/graph/workspace checkpoint |
