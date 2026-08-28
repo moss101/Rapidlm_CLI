@@ -74,10 +74,11 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> (bool, S
     // Output goes to a temp file rather than our pipes: a hook that
     // backgrounds its own children (`sleep 30 &`) would otherwise hold the
     // pipe write-end open past the kill, blocking EOF collection.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let output_path = std::env::temp_dir().join(format!(
         "rapidlm-hook-out-{}-{}",
         std::process::id(),
-        Instant::now().elapsed().as_nanos()
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     ));
     let output_file = match std::fs::File::create(&output_path) {
         Ok(file) => file,
