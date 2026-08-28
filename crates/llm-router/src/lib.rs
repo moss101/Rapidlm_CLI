@@ -56,11 +56,13 @@ pub use providers::anthropic::{
     encode_anthropic_payload,
 };
 pub use providers::openai_compatible::{
+    http_get, 
     DEFAULT_HTTP_TIMEOUT, Http1Transport, HttpTransport, MAX_BASE_URL_BYTES,
     MAX_HTTP_REQUEST_BYTES, MAX_HTTP_RESPONSE_BYTES, OPENAI_COMPATIBLE_CONFIG_SCHEMA,
     OPENAI_COMPATIBLE_SCHEMA_VERSION, OpenAiApiStyle, OpenAiCompatibleAdapter,
     OpenAiCompatibleConfig, OpenAiCompatibleEndpoint, ProviderHttpRequest, ProviderHttpResponse,
     StaticWireAuth, WireAuthorization, encode_provider_payload,
+
 };
 pub use route::filter::{
     EligibleSet, HardRejection, LOCAL_ONLY_TAG, LOCAL_PROVIDER_ID, MAX_ELIGIBLE_MODELS,

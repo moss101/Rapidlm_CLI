@@ -338,12 +338,45 @@ fn push_role_blocks(
     wire.push((role, blocks));
 }
 
+/// Split a `data:image/<type>;base64,<payload>` URL into its parts.
+fn parse_data_url(data_url: &str) -> Result<(&'static str, &str), ProviderError> {
+    const PNG: &str = "data:image/png;base64,";
+    const JPEG: &str = "data:image/jpeg;base64,";
+    const GIF: &str = "data:image/gif;base64,";
+    const WEBP: &str = "data:image/webp;base64,";
+    if let Some(data) = data_url.strip_prefix(PNG) {
+        return Ok(("image/png", data));
+    }
+    if let Some(data) = data_url.strip_prefix(JPEG) {
+        return Ok(("image/jpeg", data));
+    }
+    if let Some(data) = data_url.strip_prefix(GIF) {
+        return Ok(("image/gif", data));
+    }
+    if let Some(data) = data_url.strip_prefix(WEBP) {
+        return Ok(("image/webp", data));
+    }
+    Err(ProviderError::InvalidRequest)
+}
+
 fn encode_text_blocks(parts: &[ContentPart]) -> Result<Vec<Value>, ProviderError> {
     let mut blocks = Vec::new();
     for part in parts {
         match part {
             ContentPart::Text { text } => {
                 blocks.push(serde_json::json!({"type": "text", "text": text}));
+            }
+            // Inline vision images ride tool results as base64 image blocks.
+            ContentPart::ImageData { data_url } => {
+                let (media_type, data) = parse_data_url(data_url)?;
+                blocks.push(serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": data,
+                    }
+                }));
             }
             ContentPart::Image { .. } => return Err(ProviderError::InvalidRequest),
         }
@@ -360,6 +393,17 @@ fn encode_user_blocks(message: &CanonicalMessage) -> Result<Vec<Value>, Provider
         match part {
             ContentPart::Text { text } => {
                 blocks.push(serde_json::json!({"type": "text", "text": text}));
+            }
+            ContentPart::ImageData { data_url } => {
+                let (media_type, data) = parse_data_url(data_url)?;
+                blocks.push(serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": data,
+                    }
+                }));
             }
             ContentPart::Image { artifact } => {
                 blocks.push(serde_json::json!({

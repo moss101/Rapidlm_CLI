@@ -373,15 +373,52 @@ fn build_request(
             );
         }
         for result in exchange.results() {
-            let (call_id, text) = tool_result_text(result);
-            let call_id = ToolCallId::parse(call_id).map_err(map_provider_error)?;
-            let part = ContentPart::text(text).map_err(|_| ModelStepError::BoundExceeded)?;
-            messages.push(
-                CanonicalMessage::new(MessageRole::Tool, vec![part], Some(call_id), Vec::new())
+            let (raw_call_id, text) = tool_result_text(result);
+            let call_id = ToolCallId::parse(raw_call_id).map_err(map_provider_error)?;
+            // Inline vision content: `DATA_URL:<data:image/...>` lines become
+            // image parts so vision-capable models see the actual pixels.
+            let mut parts: Vec<ContentPart> = Vec::new();
+            let mut plain = String::new();
+            for line in text.lines() {
+                if let Some(data_url) = line.strip_prefix("DATA_URL:") {
+                    if !plain.is_empty() {
+                        plain.push('\n');
+                    }
+                    match ContentPart::image_data(data_url.to_owned()) {
+                        Ok(part) => {
+                            parts.push(part);
+                            plain.clear();
+                        }
+                        Err(_) => {
+                            plain.push_str(line);
+                            plain.push('\n');
+                        }
+                    }
+                } else {
+                    plain.push_str(line);
+                    plain.push('\n');
+                }
+            }
+            let plain = plain.trim_end().to_owned();
+            if !plain.is_empty() {
+                parts.push(
+                    ContentPart::text(plain).map_err(|_| ModelStepError::BoundExceeded)?,
+                );
+            }
+            if !parts.is_empty() {
+                messages.push(
+                    CanonicalMessage::new(
+                        MessageRole::Tool,
+                        parts,
+                        Some(call_id),
+                        Vec::new(),
+                    )
                     .map_err(|_| ModelStepError::BoundExceeded)?,
-            );
+                );
+            }
         }
     }
+
 
     let request_id = next_request_id()?;
     let model_ref = ModelRef::new(model.provider.clone(), model.model.clone());
@@ -985,7 +1022,7 @@ mod tests {
     fn part_text(part: &ContentPart) -> &str {
         match part {
             ContentPart::Text { text } => text,
-            ContentPart::Image { .. } => "",
+            ContentPart::Image { .. } | ContentPart::ImageData { .. } => "",
         }
     }
 }

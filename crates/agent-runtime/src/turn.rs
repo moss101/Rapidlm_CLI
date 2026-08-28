@@ -472,6 +472,14 @@ pub trait ToolDriver {
         ToolKind::Write
     }
 
+    /// Completed background-job notifications pending replay to the model.
+    /// Empty by default; drivers with background state return one synthetic
+    /// exchange per newly finished job so the model learns the outcome
+    /// without polling.
+    fn drain_notifications(&mut self) -> Vec<ToolStepExchange> {
+        Vec::new()
+    }
+
     /// Execute an already-validated batch, returning one outcome per call in
     /// proposal order. The default runs the calls sequentially; drivers whose
     /// calls are independent override this to dispatch concurrently, with
@@ -946,6 +954,11 @@ where
 
     let mut history: Vec<ToolStepExchange> = Vec::new();
     loop {
+        // Absorb completed background-job notifications so the model learns
+        // their outcome without polling.
+        for exchange in tools.drain_notifications() {
+            history.push(exchange);
+        }
         match run_model_step(&mut state, model, tools, events, &history, cancel)? {
             StepDecision::Continue(exchange) => history.push(exchange),
             StepDecision::Retry => {}
@@ -2222,6 +2235,103 @@ mod tests {
                 vec!["c1".to_owned(), "c2".to_owned()],
                 vec!["c1".to_owned(), "c2".to_owned()]
             )
+        );
+    }
+
+    #[test]
+    fn background_notifications_land_in_history_before_the_next_step() {
+        // The driver reports a completed background job on drain; the next
+        // model step must see it as a synthetic exchange in the history
+        // without any polling tool call from the model.
+        struct NotifyDriver {
+            drained: Vec<ToolStepExchange>,
+        }
+        impl ToolDriver for NotifyDriver {
+            fn validate(
+                &mut self,
+                call: &ProposedToolCall,
+                _cancel: &CancellationToken,
+            ) -> Result<ValidatedToolCall, ToolStepError> {
+                Ok(ValidatedToolCall::from_proposed(call))
+            }
+            fn execute(
+                &mut self,
+                call: &ValidatedToolCall,
+                _cancel: &CancellationToken,
+            ) -> Result<ToolStepResult, ToolStepError> {
+                Ok(ToolStepResult::Succeeded {
+                    call_id: call.call_id().to_owned(),
+                    summary: "started".to_owned(),
+                })
+            }
+            fn drain_notifications(&mut self) -> Vec<ToolStepExchange> {
+                std::mem::take(&mut self.drained)
+            }
+        }
+        let notification = ToolStepExchange::new(
+            vec![ProposedToolCall::new("notify-job-1", "background_jobs", "{}")
+                .expect("call")],
+            vec![ToolStepResult::Succeeded {
+                call_id: "notify-job-1".to_owned(),
+                summary: "job-1: completed exit 0 — output: done".to_owned(),
+            }],
+        );
+        struct NotifyModel {
+            notification_seen: bool,
+            steps: u32,
+        }
+        impl ModelDriver for NotifyModel {
+            fn step(
+                &mut self,
+                input: &ModelStepInput<'_>,
+                _cancel: &CancellationToken,
+            ) -> Result<ModelStepOutput, ModelStepError> {
+                self.steps += 1;
+                let seen_notification = input.history().iter().any(|exchange| {
+                    exchange
+                        .results()
+                        .iter()
+                        .any(|result| match result {
+                            ToolStepResult::Succeeded { summary, .. } => {
+                                summary.contains("completed exit 0")
+                            }
+                            _ => false,
+                        })
+                });
+                if seen_notification {
+                    self.notification_seen = true;
+                    return Ok(ModelStepOutput::Terminal {
+                        text: "noticed the job".to_owned(),
+                        tokens: 1,
+                    });
+                }
+                Ok(ModelStepOutput::ToolCalls {
+                    calls: vec![ProposedToolCall::new("bg", "background_jobs", "{}")
+                        .expect("call")],
+                    tokens: 1,
+                })
+            }
+        }
+        let mut model = NotifyModel {
+            notification_seen: false,
+            steps: 0,
+        };
+        let mut tools = NotifyDriver {
+            drained: vec![notification],
+        };
+        let mut events = Vec::new();
+        let result = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(result.status(), TurnStatus::Completed);
+        assert!(
+            model.notification_seen,
+            "step 2 must see the drained notification in history"
         );
     }
 

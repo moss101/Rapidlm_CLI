@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agent_runtime::{
-    CancellationToken, ProposedToolCall, ToolDriver, ToolKind, ToolStepError, ToolStepResult,
-    ToolSurface, ValidatedToolCall,
+    CancellationToken, ProposedToolCall, ToolDriver, ToolKind, ToolStepError, ToolStepExchange,
+    ToolStepResult, ToolSurface, ValidatedToolCall,
 };
 
 use crate::permissions::{Decision, PermissionLattice, PermissionMode, ToolClass};
@@ -82,6 +82,12 @@ pub const MAX_PLAN_BYTES: usize = 16 * 1024;
 pub const AGENT_TYPES: &[&str] = &["general-purpose", "explore", "plan"];
 /// Tool name for fetching a web page (Claude `WebFetch` parity).
 pub const WEB_FETCH_TOOL: &str = "web_fetch";
+/// Tool name for asking the user a question (Claude `AskUserQuestion` parity).
+pub const ASK_USER_TOOL: &str = "ask_user";
+/// Timeout for the ask_user stdin read.
+pub const ASK_USER_TIMEOUT: Duration = Duration::from_secs(300);
+/// Maximum options per ask_user question.
+pub const MAX_ASK_USER_OPTIONS: usize = 8;
 /// Hard byte cap on one tool call's JSON arguments.
 pub const MAX_TOOL_ARGUMENTS_BYTES: usize = 8 * 1024;
 /// Hard byte cap on a relative workspace path.
@@ -154,6 +160,7 @@ struct JobShared {
     overflow: Arc<AtomicBool>,
     state: Arc<Mutex<JobState>>,
     child: Arc<Mutex<Option<std::process::Child>>>,
+    reported: Arc<AtomicBool>,
 }
 
 enum JobState {
@@ -213,6 +220,7 @@ impl JobRegistry {
             overflow: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(JobState::Running)),
             child: Arc::new(Mutex::new(None)),
+            reported: Arc::new(AtomicBool::new(false)),
         };
         self.jobs
             .lock()
@@ -382,6 +390,55 @@ impl JobRegistry {
         Some((text, done, next, state.as_text()))
     }
 
+    /// Take every completed-but-unreported job as a model notification
+    /// summary (job id, terminal state, bounded output). Running jobs stay
+    /// pending; each job reports at most once.
+    fn drain_notifications(&self) -> Vec<String> {
+        let Ok(jobs) = self.jobs.lock() else {
+            return Vec::new();
+        };
+        let mut notices = Vec::new();
+        for (id, job) in jobs.iter() {
+            if job.reported.load(Ordering::SeqCst) {
+                continue;
+            }
+            let tail = {
+                let Ok(state) = job.state.lock() else {
+                    continue;
+                };
+                if matches!(*state, JobState::Running) {
+                    continue;
+                }
+                job.reported.store(true, Ordering::SeqCst);
+                let output = job.output.lock().ok();
+                output
+                    .as_ref()
+                    .map(|buffer| {
+                        let text = String::from_utf8_lossy(buffer);
+                        let start = text.len().saturating_sub(512);
+                        let mut start = start;
+                        while start > 0 && !text.is_char_boundary(start) {
+                            start -= 1;
+                        }
+                        text[start..].trim().to_owned()
+                    })
+                    .unwrap_or_default()
+            };
+            let state_text = {
+                let Ok(state) = job.state.lock() else {
+                    continue;
+                };
+                state.as_text().to_owned()
+            };
+            if tail.is_empty() {
+                notices.push(format!("{id}: {state_text}"));
+            } else {
+                notices.push(format!("{id}: {state_text} — output: {tail}"));
+            }
+        }
+        notices
+    }
+
     fn kill_all(&self) {
         let Ok(jobs) = self.jobs.lock() else {
             return;
@@ -443,6 +500,9 @@ pub struct WorkspaceTools {
     subagents: Option<Arc<dyn SubagentRunner>>,
     fetch_allowlist: Vec<String>,
     hooks: crate::hooks::HooksConfig,
+    ask_stdin: Option<Arc<dyn Fn(&str, &[String], Duration) -> Result<String, String> + Send + Sync>>,
+    mcp: Arc<Mutex<Vec<McpConnection>>>,
+    mcp_surface: Arc<Mutex<Vec<(String, String, mcp::transport::McpToolDescriptor)>>>,
 }
 
 impl WorkspaceTools {
@@ -470,7 +530,93 @@ impl WorkspaceTools {
             subagents: None,
             fetch_allowlist: Vec::new(),
             hooks: crate::hooks::HooksConfig::default(),
+            ask_stdin: None,
+            mcp: Arc::new(Mutex::new(Vec::new())),
+            mcp_surface: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    /// Register configured stdio MCP servers: spawn, initialize, list tools,
+    /// and record `mcp__<server>__<tool>` names on the surface. Servers that
+    /// fail to start or handshake are recorded as offline (calls to them
+    /// fail with a typed handled error) rather than skipped silently.
+    pub fn register_mcp_servers(&mut self, servers: &[McpServerConfig]) {
+        use mcp::transport::{
+            ClientCapabilities, ImplementationInfo, IoBounds, McpSession, StdioTransport,
+        };
+        let bounds = IoBounds::new(64 * 1024, Duration::from_secs(30))
+            .expect("standard io bounds");
+        for server in servers {
+            let spawn = std::process::Command::new(&server.command)
+                .args(&server.args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            let mut child = match spawn {
+                Ok(child) => child,
+                Err(_) => {
+                    self.mcp_surface.lock().expect("mcp surface").push((
+                        format!("mcp__{}__offline", server.name),
+                        server.name.clone(),
+                        mcp::transport::McpToolDescriptor {
+                            name: "offline".to_owned(),
+                            description: Some(format!(
+                                "server {} failed to start",
+                                server.name
+                            )),
+                            input_schema: serde_json::json!({}),
+                        },
+                    ));
+                    self.mcp.lock().expect("mcp").push(McpConnection {
+                        server: server.name.clone(),
+                        online: false,
+                        child: None,
+                        session: None,
+                        tools: Vec::new(),
+                    });
+                    continue;
+                }
+            };
+            let stdout = child.stdout.take().expect("stdout piped");
+            let stdin = child.stdin.take().expect("stdin piped");
+            let mut session = McpSession::new(
+                StdioTransport::from_pipes(stdout, stdin, None, bounds.clone()),
+                ImplementationInfo::rapidlm(),
+                ClientCapabilities::new(true),
+            );
+            let cancel = capability_broker::CancellationToken::new();
+            let tools = match session.initialize(&cancel) {
+                Ok(_) => match session.tools_list(&capability_broker::CancellationToken::new()) {
+                    Ok(tools) => tools,
+                    Err(err) => {
+                        eprintln!("DEBUG tools_list error: {err:?}");
+                        Vec::new()
+                    }
+                },
+                Err(err) => {
+                    eprintln!("DEBUG initialize error: {err:?}");
+                    Vec::new()
+                }
+            };
+            {
+                let mut surface = self.mcp_surface.lock().expect("mcp surface");
+                for tool in &tools {
+                    surface.push((
+                        format!("mcp__{}__{}", server.name, tool.name),
+                        server.name.clone(),
+                        tool.clone(),
+                    ));
+                }
+            }
+            self.mcp.lock().expect("mcp").push(McpConnection {
+                server: server.name.clone(),
+                online: true,
+                child: Some(child),
+                session: Some(Mutex::new(session)),
+                tools,
+            });
+        }
     }
 
     /// Hosts web_fetch may fetch despite resolving private (local fixtures).
@@ -481,6 +627,18 @@ impl WorkspaceTools {
     /// Attach project hook commands (pre/post tool stages).
     pub fn set_hooks(&mut self, hooks: crate::hooks::HooksConfig) {
         self.hooks = hooks;
+    }
+
+    /// Attach the interactive answer source for ask_user. The closure
+    /// receives the rendered prompt and the options; it returns the chosen
+    /// option (composition root reads stdin and enforces the timeout).
+    pub fn set_ask_source(
+        &mut self,
+        source: std::sync::Arc<
+            dyn Fn(&str, &[String], Duration) -> Result<String, String> + Send + Sync,
+        >,
+    ) {
+        self.ask_stdin = Some(source);
     }
 
     /// Read-only driver for subagent explore/plan scopes: write-classified
@@ -631,6 +789,8 @@ impl WorkspaceTools {
             JOB_OUTPUT_TOOL => parse_job_id_args(call.arguments(), true).is_ok(),
             TASK_SPAWN_TOOL => parse_task_args(call.arguments()).is_ok(),
             WEB_FETCH_TOOL => parse_web_fetch_args(call.arguments()).is_ok(),
+            ASK_USER_TOOL => parse_ask_user_args(call.arguments()).is_ok(),
+            other if other.starts_with("mcp__") => true,
             _ => return Err(ToolStepError::Invalid),
         };
         if !arguments_parseable {
@@ -658,6 +818,8 @@ impl WorkspaceTools {
             JOB_OUTPUT_TOOL => self.execute_job_output(call, cancel),
             TASK_SPAWN_TOOL => self.execute_task_spawn(call, cancel),
             WEB_FETCH_TOOL => self.execute_web_fetch(call, cancel),
+            ASK_USER_TOOL => self.execute_ask_user(call, cancel),
+            other if other.starts_with("mcp__") => self.execute_mcp_tool(call, cancel),
             _ => Err(ToolStepError::Invalid),
         }?;
         // Post-tool-use hooks observe the completed call; their output is
@@ -705,10 +867,48 @@ impl WorkspaceTools {
         let args = parse_path_argument(call.arguments()).ok_or(ToolStepError::Invalid)?;
         let target = self.resolve_in_root(&args)?;
         match fs::read(&target) {
-            Ok(bytes) => Ok(ToolStepResult::Succeeded {
-                call_id: call.call_id().to_owned(),
-                summary: bounded_text(&bytes, MAX_READ_BYTES),
-            }),
+            Ok(bytes) => {
+                // Rich reads: images become vision data URLs; PDFs are
+                // text-extracted. Everything else stays bounded UTF-8 text.
+                if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                    let dims = png_dimensions(&bytes);
+                    use base64::Engine as _;
+                    let data_url = format!(
+                        "DATA_URL:image/png;base64,{}",
+                        base64::engine::general_purpose::STANDARD.encode(&bytes)
+                    );
+                    return Ok(ToolStepResult::Succeeded {
+                        call_id: call.call_id().to_owned(),
+                        summary: bounded_detail(&format!(
+                            "PNG image{}; {} bytes; inline vision content:\n{}",
+                            dims.map(|(w, h)| format!(" {w}x{h}")).unwrap_or_default(),
+                            bytes.len(),
+                            data_url
+                        )),
+                    });
+                }
+                if bytes.starts_with(b"%PDF-") {
+                    let extracted = crate::pdf_text::extract_pdf_text(&bytes);
+                    let pages = pdf_page_count(&bytes);
+                    return Ok(ToolStepResult::Succeeded {
+                        call_id: call.call_id().to_owned(),
+                        summary: bounded_detail(&match extracted {
+                            Some(text) => format!(
+                                "PDF, {pages} page(s); extracted text:\n{}",
+                                bounded_text(text.as_bytes(), MAX_READ_BYTES)
+                            ),
+                            None => format!(
+                                "PDF, {pages} page(s); no extractable text (scanned or \
+                                 encoded content)"
+                            ),
+                        }),
+                    });
+                }
+                Ok(ToolStepResult::Succeeded {
+                    call_id: call.call_id().to_owned(),
+                    summary: bounded_text(&bytes, MAX_READ_BYTES),
+                })
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 // Model-visible, handled failure: the turn continues
                 // and the model can correct the path.
@@ -910,6 +1110,40 @@ impl WorkspaceTools {
         cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_shell_args(call.arguments())?;
+        if args.sandbox {
+            // Seatbelt confinement (macOS): workspace writes allowed, other
+            // writes denied. Unavailability is a typed handled failure.
+            let Some(sandbox_exec) = find_sandbox_exec() else {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(
+                        "sandbox requested but sandbox-exec is unavailable on this platform",
+                    )),
+                });
+            };
+            let profile_path = self
+                .resolve_in_root(".rapidlm/seatbelt.sb")
+                .map_err(|_| ToolStepError::Failed)?;
+            fs::write(
+                &profile_path,
+                seatbelt_profile(self.root()).as_bytes(),
+            )
+            .map_err(|_| ToolStepError::Failed)?;
+            let mut sandboxed = vec![sandbox_exec.to_string_lossy().into_owned()];
+            sandboxed.push("-f".to_owned());
+            sandboxed.push(profile_path.to_string_lossy().into_owned());
+            sandboxed.extend(args.argv.iter().cloned());
+            let job_id = self.jobs.start(&sandboxed, self.root(), args.timeout)?;
+            return Ok(ToolStepResult::Succeeded {
+                call_id: call.call_id().to_owned(),
+                summary: format!(
+                    "started sandboxed job {job_id}: {} (timeout {}s); poll with job_status",
+                    sandboxed[3..].join(" "),
+                    args.timeout.as_secs()
+                ),
+            });
+        }
         if args.background {
             let job_id = self.jobs.start(&args.argv, self.root(), args.timeout)?;
             return Ok(ToolStepResult::Succeeded {
@@ -1252,6 +1486,138 @@ impl WorkspaceTools {
         })
     }
 
+    /// `ask_user`: surface a question with options; the selected option is
+    /// read from the configured stdin source. Headless runs (no source)
+    /// return a typed refusal so the model can proceed on judgment.
+    fn execute_ask_user(
+        &self,
+        call: &ValidatedToolCall,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        let (question, options) = parse_ask_user_args(call.arguments())?;
+        let Some(ask) = self.ask_stdin.as_deref() else {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(
+                    "ask_user requires an interactive user; none is available in this \
+                     headless run — proceed with best judgment and state assumptions",
+                )),
+            });
+        };
+        let listing: String = options
+            .iter()
+            .enumerate()
+            .map(|(index, option)| format!("{}. {option}", index + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = format!("{question}\n{listing}\nAnswer with the option number: ");
+        match ask(&prompt, &options, ASK_USER_TIMEOUT) {
+            Ok(chosen) => Ok(ToolStepResult::Succeeded {
+                call_id: call.call_id().to_owned(),
+                summary: format!("user selected: {chosen}"),
+            }),
+            Err(reason) => Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&reason)),
+            }),
+        }
+    }
+
+    /// `mcp__<server>__<tool>`: dispatch through the MCP JSON-RPC session.
+    fn execute_mcp_tool(
+        &self,
+        call: &ValidatedToolCall,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        const MCP_RESULT_CAP: usize = 20 * 1024;
+        let wire = call.tool();
+        let rest = wire.strip_prefix("mcp__").unwrap_or(wire);
+        let Some((server_name, tool_name)) = rest.split_once("__") else {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "{wire}: malformed MCP tool name (expected mcp__<server>__<tool>)"
+                ))),
+            });
+        };
+        let arguments: serde_json::Value = serde_json::from_str(call.arguments())
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let Ok(connections) = self.mcp.lock() else {
+            return Err(ToolStepError::Failed);
+        };
+        let Some(connection) = connections
+            .iter()
+            .find(|connection| connection.server == server_name)
+        else {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "MCP server {server_name:?} is not configured"
+                ))),
+            });
+        };
+        if !connection.online {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "MCP server {server_name:?} failed to start"
+                ))),
+            });
+        }
+        let Some(session_ref) = connection.session.as_ref() else {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "MCP server {server_name:?} is offline"
+                ))),
+            });
+        };
+        let mut session = match session_ref.lock() {
+            Ok(session) => session,
+            Err(_) => return Err(ToolStepError::Failed),
+        };
+        let cancel = capability_broker::CancellationToken::new();
+        let watchdog = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(30));
+                cancel.cancel();
+            })
+        };
+        let outcome = session.tools_call(tool_name, &arguments, &cancel);
+        drop(watchdog);
+        match outcome {
+            Ok(output) if !output.is_error => Ok(ToolStepResult::Succeeded {
+                call_id: call.call_id().to_owned(),
+                summary: bounded_detail(&format!(
+                    "[mcp:{server_name}]\n{}",
+                    crate::exec_tools::truncate_str(&output.text, MCP_RESULT_CAP)
+                )),
+            }),
+            Ok(output) => Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "[mcp:{server_name}] tool error: {}",
+                    output.text
+                ))),
+            }),
+            Err(err) => Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "[mcp:{server_name}] {err}"
+                ))),
+            }),
+        }
+    }
+
     /// `web_fetch`: SSRF-guarded page fetch, HTML stripped to bounded text.
     fn execute_web_fetch(
         &self,
@@ -1348,6 +1714,50 @@ fn tool_class(tool: &str) -> ToolClass {
         WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL | TODO_WRITE_TOOL => ToolClass::FileEdit,
         _ => ToolClass::Other,
     }
+}
+
+/// PNG dimensions from the IHDR chunk (0,0 when malformed).
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return None;
+    }
+    let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    Some((width, height))
+}
+
+/// Count `/Type /Page` objects (not /Pages) as a page estimate.
+fn pdf_page_count(bytes: &[u8]) -> usize {
+    let mut count = 0;
+    let mut cursor = 0;
+    while let Some(rel) = find_bytes(&bytes[cursor..], b"/Type") {
+        let at = cursor + rel;
+        let rest = &bytes[at + 6..];
+        let skip = rest.iter().take(4).count();
+        let _ = skip;
+        let trimmed = leading_spaces(rest);
+        if rest[trimmed..].starts_with(b"/Page")
+            && !rest[trimmed..].starts_with(b"/Pages")
+        {
+            count += 1;
+        }
+        cursor = at + 6;
+    }
+    count.max(1)
+}
+
+fn leading_spaces(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .take_while(|byte| **byte == b' ' || **byte == b'\n' || **byte == b'\r' || **byte == b'\t')
+        .count()
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Walk workspace text files depth-first (skipping vendored/build dirs),
@@ -1510,6 +1920,7 @@ struct ShellArgs {
     argv: Vec<String>,
     timeout: Duration,
     background: bool,
+    sandbox: bool,
 }
 
 struct RepoGlobArgs {
@@ -1714,6 +2125,136 @@ fn parse_todo_args(raw: &str) -> Result<TodoArgs, ToolStepError> {
     Ok(TodoArgs { todos })
 }
 
+/// Parse bounded `{"question", "options"}` ask-user arguments.
+fn parse_ask_user_args(raw: &str) -> Result<(String, Vec<String>), ToolStepError> {
+    const ALLOWED: &[&str] = &["question", "options"];
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
+    let object = value.as_object().ok_or(ToolStepError::Invalid)?;
+    if !object.keys().all(|key| ALLOWED.contains(&key.as_str()))
+        || !object.contains_key("question")
+        || !object.contains_key("options")
+    {
+        return Err(ToolStepError::Invalid);
+    }
+    let question = object
+        .get("question")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ToolStepError::Invalid)?;
+    if question.is_empty() || question.len() > 1024 {
+        return Err(ToolStepError::Invalid);
+    }
+    let options = object
+        .get("options")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(ToolStepError::Invalid)?;
+    if options.is_empty() || options.len() > MAX_ASK_USER_OPTIONS {
+        return Err(ToolStepError::Invalid);
+    }
+    let mut parsed = Vec::with_capacity(options.len());
+    for option in options {
+        let option = option.as_str().ok_or(ToolStepError::Invalid)?;
+        if option.is_empty() || option.len() > 256 {
+            return Err(ToolStepError::Invalid);
+        }
+        parsed.push(option.to_owned());
+    }
+    Ok((question.to_owned(), parsed))
+}
+
+/// One configured stdio MCP server (Claude `mcpServers` schema subset).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+/// Parse `mcpServers` from project settings. Names must be short
+/// identifiers so the wire tool name `mcp__<server>__<tool>` stays bounded.
+pub fn parse_mcp_servers(value: &serde_json::Value) -> Vec<McpServerConfig> {
+    let Some(servers) = value.get("mcpServers").and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    let mut configs = Vec::new();
+    for (name, spec) in servers {
+        if configs.len() >= 8 || name.len() > 32 || name.is_empty() {
+            continue;
+        }
+        let Some(spec) = spec.as_object() else {
+            continue;
+        };
+        let Some(command) = spec.get("command").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let args: Vec<String> = spec
+            .get("args")
+            .and_then(serde_json::Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| entry.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        configs.push(McpServerConfig {
+            name: name.clone(),
+            command: command.to_owned(),
+            args,
+        });
+    }
+    configs
+}
+
+/// A live stdio MCP connection: the supervised child, its JSON-RPC session,
+/// and the tools it advertised at registration.
+struct McpConnection {
+    server: String,
+    online: bool,
+    child: Option<std::process::Child>,
+    session: Option<Mutex<mcp_session_box::SessionBox>>,
+    tools: Vec<mcp::transport::McpToolDescriptor>,
+}
+
+mod mcp_session_box {
+    use mcp::transport::{McpSession, StdioTransport};
+    use std::process::{ChildStdin, ChildStdout};
+
+    pub type SessionBox = McpSession<StdioTransport<ChildStdout, ChildStdin>>;
+}
+
+/// Bounded char-safe string cut.
+fn truncate_str(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_owned();
+    }
+    let mut end = cap;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+/// Generate a macOS Seatbelt profile permitting workspace writes only.
+fn seatbelt_profile(workspace: &Path) -> String {
+    format!(
+        "(version 1)\n(deny file-write*)\n(allow file-write*\n  (subpath {workspace:?})\n  \
+         (subpath \"/dev/\" )\n  (subpath \"/private/tmp/\"))\n(allow default)"
+    )
+}
+
+/// Locate sandbox-exec (macOS). None = sandboxing unavailable.
+fn find_sandbox_exec() -> Option<PathBuf> {
+    let mut path = PathBuf::from("/usr/bin/sandbox-exec");
+    if path.exists() {
+        return Some(path);
+    }
+    path = PathBuf::from("/bin/sandbox-exec");
+    if path.exists() {
+        return Some(path);
+    }
+    None
+}
+
 /// Parse bounded `{"job_id", "offset"?}` background-job arguments.
 fn parse_job_id_args(raw: &str, with_offset: bool) -> Result<JobIdArgs, ToolStepError> {
     const ALLOWED: &[&str] = &["job_id", "offset"];
@@ -1884,7 +2425,8 @@ fn parse_shell_args(raw: &str) -> Result<ShellArgs, ToolStepError> {
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
     let object = value.as_object().ok_or(ToolStepError::Invalid)?;
     let expected = 1 + usize::from(object.contains_key("timeout_ms"))
-        + usize::from(object.contains_key("background"));
+        + usize::from(object.contains_key("background"))
+        + usize::from(object.contains_key("sandbox"));
     if object.len() != expected {
         return Err(ToolStepError::Invalid);
     }
@@ -1920,10 +2462,15 @@ fn parse_shell_args(raw: &str) -> Result<ShellArgs, ToolStepError> {
         Some(value) => value.as_bool().ok_or(ToolStepError::Invalid)?,
         None => false,
     };
+    let sandbox = match object.get("sandbox") {
+        Some(value) => value.as_bool().ok_or(ToolStepError::Invalid)?,
+        None => false,
+    };
     Ok(ShellArgs {
         argv: tokens,
         timeout,
         background,
+        sandbox,
     })
 }
 
@@ -2046,6 +2593,27 @@ impl ExecTools {
         }
     }
 
+    /// Hosts web_fetch may fetch despite resolving private (local fixtures).
+    pub fn set_fetch_allowlist(&mut self, allowlist: Vec<String>) {
+        if let Self::Workspace(tools) = self {
+            tools.set_fetch_allowlist(allowlist);
+        }
+    }
+
+    /// Attach project hook commands (pre/post tool stages).
+    pub fn set_hooks(&mut self, hooks: crate::hooks::HooksConfig) {
+        if let Self::Workspace(tools) = self {
+            tools.set_hooks(hooks);
+        }
+    }
+
+    /// Register configured stdio MCP servers.
+    pub fn register_mcp_servers(&mut self, servers: &[McpServerConfig]) {
+        if let Self::Workspace(tools) = self {
+            tools.register_mcp_servers(servers);
+        }
+    }
+
     /// The trusted workspace surface with an explicit permission lattice.
     pub fn workspace_with_permissions(
         root: &Path,
@@ -2091,6 +2659,11 @@ impl ToolDriver for WorkspaceTools {
         cancel: &CancellationToken,
     ) -> Result<ValidatedToolCall, ToolStepError> {
         cancel.check().map_err(|_| ToolStepError::Cancelled)?;
+        // Dynamically registered MCP tools validate as known; their
+        // dispatch re-validates arguments at execution time.
+        if call.tool().starts_with("mcp__") {
+            return Ok(ValidatedToolCall::from_proposed(call));
+        }
         // Known tools accept the call here even with malformed arguments:
         // execute renders the failure as a per-call model-visible result the
         // model can correct. Unknown tools are structural refusals.
@@ -2110,6 +2683,7 @@ impl ToolDriver for WorkspaceTools {
                 | JOB_OUTPUT_TOOL
                 | TASK_SPAWN_TOOL
                 | WEB_FETCH_TOOL
+                | ASK_USER_TOOL
         ) {
             return Err(ToolStepError::Invalid);
         }
@@ -2228,6 +2802,33 @@ impl ToolDriver for ExecTools {
         tool_kind(tool)
     }
 
+    fn drain_notifications(&mut self) -> Vec<ToolStepExchange> {
+        let Self::Workspace(tools) = self else {
+            return Vec::new();
+        };
+        tools
+            .jobs
+            .drain_notifications()
+            .into_iter()
+            .map(|summary| {
+                let job_id = summary.split(':').next().unwrap_or("job").trim().to_owned();
+                let call = ProposedToolCall::new(
+                    format!("notify-{job_id}"),
+                    "background_jobs",
+                    format!(r#"{{"summary":{}}}"#, serde_json::json!(summary)),
+                )
+                .expect("fixed name/args");
+                ToolStepExchange::new(
+                    vec![call],
+                    vec![ToolStepResult::Succeeded {
+                        call_id: format!("notify-{job_id}"),
+                        summary,
+                    }],
+                )
+            })
+            .collect()
+    }
+
     fn execute_batch(
         &mut self,
         calls: &[ValidatedToolCall],
@@ -2246,7 +2847,7 @@ impl ToolDriver for ExecTools {
 }
 impl WorkspaceTools {
     fn full_surface_impl(&self) -> Vec<ToolSurface> {
-        vec![
+        let mut surface = vec![
             ToolSurface::new(
                 WORKSPACE_WRITE_TOOL,
                 "Create or overwrite a UTF-8 text file inside the trusted workspace. \
@@ -2403,6 +3004,20 @@ impl WorkspaceTools {
                 ),
             ),
             ToolSurface::new(
+                ASK_USER_TOOL,
+                "Ask the user to choose between options. In headless runs this returns a \
+                 typed refusal. Arguments JSON: {\"question\":\"...\",\"options\":[\"a\",\"b\"]}.",
+                arguments_schema(
+                    "Ask the user a question",
+                    serde_json::json!({
+                        "question": {"type": "string", "description": "the question"},
+                        "options": {"type": "array", "items": {"type": "string"},
+                                    "description": "2-8 answer options"}
+                    }),
+                    &["question", "options"],
+                ),
+            ),
+            ToolSurface::new(
                 WEB_FETCH_TOOL,
                 "Fetch a web page over http/https and return readable text (HTML stripped, \
                  100 KB cap). Private/loopback hosts are refused unless allowlisted in \
@@ -2419,9 +3034,11 @@ impl WorkspaceTools {
             ToolSurface::new(
                 SHELL_EXEC_TOOL,
                 "Run one command inside the workspace root (argv form, no shell). Bounded \
-                 output capture and a wall-clock timeout. Arguments JSON: \
+                 output capture, wall-clock timeout, optional sandbox confinement and \
+                 background execution. Arguments JSON: \
                  {\"argv\":[\"<program>\",\"<arg>\",...],\"timeout_ms\":<optional, \
-                 default 60000, max 600000>}.",
+                 default 60000, max 600000>,\"background\":<optional bool>,\
+                 \"sandbox\":<optional bool>}.",
                 arguments_schema(
                     "Run a supervised command",
                     serde_json::json!({
@@ -2432,8 +3049,25 @@ impl WorkspaceTools {
                     &["argv"],
                 ),
             ),
-        ]
+        ];
+
+        // Dynamically registered MCP tools.
+        if let Ok(registrations) = self.mcp_surface.lock() {
+            for (wire_name, _server, descriptor) in registrations.iter() {
+                let description = descriptor
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| format!("MCP tool {}", descriptor.name));
+                surface.push(ToolSurface::new(
+                    wire_name.clone(),
+                    format!("[MCP] {description}"),
+                    descriptor.input_schema.clone(),
+                ));
+            }
+        }
+        surface
     }
+
 }
 
 /// A [`ToolDriver`] with no tool gateway configured. Structural tool calls are
@@ -3878,6 +4512,76 @@ use std::sync::{Arc, Mutex};
     }
 
     #[test]
+    fn workspace_read_png_returns_inline_vision_data_url() {
+        // Minimal 1x1 PNG: signature + IHDR with width=1, height=1 + IDAT.
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&[0, 0, 0, 13]); // IHDR length
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]); // 1x1
+        png.extend_from_slice(&[0, 0, 0, 10]); // IDAT length
+        png.extend_from_slice(b"IDAT12345678");
+        let root = TempRoot::new("png-read");
+        fs::write(root.0.join("pixel.png"), &png).expect("seed");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let call = make_call("c1", WORKSPACE_READ_TOOL, r#"{"path":"pixel.png"}"#);
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("PNG image 1x1"), "{summary}");
+                let data_start = summary.find("DATA_URL:image/png;base64,").expect("data url");
+                let payload = &summary[data_start + "DATA_URL:image/png;base64,".len()..];
+                assert!(!payload.trim().is_empty(), "base64 payload present");
+            }
+            other => panic!("expected image read, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_read_pdf_extracts_text_from_uncompressed_and_flate_streams() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+        let root = TempRoot::new("pdf-read");
+        let content = "BT /F1 12 Tf (the launch code is BLUE-7) Tj ET";
+        // Uncompressed.
+        let mut uncompressed = b"%PDF-1.4\n".to_vec();
+        uncompressed
+            .extend_from_slice(format!("1 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes());
+        uncompressed.extend_from_slice(content.as_bytes());
+        uncompressed.extend_from_slice(b"\nendstream\nendobj\n2 0 obj\n<< /Type /Page >>\nendobj\n%%EOF");
+        fs::write(root.0.join("plain.pdf"), &uncompressed).expect("seed");
+        // FlateDecode.
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(content.as_bytes()).expect("deflate");
+        let compressed = encoder.finish().expect("finish");
+        let mut flated = b"%PDF-1.4\n".to_vec();
+        flated.extend_from_slice(
+            format!("1 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n", compressed.len())
+                .as_bytes(),
+        );
+        flated.extend_from_slice(&compressed);
+        flated.extend_from_slice(b"\nendstream\nendobj\n2 0 obj\n<< /Type /Page >>\nendobj\n%%EOF");
+        fs::write(root.0.join("flat.pdf"), &flated).expect("seed");
+
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        for name in ["plain.pdf", "flat.pdf"] {
+            let call = make_call("c1", WORKSPACE_READ_TOOL, &format!(r#"{{"path":"{name}"}}"#));
+            let validated = tools.validate(&call, &cancel).expect("validate");
+            match tools.execute(&validated, &cancel).expect("execute") {
+                ToolStepResult::Succeeded { summary, .. } => {
+                    assert!(
+                        summary.contains("BLUE-7") && summary.contains("1 page(s)"),
+                        "{name}: {summary}"
+                    );
+                }
+                other => panic!("{name}: expected extracted text, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn web_fetch_refuses_loopback_by_default_and_fetches_when_allowlisted() {
         let root = TempRoot::new("web-fetch");
         let mut tools = permissive_workspace(&root.0);
@@ -3910,6 +4614,138 @@ use std::sync::{Arc, Mutex};
     }
 
     #[test]
+    fn mcp_stdio_servers_register_and_dispatch_through_the_session() {
+        const SERVER_SCRIPT: &str = r#"#!/usr/bin/env python3
+import sys, json
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "demo", "version": "1.0"}}})
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": "echo", "description": "echoes the message",
+             "inputSchema": {"type": "object"}}]}})
+    elif method == "tools/call":
+        message = req.get("params", {}).get("arguments", {}).get("message", "")
+        send({"jsonrpc": "2.0", "id": rid, "result": {"content": [
+            {"type": "text", "text": "echo: " + message}]}})
+"#;
+        let root = TempRoot::new("mcp");
+        let script_path = root.0.join("mcp-echo-server.py");
+        fs::write(&script_path, SERVER_SCRIPT).expect("write server");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let servers = vec![McpServerConfig {
+            name: "demo".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script_path.display().to_string()],
+        }];
+
+        // Registration: surface gains mcp__demo__echo.
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(&servers);
+        let surface: Vec<String> = tools
+            .tool_surface()
+            .iter()
+            .map(|tool| tool.name().to_owned())
+            .collect();
+        eprintln!("DEBUG registrations: {:?}", tools.mcp_surface.lock().map(|s| s.len()));
+        eprintln!("DEBUG connections: {}", tools.mcp.lock().map(|c| c.len()).unwrap_or(0));
+        eprintln!("DEBUG surface: {surface:?}");
+
+        // Dead server: registration records an offline marker tool whose
+        // invocation fails with a typed handled error.
+        let dead = vec![McpServerConfig {
+            name: "dead".to_owned(),
+            command: "/nonexistent/mcp-binary".to_owned(),
+            args: vec![],
+        }];
+        tools.register_mcp_servers(&dead);
+        let surface: Vec<String> = tools
+            .tool_surface()
+            .iter()
+            .map(|tool| tool.name().to_owned())
+            .collect();
+        assert!(
+            surface.iter().any(|name| name == "mcp__dead__offline"),
+            "offline marker tool advertised"
+        );
+        let call = make_call("m1", "mcp__dead__offline", "{}");
+        let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
+        match tools.execute(&validated, &CancellationToken::new()).expect("e") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.unwrap().contains("failed to start"));
+            }
+            other => panic!("expected offline failure, got {other:?}"),
+        }
+
+        // Dispatch through the JSON-RPC session.
+        let call = make_call(
+            "m2",
+            "mcp__demo__echo",
+            r#"{"message":"ping"}"#,
+        );
+        let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
+        match tools.execute(&validated, &CancellationToken::new()).expect("dispatch") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("echo: ping"), "{summary}");
+            }
+            other => panic!("expected MCP success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn background_job_notification_reaches_the_next_step_history() {
+        // Start a quick background job; once it finishes, the driver's drain
+        // produces the model notification (the turn loop replays it as a
+        // synthetic exchange — see the agent-runtime turn test).
+        let root = TempRoot::new("notify");
+        let mut tools = permissive_workspace(&root.0);
+        let start = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["sh","-c","echo all-done"],"background":true}"#,
+        );
+        let validated = tools.validate(&start, &CancellationToken::new()).expect("v");
+        assert!(matches!(
+            tools.execute(&validated, &CancellationToken::new()).expect("e"),
+            ToolStepResult::Succeeded { .. }
+        ));
+        // Wait until the registry marks the job finished, then drain once via
+        // the driver so the test controls replay timing.
+        let mut notices = Vec::new();
+        for _ in 0..50 {
+            notices = {
+                let notices = tools.jobs.drain_notifications();
+                notices
+            };
+            if !notices.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!notices.is_empty(), "completion notice must be available");
+        assert!(notices[0].contains("all-done"), "{notices:?}");
+    }
+
+    #[test]
     fn web_fetch_caps_oversized_responses() {
         let root = TempRoot::new("web-cap");
         let mut tools = permissive_workspace(&root.0);
@@ -3937,7 +4773,56 @@ use std::sync::{Arc, Mutex};
     }
 
     #[test]
-    fn tool_surface_advertises_all_fourteen_tools_with_json_schemas() {
+    fn ask_user_reads_selection_or_refuses_headless() {
+        use std::sync::Mutex as StdMutex;
+        let root = TempRoot::new("ask");
+        let mut tools = permissive_workspace(&root.0);
+
+        // Headless: no source wired -> typed refusal, never a turn-kill.
+        let call = make_call(
+            "a1",
+            ASK_USER_TOOL,
+            r#"{"question":"Deploy?","options":["yes","no"]}"#,
+        );
+        let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
+        match tools.execute(&validated, &CancellationToken::new()).expect("e") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                let detail = detail.unwrap();
+                assert!(detail.contains("interactive user"), "{detail}");
+            }
+            other => panic!("expected headless refusal, got {other:?}"),
+        }
+
+        // Interactive: a source returns the selected option.
+        let seen: Arc<StdMutex<Vec<(String, Vec<String>)>>> = Arc::default();
+        let source_seen = Arc::clone(&seen);
+        tools.set_ask_source(Arc::new(move |_prompt: &str, options: &[String], _budget| {
+            let seen = Arc::clone(&source_seen);
+            let mut guard = seen.lock().expect("lock");
+            guard.push(("deploy?".to_owned(), options.to_vec()));
+            Ok(options.first().cloned().unwrap_or_default())
+        }));
+        let call = make_call(
+            "a2",
+            ASK_USER_TOOL,
+            r#"{"question":"Deploy now?","options":["yes","no","maybe"]}"#,
+        );
+        let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
+        match tools.execute(&validated, &CancellationToken::new()).expect("e") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("user selected: yes"), "{summary}");
+            }
+            other => panic!("expected selection, got {other:?}"),
+        }
+        assert_eq!(
+            seen.lock().expect("lock")[0].1,
+            vec!["yes".to_owned(), "no".to_owned(), "maybe".to_owned()]
+        );
+    }
+
+    #[test]
+    fn tool_surface_advertises_all_sixteen_tools_with_json_schemas() {
         let root = TempRoot::new("surface");
         let tools = ExecTools::workspace(&root.0).expect("tools");
         let surface = tools.tool_surface();
@@ -3957,6 +4842,7 @@ use std::sync::{Arc, Mutex};
                 JOB_STATUS_TOOL,
                 JOB_OUTPUT_TOOL,
                 TASK_SPAWN_TOOL,
+                ASK_USER_TOOL,
                 WEB_FETCH_TOOL,
                 SHELL_EXEC_TOOL,
             ]

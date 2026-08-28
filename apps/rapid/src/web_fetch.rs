@@ -142,10 +142,7 @@ fn strip_block(source: &str, block: &str) -> String {
         out.push_str(&source[cursor..start]);
         match lower[start..].find(&close) {
             Some(end_rel) => cursor = start + end_rel + close.len(),
-            None => {
-                cursor = source.len();
-                break;
-            }
+            None => break,
         }
     }
     out
@@ -273,7 +270,6 @@ mod tests {
     fn classify_refuses_private_and_loopback_without_allowlist() {
         let refusal = classify_fetch("http://127.0.0.1:9/x", &[]).unwrap_err();
         assert!(matches!(refusal, FetchRefusal::PrivateTargetBlocked { .. }));
-        let refusal = classify_fetch("http://192.168.1.10/x", &[]).unwrap_err();
         let refusal = classify_fetch("http://192.168.1.10/x", &[]).unwrap_err();
         assert!(matches!(refusal, FetchRefusal::PrivateTargetBlocked { .. }));
         let refusal = classify_fetch("http://[::1]/x", &[]).unwrap_err();

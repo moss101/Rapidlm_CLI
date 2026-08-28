@@ -719,6 +719,12 @@ fn encode_chat_content(parts: &[ContentPart]) -> Result<Value, ProviderError> {
                     "image_url": {"url": artifact_url(&artifact.id)}
                 }));
             }
+            ContentPart::ImageData { data_url } => {
+                encoded.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": {"url": data_url}
+                }));
+            }
         }
     }
     Ok(Value::Array(encoded))
@@ -789,6 +795,12 @@ fn encode_responses_content(
                 encoded.push(serde_json::json!({
                     "type": "input_image",
                     "image_url": artifact_url(&artifact.id),
+                }));
+            }
+            ContentPart::ImageData { data_url } => {
+                encoded.push(serde_json::json!({
+                    "type": "input_image",
+                    "image_url": data_url,
                 }));
             }
         }

@@ -908,7 +908,8 @@ impl<T: McpTransport> McpSession<T> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let request = encode_tools_list(id)?;
-        let response = self.transport.call(&request, cancel)?;
+        // Skip server->client notification frames (no id) before the reply.
+        let response = self.exchange_skipping_notifications(&request, id, cancel)?;
         parse_tools_list_result(&response, id)
     }
 
@@ -927,8 +928,26 @@ impl<T: McpTransport> McpSession<T> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let request = encode_tools_call(id, name, arguments)?;
-        let response = self.transport.call(&request, cancel)?;
+        let response = self.exchange_skipping_notifications(&request, id, cancel)?;
         parse_tools_call_result(&response, id)
+    }
+
+    /// Send one request and read frames until the reply with the expected id
+    /// arrives, discarding interleaved server notifications.
+    fn exchange_skipping_notifications(
+        &mut self,
+        request: &[u8],
+        expected_id: u64,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<u8>, TransportError> {
+        self.transport.send_frame(request, cancel)?;
+        for _ in 0..8 {
+            let frame = self.transport.recv_frame(cancel)?;
+            if has_response_id(&frame, expected_id) {
+                return Ok(frame);
+            }
+        }
+        Err(TransportError::InvalidFrame)
     }
 
     pub fn close(&mut self, cancel: &CancellationToken) -> Result<(), TransportError> {
@@ -1027,6 +1046,19 @@ fn encode_tools_call(id: u64, name: &str, arguments: &Value) -> Result<Vec<u8>, 
     );
     body.insert("params".to_owned(), Value::Object(params));
     encode_json(Value::Object(body))
+}
+
+/// Whether a raw JSON-RPC frame is the reply to `expected_id` (notifications
+/// carry no id and are skipped by the caller).
+fn has_response_id(frame: &[u8], expected_id: u64) -> bool {
+    match serde_json::from_slice::<Value>(frame) {
+        Ok(value) => match value.get("id") {
+            Some(Value::Number(n)) => n.as_u64() == Some(expected_id),
+            Some(Value::String(s)) => s.parse::<u64>().ok() == Some(expected_id),
+            _ => false,
+        },
+        Err(_) => false,
+    }
 }
 
 /// Shared JSON-RPC response checks: version, id match, error mapping.

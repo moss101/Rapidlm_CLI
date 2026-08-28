@@ -369,6 +369,9 @@ pub struct NormalizedUsage {
 pub enum ContentPart {
     Text { text: String },
     Image { artifact: ArtifactRef },
+    /// Inline image as a `data:image/<type>;base64,<payload>` URL (vision
+    /// tool results). Bounded by the constructor.
+    ImageData { data_url: String },
 }
 
 /// Assistant-emitted tool call recorded on a message.
@@ -1187,6 +1190,20 @@ impl ContentPart {
 
     pub fn image(artifact: ArtifactRef) -> Self {
         Self::Image { artifact }
+    }
+
+    /// Inline image data URL. Refuses non-image and oversized payloads.
+    pub fn image_data(data_url: impl Into<String>) -> Result<Self, ProviderError> {
+        let data_url = data_url.into();
+        const MAX_DATA_URL_BYTES: usize = 5 * 1024 * 1024;
+        let ok_prefix = data_url.starts_with("data:image/png;base64,")
+            || data_url.starts_with("data:image/jpeg;base64,")
+            || data_url.starts_with("data:image/gif;base64,")
+            || data_url.starts_with("data:image/webp;base64,");
+        if !ok_prefix || data_url.len() > MAX_DATA_URL_BYTES {
+            return Err(ProviderError::InvalidRequest);
+        }
+        Ok(Self::ImageData { data_url })
     }
 }
 
@@ -2013,6 +2030,12 @@ impl Serialize for ContentPart {
                 let mut state = serializer.serialize_struct("ContentPart", 2)?;
                 state.serialize_field("kind", "image")?;
                 state.serialize_field("artifact", artifact)?;
+                state.end()
+            }
+            Self::ImageData { data_url } => {
+                let mut state = serializer.serialize_struct("ContentPart", 2)?;
+                state.serialize_field("kind", "image_data")?;
+                state.serialize_field("data_url", data_url)?;
                 state.end()
             }
         }

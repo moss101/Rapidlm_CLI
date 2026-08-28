@@ -16,6 +16,9 @@ path = "src/lib.rs"
 anyhow.workspace = true
 # regex: repo.search regex mode + repo.glob pattern matching (Claude parity).
 regex = "1"
+# base64/flate2: rich reads — image data URLs and FlateDecode PDF streams.
+base64 = "0.22"
+flate2 = "1"
 # agent-runtime: canonical AgentExecutor + ContextController/ContextRetryPolicy
 # recovery seam. The composition root is the host that owns live context.
 agent-runtime = { path = "../../crates/agent-runtime" }

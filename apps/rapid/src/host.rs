@@ -59,10 +59,13 @@ pub const MAX_COMPACTION_SUMMARY: usize = 8 * 1024;
 pub const MAX_REMINDERS_BLOCK_BYTES: usize = 8 * 1024;
 
 /// Maximum retry attempts for a transient-class step failure; a turn makes at
-/// most `MAX_TRANSIENT_RETRIES + 1` step invocations per model step.
-pub const MAX_TRANSIENT_RETRIES: u32 = 3;
-/// Base backoff before the first retry; doubled per subsequent retry.
-pub const RETRY_BACKOFF_BASE_MS: u64 = 250;
+/// most `MAX_TRANSIENT_RETRIES + 1` step invocations per model step. Five
+/// bounded retries with the base below cover provider stream drops (b.ai
+/// drops long sessions for seconds at a time).
+pub const MAX_TRANSIENT_RETRIES: u32 = 5;
+/// Base backoff before the first retry; doubled per subsequent retry
+/// (1s, 2s, 4s, 8s, 16s — bounded, cancellable, honoring retry-after).
+pub const RETRY_BACKOFF_BASE_MS: u64 = 1000;
 /// Backoff waits are polled in slices of this size so cancellation stays
 /// responsive without busy-spinning.
 const RETRY_SLEEP_SLICE_MS: u64 = 50;
@@ -1146,7 +1149,10 @@ mod tests {
                 },
             })
         };
-        let backing = ScriptedBacking::new(vec![transient(), transient(), transient(), transient(), transient()]);
+        let failures: Vec<_> = (0..=MAX_TRANSIENT_RETRIES as usize)
+            .map(|_| transient())
+            .collect();
+        let backing = ScriptedBacking::new(failures);
         let witness = backing.clone();
         let outcome = run_live_exec(
             preserved(),
@@ -1241,20 +1247,13 @@ mod tests {
 
         // Exhausted connection retries still surface the typed cause.
         let mut events = Vec::new();
-        let backing = ScriptedBacking::new(vec![
-            Err(ModelStepError::ProviderFailed {
+        let mut failures = Vec::new();
+        for _ in 0..=(MAX_TRANSIENT_RETRIES as usize) {
+            failures.push(Err(ModelStepError::ProviderFailed {
                 cause: FailureCause::Connection,
-            }),
-            Err(ModelStepError::ProviderFailed {
-                cause: FailureCause::Connection,
-            }),
-            Err(ModelStepError::ProviderFailed {
-                cause: FailureCause::Connection,
-            }),
-            Err(ModelStepError::ProviderFailed {
-                cause: FailureCause::Connection,
-            }),
-        ]);
+            }));
+        }
+        let backing = ScriptedBacking::new(failures);
         let witness = backing.clone();
         let outcome = run_live_exec(
             preserved(),

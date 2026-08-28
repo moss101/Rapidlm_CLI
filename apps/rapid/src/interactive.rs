@@ -1129,6 +1129,37 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
         _ => ExecTools::noop(),
     };
 
+    // Trusted-project integrations: web_fetch allowlist, hooks, MCP servers.
+    if let (Some((root, TrustStatus::Trusted)), ExecTools::Workspace(_)) =
+        (&workspace, &mut tools)
+    {
+        let settings_path = root.join(".rapidlm/settings.json");
+        if let Ok(text) = fs::read_to_string(&settings_path)
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+        {
+            let allowlist: Vec<String> = value
+                .get("fetch_allowlist")
+                .and_then(serde_json::Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            tools.set_fetch_allowlist(allowlist);
+            if let Some(hooks) = crate::hooks::HooksConfig::parse(&value) {
+                if !hooks.is_empty() {
+                    tools.set_hooks(hooks);
+                }
+            }
+            let servers = crate::exec_tools::parse_mcp_servers(&value);
+            if !servers.is_empty() {
+                tools.register_mcp_servers(&servers);
+            }
+        }
+    }
+
     // Layered model selection (env overrides > user config > typed fallback).
     // The store outlives the model, which borrows it for the router resolver.
     let credential_store = auth::InMemoryCredentialStore::new();

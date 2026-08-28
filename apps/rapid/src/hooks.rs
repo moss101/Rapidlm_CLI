@@ -107,7 +107,6 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> (bool, S
         let _ = stdin.flush();
     }
     let started = Instant::now();
-    let mut timed_out = false;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -118,7 +117,6 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> (bool, S
             }
             Ok(None) => {
                 if started.elapsed() > timeout {
-                    timed_out = true;
                     let _ = child.kill();
                     let _ = child.wait();
                     break;
@@ -136,10 +134,8 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> (bool, S
     let text = truncate(output.as_bytes(), MAX_HOOK_STDERR_BYTES);
     if !text.is_empty() {
         (false, text)
-    } else if timed_out {
-        (false, "hook timed out".to_owned())
     } else {
-        (false, "hook exited non-zero".to_owned())
+        (false, "hook timed out".to_owned())
     }
 }
 
