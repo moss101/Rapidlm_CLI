@@ -1011,10 +1011,17 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         let store = auth::InMemoryCredentialStore::new();
         let model = crate::model::ConfiguredModel::build(&self.active, &store)
             .map_err(|err| err.to_string())?;
+        // A write-capable child never inherits a blanket `BypassPermissions`
+        // ceiling: it was the model's own choice to delegate, not the
+        // human's direct action, so it must not silently wield authority the
+        // human never reviewed for this specific sub-task. Rules and
+        // persisted grants still carry over unchanged. See
+        // `PermissionLattice::for_subagent`.
+        let child_permissions = self.permissions.for_subagent();
         let mut tools = if agent_type == "explore" || agent_type == "plan" {
-            ExecTools::read_only_with_permissions(&self.root, self.permissions.clone())
+            ExecTools::read_only_with_permissions(&self.root, child_permissions)
         } else {
-            ExecTools::workspace_with_permissions(&self.root, self.permissions.clone())
+            ExecTools::workspace_with_permissions(&self.root, child_permissions)
         }
         .map_err(|err| err.to_string())?;
         // Subagents run in the same trusted project as the parent (only

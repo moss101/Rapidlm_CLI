@@ -314,6 +314,29 @@ impl PermissionLattice {
         &self.rules
     }
 
+    /// Lattice for a `task_spawn` child. The child is the model's own choice
+    /// of what to delegate and with what prompt — never the human's direct
+    /// action — so it must not silently wield authority the human never
+    /// reviewed. Rules and persisted grants carry over unchanged (a child can
+    /// still *consume* what was already approved, so it isn't reduced to
+    /// asking for everything from scratch), but `BypassPermissions` — the one
+    /// mode that allows every call with no `Ask` step at all, per
+    /// [`Self::evaluate`]'s mode table — is capped to `AcceptEdits`. Every
+    /// other mode already denies (never silently allows) a non-file-edit call
+    /// for a subagent, since subagents run headless-style with no interactive
+    /// channel and `Ask` renders as a denial there; `BypassPermissions` is the
+    /// only mode where that safety net doesn't already apply.
+    pub fn for_subagent(&self) -> Self {
+        Self {
+            mode: match self.mode {
+                PermissionMode::BypassPermissions => PermissionMode::AcceptEdits,
+                other => other,
+            },
+            rules: self.rules.clone(),
+            grants: self.grants.clone(),
+        }
+    }
+
     /// Evaluate one call. `tool` is the gateway tool name, `subject` the
     /// rule-matching context (workspace-relative path for file tools, joined
     /// argv for `shell_exec`).
@@ -600,6 +623,54 @@ mod tests {
         assert!(plan
             .evaluate("repo_read", "src/lib.rs", ToolClass::ReadOnly)
             .is_allowed());
+    }
+
+    #[test]
+    fn subagent_lattice_caps_bypass_but_leaves_every_other_mode_and_rules_alone() {
+        let rule = ToolRule {
+            effect: RuleEffect::Allow,
+            pattern: ToolPattern::parse("shell_exec(*)").expect("pattern"),
+        };
+        let grant = ToolPattern::parse("workspace_patch(*)").expect("pattern");
+
+        let bypass = PermissionLattice::new(PermissionMode::BypassPermissions)
+            .with_rules(vec![rule.clone()])
+            .with_grants(vec![grant.clone()]);
+        let child = bypass.for_subagent();
+        assert_eq!(child.mode(), PermissionMode::AcceptEdits);
+        // A capable child still auto-allows file edits (it just lost the
+        // "allow literally everything, never ask" ceiling), and the parent's
+        // rules/grants carried over rather than starting from nothing.
+        assert!(
+            child
+                .evaluate("workspace_write", "src/lib.rs", ToolClass::FileEdit)
+                .is_allowed()
+        );
+        assert_eq!(
+            child.evaluate("shell_exec", "cargo test", ToolClass::Other),
+            Decision::Allow(DecisionReason::AllowRule),
+            "carried-over allow rule still applies"
+        );
+        assert!(
+            child
+                .evaluate("workspace_patch", "src/lib.rs", ToolClass::FileEdit)
+                .is_allowed(),
+            "carried-over persisted grant still applies"
+        );
+
+        // Every other mode passes through unchanged: they were already safe
+        // for a subagent (non-file-edit calls hit `Ask`, which a headless-style
+        // subagent turn treats as a denial — see `evaluate`'s doc comment).
+        for mode in [
+            PermissionMode::Default,
+            PermissionMode::Plan,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Auto,
+            PermissionMode::DontAsk,
+        ] {
+            let lattice = PermissionLattice::new(mode);
+            assert_eq!(lattice.for_subagent().mode(), mode, "{mode} passes through");
+        }
     }
 
     #[test]
