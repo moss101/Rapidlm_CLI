@@ -170,21 +170,7 @@ Re-verify both before implementing rather than trusting the original row text.
 |---|---|---|---|---|---|---|
 | 15 | Exit codes are undifferentiated (fail-closed but opaque: `agent turn failed: failed`) | Not profiled in depth | Structured taxonomy: 41 auth · 42 input · 44 sandbox · 52 config · 53 turn-limit · 54 tool-exec · 55 budget · 130 SIGINT | `apps/rapid/src/headless/` | P0 | S |
 | 16 | No constrained structured-output mode | Not established | `--json-schema` registers a synthetic tool, Ajv-validated against a caller-supplied schema | `headless` + `tool-gateway` | P1 | M |
-| 17 | **Correction (2026-08-29):** "no cost accounting anywhere" was wrong — `llm-router` already computes real per-request cost. `provider.rs`'s `UsageCost::Reported { usd_micros }` is constructed from real responses in both `providers/openai_compatible.rs` and `providers/anthropic.rs` (not just a test fixture), and `ModelDescriptor` (`llm-router/src/provider.rs`) already carries `prices: ModelPrices` inside a full `ModelCatalog` (`llm-router/src/catalog.rs`) with latency class, context limits, regions, data-policy tags — i.e. most of what Phase 2 §2.8 below asks for already exists. **The actual gap is narrower and precisely located:** `apps/rapid/src/model.rs::fold_stream` reads `NormalizedUsage` (which carries `.cost()`) but only extracts `usage_total_tokens(usage)` before constructing `ModelStepOutput` — and `ModelStepOutput` (defined in `agent-runtime`, 10 construction/match sites across `harness` + 4 `agent-runtime` files + 4 `apps/rapid` files) only carries `tokens: u64`, no cost field. Cost is computed, then silently dropped at exactly that boundary, and never reaches `ExecOutcome`/the headless JSON contract. **Not fixed this pass** — widening `ModelStepOutput`'s shape touches a shared crate across ~10 *files*
-but, checked more precisely in a follow-up pass, **40+ individual construction/match expressions**
-(most of them struct literals in `apps/rapid/src/host.rs`'s own test suite, which would all need
-updating since Rust requires every field at a non-`#[non_exhaustive]` struct literal site) — a real,
-larger-than-first-estimated, moderate-risk change deserving its own careful pass; see spawned follow-up
-task, and note its description undersold the blast radius slightly (said "10 call sites," actual count
-is far higher once every construction and match arm is counted, not just the files containing them).
-**The side-channel idea below does not actually work as a full fix**, also discovered on closer
-inspection: `apps/rapid`'s real model-selection path wraps `ConfiguredModel` in `SelectedModel` (three
-variants) and, for a configured fallback chain, in `FallbackChainModel` (wrapping *multiple*
-`ConfiguredModel`s) — both dispatch `LiveModelCall::step` polymorphically, and only `ModelStepOutput`
-itself (not a side-channel on one concrete type) flows uniformly through every layer regardless of
-which concrete backend answered, exactly the same way `tokens` already does. A side-channel on
-`ConfiguredModel` alone would miss the fallback-chain case entirely. Widening `ModelStepOutput` is very
-likely the *only* correct fix, not just the safer one — noted for whoever picks up the follow-up task. | Usage/cost fields present (`xai-grok-pager/src/headless/cli.rs`) | Token usage only, no pricing table, no `cost_usd` field | `apps/rapid/src/model.rs` (`ConfiguredModel::step`/`fold_stream`) → `host.rs` (`ExecOutcome`) → `headless/jsonl.rs` | P1 | M |
+| 17 | ~~No cost accounting anywhere~~ **Implemented 2026-08-29.** Correction chain, then a full fix: "no cost accounting" was wrong from the start — `llm-router` already computed real per-request cost (`UsageCost::Reported`, from real `openai_compatible`/`anthropic` provider responses) and a full `ModelCatalog` with pricing. The value was silently dropped at `apps/rapid/src/model.rs::fold_stream`, which read `NormalizedUsage` but only extracted token count before constructing `ModelStepOutput` (`tokens: u64` only, no cost field). Initially deferred as too large — widening `ModelStepOutput` touches a shared `agent-runtime` type across (checked precisely) 40+ construction/match expressions, and a side-channel workaround doesn't work because `SelectedModel`/`FallbackChainModel` dispatch polymorphically. **Done anyway**, once the risk was reassessed: adding a struct field makes the compiler enumerate every missed site as a compile error, not a silent bug — `cargo build --workspace --tests` was used as the authoritative fix-list rather than tracking sites by hand. `ModelStepOutput::{Terminal,ToolCalls}` now carry `cost_usd_micros: Option<u64>`; `fold_stream` reads the real value via a new `usage_cost_micros()` (no fabricated estimate the way tokens has one — a guessed dollar figure is a lie, not an estimate); a new `CostAccumulator` (`host.rs`, mirrors the existing token counter) sums it across steps, tracking whether *any* step ever reported one so "unknown" never reads back as "confirmed zero"; `ExecOutcome` and `SubagentReport` both carry the total; the `--verbose` diagnostic line and the `tokens used:` stderr line both surface it (`format_usd_micros`, 6 decimals). Still not done: surfacing it in the headless JSONL contract specifically (`session_finished` currently has no call sites at all outside its own tests — a separate, still-unwired piece, not touched here) and `RouterDecisionRecord` (§2.8 below). | Usage/cost fields present (`xai-grok-pager/src/headless/cli.rs`) | Token usage only, no pricing table, no `cost_usd` field | `apps/rapid/src/model.rs`, `host.rs` (`CostAccumulator`, `ExecOutcome`), `exec_tools.rs` (`SubagentReport`), `interactive.rs`; `crates/agent-runtime/src/turn.rs` (`ModelStepOutput`) | ~~P1~~ done | M |
 
 ### 1.6 Distribution (product/packaging, not architecture — tracked here for completeness, not gated on it)
 
@@ -354,10 +340,12 @@ retrieved; surface *inadequate context* as a distinct condition rather than edit
 
 ### 2.8 Model router upgrade: capability catalog + `RouterDecisionRecord` + real cost accounting
 
-**Correction (2026-08-29):** the capability-catalog half of this is already substantially built —
-see the correction on Phase 1 §1.5 row 17 above. What's genuinely missing is `RouterDecisionRecord`
-(no auditable routing-decision record exists) and getting the already-computed cost value from
-`llm-router` out to a caller (see that same correction for the exact boundary where it's dropped).
+**Correction (2026-08-29):** the capability-catalog half of this is already substantially built, and the
+cost-plumbing half is now **implemented** — see Phase 1 §1.5 row 17 above for both. What's still
+genuinely missing: `RouterDecisionRecord` (no auditable routing-decision record exists), and surfacing
+cost in the headless JSONL contract specifically — `apps/rapid/src/headless/jsonl.rs::session_finished`
+has no call sites at all outside its own tests, so it isn't wired into `rapid run --jsonl` yet regardless
+of cost; extending it is real, separate work once it's wired up at all.
 
 Modbit: `MOD-003` (a model capability catalog — context window, tool/parallel/vision/reasoning/
 structured-output support, latency, cost, health — "do not route by model name alone"), `MOD-004`
