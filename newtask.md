@@ -313,10 +313,20 @@ rejects a stale writer. Named explicitly to "prevent desktop/CLI/cloud dual-resu
 
 ### 2.7 Context Pack Compiler / Workspace Capsule + Next-Edit-Ripple + retrieval-before-edit guardrail
 
-**Verified genuinely absent (2026-08-29):** unlike most items in this section, a targeted grep for
-change-impact/ripple analysis (`fn.*impact`, `affected_files`, `affected_tests`) in
-`crates/context-engine/src` returned nothing. This one is a real gap, not a wiring task. Also newly
-confirmed: `context-engine::compact`'s whole compaction system (`compact.rs` + `compact_policy.rs`) is
+**Correction to the correction (2026-08-29):** the "verified genuinely absent" note directly below was
+itself wrong — a methodology bug, not a re-check of source: the grep only covered
+`crates/context-engine/src/*.rs` (one directory level), missing `crates/context-engine/src/index/
+graph.rs` entirely. **`CodeGraph::impact()` already exists there** — an incoming-only BFS over
+callers/importers of a given symbol, hop- and result-bounded, fully implemented — which is exactly
+Next-Edit-Ripple. Like nearly everything else in this document, it's unused outside its own file (grep
+for `.impact(` across `apps/`/`crates/*/src` confirms zero external call sites). The real remaining work
+is: resolve a file-level edit to the `SymbolLocator`(s) `impact()` needs (it takes a symbol, not a file
+path), and expose the result as a new model-facing tool or an automatic post-edit annotation — genuine,
+moderate-sized wiring work, not a "build a traversal algorithm" task as the paragraph below still assumes.
+Lesson for future passes: a "not found" grep result is only as good as its glob — check subdirectories
+before writing "genuinely absent" anywhere in this document.
+
+Also newly confirmed: `context-engine::compact`'s whole compaction system (`compact.rs` + `compact_policy.rs`) is
 itself unwired from `apps/rapid` — `compact_packet` is only ever called from within
 `compact_policy.rs`, in the same crate, never from the exec loop. So Phase 1 §1.4 row 13's "explicit
 fast-path" framing undersells it: compaction isn't reachable *at all* today, deterministic or model-based.
