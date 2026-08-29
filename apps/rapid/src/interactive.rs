@@ -224,7 +224,7 @@ usage: rapid [subcommand]
 /// errors. Documents the prompt argument, the exec flags, and the env vars
 /// that shape a headless run.
 pub const EXEC_USAGE: &str = "\
-usage: rapid exec <prompt> [--verbose]
+usage: rapid exec <prompt> [--verbose] [--max-wall-time <seconds>]
 
 Run one headless agent turn with the configured model. The final response is
 printed to stdout; diagnostics go to stderr; a non-zero exit code reports a
@@ -234,8 +234,10 @@ Arguments:
   <prompt>    Task prompt for the agent (required)
 
 Options:
-  --verbose   Per-attempt model and turn diagnostics on stderr
-  -h, --help  Print this help
+  --verbose               Per-attempt model and turn diagnostics on stderr
+  --max-wall-time <secs>  Cancel the turn if it runs longer than this many
+                          seconds (cooperative: the same signal Ctrl-C sends)
+  -h, --help              Print this help
 
 Environment:
   RAPIDLM_PERMISSION_MODE  Tool approval mode for this run: default | plan |
@@ -801,23 +803,41 @@ fn apply_reminder_floor(
 struct ExecArgs {
     prompt: String,
     verbose: bool,
+    /// Resource ceiling (Modbit `WRK-017`: CPU/RAM/disk/network/token/cost/
+    /// concurrency ceilings). Only wall-clock is implemented here — the
+    /// others need real OS-level resource monitoring, genuinely new
+    /// systems work not attempted in this pass (see `newtask.md` §2.10).
+    /// Enforced cooperatively via the same `CancellationToken` every model
+    /// step and tool call already checks, not a hard process kill.
+    max_wall_time: Option<Duration>,
 }
 
 fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
     let mut verbose = false;
+    let mut max_wall_time = None;
     let mut words: Vec<&str> = Vec::new();
-    for arg in args {
-        if arg == "--verbose" {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--verbose" {
             verbose = true;
+        } else if args[i] == "--max-wall-time" {
+            i += 1;
+            let secs: u64 = args.get(i)?.parse().ok()?;
+            max_wall_time = Some(Duration::from_secs(secs));
         } else {
-            words.push(arg);
+            words.push(&args[i]);
         }
+        i += 1;
     }
     let prompt = words.join(" ");
     if prompt.is_empty() {
         return None;
     }
-    Some(ExecArgs { prompt, verbose })
+    Some(ExecArgs {
+        prompt,
+        verbose,
+        max_wall_time,
+    })
 }
 
 /// Locate the project for `rapid exec` from the process cwd and look up its
@@ -1061,6 +1081,27 @@ fn load_project_integrations(root: &Path) -> ProjectIntegrations {
         shadow,
         mcp_servers,
     }
+}
+
+/// Cancel `cancel` if it isn't already cancelled once `max_wall_time`
+/// elapses — a bounded wall-clock resource ceiling (Modbit `WRK-017`;
+/// `newtask.md` §2.10 — the full Resource Governor, with CPU/RAM/disk/
+/// network/concurrency ceilings, is real, separate systems work, not
+/// attempted here). Cooperative, not a hard kill: this sets the same flag
+/// a Ctrl-C would, which every model step and tool call already checks; a
+/// turn already past its last cooperative checkpoint when the deadline
+/// passes still finishes that one step before observing it.
+fn spawn_wall_time_watchdog(cancel: agent_runtime::CancellationToken, max_wall_time: Duration) {
+    std::thread::spawn(move || {
+        std::thread::sleep(max_wall_time);
+        if !cancel.is_cancelled() {
+            eprintln!(
+                "rapid: exceeded --max-wall-time ({}s); cancelling the turn",
+                max_wall_time.as_secs()
+            );
+            cancel.cancel();
+        }
+    });
 }
 
 /// Fires `session_end` hooks exactly once, on whichever exit path `exec_turn`
@@ -1332,6 +1373,9 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
     .map_err(|_| InteractiveError::Internal)?;
     let request = AgentExecutionRequest::new(spec, protocol::SessionId::new());
     let cancel = agent_runtime::CancellationToken::new();
+    if let Some(max_wall_time) = parsed.max_wall_time {
+        spawn_wall_time_watchdog(cancel.clone(), max_wall_time);
+    }
     let mut events: Vec<agent_runtime::TurnEvent> = Vec::new();
 
     // Tools stay fail-closed: workspace tools are granted only when the
@@ -2451,6 +2495,57 @@ mod tests {
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
     static TERMINAL_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn max_wall_time_parses_and_rejects_bad_values() {
+        let args: Vec<String> = ["do", "the", "thing", "--max-wall-time", "30"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let parsed = parse_exec_args(&args).expect("parses");
+        assert_eq!(parsed.prompt, "do the thing");
+        assert_eq!(parsed.max_wall_time, Some(Duration::from_secs(30)));
+
+        // Missing value, non-numeric value: both a typed parse failure, not
+        // a silent "no limit" or an accidental prompt-word swallow.
+        let missing_value: Vec<String> = ["prompt", "--max-wall-time"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert!(parse_exec_args(&missing_value).is_none());
+        let non_numeric: Vec<String> = ["prompt", "--max-wall-time", "soon"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert!(parse_exec_args(&non_numeric).is_none());
+
+        // No flag at all: max_wall_time stays None, existing behavior
+        // (unbounded, same as before this flag existed) is unchanged.
+        let unbounded: Vec<String> = vec!["just".to_owned(), "a".to_owned(), "prompt".to_owned()];
+        assert_eq!(parse_exec_args(&unbounded).expect("parses").max_wall_time, None);
+    }
+
+    #[test]
+    fn wall_time_watchdog_cancels_after_the_deadline_and_never_double_fires() {
+        let cancel = agent_runtime::CancellationToken::new();
+        spawn_wall_time_watchdog(cancel.clone(), Duration::from_millis(20));
+        assert!(!cancel.is_cancelled(), "must not fire before the deadline");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(cancel.is_cancelled(), "must fire once the deadline passes");
+    }
+
+    #[test]
+    fn wall_time_watchdog_is_a_noop_if_the_turn_already_finished() {
+        // A turn that completes before the deadline cancels the token itself
+        // (the same way a real exec_turn would on normal completion isn't
+        // modeled here, but a cancel from *any* source before the deadline
+        // must stop the watchdog from re-firing / overwriting anything).
+        let cancel = agent_runtime::CancellationToken::new();
+        cancel.cancel();
+        spawn_wall_time_watchdog(cancel.clone(), Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(cancel.is_cancelled(), "stays cancelled, no panic or double-fire");
+    }
 
     #[test]
     fn project_integrations_merge_across_rapidlm_and_claude_settings() {

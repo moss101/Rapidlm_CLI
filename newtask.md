@@ -395,10 +395,15 @@ never written to the event ledger/traces/telemetry/logs. Not used anywhere in `a
 talks to `auth::InMemoryCredentialStore` directly for the single-provider-credential case it currently
 has) — another wiring gap, not a missing feature, and lower priority than the others in this document
 since `apps/rapid` doesn't yet have a scenario (MCP server secrets, multi-tenant credential sharing)
-that actually needs the scoping `SecretBroker` provides. **The Resource Governor half is genuinely
-absent** — no CPU/RAM/disk/network/concurrency ceiling type exists anywhere in the workspace (only
-`GoalBudget`'s narrower turn/token/time budget for one goal, `agent-runtime`, unrelated). Building one is
-a real, standalone systems feature (needs actual OS-level resource monitoring), not a small addition.
+that actually needs the scoping `SecretBroker` provides. **The Resource Governor half was genuinely
+absent, and still mostly is** — no CPU/RAM/disk/network/concurrency ceiling type exists anywhere in the
+workspace (only `GoalBudget`'s narrower turn/token/time budget for one goal, `agent-runtime`, unrelated).
+Building a full one is real, standalone systems work needing actual OS-level resource monitoring, not
+attempted here. **Implemented 2026-08-29, the one ceiling that doesn't need OS-level monitoring:**
+`rapid exec --max-wall-time <seconds>` (`apps/rapid/src/interactive.rs`, `spawn_wall_time_watchdog`) —
+a background thread that cancels the turn's existing `CancellationToken` (the same cooperative signal
+Ctrl-C already sends, checked by every model step and tool call) once the deadline passes. CPU/RAM/disk/
+network/concurrency ceilings remain real, separate future work.
 
 - **Where it lands:** Credential Broker: wire `SecretBroker` into `apps/rapid`'s credential path once a
   real multi-secret scenario exists — premature before that. Resource Governor: new work, `sandbox` or a
