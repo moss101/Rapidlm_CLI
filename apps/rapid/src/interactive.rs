@@ -37,7 +37,7 @@ use tui::{
 use crate::goal_host::{EVIDENCE_FILE, GOAL_FILE, SESSIONS_DB_FILE, GoalHost};
 use crate::headless::jsonl::JsonlExitCode;
 use crate::exec_tools::ExecTools;
-use crate::host::{PreservedLiveContext, StepDiag, UnconfiguredModel, run_live_exec};
+use crate::host::{ExecOutcome, PreservedLiveContext, StepDiag, UnconfiguredModel, run_live_exec};
 use crate::model::{ConfiguredModel, SelectedModel};
 use crate::user_config::ModelSelection;
 use agent_runtime::{
@@ -880,6 +880,17 @@ fn describe_turn_failure(
     }
 }
 
+/// Whether a finished turn counts as an effective success even when its
+/// terminal status isn't `Succeeded`: a turn that committed at least one
+/// tool call and whose only defect is an empty final model response is a
+/// completed task with a missing summary, not a failure. Shared by the
+/// top-level exec exit-code path and `task_spawn` subagent runs so a child
+/// hitting this case is not misreported as a hard failure to its parent.
+fn is_effective_success(outcome: &ExecOutcome) -> bool {
+    outcome.result.status() == AgentTerminalStatus::Succeeded
+        || (outcome.stop_reason == Some(TurnStopReason::EmptyResponse) && outcome.tool_calls > 0)
+}
+
 /// Env var overriding the permission mode for one exec run.
 const PERMISSION_MODE_ENV: &str = "RAPIDLM_PERMISSION_MODE";
 /// Project settings documents consulted for the permission lattice, in
@@ -931,7 +942,13 @@ fn exec_permission_lattice(
         PermissionLattice, PermissionMode, ProjectSettings, ToolPattern, parse_grants,
         parse_settings,
     };
-    let mut mode: Option<PermissionMode> = exec_permission_mode().ok();
+    let mut mode: Option<PermissionMode> = match exec_permission_mode() {
+        Ok(mode) => Some(mode),
+        Err(msg) => {
+            eprintln!("warning: {msg}, falling back to default mode resolution");
+            None
+        }
+    };
     let mut rules: Vec<crate::permissions::ToolRule> = Vec::new();
     let mut loaded_settings: Vec<ProjectSettings> = Vec::new();
     for file_name in PROJECT_SETTINGS_FILES {
@@ -978,7 +995,12 @@ fn exec_permission_lattice(
 struct LiveSubagentRunner {
     active: crate::user_config::ActiveModel,
     root: PathBuf,
-    mode: crate::permissions::PermissionMode,
+    /// The full permission lattice loaded for the parent session (mode plus
+    /// project-settings rules and persisted grants) — cloned into every
+    /// child so a deny/ask rule that protects the parent also protects its
+    /// subagents, instead of each child starting from a bare, ruleless
+    /// lattice.
+    permissions: crate::permissions::PermissionLattice,
 }
 
 impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
@@ -988,19 +1010,20 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         let model = crate::model::ConfiguredModel::build(&self.active, &store)
             .map_err(|err| err.to_string())?;
         let mut tools = if agent_type == "explore" || agent_type == "plan" {
-            ExecTools::read_only(&self.root)
+            ExecTools::read_only_with_permissions(&self.root, self.permissions.clone())
         } else {
-            ExecTools::workspace_with_permissions(
-                &self.root,
-                crate::permissions::PermissionLattice::new(self.mode),
-            )
+            ExecTools::workspace_with_permissions(&self.root, self.permissions.clone())
         }
         .map_err(|err| err.to_string())?;
-        let preserved = PreservedLiveContext::new(
-            prompt,
-            Vec::new(),
-            String::new(),
-            String::new(),
+        // Subagents run in the same trusted project as the parent (only
+        // spawned when the workspace is trusted), so they get the same
+        // AGENTS.md rules and system prompt as the top-level turn instead of
+        // running with neither.
+        let preserved = build_live_context(
+            Some(&self.root),
+            Some(&self.root),
+            prompt.to_owned(),
+            true,
             8192,
             256,
         )
@@ -1027,13 +1050,20 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             None,
         )
         .map_err(|err| err.to_string())?;
-        if outcome.result.status() != AgentTerminalStatus::Succeeded {
+        if !is_effective_success(&outcome) {
             return Err(format!(
                 "subagent turn {}",
                 outcome.result.status().as_str()
             ));
         }
-        Ok(outcome.result.summary().to_owned())
+        let mut summary = outcome.result.summary().to_owned();
+        if outcome.result.status() != AgentTerminalStatus::Succeeded {
+            summary.push_str(&format!(
+                " (the turn performed {} tool call(s) before the final response came back empty; verify workspace state)",
+                outcome.tool_calls
+            ));
+        }
+        Ok(summary)
     }
 }
 
@@ -1058,6 +1088,51 @@ fn exec_discover_rules(cwd: &Path, root: &Path) -> Option<String> {
             None
         }
     }
+}
+
+/// Build the preserved context shared by every live-exec caller: AGENTS.md
+/// project instructions discovered under `root`/`cwd`, and the
+/// conditional-section system prompt (environment, trust posture, token
+/// budget). Used by both the top-level `exec` turn and `task_spawn`
+/// subagents so a child sees the same project rules and system prompt as its
+/// parent instead of running with neither.
+fn build_live_context(
+    root: Option<&Path>,
+    cwd: Option<&Path>,
+    prompt: String,
+    trusted: bool,
+    context_limit: u32,
+    output_reserve: u32,
+) -> Result<PreservedLiveContext, String> {
+    let agents_rules = match (root, cwd) {
+        (Some(root), Some(cwd)) => exec_discover_rules(cwd, root).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let mut system_prompt_context = agent_runtime::PromptContext::new();
+    if let Some(cwd) = cwd {
+        let candidate = agent_runtime::PromptContext::new().with_environment(format!(
+            "cwd {}; os {}",
+            cwd.display(),
+            std::env::consts::OS
+        ));
+        if let Ok(with_env) = candidate {
+            system_prompt_context = with_env;
+        }
+    }
+    system_prompt_context = system_prompt_context.with_trust(if trusted {
+        agent_runtime::TrustPosture::Trusted
+    } else {
+        agent_runtime::TrustPosture::Untrusted
+    });
+    system_prompt_context = system_prompt_context.with_token_budget(context_limit, output_reserve);
+    let system_prompt = agent_runtime::render_system_prompt(&system_prompt_context)
+        .map_err(|err| {
+            eprintln!("warning: system prompt not rendered: {}", err.as_str());
+        })
+        .unwrap_or_default();
+    PreservedLiveContext::new(prompt, Vec::new(), agents_rules, String::new(), context_limit, output_reserve)
+        .map_err(|_| "context rejected".to_owned())
+        .map(|preserved| preserved.with_system_prompt(Some(system_prompt)))
 }
 
 /// Build the live-context host around the prompt and run one agent turn through
@@ -1085,48 +1160,16 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
     // Prompt/context stack: project instructions (AGENTS.md convention +
     // compat paths) and the conditional-section system prompt (environment,
     // trust posture, token budget).
-    let agents_rules = workspace
-        .as_ref()
-        .and_then(|(root, _)| {
-            let cwd = std::env::current_dir().ok()?;
-            exec_discover_rules(&cwd, root)
-        })
-        .unwrap_or_default();
-    let mut system_prompt_context = agent_runtime::PromptContext::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        let candidate = agent_runtime::PromptContext::new().with_environment(format!(
-            "cwd {}; os {}",
-            cwd.display(),
-            std::env::consts::OS
-        ));
-        if let Ok(with_env) = candidate {
-            system_prompt_context = with_env;
-        }
-    }
-    system_prompt_context = system_prompt_context.with_trust(if trusted {
-        agent_runtime::TrustPosture::Trusted
-    } else {
-        agent_runtime::TrustPosture::Untrusted
-    });
-    // The exec packet's token budget (mirrors the preserved context values).
-    system_prompt_context = system_prompt_context.with_token_budget(8192, 256);
-    let preserved = PreservedLiveContext::new(
+    let cwd = std::env::current_dir().ok();
+    let preserved = build_live_context(
+        workspace.as_ref().map(|(root, _)| root.as_path()),
+        cwd.as_deref(),
         prompt.clone(),
-        Vec::new(),
-        agents_rules,
-        String::new(),
+        trusted,
         8192,
         256,
     )
-    .map_err(|_| InteractiveError::Internal)?
-    .with_system_prompt(Some(
-        agent_runtime::render_system_prompt(&system_prompt_context)
-            .map_err(|err| {
-                eprintln!("warning: system prompt not rendered: {}", err.as_str());
-                InteractiveError::Internal
-            })
-            .unwrap_or_default(),
-    ));
+    .map_err(|_| InteractiveError::Internal)?;
     // Memory index: .rapidlm/MEMORY.md is always loaded (bounded, advisory).
     let memory_index = workspace
         .as_ref()
@@ -1165,15 +1208,21 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
     // project is explicitly trusted and its root still resolves, and every
     // call then passes the six-mode permission lattice (deny rules, persisted
     // grants, mode table; headless asks become typed denials). Every other
-    // surface refuses all proposed tool calls.
-    let mut tools = match (&workspace, exec_permission_lattice(workspace.as_ref().map(|(root, _)| root.as_path()))) {
-        (Some((root, TrustStatus::Trusted)), Ok(lattice)) => {
-            ExecTools::workspace_with_permissions(root, lattice)
+    // surface refuses all proposed tool calls. Resolved once here and reused
+    // below (subagent tools, the refuses-all warning) instead of re-resolving
+    // the mode/env at every call site.
+    let permission_lattice =
+        match exec_permission_lattice(workspace.as_ref().map(|(root, _)| root.as_path())) {
+            Ok(lattice) => lattice,
+            Err(reason) => {
+                eprintln!("permission configuration error: {reason}");
+                return Ok(1);
+            }
+        };
+    let mut tools = match &workspace {
+        Some((root, TrustStatus::Trusted)) => {
+            ExecTools::workspace_with_permissions(root, permission_lattice.clone())
                 .unwrap_or_else(|_| ExecTools::noop())
-        }
-        (_, Err(reason)) => {
-            eprintln!("permission configuration error: {reason}");
-            return Ok(1);
         }
         _ => ExecTools::noop(),
     };
@@ -1182,10 +1231,11 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
     // without workspace tools (or under a mode that refuses every call), say
     // so up front and name the levers, instead of leaving the run to fail
     // without an obvious why.
-    let exec_mode = exec_permission_mode().ok();
     let tools_withheld = !matches!(&workspace, Some((_, TrustStatus::Trusted)));
-    let mode_refuses_all =
-        matches!(exec_mode, Some(crate::permissions::PermissionMode::Plan | crate::permissions::PermissionMode::DontAsk));
+    let mode_refuses_all = matches!(
+        permission_lattice.mode(),
+        crate::permissions::PermissionMode::Plan | crate::permissions::PermissionMode::DontAsk
+    );
     if tools_withheld {
         eprintln!(
             "warning: workspace tools are disabled for this run: the project is not trusted; \
@@ -1268,11 +1318,10 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     if let (Some(active), Some((root, TrustStatus::Trusted))) =
         (child_model_config.as_ref(), workspace.as_ref())
     {
-        let mode = exec_permission_mode().unwrap_or(crate::permissions::PermissionMode::Default);
         tools.set_subagent_runner(std::sync::Arc::new(LiveSubagentRunner {
             active: active.clone(),
             root: root.clone(),
-            mode,
+            permissions: permission_lattice.clone(),
         }));
     }
     let diag = parsed.verbose.then(|| StepDiag::stderr(&base_url));
@@ -1298,8 +1347,9 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             // calls) and whose only defect is an empty final model response
             // is a completed task with a missing summary — exit 0 so callers
             // do not retry committed work. Every other failure exits 1.
-            if outcome.stop_reason == Some(TurnStopReason::EmptyResponse) && outcome.tool_calls > 0
-            {
+            // (`Succeeded` is already handled by the guard above, so reaching
+            // here `is_effective_success` can only be true via that case.)
+            if is_effective_success(&outcome) {
                 message.push_str(&format!(
                     " (the turn performed {} tool call(s) before the final response came back empty; verify workspace state)",
                     outcome.tool_calls

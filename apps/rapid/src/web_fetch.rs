@@ -49,6 +49,13 @@ struct SplitUrl<'a> {
     port: u16,
 }
 
+/// Hostname of a fetchable URL (`scheme://host[:port]/...`), for
+/// domain-scoped permission rule matching (`web_fetch(domain:<glob>)`).
+/// `None` when the URL does not parse as a fetchable authority.
+pub(crate) fn host_of(url: &str) -> Option<&str> {
+    split_url(url).map(|split| split.host)
+}
+
 fn split_url(url: &str) -> Option<SplitUrl<'_>> {
     let (scheme, rest) = url.split_once("://")?;
     let scheme = scheme.to_ascii_lowercase();
@@ -228,9 +235,18 @@ pub fn fetch_page(
     classify_fetch(url, allowlist)?;
     let body = http_get(
         url,
-        // The caller already ran the SSRF classification; private hosts that
-        // survived it are allowlisted.
-        true,
+        // `classify_fetch` above only bounds the *first* DNS resolution: a
+        // short-TTL attacker domain can answer with a public IP there and a
+        // private/metadata IP on `http_get`'s own (independent) resolution
+        // at connect time, which would slip straight through if that second
+        // lookup's guards were disabled. Keep `http_get`'s guards active
+        // (`allow_private: false`) so the resolution that actually matters —
+        // the one immediately before connecting — is checked too. This
+        // makes `classify_fetch` a fast-path/early-error optimization plus a
+        // second, independent guard (it also catches address classes, like
+        // RFC1918 private ranges and loopback, that `http_get`'s narrower
+        // guard does not), rather than the sole line of defense.
+        false,
         max_bytes,
         std::time::Duration::from_secs(30),
         &llm_router::provider::CancellationToken::new(),

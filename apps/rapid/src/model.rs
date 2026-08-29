@@ -386,8 +386,15 @@ fn build_request(
                     }
                     match ContentPart::image_data(data_url.to_owned()) {
                         Ok(part) => {
-                            parts.push(part);
+                            let flushed = plain.trim_end().to_owned();
+                            if !flushed.is_empty() {
+                                parts.push(
+                                    ContentPart::text(flushed)
+                                        .map_err(|_| ModelStepError::BoundExceeded)?,
+                                );
+                            }
                             plain.clear();
+                            parts.push(part);
                         }
                         Err(_) => {
                             plain.push_str(line);
@@ -405,17 +412,26 @@ fn build_request(
                     ContentPart::text(plain).map_err(|_| ModelStepError::BoundExceeded)?,
                 );
             }
-            if !parts.is_empty() {
-                messages.push(
-                    CanonicalMessage::new(
-                        MessageRole::Tool,
-                        parts,
-                        Some(call_id),
-                        Vec::new(),
-                    )
-                    .map_err(|_| ModelStepError::BoundExceeded)?,
+            if parts.is_empty() {
+                // A genuinely empty tool summary (e.g. reading a zero-byte
+                // file) must not silently drop the tool-result message: the
+                // paired `tool_use` block was already pushed above, and both
+                // Anthropic's and OpenAI-compatible's wire formats reject a
+                // `tool_use` with no matching `tool_result` on replay.
+                parts.push(
+                    ContentPart::text("(empty)".to_string())
+                        .map_err(|_| ModelStepError::BoundExceeded)?,
                 );
             }
+            messages.push(
+                CanonicalMessage::new(
+                    MessageRole::Tool,
+                    parts,
+                    Some(call_id),
+                    Vec::new(),
+                )
+                .map_err(|_| ModelStepError::BoundExceeded)?,
+            );
         }
     }
 
@@ -1017,6 +1033,59 @@ mod tests {
             .messages()
             .iter()
             .all(|message| message.role() != MessageRole::Assistant));
+    }
+
+    #[test]
+    fn empty_tool_summary_still_gets_a_paired_tool_result_message() {
+        // A zero-byte file read succeeds with an empty summary
+        // (`bounded_text` on an empty slice returns ""). The assistant's
+        // tool-call message is always pushed for a step with calls, so if
+        // the empty summary produced no parts and the tool-result message
+        // were skipped, the replayed history would carry a `tool_use` with
+        // no matching `tool_result` — malformed on both Anthropic's and
+        // OpenAI-compatible's wire formats. Every tool_use must get a paired
+        // tool_result, even when the underlying summary was genuinely empty.
+        let store = InMemoryCredentialStore::new();
+        let active = active("test-model", "http://127.0.0.1:1", "local");
+        let configured = ConfiguredModel::build(&active, &store).expect("build");
+        let pending = vec![
+            ProposedToolCall::new("c1", "workspace_read", r#"{"path":"empty.txt"}"#)
+                .expect("c1"),
+        ];
+        let prior = vec![ToolStepResult::Succeeded {
+            call_id: "c1".to_owned(),
+            summary: String::new(),
+        }];
+        let exchange = agent_runtime::ToolStepExchange::new(pending, prior);
+        let history = vec![exchange];
+        let input = ModelStepInput::with_history(2, &history, &[]);
+        let built = build_request(&configured, &[], &input).expect("request");
+        let messages = built.messages();
+
+        let assistant = messages
+            .iter()
+            .find(|message| message.role() == MessageRole::Assistant)
+            .expect("assistant tool-call message is always pushed for a step with calls");
+        assert_eq!(assistant.tool_calls().len(), 1);
+
+        let tool_messages: Vec<&CanonicalMessage> = messages
+            .iter()
+            .filter(|message| message.role() == MessageRole::Tool)
+            .collect();
+        assert_eq!(
+            tool_messages.len(),
+            1,
+            "the tool_use above must get a paired tool_result, even for an empty summary"
+        );
+        assert_eq!(tool_messages[0].tool_call_id().map(|id| id.as_str()), Some("c1"));
+        assert!(
+            !tool_messages[0].parts().is_empty(),
+            "a fallback text part must stand in for the genuinely empty summary"
+        );
+        assert!(
+            !part_text(&tool_messages[0].parts()[0]).is_empty(),
+            "the fallback part must carry non-empty placeholder text"
+        );
     }
 
     fn part_text(part: &ContentPart) -> &str {

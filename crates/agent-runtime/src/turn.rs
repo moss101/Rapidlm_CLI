@@ -16,9 +16,6 @@ use crate::loop_guard::ToolCallLoopDetector;
 /// Hard ceiling on model steps in one turn, even if the spec budget is higher.
 pub const MAX_MODEL_STEPS: u32 = 32;
 
-/// Bounded retries for an empty model response before the turn fails clearly.
-pub const EMPTY_RESPONSE_RETRY_LIMIT: u32 = 2;
-
 /// Hard ceiling on tool calls accepted from one model step.
 pub const MAX_TOOL_CALLS_PER_STEP: usize = 16;
 
@@ -594,14 +591,11 @@ struct LoopState {
     /// leftover-state stops with no call at hand — can name it.
     failure_detail: Option<TurnFailureDetail>,
     loop_detector: ToolCallLoopDetector,
-    empty_responses: u32,
 }
 
 enum StepDecision {
     /// A completed tool step: append its exchange to the turn history.
     Continue(ToolStepExchange),
-    /// An empty response: re-invoke the model without appending anything.
-    Retry,
     Stop(TurnResult),
 }
 
@@ -982,7 +976,6 @@ where
         unhandled_tool_failure: false,
         failure_detail: None,
         loop_detector: ToolCallLoopDetector::new(),
-        empty_responses: 0,
     };
     let TurnSpec {
         model,
@@ -1007,7 +1000,6 @@ where
         }
         match run_model_step(&mut state, model, tools, events, &history, cancel)? {
             StepDecision::Continue(exchange) => history.push(exchange),
-            StepDecision::Retry => {}
             StepDecision::Stop(result) => return Ok(result),
         }
     }
@@ -1179,13 +1171,14 @@ where
         ModelStepOutput::ToolCalls { calls, .. } => calls.is_empty(),
     };
     if empty_response {
-        state.empty_responses = state.empty_responses.saturating_add(1);
-        if state.empty_responses <= EMPTY_RESPONSE_RETRY_LIMIT {
-            // Bounded retry: re-invoke the model for the same step with an
-            // unchanged history, consuming model budget. An empty response is
-            // never fabricated into assistant content.
-            return Ok(StepDecision::Retry);
-        }
+        // Retrying an empty response is the host's job now: `SupervisedModel`
+        // (apps/rapid/src/host.rs) already retries an empty terminal response
+        // up to its own bounded limit with exponential backoff before this
+        // layer ever sees the result. A second independent retry loop here
+        // would compound with that one (each retry re-enters `SupervisedModel`
+        // fresh, resetting its attempt counter), multiplying real provider
+        // calls and backoff sleeps. So an empty response reaching this point
+        // is treated as terminal and never fabricated into assistant content.
         return Ok(StepDecision::Stop(fail(
             state,
             events,
@@ -1414,13 +1407,25 @@ where
         prepared.iter().map(|(_, validated)| validated.clone()).collect();
     let outcomes = tools.execute_batch(&validated, cancel);
 
+    // `execute_batch` already ran every call concurrently and joined all of
+    // them before returning `outcomes` — every outcome here corresponds to a
+    // real, already-committed side effect. So this pass must record ALL of
+    // them (push to `results`, emit their event, account usage) before
+    // deciding whether to stop; returning early on the first bad outcome
+    // would silently discard the already-executed results of every call
+    // after it. The stop reason reported is still the FIRST bad outcome
+    // encountered, by original index, matching prior behavior.
     let mut results = Vec::new();
+    let mut stop_outcome: Option<ToolBatchOutcome> = None;
     for ((call, _), outcome) in prepared.iter().zip(outcomes) {
         let result = match outcome {
             Ok(result) => result,
             Err(ToolStepError::Cancelled) => {
                 emit_tool_failed(state, events, call)?;
-                return Ok(ToolBatchOutcome::Stopped(interrupt(state, events)?));
+                if stop_outcome.is_none() {
+                    stop_outcome = Some(ToolBatchOutcome::Stopped(interrupt(state, events)?));
+                }
+                continue;
             }
             Err(err @ (ToolStepError::Invalid | ToolStepError::Failed)) => {
                 emit_tool_failed(state, events, call)?;
@@ -1429,11 +1434,14 @@ where
                     call.tool.clone(),
                     err.as_str(),
                 ));
-                return Ok(ToolBatchOutcome::Stopped(fail(
-                    state,
-                    events,
-                    TurnStopReason::ToolFailed,
-                )?));
+                if stop_outcome.is_none() {
+                    stop_outcome = Some(ToolBatchOutcome::Stopped(fail(
+                        state,
+                        events,
+                        TurnStopReason::ToolFailed,
+                    )?));
+                }
+                continue;
             }
         };
 
@@ -1442,24 +1450,30 @@ where
         results.push(result.clone());
 
         if matches!(result, ToolStepResult::ApprovalRequired { .. }) {
-            return Ok(ToolBatchOutcome::Stopped(fail(
-                state,
-                events,
-                TurnStopReason::ApprovalRequired,
-            )?));
-        }
-        if result.is_unhandled_failure() {
+            if stop_outcome.is_none() {
+                stop_outcome = Some(ToolBatchOutcome::Stopped(fail(
+                    state,
+                    events,
+                    TurnStopReason::ApprovalRequired,
+                )?));
+            }
+        } else if result.is_unhandled_failure() {
             state.unhandled_tool_failure = true;
             state.failure_detail = Some(TurnFailureDetail::new(
                 call.tool.clone(),
                 &unhandled_failure_text(&result),
             ));
-            return Ok(ToolBatchOutcome::Stopped(fail(
-                state,
-                events,
-                TurnStopReason::ToolFailed,
-            )?));
+            if stop_outcome.is_none() {
+                stop_outcome = Some(ToolBatchOutcome::Stopped(fail(
+                    state,
+                    events,
+                    TurnStopReason::ToolFailed,
+                )?));
+            }
         }
+    }
+    if let Some(stop_outcome) = stop_outcome {
+        return Ok(stop_outcome);
     }
     Ok(ToolBatchOutcome::Completed(results))
 }
@@ -2327,6 +2341,107 @@ mod tests {
         );
     }
 
+    /// `execute_batch` runs every call in the batch before returning (real
+    /// side effects already happened for all of them), but the middle call
+    /// is scripted to come back as an unhandled failure.
+    struct MixedOutcomeBatchTools;
+    impl ToolDriver for MixedOutcomeBatchTools {
+        fn validate(
+            &mut self,
+            call: &ProposedToolCall,
+            _cancel: &CancellationToken,
+        ) -> Result<ValidatedToolCall, ToolStepError> {
+            Ok(ValidatedToolCall::from_proposed(call))
+        }
+        fn execute(
+            &mut self,
+            call: &ValidatedToolCall,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolStepResult, ToolStepError> {
+            let _ = call;
+            Err(ToolStepError::Failed)
+        }
+        fn execute_batch(
+            &mut self,
+            calls: &[ValidatedToolCall],
+            _cancel: &CancellationToken,
+        ) -> Vec<Result<ToolStepResult, ToolStepError>> {
+            calls
+                .iter()
+                .map(|call| {
+                    if call.call_id() == "c2" {
+                        Ok(ToolStepResult::Failed {
+                            call_id: call.call_id().to_owned(),
+                            detail: Some("boom".to_owned()),
+                            handled: false,
+                        })
+                    } else {
+                        Ok(ToolStepResult::Succeeded {
+                            call_id: call.call_id().to_owned(),
+                            summary: format!("batch:{}", call.call_id()),
+                        })
+                    }
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn a_batch_failure_does_not_drop_the_already_executed_calls_after_it() {
+        // `execute_batch` already ran c1, c2, and c3 concurrently before
+        // returning: all three have real, committed side effects. c2 comes
+        // back as an unhandled failure, which must stop the turn — but c3's
+        // outcome (which ran right alongside c2) must still be recorded:
+        // pushed to results, its completion event emitted, and usage
+        // incremented. Silently dropping it would hide an already-executed
+        // effect from the turn's history and usage accounting.
+        let mut model = ScriptedModel::new(vec![tools_out(
+            vec![
+                call("c1", "repo.read"),
+                call("c2", "repo.search"),
+                call("c3", "repo.read"),
+            ],
+            2,
+        )]);
+        let mut tools = MixedOutcomeBatchTools;
+        let mut events = Vec::new();
+        let result = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(result.status(), TurnStatus::Failed);
+        assert_eq!(result.reason(), Some(TurnStopReason::ToolFailed));
+        // c1 and c3 both succeeded and must both be accounted, even though
+        // c2 (between them) is the one that stopped the turn.
+        assert_eq!(
+            result.usage().tool_calls(),
+            2,
+            "both successful calls must be counted, not just the one before the failure"
+        );
+        let completed = events
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::ToolCompleted { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            completed,
+            vec!["c1", "c3"],
+            "c3's completion, after the failing c2, must still be emitted"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TurnEvent::ToolFailed { call_id, .. } if call_id == "c2")),
+            "c2's failure must still be reported"
+        );
+    }
+
     #[test]
     fn continuation_step_sees_the_pending_calls_next_to_their_results() {
         struct PairRecordingModel {
@@ -2615,26 +2730,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_response_retries_then_succeeds_within_budget() {
-        let mut model = ScriptedModel::new(vec![terminal("", 1), terminal("ok", 2)]);
-        let mut tools = ScriptedTools::new(Vec::new());
-        let mut events = Vec::new();
-        let result = run(
-            TurnBudget::unlimited_steps(),
-            &mut model,
-            &mut tools,
-            &mut events,
-            &live(),
-        )
-        .expect("run");
-        assert_eq!(result.status(), TurnStatus::Completed);
-        assert_eq!(result.reason(), None);
-        assert_eq!(model.seen, 2, "one bounded retry after the empty response");
-    }
-
-    #[test]
-    fn repeated_empty_response_is_a_bounded_stop_and_never_completes() {
-        let mut model = ScriptedModel::new(vec![terminal("", 1), terminal("", 1), terminal("", 1)]);
+    fn empty_response_is_terminal_and_never_completes() {
+        // Retrying an empty model response is now solely `SupervisedModel`'s
+        // job (apps/rapid/src/host.rs), with its own bounded backoff. A
+        // second retry loop at this layer would compound with that one
+        // (each retry here re-enters `SupervisedModel` fresh), so an empty
+        // response reaching `run_model_step` must fail the turn immediately
+        // rather than re-invoking the model.
+        let mut model = ScriptedModel::new(vec![terminal("", 1), terminal("unreached", 1)]);
         let mut tools = ScriptedTools::new(Vec::new());
         let mut events = Vec::new();
         let result = run(
@@ -2647,40 +2750,19 @@ mod tests {
         .expect("run");
         assert_eq!(result.status(), TurnStatus::Failed);
         assert_eq!(result.reason(), Some(TurnStopReason::EmptyResponse));
-        assert_eq!(model.seen, 3);
+        assert_eq!(model.seen, 1, "an empty response is never retried here");
         assert!(!kinds(&events).contains(&"turn.completed"));
         assert!(kinds(&events).contains(&"turn.failed"));
     }
 
     #[test]
-    fn empty_response_retry_respects_cancellation() {
-        let cancel = live();
-        let mut model = ScriptedModel::new(vec![terminal("", 1)]).cancel_at(2, cancel.clone());
-        let mut tools = ScriptedTools::new(Vec::new());
-        let mut events = Vec::new();
-        let result = run(
-            TurnBudget::unlimited_steps(),
-            &mut model,
-            &mut tools,
-            &mut events,
-            &cancel,
-        )
-        .expect("run");
-        assert_eq!(result.status(), TurnStatus::Interrupted);
-        assert_eq!(result.reason(), Some(TurnStopReason::Cancelled));
-        assert!(kinds(&events).contains(&"turn.interrupted"));
-    }
-
-    #[test]
-    fn empty_response_retry_does_not_replay_already_executed_tool_effects() {
-        // step1 executes callA (one effect). step2 is an empty response that is
-        // retried. The retry must NOT re-execute callA: it re-invokes the model
-        // with the prior tool result as an observation, and the next model step
-        // simply finishes. Only one tool execution occurs.
+    fn empty_response_after_a_tool_step_does_not_replay_its_effects() {
+        // step1 executes callA (one effect). step2 is an empty response,
+        // which now fails the turn immediately (no retry layer here). The
+        // already-executed tool effect from step1 must not be replayed.
         let mut model = ScriptedModel::new(vec![
             tools_out(vec![call("c1", "repo.search")], 1),
             terminal("", 1),
-            terminal("done", 1),
         ]);
         let mut tools = ScriptedTools::new(vec![Ok(ToolStepResult::Succeeded {
             call_id: "c1".to_owned(),
@@ -2695,12 +2777,10 @@ mod tests {
             &live(),
         )
         .expect("run");
-        assert_eq!(result.status(), TurnStatus::Completed);
-        assert_eq!(
-            tools.executed, 1,
-            "the retry must not replay the executed tool call"
-        );
-        assert_eq!(model.seen, 3);
+        assert_eq!(result.status(), TurnStatus::Failed);
+        assert_eq!(result.reason(), Some(TurnStopReason::EmptyResponse));
+        assert_eq!(tools.executed, 1, "the executed tool call is never replayed");
+        assert_eq!(model.seen, 2);
     }
 
     #[test]

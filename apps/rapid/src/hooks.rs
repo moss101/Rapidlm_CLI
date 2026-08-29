@@ -176,10 +176,11 @@ pub fn run_post_tool_hooks(
     summary: &str,
     timeout: Duration,
 ) -> String {
-    let escaped_summary: String = summary.replace('\\', "\\\\").replace('"', "\\\"");
-    let input = format!(
-        r#"{{"tool":"{tool}","summary":"{escaped_summary}"}}"#
-    );
+    // Proper JSON serialization: a hand-rolled `"{escaped}"` format only
+    // escaped `\` and `"`, so a summary containing a raw newline (e.g.
+    // `execute_shell`'s `"exit {code}\n{output}"`) produced invalid JSON.
+    // `serde_json` escapes every control character RFC 8259 requires.
+    let input = serde_json::json!({ "tool": tool, "summary": summary }).to_string();
     let mut combined = String::new();
     for command in hooks {
         let (_, output) = run_hook_once(command, &input, timeout);

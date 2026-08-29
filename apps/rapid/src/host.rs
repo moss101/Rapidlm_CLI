@@ -1385,8 +1385,11 @@ mod tests {
             None,
         )
         .expect("execute");
-        // 3 turn-level empty attempts x (1 initial + 2 step retries).
-        assert_eq!(witness.saw_blocks.borrow().len(), 9);
+        // `SupervisedModel` owns the only empty-response retry now (1 initial
+        // + 2 backoff retries); `agent_runtime::turn::run_model_step` treats
+        // the empty response it gets back as terminal and does not retry
+        // again, so the backing sees exactly 3 calls, not a compounded 3x3.
+        assert_eq!(witness.saw_blocks.borrow().len(), 3);
         assert_eq!(outcome.result.status(), agent_runtime::AgentTerminalStatus::Failed);
         assert_eq!(outcome.stop_reason, Some(TurnStopReason::EmptyResponse));
         assert_eq!(outcome.failure_cause, None);

@@ -655,7 +655,18 @@ impl WorkspaceTools {
     /// Read-only driver for subagent explore/plan scopes: write-classified
     /// tools are not advertised and any write attempt is refused.
     pub fn open_read_only(root: &Path) -> Result<Self, ToolSetupError> {
-        let mut tools = Self::open(root)?;
+        Self::open_read_only_with_permissions(root, PermissionLattice::new(PermissionMode::Default))
+    }
+
+    /// Read-only driver with an explicit permission lattice: same structural
+    /// write refusal as [`Self::open_read_only`], but deny/ask rules and
+    /// persisted grants from the caller's lattice still apply to the reads
+    /// that remain on the surface.
+    pub fn open_read_only_with_permissions(
+        root: &Path,
+        permissions: PermissionLattice,
+    ) -> Result<Self, ToolSetupError> {
+        let mut tools = Self::open_with_permissions(root, permissions)?;
         tools.read_only = true;
         Ok(tools)
     }
@@ -682,6 +693,18 @@ impl WorkspaceTools {
                 return Err(ToolStepError::Invalid);
             }
         }
+        // The parent check above only proves the containing directory sits
+        // inside the workspace; a symlinked leaf (`ln -s /etc/passwd
+        // leak.txt`) would still resolve outside the root on open/read/write.
+        // `symlink_metadata` detects existence without following the link, so
+        // a not-yet-created file (nothing to check) is left to the parent
+        // check above.
+        if target.symlink_metadata().is_ok() {
+            let resolved = target.canonicalize().map_err(|_| ToolStepError::Invalid)?;
+            if !resolved.starts_with(self.root()) {
+                return Err(ToolStepError::Invalid);
+            }
+        }
         Ok(target)
     }
 
@@ -698,6 +721,9 @@ impl WorkspaceTools {
             PLAN_ENTER_TOOL => Some(PLAN_ENTER_TOOL.to_owned()),
             PLAN_EXIT_TOOL => Some(PLAN_EXIT_TOOL.to_owned()),
             TASK_SPAWN_TOOL => Some(TASK_SPAWN_TOOL.to_owned()),
+            WEB_FETCH_TOOL => parse_web_fetch_args(arguments).ok().and_then(|(url, _)| {
+                crate::web_fetch::host_of(&url).map(|host| format!("domain:{host}"))
+            }),
             _ => None,
         }
     }
@@ -928,7 +954,7 @@ use one of the tool names given in the tool surface"
                     let dims = png_dimensions(&bytes);
                     use base64::Engine as _;
                     let data_url = format!(
-                        "DATA_URL:image/png;base64,{}",
+                        "DATA_URL:data:image/png;base64,{}",
                         base64::engine::general_purpose::STANDARD.encode(&bytes)
                     );
                     return Ok(ToolStepResult::Succeeded {
@@ -1742,7 +1768,12 @@ use one of the tool names given in the tool surface"
     /// Group key for write-class calls: same key ⇒ serialized in proposal
     /// order. All `shell_exec` calls share one key (a process may touch any
     /// path); file writes serialize per resolved relative path.
-    fn write_group_key(call: &ValidatedToolCall) -> Option<String> {
+    /// `index` is the call's position in the batch, used to give every
+    /// uncategorized write (task_spawn, ask_user, plan_enter/exit, any
+    /// mcp__* tool) its own group: those calls target no shared resource, so
+    /// they must run concurrently rather than collapsing onto one `None` key
+    /// and serializing behind each other.
+    fn write_group_key(call: &ValidatedToolCall, index: usize) -> Option<String> {
         match call.tool() {
             SHELL_EXEC_TOOL => Some(SHELL_EXEC_TOOL.to_owned()),
             WORKSPACE_WRITE_TOOL => {
@@ -1750,7 +1781,7 @@ use one of the tool names given in the tool surface"
             }
             WORKSPACE_PATCH_TOOL => parse_patch_args(call.arguments()).ok().map(|a| a.path),
             TODO_WRITE_TOOL => Some(TODOS_PATH.to_owned()),
-            _ => None,
+            _ => Some(format!("solo:{index}")),
         }
     }
 }
@@ -1961,6 +1992,17 @@ fn bounded_detail(text: &str) -> String {
         end -= 1;
     }
     text[..end].to_owned()
+}
+
+/// Strip raw control bytes that survive JSON serialization unescaped (DEL
+/// 0x7F and the C1 control range 0x80-0x9F; serde_json only escapes
+/// 0x00-0x1F) and would otherwise trip `ProposedToolCall`'s
+/// no-control-chars validation downstream. `\n`, `\r`, `\t` are kept:
+/// serde_json escapes those into safe non-control sequences.
+fn sanitize_notification_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+        .collect()
 }
 
 /// Flatten a detail onto one line so trace output stays line-oriented.
@@ -2656,6 +2698,19 @@ impl ExecTools {
         Ok(Self::Workspace(WorkspaceTools::open_read_only(root)?))
     }
 
+    /// Read-only trusted surface with an explicit permission lattice (subagent
+    /// explore/plan scopes that must still honor the parent's deny/ask rules
+    /// and persisted grants).
+    pub fn read_only_with_permissions(
+        root: &Path,
+        permissions: PermissionLattice,
+    ) -> Result<Self, ToolSetupError> {
+        Ok(Self::Workspace(WorkspaceTools::open_read_only_with_permissions(
+            root,
+            permissions,
+        )?))
+    }
+
     /// Attach the subagent runner (no-op on the fail-closed no-op surface).
     pub fn set_subagent_runner(&mut self, runner: std::sync::Arc<dyn SubagentRunner>) {
         if let Self::Workspace(tools) = self {
@@ -2777,10 +2832,16 @@ fn batch_dispatch(
 ) -> Vec<Result<ToolStepResult, ToolStepError>> {
     let mut groups: Vec<(Option<String>, Vec<usize>)> = Vec::new();
     for (index, call) in calls.iter().enumerate() {
+        // Each Read call gets its own key: reads target no shared resource
+        // and must run concurrently with each other, not collapse onto one
+        // shared `None` group and serialize. Write calls with no specific
+        // target (see `write_group_key`'s fallback) get the same per-index
+        // treatment; only same-path writes and same-kind shell_exec calls
+        // are meant to share a key and serialize.
         let key = if tool_kind(call.tool()) == ToolKind::Read {
-            None
+            Some(format!("solo:{index}"))
         } else {
-            WorkspaceTools::write_group_key(call)
+            WorkspaceTools::write_group_key(call, index)
         };
         if let Some(group) = groups.iter_mut().find(|(existing, _)| *existing == key) {
             group.1.push(index);
@@ -2872,12 +2933,18 @@ impl ToolDriver for ExecTools {
             .into_iter()
             .map(|summary| {
                 let job_id = summary.split(':').next().unwrap_or("job").trim().to_owned();
+                // Background job output can contain raw control bytes (e.g. a
+                // literal DEL 0x7F) that `String::from_utf8_lossy` and
+                // serde_json both pass through unescaped; those would fail
+                // `ProposedToolCall`'s control-char validation below, so
+                // sanitize before it is ever embedded in the call arguments.
+                let summary = sanitize_notification_text(&summary);
                 let call = ProposedToolCall::new(
                     format!("notify-{job_id}"),
                     "background_jobs",
                     format!(r#"{{"summary":{}}}"#, serde_json::json!(summary)),
                 )
-                .expect("fixed name/args");
+                .expect("fixed name/args: summary is control-byte sanitized above");
                 ToolStepExchange::new(
                     vec![call],
                     vec![ToolStepResult::Succeeded {
@@ -3317,6 +3384,47 @@ use std::sync::{Arc, Mutex};
             }
             other => panic!("expected read success, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn symlinked_leaf_escape_is_refused_on_read_and_write() {
+        // `resolve_in_root` canonicalizes the parent directory, but a
+        // symlinked *leaf* (the file argument itself) must be checked too:
+        // `ln -s /etc/passwd leak.txt` then `workspace_read`/`workspace_write`
+        // on `leak.txt` must not follow the link outside the workspace root.
+        let root = TempRoot::new("symlink-leaf");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        let outside = TempRoot::new("symlink-leaf-outside");
+        let secret = outside.0.join("secret.txt");
+        fs::write(&secret, "outside-secret").expect("seed outside file");
+        std::os::unix::fs::symlink(&secret, root.0.join("leak.txt")).expect("symlink");
+
+        let read = ProposedToolCall::new("c1", WORKSPACE_READ_TOOL, r#"{"path":"leak.txt"}"#)
+            .expect("call");
+        let validated = tools.validate(&read, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel) {
+            Ok(ToolStepResult::Failed { .. }) | Ok(ToolStepResult::Denied { .. }) | Err(_) => {}
+            other => panic!("expected the symlinked leaf read to be refused, got {other:?}"),
+        }
+
+        let write = ProposedToolCall::new(
+            "c2",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"leak.txt","content":"pwned"}"#,
+        )
+        .expect("call");
+        let validated = tools.validate(&write, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel) {
+            Ok(ToolStepResult::Failed { .. }) | Ok(ToolStepResult::Denied { .. }) | Err(_) => {}
+            other => panic!("expected the symlinked leaf write to be refused, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read_to_string(&secret).expect("outside file still readable"),
+            "outside-secret",
+            "the write must never follow the symlink outside the workspace root"
+        );
     }
 
     #[test]
@@ -3879,6 +3987,60 @@ use std::sync::{Arc, Mutex};
             results[0],
             Ok(ToolStepResult::Denied { ref detail, .. }) if detail.as_deref().unwrap_or("").contains("deny rule")
         ));
+    }
+
+    #[test]
+    fn web_fetch_deny_rule_matches_on_the_urls_domain() {
+        // `rule_subject` must extract a `domain:<host>` subject for
+        // `web_fetch` calls (previously it fell through to `_ => None`, so a
+        // `web_fetch(domain:...)` deny rule could never match and the call
+        // fell through to the read-only auto-allow). This also proves rules
+        // are checked before that auto-allow: without the fix this call
+        // would attempt a real (loopback-refused) fetch instead of being
+        // denied outright.
+        let root = TempRoot::new("web-fetch-deny");
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::BypassPermissions)
+            .with_rules(vec![ToolRule {
+                effect: RuleEffect::Deny,
+                pattern: ToolPattern::parse("web_fetch(domain:evil.example*)").expect("rule"),
+            }]);
+        let mut tools =
+            ExecTools::workspace_with_permissions(&root.0, lattice).expect("tools");
+        let calls = vec![make_call(
+            "c1",
+            WEB_FETCH_TOOL,
+            r#"{"url":"https://evil.example.com/x"}"#,
+        )];
+        let results = run_batch(&mut tools, &calls);
+        assert!(
+            matches!(
+                &results[0],
+                Ok(ToolStepResult::Denied { detail, .. })
+                    if detail.as_deref().unwrap_or("").contains("deny rule")
+            ),
+            "expected the domain deny rule to block the fetch, got {:?}",
+            results[0]
+        );
+
+        // A non-matching domain is unaffected by the rule (still denied only
+        // by whatever the mode/allowlist would otherwise decide, not by this
+        // rule): the same lattice on a different host is not caught by the
+        // deny pattern.
+        let calls = vec![make_call(
+            "c2",
+            WEB_FETCH_TOOL,
+            r#"{"url":"https://fine.example.com/x"}"#,
+        )];
+        let results = run_batch(&mut tools, &calls);
+        assert!(
+            !matches!(
+                &results[0],
+                Ok(ToolStepResult::Denied { detail, .. })
+                    if detail.as_deref().unwrap_or("").contains("deny rule")
+            ),
+            "the deny rule must not match an unrelated domain, got {:?}",
+            results[0]
+        );
     }
 
     #[test]
@@ -4596,8 +4758,10 @@ use std::sync::{Arc, Mutex};
         match tools.execute(&validated, &cancel).expect("execute") {
             ToolStepResult::Succeeded { summary, .. } => {
                 assert!(summary.contains("PNG image 1x1"), "{summary}");
-                let data_start = summary.find("DATA_URL:image/png;base64,").expect("data url");
-                let payload = &summary[data_start + "DATA_URL:image/png;base64,".len()..];
+                let data_start = summary
+                    .find("DATA_URL:data:image/png;base64,")
+                    .expect("data url");
+                let payload = &summary[data_start + "DATA_URL:data:image/png;base64,".len()..];
                 assert!(!payload.trim().is_empty(), "base64 payload present");
             }
             other => panic!("expected image read, got {other:?}"),
@@ -4810,6 +4974,59 @@ for line in sys.stdin:
         }
         assert!(!notices.is_empty(), "completion notice must be available");
         assert!(notices[0].contains("all-done"), "{notices:?}");
+    }
+
+    #[test]
+    fn drain_notifications_survives_a_raw_control_byte_in_job_output() {
+        // A background job's stdout can contain a raw DEL (0x7F) byte;
+        // `String::from_utf8_lossy` and serde_json both pass it through
+        // unescaped, and `ProposedToolCall::new` rejects any control byte in
+        // its arguments — so building the notification call used to panic
+        // via `.expect("fixed name/args")`. The driver must sanitize the
+        // summary before it is ever embedded in the call arguments.
+        let root = TempRoot::new("notify-control-byte");
+        let mut tools =
+            ExecTools::workspace_with_permissions(&root.0, PermissionLattice::new(
+                crate::permissions::PermissionMode::BypassPermissions,
+            ))
+            .expect("tools");
+        let start = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            // \177 is octal for DEL (0x7F): the job prints a literal DEL
+            // byte between two markers.
+            r#"{"argv":["sh","-c","printf 'before\\177after'"],"background":true}"#,
+        );
+        let validated = tools.validate(&start, &CancellationToken::new()).expect("v");
+        assert!(matches!(
+            tools.execute(&validated, &CancellationToken::new()).expect("e"),
+            ToolStepResult::Succeeded { .. }
+        ));
+        let mut exchanges = Vec::new();
+        for _ in 0..50 {
+            exchanges = tools.drain_notifications();
+            if !exchanges.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!exchanges.is_empty(), "completion notice must be available");
+        let exchange = &exchanges[0];
+        assert_eq!(exchange.calls().len(), 1, "one synthetic call per job notice");
+        let call = &exchange.calls()[0];
+        // The built call's JSON arguments must contain no raw control bytes
+        // (this is exactly the condition `ProposedToolCall::new` enforces;
+        // reaching this line at all proves it did not panic).
+        assert!(
+            !call.arguments().chars().any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t'),
+            "sanitized arguments must carry no raw control bytes: {:?}",
+            call.arguments()
+        );
+        assert!(
+            call.arguments().contains("before") && call.arguments().contains("after"),
+            "surrounding text must survive sanitization: {:?}",
+            call.arguments()
+        );
     }
 
     #[test]

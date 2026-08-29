@@ -934,6 +934,15 @@ impl<T: McpTransport> McpSession<T> {
 
     /// Send one request and read frames until the reply with the expected id
     /// arrives, discarding interleaved server notifications.
+    ///
+    /// There is no fixed cap on how many notifications may be skipped: a
+    /// well-behaved server can legitimately emit any number of
+    /// `notifications/progress` frames during one call. Giving up early would
+    /// leave the real response unread in the transport, permanently
+    /// desynchronizing every later call on this session. Instead this loops
+    /// until either the matching response arrives or `recv_frame` itself
+    /// errors out (cancellation, I/O timeout, or the peer closing), which
+    /// already bounds how long a dead/hung connection can block.
     fn exchange_skipping_notifications(
         &mut self,
         request: &[u8],
@@ -941,13 +950,12 @@ impl<T: McpTransport> McpSession<T> {
         cancel: &CancellationToken,
     ) -> Result<Vec<u8>, TransportError> {
         self.transport.send_frame(request, cancel)?;
-        for _ in 0..8 {
+        loop {
             let frame = self.transport.recv_frame(cancel)?;
             if has_response_id(&frame, expected_id) {
                 return Ok(frame);
             }
         }
-        Err(TransportError::InvalidFrame)
     }
 
     pub fn close(&mut self, cancel: &CancellationToken) -> Result<(), TransportError> {
