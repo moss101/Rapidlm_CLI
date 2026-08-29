@@ -1294,6 +1294,16 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                 .unwrap_or_default();
             tools.set_fetch_allowlist(allowlist);
             if let Some(hooks) = crate::hooks::HooksConfig::parse(&value) {
+                if !hooks.session_start.is_empty() {
+                    // Fire-and-forget: a session_start hook observes the run
+                    // starting, it never gates it (no PreHookOutcome here).
+                    let _ = crate::hooks::run_notify_hooks(
+                        &hooks.session_start,
+                        "session_start",
+                        serde_json::json!({}),
+                        crate::hooks::HOOK_TIMEOUT,
+                    );
+                }
                 if !hooks.is_empty() {
                     tools.set_hooks(hooks);
                 }

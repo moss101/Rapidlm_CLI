@@ -23,6 +23,15 @@ pub const MAX_HOOK_STDERR_BYTES: usize = 2048;
 pub struct HooksConfig {
     pub pre_tool_use: Vec<String>,
     pub post_tool_use: Vec<String>,
+    /// Fires once per `rapid exec` run, after hooks/settings load, before the
+    /// turn starts. Notification-style: output is logged, never gates.
+    pub session_start: Vec<String>,
+    /// Fires when `task_spawn` is about to run a child agent.
+    /// Notification-style, same as `session_start`.
+    pub subagent_start: Vec<String>,
+    /// Fires when a `task_spawn` child finishes (success or failure).
+    /// Notification-style, same as `session_start`.
+    pub subagent_stop: Vec<String>,
 }
 
 impl HooksConfig {
@@ -33,6 +42,9 @@ impl HooksConfig {
         for (key, target) in [
             ("pre_tool_use", &mut config.pre_tool_use),
             ("post_tool_use", &mut config.post_tool_use),
+            ("session_start", &mut config.session_start),
+            ("subagent_start", &mut config.subagent_start),
+            ("subagent_stop", &mut config.subagent_stop),
         ] {
             let Some(entries) = object.get(key).and_then(serde_json::Value::as_array) else {
                 continue;
@@ -54,7 +66,11 @@ impl HooksConfig {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pre_tool_use.is_empty() && self.post_tool_use.is_empty()
+        self.pre_tool_use.is_empty()
+            && self.post_tool_use.is_empty()
+            && self.session_start.is_empty()
+            && self.subagent_start.is_empty()
+            && self.subagent_stop.is_empty()
     }
 }
 
@@ -195,6 +211,42 @@ pub fn run_post_tool_hooks(
     combined
 }
 
+/// Run every hook for a notification-style event (`session_start`,
+/// `subagent_start`, `subagent_stop`, ...): fire-and-collect, never gates —
+/// unlike `pre_tool_use`, a non-zero exit here is not a denial. `payload` is
+/// serialized as the hook's stdin JSON (only `event` is added to it here, so
+/// callers pass their own event-specific fields already, matching
+/// `run_post_tool_hooks`'s `{"tool":...,"summary":...}` shape rather than a
+/// generic wrapper).
+pub fn run_notify_hooks(
+    hooks: &[String],
+    event: &str,
+    payload: serde_json::Value,
+    timeout: Duration,
+) -> String {
+    let mut input = match payload {
+        serde_json::Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("payload".to_owned(), other);
+            map
+        }
+    };
+    input.insert("event".to_owned(), serde_json::Value::String(event.to_owned()));
+    let input = serde_json::Value::Object(input).to_string();
+    let mut combined = String::new();
+    for command in hooks {
+        let (_, output) = run_hook_once(command, &input, timeout);
+        if !output.is_empty() && combined.len() < MAX_HOOK_STDERR_BYTES {
+            if !combined.is_empty() {
+                combined.push_str("; ");
+            }
+            combined.push_str(&output);
+        }
+    }
+    combined
+}
+
 fn truncate(bytes: &[u8], cap: usize) -> String {
     let mut end = bytes.len().min(cap);
     while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
@@ -315,5 +367,46 @@ exit 0"#,
         let output = run_post_tool_hooks(&[note], "repo_read", "the summary", HOOK_TIMEOUT);
         assert!(output.contains("post-ran-ok"), "{output}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notify_hooks_never_gate_and_receive_the_event_name() {
+        let dir = std::env::temp_dir().join(format!("hook-notify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let capture = dir.join("captured.json");
+        // Exits non-zero: notification hooks must not turn that into a
+        // denial the way pre_tool_use does.
+        let hook = script(
+            &dir,
+            "notify.sh",
+            &format!("cat > {}\nexit 7", capture.display()),
+        );
+        let output = run_notify_hooks(
+            &[hook],
+            "subagent_start",
+            serde_json::json!({"agent_type": "explore"}),
+            HOOK_TIMEOUT,
+        );
+        // Non-gating: the caller gets logged output, not a Denied variant —
+        // there is no such variant for this call at all, which is the point.
+        let _ = output;
+        let captured = std::fs::read_to_string(capture).expect("captured");
+        let value: serde_json::Value = serde_json::from_str(&captured).expect("json");
+        assert_eq!(value["event"], "subagent_start");
+        assert_eq!(value["agent_type"], "explore");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_settings_reads_the_new_notification_hook_keys() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"hooks": {"session_start": ["a"], "subagent_start": ["b"], "subagent_stop": ["c"]}}"#,
+        )
+        .expect("json");
+        let hooks = HooksConfig::parse(&value).expect("hooks");
+        assert_eq!(hooks.session_start, vec!["a".to_owned()]);
+        assert_eq!(hooks.subagent_start, vec!["b".to_owned()]);
+        assert_eq!(hooks.subagent_stop, vec!["c".to_owned()]);
+        assert!(!hooks.is_empty());
     }
 }

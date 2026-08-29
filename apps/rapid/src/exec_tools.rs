@@ -1838,7 +1838,28 @@ impl WorkspaceTools {
                 )),
             });
         };
-        match runner.run(&args.prompt, &args.agent_type) {
+        if !self.hooks.subagent_start.is_empty() {
+            let _ = crate::hooks::run_notify_hooks(
+                &self.hooks.subagent_start,
+                "subagent_start",
+                serde_json::json!({"agent_type": args.agent_type}),
+                crate::hooks::HOOK_TIMEOUT,
+            );
+        }
+        let outcome = runner.run(&args.prompt, &args.agent_type);
+        if !self.hooks.subagent_stop.is_empty() {
+            let (status, ok) = match &outcome {
+                Ok(report) => (report.status.clone(), true),
+                Err(_) => ("failed".to_owned(), false),
+            };
+            let _ = crate::hooks::run_notify_hooks(
+                &self.hooks.subagent_stop,
+                "subagent_stop",
+                serde_json::json!({"agent_type": args.agent_type, "status": status, "ok": ok}),
+                crate::hooks::HOOK_TIMEOUT,
+            );
+        }
+        match outcome {
             Ok(report) => {
                 let body = bounded_text(report.summary.as_bytes(), MAX_SUBAGENT_REPORT_BYTES);
                 let mut header = format!(
