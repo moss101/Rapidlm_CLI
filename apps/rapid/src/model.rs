@@ -287,6 +287,7 @@ impl LiveModelCall for ConfiguredModel<'_> {
             return Err(ModelStepError::Cancelled);
         }
         let request = build_request(self, blocks, input)?;
+        let request_bytes = request_text_bytes(&request);
         // The agent token is checked on entry and exit; the blocking HTTP
         // call itself is bounded by the transport timeout.
         let router_cancel = llm_router::provider::CancellationToken::new();
@@ -298,8 +299,23 @@ impl LiveModelCall for ConfiguredModel<'_> {
         if cancel.is_cancelled() {
             return Err(ModelStepError::Cancelled);
         }
-        fold_stream(&stream)
+        fold_stream(&stream, request_bytes)
     }
+}
+
+/// Total text bytes across a request's messages: the input half of a
+/// client-side token estimate, used only when a provider reports no usage
+/// at all (see [`fold_stream`]).
+fn request_text_bytes(request: &CanonicalModelRequest) -> usize {
+    request
+        .messages()
+        .iter()
+        .flat_map(CanonicalMessage::parts)
+        .map(|part| match part {
+            ContentPart::Text { text } => text.len(),
+            ContentPart::Image { .. } | ContentPart::ImageData { .. } => 0,
+        })
+        .sum()
 }
 
 /// Model selection for the exec path: a configured adapter or the typed
@@ -488,8 +504,19 @@ fn next_request_id() -> Result<ModelRequestId, ModelStepError> {
 
 /// Hard bounds for the replayed tool-exchange history: the newest exchange
 /// is always kept, older ones are dropped wholesale once a bound is hit.
-const MAX_TOOL_HISTORY_EXCHANGES: usize = 12;
-const MAX_TOOL_HISTORY_BYTES: usize = 24 * 1024;
+///
+/// Sized against `DEFAULT_CONTEXT_WINDOW` (32,768 tokens, ~128 KiB of text):
+/// a real multi-file task (read N files, run a test suite a few times, edit)
+/// easily produces a dozen-plus exchanges of a few hundred bytes each. The
+/// previous 12-exchange / 24 KiB budget silently dropped early file reads
+/// out of the replayed history within the first handful of steps — on an
+/// 8-module SWE-repo-fix benchmark the model re-read the same files for all
+/// 32 model steps and committed zero edits, because every earlier read had
+/// already scrolled out of what it was shown. Genuine overflow beyond this
+/// larger budget still recovers correctly via the context-fabric
+/// `compact_packet` path (real semantic summarization, not blind eviction).
+const MAX_TOOL_HISTORY_EXCHANGES: usize = 48;
+const MAX_TOOL_HISTORY_BYTES: usize = 96 * 1024;
 
 fn exchange_wire_bytes(exchange: &agent_runtime::ToolStepExchange) -> usize {
     let calls: usize = exchange
@@ -594,7 +621,10 @@ fn map_provider_error(err: ProviderError) -> ModelStepError {
 /// Fold the collected provider stream into one step output. Text deltas form
 /// the terminal text; tool-call deltas form proposed calls (the tool driver
 /// decides validity downstream).
-fn fold_stream(stream: &ModelStream) -> Result<ModelStepOutput, ModelStepError> {
+fn fold_stream(
+    stream: &ModelStream,
+    request_bytes: usize,
+) -> Result<ModelStepOutput, ModelStepError> {
     let mut text = String::new();
     // call_id -> (tool name, accumulated arguments)
     let mut tools: BTreeMap<String, (String, String)> = BTreeMap::new();
@@ -618,7 +648,28 @@ fn fold_stream(stream: &ModelStream) -> Result<ModelStepOutput, ModelStepError> 
             ModelStreamEvent::Failed { error } => return Err(map_provider_error(error.clone())),
         }
     }
-    let tokens = usage.map(usage_total_tokens).unwrap_or(0);
+    let response_bytes: usize = text.len()
+        + tools
+            .values()
+            .map(|(name, arguments)| name.len() + arguments.len())
+            .sum::<usize>();
+    // Some OpenAI-compatible endpoints ignore `stream_options.include_usage`
+    // entirely (no usage event at all); others send a `usage` object whose
+    // `prompt_tokens`/`completion_tokens` fields are themselves null, which
+    // still resolves to a real `Some(NormalizedUsage)` with nothing inside
+    // it. Either shape ends up here as a resolved total of exactly 0 — and
+    // a real completed exchange never actually costs 0 tokens, so that is
+    // "unreported," not "zero." Reporting the bare 0 is indistinguishable
+    // from a real zero and makes every token-accounting line downstream
+    // useless. Falling back to a byte-derived estimate keeps the field
+    // honestly non-zero for a real exchange; any real reported total > 0
+    // always wins.
+    let reported = usage.map(usage_total_tokens).unwrap_or(0);
+    let tokens = if reported > 0 {
+        reported
+    } else {
+        estimate_tokens(request_bytes + response_bytes)
+    };
     if tools.is_empty() {
         return Ok(ModelStepOutput::Terminal { text, tokens });
     }
@@ -636,6 +687,12 @@ fn usage_total_tokens(usage: &NormalizedUsage) -> u64 {
         .input_tokens()
         .unwrap_or(0)
         .saturating_add(usage.output_tokens().unwrap_or(0))
+}
+
+/// Rough char-count token estimate (~4 bytes/token for English/code text),
+/// used only as a fallback when a provider reports no usage at all.
+fn estimate_tokens(bytes: usize) -> u64 {
+    ((bytes as u64) + 3) / 4
 }
 
 #[cfg(test)]
@@ -844,11 +901,36 @@ mod tests {
                 usage,
             },
         ]);
-        let output = fold_stream(&stream).expect("fold");
+        let output = fold_stream(&stream, 0).expect("fold");
         match output {
             ModelStepOutput::Terminal { text, tokens } => {
                 assert_eq!(text, "hello");
                 assert_eq!(tokens, 18);
+            }
+            other => panic!("expected terminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fold_stream_estimates_tokens_when_the_provider_reports_no_usage_at_all() {
+        // Some OpenAI-compatible endpoints never send a usage event despite
+        // `include_usage: true` in the request. That must not read back as
+        // "0 tokens" (a completed exchange never really costs zero) — it
+        // must fall back to a byte-derived estimate from the request plus
+        // response text, so the field stays honestly non-zero.
+        // No Usage/Completed event at all — the shape a usage-blind
+        // OpenAI-compatible endpoint actually produces.
+        let stream = stream(vec![ModelStreamEvent::TextDelta {
+            text: "a reasonably long response body here".to_owned(),
+        }]);
+        let output = fold_stream(&stream, 400).expect("fold");
+        match output {
+            ModelStepOutput::Terminal { text, tokens } => {
+                assert_eq!(text, "a reasonably long response body here");
+                // 400 request bytes + 37 response bytes = 437 bytes -> ~110
+                // tokens at ~4 bytes/token; must be positive and in the
+                // right order of magnitude, not the old flat 0.
+                assert!(tokens > 50 && tokens < 200, "got {tokens}");
             }
             other => panic!("expected terminal, got {other:?}"),
         }
@@ -873,14 +955,18 @@ mod tests {
                 usage,
             },
         ]);
-        let output = fold_stream(&stream).expect("fold");
+        let output = fold_stream(&stream, 0).expect("fold");
         match output {
             ModelStepOutput::ToolCalls { calls, tokens } => {
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].call_id(), "call-1");
                 assert_eq!(calls[0].tool(), "read-file");
                 assert_eq!(calls[0].arguments(), "{\"path\":\"a.rs\"}");
-                assert_eq!(tokens, 0);
+                // The Completed event carries a NormalizedUsage with both
+                // fields unset — the same "nothing really reported" shape
+                // as no usage event at all — so this falls back to the
+                // byte estimate rather than reading back as a literal 0.
+                assert!(tokens > 0, "got {tokens}");
             }
             other => panic!("expected tool calls, got {other:?}"),
         }
@@ -1085,6 +1171,60 @@ mod tests {
         assert!(
             !part_text(&tool_messages[0].parts()[0]).is_empty(),
             "the fallback part must carry non-empty placeholder text"
+        );
+    }
+
+    fn read_exchange(call_id: &str, summary_len: usize) -> agent_runtime::ToolStepExchange {
+        let pending = vec![
+            ProposedToolCall::new(call_id, "workspace_read", r#"{"path":"f.py"}"#)
+                .expect("proposed call"),
+        ];
+        let prior = vec![ToolStepResult::Succeeded {
+            call_id: call_id.to_owned(),
+            summary: "x".repeat(summary_len),
+        }];
+        agent_runtime::ToolStepExchange::new(pending, prior)
+    }
+
+    #[test]
+    fn kept_history_keeps_many_small_file_reads_within_the_new_budget() {
+        // Reproduces the shape of the hard SWE-repo-fix benchmark: reading
+        // ~9 modest files (a few hundred bytes each) across many exchanges
+        // must not scroll the earliest reads out of context before the
+        // model has seen them all. Total well under MAX_TOOL_HISTORY_BYTES
+        // and MAX_TOOL_HISTORY_EXCHANGES.
+        let history: Vec<_> = (0..20)
+            .map(|i| read_exchange(&format!("c{i}"), 800))
+            .collect();
+        let kept = kept_history(&history);
+        assert_eq!(
+            kept.len(),
+            20,
+            "20 exchanges of ~800 bytes each (~16 KiB) must all survive under the new budget"
+        );
+    }
+
+    #[test]
+    fn kept_history_still_prunes_oldest_once_the_byte_budget_is_exceeded() {
+        // The safety valve itself must still function: once the replayed
+        // history would exceed MAX_TOOL_HISTORY_BYTES, the oldest exchanges
+        // are dropped wholesale and the newest is always kept.
+        let big = MAX_TOOL_HISTORY_BYTES / 3 + 1024;
+        let history = vec![
+            read_exchange("c0", big),
+            read_exchange("c1", big),
+            read_exchange("c2", big),
+            read_exchange("c3", big),
+        ];
+        let kept = kept_history(&history);
+        assert!(
+            kept.len() < history.len(),
+            "an oversized history must still be pruned, not replayed in full"
+        );
+        assert_eq!(
+            kept.last().unwrap().calls()[0].call_id(),
+            "c3",
+            "the newest exchange is always kept"
         );
     }
 

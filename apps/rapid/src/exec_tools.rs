@@ -893,14 +893,29 @@ impl WorkspaceTools {
             WEB_FETCH_TOOL => self.execute_web_fetch(call, cancel),
             ASK_USER_TOOL => self.execute_ask_user(call, cancel),
             other if other.starts_with("mcp__") => self.execute_mcp_tool(call, cancel),
-            other => Ok(ToolStepResult::Failed {
-                call_id: call.call_id().to_owned(),
-                handled: true,
-                detail: Some(bounded_detail(&format!(
-                    "unknown tool `{other}`: it is not part of this session's tool surface; \
-use one of the tool names given in the tool surface"
-                ))),
-            }),
+            other => {
+                // Name the valid tools inline rather than pointing back at
+                // "the tool surface": a model that has already hallucinated
+                // one name is the model most likely to do it again, and the
+                // structured tool schemas sent with the request are easy to
+                // lose track of turn over turn. Spelling the real names out
+                // in the failure itself is the cheapest self-correction
+                // signal available at the point it is needed.
+                let surface = self.tool_surface();
+                let mut names: Vec<&str> = surface.iter().map(ToolSurface::name).collect();
+                names.sort_unstable();
+                Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    // Kept compact against MAX_RESULT_DETAIL_BYTES (256): a
+                    // wordy prefix once left the last few names (including
+                    // workspace_read/workspace_write) truncated off the end.
+                    detail: Some(bounded_detail(&format!(
+                        "unknown tool `{other}`; real tools are: {}",
+                        names.join(", ")
+                    ))),
+                })
+            }
         }?;
         // Post-tool-use hooks observe the completed call; their output is
         // recorded on the result the model sees.
@@ -3478,7 +3493,17 @@ use std::sync::{Arc, Mutex};
         match result {
             ToolStepResult::Failed { handled, detail, .. } => {
                 assert!(handled);
-                assert!(detail.unwrap().contains("unknown tool `mcp.call`"));
+                let detail = detail.unwrap();
+                assert!(detail.contains("unknown tool `mcp.call`"));
+                // A model that has already hallucinated one name is the
+                // model most likely to do it again; the real tool names
+                // must be spelled out right here, not just "see the tool
+                // surface", so the next attempt has something concrete to
+                // correct against.
+                assert!(
+                    detail.contains(WORKSPACE_WRITE_TOOL) && detail.contains(WORKSPACE_READ_TOOL),
+                    "detail must name real tools: {detail}"
+                );
             }
             other => panic!("expected handled failure, got {other:?}"),
         }
