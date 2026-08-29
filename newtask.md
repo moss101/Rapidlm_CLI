@@ -20,6 +20,39 @@
 
 ---
 
+## 0a. Meta-finding from this implementation pass (read this before Phase 2 especially)
+
+Nearly every gap this pass actually investigated in depth turned out to be smaller than written, for
+the same underlying reason: **this codebase already contains mature, well-tested implementations of
+most of the sophisticated primitives Phase 2 asks for — they are simply not wired into the exec loop
+`apps/rapid` actually runs.** This is the exact same shape as the context-engine finding from commit
+`687c745` (~92% of that crate was built and tested but unreachable from `rapid exec`), and it recurred
+repeatedly during this pass:
+
+- `crates/sandbox` — a full tiered `SandboxManager`/`SandboxBackend` system (HostRestricted/Container/
+  Gvisor/RemoteWorker, ~11,400 lines) exists; `apps/rapid` doesn't depend on the crate at all (§1.1).
+- `crates/capability-broker` — a complete `CapabilityLease`/policy/approval system exists (used
+  correctly in test fixtures across several crates); no production code path in the whole repo mints a
+  real lease today, confirmed while scoping §1.1's second correction.
+- `crates/llm-router` — real per-request cost (`UsageCost::Reported`) and a full `ModelCatalog` with
+  pricing/latency/context-limits already exist; the value is computed then dropped at one specific
+  `apps/rapid` boundary before ever reaching the CLI (§1.5 row 17 correction).
+- `crates/kernel::turn::guard::TurnSubmissionGuard` — exclusive per-session turn occupancy with
+  optimistic `expected_seq` conflict detection already exists (165 kernel tests pass) — this is
+  substantially what Phase 2 §2.6 (`SessionLease` + fencing) asks for. Not independently re-verified
+  whether it's actually exercised by `apps/rapid`'s `resume`/`fork` paths, or only by kernel's own tests.
+- `crates/security::scanners::secrets::FindingFingerprint` — a stable content-hash identity (digest
+  over rule/path/range/match) for one `Finding` type already exists — substantially what Phase 2 §2.9
+  (persisted, content-hash-keyed findings) asks for, at least for secrets scanning specifically.
+
+**Practical consequence for whoever picks up a Phase 2 item below: spend 15 minutes grepping for the
+primitive before writing new code.** The likely real task is "wire crate X into `apps/rapid`," not
+"build X" — a smaller, safer, and differently-shaped piece of work than the item's original prose
+describes. Phase 2 §2.1–§2.10 below were written before this pattern was discovered mid-pass and were
+not individually re-audited against source with the same rigor as the Phase 1 corrections above (§2.6
+and §2.9 got a quick spot-check, noted inline; §2.2–§2.5, §2.7, §2.8's `RouterDecisionRecord` half, and
+§2.10 did not). Treat every remaining Phase 2/3 row as a hypothesis to verify, not a confirmed gap.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
