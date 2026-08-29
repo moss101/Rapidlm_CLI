@@ -564,6 +564,7 @@ mod tests {
             outputs: vec![Ok(ModelStepOutput::Terminal {
                 text: text.to_owned(),
                 tokens: 1,
+                cost_usd_micros: None,
             })]
             .into(),
         }
@@ -738,6 +739,7 @@ mod tests {
                 Ok(ModelStepOutput::Terminal {
                     text: text.into(),
                     tokens: 1,
+                    cost_usd_micros: None,
                 }),
             ]
             .into(),
@@ -832,6 +834,7 @@ mod tests {
                 Ok(ModelStepOutput::ToolCalls {
                     calls: vec![ProposedToolCall::new("c1", "repo.read", "{}").expect("call")],
                     tokens: 1,
+                    cost_usd_micros: None,
                 }),
                 Err(ModelStepError::BoundExceeded),
             ]
@@ -974,6 +977,7 @@ mod tests {
                     ProposedToolCall::new("c2", "repo.search", "{}").expect("c2"),
                 ],
                 tokens: 1,
+                cost_usd_micros: None,
             })]
             .into(),
         };

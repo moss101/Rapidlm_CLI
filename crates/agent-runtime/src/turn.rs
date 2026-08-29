@@ -305,15 +305,24 @@ impl<'a> ModelStepInput<'a> {
 }
 
 /// Machine-controlled model output. Text cannot mark the turn complete.
+///
+/// `cost_usd_micros` is the provider-reported dollar cost of this step, in
+/// millionths of a US dollar (integer, avoids float rounding), when the
+/// backing model-invoker can report one. `None` means "unknown," never
+/// "free" — most `ModelDriver`/harness implementations (scripted test
+/// doubles, non-live drivers) have no real cost to report and should pass
+/// `None`, not `Some(0)`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ModelStepOutput {
     Terminal {
         text: String,
         tokens: u64,
+        cost_usd_micros: Option<u64>,
     },
     ToolCalls {
         calls: Vec<ProposedToolCall>,
         tokens: u64,
+        cost_usd_micros: Option<u64>,
     },
 }
 
@@ -1119,7 +1128,7 @@ where
     }
 
     let tokens = match &output {
-        ModelStepOutput::Terminal { text, tokens } => {
+        ModelStepOutput::Terminal { text, tokens, .. } => {
             if text.len() > MAX_TEXT_BYTES {
                 emit(
                     events,
@@ -1136,7 +1145,7 @@ where
             }
             *tokens
         }
-        ModelStepOutput::ToolCalls { calls, tokens } => {
+        ModelStepOutput::ToolCalls { calls, tokens, .. } => {
             if calls.len() > MAX_TOOL_CALLS_PER_STEP {
                 emit(
                     events,
@@ -1902,6 +1911,7 @@ mod tests {
         Ok(ModelStepOutput::Terminal {
             text: text.to_owned(),
             tokens,
+            cost_usd_micros: None,
         })
     }
 
@@ -1909,7 +1919,11 @@ mod tests {
         calls: Vec<ProposedToolCall>,
         tokens: u64,
     ) -> Result<ModelStepOutput, ModelStepError> {
-        Ok(ModelStepOutput::ToolCalls { calls, tokens })
+        Ok(ModelStepOutput::ToolCalls {
+            calls,
+            tokens,
+            cost_usd_micros: None,
+        })
     }
 
     fn call(id: &str, tool: &str) -> ProposedToolCall {
@@ -2067,6 +2081,7 @@ mod tests {
                 Ok(ModelStepOutput::Terminal {
                     text: "done".to_owned(),
                     tokens: 1,
+                    cost_usd_micros: None,
                 })
             }
         }
@@ -2573,12 +2588,14 @@ mod tests {
                     return Ok(ModelStepOutput::Terminal {
                         text: "noticed the job".to_owned(),
                         tokens: 1,
+                        cost_usd_micros: None,
                     });
                 }
                 Ok(ModelStepOutput::ToolCalls {
                     calls: vec![ProposedToolCall::new("bg", "background_jobs", "{}")
                         .expect("call")],
                     tokens: 1,
+                    cost_usd_micros: None,
                 })
             }
         }

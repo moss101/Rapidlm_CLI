@@ -903,6 +903,15 @@ fn describe_turn_failure(
     }
 }
 
+/// Render micro-USD (millionths of a dollar, `ExecOutcome::cost_usd_micros`'s
+/// unit — integer to avoid float rounding in the accounting path) as a
+/// human-readable dollar figure for stderr/summary text. Six decimal places:
+/// real per-turn costs for a single exec are often sub-cent, and rounding to
+/// 2 decimals would silently read every one of them as "$0.00".
+fn format_usd_micros(usd_micros: u64) -> String {
+    format!("${:.6}", usd_micros as f64 / 1_000_000.0)
+}
+
 /// Whether a finished turn counts as an effective success even when its
 /// terminal status isn't `Succeeded`: a turn that committed at least one
 /// tool call and whose only defect is an empty final model response is a
@@ -1215,6 +1224,7 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             status: outcome.result.status().as_str().to_owned(),
             tool_calls: outcome.tool_calls,
             tokens: outcome.tokens,
+            cost_usd_micros: outcome.cost_usd_micros,
             stop_reason: outcome.stop_reason.map(|reason| reason.as_str().to_owned()),
         })
     }
@@ -1632,7 +1642,11 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     ) {
         Ok(outcome) if outcome.result.status() == AgentTerminalStatus::Succeeded => {
             println!("{}", outcome.result.summary());
-            crate::exec_diag::stderr_line(&format!("tokens used: {}", outcome.tokens));
+            let mut line = format!("tokens used: {}", outcome.tokens);
+            if let Some(cost_usd_micros) = outcome.cost_usd_micros {
+                line.push_str(&format!(" ({})", format_usd_micros(cost_usd_micros)));
+            }
+            crate::exec_diag::stderr_line(&line);
             Ok(0)
         }
         Ok(outcome) => {

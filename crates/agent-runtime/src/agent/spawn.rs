@@ -1033,6 +1033,7 @@ mod tests {
             Ok(ModelStepOutput::Terminal {
                 text: "ok".to_owned(),
                 tokens: 1,
+                cost_usd_micros: None,
             })
         }
     }
@@ -1050,6 +1051,7 @@ mod tests {
             Ok(ModelStepOutput::Terminal {
                 text: "ok".to_owned(),
                 tokens: 1,
+                cost_usd_micros: None,
             })
         }
     }

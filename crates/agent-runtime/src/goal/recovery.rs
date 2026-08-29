@@ -398,6 +398,7 @@ mod tests {
         let mut model = ScriptedModel::new(vec![Ok(ModelStepOutput::Terminal {
             text: "should not run until resume".to_owned(),
             tokens: 1,
+            cost_usd_micros: None,
         })]);
         let mut tools = ScriptedTools;
         let mut events = Vec::new();

@@ -674,8 +674,19 @@ fn fold_stream(
     } else {
         estimate_tokens(request_bytes + response_bytes)
     };
+    // Unlike tokens, cost has no honest fallback estimate: a byte-derived
+    // guess at token count is a reasonable proxy for token count, but
+    // guessing a dollar figure without the provider's own catalog pricing
+    // (not available at this call site) would be fabricating a number, not
+    // estimating one. `None` means "unknown," never "free" or "zero" — see
+    // `ModelStepOutput`'s own doc comment.
+    let cost_usd_micros = usage.and_then(usage_cost_micros);
     if tools.is_empty() {
-        return Ok(ModelStepOutput::Terminal { text, tokens });
+        return Ok(ModelStepOutput::Terminal {
+            text,
+            tokens,
+            cost_usd_micros,
+        });
     }
     let calls = tools
         .into_iter()
@@ -683,7 +694,20 @@ fn fold_stream(
             ProposedToolCall::new(call_id, tool, arguments).map_err(|_| ModelStepError::Failed)
         })
         .collect::<Result<Vec<_>, ModelStepError>>()?;
-    Ok(ModelStepOutput::ToolCalls { calls, tokens })
+    Ok(ModelStepOutput::ToolCalls {
+        calls,
+        tokens,
+        cost_usd_micros,
+    })
+}
+
+/// Real provider-reported cost only — see `fold_stream`'s cost_usd_micros
+/// comment for why there's no estimate fallback the way tokens has one.
+fn usage_cost_micros(usage: &NormalizedUsage) -> Option<u64> {
+    match usage.cost() {
+        llm_router::provider::UsageCost::Reported { usd_micros } => Some(usd_micros),
+        llm_router::provider::UsageCost::Unknown => None,
+    }
 }
 
 fn usage_total_tokens(usage: &NormalizedUsage) -> u64 {
@@ -882,6 +906,49 @@ mod tests {
     }
 
     #[test]
+    fn fold_stream_carries_a_real_reported_cost_and_none_when_unreported() {
+        let usage = NormalizedUsage::new(
+            Some(11),
+            None,
+            None,
+            Some(7),
+            None,
+            None,
+            UsageCost::Reported { usd_micros: 555 },
+        );
+        let reported_stream = stream(vec![
+            ModelStreamEvent::TextDelta {
+                text: "hi".to_owned(),
+            },
+            ModelStreamEvent::Completed {
+                finish: FinishReason::Stop,
+                usage,
+            },
+        ]);
+        match fold_stream(&reported_stream, 0).expect("fold") {
+            ModelStepOutput::Terminal { cost_usd_micros, .. } => {
+                assert_eq!(cost_usd_micros, Some(555));
+            }
+            other => panic!("expected terminal, got {other:?}"),
+        }
+
+        // UsageCost::Unknown (the default when a provider reports no cost
+        // figure at all) must come out None, never a fabricated Some(0).
+        let unknown_usage =
+            NormalizedUsage::new(Some(1), None, None, Some(1), None, None, UsageCost::Unknown);
+        let unreported_stream = stream(vec![ModelStreamEvent::Completed {
+            finish: FinishReason::Stop,
+            usage: unknown_usage,
+        }]);
+        match fold_stream(&unreported_stream, 0).expect("fold") {
+            ModelStepOutput::Terminal { cost_usd_micros, .. } => {
+                assert_eq!(cost_usd_micros, None);
+            }
+            other => panic!("expected terminal, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn fold_stream_collects_text_and_usage_tokens() {
         let usage = NormalizedUsage::new(
             Some(11),
@@ -907,7 +974,7 @@ mod tests {
         ]);
         let output = fold_stream(&stream, 0).expect("fold");
         match output {
-            ModelStepOutput::Terminal { text, tokens } => {
+            ModelStepOutput::Terminal { text, tokens, .. } => {
                 assert_eq!(text, "hello");
                 assert_eq!(tokens, 18);
             }
@@ -929,7 +996,7 @@ mod tests {
         }]);
         let output = fold_stream(&stream, 400).expect("fold");
         match output {
-            ModelStepOutput::Terminal { text, tokens } => {
+            ModelStepOutput::Terminal { text, tokens, .. } => {
                 assert_eq!(text, "a reasonably long response body here");
                 // 400 request bytes + 37 response bytes = 437 bytes -> ~110
                 // tokens at ~4 bytes/token; must be positive and in the
@@ -961,7 +1028,7 @@ mod tests {
         ]);
         let output = fold_stream(&stream, 0).expect("fold");
         match output {
-            ModelStepOutput::ToolCalls { calls, tokens } => {
+            ModelStepOutput::ToolCalls { calls, tokens, .. } => {
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].call_id(), "call-1");
                 assert_eq!(calls[0].tool(), "read-file");

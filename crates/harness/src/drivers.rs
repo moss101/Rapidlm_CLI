@@ -41,6 +41,7 @@ impl ScriptedModel {
                 let out = ModelStepOutput::Terminal {
                     text: text.clone(),
                     tokens: *tokens,
+                    cost_usd_micros: None,
                 };
                 self.steps.remove(0);
                 Ok(out)
@@ -162,13 +163,15 @@ mod tests {
             out,
             ModelStepOutput::Terminal {
                 text: "first".into(),
-                tokens: 5
+                tokens: 5,
+                cost_usd_micros: None,
             }
         );
         let out = model.step(&input, &cancel).expect("step 2");
         assert_eq!(out, ModelStepOutput::Terminal {
             text: "second".into(),
-            tokens: 7
+            tokens: 7,
+            cost_usd_micros: None,
         });
         // Exhausted script fails closed with BoundExceeded.
         assert_eq!(model.step(&input, &cancel), Err(ModelStepError::BoundExceeded));

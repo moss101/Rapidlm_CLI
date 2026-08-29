@@ -1008,6 +1008,7 @@ mod tests {
         Ok(ModelStepOutput::Terminal {
             text: text.to_owned(),
             tokens,
+            cost_usd_micros: None,
         })
     }
 
@@ -1015,7 +1016,11 @@ mod tests {
         calls: Vec<ProposedToolCall>,
         tokens: u64,
     ) -> Result<ModelStepOutput, ModelStepError> {
-        Ok(ModelStepOutput::ToolCalls { calls, tokens })
+        Ok(ModelStepOutput::ToolCalls {
+            calls,
+            tokens,
+            cost_usd_micros: None,
+        })
     }
 
     fn call(id: &str, tool: &str) -> ProposedToolCall {

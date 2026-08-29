@@ -148,7 +148,7 @@ fn configured_model_step_reaches_loopback_openai_server() {
         )
         .expect("step");
     match output {
-        ModelStepOutput::Terminal { text, tokens } => {
+        ModelStepOutput::Terminal { text, tokens, .. } => {
             assert_eq!(text, "hello from scripted model");
             assert_eq!(tokens, 8);
         }
@@ -178,7 +178,7 @@ fn configured_model_step_parses_sse_stream() {
         )
         .expect("step");
     match output {
-        ModelStepOutput::Terminal { text, tokens } => {
+        ModelStepOutput::Terminal { text, tokens, .. } => {
             assert_eq!(text, "hello");
             assert_eq!(tokens, 4);
         }
@@ -249,7 +249,7 @@ fn anthropic_provider_builds_and_reaches_the_loopback_server() {
         )
         .expect("step");
     match output {
-        ModelStepOutput::Terminal { text, tokens } => {
+        ModelStepOutput::Terminal { text, tokens, .. } => {
             assert_eq!(text, "bonjour");
             assert_eq!(tokens, 6);
         }

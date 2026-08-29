@@ -634,7 +634,45 @@ fn retry_base_ms() -> u64 {
 struct SupervisedModel<B> {
     inner: B,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    cost: CostAccumulator,
     diag: Option<StepDiag>,
+}
+
+/// Sums every step's `cost_usd_micros`, distinguishing "no step ever
+/// reported a real cost" (`total()` returns `None`, same as
+/// `ModelStepOutput`'s own field) from "the reported total happens to be
+/// zero." A plain `Arc<AtomicU64>` alone can't make that distinction, and
+/// `None` here must never silently read back as `Some(0)`.
+#[derive(Clone)]
+struct CostAccumulator {
+    sum_usd_micros: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    any_reported: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CostAccumulator {
+    fn new() -> Self {
+        Self {
+            sum_usd_micros: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            any_reported: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn add(&self, cost_usd_micros: Option<u64>) {
+        if let Some(cost) = cost_usd_micros {
+            self.sum_usd_micros
+                .fetch_add(cost, std::sync::atomic::Ordering::Relaxed);
+            self.any_reported
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn total(&self) -> Option<u64> {
+        if self.any_reported.load(std::sync::atomic::Ordering::Relaxed) {
+            Some(self.sum_usd_micros.load(std::sync::atomic::Ordering::Relaxed))
+        } else {
+            None
+        }
+    }
 }
 
 impl<B> SupervisedModel<B> {
@@ -757,17 +795,27 @@ impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
                     self.diag_attempt(attempt, "failed:unspecified", 0);
                     return result;
                 }
-                Ok(ModelStepOutput::ToolCalls { tokens, .. }) => {
+                Ok(ModelStepOutput::ToolCalls {
+                    tokens,
+                    cost_usd_micros,
+                    ..
+                }) => {
                     let tokens = *tokens;
                     self.counter
                         .fetch_add(tokens, std::sync::atomic::Ordering::Relaxed);
+                    self.cost.add(*cost_usd_micros);
                     self.diag_attempt(attempt, "ok", tokens);
                     return result;
                 }
-                Ok(ModelStepOutput::Terminal { text, tokens }) => {
+                Ok(ModelStepOutput::Terminal {
+                    text,
+                    tokens,
+                    cost_usd_micros,
+                }) => {
                     let tokens = *tokens;
                     self.counter
                         .fetch_add(tokens, std::sync::atomic::Ordering::Relaxed);
+                    self.cost.add(*cost_usd_micros);
                     // An empty terminal response is a provider-side transient
                     // (the provider billed the request but returned nothing):
                     // retry under the same bounded backoff instead of failing
@@ -975,8 +1023,10 @@ fn sleep_millis_cancellable(cancel: &CancellationToken, wait_ms: u64) -> bool {
 /// What one `exec`/`goal` turn produced: the canonical result, the
 /// provider-classified failure cause (when the turn failed on a model step),
 /// the failing-tool detail (when the turn stopped on a tool failure), the
-/// typed stop reason and tool-call count (for exit-code decisions), and the
-/// provider-reported token total.
+/// typed stop reason and tool-call count (for exit-code decisions), the
+/// provider-reported token total, and the provider-reported dollar cost
+/// (summed in micro-USD across every model step; `None` when no step ever
+/// reported one — see `CostAccumulator`, never conflated with a real zero).
 #[derive(Clone, Debug)]
 pub struct ExecOutcome {
     pub result: AgentResult,
@@ -985,6 +1035,7 @@ pub struct ExecOutcome {
     pub stop_reason: Option<TurnStopReason>,
     pub tool_calls: u32,
     pub tokens: u64,
+    pub cost_usd_micros: Option<u64>,
 }
 
 /// Production entry used by the CLI `exec`/`goal` command: build the
@@ -1009,21 +1060,27 @@ where
     E: TurnEventSink,
 {
     let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let cost = CostAccumulator::new();
     let turn_diag = diag.clone();
     let supervised = SupervisedModel {
         inner: backing,
         counter: std::sync::Arc::clone(&counter),
+        cost: cost.clone(),
         diag,
     };
     let mut host = LiveContextHost::build(preserved, supervised, policy)
         .map_err(|_| AgentExecutionError::InvalidRequest)?;
     let outcome = host.execute(request, tools, events, cancel)?;
     let tokens = counter.load(std::sync::atomic::Ordering::Relaxed);
+    let cost_usd_micros = cost.total();
     if let Some(diag) = turn_diag {
         let mut line = format!(
             "turn outcome={} tokens={tokens}",
             outcome.result.status().as_str()
         );
+        if let Some(cost_usd_micros) = cost_usd_micros {
+            line.push_str(&format!(" cost_usd_micros={cost_usd_micros}"));
+        }
         if let Some(cause) = outcome.failure_cause {
             line.push_str(&format!(" cause={}", cause_tag(cause)));
         } else if let Some(reason) = outcome.stop_reason {
@@ -1038,6 +1095,7 @@ where
         stop_reason: outcome.stop_reason,
         tool_calls: outcome.tool_calls,
         tokens,
+        cost_usd_micros,
     })
 }
 
@@ -1242,7 +1300,11 @@ mod tests {
     }
 
     fn ok_terminal(text: &str) -> Result<ModelStepOutput, ModelStepError> {
-        Ok(ModelStepOutput::Terminal { text: text.to_owned(), tokens: 1 })
+        Ok(ModelStepOutput::Terminal {
+            text: text.to_owned(),
+            tokens: 1,
+            cost_usd_micros: None,
+        })
     }
 
     fn auth_failure() -> Result<ModelStepOutput, ModelStepError> {
@@ -1450,6 +1512,7 @@ mod tests {
             Ok(ModelStepOutput::Terminal {
                 text: text.to_owned(),
                 tokens: 1,
+                cost_usd_micros: None,
             }),
         ])
     }
@@ -1539,6 +1602,7 @@ mod tests {
             ScriptedBacking::new(vec![Ok(ModelStepOutput::Terminal {
                 text: "done".to_owned(),
                 tokens: 1,
+                cost_usd_micros: None,
             })]),
             ContextRetryPolicy::new(2),
         )
@@ -1588,6 +1652,7 @@ mod tests {
                 Ok(ModelStepOutput::ToolCalls {
                     calls: vec![call],
                     tokens: 1,
+                    cost_usd_micros: None,
                 }),
                 Err(ModelStepError::BoundExceeded),
             ]),
@@ -1708,6 +1773,7 @@ mod tests {
         outputs.push(Ok(ModelStepOutput::Terminal {
             text: "after transient blip".to_owned(),
             tokens: 2,
+            cost_usd_micros: None,
         }));
         let backing = ScriptedBacking::new(outputs);
         let witness = backing.clone();
@@ -1785,6 +1851,7 @@ mod tests {
             Ok(ModelStepOutput::Terminal {
                 text: "never reached".to_owned(),
                 tokens: 1,
+                cost_usd_micros: None,
             }),
         ]);
         let witness = backing.clone();
@@ -1822,6 +1889,7 @@ mod tests {
             Ok(ModelStepOutput::Terminal {
                 text: "recovered after rejection".to_owned(),
                 tokens: 1,
+                cost_usd_micros: None,
             }),
         ]);
         let witness = backing.clone();
@@ -1849,14 +1917,17 @@ mod tests {
             Ok(ModelStepOutput::Terminal {
                 text: String::new(),
                 tokens: 1,
+                cost_usd_micros: None,
             }),
             Ok(ModelStepOutput::Terminal {
                 text: String::new(),
                 tokens: 1,
+                cost_usd_micros: None,
             }),
             Ok(ModelStepOutput::Terminal {
                 text: "finally non-empty".to_owned(),
                 tokens: 1,
+                cost_usd_micros: None,
             }),
         ]);
         let witness = backing.clone();
@@ -1891,6 +1962,7 @@ mod tests {
             Ok(ModelStepOutput::Terminal {
                 text: String::new(),
                 tokens: 1,
+                cost_usd_micros: None,
             })
         };
         let mut outputs = Vec::new();
@@ -1935,6 +2007,7 @@ mod tests {
             Ok(ModelStepOutput::Terminal {
                 text: "recovered after reconnect".to_owned(),
                 tokens: 1,
+                cost_usd_micros: None,
             }),
         ]);
         let witness = backing.clone();
@@ -1992,6 +2065,7 @@ mod tests {
             Ok(ModelStepOutput::ToolCalls {
                 calls: vec![call],
                 tokens: 1,
+                cost_usd_micros: None,
             }),
             Err(ModelStepError::ProviderFailed {
                 cause: FailureCause::Transient { retry_after_ms: None },
@@ -1999,6 +2073,7 @@ mod tests {
             Ok(ModelStepOutput::Terminal {
                 text: "recovered after tools".to_owned(),
                 tokens: 2,
+                cost_usd_micros: None,
             }),
         ]);
         let outcome = run_live_exec(
@@ -2070,6 +2145,7 @@ mod tests {
         outputs.push(Ok(ModelStepOutput::Terminal {
             text: "done".to_owned(),
             tokens: 7,
+            cost_usd_micros: None,
         }));
         let backing = ScriptedBacking::new(outputs);
         let (diag, lines) = StepDiag::buffer("https://api.example.com/v1");
@@ -2109,6 +2185,73 @@ mod tests {
             "turn line: {}",
             lines[2]
         );
+    }
+
+    #[test]
+    fn exec_outcome_sums_reported_cost_across_steps_and_diagnoses_it() {
+        let request = AgentExecutionRequest::new(spec(), SessionId::new());
+        let mut events = Vec::new();
+        let outputs = vec![
+            Ok(ModelStepOutput::ToolCalls {
+                calls: vec![ProposedToolCall::new("c1", "repo_read", "{}").expect("call")],
+                tokens: 3,
+                cost_usd_micros: Some(1_200),
+            }),
+            Ok(ModelStepOutput::Terminal {
+                text: "done".to_owned(),
+                tokens: 7,
+                cost_usd_micros: Some(800),
+            }),
+        ];
+        let backing = ScriptedBacking::new(outputs);
+        let (diag, lines) = StepDiag::buffer("https://api.example.com/v1");
+        let outcome = run_live_exec(
+            preserved(),
+            backing,
+            &request,
+            &mut CountingTools { executed: 0 },
+            &mut events,
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            Some(diag),
+        )
+        .expect("execute");
+        assert_eq!(
+            outcome.cost_usd_micros,
+            Some(2_000),
+            "cost sums across every step that reported one"
+        );
+        let lines = lines.borrow().clone();
+        assert!(
+            lines.last().expect("turn line").contains("cost_usd_micros=2000"),
+            "turn summary line should carry the total: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn exec_outcome_cost_stays_none_when_no_step_ever_reports_one() {
+        // None must never read back as "$0" — a provider that never reports
+        // cost is "unknown," not "confirmed free."
+        let request = AgentExecutionRequest::new(spec(), SessionId::new());
+        let mut events = Vec::new();
+        let outputs = vec![Ok(ModelStepOutput::Terminal {
+            text: "done".to_owned(),
+            tokens: 7,
+            cost_usd_micros: None,
+        })];
+        let backing = ScriptedBacking::new(outputs);
+        let outcome = run_live_exec(
+            preserved(),
+            backing,
+            &request,
+            &mut CountingTools { executed: 0 },
+            &mut events,
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+        )
+        .expect("execute");
+        assert_eq!(outcome.cost_usd_micros, None);
     }
 
     #[test]

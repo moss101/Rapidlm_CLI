@@ -507,6 +507,9 @@ pub struct SubagentReport {
     pub status: String,
     pub tool_calls: u32,
     pub tokens: u64,
+    /// Provider-reported dollar cost of the child's run, in micro-USD.
+    /// `None` when no step reported one — see `ExecOutcome::cost_usd_micros`.
+    pub cost_usd_micros: Option<u64>,
     pub stop_reason: Option<String>,
 }
 
@@ -1866,6 +1869,9 @@ impl WorkspaceTools {
                     "subagent ({}) report [status={} tool_calls={} tokens={}",
                     args.agent_type, report.status, report.tool_calls, report.tokens
                 );
+                if let Some(cost_usd_micros) = report.cost_usd_micros {
+                    header.push_str(&format!(" cost_usd_micros={cost_usd_micros}"));
+                }
                 if let Some(reason) = &report.stop_reason {
                     header.push_str(&format!(" stop_reason={reason}"));
                 }
@@ -3404,10 +3410,12 @@ use std::sync::{Arc, Mutex};
                     Ok(ModelStepOutput::ToolCalls {
                         calls: vec![call],
                         tokens: 1,
+                        cost_usd_micros: None,
                     }),
                     Ok(ModelStepOutput::Terminal {
                         text: answer.to_owned(),
                         tokens: 1,
+                        cost_usd_micros: None,
                     }),
                 ]),
             }
@@ -3416,10 +3424,15 @@ use std::sync::{Arc, Mutex};
         fn calls_then_answer(calls: Vec<ProposedToolCall>, answer: &str) -> Self {
             Self {
                 outputs: VecDeque::from(vec![
-                    Ok(ModelStepOutput::ToolCalls { calls, tokens: 1 }),
+                    Ok(ModelStepOutput::ToolCalls {
+                        calls,
+                        tokens: 1,
+                        cost_usd_micros: None,
+                    }),
                     Ok(ModelStepOutput::Terminal {
                         text: answer.to_owned(),
                         tokens: 1,
+                        cost_usd_micros: None,
                     }),
                 ]),
             }
@@ -4919,6 +4932,7 @@ use std::sync::{Arc, Mutex};
                     status: "succeeded".to_owned(),
                     tool_calls: 3,
                     tokens: 512,
+                    cost_usd_micros: None,
                     stop_reason: None,
                 })
             }
@@ -4978,6 +4992,50 @@ use std::sync::{Arc, Mutex};
         let surface: Vec<&str> = surface_owned.iter().map(|name| name.as_str()).collect();
         assert!(!surface.contains(&TASK_SPAWN_TOOL), "depth 1 enforced: {surface:?}");
         assert!(surface.contains(&REPO_READ_TOOL), "reads stay available");
+    }
+
+    #[test]
+    fn task_spawn_report_renders_cost_only_when_reported() {
+        struct CostRunner(Option<u64>);
+        impl crate::exec_tools::SubagentRunner for CostRunner {
+            fn run(&self, _prompt: &str, _agent_type: &str) -> Result<SubagentReport, String> {
+                Ok(SubagentReport {
+                    summary: "done".to_owned(),
+                    status: "succeeded".to_owned(),
+                    tool_calls: 1,
+                    tokens: 10,
+                    cost_usd_micros: self.0,
+                    stop_reason: None,
+                })
+            }
+        }
+
+        // Reported cost: the field shows up in the rendered summary.
+        let root = TempRoot::new("spawn-cost");
+        let mut tools = permissive_workspace(&root.0);
+        tools.subagents = Some(Arc::new(CostRunner(Some(42))) as Arc<dyn SubagentRunner>);
+        let call = make_call("c1", TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
+        let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
+        match tools.execute(&validated, &CancellationToken::new()).expect("e") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("cost_usd_micros=42"), "{summary}");
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+
+        // Unreported cost (None): the field is omitted entirely, never a
+        // fabricated "cost_usd_micros=0" implying a real, known zero cost.
+        let root2 = TempRoot::new("spawn-no-cost");
+        let mut tools2 = permissive_workspace(&root2.0);
+        tools2.subagents = Some(Arc::new(CostRunner(None)) as Arc<dyn SubagentRunner>);
+        let call2 = make_call("c2", TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
+        let validated2 = tools2.validate(&call2, &CancellationToken::new()).expect("v");
+        match tools2.execute(&validated2, &CancellationToken::new()).expect("e") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(!summary.contains("cost_usd_micros"), "{summary}");
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
     }
 
     /// One-shot loopback HTTP fixture: serves `body` then closes.
