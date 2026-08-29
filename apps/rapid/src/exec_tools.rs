@@ -491,7 +491,23 @@ impl Drop for JobRegistry {
 /// from the reference CLIs: types are general-purpose | explore | plan, and
 /// children never get the spawn tool (depth limit 1).
 pub trait SubagentRunner: Send + Sync {
-    fn run(&self, prompt: &str, agent_type: &str) -> Result<String, String>;
+    fn run(&self, prompt: &str, agent_type: &str) -> Result<SubagentReport, String>;
+}
+
+/// Structured result of one `task_spawn` child run. Kept typed across the
+/// trait boundary instead of flattening to text inside the runner, so a test
+/// double can assert on real fields rather than parsed prose, and any future
+/// consumer (a ledger event, per-run cost accounting) has typed data instead
+/// of needing to re-parse rendered text. Deliberately only carries fields
+/// the runtime actually produces today (`ExecOutcome`, `apps/rapid/src/host.rs`)
+/// — no invented "touched files"/"proposed patches" fields nothing populates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubagentReport {
+    pub summary: String,
+    pub status: String,
+    pub tool_calls: u32,
+    pub tokens: u64,
+    pub stop_reason: Option<String>,
 }
 
 /// Bounded tools rooted at one canonical workspace directory, with the
@@ -1824,10 +1840,18 @@ impl WorkspaceTools {
         };
         match runner.run(&args.prompt, &args.agent_type) {
             Ok(report) => {
-                let report = bounded_text(report.as_bytes(), MAX_SUBAGENT_REPORT_BYTES);
+                let body = bounded_text(report.summary.as_bytes(), MAX_SUBAGENT_REPORT_BYTES);
+                let mut header = format!(
+                    "subagent ({}) report [status={} tool_calls={} tokens={}",
+                    args.agent_type, report.status, report.tool_calls, report.tokens
+                );
+                if let Some(reason) = &report.stop_reason {
+                    header.push_str(&format!(" stop_reason={reason}"));
+                }
+                header.push(']');
                 Ok(ToolStepResult::Succeeded {
                     call_id: call.call_id().to_owned(),
-                    summary: format!("subagent ({}) report:\n{}", args.agent_type, report),
+                    summary: format!("{header}:\n{body}"),
                 })
             }
             Err(reason) => Ok(ToolStepResult::Failed {
@@ -4864,12 +4888,18 @@ use std::sync::{Arc, Mutex};
             calls: Arc<StdMutex<Vec<(String, String)>>>,
         }
         impl crate::exec_tools::SubagentRunner for FakeRunner {
-            fn run(&self, prompt: &str, agent_type: &str) -> Result<String, String> {
+            fn run(&self, prompt: &str, agent_type: &str) -> Result<SubagentReport, String> {
                 self.calls
                     .lock()
                     .expect("lock")
                     .push((prompt.to_owned(), agent_type.to_owned()));
-                Ok("child finished the task".to_owned())
+                Ok(SubagentReport {
+                    summary: "child finished the task".to_owned(),
+                    status: "succeeded".to_owned(),
+                    tool_calls: 3,
+                    tokens: 512,
+                    stop_reason: None,
+                })
             }
         }
 
@@ -4891,6 +4921,11 @@ use std::sync::{Arc, Mutex};
             ToolStepResult::Succeeded { summary, .. } => {
                 assert!(summary.contains("subagent (explore)"), "{summary}");
                 assert!(summary.contains("child finished the task"));
+                // The structured fields from SubagentReport reach the
+                // rendered summary, not just the free-text body.
+                assert!(summary.contains("status=succeeded"), "{summary}");
+                assert!(summary.contains("tool_calls=3"), "{summary}");
+                assert!(summary.contains("tokens=512"), "{summary}");
             }
             other => panic!("expected spawn success, got {other:?}"),
         }

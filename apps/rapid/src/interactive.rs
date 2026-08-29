@@ -1006,7 +1006,7 @@ struct LiveSubagentRunner {
 }
 
 impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
-    fn run(&self, prompt: &str, agent_type: &str) -> Result<String, String> {
+    fn run(&self, prompt: &str, agent_type: &str) -> Result<crate::exec_tools::SubagentReport, String> {
         use crate::exec_tools::ExecTools;
         let store = auth::InMemoryCredentialStore::new();
         let model = crate::model::ConfiguredModel::build(&self.active, &store)
@@ -1072,7 +1072,13 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
                 outcome.tool_calls
             ));
         }
-        Ok(summary)
+        Ok(crate::exec_tools::SubagentReport {
+            summary,
+            status: outcome.result.status().as_str().to_owned(),
+            tool_calls: outcome.tool_calls,
+            tokens: outcome.tokens,
+            stop_reason: outcome.stop_reason.map(|reason| reason.as_str().to_owned()),
+        })
     }
 }
 
