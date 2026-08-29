@@ -76,6 +76,25 @@ for Claude; do not assume a fuller list. ⑥ six bundled skills (pdf, docx, pptx
 frontend-design**). ⑦ the orchestrator "ReportFindings review pass" is not evidenced; only the tool schema
 (`verdict: CONFIRMED|PLAUSIBLE`) is.
 
+**Corrections to revision 2 (RapidLM-side, 2026-08-29 audit — the headline table above and "five gaps"
+list below are now substantially wrong):** the commit immediately after this doc's `abe91b0` snapshot was
+titled `ac66e8a Wire the gaps.md parity core into the exec loop`, followed by ~15 more commits that
+implemented most of what this section calls the top five gaps — the doc was never refreshed. Five
+independent code-reading passes on 2026-08-29 (full detail in §18/§19) found: **tool execution is parallel**
+(`std::thread::scope`, per-path write-group locks, 16/step cap — gap 3 is done), **tool results are
+per-call** (one `Tool`-role `CanonicalMessage` per call with its own id — gap 2 is done), **permission
+modes are the same six** with `Tool(glob)` rules and remembered grants, not "binary project trust" — gap 4
+is done, **hooks are real and blocking** for Pre/PostToolUse (not "dry-run only" — though Prompt/Stop
+stages and a typed event enum are still missing), and **tool breadth (gap 1) is much wider** than "2 wired,
+12 cataloged" — read/glob/grep/patch/shell/todo/plan/ask_user/task_spawn/web_fetch/mcp are all live
+(`apps/rapid/src/exec_tools.rs`), leaving gap 5 (prompt/context stack) as the only one of the five still
+accurately open (`PromptContext` now exists but stays 3 sections, not Grok's fuller template renderer).
+The "where RapidLM leads" claims fare worse under the same audit: **post-compaction verification** and
+**multi-provider routing/fallback** are real, tested code with **zero call sites** from the live turn
+loop — orphaned, not shipped; **computer-use breadth** remains genuinely unwired. Only the durability
+claims (ledger-backed sessions, cron quarantine) held up unchanged. Treat every `✗`/gap number above this
+note as unverified until cross-checked against §18/§19's 2026-08-29 status columns.
+
 ---
 
 ## 1. Product shape & distribution
@@ -638,74 +657,97 @@ engineering.
 `✓` has it · `~` partial/machinery-only · `✗` missing. "Parity target" = the union; where the references
 differ, prefer the Grok Build contract (source-available, Rust, Claude-compatible).
 
-| Capability | Claude | Grok Build | RapidLM | Priority |
-|---|---|---|---|---|
-| Read tool (pagination, PDF/images, dedup) | ✓ | ✓ | ✗ | **P0** |
-| Grep/Glob search tools | ✓ | ✓ | ✗ | **P0** |
-| Exact-match edit tool | ✓ | ✓ | ✗ | **P0** |
-| Shell tool (bg, timeouts, output caps) | ✓ | ✓ | ✗ | **P0** |
-| Per-call tool-result messages | ✓ | ✓ | ✗ | **P0** |
-| Parallel tool execution | ✓ | ✓ (locks) | ✗ | **P1** |
-| Permission modes (6) + rules + grants | ✓ | ✓ | ✗ | **P1** |
-| Kernel sandbox + profiles + auto-allow coupling | ~ | ✓ | ~ (unwired) | **P1** |
-| Subagents in-loop (general-purpose/explore/plan) | ✓ | ✓ | ✗ | **P1** |
-| TodoWrite-style task list tool | ✓ | ✓ | ✗ | **P1** |
-| Plan mode (enter/exit, enforced read-only) | ✓ | ✓ | ✗ | **P1** |
-| Hooks in-loop (blocking PreToolUse/Prompt/Stop) | ~ | ✓ | ✗ | **P1** |
-| MCP in-loop (+ OAuth, refresh, caps) | ✓ | ✓ | ~ (CLI only) | **P1** |
-| Skills in-loop (SKILL.md, slash + model-invoked) | ✓ | ✓ | ~ | **P1** |
-| AskUserQuestion cards | ✓ | ✓ | ✗ | **P2** |
-| Dynamic prompt sections / template engine | ✓ | ✓ | ✗ | **P1** |
-| AGENTS.md discovery + `.claude`/`.cursor` compat | ~ | ✓ | ✗ | **P2** |
-| Compaction auto-trigger + pruning + offload | ✓ | ✓ | ~ | **P2** |
-| Memory index (always-loaded + typed records) | ✓ | ✓ | ~ | **P2** |
-| Headless JSON/streaming contract + cost fields | ~ | ✓ | ~ | **P1** |
-| ACP with permission + session-mode methods | ~ | ✓ | ~ (v1/v2) | **P2** |
-| Background notifications into transcript | ✓ | ✓ | ✗ | **P2** |
-| Web search/fetch tools | ✓ | ✓ | ✗ | **P2** |
-| Scheduler/loop tools (model-callable) | ✓ | ✓ | ~ (CLI cron) | **P2** |
-| Goal/evidence in-loop (`update_goal`) | ✗ | ✓ | ~ (CLI only) | **P2** — differentiator |
-| Ledger-durable cron + quarantine | ✗ | ✗ | **✓** | keep |
-| Post-compaction verification | ✗ | ✗ | **✓** | keep |
-| Multi-provider routing/fallback | ✗ | ✗ | **✓** | keep |
-| Computer use (browser/desktop/mobile) | ✗ | ~ (hub crates) | ~ (unwired crates) | differentiator |
-| Media generation tools | ✗ | ✓ | ✗ | P3/optional |
-| REPL tool, Projects RAG, team memory, remote sessions | ✓/~ | ✗/~ | ✗ | P3/optional |
+**Re-audited 2026-08-29 against current HEAD.** This table (and §19) was written against commit `abe91b0`.
+The very next commit after that was literally titled `ac66e8a Wire the gaps.md parity core into the exec
+loop`, followed by ~15 more commits implementing large parts of this checklist and the §19 roadmap — but
+neither table was ever refreshed. Five parallel code-reading passes re-verified every row against the live
+`apps/rapid`/`crates` source (not commit messages). The **"RapidLM (orig.)"** column preserves what this
+doc originally claimed; **"RapidLM (now)"** is the corrected, evidence-grounded verdict. Full evidence
+(file:line citations) is in the audit notes below the table.
+
+| Capability | Claude | Grok Build | RapidLM (orig.) | RapidLM (now) | Priority |
+|---|---|---|---|---|---|
+| Read tool (pagination, PDF/images, dedup) | ✓ | ✓ | ✗ | **~** — pagination/PDF/PNG done, dedup-on-unchanged unwired | **P2** |
+| Grep/Glob search tools | ✓ | ✓ | ✗ | **~** — glob is real Claude-parity; "grep" is literal substring, no regex | **P1** |
+| Exact-match edit tool | ✓ | ✓ | ✗ | **✓** | done |
+| Shell tool (bg, timeouts, output caps) | ✓ | ✓ | ✗ | **✓** | done |
+| Per-call tool-result messages | ✓ | ✓ | ✗ | **✓** | done |
+| Parallel tool execution | ✓ | ✓ (locks) | ✗ | **✓** — `thread::scope`, per-path write-group locks, 16/step cap | done |
+| Permission modes (6) + rules + grants | ✓ | ✓ | ✗ | **✓** | done |
+| Kernel sandbox + profiles + auto-allow coupling | ~ | ✓ | ~ (unwired) | **~ (still unwired)** — separate ad-hoc macOS Seatbelt path, zero coupling to the permission lattice | **P1** |
+| Subagents in-loop (general-purpose/explore/plan) | ✓ | ✓ | ✗ | **✓** — but see §19 item 8 (not background, no resume) | **P1** (residual) |
+| TodoWrite-style task list tool | ✓ | ✓ | ✗ | **✓** | done |
+| Plan mode (enter/exit, enforced read-only) | ✓ | ✓ | ✗ | **✓** — enforced at the permission-lattice level | done |
+| Hooks in-loop (blocking PreToolUse/Prompt/Stop) | ~ | ✓ | ✗ | **~** — Pre/PostToolUse genuinely blocking; Prompt/Stop don't exist; a *separate*, richer 24-variant `HookEvent` enum in `plugin-host` is disconnected, reachable only via a dry-run CLI command | **P1** |
+| MCP in-loop (+ OAuth, refresh, caps) | ✓ | ✓ | ~ (CLI only) | **~** — genuinely mid-turn callable now (no longer "CLI only"); no OAuth, no refresh, stdio-only | **P1** |
+| Skills in-loop (SKILL.md, slash + model-invoked) | ✓ | ✓ | ~ | **~ (unchanged)** — full discover/activate machinery in `plugin-host`, zero references from `apps/rapid` | **P1** |
+| AskUserQuestion cards | ✓ | ✓ | ✗ | **✓** — structured 2-8 option cards; single-question/single-select only (Claude's supports multi-question batching) | **P2** (residual) |
+| Dynamic prompt sections / template engine | ✓ | ✓ | ✗ | **✓** — `PromptContext` (3 conditional sections: environment/trust/token budget) | done |
+| AGENTS.md discovery + `.claude`/`.cursor` compat | ~ | ✓ | ✗ | **✓** — AGENTS.md + CLAUDE.md + `.claude/rules` + `.cursor/rules`, root→cwd hierarchy | done |
+| Compaction auto-trigger + pruning + offload | ✓ | ✓ | ~ | **~ (unchanged)** — a real token-band `CompactionPolicy` exists but is never called; live path only compacts reactively on hard overflow; no pruning, no offload, no `/context` | **P2** |
+| Memory index (always-loaded + typed records) | ✓ | ✓ | ~ | **~ (unchanged)** — still a naive `fs::read_to_string`; the 1,640-line typed `context_engine::memory` module has zero callers | **P2** |
+| Headless JSON/streaming contract + cost fields | ~ | ✓ | ~ | **~ (unchanged)** — `JsonlWriter`/`JsonlRecord` defined but never constructed outside their own tests; `rapid exec` only understands `--verbose`/`--help` | **P1** |
+| ACP with permission + session-mode methods | ~ | ✓ | ~ (v1/v2) | **~ (unchanged)** — `request_permission` is real and wired; both v1 and v2 explicitly return `METHOD_NOT_FOUND` for `session/set_mode` | **P2** |
+| Background notifications into transcript | ✓ | ✓ | ✗ | **✓** — `drain_notifications()` runs at the top of every turn-loop iteration, no polling needed | done |
+| Web search/fetch tools | ✓ | ✓ | ✗ | **~** — `web_fetch` is real and SSRF-guarded (resolves + refuses private/loopback IPs); no `web_search` (search-engine query) tool exists | **P2** |
+| Scheduler/loop tools (model-callable) | ✓ | ✓ | ~ (CLI cron) | **~ (unchanged)** — still only reachable via `rapid cron`, no tool constant | **P2** |
+| Goal/evidence in-loop (`update_goal`) | ✗ | ✓ | ~ (CLI only) | **✗** — no tool constant at all, not even partially reachable mid-turn | **P2** — differentiator |
+| Ledger-durable cron + quarantine | ✗ | ✗ | **✓** | **✓ (confirmed)** | keep |
+| Post-compaction verification | ✗ | ✗ | **✓** | **~ (downgrade)** — the fail-closed verify/evidence machinery in `compact_policy::compact_with_policy` is real and tested but has **zero callers**; the live overflow-recovery path calls raw `compact_packet` directly, bypassing it entirely | fix before claiming "keep" |
+| Multi-provider routing/fallback | ✗ | ✗ | **✓** | **~ (downgrade)** — `llm-router::fallback::FallbackController` (1,468 lines, real retry/backoff/alternates) is re-exported but has **zero call sites**; `apps/rapid/src/model.rs` never imports it | fix before claiming "keep" |
+| Computer use (browser/desktop/mobile) | ✗ | ~ (hub crates) | ~ (unwired crates) | **~ (unchanged)** — still no `ToolDriver` registration, no presence in `exec_tools.rs` | differentiator (unrealized) |
+| Media generation tools | ✗ | ✓ | ✗ | **✗ (confirmed)** | P3/optional |
+| REPL tool, Projects RAG, team memory, remote sessions | ✓/~ | ✗/~ | ✗ | **✗ (confirmed)** | P3/optional |
+
+**The two "downgrades" matter more than the many upgrades.** Both `post-compaction verification` and
+`multi-provider routing/fallback` were the doc's own headline evidence for RapidLM leading *both*
+references (see the executive summary and §6's compaction assessment) — and both turn out to be real,
+tested, orphaned machinery that the live turn loop never calls. That's a materially different risk profile
+than "not built yet": the code exists, is presumably trusted because it's tested, and simply isn't in the
+path that runs. Wiring `compact_with_policy` into `LiveRecoveryController::recover_from_overflow` and
+`FallbackController` into `model.rs`'s provider-call path are both small, well-scoped fixes (the hard part —
+the policy/fallback logic itself — is done) and should be prioritized ahead of new-feature roadmap items.
 
 ---
 
 ## 19. Remediation roadmap (revision 2)
 
-Grok Build source paths are implementation references, cloned at `/Users/mohsin/grokbuild`.
+Grok Build source paths are implementation references, cloned at `/Users/mohsin/grokbuild`. **Status
+column added 2026-08-29** — re-verified against current HEAD; see the audit notes after §18 for the
+methodology. `✓` genuinely wired into the live turn loop, `~` partial/orphaned, `✗` still open.
 
-| # | Item | Sev | Effort | Where it lands | Reference |
-|---|---|---|---|---|---|
-| 1 | `GatewayTool` → `ToolDriver` adapter; per-tool rollout | P0 | M | `apps/rapid/src/exec_tools.rs`, `tool-gateway` | `xai-grok-tools/src/registry/types.rs` (registry + per-tool metadata pattern) |
-| 2 | `RepoRead` (offset/limit, token cap) + `RepoSearch` (rg flags, head_limit/offset) | P0 | M | `context-engine::read`, new search driver | `xai-grok-tools/.../read_file`, `.../grep` (bounds in §2) |
-| 3 | Per-call tool-result messages in canonical stream | P0 | S–M | `apps/rapid/src/model.rs`, `llm-router` | `xai-grok-sampling-types/src/conversation.rs` `ToolResultItem` |
-| 4 | `WorkspacePatch` exact-match edit | P1 | S | new driver on `workspace` | `xai-grok-tools/.../search_replace` (must-differ, `replace_all`, unicode fallback) |
-| 5 | Parallel dispatch + per-path write locks | P1 | M | `agent-runtime::turn` | `xai-grok-shell/src/session/acp_session_impl/{tool_calls,tool_dispatch}.rs` |
-| 6 | Permission lattice: 6 modes, `Tool(glob)` rules, remembered grants, read-only auto-allow | P1 | L | capability-broker, exec + TUI | `xai-grok-workspace/src/permission/` (manager, rules, prompter, claude_settings) |
-| 7 | Sandbox profiles + approval coupling | P1 | M | `sandbox`, process-supervisor | `xai-grok-sandbox` (profiles.rs, auto-allow keying) |
-| 8 | Subagents in-loop; adopt general-purpose/explore/plan names; bg default; resume; depth 1 | P1 | M | agent-pool, tool-gateway | task tool + `xai-grok-subagent-resolution` |
-| 9 | MCP in-loop: meta-tools + 20 KB cap + never-dials refresh | P1 | M | `mcp` + ToolDriver | `xai-grok-mcp` (search_tool/use_tool), Claude `RefreshMcpTools` contract |
-| 10 | Hooks in-loop: event enum + blocking semantics | P1 | M | plugin-host + agent-runtime | `xai-grok-hooks/src/event.rs` (15 events) |
-| 11 | Prompt template engine + PromptContext (env/trust/token/cause sections; subagent variant; post-compact short prompt) | P1 | M | new module beside `reminders.rs` | `xai-grok-agent/src/prompt/` + `templates/prompt.md` |
-| 12 | AGENTS.md/rules discovery + `.claude`/`.cursor` compat paths | P2 | S | rules_loader | `xai-grok-agent/src/prompt/agents_md.rs`, `compat.rs` |
-| 13 | Compaction: auto-trigger %, keep-last-N tool-result pruning, segment offload, `/context` breakdown | P2 | M | `context-engine::compact` | `xai-grok-compaction`, `xai-compaction-transcript` |
-| 14 | Plan mode + todo tool + question cards in TUI | P2 | M | tui, agent-runtime | plan_mode.rs (plan-file-only gate), todo tool, ask_user_question |
-| 15 | Memory index: always-loaded bounded pointer + typed records + origin-keyed workspace memory | P2 | S | `context-engine::memory` | `xai-grok-memory`, Claude 4-type frontmatter |
-| 16 | Headless contract: `--output-format json|streaming-json(+messages)`, `--allow/--deny`, `--max-turns`, usage/cost fields | P1 | M | headless | `xai-grok-pager/src/headless/cli.rs` |
-| 17 | ACP: `request_permission` + session modes | P2 | M | `acp` | `xai-grok-shell/src/agent/mvp_agent/acp_agent.rs` |
-| 18 | `update_goal` + `EvidenceRecord` in-loop (model cites verification) | P2 | S | goal_host adapter | Grok `update_goal`; RapidLM ledger gate is the deeper base |
-| 19 | SDK-style tool-schema artifact export | P2 | S | `tool-gateway::schema` | `xai-grok-tools-api` (protobuf), Claude `sdk-tools.d.ts` |
-| 20 | Model catalog file (context windows, effort menus) feeding compaction + router | P2 | S | `llm-router::catalog` | `xai-grok-models/default_models.json` |
+| # | Item | Sev | Effort | Status (2026-08-29) |
+|---|---|---|---|---|
+| 1 | `GatewayTool` → `ToolDriver` adapter; per-tool rollout | P0 | M | **✓** — `ToolDriver` implemented by `WorkspaceTools`/`ExecTools`, live-constructed |
+| 2 | `RepoRead` (offset/limit, token cap) + `RepoSearch` (rg flags, head_limit/offset) | P0 | M | **~** — offset/limit real; cap is bytes not tokens; search has no regex/rg flags, literal substring only |
+| 3 | Per-call tool-result messages in canonical stream | P0 | S–M | **✓** |
+| 4 | `WorkspacePatch` exact-match edit | P1 | S | **✓** — must-differ + `replace_all` both enforced |
+| 5 | Parallel dispatch + per-path write locks | P1 | M | **✓** — `thread::scope`, per-path write-group keys, 16/step cap |
+| 6 | Permission lattice: 6 modes, `Tool(glob)` rules, remembered grants, read-only auto-allow | P1 | L | **✓** — including read-only tools auto-allowed before mode/grants are consulted |
+| 7 | Sandbox profiles + approval coupling | P1 | M | **~** — `crates/sandbox` cataloged, only consumed by `rapid doctor`; live `shell_exec` sandboxing is a separate macOS-only Seatbelt path, zero coupling to permissions |
+| 8 | Subagents in-loop; adopt general-purpose/explore/plan names; bg default; resume; depth 1 | P1 | M | **~** — naming/in-loop/depth-1 done; runs **synchronously, blocks the parent turn** (no background default, no resume); `PersistentSpecialist` machinery is unreferenced dead code |
+| 9 | MCP in-loop: meta-tools + 20 KB cap + never-dials refresh | P1 | M | **~** — cap confirmed (20 KiB); no meta-tools (search_tool/use_tool) pattern; `catalog::refresh` exists but is never called |
+| 10 | Hooks in-loop: event enum + blocking semantics | P1 | M | **~** — blocking semantics real for Pre/PostToolUse; the 24-variant typed event enum this item asks for exists in `plugin-host` but is a disconnected system, reachable only via a dry-run CLI test command |
+| 11 | Prompt template engine + PromptContext (env/trust/token/cause sections; subagent variant; post-compact short prompt) | P1 | M | **✓** — `PromptContext` by that exact name, wired for both parent and subagent turns |
+| 12 | AGENTS.md/rules discovery + `.claude`/`.cursor` compat paths | P2 | S | **✓** |
+| 13 | Compaction: auto-trigger %, keep-last-N tool-result pruning, segment offload, `/context` breakdown | P2 | M | **~ (unchanged)** — none of the four sub-items exist in the live path |
+| 14 | Plan mode + todo tool + question cards in TUI | P2 | M | **~** — all three tools are live-wired in the exec loop; zero TUI rendering exists for any of them |
+| 15 | Memory index: always-loaded bounded pointer + typed records + origin-keyed workspace memory | P2 | S | **~ (unchanged)** — still a naive file read; the typed module has zero callers |
+| 16 | Headless contract: `--output-format json\|streaming-json(+messages)`, `--allow/--deny`, `--max-turns`, usage/cost fields | P1 | M | **~ (unchanged)** — the JSONL types exist but nothing outside their own tests constructs them; no flags |
+| 17 | ACP: `request_permission` + session modes | P2 | M | **~ (unchanged)** — permission real; `session/set_mode` explicitly returns `METHOD_NOT_FOUND` in both v1 and v2 |
+| 18 | `update_goal` + `EvidenceRecord` in-loop (model cites verification) | P2 | S | **✗** — no tool constant exists anywhere; goal lifecycle is CLI-only |
+| 19 | SDK-style tool-schema artifact export | P2 | S | **~ leaning ✗** — a versioned, hashed `ToolCatalog` exists but is consumed only internally; no export command or generated artifact |
+| 20 | Model catalog file (context windows, effort menus) feeding compaction + router | P2 | S | **✗** — `llm-router::catalog` is real but models pricing/capability/region, not context-window size; `DEFAULT_CONTEXT_WINDOW` is still one hardcoded constant |
 
-**Sequencing logic (updated):** items 1–3 remain the unlock. Items 4–9 reproduce the core coding loop of
-both references; 6–7 are what make it safe. Items 10–12 make RapidLM extensible the way both references
-are. Items 13–20 are polish and differentiation — and the three `✓ keep` rows (ledger-durable cron,
-post-compaction verification, routing policy) plus computer-use are where RapidLM should aim to *stay*
-ahead rather than converge.
+**Sequencing logic (updated 2026-08-29):** items 1, 3, 4, 5, 6, 11, 12 are now done — the "unlock" and the
+safety layer (6) both landed. What's left clusters into three real categories, not the original 1→20
+priority order: **(a) orphaned machinery** — 7 (sandbox), 9 (MCP refresh/meta-tools), 10 (hook event enum),
+15 (memory), 19 (schema export), and the two §18 "keep" downgrades (post-compaction verification,
+provider fallback) — these are the cheapest wins in the whole document, since the hard logic already
+exists and is tested; only the wiring is missing. **(b) genuinely unbuilt:** 13 (compaction ergonomics), 16
+(headless contract), 17 (ACP session modes), 18 (`update_goal`), 20 (model catalog). **(c) backend-done,
+UI-only:** 14 (plan/todo/question-card TUI rendering) — the exec-loop tools all work headlessly today; only
+the terminal UI surface is missing.
 
 ---
 
