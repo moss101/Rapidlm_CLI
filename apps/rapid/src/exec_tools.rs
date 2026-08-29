@@ -753,7 +753,7 @@ impl WorkspaceTools {
                 }
                 Err(err) => format!("tool {}: error ({})", call.tool(), err.as_str()),
             };
-            eprintln!("{}", bounded_detail(&line));
+            crate::exec_diag::stderr_line(&bounded_detail(&line));
         }
         outcome
     }
@@ -779,7 +779,10 @@ impl WorkspaceTools {
         }
         // Argument re-validation: a known tool with malformed or oversized
         // arguments is a per-call handled failure the model can correct —
-        // never a dead turn. Unknown tools stay structural refusals.
+        // never a dead turn. An unknown tool name (free-tier models propose
+        // names from other CLIs, e.g. `read`) is the same: a handled failure
+        // that names the mistake, not a structural refusal that ends the
+        // turn.
         if call.arguments().len() > MAX_TOOL_ARGUMENTS_BYTES {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
@@ -832,8 +835,10 @@ impl WorkspaceTools {
             TASK_SPAWN_TOOL => parse_task_args(call.arguments()).is_ok(),
             WEB_FETCH_TOOL => parse_web_fetch_args(call.arguments()).is_ok(),
             ASK_USER_TOOL => parse_ask_user_args(call.arguments()).is_ok(),
-            other if other.starts_with("mcp__") => true,
-            _ => return Err(ToolStepError::Invalid),
+            // Unknown tool names skip the shape pre-check: the dispatch
+            // match below renders a handled "unknown tool" failure the
+            // model can correct.
+            _ => true,
         };
         if !arguments_parseable {
             return Ok(ToolStepResult::Failed {
@@ -862,7 +867,14 @@ impl WorkspaceTools {
             WEB_FETCH_TOOL => self.execute_web_fetch(call, cancel),
             ASK_USER_TOOL => self.execute_ask_user(call, cancel),
             other if other.starts_with("mcp__") => self.execute_mcp_tool(call, cancel),
-            _ => Err(ToolStepError::Invalid),
+            other => Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "unknown tool `{other}`: it is not part of this session's tool surface; \
+use one of the tool names given in the tool surface"
+                ))),
+            }),
         }?;
         // Post-tool-use hooks observe the completed call; their output is
         // recorded on the result the model sees.
@@ -1153,7 +1165,9 @@ impl WorkspaceTools {
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_shell_args(call.arguments())?;
         if self.trace_calls {
-            eprintln!("tool shell_exec: argv={:?} background={} sandbox={}", args.argv, args.background, args.sandbox);
+            crate::exec_diag::stderr_line(&format!(
+                "tool shell_exec: argv={:?} background={} sandbox={}", args.argv, args.background, args.sandbox
+            ));
         }
         if args.sandbox {
             // Seatbelt confinement (macOS): workspace writes allowed, other
@@ -2722,34 +2736,10 @@ impl ToolDriver for WorkspaceTools {
         cancel: &CancellationToken,
     ) -> Result<ValidatedToolCall, ToolStepError> {
         cancel.check().map_err(|_| ToolStepError::Cancelled)?;
-        // Dynamically registered MCP tools validate as known; their
-        // dispatch re-validates arguments at execution time.
-        if call.tool().starts_with("mcp__") {
-            return Ok(ValidatedToolCall::from_proposed(call));
-        }
-        // Known tools accept the call here even with malformed arguments:
-        // execute renders the failure as a per-call model-visible result the
-        // model can correct. Unknown tools are structural refusals.
-        if !matches!(
-            call.tool(),
-            WORKSPACE_WRITE_TOOL
-                | WORKSPACE_READ_TOOL
-                | REPO_READ_TOOL
-                | REPO_SEARCH_TOOL
-                | WORKSPACE_PATCH_TOOL
-                | SHELL_EXEC_TOOL
-                | REPO_GLOB_TOOL
-                | TODO_WRITE_TOOL
-                | PLAN_ENTER_TOOL
-                | PLAN_EXIT_TOOL
-                | JOB_STATUS_TOOL
-                | JOB_OUTPUT_TOOL
-                | TASK_SPAWN_TOOL
-                | WEB_FETCH_TOOL
-                | ASK_USER_TOOL
-        ) {
-            return Err(ToolStepError::Invalid);
-        }
+        // Every proposed name validates: a name outside the surface becomes
+        // a per-call model-visible failure at execution ("unknown tool …"),
+        // which the model can correct, never a turn-fatal refusal. (MCP
+        // tools re-validate arguments at dispatch time.)
         Ok(ValidatedToolCall::from_proposed(call))
     }
 
@@ -2802,7 +2792,7 @@ fn batch_dispatch(
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for (_, indexes) in groups {
-            handles.push(scope.spawn(move || {
+            handles.push((indexes.clone(), scope.spawn(move || {
                 indexes
                     .into_iter()
                     .map(|index| {
@@ -2810,12 +2800,19 @@ fn batch_dispatch(
                         (index, outcome)
                     })
                     .collect::<Vec<_>>()
-            }));
+            })));
         }
-        for handle in handles {
-            if let Ok(group) = handle.join() {
-                done.push(group);
-            }
+        for (indexes, handle) in handles {
+            // A dead worker (unexpected panic) must never silently drop its
+            // calls: the affected indexes surface as typed per-call failures.
+            let group = match handle.join() {
+                Ok(group) => group,
+                Err(_) => indexes
+                    .into_iter()
+                    .map(|index| (index, Err(ToolStepError::Failed)))
+                    .collect(),
+            };
+            done.push(group);
         }
     });
     let mut outcomes: Vec<Option<Result<ToolStepResult, ToolStepError>>> =
@@ -3361,15 +3358,22 @@ use std::sync::{Arc, Mutex};
     }
 
     #[test]
-    fn unknown_tools_are_refused() {
+    fn unknown_tools_become_model_correctable_failures() {
         let root = TempRoot::new("unknown");
         let mut tools = permissive_workspace(&root.0);
         let cancel = CancellationToken::new();
         let call = ProposedToolCall::new("c1", "mcp.call", "{}").expect("call");
-        assert!(matches!(
-            tools.validate(&call, &cancel),
-            Err(ToolStepError::Invalid)
-        ));
+        // A name outside the surface validates (it is not structural), then
+        // executes as a handled failure the model can correct.
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        let result = tools.execute(&validated, &cancel).expect("handled");
+        match result {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.unwrap().contains("unknown tool `mcp.call`"));
+            }
+            other => panic!("expected handled failure, got {other:?}"),
+        }
     }
 
     #[test]

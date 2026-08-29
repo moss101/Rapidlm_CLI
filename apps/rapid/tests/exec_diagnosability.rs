@@ -30,6 +30,24 @@ const SHELL_FAIL_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","con
 /// One shell_exec tool call proposing a command that succeeds.
 const SHELL_OK_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"shell_exec","arguments":"{\"argv\":[\"true\"]}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":5}}"#;
 
+/// Tool call with an explicit argv (used to drive git operations).
+fn shell_call_body(id: &str, argv: &[&str]) -> String {
+    tool_call_body(id, "shell_exec", &format!(
+        "{{\\\"argv\\\":[{0}]}}",
+        argv.iter()
+            .map(|a| format!("\\\"{a}\\\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    ))
+}
+
+/// Tool call with an explicit raw tool name and pre-escaped arguments JSON.
+fn tool_call_body(id: &str, tool: &str, arguments_json: &str) -> String {
+    format!(
+        r#"{{"choices":[{{"message":{{"role":"assistant","content":null,"tool_calls":[{{"id":"{id}","type":"function","function":{{"name":"{tool}","arguments":"{arguments_json}"}}}}]}},"finish_reason":"tool_calls"}}],"usage":{{"prompt_tokens":3,"completion_tokens":5}}}}"#
+    )
+}
+
 fn config_doc(base_url: &str) -> String {
     format!(
         "[models]\ndefault = \"local\"\n\
@@ -104,10 +122,25 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// A project directory with a `.git` marker plus a trust record for it in the
-/// temp home's catalog, mirroring the interactive trust grant.
+/// A project directory with a real git repo (commit identity configured) plus
+/// a trust record for it in the temp home's catalog, mirroring the
+/// interactive trust grant.
 fn trusted_project(home: &Path, project: &Path) {
-    std::fs::create_dir_all(project.join(".git")).expect("git marker");
+    std::fs::create_dir_all(project).expect("project");
+    let init = Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .current_dir(project)
+        .output()
+        .expect("git init");
+    assert!(init.status.success(), "git init failed");
+    for (key, value) in [("user.email", "bench@example.com"), ("user.name", "bench")] {
+        let _ = Command::new("git")
+            .args(["config", key, value])
+            .current_dir(project)
+            .output()
+            .expect("git config");
+    }
     let root = std::fs::canonicalize(project).expect("canonical root");
     let trust_dir = home.join(".rapidlm");
     std::fs::create_dir_all(&trust_dir).expect("rapidlm home");
@@ -289,5 +322,105 @@ fn exec_help_prints_exec_specific_usage() {
     assert!(stdout.contains("rapid exec <prompt>"), "{stdout}");
     assert!(stdout.contains("--verbose"), "{stdout}");
     assert!(stdout.contains("RAPIDLM_PERMISSION_MODE"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn stderr_stays_complete_when_the_agent_git_adds_the_log_file() {
+    // The triggering shape of the observed mid-run stderr silence: a
+    // multi-call run where the agent stages and commits the workspace —
+    // including the process's own stderr redirect target, which lives inside
+    // it — while stderr is held open. Every diagnostic line must survive
+    // through process exit: one argv + one outcome line per shell call,
+    // `turn outcome=`, and `tokens used:`.
+    let home = temp_dir("gitlog-home");
+    let project = home.join("project");
+    trusted_project(&home, &project);
+    std::fs::write(project.join("work.txt"), "seed content\n").expect("work file");
+    let responses = vec![
+        (200, shell_call_body("call_1", &["git", "add", "-A"])),
+        (200, shell_call_body("call_2", &["git", "commit", "-m", "wip"])),
+        (200, shell_call_body("call_3", &["false"])),
+        (200, shell_call_body("call_4", &["git", "add", "-A"])),
+        (200, TERMINAL_BODY.to_owned()),
+    ];
+    let server = spawn_scripted_server(responses);
+    let config = write_config(&home, server.addr);
+
+    // stderr is redirected to a file INSIDE the workspace, exactly like the
+    // benchmark harness redirect that exposed the anomaly.
+    let err_path = project.join("err.log");
+    let err_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&err_path)
+        .expect("open stderr log");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rapid"));
+    command
+        .args(["exec", "--verbose", "work through the steps"])
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("RAPIDLM_CONFIG", &config)
+        .env("RAPIDLM_PERMISSION_MODE", "bypassPermissions")
+        .env("RAPIDLM_RETRY_BASE_MS", "1")
+        .env_remove("RAPIDLM_HOME")
+        .env_remove("RAPIDLM_MODEL")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::from(err_file));
+    let output = command.output().expect("run rapid");
+    let code = output.status.code();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    drop(output);
+    let stderr = std::fs::read_to_string(&err_path).expect("read stderr log");
+
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("hello from scripted model"), "{stdout}");
+    // Four shell calls, each fully traced with its outcome.
+    assert_eq!(stderr.matches("tool shell_exec: argv=").count(), 4, "{stderr}");
+    // add (0), commit (0), false (1), add (0).
+    assert_eq!(stderr.matches("tool shell_exec: ok (exit 0").count(), 3, "{stderr}");
+    assert!(
+        stderr.contains("tool shell_exec: ok (exit 1"),
+        "the failing command's handled outcome is still traced: {stderr}"
+    );
+    // The complete terminal tail.
+    assert!(stderr.contains("turn outcome=succeeded"), "{stderr}");
+    assert!(stderr.contains("tokens used:"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn unknown_tool_proposal_is_model_correctable_not_fatal() {
+    // Free-tier models sometimes propose a tool name from a different CLI
+    // (`read`). The proposal must come back as a handled per-call failure
+    // the model can correct — never a dead turn.
+    let home = temp_dir("unknowntool-home");
+    let project = home.join("project");
+    trusted_project(&home, &project);
+    let responses = vec![
+        (200, tool_call_body("call_1", "read", "{}")),
+        (200, SHELL_OK_BODY.to_owned()),
+        (200, TERMINAL_BODY.to_owned()),
+    ];
+    let server = spawn_scripted_server(responses);
+    let config = write_config(&home, server.addr);
+
+    let (code, stdout, stderr) =
+        run_exec(&project, &home, &config, &["--verbose", "read a file then act"]);
+
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("hello from scripted model"));
+    assert!(
+        stderr.contains("tool read: failed (unknown tool `read`"),
+        "the unknown-tool proposal should trace as a handled failure: {stderr}"
+    );
+    assert!(
+        stderr.contains("tool shell_exec: ok (exit 0"),
+        "the model's corrected follow-up call should run: {stderr}"
+    );
+    assert!(stderr.contains("turn outcome=succeeded"), "{stderr}");
     let _ = std::fs::remove_dir_all(&home);
 }

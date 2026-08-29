@@ -500,7 +500,11 @@ impl StepDiag {
     fn line(&self, text: String) {
         match &self.sink {
             DiagSink::Quiet => {}
-            DiagSink::Stderr => eprintln!("{text}"),
+            DiagSink::Stderr => {
+                // Resilient: a failed stderr write must never panic inside a
+                // model-step or tool-batch worker thread.
+                crate::exec_diag::stderr_line(&text);
+            }
             DiagSink::Buffer(buffer) => {
                 let mut buffer = buffer.borrow_mut();
                 if buffer.len() < MAX_DIAG_LINES {

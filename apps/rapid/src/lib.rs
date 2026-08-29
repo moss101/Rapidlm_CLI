@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod computer_runtime;
+pub mod exec_diag;
 pub mod exec_tools;
 pub mod external_agents;
 pub mod goal_claim;

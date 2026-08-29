@@ -1288,7 +1288,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     ) {
         Ok(outcome) if outcome.result.status() == AgentTerminalStatus::Succeeded => {
             println!("{}", outcome.result.summary());
-            eprintln!("tokens used: {}", outcome.tokens);
+            crate::exec_diag::stderr_line(&format!("tokens used: {}", outcome.tokens));
             Ok(0)
         }
         Ok(outcome) => {
@@ -1304,7 +1304,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                     " (the turn performed {} tool call(s) before the final response came back empty; verify workspace state)",
                     outcome.tool_calls
                 ));
-                eprintln!("{message}");
+                crate::exec_diag::stderr_line(&message);
                 return Ok(0);
             }
             if outcome.failure_cause.is_none()
@@ -1312,7 +1312,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             {
                 message.push_str(" (workspace tools are disabled: project is not trusted)");
             }
-            eprintln!("{message}");
+            crate::exec_diag::stderr_line(&message);
             Ok(1)
         }
         Err(err) => {
