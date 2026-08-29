@@ -474,6 +474,23 @@ publishes.
 
 ---
 
+## Follow-up-task diagnostic notes
+
+**`computer-use` fixtures hang (spawned task `task_81037fda`):** ran all 8 tests individually with
+`--test-threads=1` (all pass, ~0.00–0.01s each), then all 8 together with default parallelism via
+`cargo test -p computer-use --test fixtures --quiet` (also passes, 0.01s total) — reproduced cleanly
+twice. This rules out a deterministic concurrency bug in the fixtures file itself with reasonable
+confidence: every individual test is fast and correct, and the whole file passes together in isolation.
+The original hang only manifested inside a full `cargo test --workspace` run, which spawns many test
+*binaries* concurrently across every crate on a machine already under heavy, sustained background CPU
+load (several long-running, unrelated processes pinning multiple cores for days — see the note in this
+document's own commit history about compile times). The likely cause is resource contention/exhaustion
+under that combined load, not a bug in this specific test file. Whoever picks up that task should
+prioritize reproducing it via a full `cargo test --workspace` run (accepting the 10-20+ minute cost) over
+further scrutiny of `fixtures.rs` in isolation, and consider whether the fix belongs in test
+infrastructure (bounded parallelism, e.g. `cargo test --workspace -- --test-threads=N`) rather than in
+`computer-use`'s own code.
+
 ## Source ledger
 
 - This session's three-way parity research (RapidLM vs. Grok Build vs. Qwen Code), published as an
