@@ -43,6 +43,12 @@ pub enum NodeState {
     Running,
     Waiting,
     Blocked,
+    /// Explicitly suspended by the host or a human, distinct from `Waiting`
+    /// (blocked on an external dependency) and `Cancelled` (terminal, never
+    /// resumes): a `Paused` node keeps its progress and resumes back to
+    /// `Running` on an explicit [`crate::service::GraphService::resume`]
+    /// call. Never entered by the scheduler itself.
+    Paused,
     Succeeded,
     Failed,
     Cancelled,
@@ -115,6 +121,7 @@ impl NodeState {
             Self::Running => "running",
             Self::Waiting => "waiting",
             Self::Blocked => "blocked",
+            Self::Paused => "paused",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",

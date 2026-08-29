@@ -1273,6 +1273,9 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                     tools.set_hooks(hooks);
                 }
             }
+            if let Some(shadow) = crate::shadow_diagnostics::ShadowDiagnosticsConfig::parse(&value) {
+                tools.set_shadow_diagnostics(shadow);
+            }
             let servers = crate::exec_tools::parse_mcp_servers(&value);
             if !servers.is_empty() {
                 tools.register_mcp_servers(&servers);

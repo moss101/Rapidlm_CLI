@@ -272,6 +272,40 @@ impl GraphService {
         self.set_state(graph_id, node_id, NodeState::Pending)
     }
 
+    /// Suspend a running node without cancelling it: the process/agent step
+    /// underneath keeps its progress and is resumable, distinct from both
+    /// `cancel_tree` (terminal, never resumes) and `wait` (blocked on an
+    /// external token, re-enters scheduling via `Pending` on resume). Only a
+    /// currently-`Running` node can be paused; the scheduler never enters
+    /// `Paused` on its own.
+    pub fn pause(&mut self, graph_id: GraphId, node_id: NodeId) -> Result<RuntimeGraph, GraphError> {
+        let running = self
+            .graphs
+            .get(&graph_id)
+            .and_then(|g| g.node(node_id))
+            .is_some_and(|n| n.state == NodeState::Running);
+        if !running {
+            return Err(GraphError::InvalidState);
+        }
+        self.set_state(graph_id, node_id, NodeState::Paused)
+    }
+
+    /// Resume a paused node directly back to `Running`: unlike `resume_wait`,
+    /// there is no dependency to re-check — the node was already running and
+    /// mid-work when it was paused, so it picks up exactly where it left off
+    /// rather than re-entering the ready queue.
+    pub fn resume(&mut self, graph_id: GraphId, node_id: NodeId) -> Result<RuntimeGraph, GraphError> {
+        let paused = self
+            .graphs
+            .get(&graph_id)
+            .and_then(|g| g.node(node_id))
+            .is_some_and(|n| n.state == NodeState::Paused);
+        if !paused {
+            return Err(GraphError::InvalidState);
+        }
+        self.set_state(graph_id, node_id, NodeState::Running)
+    }
+
     /// Bounded invalidation: the node and descendants up to `bound` hops.
     pub fn invalidate_from(
         &mut self,

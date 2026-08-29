@@ -59,6 +59,9 @@ plugin-host = { path = "../../crates/plugin-host" }
 # kernel: in-process KernelClient, project trust, config load, and service graph.
 # This crate is a composition root and does not own those domain rules.
 kernel = { path = "../../crates/kernel" }
+# workspace: GitWorktreeStore isolation backend, used for shadow-verified
+# writes (materialize a candidate edit, run diagnostics, only then commit).
+workspace = { path = "../../crates/workspace" }
 # tui: terminal lifecycle, reducer, and slash-command dispatch. Domain state
 # stays in the kernel; this crate only projects and forwards commands.
 tui = { path = "../../crates/tui" }

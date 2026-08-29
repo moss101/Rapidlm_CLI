@@ -19,6 +19,7 @@ pub mod p9_commands;
 pub mod pdf_text;
 pub mod permissions;
 pub mod preview;
+pub mod shadow_diagnostics;
 pub mod user_config;
 pub mod web_fetch;
 

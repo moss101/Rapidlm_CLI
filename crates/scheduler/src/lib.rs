@@ -472,4 +472,88 @@ mod tests {
         );
         let _ = fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn pause_only_leaves_running_and_resume_goes_straight_back_to_running() {
+        let (mut svc, dir) = open_service();
+        let graph = svc.create("root").unwrap();
+
+        // A Pending node cannot be paused — pause is a Running-only transition.
+        assert_eq!(
+            svc.pause(graph.graph_id, graph.root),
+            Err(GraphError::InvalidState)
+        );
+
+        svc.set_state(graph.graph_id, graph.root, NodeState::Running)
+            .unwrap();
+        svc.pause(graph.graph_id, graph.root).unwrap();
+        assert_eq!(
+            svc.snapshot(graph.graph_id).unwrap().nodes[&graph.root].state,
+            NodeState::Paused
+        );
+
+        // Pausing an already-paused node is rejected, not a silent no-op.
+        assert_eq!(
+            svc.pause(graph.graph_id, graph.root),
+            Err(GraphError::InvalidState)
+        );
+
+        // Resume goes straight back to Running (not Pending): the node was
+        // already running mid-work, unlike a `wait`/`resume_wait` node that
+        // re-enters the ready queue.
+        svc.resume(graph.graph_id, graph.root).unwrap();
+        assert_eq!(
+            svc.snapshot(graph.graph_id).unwrap().nodes[&graph.root].state,
+            NodeState::Running
+        );
+
+        // Resuming a non-paused node is rejected.
+        assert_eq!(
+            svc.resume(graph.graph_id, graph.root),
+            Err(GraphError::InvalidState)
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cancel_tree_cascades_through_a_paused_descendant() {
+        // Paused is deliberately not a terminal state, so cancel_tree must
+        // still cascade into a paused child instead of skipping it.
+        let (mut svc, dir) = open_service();
+        let graph = svc.create("root").unwrap();
+        let child = NodeId::new();
+        svc.propose(
+            graph.graph_id,
+            GraphProposal {
+                base_revision: 1,
+                add_nodes: vec![NodeSpec {
+                    id: child,
+                    kind: NodeKind::Task,
+                    label: "c".into(),
+                    workspace_key: None,
+                    resource_key: None,
+                    budget_tokens: 0,
+                }],
+                add_edges: vec![EdgeSpec {
+                    from: graph.root,
+                    to: child,
+                    kind: EdgeKind::DecomposesInto,
+                    condition: EdgeCondition::default(),
+                }],
+                supersede: vec![],
+                invalidate: vec![],
+            },
+        )
+        .unwrap();
+        svc.set_state(graph.graph_id, child, NodeState::Running)
+            .unwrap();
+        svc.pause(graph.graph_id, child).unwrap();
+        svc.cancel_tree(graph.graph_id, graph.root).unwrap();
+        assert_eq!(
+            svc.snapshot(graph.graph_id).unwrap().nodes[&child].state,
+            NodeState::Cancelled
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
 }

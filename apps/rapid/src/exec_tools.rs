@@ -508,6 +508,7 @@ pub struct WorkspaceTools {
     subagents: Option<Arc<dyn SubagentRunner>>,
     fetch_allowlist: Vec<String>,
     hooks: crate::hooks::HooksConfig,
+    shadow_diagnostics: Option<crate::shadow_diagnostics::ShadowDiagnosticsConfig>,
     ask_stdin: Option<Arc<dyn Fn(&str, &[String], Duration) -> Result<String, String> + Send + Sync>>,
     mcp: Arc<Mutex<Vec<McpConnection>>>,
     mcp_surface: Arc<Mutex<Vec<(String, String, mcp::transport::McpToolDescriptor)>>>,
@@ -539,6 +540,7 @@ impl WorkspaceTools {
             subagents: None,
             fetch_allowlist: Vec::new(),
             hooks: crate::hooks::HooksConfig::default(),
+            shadow_diagnostics: None,
             ask_stdin: None,
             mcp: Arc::new(Mutex::new(Vec::new())),
             mcp_surface: Arc::new(Mutex::new(Vec::new())),
@@ -633,6 +635,16 @@ impl WorkspaceTools {
     /// Hosts web_fetch may fetch despite resolving private (local fixtures).
     pub fn set_fetch_allowlist(&mut self, allowlist: Vec<String>) {
         self.fetch_allowlist = allowlist;
+    }
+
+    /// Attach the shadow-diagnostics command: `workspace_write` calls whose
+    /// path matches a configured glob are verified in an isolated Git
+    /// worktree before ever reaching the real tree.
+    pub fn set_shadow_diagnostics(
+        &mut self,
+        config: crate::shadow_diagnostics::ShadowDiagnosticsConfig,
+    ) {
+        self.shadow_diagnostics = Some(config);
     }
 
     /// Attach project hook commands (pre/post tool stages).
@@ -947,6 +959,55 @@ impl WorkspaceTools {
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_write_args(call.arguments())?;
         let target = self.resolve_in_root(&args.path)?;
+        if let Some(config) = self
+            .shadow_diagnostics
+            .as_ref()
+            .filter(|config| config.matches(&args.path, glob_path_match))
+        {
+            use crate::shadow_diagnostics::{ShadowVerifyOutcome, verify_candidate};
+            match verify_candidate(self.root(), &args.path, args.content.as_bytes(), config) {
+                ShadowVerifyOutcome::Failed { diagnostics_tail } => {
+                    // Verify before showing, not after applying: the real
+                    // tree is never touched by a candidate that fails
+                    // diagnostics in isolation.
+                    return Ok(ToolStepResult::Failed {
+                        call_id: call.call_id().to_owned(),
+                        handled: true,
+                        detail: Some(bounded_detail(&format!(
+                            "shadow diagnostics failed for {}; the write was NOT applied:\n{diagnostics_tail}",
+                            args.path
+                        ))),
+                    });
+                }
+                ShadowVerifyOutcome::Passed { diagnostics_tail } => {
+                    fs::write(&target, args.content.as_bytes()).map_err(|_| ToolStepError::Failed)?;
+                    return Ok(ToolStepResult::Succeeded {
+                        call_id: call.call_id().to_owned(),
+                        summary: bounded_detail(&format!(
+                            "wrote {} bytes to {} (shadow diagnostics: ok)\n{diagnostics_tail}",
+                            args.content.len(),
+                            args.path
+                        )),
+                    });
+                }
+                ShadowVerifyOutcome::Skipped { reason } => {
+                    // Advisory-only: a broken/inapplicable shadow-diagnostics
+                    // setup must never block a normal write. Falls through
+                    // to the direct write below, noting the skip so it is
+                    // not silently invisible.
+                    fs::write(&target, args.content.as_bytes())
+                        .map_err(|_| ToolStepError::Failed)?;
+                    return Ok(ToolStepResult::Succeeded {
+                        call_id: call.call_id().to_owned(),
+                        summary: bounded_detail(&format!(
+                            "wrote {} bytes to {} (shadow diagnostics skipped: {reason})",
+                            args.content.len(),
+                            args.path
+                        )),
+                    });
+                }
+            }
+        }
         fs::write(&target, args.content.as_bytes()).map_err(|_| ToolStepError::Failed)?;
         Ok(ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
@@ -2754,6 +2815,16 @@ impl ExecTools {
         }
     }
 
+    /// Attach the shadow-diagnostics command (no-op on the no-op surface).
+    pub fn set_shadow_diagnostics(
+        &mut self,
+        config: crate::shadow_diagnostics::ShadowDiagnosticsConfig,
+    ) {
+        if let Self::Workspace(tools) = self {
+            tools.set_shadow_diagnostics(config);
+        }
+    }
+
     /// Register configured stdio MCP servers.
     pub fn register_mcp_servers(&mut self, servers: &[McpServerConfig]) {
         if let Self::Workspace(tools) = self {
@@ -3399,6 +3470,114 @@ use std::sync::{Arc, Mutex};
             }
             other => panic!("expected read success, got {other:?}"),
         }
+    }
+
+    fn git_init(dir: &Path) {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-b", "main"]);
+        fs::write(dir.join("seed.txt"), b"seed\n").expect("seed");
+        run(&["add", "seed.txt"]);
+        run(&["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-m", "seed"]);
+    }
+
+    #[test]
+    fn shadow_diagnostics_blocks_a_failing_write_and_never_touches_the_real_tree() {
+        let root = TempRoot::new("shadow-fail");
+        git_init(&root.0);
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_shadow_diagnostics(
+            crate::shadow_diagnostics::ShadowDiagnosticsConfig::parse(&serde_json::json!({
+                "shadow_diagnostics": { "command": ["grep", "-q", "MARKER", "{path}"], "globs": ["*.txt"] }
+            }))
+            .expect("parsed"),
+        );
+        let cancel = CancellationToken::new();
+        let call = ProposedToolCall::new(
+            "c1",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"broken.txt","content":"no marker here"}"#,
+        )
+        .expect("call");
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        let result = tools.execute(&validated, &cancel).expect("execute");
+        match result {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.unwrap().contains("shadow diagnostics failed"));
+            }
+            other => panic!("expected a handled shadow-diagnostics failure, got {other:?}"),
+        }
+        assert!(
+            !root.0.join("broken.txt").exists(),
+            "a write that fails shadow diagnostics must never reach the real tree"
+        );
+    }
+
+    #[test]
+    fn shadow_diagnostics_applies_a_passing_write_for_real() {
+        let root = TempRoot::new("shadow-pass");
+        git_init(&root.0);
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_shadow_diagnostics(
+            crate::shadow_diagnostics::ShadowDiagnosticsConfig::parse(&serde_json::json!({
+                "shadow_diagnostics": { "command": ["grep", "-q", "MARKER", "{path}"], "globs": ["*.txt"] }
+            }))
+            .expect("parsed"),
+        );
+        let cancel = CancellationToken::new();
+        let call = ProposedToolCall::new(
+            "c1",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"good.txt","content":"has MARKER inside"}"#,
+        )
+        .expect("call");
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        let result = tools.execute(&validated, &cancel).expect("execute");
+        match result {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("shadow diagnostics: ok"));
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(root.0.join("good.txt")).expect("written"),
+            b"has MARKER inside"
+        );
+    }
+
+    #[test]
+    fn shadow_diagnostics_glob_scoping_leaves_non_matching_writes_unaffected() {
+        let root = TempRoot::new("shadow-scope");
+        git_init(&root.0);
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_shadow_diagnostics(
+            crate::shadow_diagnostics::ShadowDiagnosticsConfig::parse(&serde_json::json!({
+                "shadow_diagnostics": { "command": ["false"], "globs": ["*.py"] }
+            }))
+            .expect("parsed"),
+        );
+        let cancel = CancellationToken::new();
+        // "false" always fails, but the glob only covers *.py — this write
+        // to a .txt file must bypass shadow diagnostics entirely.
+        let call = ProposedToolCall::new(
+            "c1",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"unrelated.txt","content":"fine"}"#,
+        )
+        .expect("call");
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        let result = tools.execute(&validated, &cancel).expect("execute");
+        assert!(matches!(result, ToolStepResult::Succeeded { .. }));
+        assert_eq!(fs::read(root.0.join("unrelated.txt")).expect("written"), b"fine");
     }
 
     #[test]
