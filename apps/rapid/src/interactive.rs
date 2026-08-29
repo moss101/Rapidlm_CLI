@@ -355,7 +355,7 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
         Ok(host) => host.unwrap_or_else(GoalHost::new),
         Err(err) => {
             eprintln!("{err}");
-            return Ok(1);
+            return Ok(JsonlExitCode::Runtime.as_i32());
         }
     };
     // Durable-ledger backing for agent-produced evidence citations. Without
@@ -376,7 +376,7 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
         };
     if let Err(err) = host.load_evidence(&evidence_path) {
         eprintln!("{err}");
-        return Ok(1);
+        return Ok(JsonlExitCode::Runtime.as_i32());
     }
 
     let result = match sub {
@@ -449,7 +449,7 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
         "show" => {
             let Some(snapshot) = host.snapshot() else {
                 println!("no active goal");
-                return Ok(1);
+                return Ok(JsonlExitCode::Usage.as_i32());
             };
             println!("{}", snapshot.statement());
             for criterion in snapshot.completion_criteria() {
@@ -466,7 +466,7 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
         "claim" => {
             let Some(ledger) = claim_ledger.as_ref() else {
                 eprintln!("ledger unavailable; claims cannot be audited");
-                return Ok(1);
+                return Ok(JsonlExitCode::Runtime.as_i32());
             };
             let flags = parse_flags(&args[1..])?;
             let summary = one(&flags, "summary").ok_or(InteractiveError::Usage)?;
@@ -507,12 +507,16 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
             println!("evidence recorded: {}", outcome.evidence_recorded);
             println!("verdict: {}", outcome.verdict.as_str());
             println!("accepted: {}", outcome.accepted);
-            Ok(if outcome.accepted { 0 } else { 1 })
+            Ok(if outcome.accepted {
+                JsonlExitCode::Success.as_i32()
+            } else {
+                JsonlExitCode::GoalIncomplete.as_i32()
+            })
         }
         "export" => {
             let Some(export) = host.export(&cancel) else {
                 println!("no active goal");
-                return Ok(1);
+                return Ok(JsonlExitCode::Usage.as_i32());
             };
             println!("{export}");
             Ok(0)
@@ -520,7 +524,7 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
         "verify" => {
             if host.snapshot().is_none() {
                 println!("no active goal");
-                return Ok(1);
+                return Ok(JsonlExitCode::Usage.as_i32());
             }
             let allowed = host.can_complete(&cancel);
             println!("complete: {allowed}");
@@ -557,11 +561,11 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
 
     if let Err(err) = host.save(&path) {
         eprintln!("{err}");
-        return Ok(1);
+        return Ok(JsonlExitCode::Runtime.as_i32());
     }
     if let Err(err) = host.save_evidence(&evidence_path) {
         eprintln!("{err}");
-        return Ok(1);
+        return Ok(JsonlExitCode::Runtime.as_i32());
     }
     Ok(result)
 }
@@ -594,7 +598,7 @@ fn goal_evidence_record(host: &mut GoalHost, args: &[String]) -> Result<i32, Int
     let flags = parse_flags(args)?;
     let Some(snapshot) = host.snapshot() else {
         println!("no active goal");
-        return Ok(1);
+        return Ok(JsonlExitCode::Usage.as_i32());
     };
     let kind: EvidenceKind = one(&flags, "kind")
         .ok_or(InteractiveError::Usage)?
@@ -697,7 +701,7 @@ fn goal_evidence_list(host: &GoalHost) -> Result<i32, InteractiveError> {
     let store = host.evidence().store();
     if store.is_empty() {
         println!("no evidence recorded");
-        return Ok(1);
+        return Ok(JsonlExitCode::Usage.as_i32());
     }
     for record in store.records() {
         let criterion = record.criterion_id().unwrap_or("-");
@@ -725,11 +729,11 @@ fn goal_lifecycle(
 ) -> Result<i32, InteractiveError> {
     let Some(goal_id) = host.snapshot().map(|s| s.id()) else {
         println!("no active goal");
-        return Ok(1);
+        return Ok(JsonlExitCode::Usage.as_i32());
     };
     if kind == "complete" && !host.can_complete(cancel) {
         println!("completion refused: criteria are not all satisfied by recorded evidence");
-        return Ok(1);
+        return Ok(JsonlExitCode::GoalIncomplete.as_i32());
     }
     let command = match kind {
         "pause" => GoalCommand::Pause {
@@ -921,6 +925,24 @@ fn format_usd_micros(usd_micros: u64) -> String {
 fn is_effective_success(outcome: &ExecOutcome) -> bool {
     outcome.result.status() == AgentTerminalStatus::Succeeded
         || (outcome.stop_reason == Some(TurnStopReason::EmptyResponse) && outcome.tool_calls > 0)
+}
+
+/// Typed exit code for a finished-but-not-effectively-successful turn. A
+/// `Cancelled` terminal status is Ctrl-C/SIGINT, not a generic failure — a CI
+/// script should be able to tell "the user interrupted this" apart from
+/// "the model/tool layer failed" without parsing stderr text. A provider-
+/// classified `FailureCause` (`Auth`/`Connection`/`Rejected`/`Transient`)
+/// maps to the same `Provider` bucket the JSONL contract already uses for
+/// provider errors; an unclassified cause (e.g. a tool-failure stop, which
+/// carries `failure_detail` instead) falls back to `Runtime`.
+fn exec_turn_exit_code(status: AgentTerminalStatus, failure_cause: Option<FailureCause>) -> i32 {
+    if status == AgentTerminalStatus::Cancelled {
+        return JsonlExitCode::Interrupted.as_i32();
+    }
+    match failure_cause {
+        Some(FailureCause::Unspecified) | None => JsonlExitCode::Runtime.as_i32(),
+        Some(_) => JsonlExitCode::Provider.as_i32(),
+    }
 }
 
 /// Env var overriding the permission mode for one exec run.
@@ -1400,7 +1422,7 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
             Ok(lattice) => lattice,
             Err(reason) => {
                 eprintln!("permission configuration error: {reason}");
-                return Ok(1);
+                return Ok(JsonlExitCode::Policy.as_i32());
             }
         };
     let mut tools = match &workspace {
@@ -1531,7 +1553,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         }
         Err(err) => {
             eprintln!("model configuration error: {err}");
-            return Ok(1);
+            return Ok(JsonlExitCode::Usage.as_i32());
         }
     }
     // One store per backend, fully built before any ConfiguredModel borrows
@@ -1548,7 +1570,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             Ok(model) => SelectedModel::Configured(Box::new(model)),
             Err(err) => {
                 eprintln!("model configuration error: {err}");
-                return Ok(1);
+                return Ok(JsonlExitCode::Usage.as_i32());
             }
         }
     } else {
@@ -1589,7 +1611,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                 Some((_, model)) => SelectedModel::Configured(Box::new(model)),
                 None => {
                     eprintln!("model configuration error: primary model failed to configure");
-                    return Ok(1);
+                    return Ok(JsonlExitCode::Usage.as_i32());
                 }
             }
         } else {
@@ -1672,11 +1694,17 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                 message.push_str(" (workspace tools are disabled: project is not trusted)");
             }
             crate::exec_diag::stderr_line(&message);
-            Ok(1)
+            Ok(exec_turn_exit_code(
+                outcome.result.status(),
+                outcome.failure_cause,
+            ))
         }
         Err(err) => {
             eprintln!("{err}");
-            Ok(1)
+            Ok(match err.error_code() {
+                Some(code) => JsonlExitCode::from_error_code(code, false).as_i32(),
+                None => JsonlExitCode::Interrupted.as_i32(),
+            })
         }
     }
 }

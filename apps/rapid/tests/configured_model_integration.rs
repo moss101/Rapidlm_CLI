@@ -311,7 +311,10 @@ fn binary_exec_uses_configured_model_end_to_end() {
 fn binary_exec_without_config_takes_the_typed_fallback() {
     let dir = temp_dir("exec-unconfigured");
     let (code, stdout, stderr) = run_rapid(None, None, &dir);
-    assert_eq!(code, Some(1), "stdout: {stdout}");
+    // JsonlExitCode::Runtime: an unconfigured model step fails with an
+    // unclassified `FailureCause` (never provider-classified, since no
+    // provider was ever dispatched to).
+    assert_eq!(code, Some(5), "stdout: {stdout}");
     assert!(
         stderr.contains("no model configured"),
         "hint missing: {stderr}"
@@ -338,7 +341,8 @@ fn binary_exec_rejects_invalid_config_typed() {
     );
     std::fs::write(&config_path, doc).expect("write config");
     let (code, stdout, stderr) = run_rapid(Some(&config_path), None, &dir);
-    assert_eq!(code, Some(1), "stdout: {stdout}");
+    // JsonlExitCode::Usage: an invalid config is a user-input error.
+    assert_eq!(code, Some(2), "stdout: {stdout}");
     assert!(
         stderr.contains("model configuration error") && stderr.contains("provider"),
         "typed config error missing: {stderr}"
@@ -355,7 +359,8 @@ fn binary_exec_rejects_unknown_model_override_typed() {
     std::fs::write(&config_path, config_doc(&format!("http://{}/v1", server.addr)))
         .expect("write config");
     let (code, _stdout, stderr) = run_rapid(Some(&config_path), Some("missing-model"), &dir);
-    assert_eq!(code, Some(1));
+    // JsonlExitCode::Usage: an unknown model override is a user-input error.
+    assert_eq!(code, Some(2));
     assert!(
         stderr.contains("model configuration error") && stderr.contains("missing-model"),
         "typed override error missing: {stderr}"

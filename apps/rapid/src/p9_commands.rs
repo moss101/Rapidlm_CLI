@@ -18,6 +18,7 @@ use capability_broker::{
 };
 use agent_runtime::ToolDriver;
 use crate::external_agents::CliRunner;
+use crate::headless::jsonl::JsonlExitCode;
 use mcp::{ImplementationInfo, McpServer, McpServerConfig, ProtocolVersion};
 use scheduler::graph::RuntimeGraph;
 use scheduler::kinds::NodeKind;
@@ -703,7 +704,7 @@ pub fn run_cron(args: &[String]) -> Result<i32, P9CommandError> {
                 Ok(0)
             } else {
                 println!("not found id={id}");
-                Ok(1)
+                Ok(JsonlExitCode::Usage.as_i32())
             }
         }
         "poll" => {
@@ -822,7 +823,7 @@ pub fn run_agents(args: &[String]) -> Result<i32, P9CommandError> {
             if inventory.rejected.is_empty() {
                 Ok(0)
             } else {
-                Ok(1)
+                Ok(JsonlExitCode::Usage.as_i32())
             }
         }
         "scaffold" => {

@@ -203,7 +203,9 @@ fn tool_failure_names_failing_tool_and_error_on_stderr() {
         &["--verbose", "run the impossible command"],
     );
 
-    assert_eq!(code, Some(1), "a tool-failure stop exits non-zero");
+    // JsonlExitCode::Runtime: a tool-failure stop carries no provider-
+    // classified FailureCause, so it falls into the generic Runtime bucket.
+    assert_eq!(code, Some(5), "a tool-failure stop exits non-zero");
     // Per-call stderr line with the tool name and the failing outcome.
     assert!(stderr.contains("tool shell_exec:"), "per-call line missing: {stderr}");
     // The terminal failure names the tool and the underlying error instead of
