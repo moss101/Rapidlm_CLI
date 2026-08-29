@@ -1175,6 +1175,16 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
         .as_ref()
         .and_then(|(root, _)| crate::host::load_memory_index(root));
     let preserved = preserved.with_memory_index(memory_index);
+    // Proactive context retrieval: only for a trusted project (it walks the
+    // tree and writes an incremental index under .rapidlm/index/). Fails
+    // open inside retrieve() itself — an unindexable or slow repo yields no
+    // blocks rather than blocking the turn.
+    let preserved = if let Some((root, TrustStatus::Trusted)) = &workspace {
+        let retrieved = crate::context_retrieval::retrieve(root, &prompt, 2048);
+        preserved.with_retrieved_context(retrieved)
+    } else {
+        preserved
+    };
     // Reminder feeds: load the project roster if present and admit the
     // always-on feeds (the CLI host grants no capabilities, so feeds gated
     // on a capability stay inactive). A broken roster warns and the turn

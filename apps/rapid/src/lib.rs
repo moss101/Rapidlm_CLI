@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod computer_runtime;
+pub mod context_retrieval;
 pub mod exec_diag;
 pub mod exec_tools;
 pub mod external_agents;

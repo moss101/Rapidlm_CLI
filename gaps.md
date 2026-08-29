@@ -262,6 +262,83 @@ references (Grok Build's compaction ends at the summary + short prompt; Claude's
 keep-3/trim-4 000/hard-clear-at-10 is directly portable; Claude's keep-5/≥20 k gate is the same idea with
 a savings gate) + a `/context`-style breakdown, which RapidLM's packet compiler can already produce.
 
+### 6a. The retrieval layer is built and unwired (P0, found 2026-08-29)
+
+The assessment above is about compaction ergonomics — packing/budgeting an *already-assembled* context
+packet. It understates a much bigger gap underneath it: `context-engine` is 29,109 lines across `chunk`,
+`compact`/`compact_policy`, `compile`, `index::{fts,vector,graph}`, `ingest::{walk,watch,content,pipeline}`,
+`lsp`, `memory`, `parse::{registry,symbols}`, `read`/`read_set`, `repo_manifest`, `retrieval::{candidates,
+rank,grep,links,filter}`, `scout`, `token_estimate` — with 305 passing tests. Design-wise this is more
+sophisticated than either reference: a code graph, vector/embedding search, LSP integration, Tree-sitter
+symbol parsing, an ingest/watch pipeline, and a Context Scout (`scout.rs`) that reports negative findings
+and tracks freshness/lineage, not just hits.
+
+**Traced the actual call path and confirmed almost none of it is reachable from `rapid exec`.**
+`apps/rapid/src/host.rs::build_packet()` — the *only* place a live turn builds a `ContextPacket` — calls
+`compile()` with nothing but fixed prompt-stack text: `ctx.system("system/prompt", …)`,
+`ctx.system("memory/index", …)`, `ctx.system("rules/agents", …)`, `ctx.system("skills/selected", …)`,
+`ctx.goal(…)`, per-criterion `ctx.goal_block(…)`, `ctx.memory("context/compaction", …)`,
+`ctx.system("reminders/active", …)`. Zero calls into `scout`, `retrieval::candidates`, `index::{fts,
+vector,graph}`, `lsp`, or `ingest`. Of the crate's 29,109 lines, only `compile.rs` + `compact.rs` +
+`compact_policy.rs` (~2,400 lines, ~8%) are wired — the packing/budgeting layer. Even
+`context_engine::memory` (1,640 lines) is bypassed: `host.rs::load_memory_index` reads `.rapidlm/MEMORY.md`
+with a bare `fs::read_to_string` + line/byte truncation instead of the real module.
+
+**This is not a hypothesis — it explains something measured directly in the same-day benchmark work**
+(`docs/benchmarks/2026-08-29-hard-swe-context-history-bug.md`, `2026-08-29-post-fix-reverification.md`):
+every run starts the model at zero repo knowledge, so it manually `repo_glob`s then `workspace_read`s every
+file one at a time before touching anything, burning steps/tokens that a wired retrieval layer would have
+front-loaded. It is also the reason the `MAX_TOOL_HISTORY_*` budget fix from that session mattered so much
+— the model was paying full exploration cost on *every single turn*, with no memory of the repo carried
+in from a prior index.
+
+**Comparison:** Grok Build has nothing this ambitious — its closest equivalent is
+`xai-fuzzy-file-search` (936 lines, fuzzy filename matching, not semantic) in the reference tree at
+`/Users/mohsin/grokbuild` — but it *is* an actual dependency of `xai-grok-workspace`, i.e. wired into the
+real tool loop. Qwen Code's source isn't available for comparison; the two same-day benchmark transcripts
+against it (`2026-08-28-qwen-code-vs-rapid.md`, `2026-08-29-swe-repo-fix.md`) show it doing the same
+manual, one-file-at-a-time exploration RapidLM does (11 `read_file` calls to explore a five-module ~150 LOC
+repo) — no visible pre-populated retrieval either, though a hidden layer that simply didn't trigger on a
+small repo can't be ruled out without source. The honest read: RapidLM's retrieval design is more
+sophisticated than either reference's, and that design currently buys nothing, because a working
+fuzzy-filename search that ships beats a code-graph-plus-vector-index stack that doesn't run.
+
+**Recommendation (P0):** wire `build_packet()` (or a new pre-turn step ahead of it) to source real
+candidate content via `context-engine`'s existing retrieval before the turn starts, using the task
+prompt/goal as the query, and feed the results in as scored/optional blocks `compile()` already knows how
+to budget and drop. Start with FTS (`index::fts` + `retrieval::{candidates,rank}` via `scout.rs`) — no
+embedding-model dependency, no persistent-index staleness problem, and it directly targets the observed
+failure mode (the model rediscovering the same files by hand every run). Vector search, the code graph, and
+LSP are larger, separate investments once FTS proves the wiring; `context_engine::memory` replacing the
+naive `load_memory_index` is a small, independent follow-up.
+
+**Implemented 2026-08-29.** New module `apps/rapid/src/context_retrieval.rs`: for a trusted project,
+`retrieve(root, task_prompt, budget)` builds/updates a persistent FTS+code-graph index under
+`.rapidlm/index/` via `IndexPipeline::open` (incremental — unchanged files are a content-hash no-op),
+walks the repo (`ingest::walk`, capped at `MAX_INDEXED_FILES`), runs `scout()` with the task prompt as the
+question, and converts `Reference` hits into `CompileInput`s (`CompileReason::Retrieved`,
+`TrustClass::Untrusted`, `Freshness::Fresh` — `compile()`'s own retrieved-share budget does the trimming).
+Wired through a new `PreservedLiveContext::with_retrieved_context`/`retrieved_context()` field into
+`build_packet()`. Bounded by a background-thread wall-clock watcher (`RETRIEVAL_TIMEOUT`, 8s) that fires
+`CancellationToken::cancel()` on the cooperative-cancellation walk/index/scout loop; any error anywhere in
+the pass fails open (empty result, one-line stderr warning) — it can never block a turn. Called from
+`interactive.rs::exec_turn` only when the workspace is trusted (it writes the index to disk).
+
+Live-verified against the real model: the same LRU-cache repo used for the context-history-bug benchmark,
+asked "explain what LRUCache does and how eviction works" — before this change every benchmark today
+needed a `repo_glob` + `workspace_read` round trip to answer a question like this; with retrieval wired in,
+stderr showed `context retrieval: 6 block(s) proactively retrieved`, and the model answered correctly and
+in detail (`_touch`, `_order`, capacity, recency all named correctly) in **one model step with zero tool
+calls**. 6 new tests in `context_retrieval.rs` plus an integration test in `host.rs` asserting a retrieved
+block reaches the compiled `ContextPacket` with the right source/trust/freshness; full workspace test suite
+green.
+
+**Not done in this pass:** vector search and LSP stay unwired (as scoped above); `workspace_patch`-style
+incremental re-indexing on edit isn't hooked up (each turn re-walks from the persistent index, which is
+fast after the first cold index, but a mid-turn edit to a file won't be reflected in *that same turn's*
+retrieval since retrieval runs once at turn start); `context_engine::memory` replacing `load_memory_index`
+is still open.
+
 ---
 
 ## 7. System prompt & behavior stack

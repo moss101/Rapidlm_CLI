@@ -90,7 +90,11 @@ pub enum HostError {
 /// State preserved across a live-context rebuild. Authority over the actual
 /// context stays with the Context Fabric; this only carries what a rebuild must
 /// not lose.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// No `Eq`/`PartialEq`: `retrieved_context` holds `CompileInput`, which
+/// doesn't implement them (nothing compared `PreservedLiveContext` with
+/// `==` before this field existed either).
+#[derive(Clone, Debug)]
 pub struct PreservedLiveContext {
     goal_statement: String,
     completion_criteria: Vec<String>,
@@ -104,6 +108,7 @@ pub struct PreservedLiveContext {
     reminders_block: Option<String>,
     system_prompt: Option<String>,
     memory_index: Option<String>,
+    retrieved_context: Vec<CompileInput>,
 }
 
 impl PreservedLiveContext {
@@ -143,7 +148,21 @@ impl PreservedLiveContext {
             reminders_block: None,
             system_prompt: None,
             memory_index: None,
+            retrieved_context: Vec::new(),
         })
+    }
+
+    /// Attach proactively-retrieved repo content for this turn (Context
+    /// Scout hits against the task prompt) — see `context_retrieval.rs`.
+    /// Bounded by the retrieval pass itself (`MAX_REFERENCES`); no further
+    /// limit here, `compile()`'s own retrieved-share budget does the rest.
+    pub fn with_retrieved_context(mut self, blocks: Vec<CompileInput>) -> Self {
+        self.retrieved_context = blocks;
+        self
+    }
+
+    pub fn retrieved_context(&self) -> &[CompileInput] {
+        &self.retrieved_context
     }
 
     /// Attach the always-loaded memory index (`.rapidlm/MEMORY.md`).
@@ -838,6 +857,9 @@ pub fn build_packet(
     if let Some(reminders) = preserved.reminders_block() {
         ctx = ctx.system(CompileInput::new("reminders/active", reminders.to_owned()));
     }
+    for block in preserved.retrieved_context() {
+        ctx = ctx.retrieved(block.clone());
+    }
     compile(&ctx)
 }
 
@@ -848,6 +870,7 @@ mod tests {
         AgentRole, AgentSpec, ModelStepOutput, ProposedToolCall, ToolStepError, ToolStepResult,
         ValidatedToolCall,
     };
+    use context_engine::retrieval::candidates::{Freshness, TrustClass};
     use protocol::{AgentId, SessionId};
     use std::collections::VecDeque;
 
@@ -983,6 +1006,27 @@ mod tests {
         // None adds no block.
         let packet = build_packet(&preserved(), None).expect("packet");
         assert!(packet.blocks().iter().all(|b| !b.text().contains("reminders schema")));
+    }
+
+    #[test]
+    fn retrieved_context_is_compiled_into_the_packet_as_untrusted_fresh_blocks() {
+        let block = CompileInput::new("retrieved:lru.py", "class LRUCache:\n    pass\n")
+            .reason(context_engine::compile::CompileReason::Retrieved)
+            .trust(TrustClass::Untrusted)
+            .freshness(Freshness::Fresh);
+        let with_retrieved = preserved().with_retrieved_context(vec![block]);
+        let packet = build_packet(&with_retrieved, None).expect("packet");
+        let retrieved = packet
+            .blocks()
+            .iter()
+            .find(|b| b.text().contains("LRUCache"))
+            .expect("retrieved block in packet");
+        assert_eq!(retrieved.source(), context_engine::compile::ContextSource::Retrieved);
+        assert_eq!(retrieved.trust(), TrustClass::Untrusted);
+        assert_eq!(retrieved.freshness(), Freshness::Fresh);
+        // No retrieved blocks configured: none enter the packet either.
+        let packet = build_packet(&preserved(), None).expect("packet");
+        assert!(packet.blocks().iter().all(|b| !b.text().contains("LRUCache")));
     }
 
     #[test]
