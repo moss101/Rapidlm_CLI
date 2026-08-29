@@ -242,7 +242,15 @@ but cannot interrupt for new ones — escalate via the foreground parent).
 
 **Verified genuinely absent (2026-08-29):** a targeted grep for `CapabilitySnapshot`/`AuthorizationEpoch`/
 a policy-compiler type across `capability-broker` found nothing — unlike most of this section, this one
-really is missing, not just unwired.
+really is missing, not just unwired. **Narrower nuance found while scoping this:** `exec_permission_lattice()`
+(`apps/rapid/src/interactive.rs`) has exactly one call site, inside headless `exec_turn` — the lattice
+loads once per process invocation and is fixed for the whole turn, which is already the core property
+`CAP-005` asks for (an immutable per-round snapshot, no mid-turn retroactive policy change) for
+`rapid exec`'s single-turn case specifically. Whether the interactive TUI's longer-lived, potentially
+multi-turn session reloads settings between turns (and so needs an explicit snapshot/epoch type to get
+the same guarantee) was not confirmed — its lattice-construction call site wasn't traced in this pass.
+Worth checking before building a full `CapabilitySnapshot` type: the exec case may already need only a
+name for a property it already has, while the TUI case is the part that might still be genuinely open.
 
 Modbit: `CAP-005` (immutable per-model-round capability snapshot carried through the model event, tool
 call, and run step — mid-round policy changes apply next round, never retroactively), `CAP-001` (Policy
