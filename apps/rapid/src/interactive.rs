@@ -323,6 +323,7 @@ fn run_subcommand(args: &[String]) -> Result<i32, InteractiveError> {
         Some("goal") => run_goal_command(&args[1..]),
         Some("playbook-compile") => p9(&args[1..], crate::p9_commands::run_playbook_compile),
         Some("mcp-tools") => p9(&args[1..], crate::p9_commands::run_mcp_tools),
+        Some("tools") => p9(&args[1..], crate::p9_commands::run_tools_schema),
         Some("agent-cli") => p9(&args[1..], crate::p9_commands::run_agent_cli),
         Some("doctor") => p9(&args[1..], crate::p9_commands::run_doctor),
         Some("sessions") => p9(&args[1..], crate::p9_commands::run_sessions),

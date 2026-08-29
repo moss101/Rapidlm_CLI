@@ -16,6 +16,7 @@ use capability_broker::{
     PolicyRevision, PolicySource, PolicyStack, PrincipalRef, Resolver, evaluate, issue,
     normalize_exec, request_approval, validate_use,
 };
+use agent_runtime::ToolDriver;
 use crate::external_agents::CliRunner;
 use mcp::{ImplementationInfo, McpServer, McpServerConfig, ProtocolVersion};
 use scheduler::graph::RuntimeGraph;
@@ -189,6 +190,58 @@ pub fn run_mcp_tools(args: &[String]) -> Result<i32, P9CommandError> {
         "exposes_write": surface.exposes_write(),
         "exposes_shell": surface.exposes_shell(),
         "exposes_browser": surface.exposes_browser(),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).map_err(P9CommandError::Json)?
+    );
+    Ok(0)
+}
+
+/// Dump the model-facing tool surface's typed JSON schemas — a static,
+/// versioned artifact analogous to Claude Code's `sdk-tools.d.ts` or Grok
+/// Build's protobuf tool API (newtask.md item 1.3/#10: "no SDK-style typed
+/// tool-schema export"). Introspective only: `root` is never written to,
+/// just used to construct a real `ExecTools` (the same tool-name/schema set
+/// the model would see for a trusted workspace), defaulting to the current
+/// directory when `--root` is not given. `--read-only` dumps the narrower
+/// surface a subagent's `explore`/`plan` scope actually gets instead.
+pub fn run_tools_schema(args: &[String]) -> Result<i32, P9CommandError> {
+    let mut root = std::env::current_dir().map_err(P9CommandError::Io)?;
+    let mut read_only = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--root" => {
+                i += 1;
+                root = args.get(i).map(PathBuf::from).ok_or(P9CommandError::Usage)?;
+            }
+            "--read-only" => read_only = true,
+            _ => return Err(P9CommandError::Usage),
+        }
+        i += 1;
+    }
+    let tools = if read_only {
+        crate::exec_tools::ExecTools::read_only(&root)
+    } else {
+        crate::exec_tools::ExecTools::workspace(&root)
+    }
+    .map_err(|err| P9CommandError::Agent(format!("{err:?}")))?;
+    let schemas: Vec<serde_json::Value> = tools
+        .tool_surface()
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "name": tool.name(),
+                "description": tool.description(),
+                "parameters": tool.parameters(),
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "schema": "rapidlm.tool_surface",
+        "read_only": read_only,
+        "tools": schemas,
     });
     println!(
         "{}",
@@ -419,6 +472,43 @@ mod tests {
     }
 
     #[test]
+    fn tools_schema_dumps_every_tool_with_a_json_schema() {
+        let root = temp_file("tools-schema-root");
+        std::fs::create_dir_all(&root).expect("root");
+        let args = vec!["--root".to_owned(), root.to_string_lossy().into_owned()];
+        let code = run_tools_schema(&args).expect("tools command");
+        assert_eq!(code, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tools_schema_read_only_advertises_a_narrower_surface() {
+        let root = temp_file("tools-schema-ro-root");
+        std::fs::create_dir_all(&root).expect("root");
+        let full = crate::exec_tools::ExecTools::workspace(&root)
+            .expect("workspace tools")
+            .tool_surface()
+            .len();
+        let read_only = crate::exec_tools::ExecTools::read_only(&root)
+            .expect("read-only tools")
+            .tool_surface()
+            .len();
+        assert!(
+            read_only < full,
+            "read-only surface ({read_only}) should be strictly narrower than the full surface ({full})"
+        );
+        let args = vec!["--root".to_owned(), root.to_string_lossy().into_owned(), "--read-only".to_owned()];
+        assert_eq!(run_tools_schema(&args).expect("tools command"), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tools_schema_rejects_unknown_flags() {
+        let args = vec!["--bogus".to_owned()];
+        assert!(matches!(run_tools_schema(&args), Err(P9CommandError::Usage)));
+    }
+
+    #[test]
     fn mcp_tools_command_performs_real_handshake_and_intersection() {
         let args = vec!["--tools".to_owned(), "repo.read,shell.exec".to_owned()];
         let code = run_mcp_tools(&args).expect("surface command");
@@ -451,6 +541,7 @@ pub const RAPID_SUBCOMMANDS: &[(&str, &str)] = &[
     ("goal", "durable goal lifecycle (create/show/pause/resume/cancel/export/verify)"),
     ("playbook-compile", "compile a playbook JSON template into an initial graph"),
     ("mcp-tools", "print the published RapidLM MCP server surface"),
+    ("tools", "dump the model-facing tool surface's typed JSON schemas"),
     ("agent-cli", "one supervised external CLI agent turn: <prompt> -- argv..."),
     ("sessions", "list or search sessions"),
     ("inspect-export", "export the raw event ledger for a session as JSONL"),
