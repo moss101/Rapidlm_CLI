@@ -24,7 +24,7 @@ use agent_runtime::{
     CancellationToken, ContextController, ContextOverflow, ContextRecoveryDecision,
     ContextRetryPolicy, ContextRevision, FailureCause, ModelDriver, ModelStepError, ModelStepInput,
     ModelStepOutput, ProposedToolCall, ToolDriver, ToolStepError, ToolStepResult,
-    TurnAgentExecutor, TurnEventSink, ValidatedToolCall,
+    TurnAgentExecutor, TurnEventSink, TurnFailureDetail, TurnStopReason, ValidatedToolCall,
 };
 use context_engine::CancellationToken as CeCancel;
 use context_engine::compact::compact_packet;
@@ -63,8 +63,14 @@ pub const MAX_REMINDERS_BLOCK_BYTES: usize = 8 * 1024;
 /// bounded retries with the base below cover provider stream drops (b.ai
 /// drops long sessions for seconds at a time).
 pub const MAX_TRANSIENT_RETRIES: u32 = 5;
+/// Maximum retry attempts for an empty terminal response specifically. Empty
+/// responses are provider transients too, but each one is a full billed
+/// request, so the ceiling stays tighter than [`MAX_TRANSIENT_RETRIES`].
+pub const MAX_EMPTY_RESPONSE_RETRIES: u32 = 2;
 /// Base backoff before the first retry; doubled per subsequent retry
 /// (1s, 2s, 4s, 8s, 16s — bounded, cancellable, honoring retry-after).
+/// `RAPIDLM_RETRY_BASE_MS` overrides the base for one run (clamped to
+/// 0..=60000) so deployments and tests can shorten the waits.
 pub const RETRY_BACKOFF_BASE_MS: u64 = 1000;
 /// Backoff waits are polled in slices of this size so cancellation stays
 /// responsive without busy-spinning.
@@ -536,7 +542,8 @@ fn cause_tag(cause: FailureCause) -> &'static str {
 /// provider retry-after hint (never shorter than the doubling backoff) and
 /// staying cancellable in small slices. Returns false when cancelled.
 fn sleep_backoff(cancel: &CancellationToken, attempt: u32, retry_after_ms: Option<u64>) -> bool {
-    let doubling = RETRY_BACKOFF_BASE_MS << attempt.min(16);
+    let base = retry_base_ms();
+    let doubling = base << attempt.min(16);
     let wait_ms = retry_after_ms.map_or(doubling, |after| after.max(doubling));
     let mut waited = 0u64;
     while waited < wait_ms {
@@ -550,10 +557,21 @@ fn sleep_backoff(cancel: &CancellationToken, attempt: u32, retry_after_ms: Optio
     !cancel.is_cancelled()
 }
 
+/// Retry-after base in milliseconds: `RAPIDLM_RETRY_BASE_MS` when set and in
+/// range, else [`RETRY_BACKOFF_BASE_MS`].
+fn retry_base_ms() -> u64 {
+    std::env::var("RAPIDLM_RETRY_BASE_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(|ms| ms.min(60_000))
+        .unwrap_or(RETRY_BACKOFF_BASE_MS)
+}
+
 /// Step-layer supervision over the provider backing: accumulates
-/// provider-reported tokens, retries transient-class step failures with
-/// bounded backoff (honoring provider retry-after hints and cancellation),
-/// and emits one diagnostics line per attempt when enabled.
+/// provider-reported tokens, retries transient-class failures, provider
+/// rejections, and empty terminal responses with bounded backoff (honoring
+/// provider retry-after hints and cancellation), and emits one diagnostics
+/// line per attempt when enabled.
 ///
 /// Only the model-step invocation itself is retried, and a failed step
 /// proposed no tool calls — so already-committed tool effects are never
@@ -609,6 +627,20 @@ impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
                     attempt += 1;
                     continue;
                 }
+                // A provider rejection of an already-shaped request (free-tier
+                // rate limiting, transient capacity errors) is retryable: a
+                // failed step committed no tool effects, so re-invoking is
+                // safe within the bounded ceiling.
+                Err(ModelStepError::ProviderFailed {
+                    cause: FailureCause::Rejected,
+                }) if attempt < MAX_TRANSIENT_RETRIES => {
+                    self.diag_attempt(attempt, "failed:rejected", 0);
+                    if !sleep_backoff(cancel, attempt, None) {
+                        return Err(ModelStepError::Cancelled);
+                    }
+                    attempt += 1;
+                    continue;
+                }
                 Err(ModelStepError::ProviderFailed { cause }) => {
                     let tag = cause_tag(*cause);
                     self.diag_attempt(attempt, &format!("failed:{tag}"), 0);
@@ -632,14 +664,38 @@ impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
                     self.diag_attempt(attempt, "failed:unspecified", 0);
                     return result;
                 }
-                Ok(
-                    ModelStepOutput::Terminal { tokens, .. }
-                    | ModelStepOutput::ToolCalls { tokens, .. },
-                ) => {
+                Ok(ModelStepOutput::ToolCalls { tokens, .. }) => {
                     let tokens = *tokens;
                     self.counter
                         .fetch_add(tokens, std::sync::atomic::Ordering::Relaxed);
                     self.diag_attempt(attempt, "ok", tokens);
+                    return result;
+                }
+                Ok(ModelStepOutput::Terminal { text, tokens }) => {
+                    let tokens = *tokens;
+                    self.counter
+                        .fetch_add(tokens, std::sync::atomic::Ordering::Relaxed);
+                    // An empty terminal response is a provider-side transient
+                    // (the provider billed the request but returned nothing):
+                    // retry under the same bounded backoff instead of failing
+                    // the turn on first occurrence.
+                    if text.is_empty() && attempt < MAX_EMPTY_RESPONSE_RETRIES {
+                        self.diag_attempt(attempt, "empty_response", tokens);
+                        if !sleep_backoff(cancel, attempt, None) {
+                            return Err(ModelStepError::Cancelled);
+                        }
+                        attempt += 1;
+                        continue;
+                    }
+                    self.diag_attempt(
+                        attempt,
+                        if text.is_empty() {
+                            "empty_response"
+                        } else {
+                            "ok"
+                        },
+                        tokens,
+                    );
                     return result;
                 }
             }
@@ -649,11 +705,16 @@ impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
 
 /// What one `exec`/`goal` turn produced: the canonical result, the
 /// provider-classified failure cause (when the turn failed on a model step),
-/// and the provider-reported token total.
+/// the failing-tool detail (when the turn stopped on a tool failure), the
+/// typed stop reason and tool-call count (for exit-code decisions), and the
+/// provider-reported token total.
 #[derive(Clone, Debug)]
 pub struct ExecOutcome {
     pub result: AgentResult,
     pub failure_cause: Option<FailureCause>,
+    pub failure_detail: Option<TurnFailureDetail>,
+    pub stop_reason: Option<TurnStopReason>,
+    pub tool_calls: u32,
     pub tokens: u64,
 }
 
@@ -696,12 +757,17 @@ where
         );
         if let Some(cause) = outcome.failure_cause {
             line.push_str(&format!(" cause={}", cause_tag(cause)));
+        } else if let Some(reason) = outcome.stop_reason {
+            line.push_str(&format!(" reason={}", reason.as_str()));
         }
         diag.line(line);
     }
     Ok(ExecOutcome {
         result: outcome.result,
         failure_cause: outcome.failure_cause,
+        failure_detail: outcome.failure_detail,
+        stop_reason: outcome.stop_reason,
+        tool_calls: outcome.tool_calls,
         tokens,
     })
 }
@@ -1211,6 +1277,116 @@ mod tests {
             1,
             "auth failures are actionable, never auto-retried"
         );
+    }
+
+    #[test]
+    fn provider_rejection_is_retried_then_succeeds() {
+        // Free-tier endpoints reject already-shaped requests (capacity,
+        // per-minute limits surfaced as 4xx): a failed step committed no tool
+        // effects, so the rejection is retried under the bounded backoff.
+        let request = AgentExecutionRequest::new(spec(), SessionId::new());
+        let mut events = Vec::new();
+        let backing = ScriptedBacking::new(vec![
+            Err(ModelStepError::ProviderFailed {
+                cause: FailureCause::Rejected,
+            }),
+            Ok(ModelStepOutput::Terminal {
+                text: "recovered after rejection".to_owned(),
+                tokens: 1,
+            }),
+        ]);
+        let witness = backing.clone();
+        let outcome = run_live_exec(
+            preserved(),
+            backing,
+            &request,
+            &mut CountingTools { executed: 0 },
+            &mut events,
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+        )
+        .expect("execute");
+        assert_eq!(outcome.result.summary(), "recovered after rejection");
+        assert_eq!(outcome.failure_cause, None);
+        assert_eq!(witness.saw_blocks.borrow().len(), 2, "one retry, then success");
+    }
+
+    #[test]
+    fn empty_terminal_response_is_retried_then_succeeds() {
+        let request = AgentExecutionRequest::new(spec(), SessionId::new());
+        let mut events = Vec::new();
+        let backing = ScriptedBacking::new(vec![
+            Ok(ModelStepOutput::Terminal {
+                text: String::new(),
+                tokens: 1,
+            }),
+            Ok(ModelStepOutput::Terminal {
+                text: String::new(),
+                tokens: 1,
+            }),
+            Ok(ModelStepOutput::Terminal {
+                text: "finally non-empty".to_owned(),
+                tokens: 1,
+            }),
+        ]);
+        let witness = backing.clone();
+        let outcome = run_live_exec(
+            preserved(),
+            backing,
+            &request,
+            &mut CountingTools { executed: 0 },
+            &mut events,
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+        )
+        .expect("execute");
+        assert_eq!(outcome.result.summary(), "finally non-empty");
+        assert_eq!(
+            witness.saw_blocks.borrow().len(),
+            3,
+            "two bounded empty-response retries, then success"
+        );
+    }
+
+    #[test]
+    fn exhausted_empty_responses_stop_typed_and_report_tool_count() {
+        // Every empty retry exhausted: the turn fails with the typed
+        // empty_response stop and the outcome still reports that no tool
+        // calls were executed — the exact inputs of the CLI exit-code
+        // decision (work-committed empty finals exit 0; this run is not one).
+        let request = AgentExecutionRequest::new(spec(), SessionId::new());
+        let mut events = Vec::new();
+        let empty = || {
+            Ok(ModelStepOutput::Terminal {
+                text: String::new(),
+                tokens: 1,
+            })
+        };
+        let mut outputs = Vec::new();
+        for _ in 0..30 {
+            outputs.push(empty());
+        }
+        let backing = ScriptedBacking::new(outputs);
+        let witness = backing.clone();
+        let outcome = run_live_exec(
+            preserved(),
+            backing,
+            &request,
+            &mut CountingTools { executed: 0 },
+            &mut events,
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+        )
+        .expect("execute");
+        // 3 turn-level empty attempts x (1 initial + 2 step retries).
+        assert_eq!(witness.saw_blocks.borrow().len(), 9);
+        assert_eq!(outcome.result.status(), agent_runtime::AgentTerminalStatus::Failed);
+        assert_eq!(outcome.stop_reason, Some(TurnStopReason::EmptyResponse));
+        assert_eq!(outcome.failure_cause, None);
+        assert_eq!(outcome.tool_calls, 0);
     }
 
     #[test]

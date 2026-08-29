@@ -70,6 +70,40 @@ pub enum TurnStopReason {
     ContextBoundExceeded,
 }
 
+/// Bounded detail for the failing tool when a turn stops on
+/// [`TurnStopReason::ToolFailed`]. `tool` names the failing call; `error` is
+/// the bounded one-line underlying outcome, safe for operator display — never
+/// a substitute for the structured model-visible result.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct TurnFailureDetail {
+    tool: String,
+    error: String,
+}
+
+/// Byte bound for the operator-facing error text in [`TurnFailureDetail`].
+const FAILURE_DETAIL_ERROR_BYTES: usize = 300;
+
+impl TurnFailureDetail {
+    pub fn new(tool: impl Into<String>, error: &str) -> Self {
+        let mut end = FAILURE_DETAIL_ERROR_BYTES.min(error.len());
+        while !error.is_char_boundary(end) {
+            end -= 1;
+        }
+        Self {
+            tool: tool.into(),
+            error: error[..end].to_owned(),
+        }
+    }
+
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+
+    pub fn error(&self) -> &str {
+        &self.error
+    }
+}
+
 /// Terminal class recorded on [`TurnResult`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
@@ -421,6 +455,8 @@ pub struct TurnResult {
     terminal_output: Option<BoundedAssistantOutput>,
     /// Provider-classified cause when the turn failed on a model step.
     failure_cause: Option<FailureCause>,
+    /// Failing-tool detail when the turn stopped on [`TurnStopReason::ToolFailed`].
+    failure_detail: Option<TurnFailureDetail>,
 }
 
 /// Collaborators and identity for one [`run_turn`].
@@ -554,6 +590,9 @@ struct LoopState {
     budget: TurnBudget,
     usage: TurnUsage,
     unhandled_tool_failure: bool,
+    /// Most recent failing tool, kept so every `ToolFailed` stop — including
+    /// leftover-state stops with no call at hand — can name it.
+    failure_detail: Option<TurnFailureDetail>,
     loop_detector: ToolCallLoopDetector,
     empty_responses: u32,
 }
@@ -866,6 +905,12 @@ impl TurnResult {
     pub const fn failure_cause(&self) -> Option<FailureCause> {
         self.failure_cause
     }
+
+    /// Failing-tool detail when the turn stopped on
+    /// [`TurnStopReason::ToolFailed`]; `None` for every other stop.
+    pub fn failure_detail(&self) -> Option<&TurnFailureDetail> {
+        self.failure_detail.as_ref()
+    }
 }
 
 impl<'a, M, T, E> TurnSpec<'a, M, T, E> {
@@ -935,6 +980,7 @@ where
         budget: spec.budget,
         usage: TurnUsage::default(),
         unhandled_tool_failure: false,
+        failure_detail: None,
         loop_detector: ToolCallLoopDetector::new(),
         empty_responses: 0,
     };
@@ -1038,6 +1084,7 @@ where
                 events,
                 TurnStopReason::ModelFailed,
                 Some(FailureCause::Unspecified),
+                None,
             )?));
         }
         Err(ModelStepError::ProviderFailed { cause }) => {
@@ -1053,6 +1100,7 @@ where
                 events,
                 TurnStopReason::ModelFailed,
                 Some(cause),
+                None,
             )?));
         }
         Err(ModelStepError::BoundExceeded) => {
@@ -1277,8 +1325,12 @@ where
                 });
                 break;
             }
-            Err(ToolStepError::Invalid | ToolStepError::Failed) => {
+            Err(err @ (ToolStepError::Invalid | ToolStepError::Failed)) => {
                 state.unhandled_tool_failure = true;
+                state.failure_detail = Some(TurnFailureDetail::new(
+                    call.tool.clone(),
+                    err.as_str(),
+                ));
                 refusal = Some(StepRefusal {
                     call: Some(call),
                     action: RefusalAction::Fail(TurnStopReason::ToolFailed),
@@ -1289,6 +1341,10 @@ where
 
         if validated.call_id != call.call_id || validated.tool != call.tool {
             state.unhandled_tool_failure = true;
+            state.failure_detail = Some(TurnFailureDetail::new(
+                call.tool.clone(),
+                "tool call identity changed during validation",
+            ));
             refusal = Some(StepRefusal {
                 call: Some(call),
                 action: RefusalAction::Fail(TurnStopReason::ToolFailed),
@@ -1366,9 +1422,13 @@ where
                 emit_tool_failed(state, events, call)?;
                 return Ok(ToolBatchOutcome::Stopped(interrupt(state, events)?));
             }
-            Err(ToolStepError::Invalid | ToolStepError::Failed) => {
+            Err(err @ (ToolStepError::Invalid | ToolStepError::Failed)) => {
                 emit_tool_failed(state, events, call)?;
                 state.unhandled_tool_failure = true;
+                state.failure_detail = Some(TurnFailureDetail::new(
+                    call.tool.clone(),
+                    err.as_str(),
+                ));
                 return Ok(ToolBatchOutcome::Stopped(fail(
                     state,
                     events,
@@ -1390,6 +1450,10 @@ where
         }
         if result.is_unhandled_failure() {
             state.unhandled_tool_failure = true;
+            state.failure_detail = Some(TurnFailureDetail::new(
+                call.tool.clone(),
+                &unhandled_failure_text(&result),
+            ));
             return Ok(ToolBatchOutcome::Stopped(fail(
                 state,
                 events,
@@ -1446,6 +1510,18 @@ fn emit_tool_failed<E: TurnEventSink>(
     )
 }
 
+/// Operator-facing one-liner for an unhandled per-call tool failure: the
+/// driver's own detail when present, else a stable fallback.
+fn unhandled_failure_text(result: &ToolStepResult) -> String {
+    match result {
+        ToolStepResult::Failed {
+            detail: Some(detail),
+            ..
+        } => detail.clone(),
+        _ => "tool reported an unhandled failure".to_owned(),
+    }
+}
+
 fn complete<E: TurnEventSink>(
     state: &LoopState,
     events: &mut E,
@@ -1468,6 +1544,7 @@ fn complete<E: TurnEventSink>(
         terminal_hash: terminal_text.map(|text| ArtifactId::from_bytes(text.as_bytes())),
         terminal_output: terminal_text.map(BoundedAssistantOutput::new),
         failure_cause: None,
+        failure_detail: None,
     })
 }
 
@@ -1476,7 +1553,14 @@ fn fail<E: TurnEventSink>(
     events: &mut E,
     reason: TurnStopReason,
 ) -> Result<TurnResult, TurnError> {
-    fail_with_cause(state, events, reason, None)
+    // A ToolFailed stop carries the most recent failing tool so the CLI can
+    // name it; every other stop has no tool detail by definition.
+    let detail = if reason == TurnStopReason::ToolFailed {
+        state.failure_detail.clone()
+    } else {
+        None
+    };
+    fail_with_cause(state, events, reason, None, detail)
 }
 
 /// Like [`fail`], but records the provider-classified cause that produced the
@@ -1487,6 +1571,7 @@ fn fail_with_cause<E: TurnEventSink>(
     events: &mut E,
     reason: TurnStopReason,
     cause: Option<FailureCause>,
+    detail: Option<TurnFailureDetail>,
 ) -> Result<TurnResult, TurnError> {
     emit(
         events,
@@ -1503,6 +1588,7 @@ fn fail_with_cause<E: TurnEventSink>(
         terminal_hash: None,
         terminal_output: None,
         failure_cause: cause,
+        failure_detail: detail,
     })
 }
 
@@ -1521,6 +1607,7 @@ fn interrupt<E: TurnEventSink>(state: &LoopState, events: &mut E) -> Result<Turn
         terminal_hash: None,
         terminal_output: None,
         failure_cause: None,
+        failure_detail: None,
     })
 }
 
@@ -1813,6 +1900,74 @@ mod tests {
 
     fn call(id: &str, tool: &str) -> ProposedToolCall {
         ProposedToolCall::new(id, tool, "{}").expect("call")
+    }
+
+    #[test]
+    fn tool_failure_stop_names_the_failing_tool_and_error() {
+        // The proposed call's execution fails at the driver: the turn stops
+        // ToolFailed and the result carries the failing tool's name plus the
+        // underlying error text, so a CLI can diagnose without replaying.
+        let mut model = ScriptedModel::new(vec![
+            tools_out(vec![call("c1", "repo.search")], 1),
+            terminal("unreached", 1),
+        ]);
+        let mut tools = ScriptedTools::new(vec![Err(ToolStepError::Failed)]);
+        let mut events = Vec::new();
+        let result = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(result.status(), TurnStatus::Failed);
+        assert_eq!(result.reason(), Some(TurnStopReason::ToolFailed));
+        assert!(result.failure_cause().is_none());
+        let detail = result.failure_detail().expect("tool detail");
+        assert_eq!(detail.tool(), "repo.search");
+        assert_eq!(detail.error(), "tool step failed");
+    }
+
+    #[test]
+    fn unhandled_tool_result_detail_surfaces_in_failure_detail() {
+        // An unhandled Failed result (driver-produced detail): the detail text
+        // rides the stop instead of collapsing into the bare reason.
+        let mut model = ScriptedModel::new(vec![
+            tools_out(vec![call("c1", "workspace.write")], 1),
+            terminal("unreached", 1),
+        ]);
+        let mut tools = ScriptedTools::new(vec![Ok(ToolStepResult::Failed {
+            call_id: "c1".to_owned(),
+            handled: false,
+            detail: Some("write refused: outside the workspace root".to_owned()),
+        })]);
+        let mut events = Vec::new();
+        let result = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(result.status(), TurnStatus::Failed);
+        assert_eq!(result.reason(), Some(TurnStopReason::ToolFailed));
+        let detail = result.failure_detail().expect("tool detail");
+        assert_eq!(detail.tool(), "workspace.write");
+        assert_eq!(detail.error(), "write refused: outside the workspace root");
+    }
+
+    #[test]
+    fn turn_failure_detail_error_text_is_bounded() {
+        let long = "x".repeat(10_000);
+        let detail = TurnFailureDetail::new("shell_exec", &long);
+        assert_eq!(detail.tool(), "shell_exec");
+        assert_eq!(detail.error().len(), FAILURE_DETAIL_ERROR_BYTES);
+        // Bounds are char-safe: a multibyte tail never splits a code point.
+        let multibyte = "héllo ".repeat(2_000);
+        let detail = TurnFailureDetail::new("t", &multibyte);
+        assert!(detail.error().is_char_boundary(detail.error().len()));
     }
 
     fn kinds(events: &[TurnEvent]) -> Vec<&'static str> {

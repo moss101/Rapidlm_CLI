@@ -145,10 +145,11 @@ pub use prompt::{
     core_prefix_hash,
 };
 pub use turn::{
-    BoundedAssistantOutput, FailureCause, MAX_ARGUMENT_BYTES, MAX_CALL_ID_BYTES, MAX_MODEL_STEPS,
-    MAX_TEXT_BYTES, MAX_TOOL_CALLS_PER_STEP, MAX_TOOL_NAME_BYTES, MAX_TURN_EVENTS, ModelDriver,
-    ModelStepError, ModelStepInput, ModelStepOutput, ProposedToolCall, ToolDriver, ToolKind,
-    ToolStepError, ToolStepExchange, ToolStepResult, TurnBudget, TurnError, TurnEvent,
-    TurnEventKind, TurnEventSink, TurnResult, ToolSurface, TurnSpec, TurnStatus, TurnStopReason,
-    TurnUsage, ValidatedToolCall, run_turn,
+    BoundedAssistantOutput, EMPTY_RESPONSE_RETRY_LIMIT, FailureCause, MAX_ARGUMENT_BYTES,
+    MAX_CALL_ID_BYTES, MAX_MODEL_STEPS, MAX_TEXT_BYTES, MAX_TOOL_CALLS_PER_STEP,
+    MAX_TOOL_NAME_BYTES, MAX_TURN_EVENTS, ModelDriver, ModelStepError, ModelStepInput,
+    ModelStepOutput, ProposedToolCall, ToolDriver, ToolKind, ToolStepError, ToolStepExchange,
+    ToolStepResult, TurnBudget, TurnError, TurnEvent, TurnEventKind, TurnEventSink,
+    TurnFailureDetail, TurnResult, ToolSurface, TurnSpec, TurnStatus, TurnStopReason, TurnUsage,
+    ValidatedToolCall, run_turn,
 };

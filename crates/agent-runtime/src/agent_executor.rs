@@ -24,7 +24,7 @@ use crate::context_recovery::{
     ContextRetryPolicy, RetryOutcome, should_retry,
 };
 use crate::role_profile::RoleToolSurface;
-use crate::turn::{FailureCause};
+use crate::turn::{FailureCause, TurnFailureDetail};
 use crate::turn::{
     MAX_MODEL_STEPS, ModelDriver, ToolDriver, TurnBudget, TurnError, TurnEventSink, TurnResult,
     TurnSpec, TurnStatus, TurnStopReason, run_turn,
@@ -207,6 +207,9 @@ pub trait AgentExecutor {
             .map(|result| AgentOutcome {
                 result,
                 failure_cause: None,
+                failure_detail: None,
+                stop_reason: None,
+                tool_calls: 0,
             })
     }
 }
@@ -242,13 +245,17 @@ impl AgentExecutionError {
 }
 
 /// Canonical execution outcome: the assembled [`AgentResult`] plus the
-/// provider-classified cause when the turn failed on a model step. The cause
-/// rides this in-memory struct — `AgentResult` is a wire type and stays
-/// unchanged.
+/// provider-classified cause when the turn failed on a model step, the
+/// failing-tool detail for a `ToolFailed` stop, and the typed stop reason and
+/// tool-call count for exit-code decisions. These ride this in-memory struct —
+/// `AgentResult` is a wire type and stays unchanged.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentOutcome {
     pub result: AgentResult,
     pub failure_cause: Option<FailureCause>,
+    pub failure_detail: Option<TurnFailureDetail>,
+    pub stop_reason: Option<TurnStopReason>,
+    pub tool_calls: u32,
 }
 
 /// Default executor: runs a turn and assembles a canonical `AgentResult`.
@@ -423,6 +430,9 @@ impl AgentExecutor for TurnAgentExecutor {
                     .map(|bound| AgentOutcome {
                         result: bound,
                         failure_cause: cause,
+                        failure_detail: turn.failure_detail().cloned(),
+                        stop_reason: turn.reason(),
+                        tool_calls: turn.usage().tool_calls(),
                     })
                     .map_err(|_| AgentExecutionError::AgentResult);
             }

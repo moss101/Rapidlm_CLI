@@ -502,6 +502,9 @@ pub struct WorkspaceTools {
     jobs: JobRegistry,
     plan_mode: Arc<AtomicBool>,
     read_only: bool,
+    /// One stderr line per tool call (name + outcome + detail). Off by
+    /// default; headless `exec` turns it on so runs are diagnosable.
+    trace_calls: bool,
     subagents: Option<Arc<dyn SubagentRunner>>,
     fetch_allowlist: Vec<String>,
     hooks: crate::hooks::HooksConfig,
@@ -532,6 +535,7 @@ impl WorkspaceTools {
             jobs: JobRegistry::default(),
             plan_mode: Arc::new(AtomicBool::new(false)),
             read_only: false,
+            trace_calls: false,
             subagents: None,
             fetch_allowlist: Vec::new(),
             hooks: crate::hooks::HooksConfig::default(),
@@ -539,6 +543,12 @@ impl WorkspaceTools {
             mcp: Arc::new(Mutex::new(Vec::new())),
             mcp_surface: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    /// Emit one stderr line per tool call (name + one-line outcome + detail).
+    /// Headless exec enables this; the interactive TUI keeps it off.
+    pub fn set_trace_calls(&mut self, trace: bool) {
+        self.trace_calls = trace;
     }
 
     /// Register configured stdio MCP servers: spawn, initialize, list tools,
@@ -576,9 +586,7 @@ impl WorkspaceTools {
                     self.mcp.lock().expect("mcp").push(McpConnection {
                         server: server.name.clone(),
                         online: false,
-                        child: None,
                         session: None,
-                        tools: Vec::new(),
                     });
                     continue;
                 }
@@ -617,9 +625,7 @@ impl WorkspaceTools {
             self.mcp.lock().expect("mcp").push(McpConnection {
                 server: server.name.clone(),
                 online: true,
-                child: Some(child),
                 session: Some(Mutex::new(session)),
-                tools,
             });
         }
     }
@@ -722,6 +728,37 @@ impl WorkspaceTools {
     /// Execute one validated call against the workspace. Inherent `&self` so
     /// the batch dispatcher can run independent calls on threads.
     fn execute_call(
+        &self,
+        call: &ValidatedToolCall,
+        cancel: &CancellationToken,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        let outcome = self.execute_call_traced(call, cancel);
+        if self.trace_calls {
+            let line = match &outcome {
+                Ok(ToolStepResult::Succeeded { summary, .. }) => {
+                    format!("tool {}: ok ({})", call.tool(), single_line(summary))
+                }
+                Ok(ToolStepResult::Failed { detail, .. }) => format!(
+                    "tool {}: failed ({})",
+                    call.tool(),
+                    single_line(detail.as_deref().unwrap_or("no detail"))
+                ),
+                Ok(ToolStepResult::Denied { detail, .. }) => format!(
+                    "tool {}: denied ({})",
+                    call.tool(),
+                    single_line(detail.as_deref().unwrap_or("no detail"))
+                ),
+                Ok(ToolStepResult::ApprovalRequired { .. }) => {
+                    format!("tool {}: approval_required", call.tool())
+                }
+                Err(err) => format!("tool {}: error ({})", call.tool(), err.as_str()),
+            };
+            eprintln!("{}", bounded_detail(&line));
+        }
+        outcome
+    }
+
+    fn execute_call_traced(
         &self,
         call: &ValidatedToolCall,
         cancel: &CancellationToken,
@@ -1115,10 +1152,9 @@ impl WorkspaceTools {
         cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_shell_args(call.arguments())?;
-        eprintln!(
-            "DEBUG execute_shell argv={:?} background={} sandbox={} timeout={:?}",
-            args.argv, args.background, args.sandbox, args.timeout
-        );
+        if self.trace_calls {
+            eprintln!("tool shell_exec: argv={:?} background={} sandbox={}", args.argv, args.background, args.sandbox);
+        }
         if args.sandbox {
             // Seatbelt confinement (macOS): workspace writes allowed, other
             // writes denied. Unavailability is a typed handled failure.
@@ -1913,6 +1949,19 @@ fn bounded_detail(text: &str) -> String {
     text[..end].to_owned()
 }
 
+/// Flatten a detail onto one line so trace output stays line-oriented.
+fn single_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '\n' || ch == '\r' {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 struct WriteArgs {
     path: String,
     content: String,
@@ -2219,9 +2268,7 @@ pub fn parse_mcp_servers(value: &serde_json::Value) -> Vec<McpServerConfig> {
 struct McpConnection {
     server: String,
     online: bool,
-    child: Option<std::process::Child>,
     session: Option<Mutex<mcp_session_box::SessionBox>>,
-    tools: Vec<mcp::transport::McpToolDescriptor>,
 }
 
 mod mcp_session_box {
@@ -2602,6 +2649,13 @@ impl ExecTools {
         }
     }
 
+    /// One stderr line per tool call (no-op on the no-op surface).
+    pub fn set_trace_calls(&mut self, trace: bool) {
+        if let Self::Workspace(tools) = self {
+            tools.set_trace_calls(trace);
+        }
+    }
+
     /// Hosts web_fetch may fetch despite resolving private (local fixtures).
     pub fn set_fetch_allowlist(&mut self, allowlist: Vec<String>) {
         if let Self::Workspace(tools) = self {
@@ -2816,7 +2870,6 @@ impl ToolDriver for ExecTools {
             return Vec::new();
         };
         let notices = tools.jobs.drain_notifications();
-        eprintln!("DEBUG ExecTools drain: {} notices", notices.len());
         notices
             .into_iter()
             .into_iter()

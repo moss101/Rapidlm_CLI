@@ -44,7 +44,7 @@ use agent_runtime::{
     AgentExecutionRequest, AgentResult, AgentRole, AgentSpec, AgentTerminalStatus,
     ContextRetryPolicy, EvidenceKind, EvidenceLedgerRef, EvidenceProducer, EvidenceSpec,
     EvidenceStatus, FailureCause, GoalActor, GoalBudget, GoalCommand, GoalSnapshot, GoalSpec,
-    GoalState, TEST_PASSED,
+    GoalState, TEST_PASSED, TurnFailureDetail, TurnStopReason,
 };
 
 /// Bound on ancestors inspected while locating `.rapidlm` / `.git`.
@@ -168,18 +168,20 @@ enum LoopControl {
 
 /// Classify argv after the program name. Flags do not select a subcommand.
 pub fn classify_launch<S: AsRef<str>>(args: &[S]) -> LaunchMode {
-    for arg in args {
-        let arg = arg.as_ref();
-        if arg == "--help" || arg == "-h" {
-            return LaunchMode::Help;
-        }
-    }
+    // `--help` before any subcommand word prints the top-level usage; after
+    // one it belongs to that subcommand (`rapid exec --help` → exec usage).
     for arg in args {
         let arg = arg.as_ref();
         if arg == "--" || arg.starts_with('-') {
             continue;
         }
         return LaunchMode::Subcommand;
+    }
+    for arg in args {
+        let arg = arg.as_ref();
+        if arg == "--help" || arg == "-h" {
+            return LaunchMode::Help;
+        }
     }
     LaunchMode::Interactive
 }
@@ -214,6 +216,34 @@ usage: rapid [subcommand]
   rapid export
   rapid doctor
   rapid update
+";
+
+/// Exec-specific usage, printed by `rapid exec --help` and on exec usage
+/// errors. Documents the prompt argument, the exec flags, and the env vars
+/// that shape a headless run.
+pub const EXEC_USAGE: &str = "\
+usage: rapid exec <prompt> [--verbose]
+
+Run one headless agent turn with the configured model. The final response is
+printed to stdout; diagnostics go to stderr; a non-zero exit code reports a
+failed turn.
+
+Arguments:
+  <prompt>    Task prompt for the agent (required)
+
+Options:
+  --verbose   Per-attempt model and turn diagnostics on stderr
+  -h, --help  Print this help
+
+Environment:
+  RAPIDLM_PERMISSION_MODE  Tool approval mode for this run: default | plan |
+                           acceptEdits | auto | dontAsk | bypassPermissions
+  RAPIDLM_CONFIG           Path to a model config TOML overriding the user
+                           config
+  RAPIDLM_MODEL            Model id override for this run
+
+Workspace tools stay disabled until the project is trusted: run `rapid`
+interactively once in the project to approve trust.
 ";
 
 /// Process entry: no subcommand starts the TUI against the detected project.
@@ -824,8 +854,22 @@ fn exec_user_home() -> Option<PathBuf> {
 /// Cause-classified failure line for a finished turn: a provider cause names
 /// the class and the first remedy; otherwise the turn summary carries the
 /// typed stop reason (e.g. "agent turn failed: repeated_tool_call").
-fn describe_turn_failure(result: &AgentResult, cause: Option<FailureCause>) -> String {
+fn describe_turn_failure(
+    result: &AgentResult,
+    cause: Option<FailureCause>,
+    detail: Option<&TurnFailureDetail>,
+) -> String {
     let summary = result.summary();
+    // A tool-failure stop names the failing tool and the underlying error so
+    // the run is diagnosable from CLI output alone; model failures keep the
+    // typed cause + remedy form.
+    if let Some(detail) = detail {
+        return format!(
+            "{summary} (failing tool: {}; {})",
+            detail.tool(),
+            detail.error()
+        );
+    }
     match cause {
         Some(cause) => format!(
             "{summary} ({}; {})",
@@ -1024,7 +1068,12 @@ fn exec_discover_rules(cwd: &Path, root: &Path) -> Option<String> {
 /// only when the project is explicitly trusted; anything else stays a
 /// fail-closed refusal. `--verbose` opts into bounded step diagnostics.
 fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{EXEC_USAGE}");
+        return Ok(0);
+    }
     let Some(parsed) = parse_exec_args(args) else {
+        eprint!("{EXEC_USAGE}");
         return Err(InteractiveError::Usage);
     };
     let prompt = parsed.prompt;
@@ -1128,6 +1177,27 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
         }
         _ => ExecTools::noop(),
     };
+    tools.set_trace_calls(true);
+    // Observability for the fail-closed default: when headless exec runs
+    // without workspace tools (or under a mode that refuses every call), say
+    // so up front and name the levers, instead of leaving the run to fail
+    // without an obvious why.
+    let exec_mode = exec_permission_mode().ok();
+    let tools_withheld = !matches!(&workspace, Some((_, TrustStatus::Trusted)));
+    let mode_refuses_all =
+        matches!(exec_mode, Some(crate::permissions::PermissionMode::Plan | crate::permissions::PermissionMode::DontAsk));
+    if tools_withheld {
+        eprintln!(
+            "warning: workspace tools are disabled for this run: the project is not trusted; \
+approve trust by running `rapid` interactively once in this project, and set \
+{PERMISSION_MODE_ENV} (e.g. bypassPermissions) to control tool approvals"
+        );
+    } else if mode_refuses_all {
+        eprintln!(
+            "warning: permission mode refuses every tool call in headless exec; \
+set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
+        );
+    }
 
     // Trusted-project integrations: web_fetch allowlist, hooks, MCP servers.
     if let (Some((root, TrustStatus::Trusted)), ExecTools::Workspace(_)) =
@@ -1222,7 +1292,21 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
             Ok(0)
         }
         Ok(outcome) => {
-            let mut message = describe_turn_failure(&outcome.result, outcome.failure_cause);
+            let mut message =
+                describe_turn_failure(&outcome.result, outcome.failure_cause, outcome.failure_detail.as_ref());
+            // Exit-code fidelity: a turn that did real work (committed tool
+            // calls) and whose only defect is an empty final model response
+            // is a completed task with a missing summary — exit 0 so callers
+            // do not retry committed work. Every other failure exits 1.
+            if outcome.stop_reason == Some(TurnStopReason::EmptyResponse) && outcome.tool_calls > 0
+            {
+                message.push_str(&format!(
+                    " (the turn performed {} tool call(s) before the final response came back empty; verify workspace state)",
+                    outcome.tool_calls
+                ));
+                eprintln!("{message}");
+                return Ok(0);
+            }
             if outcome.failure_cause.is_none()
                 && !matches!(&workspace, Some((_, TrustStatus::Trusted)))
             {
