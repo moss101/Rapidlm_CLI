@@ -323,6 +323,9 @@ fn request_text_bytes(request: &CanonicalModelRequest) -> usize {
 pub enum SelectedModel<'store> {
     Configured(Box<ConfiguredModel<'store>>),
     Unconfigured(UnconfiguredModel),
+    /// A configured primary plus a user-approved `[models] fallback` chain —
+    /// see [`crate::host::FallbackChainModel`].
+    FallbackChain(Box<crate::host::FallbackChainModel<ConfiguredModel<'store>>>),
 }
 
 impl LiveModelCall for SelectedModel<'_> {
@@ -335,6 +338,7 @@ impl LiveModelCall for SelectedModel<'_> {
         match self {
             Self::Configured(model) => model.step(blocks, input, cancel),
             Self::Unconfigured(fallback) => fallback.step(blocks, input, cancel),
+            Self::FallbackChain(chain) => chain.step(blocks, input, cancel),
         }
     }
 }

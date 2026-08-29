@@ -4,7 +4,9 @@
 //! runs the recovery-capable executor. It couples:
 //!
 //!   - a live [`ContextPacket`] (the single Context-Fabric authority), rebuilt
-//!     via `context_engine::compile` + `compact_packet` on overflow;
+//!     via `context_engine::compile` + policy-verified `compact_with_policy` on
+//!     overflow (fail-closed: a compaction that doesn't shrink enough is a typed
+//!     `StillOverHard`, never a silently still-oversized packet);
 //!   - a [`LiveModelCall`] backing (the provider adapter) that reads that packet;
 //!   - the existing [`ContextController`]/[`ContextRetryPolicy`] recovery seam.
 //!
@@ -27,9 +29,17 @@ use agent_runtime::{
     TurnAgentExecutor, TurnEventSink, TurnFailureDetail, TurnStopReason, ValidatedToolCall,
 };
 use context_engine::CancellationToken as CeCancel;
-use context_engine::compact::compact_packet;
+use context_engine::compact_policy::{
+    CompactPolicyError, CompactionPolicy, CompactionStrategy, compact_with_policy,
+};
 use context_engine::compile::{
     CompileContext, CompileError, CompileInput, ContextBlock, ContextPacket, compile,
+};
+use llm_router::fallback::{
+    AttemptProgress, FallbackAction, FallbackController, FallbackPlan, FallbackTrigger,
+};
+use llm_router::provider::{
+    CancellationToken as RouterCancellationToken, ModelRef, ProviderError,
 };
 use protocol::{ArtifactId, ArtifactRef, EvidenceId, WorkspaceViewId};
 
@@ -298,15 +308,37 @@ impl LiveRecoveryController {
 
 impl ContextController for LiveRecoveryController {
     fn recover_from_overflow(&mut self, _request: ContextOverflow) -> ContextRecoveryDecision {
-        // Compact via the Context-Fabric summarization policy (never arbitrary
-        // truncation); mandatory/system blocks are retained by the pack summary.
+        // Compact via compact_with_policy, not the raw compactor: this is the
+        // fail-closed post-compaction verification path — the replacement's
+        // re-estimated size is checked against the hard threshold before it
+        // is ever accepted, typed StillOverHard rather than a silent
+        // still-oversized summary. (Checking only the summary's own byte
+        // length, as before, doesn't verify shrinkage against the budget at
+        // all; that machinery existed in context-engine but had no caller.)
         {
             let live = self.live.borrow();
-            let compacted = match compact_packet(live.packet(), None, &CeCancel::new()) {
-                Ok(compacted) => compacted,
+            let hard_tokens = live
+                .preserved()
+                .context_limit
+                .saturating_sub(live.preserved().output_reserve)
+                .max(1);
+            let soft_tokens = hard_tokens.saturating_mul(4) / 5;
+            let soft_tokens = soft_tokens.clamp(1, hard_tokens.saturating_sub(1).max(1));
+            let policy = match CompactionPolicy::new(soft_tokens, hard_tokens, CompactionStrategy::ModelPreferred) {
+                Ok(policy) => policy,
                 Err(_) => return ContextRecoveryDecision::NotRecoverable,
             };
-            let summary = compacted.summary().to_owned();
+            let outcome = match compact_with_policy(live.packet(), &policy, None, &CeCancel::new()) {
+                Ok(outcome) => outcome,
+                Err(CompactPolicyError::StillOverHard { .. } | CompactPolicyError::InvalidPacket | CompactPolicyError::Cancelled) => {
+                    return ContextRecoveryDecision::NotRecoverable;
+                }
+            };
+            let summary = outcome
+                .compacted
+                .as_ref()
+                .map(|compacted| compacted.summary().to_owned())
+                .unwrap_or_default();
             if summary.is_empty() || summary.len() > MAX_COMPACTION_SUMMARY {
                 self.summary = None;
             } else {
@@ -726,6 +758,182 @@ impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
     }
 }
 
+/// A model backing bound to a user-configured ordered fallback chain
+/// (`[models] fallback = [...]`). Fully self-contained — it does its own
+/// retry-with-backoff and cross-model fallback internally and always
+/// returns a final, resolved outcome, so the caller never needs a separate
+/// retry loop around it (unlike [`SupervisedModel`], which only retries the
+/// single backend it wraps).
+///
+/// Auth/config/safety failures fall back only onto a model the user
+/// actually named in `fallback`; transient/rate-limited failures retry the
+/// current backend up to the policy bound first, then fall back in the
+/// user's configured order. When the chain is exhausted, the *original*
+/// typed error from the last attempt is returned — never a fabricated
+/// success and never a switch to a model the user did not approve.
+pub struct FallbackChainModel<B> {
+    backends: Vec<(ModelRef, B)>,
+    controller: FallbackController,
+    diag: Option<StepDiag>,
+}
+
+impl<B: LiveModelCall> FallbackChainModel<B> {
+    /// `backends` must include an entry for `controller.current()` and every
+    /// model `controller.chain()` can ever name — the composition root
+    /// builds both from the same resolved `[models] fallback` list, so this
+    /// invariant holds by construction.
+    pub fn new(backends: Vec<(ModelRef, B)>, controller: FallbackController, diag: Option<StepDiag>) -> Self {
+        Self { backends, controller, diag }
+    }
+
+    fn backend_mut(&mut self, target: &ModelRef) -> &mut B {
+        &mut self
+            .backends
+            .iter_mut()
+            .find(|(model_ref, _)| model_ref == target)
+            .expect("FallbackController only names models present in `backends`")
+            .1
+    }
+
+    fn diag_line(&self, line: String) {
+        if let Some(diag) = &self.diag {
+            diag.line(line);
+        }
+    }
+}
+
+impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
+    fn step(
+        &mut self,
+        blocks: &[ContextBlock],
+        input: &ModelStepInput<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<ModelStepOutput, ModelStepError> {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(ModelStepError::Cancelled);
+            }
+            let current = self.controller.current().clone();
+            let result = self.backend_mut(&current).step(blocks, input, cancel);
+            let err = match result {
+                Ok(output) => {
+                    self.diag_line(format!("fallback model={} outcome=ok", model_label(&current)));
+                    return Ok(output);
+                }
+                Err(ModelStepError::Cancelled) => return Err(ModelStepError::Cancelled),
+                Err(err) => err,
+            };
+            let trigger = to_fallback_trigger(&err);
+            let router_cancel = RouterCancellationToken::new();
+            let plan = match self.controller.plan(&trigger, AttemptProgress::PreResponse, &router_cancel) {
+                Ok(plan) => plan,
+                // The controller itself failed closed (e.g. an internal
+                // bound) — surface the original error rather than a
+                // second-order fallback failure the caller can't act on.
+                Err(_) => return Err(err),
+            };
+            // apply() only fails on a stale/already-terminal plan, neither
+            // of which is reachable here (plan was just computed fresh from
+            // the controller's own current state) — best-effort, never
+            // panics either way.
+            let _ = self.controller.apply(&plan);
+            match &plan {
+                FallbackPlan::PreResponse { action: FallbackAction::RetrySame { backoff_ms, .. }, .. } => {
+                    self.diag_line(format!(
+                        "fallback model={} outcome=retry backoff_ms={backoff_ms}",
+                        model_label(&current)
+                    ));
+                    if !sleep_millis_cancellable(cancel, *backoff_ms) {
+                        return Err(ModelStepError::Cancelled);
+                    }
+                }
+                FallbackPlan::PreResponse { action: FallbackAction::FallbackTo { to, backoff_ms, .. }, .. } => {
+                    self.diag_line(format!(
+                        "fallback model={} -> {} backoff_ms={backoff_ms}",
+                        model_label(&current),
+                        model_label(to)
+                    ));
+                    if !sleep_millis_cancellable(cancel, *backoff_ms) {
+                        return Err(ModelStepError::Cancelled);
+                    }
+                }
+                FallbackPlan::PreResponse { action: FallbackAction::Stop { reason, .. }, .. } => {
+                    self.diag_line(format!(
+                        "fallback model={} outcome=stop reason={}",
+                        model_label(&current),
+                        reason.as_str()
+                    ));
+                    return Err(err);
+                }
+                FallbackPlan::PartiallyStreamed { reason, .. } | FallbackPlan::ToolSideEffect { reason, .. } => {
+                    self.diag_line(format!(
+                        "fallback model={} outcome=stop reason={}",
+                        model_label(&current),
+                        reason.as_str()
+                    ));
+                    return Err(err);
+                }
+            }
+        }
+    }
+}
+
+fn model_label(model: &ModelRef) -> String {
+    format!("{}/{}", model.provider().as_str(), model.model().as_str())
+}
+
+/// Reconstruct the `llm_router` failure classification from the typed
+/// `ModelStepError` the step layer already produced. `ModelStepError`
+/// deliberately doesn't carry the original `ProviderError` (agent-runtime
+/// doesn't depend on llm-router), so this is a best-effort but faithful
+/// reverse mapping of `model.rs::map_provider_error`'s forward one — the
+/// one ambiguous case is `FailureCause::Rejected`, which collapses
+/// `InvalidRequest`/`Permanent`/`UnknownVariant`; mapped to `InvalidRequest`
+/// (`FailureClass::Config`) since a request malformed for one provider's
+/// dialect may still be valid for another, and the user's configured
+/// fallback chain is exactly the mechanism to let that recover.
+fn to_fallback_trigger(err: &ModelStepError) -> FallbackTrigger {
+    let provider_error = match err {
+        ModelStepError::Cancelled => ProviderError::Cancelled,
+        ModelStepError::BoundExceeded => ProviderError::ContextTooLarge,
+        ModelStepError::Failed => ProviderError::Permanent,
+        ModelStepError::ProviderFailed { cause } => match cause {
+            FailureCause::Auth => ProviderError::AuthFailed,
+            FailureCause::Connection => ProviderError::Connection,
+            FailureCause::Rejected => ProviderError::InvalidRequest,
+            FailureCause::Transient { retry_after_ms: Some(after) } => {
+                ProviderError::RateLimited { retry_after_ms: Some(*after) }
+            }
+            FailureCause::Transient { retry_after_ms: None } => ProviderError::Transient,
+            FailureCause::Unspecified => ProviderError::Permanent,
+            // #[non_exhaustive]: an unrecognized future cause fails closed
+            // rather than being guessed into a retryable class.
+            _ => ProviderError::Permanent,
+        },
+        // #[non_exhaustive]: same fail-closed default for a future
+        // ModelStepError variant this match doesn't know about yet.
+        _ => ProviderError::Permanent,
+    };
+    FallbackTrigger::Provider(provider_error)
+}
+
+/// Sleep for exactly `wait_ms`, checking cancellation on each slice. Unlike
+/// `sleep_backoff`, the caller (here, `FallbackController::plan`) already
+/// computed the full backoff value — this does not re-derive it from an
+/// attempt counter.
+fn sleep_millis_cancellable(cancel: &CancellationToken, wait_ms: u64) -> bool {
+    let mut waited = 0u64;
+    while waited < wait_ms {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        let slice = RETRY_SLEEP_SLICE_MS.min(wait_ms - waited);
+        std::thread::sleep(std::time::Duration::from_millis(slice));
+        waited += slice;
+    }
+    !cancel.is_cancelled()
+}
+
 /// What one `exec`/`goal` turn produced: the canonical result, the
 /// provider-classified failure cause (when the turn failed on a model step),
 /// the failing-tool detail (when the turn stopped on a tool failure), the
@@ -913,6 +1121,180 @@ mod tests {
                 .pop_front()
                 .unwrap_or(Err(ModelStepError::Failed))
         }
+    }
+
+    // --- FallbackChainModel -------------------------------------------------
+
+    fn model_ref(provider: &str, model: &str) -> ModelRef {
+        ModelRef::new(
+            llm_router::provider::ProviderId::parse(provider).expect("provider"),
+            llm_router::provider::ModelId::parse(model).expect("model"),
+        )
+    }
+
+    fn chain_controller(primary: ModelRef, alternates: Vec<ModelRef>) -> FallbackController {
+        FallbackController::from_explicit_chain(
+            primary,
+            alternates,
+            llm_router::fallback::FallbackPolicy::standard(),
+            &RouterCancellationToken::new(),
+        )
+        .expect("controller")
+    }
+
+    fn ok_terminal(text: &str) -> Result<ModelStepOutput, ModelStepError> {
+        Ok(ModelStepOutput::Terminal { text: text.to_owned(), tokens: 1 })
+    }
+
+    fn auth_failure() -> Result<ModelStepOutput, ModelStepError> {
+        Err(ModelStepError::ProviderFailed { cause: FailureCause::Auth })
+    }
+
+    fn connection_failure() -> Result<ModelStepOutput, ModelStepError> {
+        Err(ModelStepError::ProviderFailed { cause: FailureCause::Connection })
+    }
+
+    fn step_input() -> ModelStepInput<'static> {
+        ModelStepInput::without_tools(1)
+    }
+
+    #[test]
+    fn fallback_switches_to_the_configured_alternate_on_auth_failure() {
+        let primary_ref = model_ref("b-ai", "deepseek");
+        let alt_ref = model_ref("openrouter", "ling-3");
+        let controller = chain_controller(primary_ref.clone(), vec![alt_ref.clone()]);
+        let primary = ScriptedBacking::new(vec![auth_failure()]);
+        let alt = ScriptedBacking::new(vec![ok_terminal("from alternate")]);
+        let mut chain = FallbackChainModel::new(
+            vec![(primary_ref, primary), (alt_ref, alt)],
+            controller,
+            None,
+        );
+        let output = chain
+            .step(&[], &step_input(), &CancellationToken::new())
+            .expect("recovers onto the alternate");
+        match output {
+            ModelStepOutput::Terminal { text, .. } => assert_eq!(text, "from alternate"),
+            other => panic!("expected terminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_never_switches_when_nothing_is_configured() {
+        // Regression guard for the design's central safety property: no
+        // configured alternates means an auth failure surfaces exactly as
+        // it always has, never a silent substitution.
+        let primary_ref = model_ref("b-ai", "deepseek");
+        let controller = chain_controller(primary_ref.clone(), Vec::new());
+        let primary = ScriptedBacking::new(vec![auth_failure()]);
+        let mut chain = FallbackChainModel::new(vec![(primary_ref, primary)], controller, None);
+        let err = chain
+            .step(&[], &step_input(), &CancellationToken::new())
+            .expect_err("no alternate configured, must stay a typed failure");
+        assert_eq!(err, ModelStepError::ProviderFailed { cause: FailureCause::Auth });
+    }
+
+    #[test]
+    fn fallback_retries_the_same_backend_for_transient_failures_before_falling_back() {
+        let primary_ref = model_ref("b-ai", "deepseek");
+        let alt_ref = model_ref("openrouter", "ling-3");
+        let controller = chain_controller(primary_ref.clone(), vec![alt_ref.clone()]);
+        // Standard policy allows 2 same-model retries before falling back;
+        // recovering on the 2nd attempt must never touch the alternate.
+        let primary = ScriptedBacking::new(vec![
+            connection_failure(),
+            connection_failure(),
+            ok_terminal("recovered on the same backend"),
+        ]);
+        let alt = ScriptedBacking::new(vec![ok_terminal("must not be reached")]);
+        let mut chain = FallbackChainModel::new(
+            vec![(primary_ref, primary), (alt_ref, alt.clone())],
+            controller,
+            None,
+        );
+        let output = chain
+            .step(&[], &step_input(), &CancellationToken::new())
+            .expect("recovers without falling back");
+        match output {
+            ModelStepOutput::Terminal { text, .. } => {
+                assert_eq!(text, "recovered on the same backend");
+            }
+            other => panic!("expected terminal, got {other:?}"),
+        }
+        assert_eq!(
+            alt.outputs.borrow().len(),
+            1,
+            "the alternate backend must never have been called"
+        );
+    }
+
+    #[test]
+    fn fallback_falls_back_after_exhausting_same_model_retries_on_transient_failure() {
+        let primary_ref = model_ref("b-ai", "deepseek");
+        let alt_ref = model_ref("openrouter", "ling-3");
+        let controller = chain_controller(primary_ref.clone(), vec![alt_ref.clone()]);
+        // Standard policy allows 2 same-model retries; a 3rd consecutive
+        // transient failure must exhaust the budget and fall back.
+        let primary = ScriptedBacking::new(vec![
+            connection_failure(),
+            connection_failure(),
+            connection_failure(),
+        ]);
+        let alt = ScriptedBacking::new(vec![ok_terminal("from alternate after exhaustion")]);
+        let mut chain = FallbackChainModel::new(
+            vec![(primary_ref, primary), (alt_ref, alt)],
+            controller,
+            None,
+        );
+        let output = chain
+            .step(&[], &step_input(), &CancellationToken::new())
+            .expect("falls back once same-model retries are exhausted");
+        match output {
+            ModelStepOutput::Terminal { text, .. } => {
+                assert_eq!(text, "from alternate after exhaustion");
+            }
+            other => panic!("expected terminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_returns_the_original_error_once_the_whole_chain_is_exhausted() {
+        let primary_ref = model_ref("b-ai", "deepseek");
+        let alt_ref = model_ref("openrouter", "ling-3");
+        let controller = chain_controller(primary_ref.clone(), vec![alt_ref.clone()]);
+        let primary = ScriptedBacking::new(vec![auth_failure()]);
+        let alt = ScriptedBacking::new(vec![auth_failure()]);
+        let mut chain = FallbackChainModel::new(
+            vec![(primary_ref, primary), (alt_ref, alt)],
+            controller,
+            None,
+        );
+        let err = chain
+            .step(&[], &step_input(), &CancellationToken::new())
+            .expect_err("both backends fail, chain exhausted");
+        assert_eq!(err, ModelStepError::ProviderFailed { cause: FailureCause::Auth });
+    }
+
+    #[test]
+    fn fallback_never_falls_back_on_context_too_large() {
+        // A different model's context window is a routing/config decision,
+        // not something this chain is allowed to guess its way around —
+        // classify_failure() already stops on ContextTooLarge unconditionally
+        // upstream in llm-router; this asserts the wiring respects that.
+        let primary_ref = model_ref("b-ai", "deepseek");
+        let alt_ref = model_ref("openrouter", "ling-3");
+        let controller = chain_controller(primary_ref.clone(), vec![alt_ref.clone()]);
+        let primary = ScriptedBacking::new(vec![Err(ModelStepError::BoundExceeded)]);
+        let alt = ScriptedBacking::new(vec![ok_terminal("must not be reached")]);
+        let mut chain = FallbackChainModel::new(
+            vec![(primary_ref, primary), (alt_ref, alt)],
+            controller,
+            None,
+        );
+        let err = chain
+            .step(&[], &step_input(), &CancellationToken::new())
+            .expect_err("ContextTooLarge must stop, not fall back");
+        assert_eq!(err, ModelStepError::BoundExceeded);
     }
 
     struct CountingTools {

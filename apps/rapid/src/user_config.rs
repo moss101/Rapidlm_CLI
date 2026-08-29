@@ -46,6 +46,9 @@ pub const MAX_USER_CONFIG_BYTES: usize = 256 * 1024;
 pub const DEFAULT_CONTEXT_WINDOW: u32 = 32_768;
 /// Default output cap when `max_tokens` is absent (provider default applies).
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
+/// Maximum `[models] fallback` entries accepted (matches
+/// `llm_router::fallback::MAX_FALLBACK_MODELS` minus the primary).
+pub const MAX_FALLBACK_MODELS: usize = 7;
 
 /// User config document: `[models]` + `[model.<id>]` tables.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +73,12 @@ pub struct ModelsSection {
     pub default: Option<String>,
     /// Keyed by the `[model.<id>]` table id (the profile id).
     pub entries: BTreeMap<String, ModelEntry>,
+    /// Ordered `[model.<id>]` table ids to fall back onto, in order, when the
+    /// default model's provider fails. Explicit and user-owned: never
+    /// inferred from the other configured entries. Empty means no fallback
+    /// (today's behavior — a provider failure surfaces to the user as it
+    /// always has).
+    pub fallback: Vec<String>,
 }
 
 /// Supported provider adapter kinds.
@@ -337,12 +346,28 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
     if let Some(section) = root.get("models") {
         let table = expect_table(section, "models")?;
         for key in table.keys() {
-            if key != "default" {
+            if key != "default" && key != "fallback" {
                 unknown_keys.push(format!("models.{key}"));
             }
         }
         if let Some(value) = table.get("default") {
             models.default = Some(expect_non_empty_str(value, "models.default")?.to_owned());
+        }
+        if let Some(value) = table.get("fallback") {
+            let array = value.as_array().ok_or(UserConfigError::TypeMismatch {
+                key: "models.fallback".to_owned(),
+            })?;
+            if array.len() > MAX_FALLBACK_MODELS {
+                return Err(UserConfigError::InvalidValue {
+                    key: "models.fallback".to_owned(),
+                    reason: format!("at most {MAX_FALLBACK_MODELS} fallback entries"),
+                });
+            }
+            for entry in array {
+                models
+                    .fallback
+                    .push(expect_non_empty_str(entry, "models.fallback[]")?.to_owned());
+            }
         }
     }
 
@@ -616,6 +641,45 @@ pub fn resolve_active(env: &[(String, String)], config: &UserConfig) -> Result<A
         credential: resolve_credential(entry, env),
         phase_route: route,
     })
+}
+
+/// Resolve `[models] fallback` into an ordered list of `ActiveModel`s, in
+/// the user's configured order. An id that doesn't name a defined
+/// `[model.<id>]` entry is skipped with a warning rather than failing
+/// startup — a fallback-list typo must never block the primary model from
+/// working, only weaken the fallback itself. The primary (`active`) is
+/// never duplicated into this list even if the user names it again.
+pub fn resolve_fallback_chain(
+    env: &[(String, String)],
+    config: &UserConfig,
+    active: &ActiveModel,
+) -> (Vec<ActiveModel>, Vec<String>) {
+    let mut resolved = Vec::new();
+    let mut warnings = Vec::new();
+    for id in &config.models.fallback {
+        if id == &active.profile_id {
+            continue;
+        }
+        let Some(entry) = config.models.entries.get(id) else {
+            warnings.push(format!(
+                "models.fallback names '{id}', which has no [model.{id}] entry; skipped"
+            ));
+            continue;
+        };
+        let Ok(profile) = llm_router::ProfileId::parse(id) else {
+            warnings.push(format!(
+                "models.fallback entry '{id}' does not satisfy the llm-router profile alphabet; skipped"
+            ));
+            continue;
+        };
+        resolved.push(ActiveModel {
+            profile_id: id.clone(),
+            entry: entry.clone(),
+            credential: resolve_credential(entry, env),
+            phase_route: PhaseRoute::new(profile),
+        });
+    }
+    (resolved, warnings)
 }
 
 /// Resolve the model driving one request purpose: the `[phases]` override
@@ -911,6 +975,104 @@ base_url = "http://127.0.0.1:11434/v1"
         assert!(err
             .to_string()
             .contains("phases.compact names model 'missing'"));
+    }
+
+    #[test]
+    fn parses_and_resolves_the_fallback_chain_in_order() {
+        let doc = r#"
+[models]
+default = "local"
+fallback = ["cloud", "cloud2"]
+
+[model.local]
+provider = "openai-compatible"
+model = "llama3.2"
+base_url = "http://127.0.0.1:11434/v1"
+
+[model.cloud]
+provider = "anthropic"
+model = "claude-3-5-sonnet"
+base_url = "http://gateway.internal:8080"
+api_key = "inline-secret"
+
+[model.cloud2]
+provider = "openai-compatible"
+model = "other"
+base_url = "http://127.0.0.1:9999/v1"
+"#;
+        let config = parse_config_document(doc, "test.toml").expect("parse");
+        assert_eq!(config.models.fallback, vec!["cloud", "cloud2"]);
+        let active = resolve_active(&[], &config).expect("resolve");
+        let (chain, warnings) = resolve_fallback_chain(&[], &config, &active);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].profile_id, "cloud");
+        assert_eq!(chain[1].profile_id, "cloud2");
+    }
+
+    #[test]
+    fn fallback_chain_skips_an_unknown_id_with_a_warning_not_an_error() {
+        let doc = r#"
+[models]
+default = "local"
+fallback = ["typo-id"]
+
+[model.local]
+provider = "openai-compatible"
+model = "llama3.2"
+base_url = "http://127.0.0.1:11434/v1"
+"#;
+        let config = parse_config_document(doc, "test.toml").expect("parse");
+        let active = resolve_active(&[], &config).expect("resolve");
+        let (chain, warnings) = resolve_fallback_chain(&[], &config, &active);
+        assert!(chain.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("typo-id"));
+    }
+
+    #[test]
+    fn fallback_chain_never_duplicates_the_primary() {
+        let doc = r#"
+[models]
+default = "local"
+fallback = ["local", "cloud"]
+
+[model.local]
+provider = "openai-compatible"
+model = "llama3.2"
+base_url = "http://127.0.0.1:11434/v1"
+
+[model.cloud]
+provider = "anthropic"
+model = "claude-3-5-sonnet"
+base_url = "http://gateway.internal:8080"
+api_key = "inline-secret"
+"#;
+        let config = parse_config_document(doc, "test.toml").expect("parse");
+        let active = resolve_active(&[], &config).expect("resolve");
+        let (chain, warnings) = resolve_fallback_chain(&[], &config, &active);
+        assert!(warnings.is_empty());
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].profile_id, "cloud");
+    }
+
+    #[test]
+    fn no_fallback_configured_resolves_to_an_empty_chain() {
+        let doc = r#"
+[models]
+default = "local"
+
+[model.local]
+provider = "openai-compatible"
+model = "llama3.2"
+base_url = "http://127.0.0.1:11434/v1"
+"#;
+        let config = parse_config_document(doc, "test.toml").expect("parse");
+        assert!(config.models.fallback.is_empty());
+        let active = resolve_active(&[], &config).expect("resolve");
+        let (chain, warnings) = resolve_fallback_chain(&[], &config, &active);
+        assert!(chain.is_empty());
+        assert!(warnings.is_empty());
     }
 
     /// Two-model document with a compact-phase override to the cloud entry.

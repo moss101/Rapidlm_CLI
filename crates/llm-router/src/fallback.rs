@@ -457,6 +457,50 @@ impl FallbackController {
         })
     }
 
+    /// Bind a controller to an explicit, user-configured chain — no
+    /// `RouteDecision`/scoring pass required. For configurations where the
+    /// user names the primary model and its fallback order directly (e.g. a
+    /// `[models] fallback = [...]` list); automatic scoring-based routing
+    /// should still go through [`Self::from_decision`].
+    ///
+    /// `alternates` becomes both the fallback chain (visited in order after
+    /// `primary`) and the policy's `explicit_alternates` for every entry not
+    /// already named by the caller's `policy` — Auth/Config/Safety failures
+    /// only fall back onto an explicit alternate by design (see the module
+    /// doc), and a user-configured chain is exactly that: an explicit,
+    /// consented alternate list, never an invented one. No hard rejections
+    /// exist for an explicit chain, so `pin_forbids_fallback` is always
+    /// `false` — nothing here can be pinned-and-excluded the way a scored
+    /// decision's `UserPinExcludes` rejection can.
+    pub fn from_explicit_chain(
+        primary: ModelRef,
+        alternates: Vec<ModelRef>,
+        mut policy: FallbackPolicy,
+        cancel: &CancellationToken,
+    ) -> Result<Self, FallbackError> {
+        cancel.check().map_err(|_| FallbackError::Cancelled)?;
+        let mut chain = Vec::with_capacity((1 + alternates.len()).min(policy.max_models));
+        push_chain_member(&mut chain, primary, policy.max_models)?;
+        for model in &alternates {
+            push_chain_member(&mut chain, model.clone(), policy.max_models)?;
+        }
+        if has_duplicate_refs(&chain) {
+            return Err(FallbackError::InvalidPolicy);
+        }
+        if policy.explicit_alternates.is_empty() {
+            policy.explicit_alternates = alternates;
+        }
+        Ok(Self {
+            policy,
+            policy_version: FALLBACK_POLICY_VERSION,
+            chain,
+            index: 0,
+            same_model_retries: 0,
+            pin_forbids_fallback: false,
+            terminal: None,
+        })
+    }
+
     pub fn policy(&self) -> &FallbackPolicy {
         &self.policy
     }
@@ -1464,5 +1508,91 @@ mod tests {
                 .any(|row| row.model() == model));
         }
         assert_eq!(controller.chain()[0], *decision.model());
+    }
+
+    #[test]
+    fn explicit_chain_orders_primary_first_and_falls_back_in_configured_order() {
+        let primary = pin("b-ai", "deepseek-v4");
+        let alt1 = pin("openrouter", "ling-3");
+        let alt2 = pin("openrouter", "other");
+        let controller = FallbackController::from_explicit_chain(
+            primary.clone(),
+            vec![alt1.clone(), alt2.clone()],
+            FallbackPolicy::standard(),
+            &live(),
+        )
+        .expect("controller");
+        assert_eq!(controller.chain(), &[primary.clone(), alt1.clone(), alt2.clone()]);
+        assert_eq!(controller.current(), &primary);
+    }
+
+    #[test]
+    fn explicit_chain_with_no_alternates_is_still_valid_and_never_falls_back() {
+        let primary = pin("b-ai", "deepseek-v4");
+        let mut controller = FallbackController::from_explicit_chain(
+            primary.clone(),
+            Vec::new(),
+            FallbackPolicy::standard(),
+            &live(),
+        )
+        .expect("controller (no fallback configured)");
+        let trigger = FallbackTrigger::Provider(ProviderError::Connection);
+        // Exhaust same-model retries; with nothing configured to fall back
+        // onto, the only valid outcome is Stop, never a fabricated alternate.
+        for _ in 0..=FallbackPolicy::standard().max_same_model_retries() {
+            let plan = controller.plan(&trigger, AttemptProgress::PreResponse, &live()).expect("plan");
+            controller.apply(&plan).expect("apply");
+        }
+        let plan = controller
+            .plan(&trigger, AttemptProgress::PreResponse, &live())
+            .expect("plan");
+        match plan {
+            FallbackPlan::PreResponse { action: FallbackAction::Stop { reason, .. }, .. } => {
+                assert_eq!(reason, StopReason::FallbackChainExhausted);
+            }
+            other => panic!("expected Stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_chain_falls_back_on_auth_failure_only_onto_the_configured_alternate() {
+        let primary = pin("b-ai", "deepseek-v4");
+        let alt = pin("openrouter", "ling-3");
+        let mut controller = FallbackController::from_explicit_chain(
+            primary.clone(),
+            vec![alt.clone()],
+            FallbackPolicy::standard(),
+            &live(),
+        )
+        .expect("controller");
+        let trigger = FallbackTrigger::Provider(ProviderError::AuthFailed);
+        let plan = controller
+            .plan(&trigger, AttemptProgress::PreResponse, &live())
+            .expect("plan");
+        match &plan {
+            FallbackPlan::PreResponse {
+                action: FallbackAction::FallbackTo { from, to, .. },
+                ..
+            } => {
+                assert_eq!(from, &primary);
+                assert_eq!(to, &alt);
+            }
+            other => panic!("expected an auth failure to fall back onto the configured alternate, got {other:?}"),
+        }
+        controller.apply(&plan).expect("apply");
+        assert_eq!(controller.current(), &alt);
+    }
+
+    #[test]
+    fn explicit_chain_rejects_a_duplicate_between_primary_and_alternates() {
+        let primary = pin("b-ai", "deepseek-v4");
+        let err = FallbackController::from_explicit_chain(
+            primary.clone(),
+            vec![primary.clone()],
+            FallbackPolicy::standard(),
+            &live(),
+        )
+        .expect_err("duplicate primary/alternate must be rejected");
+        assert_eq!(err, FallbackError::InvalidPolicy);
     }
 }

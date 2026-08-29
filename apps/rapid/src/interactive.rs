@@ -37,7 +37,9 @@ use tui::{
 use crate::goal_host::{EVIDENCE_FILE, GOAL_FILE, SESSIONS_DB_FILE, GoalHost};
 use crate::headless::jsonl::JsonlExitCode;
 use crate::exec_tools::ExecTools;
-use crate::host::{ExecOutcome, PreservedLiveContext, StepDiag, UnconfiguredModel, run_live_exec};
+use crate::host::{
+    ExecOutcome, FallbackChainModel, PreservedLiveContext, StepDiag, UnconfiguredModel, run_live_exec,
+};
 use crate::model::{ConfiguredModel, SelectedModel};
 use crate::user_config::ModelSelection;
 use agent_runtime::{
@@ -1294,35 +1296,145 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     }
 
     // Layered model selection (env overrides > user config > typed fallback).
-    // The store outlives the model, which borrows it for the router resolver.
-    let credential_store = auth::InMemoryCredentialStore::new();
+    let process_env: Vec<(String, String)> = std::env::vars().collect();
     let mut base_url = String::from("unconfigured");
     let mut child_model_config: Option<crate::user_config::ActiveModel> = None;
-    let backing = match crate::user_config::select_from_process_env_gated() {
+    // `models`: [primary, ...fallback alternates] — resolved as plain data
+    // (no borrows yet) so the credential-store count is known upfront.
+    let mut models: Vec<crate::user_config::ActiveModel> = Vec::new();
+    let mut unconfigured = false;
+    match crate::user_config::select_from_process_env_gated() {
         Ok(ModelSelection::Configured { active, warnings }) => {
             for warning in warnings {
                 eprintln!("warning: {warning}");
             }
             base_url = active.entry.base_url.clone();
             child_model_config = Some(active.as_ref().clone());
-            match ConfiguredModel::build(
-                &apply_reminder_floor(*active, reminder_floor),
-                &credential_store,
-            ) {
-                Ok(model) => SelectedModel::Configured(Box::new(model)),
-                Err(err) => {
-                    eprintln!("model configuration error: {err}");
-                    return Ok(1);
+            let primary = apply_reminder_floor(*active, reminder_floor);
+
+            // Fallback chain: opt-in via `[models] fallback`, resolved
+            // against the same raw config the primary came from, then
+            // narrowed by the same managed-provider allowlist (if any) the
+            // primary was already gated through — a fallback entry is never
+            // let through a restriction the primary itself has to honor.
+            if let Some(config) = crate::user_config::load_config(
+                &crate::user_config::resolve_config_source(&process_env),
+            )
+            .unwrap_or(None)
+            {
+                let (candidates, warnings) =
+                    crate::user_config::resolve_fallback_chain(&process_env, &config, &primary);
+                for warning in warnings {
+                    eprintln!("warning: {warning}");
+                }
+                let allowed_providers = crate::managed_config::load_policy(&process_env)
+                    .unwrap_or(None)
+                    .and_then(|policy| policy.allowed_providers().map(<[String]>::to_vec));
+                for candidate in candidates {
+                    if let Some(allowed) = &allowed_providers
+                        && !allowed.iter().any(|name| name == candidate.entry.provider.as_str())
+                    {
+                        eprintln!(
+                            "warning: models.fallback entry '{}' is not on the managed provider allowlist; skipped",
+                            candidate.profile_id
+                        );
+                        continue;
+                    }
+                    models.push(candidate);
                 }
             }
+            models.insert(0, primary);
         }
         Ok(ModelSelection::Unconfigured { .. }) => {
             eprintln!("{NOT_CONFIGURED_HINT}");
-            SelectedModel::Unconfigured(UnconfiguredModel)
+            unconfigured = true;
         }
         Err(err) => {
             eprintln!("model configuration error: {err}");
             return Ok(1);
+        }
+    }
+    // One store per backend, fully built before any ConfiguredModel borrows
+    // from it — every borrow below is a plain, compiler-checked immutable
+    // borrow of an already-final Vec, not touched again afterward.
+    let credential_stores: Vec<auth::InMemoryCredentialStore> = models
+        .iter()
+        .map(|_| auth::InMemoryCredentialStore::new())
+        .collect();
+    let backing = if unconfigured {
+        SelectedModel::Unconfigured(UnconfiguredModel)
+    } else if models.len() == 1 {
+        match ConfiguredModel::build(&models[0], &credential_stores[0]) {
+            Ok(model) => SelectedModel::Configured(Box::new(model)),
+            Err(err) => {
+                eprintln!("model configuration error: {err}");
+                return Ok(1);
+            }
+        }
+    } else {
+        let mut backends = Vec::with_capacity(models.len());
+        for (active, store) in models.iter().zip(credential_stores.iter()) {
+            // Tracking identity for FallbackController only — distinct from
+            // whatever ModelRef ConfiguredModel builds internally for the
+            // real wire request. Two profiles can legitimately name the
+            // same underlying provider+model (a paid vs. free tier of the
+            // same model, or — as a real-provider live check for this
+            // wiring found — two entries that only differ by base_url), so
+            // `entry.model` alone is not a safe uniqueness key here;
+            // `profile_id` always is, since it's a `[model.<id>]` TOML
+            // table key and BTreeMap-unique by construction. Already
+            // validated against the (stricter) llm-router profile alphabet
+            // in `resolve_active`/`resolve_fallback_chain`, so this can
+            // never fail ModelId's looser alphabet.
+            let model_ref = llm_router::provider::ModelRef::new(
+                llm_router::provider::ProviderId::parse(active.entry.provider.as_str())
+                    .expect("provider id already validated by user_config parsing"),
+                llm_router::provider::ModelId::parse(&active.profile_id)
+                    .expect("profile id already validated against the stricter llm-router alphabet"),
+            );
+            match ConfiguredModel::build(active, store) {
+                Ok(model) => backends.push((model_ref, model)),
+                Err(err) => {
+                    eprintln!(
+                        "warning: fallback entry '{}' failed to configure ({err}); skipped",
+                        active.profile_id
+                    );
+                }
+            }
+        }
+        if backends.len() < 2 {
+            // Every alternate failed to configure — fall back to the plain,
+            // single-model path rather than a chain of one.
+            match backends.into_iter().next() {
+                Some((_, model)) => SelectedModel::Configured(Box::new(model)),
+                None => {
+                    eprintln!("model configuration error: primary model failed to configure");
+                    return Ok(1);
+                }
+            }
+        } else {
+            let primary_ref = backends[0].0.clone();
+            let alternate_refs: Vec<_> = backends[1..].iter().map(|(model_ref, _)| model_ref.clone()).collect();
+            let policy = llm_router::fallback::FallbackPolicy::standard();
+            let router_cancel = llm_router::provider::CancellationToken::new();
+            match llm_router::fallback::FallbackController::from_explicit_chain(
+                primary_ref,
+                alternate_refs,
+                policy,
+                &router_cancel,
+            ) {
+                Ok(controller) => {
+                    let diag = parsed.verbose.then(|| StepDiag::stderr(&base_url));
+                    SelectedModel::FallbackChain(Box::new(FallbackChainModel::new(
+                        backends, controller, diag,
+                    )))
+                }
+                Err(err) => {
+                    eprintln!("warning: fallback chain configuration failed ({err}); using the primary model only");
+                    let (_, model) = backends.into_iter().next().expect("checked len >= 2 above");
+                    SelectedModel::Configured(Box::new(model))
+                }
+            }
         }
     };
     // Subagents: with a configured model, task_spawn runs child agents with

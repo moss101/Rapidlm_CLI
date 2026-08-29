@@ -693,20 +693,19 @@ doc originally claimed; **"RapidLM (now)"** is the corrected, evidence-grounded 
 | Scheduler/loop tools (model-callable) | ✓ | ✓ | ~ (CLI cron) | **~ (unchanged)** — still only reachable via `rapid cron`, no tool constant | **P2** |
 | Goal/evidence in-loop (`update_goal`) | ✗ | ✓ | ~ (CLI only) | **✗** — no tool constant at all, not even partially reachable mid-turn | **P2** — differentiator |
 | Ledger-durable cron + quarantine | ✗ | ✗ | **✓** | **✓ (confirmed)** | keep |
-| Post-compaction verification | ✗ | ✗ | **✓** | **~ (downgrade)** — the fail-closed verify/evidence machinery in `compact_policy::compact_with_policy` is real and tested but has **zero callers**; the live overflow-recovery path calls raw `compact_packet` directly, bypassing it entirely | fix before claiming "keep" |
-| Multi-provider routing/fallback | ✗ | ✗ | **✓** | **~ (downgrade)** — `llm-router::fallback::FallbackController` (1,468 lines, real retry/backoff/alternates) is re-exported but has **zero call sites**; `apps/rapid/src/model.rs` never imports it | fix before claiming "keep" |
+| Post-compaction verification | ✗ | ✗ | **✓** | **✓ (re-wired 2026-08-29)** — `LiveRecoveryController::recover_from_overflow` (`host.rs`) now calls `compact_with_policy` with real soft/hard thresholds derived from the turn's own `context_limit`/`output_reserve`, replacing the raw `compact_packet` call + an unrelated byte-length check; a compaction that doesn't verifiably shrink under the hard threshold now fails closed (`StillOverHard`) instead of silently proceeding. All 30 existing `host::tests` pass unchanged. | keep (now real) |
+| Multi-provider routing/fallback | ✗ | ✗ | **✓** | **✓ (re-wired 2026-08-29)** — genuine wiring turned out to need more than a call site: `FallbackController::from_decision` requires the separate, also-unwired `route::score`/`route::filter` subsystem (~3,000 more lines). Scoped down per explicit user direction to **user-configured** fallback (new `FallbackController::from_explicit_chain` in `llm-router`, no scoring pass) — a new `[models] fallback = [...]` config list, resolved through the same credential/validation path as the primary and narrowed by any managed-policy provider allowlist, drives a new `FallbackChainModel` (`host.rs`, generic over the backend so it's unit-testable with scripted backends) that retries the current backend with the fallback policy's own backoff before falling back in the user's configured order — auth/config/safety failures fall back only onto an explicitly configured alternate, `ContextTooLarge`/`Cancelled` never fall back, ordering preserved even after exhausting same-model retries. Empty `fallback` (the default) is byte-for-byte the old single-model path — zero behavior change unless a user opts in. Live-verified against a real broken primary (bad `base_url`) falling back to the real working alternate: `fallback model=…/broken outcome=retry backoff_ms=200` → `…backoff_ms=400` → `…-> …/real backoff_ms=200` → `outcome=ok`, turn succeeded, correct answer. `route::score`/`route::filter` remain unwired, available for a future automatic "Auto" routing mode. 6 new `FallbackChainModel` tests + 4 new `llm-router` fallback tests + 4 new config-resolution tests, full workspace suite green. | keep (now real) |
 | Computer use (browser/desktop/mobile) | ✗ | ~ (hub crates) | ~ (unwired crates) | **~ (unchanged)** — still no `ToolDriver` registration, no presence in `exec_tools.rs` | differentiator (unrealized) |
 | Media generation tools | ✗ | ✓ | ✗ | **✗ (confirmed)** | P3/optional |
 | REPL tool, Projects RAG, team memory, remote sessions | ✓/~ | ✗/~ | ✗ | **✗ (confirmed)** | P3/optional |
 
-**The two "downgrades" matter more than the many upgrades.** Both `post-compaction verification` and
-`multi-provider routing/fallback` were the doc's own headline evidence for RapidLM leading *both*
-references (see the executive summary and §6's compaction assessment) — and both turn out to be real,
-tested, orphaned machinery that the live turn loop never calls. That's a materially different risk profile
-than "not built yet": the code exists, is presumably trusted because it's tested, and simply isn't in the
-path that runs. Wiring `compact_with_policy` into `LiveRecoveryController::recover_from_overflow` and
-`FallbackController` into `model.rs`'s provider-call path are both small, well-scoped fixes (the hard part —
-the policy/fallback logic itself — is done) and should be prioritized ahead of new-feature roadmap items.
+**The two "downgrades" mattered more than the many upgrades — both now fixed (2026-08-29).** Both
+`post-compaction verification` and `multi-provider routing/fallback` were the doc's own headline evidence
+for RapidLM leading *both* references (see the executive summary and §6's compaction assessment), and both
+turned out to be real, tested, orphaned machinery the live turn loop never called — a materially different
+risk profile than "not built yet." Both are wired now (see the two rows above for the specifics and live
+verification); the "downgrade" framing above is kept as the historical record of what the audit found, not
+current status.
 
 ---
 
@@ -739,15 +738,16 @@ methodology. `✓` genuinely wired into the live turn loop, `~` partial/orphaned
 | 19 | SDK-style tool-schema artifact export | P2 | S | **~ leaning ✗** — a versioned, hashed `ToolCatalog` exists but is consumed only internally; no export command or generated artifact |
 | 20 | Model catalog file (context windows, effort menus) feeding compaction + router | P2 | S | **✗** — `llm-router::catalog` is real but models pricing/capability/region, not context-window size; `DEFAULT_CONTEXT_WINDOW` is still one hardcoded constant |
 
-**Sequencing logic (updated 2026-08-29):** items 1, 3, 4, 5, 6, 11, 12 are now done — the "unlock" and the
-safety layer (6) both landed. What's left clusters into three real categories, not the original 1→20
-priority order: **(a) orphaned machinery** — 7 (sandbox), 9 (MCP refresh/meta-tools), 10 (hook event enum),
-15 (memory), 19 (schema export), and the two §18 "keep" downgrades (post-compaction verification,
-provider fallback) — these are the cheapest wins in the whole document, since the hard logic already
-exists and is tested; only the wiring is missing. **(b) genuinely unbuilt:** 13 (compaction ergonomics), 16
-(headless contract), 17 (ACP session modes), 18 (`update_goal`), 20 (model catalog). **(c) backend-done,
-UI-only:** 14 (plan/todo/question-card TUI rendering) — the exec-loop tools all work headlessly today; only
-the terminal UI surface is missing.
+**Sequencing logic (updated 2026-08-29, twice today):** items 1, 3, 4, 5, 6, 11, 12 landed first — the
+"unlock" and the safety layer (6). The two §18 "keep" downgrades (post-compaction verification, provider
+fallback) landed later the same day — both were exactly the "orphaned machinery, cheapest win" shape this
+note originally predicted. What's left clusters into two real categories, not the original 1→20 priority
+order: **(a) orphaned machinery still open** — 7 (sandbox), 9 (MCP refresh/meta-tools), 10 (hook event
+enum), 15 (memory), 19 (schema export) — same cheap-win shape, hard logic exists and is tested, only the
+wiring is missing. **(b) genuinely unbuilt:** 13 (compaction ergonomics), 16 (headless contract), 17 (ACP
+session modes), 18 (`update_goal`), 20 (model catalog). **(c) backend-done, UI-only:** 14 (plan/todo/
+question-card TUI rendering) — the exec-loop tools all work headlessly today; only the terminal UI surface
+is missing.
 
 ---
 
