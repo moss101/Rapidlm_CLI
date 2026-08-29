@@ -1292,37 +1292,61 @@ impl WorkspaceTools {
         }
         if args.sandbox {
             // Seatbelt confinement (macOS): workspace writes allowed, other
-            // writes denied. Unavailability is a typed handled failure.
-            let Some(sandbox_exec) = find_sandbox_exec() else {
-                return Ok(ToolStepResult::Failed {
+            // writes denied. Runs as an async background job — see
+            // sandbox_exec's own doc comment for why the two paths aren't
+            // unified yet.
+            if let Some(sandbox_exec) = find_sandbox_exec() {
+                let profile_path = self
+                    .resolve_in_root(".rapidlm/seatbelt.sb")
+                    .map_err(|_| ToolStepError::Failed)?;
+                fs::write(
+                    &profile_path,
+                    seatbelt_profile(self.root()).as_bytes(),
+                )
+                .map_err(|_| ToolStepError::Failed)?;
+                let mut sandboxed = vec![sandbox_exec.to_string_lossy().into_owned()];
+                sandboxed.push("-f".to_owned());
+                sandboxed.push(profile_path.to_string_lossy().into_owned());
+                sandboxed.extend(args.argv.iter().cloned());
+                let job_id = self.jobs.start(&sandboxed, self.root(), args.timeout)?;
+                return Ok(ToolStepResult::Succeeded {
+                    call_id: call.call_id().to_owned(),
+                    summary: format!(
+                        "started sandboxed job {job_id}: {} (timeout {}s); poll with job_status",
+                        sandboxed[3..].join(" "),
+                        args.timeout.as_secs()
+                    ),
+                });
+            }
+            // Non-macOS (or sandbox-exec missing): the tiered `sandbox`
+            // crate's host-restricted backend — real process-group isolation
+            // plus CPU/memory/pid limits, synchronous (unlike the job above;
+            // see sandbox_exec's doc comment). A genuine capability where
+            // this previously just failed outright.
+            return match crate::sandbox_exec::run_sandboxed(
+                self.root(),
+                &args.argv,
+                args.timeout,
+                MAX_SHELL_OUTPUT_BYTES as u64,
+            ) {
+                Ok(outcome) => {
+                    let output = bounded_text(&outcome.output, MAX_SHELL_OUTPUT_BYTES);
+                    let status = match outcome.exit_code {
+                        Some(code) => format!("exit {code}"),
+                        None if outcome.timed_out => "timed out".to_owned(),
+                        None => "no exit code (signalled)".to_owned(),
+                    };
+                    Ok(ToolStepResult::Succeeded {
+                        call_id: call.call_id().to_owned(),
+                        summary: format!("sandboxed {status}\n{output}"),
+                    })
+                }
+                Err(err) => Ok(ToolStepResult::Failed {
                     call_id: call.call_id().to_owned(),
                     handled: true,
-                    detail: Some(bounded_detail(
-                        "sandbox requested but sandbox-exec is unavailable on this platform",
-                    )),
-                });
+                    detail: Some(bounded_detail(&format!("sandboxed exec failed: {err}"))),
+                }),
             };
-            let profile_path = self
-                .resolve_in_root(".rapidlm/seatbelt.sb")
-                .map_err(|_| ToolStepError::Failed)?;
-            fs::write(
-                &profile_path,
-                seatbelt_profile(self.root()).as_bytes(),
-            )
-            .map_err(|_| ToolStepError::Failed)?;
-            let mut sandboxed = vec![sandbox_exec.to_string_lossy().into_owned()];
-            sandboxed.push("-f".to_owned());
-            sandboxed.push(profile_path.to_string_lossy().into_owned());
-            sandboxed.extend(args.argv.iter().cloned());
-            let job_id = self.jobs.start(&sandboxed, self.root(), args.timeout)?;
-            return Ok(ToolStepResult::Succeeded {
-                call_id: call.call_id().to_owned(),
-                summary: format!(
-                    "started sandboxed job {job_id}: {} (timeout {}s); poll with job_status",
-                    sandboxed[3..].join(" "),
-                    args.timeout.as_secs()
-                ),
-            });
         }
         if args.background {
             let job_id = self.jobs.start(&args.argv, self.root(), args.timeout)?;

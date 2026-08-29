@@ -40,6 +40,9 @@ capability-broker = { path = "../../crates/capability-broker" }
 # computer-use: browser/desktop/mobile observation+action leaf systems.
 computer-use = { path = "../../crates/computer-use" }
 mobile-sim = { path = "../../crates/mobile-sim" }
+# sandbox: tiered SandboxManager (host-restricted/container/gvisor) for
+# shell_exec's non-macOS sandbox: true path — see newtask.md §1.1.
+sandbox = { path = "../../crates/sandbox" }
 # protocol: SessionId / ApiError / ErrorCode are the JSONL record and exit-code surface.
 protocol = { path = "../../crates/protocol" }
 # auth: credential handles (SecretRef/SecretValue) and the process-local

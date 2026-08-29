@@ -1031,6 +1031,7 @@ dependencies = [
  "process-supervisor",
  "protocol",
  "regex",
+ "sandbox",
  "scheduler",
  "security",
  "serde",
