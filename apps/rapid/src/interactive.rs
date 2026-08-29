@@ -991,6 +991,78 @@ fn exec_permission_lattice(
     Ok(lattice)
 }
 
+/// Trusted-project config merged from every file in `PROJECT_SETTINGS_FILES`
+/// — the `web_fetch` allowlist, hooks, shadow-diagnostics config, and MCP
+/// servers a `.rapidlm/settings.json` *or* `.claude/settings.json`-only
+/// project can configure, in one place instead of duplicated at both call
+/// sites (the real `exec_turn` path and this struct's own unit test).
+struct ProjectIntegrations {
+    fetch_allowlist: Vec<String>,
+    hooks: crate::hooks::HooksConfig,
+    shadow: Option<crate::shadow_diagnostics::ShadowDiagnosticsConfig>,
+    mcp_servers: Vec<crate::exec_tools::McpServerConfig>,
+}
+
+/// Read and merge every `PROJECT_SETTINGS_FILES` entry under `root`. List-
+/// shaped config (fetch allowlist, each hook stage, MCP servers) merges
+/// across every file that exists — the same precedence
+/// `exec_permission_lattice` already uses for permission rules. Single-value
+/// config (shadow-diagnostics) uses first-file-wins, matching
+/// `exec_permission_mode`'s `mode` resolution. A missing or unparsable file
+/// contributes nothing rather than failing the whole load — this mirrors
+/// this block's pre-existing behavior (only permission-rule parsing is
+/// strict enough to refuse the run typed; this integration config was never
+/// that strict even before this function existed).
+fn load_project_integrations(root: &Path) -> ProjectIntegrations {
+    let mut fetch_allowlist: Vec<String> = Vec::new();
+    let mut hooks = crate::hooks::HooksConfig::default();
+    let mut shadow = None;
+    let mut mcp_servers = Vec::new();
+    for file_name in PROJECT_SETTINGS_FILES {
+        let settings_path = root.join(file_name);
+        let Ok(text) = fs::read_to_string(&settings_path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if let Some(entries) = value.get("fetch_allowlist").and_then(serde_json::Value::as_array) {
+            fetch_allowlist.extend(entries.iter().filter_map(|entry| entry.as_str().map(str::to_owned)));
+        }
+        if let Some(file_hooks) = crate::hooks::HooksConfig::parse(&value) {
+            hooks.pre_tool_use.extend(file_hooks.pre_tool_use);
+            hooks.post_tool_use.extend(file_hooks.post_tool_use);
+            hooks.session_start.extend(file_hooks.session_start);
+            hooks.session_end.extend(file_hooks.session_end);
+            hooks.subagent_start.extend(file_hooks.subagent_start);
+            hooks.subagent_stop.extend(file_hooks.subagent_stop);
+        }
+        if shadow.is_none() {
+            shadow = crate::shadow_diagnostics::ShadowDiagnosticsConfig::parse(&value);
+        }
+        mcp_servers.extend(crate::exec_tools::parse_mcp_servers(&value));
+    }
+    // Each file's own HooksConfig::parse already capped itself at
+    // MAX_HOOKS_PER_STAGE; re-cap after merging two files' worth so the
+    // combined per-stage bound still holds.
+    for stage in [
+        &mut hooks.pre_tool_use,
+        &mut hooks.post_tool_use,
+        &mut hooks.session_start,
+        &mut hooks.session_end,
+        &mut hooks.subagent_start,
+        &mut hooks.subagent_stop,
+    ] {
+        stage.truncate(crate::hooks::MAX_HOOKS_PER_STAGE);
+    }
+    ProjectIntegrations {
+        fetch_allowlist,
+        hooks,
+        shadow,
+        mcp_servers,
+    }
+}
+
 /// Fires `session_end` hooks exactly once, on whichever exit path `exec_turn`
 /// takes — early `?`-propagated error, an explicit early return, or falling
 /// off the end. `exec_turn` has many of the first two; a `Drop` guard is the
@@ -1308,50 +1380,44 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     }
 
     // Trusted-project integrations: web_fetch allowlist, hooks, MCP servers.
+    // Merged across every file in PROJECT_SETTINGS_FILES the same way
+    // exec_permission_lattice already merges permission rules — a
+    // `.claude/settings.json`-only project (no `.rapidlm/settings.json` at
+    // all) previously got permission-rule compat but silently lost hooks/
+    // mcp/shadow-diagnostics/fetch-allowlist, since this block only ever
+    // read the one RapidLM-native file name.
     if let (Some((root, TrustStatus::Trusted)), ExecTools::Workspace(_)) =
         (&workspace, &mut tools)
     {
-        let settings_path = root.join(".rapidlm/settings.json");
-        if let Ok(text) = fs::read_to_string(&settings_path)
-            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
-        {
-            let allowlist: Vec<String> = value
-                .get("fetch_allowlist")
-                .and_then(serde_json::Value::as_array)
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .filter_map(|entry| entry.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default();
-            tools.set_fetch_allowlist(allowlist);
-            if let Some(hooks) = crate::hooks::HooksConfig::parse(&value) {
-                if !hooks.session_start.is_empty() {
-                    // Fire-and-forget: a session_start hook observes the run
-                    // starting, it never gates it (no PreHookOutcome here).
-                    let _ = crate::hooks::run_notify_hooks(
-                        &hooks.session_start,
-                        "session_start",
-                        serde_json::json!({}),
-                        crate::hooks::HOOK_TIMEOUT,
-                    );
-                }
-                // Captured now (before `hooks` moves into `set_hooks` below);
-                // fired later by SessionEndHookGuard's Drop impl, on whatever
-                // exit path this turn actually takes.
-                session_end_guard.hooks = hooks.session_end.clone();
-                if !hooks.is_empty() {
-                    tools.set_hooks(hooks);
-                }
-            }
-            if let Some(shadow) = crate::shadow_diagnostics::ShadowDiagnosticsConfig::parse(&value) {
-                tools.set_shadow_diagnostics(shadow);
-            }
-            let servers = crate::exec_tools::parse_mcp_servers(&value);
-            if !servers.is_empty() {
-                tools.register_mcp_servers(&servers);
-            }
+        let ProjectIntegrations {
+            fetch_allowlist: allowlist,
+            hooks: merged_hooks,
+            shadow: shadow_config,
+            mcp_servers,
+        } = load_project_integrations(root);
+        tools.set_fetch_allowlist(allowlist);
+        if !merged_hooks.session_start.is_empty() {
+            // Fire-and-forget: a session_start hook observes the run
+            // starting, it never gates it (no PreHookOutcome here).
+            let _ = crate::hooks::run_notify_hooks(
+                &merged_hooks.session_start,
+                "session_start",
+                serde_json::json!({}),
+                crate::hooks::HOOK_TIMEOUT,
+            );
+        }
+        // Captured now (before `merged_hooks` moves into `set_hooks` below);
+        // fired later by SessionEndHookGuard's Drop impl, on whatever exit
+        // path this turn actually takes.
+        session_end_guard.hooks = merged_hooks.session_end.clone();
+        if !merged_hooks.is_empty() {
+            tools.set_hooks(merged_hooks);
+        }
+        if let Some(shadow) = shadow_config {
+            tools.set_shadow_diagnostics(shadow);
+        }
+        if !mcp_servers.is_empty() {
+            tools.register_mcp_servers(&mcp_servers);
         }
     }
 
@@ -2385,6 +2451,72 @@ mod tests {
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
     static TERMINAL_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn project_integrations_merge_across_rapidlm_and_claude_settings() {
+        let dir = std::env::temp_dir().join(format!(
+            "project-integrations-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("rapidlm dir");
+        std::fs::create_dir_all(dir.join(".claude")).expect("claude dir");
+        std::fs::write(
+            dir.join(".rapidlm/settings.json"),
+            r#"{"fetch_allowlist": ["example.com"], "hooks": {"session_start": ["a"]}}"#,
+        )
+        .expect("rapidlm settings");
+        std::fs::write(
+            dir.join(".claude/settings.json"),
+            r#"{"fetch_allowlist": ["other.example"], "hooks": {"session_start": ["b"]}}"#,
+        )
+        .expect("claude settings");
+
+        let integrations = load_project_integrations(&dir);
+        // List-shaped config merges across both files: a `.claude/
+        // settings.json`-only project (the compat case this exists for)
+        // gets the same treatment as a `.rapidlm/settings.json`-only one,
+        // and a project with both gets contributions from both.
+        assert_eq!(
+            integrations.fetch_allowlist,
+            vec!["example.com".to_owned(), "other.example".to_owned()]
+        );
+        assert_eq!(
+            integrations.hooks.session_start,
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_integrations_caps_merged_hooks_at_the_per_stage_bound() {
+        let dir = std::env::temp_dir().join(format!(
+            "project-integrations-cap-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("rapidlm dir");
+        std::fs::create_dir_all(dir.join(".claude")).expect("claude dir");
+        // MAX_HOOKS_PER_STAGE commands in each file: each file's own parse
+        // stays under the per-file cap, but the merge across two files
+        // would exceed it without the post-merge truncate.
+        let full_stage: Vec<String> = (0..crate::hooks::MAX_HOOKS_PER_STAGE)
+            .map(|i| format!("echo {i}"))
+            .collect();
+        let settings = serde_json::json!({"hooks": {"session_start": full_stage}}).to_string();
+        std::fs::write(dir.join(".rapidlm/settings.json"), &settings).expect("rapidlm settings");
+        std::fs::write(dir.join(".claude/settings.json"), &settings).expect("claude settings");
+
+        let integrations = load_project_integrations(&dir);
+        assert_eq!(
+            integrations.hooks.session_start.len(),
+            crate::hooks::MAX_HOOKS_PER_STAGE,
+            "merged session_start must stay capped at MAX_HOOKS_PER_STAGE"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn session_end_guard_fires_on_drop_regardless_of_which_scope_exit_ran() {
