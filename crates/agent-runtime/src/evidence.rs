@@ -149,6 +149,16 @@ pub enum CriterionUnsatisfied {
     InvalidTestPassed,
     UnknownKind,
     UnbackedEvidence,
+    /// The cited ledger event does not exist (wrong session, bad seq, or the
+    /// row was never written). Structural, not retryable.
+    LedgerEventNotFound,
+    /// The cited ledger event exists but is not a kind the gate accepts as
+    /// backing (see `BACKING_EVENT_KINDS`). Structural, not retryable.
+    LedgerEventWrongKind,
+    /// The resolver could not be reached (I/O failure, ledger down). Distinct
+    /// from the two reasons above: the citation may be perfectly valid and a
+    /// retry could satisfy the criterion once the ledger is reachable again.
+    LedgerUnavailable,
 }
 
 /// Content-addressed origin of an observation. Hash is required.
@@ -487,7 +497,24 @@ impl CriterionUnsatisfied {
             Self::InvalidTestPassed => "invalid_test_passed",
             Self::UnknownKind => "unknown_kind",
             Self::UnbackedEvidence => "unbacked_evidence",
+            Self::LedgerEventNotFound => "ledger_event_not_found",
+            Self::LedgerEventWrongKind => "ledger_event_wrong_kind",
+            Self::LedgerUnavailable => "ledger_unavailable",
         }
+    }
+
+    /// Whether a caller might reasonably retry and see this criterion become
+    /// satisfied without any new evidence being recorded (e.g. the ledger
+    /// becomes reachable again, or a flaky check reruns). Every other reason
+    /// requires a genuinely new observation. This never affects the
+    /// completion gate itself — `satisfied` stays `false` either way; it only
+    /// gives a CLI or automation caller a "try again" vs. "this is final"
+    /// signal to act on. See `newtask.md` §2.4.
+    pub const fn retryable(self) -> bool {
+        matches!(
+            self,
+            Self::UnavailableStatus | Self::ErrorStatus | Self::LedgerUnavailable
+        )
     }
 }
 
@@ -1049,9 +1076,15 @@ fn evaluate_kind(
 }
 
 /// Anti-self-assertion gate: an agent-produced record must cite a real
-/// ledger event, resolved through the host-installed resolver. Every
-/// failure mode (no citation, no resolver, unresolved citation) collapses
-/// to the same unsatisfied reason; the verdict never says "almost".
+/// ledger event, resolved through the host-installed resolver. The gate
+/// itself never softens on any failure mode — a criterion citing an
+/// unresolved reference is `satisfied: false` whether the reference was
+/// missing, invalid, or merely unreachable right now. What varies is the
+/// *reason* surfaced to the caller: a missing citation or an installed
+/// resolver's structural rejection (`LedgerEventNotFound`/`WrongKind`) is
+/// final, but a resolver outage (`LedgerUnavailable`) is the one case where
+/// re-running the same check later could produce a different verdict with no
+/// new evidence at all — see `CriterionUnsatisfied::retryable`.
 fn check_backing(
     record: &EvidenceRecord,
     backing: Option<&SharedBackingResolver>,
@@ -1067,9 +1100,11 @@ fn check_backing(
         Some(resolver) => resolver,
         None => return Err(CriterionUnsatisfied::UnbackedEvidence),
     };
-    resolver
-        .resolve(ledger_ref)
-        .map_err(|_| CriterionUnsatisfied::UnbackedEvidence)
+    resolver.resolve(ledger_ref).map_err(|err| match err {
+        BackingError::NotFound => CriterionUnsatisfied::LedgerEventNotFound,
+        BackingError::NotABackingEvent => CriterionUnsatisfied::LedgerEventWrongKind,
+        BackingError::Unavailable => CriterionUnsatisfied::LedgerUnavailable,
+    })
 }
 
 fn applies_to(record: &EvidenceRecord, criterion_id: &str, kind: EvidenceKind) -> bool {
@@ -2083,10 +2118,53 @@ mod tests {
         service.record(spec).expect("record");
         let verdicts = service.validate_goal(&goal);
         assert!(!verdicts.allowed());
+        // Structural rejection: the gate still blocks completion the same as
+        // before, but the reason is now specific enough to tell a caller this
+        // citation will never resolve (as opposed to a transient outage).
         assert_eq!(
             verdicts.verdicts()[0].reason(),
-            Some(CriterionUnsatisfied::UnbackedEvidence)
+            Some(CriterionUnsatisfied::LedgerEventNotFound)
         );
+        assert!(!verdicts.verdicts()[0].reason().unwrap().retryable());
+    }
+
+    /// Resolver stub that always returns one fixed [`BackingError`], to
+    /// exercise `check_backing`'s reason mapping independently of
+    /// [`StubResolver`]'s exact-match behavior.
+    struct AlwaysErrResolver(BackingError);
+
+    impl BackingResolver for AlwaysErrResolver {
+        fn resolve(&self, _ledger_ref: &EvidenceLedgerRef) -> Result<(), BackingError> {
+            Err(self.0)
+        }
+    }
+
+    #[test]
+    fn backing_error_reasons_map_one_to_one_and_only_unavailable_is_retryable() {
+        let cases = [
+            (BackingError::NotFound, CriterionUnsatisfied::LedgerEventNotFound),
+            (
+                BackingError::NotABackingEvent,
+                CriterionUnsatisfied::LedgerEventWrongKind,
+            ),
+            (BackingError::Unavailable, CriterionUnsatisfied::LedgerUnavailable),
+        ];
+        for (backing_error, expected_reason) in cases {
+            let goal = goal_with_kinds(&["command"]);
+            let mut service = EvidenceService::new();
+            service.set_backing_resolver(std::sync::Arc::new(AlwaysErrResolver(backing_error)));
+            let spec = agent_command_record().with_ledger_ref(backed_ref());
+            service.record(spec).expect("record");
+            let verdicts = service.validate_goal(&goal);
+            assert!(!verdicts.allowed(), "{backing_error:?} must still fail closed");
+            let reason = verdicts.verdicts()[0].reason();
+            assert_eq!(reason, Some(expected_reason), "for {backing_error:?}");
+            assert_eq!(
+                reason.unwrap().retryable(),
+                matches!(backing_error, BackingError::Unavailable),
+                "only a resolver outage should be marked retryable, got {backing_error:?}"
+            );
+        }
     }
 
     #[test]

@@ -79,6 +79,8 @@ pub enum JsonlExitCode {
     Provider = 4,
     Runtime = 5,
     GoalIncomplete = 6,
+    Sandbox = 7,
+    ResourceExhausted = 8,
     Interrupted = 130,
 }
 
@@ -453,9 +455,13 @@ fn from_error_code(code: ErrorCode, require_complete: bool) -> JsonlExitCode {
             JsonlExitCode::Provider
         }
         RapidErrorClass::Cancelled => JsonlExitCode::Interrupted,
+        // Split out from the generic `Runtime` bucket: a CI script can act on
+        // "the sandbox couldn't run this" or "a budget/limit was hit" without
+        // parsing the JSON error body, the same way it already can for usage/
+        // policy/provider failures.
+        RapidErrorClass::SandboxFailed => JsonlExitCode::Sandbox,
+        RapidErrorClass::ResourceExhausted => JsonlExitCode::ResourceExhausted,
         RapidErrorClass::ToolFailed
-        | RapidErrorClass::SandboxFailed
-        | RapidErrorClass::ResourceExhausted
         | RapidErrorClass::Conflict
         | RapidErrorClass::Corruption
         | RapidErrorClass::Unsupported
@@ -522,10 +528,10 @@ mod tests {
     const GOLDEN_APPROVAL_REQUIRED: &str = r#"{"schema":1,"type":"approval.required","session_id":"019c0000-0000-7000-8000-000000000002","seq":5,"time":"2026-08-14T15:20:04.123Z","data":{"capability":"fs.write"}}"#;
     const GOLDEN_ERROR: &str = r#"{"schema":1,"type":"error","session_id":"019c0000-0000-7000-8000-000000000002","seq":0,"time":"2026-08-14T15:20:04.123Z","data":{"code":"policy.denied","message":"Action denied by project policy","retryable":false,"trace_id":"018f3c8a-7e2b-7a10-8c4d-0123456789ab","details":{}}}"#;
     const GOLDEN_SESSION_FINISHED: &str = r#"{"schema":1,"type":"session.finished","session_id":"019c0000-0000-7000-8000-000000000002","seq":7,"time":"2026-08-14T15:20:04.123Z","data":{"exit_code":0}}"#;
-    const GOLDEN_EXIT_CODES: &str = r#"{"agent.concurrency_limit":5,"auth.required":4,"browser.stale_observation":5,"config.invalid":2,"context.index_unavailable":5,"goal.budget_exhausted":5,"goal.evidence_missing":2,"goal.invalid_transition":5,"internal.unexpected":5,"mcp.server_untrusted":3,"mobile.capability_unavailable":5,"plugin.capability_denied":3,"policy.approval_required":3,"policy.denied":3,"policy.lease_invalid":3,"process.timeout":5,"provider.auth_failed":4,"provider.context_too_large":4,"provider.rate_limited":4,"sandbox.tier_unavailable":5,"session.conflict":5,"session.not_found":2,"storage.corrupt":5,"tool.invalid_arguments":2,"workspace.merge_conflict":5,"workspace.preimage_mismatch":5}"#;
+    const GOLDEN_EXIT_CODES: &str = r#"{"agent.concurrency_limit":8,"auth.required":4,"browser.stale_observation":5,"config.invalid":2,"context.index_unavailable":5,"goal.budget_exhausted":8,"goal.evidence_missing":2,"goal.invalid_transition":5,"internal.unexpected":5,"mcp.server_untrusted":3,"mobile.capability_unavailable":5,"plugin.capability_denied":3,"policy.approval_required":3,"policy.denied":3,"policy.lease_invalid":3,"process.timeout":8,"provider.auth_failed":4,"provider.context_too_large":4,"provider.rate_limited":4,"sandbox.tier_unavailable":7,"session.conflict":5,"session.not_found":2,"storage.corrupt":5,"tool.invalid_arguments":2,"workspace.merge_conflict":5,"workspace.preimage_mismatch":5}"#;
     const GOLDEN_EXIT_CODES_REQUIRE_COMPLETE: &str =
         r#"{"goal.budget_exhausted":6,"goal.evidence_missing":6}"#;
-    const GOLDEN_OUTCOMES: &str = r#"{"goal_incomplete_require_complete":6,"goal_incomplete_without_flag":0,"interrupted":130,"policy":3,"provider":4,"runtime":5,"success":0,"usage":2}"#;
+    const GOLDEN_OUTCOMES: &str = r#"{"goal_incomplete_require_complete":6,"goal_incomplete_without_flag":0,"interrupted":130,"policy":3,"provider":4,"resource_exhausted":8,"runtime":5,"sandbox":7,"success":0,"usage":2}"#;
 
     fn session_id() -> SessionId {
         SESSION_ID.parse().expect("session id")
@@ -677,6 +683,11 @@ mod tests {
             ("policy", JsonlExitCode::Policy.as_i32()),
             ("provider", JsonlExitCode::Provider.as_i32()),
             ("runtime", JsonlExitCode::Runtime.as_i32()),
+            ("sandbox", JsonlExitCode::Sandbox.as_i32()),
+            (
+                "resource_exhausted",
+                JsonlExitCode::ResourceExhausted.as_i32(),
+            ),
             (
                 "goal_incomplete_require_complete",
                 JsonlRunOutcome::GoalIncomplete {
@@ -707,6 +718,34 @@ mod tests {
         );
         assert_eq!(JsonlExitCode::Success.as_i32(), 0);
         assert_eq!(JsonlExitCode::Interrupted.as_i32(), 130);
+    }
+
+    #[test]
+    fn sandbox_and_resource_exhausted_split_from_generic_runtime() {
+        assert_eq!(
+            JsonlExitCode::from_error_code(ErrorCode::SandboxTierUnavailable, false),
+            JsonlExitCode::Sandbox
+        );
+        for code in [
+            ErrorCode::GoalBudgetExhausted,
+            ErrorCode::AgentConcurrencyLimit,
+            ErrorCode::ProcessTimeout,
+        ] {
+            assert_eq!(
+                JsonlExitCode::from_error_code(code, false),
+                JsonlExitCode::ResourceExhausted,
+                "{code} should map to ResourceExhausted when completion is not required"
+            );
+        }
+        // `--require-complete` still wins over the class-based mapping for the
+        // two goal-shaped codes: a script that asked for goal completion should
+        // see the goal-incomplete signal, not a generic resource-exhausted one.
+        assert_eq!(
+            JsonlExitCode::from_error_code(ErrorCode::GoalBudgetExhausted, true),
+            JsonlExitCode::GoalIncomplete
+        );
+        assert_eq!(JsonlExitCode::Sandbox.as_i32(), 7);
+        assert_eq!(JsonlExitCode::ResourceExhausted.as_i32(), 8);
     }
 
     #[test]
