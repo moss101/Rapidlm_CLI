@@ -1329,6 +1329,7 @@ pub fn run_inspect_export(args: &[String]) -> Result<i32, P9CommandError> {
     let mut db: Option<PathBuf> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut recover: Option<PathBuf> = None;
+    let mut format = "jsonl".to_owned();
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--db" {
@@ -1337,6 +1338,12 @@ pub fn run_inspect_export(args: &[String]) -> Result<i32, P9CommandError> {
         } else if args[i] == "--recover" {
             i += 1;
             recover = args.get(i).map(PathBuf::from);
+        } else if args[i] == "--format" {
+            i += 1;
+            format = args.get(i).cloned().ok_or(P9CommandError::Usage)?;
+            if format != "jsonl" && format != "md" {
+                return Err(P9CommandError::Usage);
+            }
         } else {
             positional.push(args[i].clone());
         }
@@ -1372,19 +1379,46 @@ pub fn run_inspect_export(args: &[String]) -> Result<i32, P9CommandError> {
         .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
     use std::io::Write;
     let mut out = std::fs::File::create(&positional[1]).map_err(P9CommandError::Io)?;
-    for event in &events {
-        let line = serde_json::json!({
-            "schema": "rapidlm.ledger_event",
-            "seq": event.seq,
-            "kind": event.kind,
-            "recorded_at": event.recorded_at,
-            "payload": serde_json::from_str::<serde_json::Value>(&event.payload_json)
-                .unwrap_or(serde_json::Value::Null),
-        });
-        writeln!(out, "{}", serde_json::to_string(&line).map_err(P9CommandError::Json)?)
+    if format == "md" {
+        writeln!(out, "# Session {session}\n").map_err(P9CommandError::Io)?;
+        for event in &events {
+            let payload = serde_json::from_str::<serde_json::Value>(&event.payload_json)
+                .unwrap_or(serde_json::Value::Null);
+            // Generic rendering, not per-kind prose: EventKind has dozens of
+            // variants (session/turn/model/tool/... families) and getting
+            // each one's payload shape right is real, separate work (see
+            // newtask.md item 1.4/#14). A readable, chronological list with
+            // the raw payload as an inline code block is still a real step
+            // up from raw JSONL for a human skimming a transcript, without
+            // guessing at semantics this function doesn't actually know.
+            writeln!(
+                out,
+                "- **{}** (seq {}, {}) — `{}`",
+                event.kind,
+                event.seq,
+                event.recorded_at,
+                serde_json::to_string(&payload).map_err(P9CommandError::Json)?
+            )
             .map_err(P9CommandError::Io)?;
+        }
+    } else {
+        for event in &events {
+            let line = serde_json::json!({
+                "schema": "rapidlm.ledger_event",
+                "seq": event.seq,
+                "kind": event.kind,
+                "recorded_at": event.recorded_at,
+                "payload": serde_json::from_str::<serde_json::Value>(&event.payload_json)
+                    .unwrap_or(serde_json::Value::Null),
+            });
+            writeln!(out, "{}", serde_json::to_string(&line).map_err(P9CommandError::Json)?)
+                .map_err(P9CommandError::Io)?;
+        }
     }
-    println!("schema=rapidlm.ledger_export records_written={}", events.len());
+    println!(
+        "schema=rapidlm.ledger_export format={format} records_written={}",
+        events.len()
+    );
     Ok(0)
 }
 
@@ -1465,6 +1499,43 @@ mod sessions_tests {
         );
         let _ = std::fs::remove_file(&db);
         let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn inspect_export_format_md_writes_a_readable_transcript() {
+        let db = temp_db("export-md");
+        let out = db.with_extension("md");
+        let seeded = seed_session(&db);
+        let session_id = seeded.to_string();
+        let args: Vec<String> = vec![
+            session_id.clone(),
+            out.to_string_lossy().into_owned(),
+            "--db".to_owned(),
+            db.to_string_lossy().into_owned(),
+            "--format".to_owned(),
+            "md".to_owned(),
+        ];
+        let code = run_inspect_export(&args).expect("export command");
+        assert_eq!(code, 0);
+        let contents = std::fs::read_to_string(&out).expect("read export");
+        assert!(contents.starts_with(&format!("# Session {session_id}")), "{contents}");
+        assert!(contents.contains("**session.created**"), "{contents}");
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn inspect_export_rejects_an_unknown_format() {
+        let args: Vec<String> = vec![
+            "018f3c8a-7e2b-7a10-8c4d-0123456789ab".to_owned(),
+            "/dev/null".to_owned(),
+            "--format".to_owned(),
+            "html".to_owned(),
+        ];
+        assert!(matches!(
+            run_inspect_export(&args),
+            Err(P9CommandError::Usage)
+        ));
     }
 
     fn actor_for_sessions() -> event_ledger::event::ActorRef {
