@@ -990,6 +990,30 @@ fn exec_permission_lattice(
     Ok(lattice)
 }
 
+/// Fires `session_end` hooks exactly once, on whichever exit path `exec_turn`
+/// takes — early `?`-propagated error, an explicit early return, or falling
+/// off the end. `exec_turn` has many of the first two; a `Drop` guard is the
+/// only way to guarantee this without threading a result through every
+/// branch by hand. Empty by construction until hooks load; a fire with no
+/// configured hooks is a no-op.
+#[derive(Default)]
+struct SessionEndHookGuard {
+    hooks: Vec<String>,
+}
+
+impl Drop for SessionEndHookGuard {
+    fn drop(&mut self) {
+        if !self.hooks.is_empty() {
+            let _ = crate::hooks::run_notify_hooks(
+                &self.hooks,
+                "session_end",
+                serde_json::json!({}),
+                crate::hooks::HOOK_TIMEOUT,
+            );
+        }
+    }
+}
+
 /// Runs child agents for `task_spawn`: builds a fresh model adapter from the
 /// same user config and a depth-restricted tool surface (children never get
 /// the spawn tool, so the depth limit is structural). explore/plan scopes are
@@ -1166,6 +1190,14 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
         eprint!("{EXEC_USAGE}");
         return Err(InteractiveError::Usage);
     };
+    // `session_end` must fire on every exit path from here down — the early
+    // return above (before any project/hooks loading) doesn't count as a
+    // started session, same as `session_start`'s own placement below. The
+    // rest of this function has many `?`-propagated and explicit early
+    // returns; a `Drop` guard is the only way to guarantee firing exactly
+    // once regardless of which one is taken, without threading a result
+    // through every branch by hand.
+    let mut session_end_guard = SessionEndHookGuard::default();
     let prompt = parsed.prompt;
     // Workspace detection and trust: any resolution failure stays untrusted.
     let workspace_cancel = CancellationToken::new();
@@ -1304,6 +1336,10 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                         crate::hooks::HOOK_TIMEOUT,
                     );
                 }
+                // Captured now (before `hooks` moves into `set_hooks` below);
+                // fired later by SessionEndHookGuard's Drop impl, on whatever
+                // exit path this turn actually takes.
+                session_end_guard.hooks = hooks.session_end.clone();
                 if !hooks.is_empty() {
                     tools.set_hooks(hooks);
                 }
@@ -2348,6 +2384,50 @@ mod tests {
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
     static TERMINAL_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn session_end_guard_fires_on_drop_regardless_of_which_scope_exit_ran() {
+        let dir = std::env::temp_dir().join(format!(
+            "session-end-guard-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let capture = dir.join("fired.txt");
+        let script_path = dir.join("note.sh");
+        std::fs::write(&script_path, format!("echo fired > {}", capture.display()))
+            .expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let hook = format!("sh {}", script_path.display());
+
+        // Simulate an early-return exit path: the guard is constructed,
+        // configured, and then the enclosing scope ends (an early `return`
+        // from a real function would look identical from Drop's point of
+        // view) without ever calling anything that "finishes normally".
+        {
+            let mut guard = SessionEndHookGuard::default();
+            guard.hooks = vec![hook.clone()];
+            // scope ends here -> Drop::drop fires, same as an early `?`
+            // or `return` inside exec_turn would trigger.
+        }
+        assert!(capture.exists(), "session_end hook did not fire on drop");
+
+        // A guard that never gets any hooks configured (e.g. no project
+        // settings, or settings with no session_end key) must be a silent
+        // no-op, not an error or a spurious fire.
+        let capture2 = dir.join("should-not-exist.txt");
+        {
+            let _guard = SessionEndHookGuard::default();
+        }
+        assert!(!capture2.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parse_flags_accumulates_repeated_keys_and_rejects_bad_shapes() {

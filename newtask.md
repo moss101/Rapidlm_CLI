@@ -136,7 +136,7 @@ isn't "no write-scoped child run exists" — it's "the one that exists doesn't s
 
 | # | Gap | Grok Build | Qwen Code | Where it lands | Sev | Effort |
 |---|---|---|---|---|---|---|
-| 7 | ~~Hooks cover only `pre_tool_use`/`post_tool_use`~~ **Partially implemented 2026-08-29.** Added `session_start` (fires once per `rapid exec` run, right after settings load in `interactive.rs`), `subagent_start`/`subagent_stop` (fire around `task_spawn` in `exec_tools.rs::execute_task_spawn`) — all three via a new notification-style `run_notify_hooks` (fire-and-collect, never gates, unlike `pre_tool_use`). 5 events total now, up from 2. **Not done:** `session_end` — every other event has one clean call site; `session_end` would need firing at every exit path of `exec_turn` (`interactive.rs`, a large `?`-heavy function with many return points), which is real, separate, riskier work, not attempted here rather than half-covering it. Still far short of Grok Build/Qwen's ~15 events, no `http`/`function`/`prompt` executor types (command-only, matching the existing `pre_tool_use`/`post_tool_use` shape). | 15 events, blocking semantics | ~15 events across 4 executor types (`command`/`http`/`function`/LLM-judged `prompt`), parallel by default | `apps/rapid/src/hooks.rs` | P1 (partial) | M |
+| 7 | ~~Hooks cover only `pre_tool_use`/`post_tool_use`~~ **Implemented 2026-08-29.** Added `session_start` (fires once per `rapid exec` run, right after settings load), `session_end` (fires on *every* exit path of `exec_turn` — early `?`-propagated error, explicit early return, or falling off the end — via a `SessionEndHookGuard` whose `Drop` impl fires exactly once regardless of which path was taken; this was initially skipped as "too risky to intercept every return point" and then actually implemented once the `Drop`-guard approach was worked out, rather than left half-done), `subagent_start`/`subagent_stop` (fire around `task_spawn`) — all four via a new notification-style `run_notify_hooks` (fire-and-collect, never gates, unlike `pre_tool_use`). 6 events total now, up from 2. Still far short of Grok Build/Qwen's ~15 events, no `http`/`function`/`prompt` executor types (command-only, matching the existing `pre_tool_use`/`post_tool_use` shape). | 15 events, blocking semantics | ~15 events across 4 executor types (`command`/`http`/`function`/LLM-judged `prompt`), parallel by default | `apps/rapid/src/hooks.rs`, `interactive.rs` (`SessionEndHookGuard`) | ~~P1~~ done (partial breadth) | M |
 | 8 | No cross-CLI config/plugin import | Reads `.claude/settings.json` for permission rules only | Converts and installs **Claude Code Marketplace plugins**, Gemini CLI extensions, Qoder plugins; `/import-config claude-code` | `plugin-host` + rules_loader (RapidLM already discovers `AGENTS.md`/`.claude`/`.cursor` — extend from rule-file discovery to full plugin/MCP-config import) | P1 | M |
 | 9 | MCP tool schemas are not lazily hydrated | Meta-tools (`search_tool`/`use_tool`) | Same idea, plus 20 KB cap on eager injection | `mcp` crate | P2 | S |
 | 10 | No SDK-style typed tool-schema export | Protobuf tool API (`xai-grok-tools-api`) | `sdk-tools.d.ts`-equivalent not present either — this is a three-way gap | `tool-gateway::schema` | P2 | S |
@@ -170,7 +170,21 @@ Re-verify both before implementing rather than trusting the original row text.
 |---|---|---|---|---|---|---|
 | 15 | Exit codes are undifferentiated (fail-closed but opaque: `agent turn failed: failed`) | Not profiled in depth | Structured taxonomy: 41 auth · 42 input · 44 sandbox · 52 config · 53 turn-limit · 54 tool-exec · 55 budget · 130 SIGINT | `apps/rapid/src/headless/` | P0 | S |
 | 16 | No constrained structured-output mode | Not established | `--json-schema` registers a synthetic tool, Ajv-validated against a caller-supplied schema | `headless` + `tool-gateway` | P1 | M |
-| 17 | **Correction (2026-08-29):** "no cost accounting anywhere" was wrong — `llm-router` already computes real per-request cost. `provider.rs`'s `UsageCost::Reported { usd_micros }` is constructed from real responses in both `providers/openai_compatible.rs` and `providers/anthropic.rs` (not just a test fixture), and `ModelDescriptor` (`llm-router/src/provider.rs`) already carries `prices: ModelPrices` inside a full `ModelCatalog` (`llm-router/src/catalog.rs`) with latency class, context limits, regions, data-policy tags — i.e. most of what Phase 2 §2.8 below asks for already exists. **The actual gap is narrower and precisely located:** `apps/rapid/src/model.rs::fold_stream` reads `NormalizedUsage` (which carries `.cost()`) but only extracts `usage_total_tokens(usage)` before constructing `ModelStepOutput` — and `ModelStepOutput` (defined in `agent-runtime`, 10 construction/match sites across `harness` + 4 `agent-runtime` files + 4 `apps/rapid` files) only carries `tokens: u64`, no cost field. Cost is computed, then silently dropped at exactly that boundary, and never reaches `ExecOutcome`/the headless JSON contract. **Not fixed this pass** — widening `ModelStepOutput`'s shape touches a shared crate across ~10 call sites, which is a real, moderate-risk change deserving its own careful pass rather than being squeezed in; see spawned follow-up task. The narrower, lower-risk fix: give `ConfiguredModel` (`apps/rapid/src/model.rs`) its own `Arc<AtomicU64>`-style cost side-channel (exactly how `SupervisedModel.counter` already works for tokens, `apps/rapid/src/host.rs`), read by whichever caller constructs both `ConfiguredModel` and `run_live_exec` together, without touching `agent-runtime` at all. | Usage/cost fields present (`xai-grok-pager/src/headless/cli.rs`) | Token usage only, no pricing table, no `cost_usd` field | `apps/rapid/src/model.rs` (`ConfiguredModel::step`/`fold_stream`) → `host.rs` (`ExecOutcome`) → `headless/jsonl.rs` | P1 | M |
+| 17 | **Correction (2026-08-29):** "no cost accounting anywhere" was wrong — `llm-router` already computes real per-request cost. `provider.rs`'s `UsageCost::Reported { usd_micros }` is constructed from real responses in both `providers/openai_compatible.rs` and `providers/anthropic.rs` (not just a test fixture), and `ModelDescriptor` (`llm-router/src/provider.rs`) already carries `prices: ModelPrices` inside a full `ModelCatalog` (`llm-router/src/catalog.rs`) with latency class, context limits, regions, data-policy tags — i.e. most of what Phase 2 §2.8 below asks for already exists. **The actual gap is narrower and precisely located:** `apps/rapid/src/model.rs::fold_stream` reads `NormalizedUsage` (which carries `.cost()`) but only extracts `usage_total_tokens(usage)` before constructing `ModelStepOutput` — and `ModelStepOutput` (defined in `agent-runtime`, 10 construction/match sites across `harness` + 4 `agent-runtime` files + 4 `apps/rapid` files) only carries `tokens: u64`, no cost field. Cost is computed, then silently dropped at exactly that boundary, and never reaches `ExecOutcome`/the headless JSON contract. **Not fixed this pass** — widening `ModelStepOutput`'s shape touches a shared crate across ~10 *files*
+but, checked more precisely in a follow-up pass, **40+ individual construction/match expressions**
+(most of them struct literals in `apps/rapid/src/host.rs`'s own test suite, which would all need
+updating since Rust requires every field at a non-`#[non_exhaustive]` struct literal site) — a real,
+larger-than-first-estimated, moderate-risk change deserving its own careful pass; see spawned follow-up
+task, and note its description undersold the blast radius slightly (said "10 call sites," actual count
+is far higher once every construction and match arm is counted, not just the files containing them).
+**The side-channel idea below does not actually work as a full fix**, also discovered on closer
+inspection: `apps/rapid`'s real model-selection path wraps `ConfiguredModel` in `SelectedModel` (three
+variants) and, for a configured fallback chain, in `FallbackChainModel` (wrapping *multiple*
+`ConfiguredModel`s) — both dispatch `LiveModelCall::step` polymorphically, and only `ModelStepOutput`
+itself (not a side-channel on one concrete type) flows uniformly through every layer regardless of
+which concrete backend answered, exactly the same way `tokens` already does. A side-channel on
+`ConfiguredModel` alone would miss the fallback-chain case entirely. Widening `ModelStepOutput` is very
+likely the *only* correct fix, not just the safer one — noted for whoever picks up the follow-up task. | Usage/cost fields present (`xai-grok-pager/src/headless/cli.rs`) | Token usage only, no pricing table, no `cost_usd` field | `apps/rapid/src/model.rs` (`ConfiguredModel::step`/`fold_stream`) → `host.rs` (`ExecOutcome`) → `headless/jsonl.rs` | P1 | M |
 
 ### 1.6 Distribution (product/packaging, not architecture — tracked here for completeness, not gated on it)
 
@@ -225,6 +239,10 @@ but cannot interrupt for new ones — escalate via the foreground parent).
 - **Sev/Effort:** P0 / M.
 
 ### 2.3 `CapabilitySnapshot` / `AuthorizationEpoch` + Policy Compiler
+
+**Verified genuinely absent (2026-08-29):** a targeted grep for `CapabilitySnapshot`/`AuthorizationEpoch`/
+a policy-compiler type across `capability-broker` found nothing — unlike most of this section, this one
+really is missing, not just unwired.
 
 Modbit: `CAP-005` (immutable per-model-round capability snapshot carried through the model event, tool
 call, and run step — mid-round policy changes apply next round, never retroactively), `CAP-001` (Policy
@@ -283,6 +301,14 @@ rejects a stale writer. Named explicitly to "prevent desktop/CLI/cloud dual-resu
 
 ### 2.7 Context Pack Compiler / Workspace Capsule + Next-Edit-Ripple + retrieval-before-edit guardrail
 
+**Verified genuinely absent (2026-08-29):** unlike most items in this section, a targeted grep for
+change-impact/ripple analysis (`fn.*impact`, `affected_files`, `affected_tests`) in
+`crates/context-engine/src` returned nothing. This one is a real gap, not a wiring task. Also newly
+confirmed: `context-engine::compact`'s whole compaction system (`compact.rs` + `compact_policy.rs`) is
+itself unwired from `apps/rapid` — `compact_packet` is only ever called from within
+`compact_policy.rs`, in the same crate, never from the exec loop. So Phase 1 §1.4 row 13's "explicit
+fast-path" framing undersells it: compaction isn't reachable *at all* today, deterministic or model-based.
+
 Modbit: `CTX-013`/`CTX-014` (a bounded, provenance-carrying, task-specific context package for execution
 and handoff — "a context package grants no permissions"), `CTX-017` (tagged MOAT — graph-driven affected
 files/symbols/tests/config as change-impact follow-up after an edit, revision/evidence bound), `CTX-003`
@@ -340,11 +366,23 @@ Modbit: `WRK-016` (mint short-TTL, audience/run/workspace-scoped credentials for
 — hosted provider API keys never leave the gateway), `WRK-017` (CPU/RAM/disk/network/token/cost/
 concurrency ceilings — and explicitly: "budgets cannot convert failed verification into success").
 
-- **Where it lands:** RapidLM's frontier capability list already names "short-lived credentials" as an
-  invariant (`00-README.md`) — this makes it concrete against the `auth`/`security` crates. The Resource
-  Governor's anti-pattern clause (budgets can't buy a fake pass) is a guardrail worth encoding directly
-  into whatever implements `CompletionContract` in §2.4.
-- **Sev/Effort:** P2 / M.
+**Correction (2026-08-29): the Credential Broker half is already built.** `crates/auth/src/broker.rs`'s
+`SecretBroker` already does exactly this — opaque `ScopedSecret` handles (never plaintext), resolution
+only at the executor/provider boundary via `SecretBroker::open`, one-use tokens that can't be replayed,
+never written to the event ledger/traces/telemetry/logs. Not used anywhere in `apps/rapid` today (which
+talks to `auth::InMemoryCredentialStore` directly for the single-provider-credential case it currently
+has) — another wiring gap, not a missing feature, and lower priority than the others in this document
+since `apps/rapid` doesn't yet have a scenario (MCP server secrets, multi-tenant credential sharing)
+that actually needs the scoping `SecretBroker` provides. **The Resource Governor half is genuinely
+absent** — no CPU/RAM/disk/network/concurrency ceiling type exists anywhere in the workspace (only
+`GoalBudget`'s narrower turn/token/time budget for one goal, `agent-runtime`, unrelated). Building one is
+a real, standalone systems feature (needs actual OS-level resource monitoring), not a small addition.
+
+- **Where it lands:** Credential Broker: wire `SecretBroker` into `apps/rapid`'s credential path once a
+  real multi-secret scenario exists — premature before that. Resource Governor: new work, `sandbox` or a
+  new small crate; encode its "budgets can't buy a fake pass" anti-pattern into whatever implements
+  `CompletionContract` in §2.4.
+- **Sev/Effort:** P2 / M (broker wiring) + L (governor, new feature).
 
 ---
 

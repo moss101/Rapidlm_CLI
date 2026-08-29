@@ -26,6 +26,10 @@ pub struct HooksConfig {
     /// Fires once per `rapid exec` run, after hooks/settings load, before the
     /// turn starts. Notification-style: output is logged, never gates.
     pub session_start: Vec<String>,
+    /// Fires once per `rapid exec` run, on every exit path (success, typed
+    /// failure, or early return) — see `SessionEndHookGuard` in
+    /// `interactive.rs`. Notification-style, same as `session_start`.
+    pub session_end: Vec<String>,
     /// Fires when `task_spawn` is about to run a child agent.
     /// Notification-style, same as `session_start`.
     pub subagent_start: Vec<String>,
@@ -43,6 +47,7 @@ impl HooksConfig {
             ("pre_tool_use", &mut config.pre_tool_use),
             ("post_tool_use", &mut config.post_tool_use),
             ("session_start", &mut config.session_start),
+            ("session_end", &mut config.session_end),
             ("subagent_start", &mut config.subagent_start),
             ("subagent_stop", &mut config.subagent_stop),
         ] {
@@ -69,6 +74,7 @@ impl HooksConfig {
         self.pre_tool_use.is_empty()
             && self.post_tool_use.is_empty()
             && self.session_start.is_empty()
+            && self.session_end.is_empty()
             && self.subagent_start.is_empty()
             && self.subagent_stop.is_empty()
     }
@@ -400,11 +406,12 @@ exit 0"#,
     #[test]
     fn parse_settings_reads_the_new_notification_hook_keys() {
         let value: serde_json::Value = serde_json::from_str(
-            r#"{"hooks": {"session_start": ["a"], "subagent_start": ["b"], "subagent_stop": ["c"]}}"#,
+            r#"{"hooks": {"session_start": ["a"], "session_end": ["d"], "subagent_start": ["b"], "subagent_stop": ["c"]}}"#,
         )
         .expect("json");
         let hooks = HooksConfig::parse(&value).expect("hooks");
         assert_eq!(hooks.session_start, vec!["a".to_owned()]);
+        assert_eq!(hooks.session_end, vec!["d".to_owned()]);
         assert_eq!(hooks.subagent_start, vec!["b".to_owned()]);
         assert_eq!(hooks.subagent_stop, vec!["c".to_owned()]);
         assert!(!hooks.is_empty());
