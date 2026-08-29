@@ -230,10 +230,16 @@ pub struct SandboxExecRequest {
     output_limit: u64,
 }
 
-/// Structured exec completion.
+/// Structured exec completion. `output` is the combined stdout+stderr bytes,
+/// already bounded by the spec's `output_limit` (a backend that truncates
+/// must still report the real truncated bytes, never a fabricated/partial
+/// reconstruction) — a sibling field to `exit`, not folded into
+/// `ResourceUsage`, whose own doc comment ("counters only") is specifically
+/// about that struct, not this one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxExecResult {
     exit: SandboxExit,
+    output: Vec<u8>,
 }
 
 /// Process-tree exit plus resource usage. Reason flags are explicit.
@@ -920,12 +926,22 @@ impl SandboxExecRequest {
 }
 
 impl SandboxExecResult {
-    pub const fn new(exit: SandboxExit) -> Self {
-        Self { exit }
+    /// `output` is the exec's combined, already-bounded stdout+stderr bytes.
+    /// A backend with no way to capture real output yet (not attempted for
+    /// every backend in this pass — see call sites) passes an empty `Vec`,
+    /// which is indistinguishable from "produced no output" here; that's a
+    /// known, honest limitation for those backends, not a claim they've been
+    /// verified silent.
+    pub const fn new(exit: SandboxExit, output: Vec<u8>) -> Self {
+        Self { exit, output }
     }
 
     pub const fn exit(&self) -> SandboxExit {
         self.exit
+    }
+
+    pub fn output(&self) -> &[u8] {
+        &self.output
     }
 }
 
@@ -1422,15 +1438,18 @@ mod tests {
             if request.timeout() > MAX_TIMEOUT {
                 return Err(SandboxError::TimeoutInvalid);
             }
-            Ok(SandboxExecResult::new(SandboxExit::new(
-                Some(0),
-                None,
-                SandboxExitReason::Exited,
-                false,
-                false,
-                false,
-                ResourceUsage::new(1, 1, 1, 0),
-            )))
+            Ok(SandboxExecResult::new(
+                SandboxExit::new(
+                    Some(0),
+                    None,
+                    SandboxExitReason::Exited,
+                    false,
+                    false,
+                    false,
+                    ResourceUsage::new(1, 1, 1, 0),
+                ),
+                Vec::new(),
+            ))
         }
 
         fn destroy(

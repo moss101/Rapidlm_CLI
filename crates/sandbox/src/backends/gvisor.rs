@@ -1393,94 +1393,100 @@ fn run_gvisor(
     delete_container(&plan.program, &bundle.state, &bundle.cid, cancel);
     let _ = sandbox_id;
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    fn usage_bytes(output: &[u8]) -> u64 {
+        u64::try_from(output.len()).unwrap_or(u64::MAX)
+    }
     match outcome {
         WaitOutcome::Finished {
             code,
             signal,
-            output_bytes,
+            output,
             usage,
-        } => Ok(SandboxExecResult::new(SandboxExit::new(
-            code,
-            signal,
-            SandboxExitReason::Exited,
-            false,
-            false,
-            false,
-            ResourceUsage::new(
-                elapsed_ms,
-                usage.memory_peak_mb,
-                usage.pids_peak,
-                output_bytes,
+        } => Ok(SandboxExecResult::new(
+            SandboxExit::new(
+                code,
+                signal,
+                SandboxExitReason::Exited,
+                false,
+                false,
+                false,
+                ResourceUsage::new(
+                    elapsed_ms,
+                    usage.memory_peak_mb,
+                    usage.pids_peak,
+                    usage_bytes(&output),
+                ),
             ),
-        ))),
-        WaitOutcome::TimedOut {
-            output_bytes,
-            usage,
-        } => Ok(SandboxExecResult::new(SandboxExit::new(
-            None,
-            None,
-            SandboxExitReason::TimedOut,
-            false,
-            true,
-            false,
-            ResourceUsage::new(
-                elapsed_ms,
-                usage.memory_peak_mb,
-                usage.pids_peak,
-                output_bytes,
+            output,
+        )),
+        WaitOutcome::TimedOut { output, usage } => Ok(SandboxExecResult::new(
+            SandboxExit::new(
+                None,
+                None,
+                SandboxExitReason::TimedOut,
+                false,
+                true,
+                false,
+                ResourceUsage::new(
+                    elapsed_ms,
+                    usage.memory_peak_mb,
+                    usage.pids_peak,
+                    usage_bytes(&output),
+                ),
             ),
-        ))),
-        WaitOutcome::Cancelled {
-            output_bytes,
-            usage,
-        } => Ok(SandboxExecResult::new(SandboxExit::new(
-            None,
-            None,
-            SandboxExitReason::Cancelled,
-            false,
-            false,
-            false,
-            ResourceUsage::new(
-                elapsed_ms,
-                usage.memory_peak_mb,
-                usage.pids_peak,
-                output_bytes,
+            output,
+        )),
+        WaitOutcome::Cancelled { output, usage } => Ok(SandboxExecResult::new(
+            SandboxExit::new(
+                None,
+                None,
+                SandboxExitReason::Cancelled,
+                false,
+                false,
+                false,
+                ResourceUsage::new(
+                    elapsed_ms,
+                    usage.memory_peak_mb,
+                    usage.pids_peak,
+                    usage_bytes(&output),
+                ),
             ),
-        ))),
-        WaitOutcome::Oom {
-            output_bytes,
-            usage,
-        } => Ok(SandboxExecResult::new(SandboxExit::new(
-            None,
-            None,
-            SandboxExitReason::Oom,
-            true,
-            false,
-            false,
-            ResourceUsage::new(
-                elapsed_ms,
-                usage.memory_peak_mb,
-                usage.pids_peak,
-                output_bytes,
+            output,
+        )),
+        WaitOutcome::Oom { output, usage } => Ok(SandboxExecResult::new(
+            SandboxExit::new(
+                None,
+                None,
+                SandboxExitReason::Oom,
+                true,
+                false,
+                false,
+                ResourceUsage::new(
+                    elapsed_ms,
+                    usage.memory_peak_mb,
+                    usage.pids_peak,
+                    usage_bytes(&output),
+                ),
             ),
-        ))),
-        WaitOutcome::PidsExceeded {
-            output_bytes,
-            usage,
-        } => Ok(SandboxExecResult::new(SandboxExit::new(
-            None,
-            None,
-            SandboxExitReason::PolicyViolation,
-            false,
-            false,
-            true,
-            ResourceUsage::new(
-                elapsed_ms,
-                usage.memory_peak_mb,
-                usage.pids_peak,
-                output_bytes,
+            output,
+        )),
+        WaitOutcome::PidsExceeded { output, usage } => Ok(SandboxExecResult::new(
+            SandboxExit::new(
+                None,
+                None,
+                SandboxExitReason::PolicyViolation,
+                false,
+                false,
+                true,
+                ResourceUsage::new(
+                    elapsed_ms,
+                    usage.memory_peak_mb,
+                    usage.pids_peak,
+                    usage_bytes(&output),
+                ),
             ),
-        ))),
+            output,
+        )),
         WaitOutcome::Failed => Err(SandboxError::HealthFailed),
     }
 }
@@ -1714,23 +1720,23 @@ enum WaitOutcome {
     Finished {
         code: Option<i32>,
         signal: Option<i32>,
-        output_bytes: u64,
+        output: Vec<u8>,
         usage: GroupUsage,
     },
     TimedOut {
-        output_bytes: u64,
+        output: Vec<u8>,
         usage: GroupUsage,
     },
     Cancelled {
-        output_bytes: u64,
+        output: Vec<u8>,
         usage: GroupUsage,
     },
     Oom {
-        output_bytes: u64,
+        output: Vec<u8>,
         usage: GroupUsage,
     },
     PidsExceeded {
-        output_bytes: u64,
+        output: Vec<u8>,
         usage: GroupUsage,
     },
     Failed,
@@ -1783,19 +1789,13 @@ fn wait_child(
     let status = loop {
         if polls.is_multiple_of(CANCEL_STRIDE) && cancel.is_cancelled() {
             terminate_process_group(child);
-            let output_bytes = join_output(stdout_thread, stderr_thread);
-            return WaitOutcome::Cancelled {
-                output_bytes,
-                usage,
-            };
+            let output = join_output(stdout_thread, stderr_thread);
+            return WaitOutcome::Cancelled { output, usage };
         }
         if started.elapsed() >= timeout {
             terminate_process_group(child);
-            let output_bytes = join_output(stdout_thread, stderr_thread);
-            return WaitOutcome::TimedOut {
-                output_bytes,
-                usage,
-            };
+            let output = join_output(stdout_thread, stderr_thread);
+            return WaitOutcome::TimedOut { output, usage };
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -1807,19 +1807,13 @@ fn wait_child(
                         usage.memory_peak_mb = usage.memory_peak_mb.max(sample.1);
                         if sample.1 > u64::from(plan.memory_mb) {
                             terminate_process_group(child);
-                            let output_bytes = join_output(stdout_thread, stderr_thread);
-                            return WaitOutcome::Oom {
-                                output_bytes,
-                                usage,
-                            };
+                            let output = join_output(stdout_thread, stderr_thread);
+                            return WaitOutcome::Oom { output, usage };
                         }
                         if sample.0 > plan.pids {
                             terminate_process_group(child);
-                            let output_bytes = join_output(stdout_thread, stderr_thread);
-                            return WaitOutcome::PidsExceeded {
-                                output_bytes,
-                                usage,
-                            };
+                            let output = join_output(stdout_thread, stderr_thread);
+                            return WaitOutcome::PidsExceeded { output, usage };
                         }
                     }
                     None => {
@@ -1843,22 +1837,26 @@ fn wait_child(
         }
         polls = polls.saturating_add(1);
     };
-    let output_bytes = join_output(stdout_thread, stderr_thread);
+    let output = join_output(stdout_thread, stderr_thread);
     WaitOutcome::Finished {
         code: status.code(),
         signal: exit_signal(&status),
-        output_bytes,
+        output,
         usage,
     }
 }
 
+/// Combined, already-capped stdout+stderr bytes: stdout first, then stderr —
+/// the two are read concurrently on separate pipes/threads, so there is no
+/// real chronological interleaving to preserve.
 fn join_output(
     stdout: thread::JoinHandle<(Vec<u8>, bool)>,
     stderr: thread::JoinHandle<(Vec<u8>, bool)>,
-) -> u64 {
-    let stdout_len = stdout.join().map(|(buf, _)| buf.len()).unwrap_or(0);
-    let stderr_len = stderr.join().map(|(buf, _)| buf.len()).unwrap_or(0);
-    u64::try_from(stdout_len.saturating_add(stderr_len)).unwrap_or(u64::MAX)
+) -> Vec<u8> {
+    let mut out = stdout.join().map(|(buf, _)| buf).unwrap_or_default();
+    let mut err = stderr.join().map(|(buf, _)| buf).unwrap_or_default();
+    out.append(&mut err);
+    out
 }
 
 fn read_capped(mut pipe: impl Read, cap: usize) -> (Vec<u8>, bool) {
