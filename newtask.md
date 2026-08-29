@@ -277,6 +277,18 @@ error, timeout, or invalid output must yield `INDETERMINATE`, never silent succe
 
 ### 2.5 Structured `PlanGraph`/`TodoState` outside the transcript + stall detection
 
+**Stall detection implemented 2026-08-29** (the `PlanGraph`/`TodoState` half below is not). New
+`detect_stall()` (`apps/rapid/src/host.rs`) scans the last `STALL_WINDOW` (6) tool exchanges for an
+identical `(tool, arguments)` call repeated at least `STALL_REPEAT_THRESHOLD` (3) times — a model stuck
+re-reading the same file with no distinct progress — and, when found, logs a `--verbose` diagnostic
+line via the existing `StepDiag` mechanism on `SupervisedModel::step`. Deliberately diagnostic-only:
+never fails or alters the turn, and does **not** inject the warning into the model's own context so it
+could see and react to it — that's real follow-up work (would need to thread a warning string into the
+prompt/context-packet pipeline), not attempted here. Tests confirm exact-repeat detection, that varied
+arguments (real progress) don't false-positive even with the same tool name repeating, that two repeats
+stays under threshold, and that an old repetition outside the window doesn't count against a turn that
+moved on.
+
 Modbit: `AGT-016` (plan nodes carry status, dependencies, owner, evidence requirements, attempts, and
 blockers as durable state outside the transcript — compaction cannot silently change task truth),
 `AGT-017` (detect repeated read/edit cycles with no progress and surface the known state plus the

@@ -648,6 +648,39 @@ impl<B> SupervisedModel<B> {
     }
 }
 
+/// Bounded window of the most recent tool exchanges examined for a stall
+/// pattern (Modbit `AGT-017`: detect repeated read/edit cycles without
+/// progress, surface it rather than let the turn loop silently). Smaller
+/// than `MAX_TOOL_HISTORY_EXCHANGES` on purpose — a stall is a recent-
+/// behavior signal, not a whole-turn one.
+const STALL_WINDOW: usize = 6;
+/// An identical `(tool, arguments)` call repeated at least this many times
+/// inside the window is reported as a stall.
+const STALL_REPEAT_THRESHOLD: usize = 3;
+
+/// Detect a model stuck repeating the exact same tool call with no distinct
+/// progress in between. Returns a description of the repeated call when
+/// found. Diagnostic-only: never fails or alters the turn, only surfaces a
+/// `--verbose` warning line an operator or CI log can see. Injecting this
+/// into the model's own context (so it can see and react to its own stall)
+/// is further follow-up, not attempted here — see `newtask.md` §2.5.
+fn detect_stall(history: &[agent_runtime::ToolStepExchange]) -> Option<String> {
+    let window_start = history.len().saturating_sub(STALL_WINDOW);
+    let mut counts: std::collections::BTreeMap<(&str, &str), usize> = std::collections::BTreeMap::new();
+    for exchange in &history[window_start..] {
+        for call in exchange.calls() {
+            *counts.entry((call.tool(), call.arguments())).or_insert(0) += 1;
+        }
+    }
+    let ((tool, _), count) = counts
+        .into_iter()
+        .find(|(_, count)| *count >= STALL_REPEAT_THRESHOLD)?;
+    Some(format!(
+        "{tool} repeated {count}x in the last {} exchange(s) with no distinct progress",
+        history.len().min(STALL_WINDOW)
+    ))
+}
+
 impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
     fn step(
         &mut self,
@@ -655,6 +688,11 @@ impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
         input: &ModelStepInput<'_>,
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError> {
+        if let Some(warning) = detect_stall(input.history())
+            && let Some(diag) = &self.diag
+        {
+            diag.line(format!("stall warning: {warning}"));
+        }
         // Connection and transient failures are retryable for a model step: a
         // step that failed committed no tool effects, so re-invoking is safe
         // (bounded retry ceiling).
@@ -1081,6 +1119,67 @@ mod tests {
     use context_engine::retrieval::candidates::{Freshness, TrustClass};
     use protocol::{AgentId, SessionId};
     use std::collections::VecDeque;
+
+    fn exchange(tool: &str, arguments: &str) -> agent_runtime::ToolStepExchange {
+        let call = ProposedToolCall::new("c", tool, arguments).expect("call");
+        agent_runtime::ToolStepExchange::new(
+            vec![call],
+            vec![ToolStepResult::Succeeded {
+                call_id: "c".to_owned(),
+                summary: "ok".to_owned(),
+            }],
+        )
+    }
+
+    #[test]
+    fn stall_detection_flags_the_same_call_repeated_and_ignores_varied_history() {
+        // Three identical repo_read calls on the same path within the
+        // window: a real stall, no distinct progress in between.
+        let stalled = vec![
+            exchange("repo_read", r#"{"path":"a.rs"}"#),
+            exchange("repo_read", r#"{"path":"a.rs"}"#),
+            exchange("repo_read", r#"{"path":"a.rs"}"#),
+        ];
+        let warning = detect_stall(&stalled).expect("stall detected");
+        assert!(warning.contains("repo_read"), "{warning}");
+        assert!(warning.contains('3'), "{warning}");
+
+        // Same tool, different arguments each time: real progress, not a
+        // stall, even though the tool name repeats.
+        let varied = vec![
+            exchange("repo_read", r#"{"path":"a.rs"}"#),
+            exchange("repo_read", r#"{"path":"b.rs"}"#),
+            exchange("repo_read", r#"{"path":"c.rs"}"#),
+        ];
+        assert!(detect_stall(&varied).is_none());
+
+        // Below the repeat threshold: two repeats is not (yet) a stall.
+        let below_threshold = vec![
+            exchange("repo_read", r#"{"path":"a.rs"}"#),
+            exchange("repo_read", r#"{"path":"a.rs"}"#),
+        ];
+        assert!(detect_stall(&below_threshold).is_none());
+
+        assert!(detect_stall(&[]).is_none());
+    }
+
+    #[test]
+    fn stall_detection_only_looks_at_the_recent_window() {
+        // A repeated call far in the past, outside STALL_WINDOW, must not
+        // count against a turn that has since moved on to distinct calls.
+        let mut history = vec![
+            exchange("repo_read", r#"{"path":"a.rs"}"#),
+            exchange("repo_read", r#"{"path":"a.rs"}"#),
+            exchange("repo_read", r#"{"path":"a.rs"}"#),
+        ];
+        for i in 0..STALL_WINDOW {
+            history.push(exchange("repo_read", &format!(r#"{{"path":"distinct-{i}.rs"}}"#)));
+        }
+        assert!(
+            detect_stall(&history).is_none(),
+            "old repetition outside the window must not still be flagged"
+        );
+    }
 
     /// Scripted backing whose call log is shared across clones, so a test can
     /// hand the backing to `run_live_exec` by value and still observe how many
