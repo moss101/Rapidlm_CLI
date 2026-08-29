@@ -1,0 +1,17 @@
+Build a small polyglot project in the current directory. Complete ALL of these steps in order:
+
+1. Create src/primegen.py: running `python3 src/primegen.py N` must print the first N prime numbers, one per line, to stdout. It must be correct for any N up to 100.
+
+2. The file tools/stats.py exists but contains a bug: `python3 tools/stats.py --selftest` currently fails. Diagnose and fix the bug in place so the self-test prints PASS and exits 0. Make the minimal fix; do not rewrite the whole file.
+
+3. Create doubler/src/main.rs: a Rust program that reads one integer per line from stdin and prints each integer doubled, one per line. Build it with: rustc --edition 2021 -O -o doubler/doubler doubler/src/main.rs
+
+4. Create inventory.json containing exactly 5 items, each a JSON object with keys "name" (string), "price" (number greater than 0) and "qty" (integer greater than 0). Create src/report.py that reads inventory.json and prints exactly one line to stdout: `TOTAL: <sum of price*qty over all items>` with the sum rounded to 2 decimal places.
+
+5. Create build.sh and make it executable. It must run, in order: (a) python3 tools/stats.py --selftest, (b) python3 src/primegen.py 5 piped into ./doubler/doubler, (c) python3 src/report.py. The script must exit non-zero if any of the three steps fails.
+
+6. Run ./build.sh and make sure it succeeds end to end. Then make sure the project is a git repository (run `git init` if needed) and commit ALL project files with the exact commit message: init: inventory project
+
+Afterwards the working tree must be clean: no modified or untracked files other than build artifacts you have explicitly listed in .gitignore.
+
+Finish by printing: (1) the full output of ./build.sh from your final run, and (2) a one-paragraph summary of what you did.

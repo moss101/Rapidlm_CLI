@@ -1,0 +1,14 @@
+You are working in a Python repository at the current directory. The package is `textlib`; its test suite currently fails:
+
+  python3 -m unittest discover -s tests -v
+
+Your job: make the whole suite pass by finding and fixing the underlying product bugs in the `textlib/` package code. Every failing test points at real broken behavior; diagnose the root cause and fix it properly.
+
+Rules:
+- Do NOT modify anything under `tests/`. Do not delete, skip, weaken, or trivialize tests. A fix that games the tests instead of repairing the behavior does not count.
+- Make targeted fixes; do not rewrite modules from scratch.
+- When you are done, the command above must exit 0 with every test passing.
+- Commit all your changes with the exact commit message: fix: make test suite green
+- The working tree must be clean afterwards (nothing modified or untracked).
+
+Finish by printing: (1) the tail of the final passing test run, and (2) a one-line-per-bug list of what was broken and how you fixed it.
