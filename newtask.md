@@ -110,12 +110,26 @@ isn't "no write-scoped child run exists" — it's "the one that exists doesn't s
 
 ### 1.4 Memory & context
 
+**Correction (2026-08-29):** rows 13 and 14 below are narrower than first written — spot-checked
+against source during this pass (not as thoroughly as the sandboxing/cost-accounting corrections
+above, flagging as lower-confidence rather than re-scoping in full):
+- `crates/context-engine/src/compact.rs::compact_packet` already has a `CompactMethod::Deterministic`
+  path used as the built-in fallback whenever no model summarizer is supplied or one fails — i.e. a
+  mechanical, no-model-call compaction mode already exists at the context-engine layer. What's
+  unconfirmed is whether it's reachable as an explicit, user-requested "always mechanical, skip the
+  summarizer" mode (row 13's actual ask) rather than only as an automatic fallback.
+- A form of session export already exists: `rapid inspect export <session> <file>`
+  (`apps/rapid/src/p9_commands.rs::run_inspect_export`) writes raw ledger events as JSONL. Row 14's
+  real gap is narrower than "no export exists" — it's the richer `html`/`md` rendered-transcript
+  formats, not the JSONL case.
+Re-verify both before implementing rather than trusting the original row text.
+
 | # | Gap | Grok Build | Qwen Code | Where it lands | Sev | Effort |
 |---|---|---|---|---|---|---|
 | 11 | No background memory-consolidation pass | Not established | **"Dream"**: LLM-planned dedup/cleanup over saved memories, daily or on-demand | `context-engine::memory` (crate exists per `gaps.md` remediation item 15 — extend, don't replace) | P1 | M |
 | 12 | No git-committed team-shared memory tier | Not established | `.qwen/team-memory/` with a mandatory secret scanner before commit | `context-engine::memory` + `security::scanners::secrets` (a `Finding`-lifecycle type already exists for secrets — reuse it, per `gaps.md` finding #4) | P2 | M |
-| 13 | No mechanical (non-model-call) compaction fast-path | Not established | `/compress-fast`: strips old tool output/thinking with no model call | `context-engine::compact` | P1 | S |
-| 14 | No full session export (`html`/`md`/`json`/`jsonl`) | Not established | `/export {html,md,json,jsonl}` | `event-ledger` + a new `rapid export` subcommand (already listed in `00-README.md`'s CLI surface, not wired) | P2 | S |
+| 13 | No *user-requested* mechanical (non-model-call) compaction fast-path — the deterministic path already exists as an automatic fallback (see correction above), just maybe not as an explicit mode | Not established | `/compress-fast`: strips old tool output/thinking with no model call | `context-engine::compact` (already has the primitive) + wherever compaction is user-triggered | P2 | S |
+| 14 | No rendered (`html`/`md`) export format — raw JSONL export already exists (see correction above) | Not established | `/export {html,md,json,jsonl}` | `apps/rapid/src/p9_commands.rs::run_inspect_export` (extend, don't replace) | P2 | S |
 
 ### 1.5 Headless / scripting contract
 
@@ -123,7 +137,7 @@ isn't "no write-scoped child run exists" — it's "the one that exists doesn't s
 |---|---|---|---|---|---|---|
 | 15 | Exit codes are undifferentiated (fail-closed but opaque: `agent turn failed: failed`) | Not profiled in depth | Structured taxonomy: 41 auth · 42 input · 44 sandbox · 52 config · 53 turn-limit · 54 tool-exec · 55 budget · 130 SIGINT | `apps/rapid/src/headless/` | P0 | S |
 | 16 | No constrained structured-output mode | Not established | `--json-schema` registers a synthetic tool, Ajv-validated against a caller-supplied schema | `headless` + `tool-gateway` | P1 | M |
-| 17 | No dollar-cost accounting anywhere (note: Qwen Code doesn't have this either — token usage is reported, `cost_usd` is not) | Usage/cost fields present (`xai-grok-pager/src/headless/cli.rs`) | Token usage only, no pricing table, no `cost_usd` field | `llm-router` + `headless` — see Phase 2 §2.8, this is a chance to actually lead, not just match | P1 | M |
+| 17 | **Correction (2026-08-29):** "no cost accounting anywhere" was wrong — `llm-router` already computes real per-request cost. `provider.rs`'s `UsageCost::Reported { usd_micros }` is constructed from real responses in both `providers/openai_compatible.rs` and `providers/anthropic.rs` (not just a test fixture), and `ModelDescriptor` (`llm-router/src/provider.rs`) already carries `prices: ModelPrices` inside a full `ModelCatalog` (`llm-router/src/catalog.rs`) with latency class, context limits, regions, data-policy tags — i.e. most of what Phase 2 §2.8 below asks for already exists. **The actual gap is narrower and precisely located:** `apps/rapid/src/model.rs::fold_stream` reads `NormalizedUsage` (which carries `.cost()`) but only extracts `usage_total_tokens(usage)` before constructing `ModelStepOutput` — and `ModelStepOutput` (defined in `agent-runtime`, 10 construction/match sites across `harness` + 4 `agent-runtime` files + 4 `apps/rapid` files) only carries `tokens: u64`, no cost field. Cost is computed, then silently dropped at exactly that boundary, and never reaches `ExecOutcome`/the headless JSON contract. **Not fixed this pass** — widening `ModelStepOutput`'s shape touches a shared crate across ~10 call sites, which is a real, moderate-risk change deserving its own careful pass rather than being squeezed in; see spawned follow-up task. The narrower, lower-risk fix: give `ConfiguredModel` (`apps/rapid/src/model.rs`) its own `Arc<AtomicU64>`-style cost side-channel (exactly how `SupervisedModel.counter` already works for tokens, `apps/rapid/src/host.rs`), read by whichever caller constructs both `ConfiguredModel` and `run_live_exec` together, without touching `agent-runtime` at all. | Usage/cost fields present (`xai-grok-pager/src/headless/cli.rs`) | Token usage only, no pricing table, no `cost_usd` field | `apps/rapid/src/model.rs` (`ConfiguredModel::step`/`fold_stream`) → `host.rs` (`ExecOutcome`) → `headless/jsonl.rs` | P1 | M |
 
 ### 1.6 Distribution (product/packaging, not architecture — tracked here for completeness, not gated on it)
 
@@ -250,6 +264,11 @@ retrieved; surface *inadequate context* as a distinct condition rather than edit
 - **Sev/Effort:** P1 / M.
 
 ### 2.8 Model router upgrade: capability catalog + `RouterDecisionRecord` + real cost accounting
+
+**Correction (2026-08-29):** the capability-catalog half of this is already substantially built —
+see the correction on Phase 1 §1.5 row 17 above. What's genuinely missing is `RouterDecisionRecord`
+(no auditable routing-decision record exists) and getting the already-computed cost value from
+`llm-router` out to a caller (see that same correction for the exact boundary where it's dropped).
 
 Modbit: `MOD-003` (a model capability catalog — context window, tool/parallel/vision/reasoning/
 structured-output support, latency, cost, health — "do not route by model name alone"), `MOD-004`
