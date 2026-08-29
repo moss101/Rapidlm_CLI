@@ -545,7 +545,7 @@ pub const RAPID_SUBCOMMANDS: &[(&str, &str)] = &[
     ("tools", "dump the model-facing tool surface's typed JSON schemas"),
     ("agent-cli", "one supervised external CLI agent turn: <prompt> -- argv..."),
     ("sessions", "list or search sessions"),
-    ("inspect-export", "export the raw event ledger for a session as JSONL"),
+    ("inspect-export", "export a session's event ledger (--format jsonl|md|html)"),
     ("cron", "durable prompt cron (add/list/remove/poll)"),
     ("agents", "project agent definitions (list/validate/scaffold)"),
     ("plugins", "plugin trust lifecycle (validate/register/list/approve/reject/hook-test)"),
@@ -1324,6 +1324,24 @@ fn decode_hook_fixture(bytes: &[u8]) -> Result<plugin_host::HookEventInput, Stri
 }
 
 
+/// Minimal HTML entity escaping for the `--format html` export below. Ledger
+/// payloads are untrusted-origin text (tool output, model text) rendered into
+/// a static file a human may open in a browser — escape unconditionally.
+fn html_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// `rapid inspect-export <session-id> <out.jsonl> [--db <path>]`: dump the
 /// durable ledger for one session as bounded JSONL via the kernel client.
 pub fn run_inspect_export(args: &[String]) -> Result<i32, P9CommandError> {
@@ -1342,7 +1360,7 @@ pub fn run_inspect_export(args: &[String]) -> Result<i32, P9CommandError> {
         } else if args[i] == "--format" {
             i += 1;
             format = args.get(i).cloned().ok_or(P9CommandError::Usage)?;
-            if format != "jsonl" && format != "md" {
+            if format != "jsonl" && format != "md" && format != "html" {
                 return Err(P9CommandError::Usage);
             }
         } else {
@@ -1402,6 +1420,31 @@ pub fn run_inspect_export(args: &[String]) -> Result<i32, P9CommandError> {
             )
             .map_err(P9CommandError::Io)?;
         }
+    } else if format == "html" {
+        writeln!(
+            out,
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>Session {session}</title></head><body>"
+        )
+        .map_err(P9CommandError::Io)?;
+        writeln!(out, "<h1>Session {session}</h1><ul>").map_err(P9CommandError::Io)?;
+        for event in &events {
+            let payload = serde_json::from_str::<serde_json::Value>(&event.payload_json)
+                .unwrap_or(serde_json::Value::Null);
+            // Same generic, per-kind-agnostic rendering as the `md` format
+            // above — a readable chronological list, not per-kind prose.
+            writeln!(
+                out,
+                "<li><strong>{}</strong> (seq {}, {}) — <code>{}</code></li>",
+                html_escape(&event.kind.to_string()),
+                event.seq,
+                html_escape(&event.recorded_at.to_string()),
+                html_escape(
+                    &serde_json::to_string(&payload).map_err(P9CommandError::Json)?
+                ),
+            )
+            .map_err(P9CommandError::Io)?;
+        }
+        writeln!(out, "</ul></body></html>").map_err(P9CommandError::Io)?;
     } else {
         for event in &events {
             let line = serde_json::json!({
@@ -1454,6 +1497,14 @@ mod sessions_tests {
     use super::*;
 
     static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    #[test]
+    fn html_escape_neutralizes_all_five_entities() {
+        assert_eq!(
+            html_escape(r#"<script>alert('&"xss"&')</script>"#),
+            "&lt;script&gt;alert(&#39;&amp;&quot;xss&quot;&amp;&#39;)&lt;/script&gt;"
+        );
+    }
 
     fn temp_db(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1526,12 +1577,42 @@ mod sessions_tests {
     }
 
     #[test]
+    fn inspect_export_format_html_writes_an_escaped_page() {
+        let db = temp_db("export-html");
+        let out = db.with_extension("html");
+        let seeded = seed_session(&db);
+        let session_id = seeded.to_string();
+        let args: Vec<String> = vec![
+            session_id.clone(),
+            out.to_string_lossy().into_owned(),
+            "--db".to_owned(),
+            db.to_string_lossy().into_owned(),
+            "--format".to_owned(),
+            "html".to_owned(),
+        ];
+        let code = run_inspect_export(&args).expect("export command");
+        assert_eq!(code, 0);
+        let contents = std::fs::read_to_string(&out).expect("read export");
+        assert!(
+            contents.starts_with("<!doctype html>"),
+            "must be a real HTML document: {contents}"
+        );
+        assert!(
+            contents.contains(&format!("<title>Session {session_id}</title>")),
+            "{contents}"
+        );
+        assert!(contents.contains("<strong>session.created</strong>"), "{contents}");
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
     fn inspect_export_rejects_an_unknown_format() {
         let args: Vec<String> = vec![
             "018f3c8a-7e2b-7a10-8c4d-0123456789ab".to_owned(),
             "/dev/null".to_owned(),
             "--format".to_owned(),
-            "html".to_owned(),
+            "xml".to_owned(),
         ];
         assert!(matches!(
             run_inspect_export(&args),
