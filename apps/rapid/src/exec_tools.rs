@@ -605,6 +605,13 @@ pub struct WorkspaceTools {
     /// default. No opt-in "explicit max-depth profile" exists yet — that
     /// half of `AGT-010` remains open, see `newtask.md` §2.2.
     nested_spawn_allowed: bool,
+    /// Per-turn disk-write ceiling (Modbit `WRK-017`/`CAP-001`): defaults to
+    /// `MAX_TOTAL_WRITE_BYTES_PER_TURN`, but a managed policy may lower it
+    /// further (`narrow_write_ceiling`, never raise it — see that method's
+    /// own doc comment). Compared against in `reserve_write_budget`.
+    max_write_bytes: u64,
+    /// Same shape as `max_write_bytes`, for `web_fetch`'s per-turn ceiling.
+    max_fetch_bytes: u64,
 }
 
 impl WorkspaceTools {
@@ -641,6 +648,8 @@ impl WorkspaceTools {
             bytes_written: Arc::new(AtomicU64::new(0)),
             fetch_bytes: Arc::new(AtomicU64::new(0)),
             nested_spawn_allowed: true,
+            max_write_bytes: MAX_TOTAL_WRITE_BYTES_PER_TURN,
+            max_fetch_bytes: MAX_TOTAL_FETCH_BYTES_PER_TURN,
         })
     }
 
@@ -834,6 +843,27 @@ impl WorkspaceTools {
         self.fetch_bytes = fetch_bytes;
     }
 
+    /// Current disk/network per-turn ceilings (Modbit `CAP-001`), for a
+    /// caller propagating them to a subagent child alongside the shared
+    /// counters — see `narrow_write_ceiling`/`narrow_fetch_ceiling`.
+    pub(crate) fn turn_ceilings(&self) -> (u64, u64) {
+        (self.max_write_bytes, self.max_fetch_bytes)
+    }
+
+    /// Lower the disk per-turn ceiling (Modbit `CAP-001`: a managed policy
+    /// may only restrict this, never widen it past
+    /// `MAX_TOTAL_WRITE_BYTES_PER_TURN`) — takes the minimum of the current
+    /// value and `max`, so calling this with a larger value than what's
+    /// already set is a no-op rather than an accidental widening.
+    pub(crate) fn narrow_write_ceiling(&mut self, max: u64) {
+        self.max_write_bytes = self.max_write_bytes.min(max);
+    }
+
+    /// Same shape as `narrow_write_ceiling`, for the network ceiling.
+    pub(crate) fn narrow_fetch_ceiling(&mut self, max: u64) {
+        self.max_fetch_bytes = self.max_fetch_bytes.min(max);
+    }
+
     /// Attach the subagent runner (composition root only; children are built
     /// without one, which enforces the depth limit structurally).
     pub fn set_subagent_runner(&mut self, runner: Arc<dyn SubagentRunner>) {
@@ -881,10 +911,11 @@ impl WorkspaceTools {
     fn reserve_write_budget(&self, bytes: usize) -> Option<String> {
         let bytes = bytes as u64;
         let previous = self.bytes_written.fetch_add(bytes, Ordering::SeqCst);
-        if previous.saturating_add(bytes) > MAX_TOTAL_WRITE_BYTES_PER_TURN {
+        if previous.saturating_add(bytes) > self.max_write_bytes {
             self.bytes_written.fetch_sub(bytes, Ordering::SeqCst);
             return Some(format!(
-                "per-turn disk-write budget exhausted: {MAX_TOTAL_WRITE_BYTES_PER_TURN} bytes already written this turn"
+                "per-turn disk-write budget exhausted: {} bytes already written this turn",
+                self.max_write_bytes
             ));
         }
         None
@@ -895,10 +926,11 @@ impl WorkspaceTools {
     fn reserve_fetch_budget(&self, bytes: usize) -> Option<String> {
         let bytes = bytes as u64;
         let previous = self.fetch_bytes.fetch_add(bytes, Ordering::SeqCst);
-        if previous.saturating_add(bytes) > MAX_TOTAL_FETCH_BYTES_PER_TURN {
+        if previous.saturating_add(bytes) > self.max_fetch_bytes {
             self.fetch_bytes.fetch_sub(bytes, Ordering::SeqCst);
             return Some(format!(
-                "per-turn web_fetch budget exhausted: {MAX_TOTAL_FETCH_BYTES_PER_TURN} bytes already requested this turn"
+                "per-turn web_fetch budget exhausted: {} bytes already requested this turn",
+                self.max_fetch_bytes
             ));
         }
         None
@@ -3757,6 +3789,31 @@ impl ExecTools {
         }
     }
 
+    /// Current disk/network per-turn ceilings, `None` on the no-op surface.
+    /// See `WorkspaceTools::turn_ceilings`.
+    pub(crate) fn turn_ceilings(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Workspace(tools) => Some(tools.turn_ceilings()),
+            Self::Noop(_) => None,
+        }
+    }
+
+    /// Lower the disk per-turn ceiling (no-op on the no-op surface). See
+    /// `WorkspaceTools::narrow_write_ceiling`.
+    pub(crate) fn narrow_write_ceiling(&mut self, max: u64) {
+        if let Self::Workspace(tools) = self {
+            tools.narrow_write_ceiling(max);
+        }
+    }
+
+    /// Lower the network per-turn ceiling (no-op on the no-op surface). See
+    /// `WorkspaceTools::narrow_fetch_ceiling`.
+    pub(crate) fn narrow_fetch_ceiling(&mut self, max: u64) {
+        if let Self::Workspace(tools) = self {
+            tools.narrow_fetch_ceiling(max);
+        }
+    }
+
     /// The trusted workspace surface with an explicit permission lattice.
     pub fn workspace_with_permissions(
         root: &Path,
@@ -4393,6 +4450,45 @@ use std::sync::{Arc, Mutex};
             .map(|call| validate_one(tools, call))
             .collect();
         tools.execute_batch(&validated, &CancellationToken::new())
+    }
+
+    #[test]
+    fn narrow_write_ceiling_only_ever_lowers_never_raises() {
+        let root = TempRoot::new("narrow-ceiling");
+        let mut tools = permissive_workspace(&root.0);
+        assert_eq!(tools.turn_ceilings(), (MAX_TOTAL_WRITE_BYTES_PER_TURN, MAX_TOTAL_FETCH_BYTES_PER_TURN));
+
+        tools.narrow_write_ceiling(1024);
+        tools.narrow_fetch_ceiling(2048);
+        assert_eq!(tools.turn_ceilings(), (1024, 2048));
+
+        // A "narrower" call with a *larger* value than what's already set
+        // must be a no-op — an admin ceiling, once applied, is never
+        // widened by a second call with a bigger number.
+        tools.narrow_write_ceiling(MAX_TOTAL_WRITE_BYTES_PER_TURN);
+        tools.narrow_fetch_ceiling(MAX_TOTAL_FETCH_BYTES_PER_TURN);
+        assert_eq!(
+            tools.turn_ceilings(),
+            (1024, 2048),
+            "a larger value must never widen an already-narrower ceiling"
+        );
+
+        let cancel = CancellationToken::new();
+        let call = ProposedToolCall::new(
+            "c1",
+            WORKSPACE_WRITE_TOOL,
+            &serde_json::to_string(&serde_json::json!({"path": "a.txt", "content": "x".repeat(2000)}))
+                .expect("encode call"),
+        )
+        .expect("call");
+        let validated = tools.validate(&call, &cancel).expect("v");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.unwrap().contains("disk-write budget exhausted: 1024 bytes"));
+            }
+            other => panic!("expected the narrowed ceiling to refuse the write, got {other:?}"),
+        }
     }
 
     #[test]

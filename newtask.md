@@ -517,6 +517,29 @@ default; adopt the classifier-as-safety-net idea, not the classifier-as-default 
   layered on top as `task_spawn` would) and confirms the admin ceiling still holds *and* the subagent's
   own narrower scope still independently applies too — both constraints active at once, neither silently
   dropped. Full `-p rapid` suite (316 lib tests) and `cargo build --workspace --tests` pass.
+- **A fourth `CAP-001`/`WRK-017` dimension, 2026-08-30: `max_write_bytes_per_turn`/`max_fetch_bytes_per_turn`
+  — admin-lowerable disk/network per-turn ceilings.** `WorkspaceTools`'s `MAX_TOTAL_WRITE_BYTES_PER_TURN`/
+  `MAX_TOTAL_FETCH_BYTES_PER_TURN` (§2.10) were fixed constants; a managed deployment wanting a stricter
+  budget than the 64 MB/16 MB built-in defaults had no way to configure one. New `max_write_bytes`/
+  `max_fetch_bytes: u64` fields (defaulting to the existing constants) replace the constants in
+  `reserve_write_budget`/`reserve_fetch_budget`'s comparison; new `narrow_write_ceiling`/
+  `narrow_fetch_ceiling` setters take the *minimum* of the current value and the requested one, so a
+  managed policy can only ever lower the ceiling, never raise it past the built-in default even if called
+  with a larger number by mistake — verified directly (`narrow_write_ceiling_only_ever_lowers_never_raises`
+  calls it once with a small value, once with the original constant, and confirms the second call is a
+  no-op). Propagated to subagent children via the same `LiveSubagentRunner` mechanism as the other three
+  dimensions (`turn_ceilings()`/`narrow_*_ceiling()` alongside `hooks_config()`/`shadow_diagnostics_config()`
+  — a managed ceiling must bound a delegated subagent's writes too, not just the parent's). Applied in
+  `exec_turn` by re-loading the managed policy rather than threading it out of `exec_permission_lattice`'s
+  return type — that function already fails the whole turn closed on an unreadable policy, so a load
+  failure at this second call site is treated as "skip narrowing" rather than a second independent
+  failure point, since the ceiling is non-security-critical compared to the permission lattice itself.
+  `managed_config.rs` gained a shared `parse_positive_integer` helper (rejects zero/negative — a "ceiling"
+  of zero would fail every real turn, almost certainly a policy-authoring mistake, not an intended
+  ultra-strict setting). Full `-p rapid` suite (318 lib tests) and `cargo build --workspace --tests` pass.
+  `CAP-001`'s Policy Compiler now has four real, independently-tested admin dimensions (mode ceiling, tool
+  ban, write confinement, resource ceilings); the full multi-layer merge-order primitive across arbitrary
+  settings sources remains the one part of `CAP-001`/`AuthorizationEpoch` genuinely unbuilt.
 
 ### 2.4 `CompletionContract` (tri-state) + `VerificationPlane`
 

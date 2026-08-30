@@ -1271,6 +1271,12 @@ struct LiveSubagentRunner {
     /// into every child so a headless `rapid exec` run watching its own
     /// stderr sees a delegated subagent's tool calls too, not silence.
     trace_calls: bool,
+    /// The parent's own (possibly managed-policy-narrowed) per-turn disk/
+    /// network ceilings, applied to every child alongside the shared
+    /// counters (`turn_budgets`) so a managed policy's `max_write_bytes_
+    /// per_turn`/`max_fetch_bytes_per_turn` bounds a subagent's own writes
+    /// too, not just the parent's.
+    turn_ceilings: (u64, u64),
 }
 
 impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
@@ -1323,6 +1329,13 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             tools.set_shadow_diagnostics(shadow);
         }
         tools.set_trace_calls(self.trace_calls);
+        // A managed policy's per-turn disk/network ceilings (Modbit
+        // `CAP-001`) must bound a subagent's own writes/fetches too, not
+        // just the parent's — narrow_*_ceiling is a no-op when the default
+        // (unmanaged) ceiling is already what the child started with.
+        let (write_ceiling, fetch_ceiling) = self.turn_ceilings;
+        tools.narrow_write_ceiling(write_ceiling);
+        tools.narrow_fetch_ceiling(fetch_ceiling);
         // Subagents run in the same trusted project as the parent (only
         // spawned when the workspace is trusted), so they get the same
         // AGENTS.md rules and system prompt as the top-level turn instead of
@@ -1613,6 +1626,22 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
         _ => ExecTools::noop(),
     };
     tools.set_trace_calls(true);
+    // Managed-policy disk/network ceilings (Modbit `CAP-001`/`WRK-017`):
+    // narrow-only, so a missing or default policy is simply a no-op here.
+    // Re-loading rather than threading the value out of
+    // `exec_permission_lattice` — that call already fails the whole turn
+    // closed on an unreadable policy above, so by this point a load failure
+    // here would mean the file changed underneath us mid-turn; skipping the
+    // (non-security-critical) ceiling narrowing in that edge case is safer
+    // than failing a turn whose permission lattice already resolved.
+    if let Ok(Some(policy)) = crate::managed_config::load_policy(&std::env::vars().collect::<Vec<_>>()) {
+        if let Some(max) = policy.max_write_bytes_per_turn() {
+            tools.narrow_write_ceiling(max);
+        }
+        if let Some(max) = policy.max_fetch_bytes_per_turn() {
+            tools.narrow_fetch_ceiling(max);
+        }
+    }
     // Observability for the fail-closed default: when headless exec runs
     // without workspace tools (or under a mode that refuses every call), say
     // so up front and name the levers, instead of leaving the run to fail
@@ -1834,6 +1863,10 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             let hooks = tools.hooks_config();
             let shadow_diagnostics = tools.shadow_diagnostics_config();
             let trace_calls = tools.trace_calls_enabled();
+            let turn_ceilings = tools.turn_ceilings().unwrap_or((
+                crate::exec_tools::MAX_TOTAL_WRITE_BYTES_PER_TURN,
+                crate::exec_tools::MAX_TOTAL_FETCH_BYTES_PER_TURN,
+            ));
             tools.set_subagent_runner(std::sync::Arc::new(LiveSubagentRunner {
                 active: active.clone(),
                 root: root.clone(),
@@ -1842,6 +1875,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                 hooks,
                 shadow_diagnostics,
                 trace_calls,
+                turn_ceilings,
             }));
         }
     }

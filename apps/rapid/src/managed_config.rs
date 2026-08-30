@@ -23,7 +23,11 @@
 //!   — a deployment-wide write confinement independent of (and checked
 //!   before) any per-`task_spawn` `write_scope`, so a subagent's own scope
 //!   argument can only add a further restriction inside it, never widen
-//!   past it.
+//!   past it;
+//! * `max_write_bytes_per_turn`/`max_fetch_bytes_per_turn` lower
+//!   `apps/rapid`'s own built-in per-turn disk/network ceilings
+//!   (`WorkspaceTools::narrow_write_ceiling`/`narrow_fetch_ceiling` —
+//!   narrow-only, a larger value than the built-in default is a no-op).
 //!
 //! Every gate outcome is reported with field id, origin, and remediation so
 //! operators can see exactly which layer decided what.
@@ -159,6 +163,12 @@ pub struct ManagedPolicy {
     /// -wide (Modbit `CAP-001`), applied via
     /// `PermissionLattice::with_admin_write_scope`.
     confine_writes_to: Option<String>,
+    /// Per-turn disk-write ceiling override (Modbit `CAP-001`/`WRK-017`),
+    /// applied via `WorkspaceTools::narrow_write_ceiling` — narrow-only.
+    max_write_bytes_per_turn: Option<u64>,
+    /// Per-turn `web_fetch` ceiling override, same shape as
+    /// `max_write_bytes_per_turn`.
+    max_fetch_bytes_per_turn: Option<u64>,
 }
 
 impl ManagedPolicy {
@@ -215,6 +225,8 @@ impl ManagedPolicy {
                     | "max_permission_mode"
                     | "denied_tools"
                     | "confine_writes_to"
+                    | "max_write_bytes_per_turn"
+                    | "max_fetch_bytes_per_turn"
             ) {
                 return Err(ManagedConfigError::UnknownField {
                     field: format!("policy.{key}"),
@@ -372,6 +384,8 @@ impl ManagedPolicy {
                 Some(repo_path.as_str().to_owned())
             }
         };
+        let max_write_bytes_per_turn = parse_positive_integer(policy, "max_write_bytes_per_turn")?;
+        let max_fetch_bytes_per_turn = parse_positive_integer(policy, "max_fetch_bytes_per_turn")?;
         Ok(Self {
             locked_default,
             allowed_providers,
@@ -379,6 +393,8 @@ impl ManagedPolicy {
             max_permission_mode,
             denied_tools,
             confine_writes_to,
+            max_write_bytes_per_turn,
+            max_fetch_bytes_per_turn,
         })
     }
 
@@ -404,6 +420,14 @@ impl ManagedPolicy {
 
     pub fn confine_writes_to(&self) -> Option<&str> {
         self.confine_writes_to.as_deref()
+    }
+
+    pub fn max_write_bytes_per_turn(&self) -> Option<u64> {
+        self.max_write_bytes_per_turn
+    }
+
+    pub fn max_fetch_bytes_per_turn(&self) -> Option<u64> {
+        self.max_fetch_bytes_per_turn
     }
 }
 
@@ -433,6 +457,41 @@ pub fn gate_permission_mode(
         remediation: "contact your administrator to raise the managed permission-mode ceiling",
     };
     (ceiling, Some(report))
+}
+
+/// Parse an optional strictly-positive integer policy field (a byte-count
+/// ceiling: zero or negative would mean "nothing may ever be written/
+/// fetched," almost certainly a policy-authoring mistake, not an intended
+/// ultra-strict ceiling — reject it rather than silently accept a value
+/// that would make every real turn fail).
+fn parse_positive_integer(
+    policy: &toml::value::Table,
+    key: &str,
+) -> Result<Option<u64>, ManagedConfigError> {
+    match policy.get(key) {
+        None => Ok(None),
+        Some(raw) => {
+            let value = raw.as_integer().ok_or_else(|| {
+                ManagedConfigError::PolicyField(field_error(
+                    &format!("policy.{key}"),
+                    "must be an integer number of bytes",
+                ))
+            })?;
+            let value = u64::try_from(value).map_err(|_| {
+                ManagedConfigError::PolicyField(field_error(
+                    &format!("policy.{key}"),
+                    "must be a positive integer",
+                ))
+            })?;
+            if value == 0 {
+                return Err(ManagedConfigError::PolicyField(field_error(
+                    &format!("policy.{key}"),
+                    "must be a positive integer",
+                )));
+            }
+            Ok(Some(value))
+        }
+    }
 }
 
 fn field_error(field_id: &str, reason: &str) -> ConfigFieldError {
@@ -671,7 +730,7 @@ base_url = "http://gateway.internal:8080"
     #[test]
     fn parse_reads_all_policy_fields_and_rejects_unknowns() {
         let policy = parse_policy(&policy_doc(
-            "locked_default = \"cloud\"\nallowed_providers = [\"anthropic\"]\nmin_reasoning_effort = \"high\"\nmax_permission_mode = \"acceptEdits\"\ndenied_tools = [\"shell_exec\"]\nconfine_writes_to = \"src\"\n",
+            "locked_default = \"cloud\"\nallowed_providers = [\"anthropic\"]\nmin_reasoning_effort = \"high\"\nmax_permission_mode = \"acceptEdits\"\ndenied_tools = [\"shell_exec\"]\nconfine_writes_to = \"src\"\nmax_write_bytes_per_turn = 1024\nmax_fetch_bytes_per_turn = 2048\n",
         ));
         assert_eq!(policy.locked_default(), Some("cloud"));
         assert_eq!(
@@ -688,6 +747,8 @@ base_url = "http://gateway.internal:8080"
             Some([crate::permissions::ToolPattern::parse("shell_exec").expect("pattern")].as_slice())
         );
         assert_eq!(policy.confine_writes_to(), Some("src"));
+        assert_eq!(policy.max_write_bytes_per_turn(), Some(1024));
+        assert_eq!(policy.max_fetch_bytes_per_turn(), Some(2048));
         let bad = format!("schema = \"{MANAGED_SCHEMA}\"\nsurprise = 1\n[policy]\n");
         let err = ManagedPolicy::parse(&bad).expect_err("unknown field");
         assert!(err.to_string().contains("unknown field 'surprise'"));
@@ -842,6 +903,17 @@ reasoning_effort = "low"
         let traversal = ManagedPolicy::parse(&policy_doc("confine_writes_to = \"../outside\"\n"))
             .expect_err("traversal");
         assert!(traversal.to_string().contains("no '..' or absolute segments"));
+    }
+
+    #[test]
+    fn parse_rejects_a_zero_or_negative_byte_ceiling() {
+        let zero = ManagedPolicy::parse(&policy_doc("max_write_bytes_per_turn = 0\n"))
+            .expect_err("zero");
+        assert!(zero.to_string().contains("must be a positive integer"));
+
+        let negative = ManagedPolicy::parse(&policy_doc("max_fetch_bytes_per_turn = -1\n"))
+            .expect_err("negative");
+        assert!(negative.to_string().contains("must be a positive integer"));
     }
 
     #[test]
