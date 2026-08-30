@@ -822,6 +822,39 @@ call returns), so there is no actual concurrent-subagent risk in this codebase's
 unbounded-sequential-total one, which is what WRK-017's spirit ("budgets can't buy a fake pass" aside)
 is really protecting against here. CPU/RAM/disk/network ceilings are still real, separate, OS-level work.
 
+**Correction (2026-08-30): the CPU/RAM claim was wrong too — real OS-level enforcement already existed
+for one path, was silently misconfigured, and is now fixed, not just documented.** While auditing this
+section, checked `crates/sandbox/src/backends/host_restricted.rs` (already wired into `apps/rapid` since
+an earlier session via `sandbox_exec::run_sandboxed`, the non-macOS `shell_exec(sandbox: true)` path) and
+found it already does genuine OS-level CPU (`ulimit -t` via `require_cpu_rlimit`) and memory
+(`/proc`-based RSS sampling against `plan.memory_mb`, killing the process group on breach) enforcement —
+this is real, not a stub. The bug: `apps/rapid/src/sandbox_exec.rs::build_spec` never set `cpu_millis`/
+`memory_mb` on the `SandboxSpec` it built, so every sandboxed `shell_exec` call on that path silently ran
+under `SandboxSpecBuilder`'s generic crate-wide defaults — `cpu_millis: 1_000` (**one CPU-second**) and
+`memory_mb: 256` — values sized for nothing in particular, certainly not a general-purpose shell command.
+**Verified empirically, not assumed:** a real `sh` loop doing ~200,000,000 iterations of trivial
+arithmetic was killed by `SIGXCPU` after ~2.4 real seconds with **zero output** and no informative error
+— `execute_shell` only ever reported "sandboxed no exit code (signalled)", identical to any other signal
+death, giving no hint that a resource ceiling (not a crash, not a kill request) was the cause. This is a
+real correctness bug for anyone actually relying on `shell_exec(sandbox: true)` on Linux/Windows: a
+legitimate CPU-bound script (a build, a data-processing loop, anything nontrivial) would silently die with
+no explanation, not just a "runaway process" edge case. **Fixed 2026-08-30:** `sandbox_exec.rs` now sets
+explicit, intentional `SANDBOX_CPU_MILLIS = 30_000` (30 CPU-seconds) and `SANDBOX_MEMORY_MB = 1024`
+(1 GiB) on every spec it builds, replacing the accidental generic defaults. Also surfaced the previously-
+discarded `SandboxExit::signal()` through `SandboxRunOutcome` (new `signal: Option<i32>` field) and added
+`exec_tools.rs::sandboxed_status_line()` (extracted, directly unit-tested) so a future CPU-limit kill
+reports `"killed: sandbox CPU-time limit exceeded (SIGXCPU)"` by name instead of the same opaque
+"no exit code (signalled)" for every signal death. New tests: `run_sandboxed_survives_a_moderately_cpu_
+heavy_command` (a real, wall-clock-bounded ~3-second busy loop that would have died under the old 1-
+second default and now completes) and `sandboxed_status_line_names_the_cpu_limit_specifically` (pure
+unit test over the four status-line cases). Full `-p rapid` suite (299 lib tests) and
+`cargo build --workspace --tests` pass. **What this does not close:** the macOS Seatbelt path (this
+session's own new `SeatbeltBackend`, `crates/sandbox/src/backends/seatbelt.rs`) has no CPU/memory
+enforcement at all yet — only timeout/cancel — a real, separate gap in that backend specifically, not
+attempted here; and disk/network ceilings for the sandboxed exec path itself (distinct from the per-turn
+disk/network budgets in §2.10's earlier paragraph, which cover `workspace_write`/`web_fetch`, not
+sandboxed shell commands) remain unaddressed.
+
 **Disk axis, 2026-08-30: a real per-turn ceiling landed without needing any OS-level monitoring —
 the same "count what's already flowing through a chokepoint" trick as the concurrency fix above,
 not the OS-level work the "still real, separate" note above assumed disk required.** Every

@@ -38,6 +38,21 @@ use sandbox::{
 /// shown to the user, just an anchor name shared by the mount and `cwd`.
 const MOUNT_TARGET: &str = "workspace";
 
+/// CPU-time ceiling for one sandboxed `shell_exec` call (Modbit `WRK-017`'s
+/// CPU axis). Explicit, not `SandboxSpecBuilder`'s own default
+/// (1_000 = 1 CPU-second): that generic crate default is far too tight for
+/// a general-purpose shell command and was silently in effect here before —
+/// confirmed empirically (a `while` loop counting to 200,000,000 was killed
+/// by `SIGXCPU` after ~1 CPU-second with no output and no clear error,
+/// `execute_shell` only ever reporting the unhelpful "no exit code
+/// (signalled)"). 30 CPU-seconds comfortably covers real scripts/builds
+/// without being unbounded.
+const SANDBOX_CPU_MILLIS: u32 = 30_000;
+/// Memory ceiling for one sandboxed `shell_exec` call. Same reasoning as
+/// `SANDBOX_CPU_MILLIS`: an explicit, intentional value for this call site
+/// rather than the crate's generic 256 MB default.
+const SANDBOX_MEMORY_MB: u32 = 1024;
+
 /// Typed failure. Display never echoes command argv or file paths.
 #[derive(Debug)]
 pub enum SandboxRunError {
@@ -74,6 +89,12 @@ impl std::error::Error for SandboxRunError {}
 pub struct SandboxRunOutcome {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+    /// Terminating signal when `exit_code` is `None` and `timed_out` is
+    /// `false` — most commonly `SIGXCPU` (24) from the CPU-time ceiling
+    /// (`SANDBOX_CPU_MILLIS`) firing before the wall-clock `timeout` did.
+    /// Without this, that case was previously indistinguishable from any
+    /// other signal death, reported only as "no exit code (signalled)".
+    pub signal: Option<i32>,
     pub output: Vec<u8>,
 }
 
@@ -109,6 +130,8 @@ fn build_spec(
         .mount(mount)
         .timeout(timeout)
         .output_limit(output_limit)
+        .cpu_millis(SANDBOX_CPU_MILLIS)
+        .memory_mb(SANDBOX_MEMORY_MB)
         .build()
         .map_err(SandboxRunError::Sandbox)
 }
@@ -241,6 +264,7 @@ pub fn run_sandboxed(
     Ok(SandboxRunOutcome {
         exit_code: result.exit().code(),
         timed_out: result.exit().timed_out(),
+        signal: result.exit().signal(),
         output: result.output().to_vec(),
     })
 }
@@ -302,6 +326,34 @@ mod tests {
         let outcome =
             run_sandboxed(&root, &argv, Duration::from_millis(300), 4096).expect("run");
         assert!(outcome.timed_out);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn run_sandboxed_survives_a_moderately_cpu_heavy_command() {
+        // Regression: SandboxSpec::builder's own generic default
+        // (cpu_millis: 1_000, i.e. 1 CPU-second) was silently in effect here
+        // before SANDBOX_CPU_MILLIS existed, and a real shell loop like this
+        // one (confirmed empirically, ~2.4 CPU-seconds) was killed by
+        // SIGXCPU well under any wall-clock timeout, with no output and no
+        // informative error — a legitimate command, not a runaway one.
+        let root = temp_root("cpu-heavy");
+        // A wall-clock-bounded busy loop (~3 real/CPU seconds, single-
+        // threaded) rather than a fixed iteration count: portable and
+        // predictable regardless of this machine's shell-arithmetic
+        // throughput, unlike counting iterations to hit a target duration.
+        let argv = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "end=$(($(date +%s)+3)); while [ $(date +%s) -lt $end ]; do :; done; \
+             echo done-looping"
+                .to_owned(),
+        ];
+        let outcome = run_sandboxed(&root, &argv, Duration::from_secs(15), 4096).expect("run");
+        assert_eq!(outcome.exit_code, Some(0), "signal={:?}", outcome.signal);
+        assert!(!outcome.timed_out);
+        let output = String::from_utf8_lossy(&outcome.output);
+        assert!(output.contains("done-looping"), "{output}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -1525,11 +1525,8 @@ impl WorkspaceTools {
             ) {
                 Ok(outcome) => {
                     let output = bounded_text(&outcome.output, MAX_SHELL_OUTPUT_BYTES);
-                    let status = match outcome.exit_code {
-                        Some(code) => format!("exit {code}"),
-                        None if outcome.timed_out => "timed out".to_owned(),
-                        None => "no exit code (signalled)".to_owned(),
-                    };
+                    let status =
+                        sandboxed_status_line(outcome.exit_code, outcome.timed_out, outcome.signal);
                     let mut summary = format!("sandboxed {status}\n{output}");
                     if let Some(note) = scan_command_advisory(self.root(), &args.argv) {
                         summary.push('\n');
@@ -2481,6 +2478,32 @@ struct RepoSearchArgs {
     pattern: String,
     head_limit: usize,
     offset: usize,
+}
+
+/// SIGXCPU, the signal `sandbox_exec::SANDBOX_CPU_MILLIS`'s rlimit raises.
+const SIGXCPU: i32 = 24;
+
+/// Render `sandbox_exec::run_sandboxed`'s outcome as one status line. Named
+/// out the CPU-time-ceiling case specifically (Modbit `WRK-017`'s CPU axis):
+/// before this, a command that exceeded the sandbox's CPU limit reported
+/// only "no exit code (signalled)", indistinguishable from any other signal
+/// death — confirmed empirically that a legitimate CPU-heavy command (not
+/// stuck, not malicious) hits this well before the wall-clock `timeout`
+/// under the crate's own generic defaults, which is exactly why
+/// `sandbox_exec::build_spec` now sets an explicit, wider CPU/memory
+/// ceiling instead of inheriting them.
+fn sandboxed_status_line(exit_code: Option<i32>, timed_out: bool, signal: Option<i32>) -> String {
+    match exit_code {
+        Some(code) => format!("exit {code}"),
+        None if timed_out => "timed out".to_owned(),
+        None if signal == Some(SIGXCPU) => {
+            "killed: sandbox CPU-time limit exceeded (SIGXCPU)".to_owned()
+        }
+        None => match signal {
+            Some(signal) => format!("no exit code (signal {signal})"),
+            None => "no exit code (signalled)".to_owned(),
+        },
+    }
 }
 
 /// Every advisory-only content scan a successful write/patch can trigger,
@@ -5257,6 +5280,18 @@ use std::sync::{Arc, Mutex};
             }
             other => panic!("expected sandboxed start, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sandboxed_status_line_names_the_cpu_limit_specifically() {
+        assert_eq!(sandboxed_status_line(Some(0), false, None), "exit 0");
+        assert_eq!(sandboxed_status_line(None, true, None), "timed out");
+        assert_eq!(
+            sandboxed_status_line(None, false, Some(24)),
+            "killed: sandbox CPU-time limit exceeded (SIGXCPU)"
+        );
+        assert_eq!(sandboxed_status_line(None, false, Some(9)), "no exit code (signal 9)");
+        assert_eq!(sandboxed_status_line(None, false, None), "no exit code (signalled)");
     }
 
     #[test]
