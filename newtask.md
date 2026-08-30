@@ -311,6 +311,25 @@ but cannot interrupt for new ones — escalate via the foreground parent).
   `cargo build --workspace --tests` pass. `session_start`/`session_end` hooks are deliberately not
   propagated — those fire once per `rapid exec` process, not per tool call, so a subagent (which runs
   inside the same process, not a new one) firing them again would be a duplicate, not a fix.
+- **A fourth instance, found by checking the rest of `WorkspaceTools`'s per-instance config for the same
+  shape: the shadow-diagnostics quality gate.** Same defect as hooks, one config field over:
+  `shadow_diagnostics: None` by default, only ever set on the parent (`tools.set_shadow_diagnostics(shadow)`
+  in `interactive.rs`), never propagated by `LiveSubagentRunner::run`. A subagent's `workspace_write` calls
+  silently skipped the verify-in-an-isolated-worktree check the parent's own matching writes went through
+  — lower severity than the hooks bypass (a quality gate, not a security control, and shadow diagnostics
+  already fails open by design on its own misconfiguration), but the same "delegation quietly drops a
+  policy the parent had" shape. **Fixed** with the same technique: new `WorkspaceTools::
+  shadow_diagnostics_config()` (clone, mirrors `hooks_config()`), read from the parent alongside `hooks`
+  right where `LiveSubagentRunner` is constructed, applied via the already-existing `set_shadow_diagnostics`
+  in `LiveSubagentRunner::run`. New test `subagent_children_inherit_the_parents_shadow_diagnostics_gate`:
+  a `grep -q MARKER {path}` gate that fails a markerless write, confirmed to *not* fire for an unshared
+  child (the gap was real) and confirmed to fire once propagated (fixed). Full `-p rapid` suite (307 lib
+  tests) and `cargo build --workspace --tests` pass. **Checked and deliberately left alone:**
+  `fetch_allowlist` (private-host allowlist for `web_fetch`) has the identical "parent-only" shape, but
+  fixing it would *widen* a subagent's capabilities to match the parent's, cutting against this
+  codebase's established direction of narrowing subagent scope (write-scope confinement, permission-mode
+  capping, nested-spawn denial) — an unshared, empty allowlist makes a child strictly *more* restricted
+  than the parent, which is the safe direction to leave a gap in, not one that needs closing.
 - **Correction + partial fix (2026-08-30):** `AgentResultEnvelope`'s exact field list already exists —
   `crates/agent-runtime/src/agent/model.rs`'s `AgentResult` carries `summary, evidence, workspace_view,
   patch_summary, artifacts, claims, open_questions, blockers, context_lineage` (all with accessors) —

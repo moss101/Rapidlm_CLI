@@ -1242,6 +1242,11 @@ struct LiveSubagentRunner {
     /// own tool calls also gates its subagents' — without this, delegating
     /// a call to a subagent silently bypassed every hook.
     hooks: crate::hooks::HooksConfig,
+    /// The parent's configured shadow-diagnostics command, if any, cloned
+    /// into every child so a subagent's writes are verified against the
+    /// same quality gate as the parent's own instead of silently skipping
+    /// it.
+    shadow_diagnostics: Option<crate::shadow_diagnostics::ShadowDiagnosticsConfig>,
 }
 
 impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
@@ -1287,6 +1292,12 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // subagent_stop) must apply to a subagent's own tool calls too, or
         // delegation becomes a way to route around them entirely.
         tools.set_hooks(self.hooks.clone());
+        // Same reasoning for the shadow-diagnostics quality gate: a
+        // subagent's writes should be verified the same way the parent's
+        // own would be.
+        if let Some(shadow) = self.shadow_diagnostics.clone() {
+            tools.set_shadow_diagnostics(shadow);
+        }
         // Subagents run in the same trusted project as the parent (only
         // spawned when the workspace is trusted), so they get the same
         // AGENTS.md rules and system prompt as the top-level turn instead of
@@ -1796,12 +1807,14 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     {
         if let Some(turn_budgets) = tools.turn_budget_handles() {
             let hooks = tools.hooks_config();
+            let shadow_diagnostics = tools.shadow_diagnostics_config();
             tools.set_subagent_runner(std::sync::Arc::new(LiveSubagentRunner {
                 active: active.clone(),
                 root: root.clone(),
                 permissions: permission_lattice.clone(),
                 turn_budgets,
                 hooks,
+                shadow_diagnostics,
             }));
         }
     }

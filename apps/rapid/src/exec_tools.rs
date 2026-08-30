@@ -738,6 +738,16 @@ impl WorkspaceTools {
         self.shadow_diagnostics = Some(config);
     }
 
+    /// Clone the configured shadow-diagnostics command, if any: a subagent
+    /// child should be verified against the same quality gate as the
+    /// parent's own writes, not silently skip it because nothing
+    /// propagated it. See `set_shadow_diagnostics`.
+    pub(crate) fn shadow_diagnostics_config(
+        &self,
+    ) -> Option<crate::shadow_diagnostics::ShadowDiagnosticsConfig> {
+        self.shadow_diagnostics.clone()
+    }
+
     /// Attach project hook commands (pre/post tool stages).
     pub fn set_hooks(&mut self, hooks: crate::hooks::HooksConfig) {
         self.hooks = hooks;
@@ -3684,6 +3694,18 @@ impl ExecTools {
         }
     }
 
+    /// Clone the configured shadow-diagnostics command (`None` on the no-op
+    /// surface, which never writes at all). See
+    /// `WorkspaceTools::shadow_diagnostics_config`.
+    pub(crate) fn shadow_diagnostics_config(
+        &self,
+    ) -> Option<crate::shadow_diagnostics::ShadowDiagnosticsConfig> {
+        match self {
+            Self::Workspace(tools) => tools.shadow_diagnostics_config(),
+            Self::Noop(_) => None,
+        }
+    }
+
     /// Register configured stdio MCP servers.
     pub fn register_mcp_servers(&mut self, servers: &[McpServerConfig]) {
         if let Self::Workspace(tools) = self {
@@ -4399,6 +4421,59 @@ use std::sync::{Arc, Mutex};
         }
         // The refused write must never have touched disk.
         assert!(!root.0.join("b.txt").exists());
+    }
+
+    #[test]
+    fn subagent_children_inherit_the_parents_shadow_diagnostics_gate() {
+        let root = TempRoot::new("shadow-inherit");
+        git_init(&root.0);
+        let mut parent = permissive_workspace(&root.0);
+        parent.set_shadow_diagnostics(
+            crate::shadow_diagnostics::ShadowDiagnosticsConfig::parse(&serde_json::json!({
+                "shadow_diagnostics": { "command": ["grep", "-q", "MARKER", "{path}"], "globs": ["*.txt"] }
+            }))
+            .expect("parsed"),
+        );
+
+        let cancel = CancellationToken::new();
+        let call = ProposedToolCall::new(
+            "c1",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"broken.txt","content":"no marker here"}"#,
+        )
+        .expect("call");
+
+        // Sanity check: a fresh child with no shadow-diagnostics config of
+        // its own writes straight through — confirming the gap was real.
+        let mut unshared_child = permissive_workspace(&root.0);
+        let validated = unshared_child.validate(&call, &cancel).expect("v");
+        match unshared_child.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { .. } => {}
+            other => panic!("sanity check: an unconfigured child should write through, got {other:?}"),
+        }
+
+        // With the parent's shadow-diagnostics config propagated (what
+        // LiveSubagentRunner::run now does), the same write the parent's
+        // own gate would fail is failed for the child too.
+        let mut child = permissive_workspace(&root.0);
+        if let Some(shadow) = parent.shadow_diagnostics_config() {
+            child.set_shadow_diagnostics(shadow);
+        }
+        let call2 = ProposedToolCall::new(
+            "c2",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"broken2.txt","content":"no marker here"}"#,
+        )
+        .expect("call");
+        let validated = child.validate(&call2, &cancel).expect("v");
+        match child.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.unwrap().contains("shadow diagnostics failed"));
+            }
+            other => panic!("expected the inherited gate to fail the child's write, got {other:?}"),
+        }
+        assert!(!root.0.join("broken2.txt").exists());
     }
 
     #[cfg(unix)]
