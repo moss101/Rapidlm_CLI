@@ -759,6 +759,21 @@ their results become evidence, not just a console warning).
   succeeds on macOS). Full `-p rapid` suite (296 lib tests) and `cargo build --workspace --tests` pass.
   `ExternalFinding` and `execute_patch`'s equivalent command-adjacent surfaces remain the only pieces of
   this section still untouched.
+- **`execute_patch`'s own "not covered" gap closed 2026-08-30 too — secrets, patch-policy, and ripple all
+  now scan the patched content, not just fresh writes.** Both success tiers of `execute_patch` (exact-match
+  and whitespace-insensitive) now run `scan_for_secrets_advisory`/`scan_patch_advisory`/`ripple_advisory`
+  against `updated` (the post-patch file content) before returning, in the same order `execute_write`
+  already uses. This was flagged as a gap independently in both the secrets correction ("not covered:
+  ... `execute_patch`'s written content") and the patch-policy correction ("still unattempted: ... the
+  same shadow-diagnostics/`execute_patch` paths") — both close with this one change, since both scanners
+  take the same `(root, path, content: &[u8])` shape regardless of which tool produced the bytes. New test
+  `workspace_patch_scans_the_resulting_content_like_workspace_write_does` exercises both success tiers:
+  a secret introduced via an exact-match patch, and a `patch.ci_permissions_broaden` finding reached only
+  through the whitespace-insensitive fallback (confirming the scan runs on that tier too, not just the
+  exact-match one). Full `-p rapid` suite (297 lib tests) and `cargo build --workspace --tests` pass.
+  `execute_write`'s shadow-diagnostics branches remain the one write path in this file with no scanner
+  coverage at all — a real change to verify-then-apply semantics (scan before the shadow-diagnostics
+  candidate is even accepted, not after), deliberately left for its own pass.
 
 ### 2.10 Scoped Credential Broker + Resource Governor
 

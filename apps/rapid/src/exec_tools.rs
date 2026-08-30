@@ -1409,6 +1409,14 @@ impl WorkspaceTools {
             }
             fs::write(&target, updated.as_bytes()).map_err(|_| ToolStepError::Failed)?;
             let mut summary = format!("replaced {exact_occurrences} occurrence(s) in {}", args.path);
+            if let Some(note) = scan_for_secrets_advisory(self.root(), &args.path, updated.as_bytes()) {
+                summary.push('\n');
+                summary.push_str(&note);
+            }
+            if let Some(note) = scan_patch_advisory(self.root(), &args.path, updated.as_bytes()) {
+                summary.push('\n');
+                summary.push_str(&note);
+            }
             if let Some(note) = crate::context_retrieval::ripple_advisory(self.root(), &args.path) {
                 summary.push('\n');
                 summary.push_str(&note);
@@ -1468,6 +1476,14 @@ impl WorkspaceTools {
             selected.len(),
             args.path
         );
+        if let Some(note) = scan_for_secrets_advisory(self.root(), &args.path, updated.as_bytes()) {
+            summary.push('\n');
+            summary.push_str(&note);
+        }
+        if let Some(note) = scan_patch_advisory(self.root(), &args.path, updated.as_bytes()) {
+            summary.push('\n');
+            summary.push_str(&note);
+        }
         if let Some(note) = crate::context_retrieval::ripple_advisory(self.root(), &args.path) {
             summary.push('\n');
             summary.push_str(&note);
@@ -4918,6 +4934,61 @@ use std::sync::{Arc, Mutex};
                 assert!(detail.unwrap().contains("not found"));
             }
             other => panic!("expected not-found failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_patch_scans_the_resulting_content_like_workspace_write_does() {
+        let root = TempRoot::new("patch-scanners");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        // Exact-match tier: a patch that introduces a likely secret is
+        // flagged the same way workspace_write's plain path already is.
+        fs::write(root.0.join("config.rs"), "const TOKEN: &str = \"placeholder\";\n").expect("seed");
+        let token = format!("ghp_{}", "d".repeat(36));
+        let call = make_call(
+            "c1",
+            WORKSPACE_PATCH_TOOL,
+            &serde_json::to_string(&serde_json::json!({
+                "path": "config.rs",
+                "old": "\"placeholder\"",
+                "new": format!("\"{token}\"")
+            }))
+            .expect("encode call"),
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("advisory: possible secret"), "{summary}");
+            }
+            other => panic!("expected patch success, got {other:?}"),
+        }
+
+        // Whitespace-insensitive tier: same scan still runs when the exact
+        // substring match falls through to the loose one.
+        fs::create_dir_all(root.0.join(".github/workflows")).expect("mkdir");
+        fs::write(
+            root.0.join(".github/workflows/release.yml"),
+            "name: release\npermissions:    read-all\njobs: {}\n",
+        )
+        .expect("seed workflow");
+        let call = make_call(
+            "c2",
+            WORKSPACE_PATCH_TOOL,
+            r#"{"path":".github/workflows/release.yml","old":"permissions: read-all","new":"permissions: write-all"}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("whitespace-insensitive match"), "{summary}");
+                assert!(
+                    summary.contains("advisory: possible patch-policy issue"),
+                    "{summary}"
+                );
+                assert!(summary.contains("patch.ci_permissions_broaden"), "{summary}");
+            }
+            other => panic!("expected patch success, got {other:?}"),
         }
     }
 
