@@ -218,11 +218,16 @@ impl JsonlRecord {
     }
 
     /// Process-end `session.finished` with the mapped exit code.
+    /// `cost_usd_micros` is `None` (serializes as JSON `null`, never a
+    /// fabricated `0`) when no step in the turn ever reported real cost —
+    /// same "unknown is not confirmed zero" discipline as `CostAccumulator`
+    /// (`host.rs`), whose `total()` is this field's usual source.
     pub fn session_finished(
         session_id: SessionId,
         seq: u64,
         time: impl Into<String>,
         exit_code: JsonlExitCode,
+        cost_usd_micros: Option<u64>,
     ) -> Result<Self, JsonlError> {
         Ok(Self {
             schema: JSONL_SCHEMA,
@@ -230,7 +235,10 @@ impl JsonlRecord {
             session_id: Some(session_id),
             seq,
             time: time.into(),
-            data: raw_json(&serde_json::json!({ "exit_code": exit_code.as_i32() }))?,
+            data: raw_json(&serde_json::json!({
+                "exit_code": exit_code.as_i32(),
+                "cost_usd_micros": cost_usd_micros,
+            }))?,
         })
     }
 
@@ -581,7 +589,7 @@ mod tests {
     const GOLDEN_TOOL_COMPLETED: &str = r#"{"schema":1,"type":"tool.completed","session_id":"019c0000-0000-7000-8000-000000000002","seq":42,"time":"2026-08-14T15:20:04.123Z","data":{}}"#;
     const GOLDEN_APPROVAL_REQUIRED: &str = r#"{"schema":1,"type":"approval.required","session_id":"019c0000-0000-7000-8000-000000000002","seq":5,"time":"2026-08-14T15:20:04.123Z","data":{"capability":"fs.write"}}"#;
     const GOLDEN_ERROR: &str = r#"{"schema":1,"type":"error","session_id":"019c0000-0000-7000-8000-000000000002","seq":0,"time":"2026-08-14T15:20:04.123Z","data":{"code":"policy.denied","message":"Action denied by project policy","retryable":false,"trace_id":"018f3c8a-7e2b-7a10-8c4d-0123456789ab","details":{}}}"#;
-    const GOLDEN_SESSION_FINISHED: &str = r#"{"schema":1,"type":"session.finished","session_id":"019c0000-0000-7000-8000-000000000002","seq":7,"time":"2026-08-14T15:20:04.123Z","data":{"exit_code":0}}"#;
+    const GOLDEN_SESSION_FINISHED: &str = r#"{"schema":1,"type":"session.finished","session_id":"019c0000-0000-7000-8000-000000000002","seq":7,"time":"2026-08-14T15:20:04.123Z","data":{"cost_usd_micros":null,"exit_code":0}}"#;
     const GOLDEN_EXIT_CODES: &str = r#"{"agent.concurrency_limit":8,"auth.required":4,"browser.stale_observation":5,"config.invalid":2,"context.index_unavailable":5,"goal.budget_exhausted":8,"goal.evidence_missing":2,"goal.invalid_transition":5,"internal.unexpected":5,"mcp.server_untrusted":3,"mobile.capability_unavailable":5,"plugin.capability_denied":3,"policy.approval_required":3,"policy.denied":3,"policy.lease_invalid":3,"process.timeout":8,"provider.auth_failed":4,"provider.context_too_large":4,"provider.rate_limited":4,"sandbox.tier_unavailable":7,"session.conflict":5,"session.not_found":2,"storage.corrupt":5,"tool.invalid_arguments":2,"workspace.merge_conflict":5,"workspace.preimage_mismatch":5}"#;
     const GOLDEN_EXIT_CODES_REQUIRE_COMPLETE: &str =
         r#"{"goal.budget_exhausted":6,"goal.evidence_missing":6}"#;
@@ -727,8 +735,9 @@ mod tests {
         let err = JsonlRecord::error(&policy_error(), Some(session_id()), 0, TIME).expect("error");
         assert_eq!(encode(&err), GOLDEN_ERROR);
 
-        let finished = JsonlRecord::session_finished(session_id(), 7, TIME, JsonlExitCode::Success)
-            .expect("finished");
+        let finished =
+            JsonlRecord::session_finished(session_id(), 7, TIME, JsonlExitCode::Success, None)
+                .expect("finished");
         assert_eq!(encode(&finished), GOLDEN_SESSION_FINISHED);
 
         let closed = JsonlRecord::from_event(

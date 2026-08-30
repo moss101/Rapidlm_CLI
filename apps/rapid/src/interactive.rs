@@ -1847,65 +1847,70 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         }
     }
     // `text` is the same content the plain-text path would have printed;
-    // `code` is the typed exit code either path returns.
-    let (text, code): (Option<String>, JsonlExitCode) = match run_result {
-        Ok(outcome) if outcome.result.status() == AgentTerminalStatus::Succeeded => {
-            let captured = json_schema_capture.borrow();
-            if json_schema_requested && captured.is_none() {
-                eprintln!(
-                    "--json-schema was set but the model never called the synthetic tool \
-                     with a schema-conformant result"
+    // `code` is the typed exit code either path returns; `cost_usd_micros`
+    // is `None` for every `Err` arm (no `ExecOutcome` to read one from).
+    let (text, code, cost_usd_micros): (Option<String>, JsonlExitCode, Option<u64>) =
+        match run_result {
+            Ok(outcome) if outcome.result.status() == AgentTerminalStatus::Succeeded => {
+                let captured = json_schema_capture.borrow();
+                if json_schema_requested && captured.is_none() {
+                    eprintln!(
+                        "--json-schema was set but the model never called the synthetic tool \
+                         with a schema-conformant result"
+                    );
+                    (None, JsonlExitCode::Runtime, outcome.cost_usd_micros)
+                } else {
+                    let text = captured
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or_else(|| outcome.result.summary().to_owned());
+                    let mut line = format!("tokens used: {}", outcome.tokens);
+                    if let Some(cost_usd_micros) = outcome.cost_usd_micros {
+                        line.push_str(&format!(" ({})", format_usd_micros(cost_usd_micros)));
+                    }
+                    crate::exec_diag::stderr_line(&line);
+                    (Some(text), JsonlExitCode::Success, outcome.cost_usd_micros)
+                }
+            }
+            Ok(outcome) => {
+                let mut message = describe_turn_failure(
+                    &outcome.result,
+                    outcome.failure_cause,
+                    outcome.failure_detail.as_ref(),
                 );
-                (None, JsonlExitCode::Runtime)
-            } else {
-                let text = captured
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| outcome.result.summary().to_owned());
-                let mut line = format!("tokens used: {}", outcome.tokens);
-                if let Some(cost_usd_micros) = outcome.cost_usd_micros {
-                    line.push_str(&format!(" ({})", format_usd_micros(cost_usd_micros)));
+                // Exit-code fidelity: a turn that did real work (committed tool
+                // calls) and whose only defect is an empty final model response
+                // is a completed task with a missing summary — exit 0 so callers
+                // do not retry committed work. Every other failure exits 1.
+                // (`Succeeded` is already handled by the guard above, so reaching
+                // here `is_effective_success` can only be true via that case.)
+                if is_effective_success(&outcome) {
+                    message.push_str(&format!(
+                        " (the turn performed {} tool call(s) before the final response came back empty; verify workspace state)",
+                        outcome.tool_calls
+                    ));
+                    crate::exec_diag::stderr_line(&message);
+                    (None, JsonlExitCode::Success, outcome.cost_usd_micros)
+                } else {
+                    if outcome.failure_cause.is_none()
+                        && !matches!(&workspace, Some((_, TrustStatus::Trusted)))
+                    {
+                        message.push_str(" (workspace tools are disabled: project is not trusted)");
+                    }
+                    crate::exec_diag::stderr_line(&message);
+                    let code = exec_turn_exit_code(outcome.result.status(), outcome.failure_cause);
+                    (None, code, outcome.cost_usd_micros)
                 }
-                crate::exec_diag::stderr_line(&line);
-                (Some(text), JsonlExitCode::Success)
             }
-        }
-        Ok(outcome) => {
-            let mut message =
-                describe_turn_failure(&outcome.result, outcome.failure_cause, outcome.failure_detail.as_ref());
-            // Exit-code fidelity: a turn that did real work (committed tool
-            // calls) and whose only defect is an empty final model response
-            // is a completed task with a missing summary — exit 0 so callers
-            // do not retry committed work. Every other failure exits 1.
-            // (`Succeeded` is already handled by the guard above, so reaching
-            // here `is_effective_success` can only be true via that case.)
-            if is_effective_success(&outcome) {
-                message.push_str(&format!(
-                    " (the turn performed {} tool call(s) before the final response came back empty; verify workspace state)",
-                    outcome.tool_calls
-                ));
-                crate::exec_diag::stderr_line(&message);
-                (None, JsonlExitCode::Success)
-            } else {
-                if outcome.failure_cause.is_none()
-                    && !matches!(&workspace, Some((_, TrustStatus::Trusted)))
-                {
-                    message.push_str(" (workspace tools are disabled: project is not trusted)");
-                }
-                crate::exec_diag::stderr_line(&message);
-                let code = exec_turn_exit_code(outcome.result.status(), outcome.failure_cause);
-                (None, code)
+            Err(err) => {
+                eprintln!("{err}");
+                let code = match err.error_code() {
+                    Some(code) => JsonlExitCode::from_error_code(code, false),
+                    None => JsonlExitCode::Interrupted,
+                };
+                (None, code, None)
             }
-        }
-        Err(err) => {
-            eprintln!("{err}");
-            let code = match err.error_code() {
-                Some(code) => JsonlExitCode::from_error_code(code, false),
-                None => JsonlExitCode::Interrupted,
-            };
-            (None, code)
-        }
-    };
+        };
     if let Some(io) = jsonl_io.as_mut() {
         if let Some(text) = &text {
             let _ = crate::headless::jsonl::JsonlRecord::assistant_message(
@@ -1922,6 +1927,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             next_jsonl_seq,
             crate::headless::jsonl::now_rfc3339(),
             code,
+            cost_usd_micros,
         )
         .map(|record| io.records().write(&record));
     } else if let Some(text) = &text {
