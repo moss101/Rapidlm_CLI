@@ -4,6 +4,7 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use crate::orchestration::evidence::CompletionClaim;
@@ -157,6 +158,13 @@ pub struct Supervisor {
     extra_sink: Option<Box<dyn OrchestrationEventSink>>,
     drivers: SupervisorDrivers,
     clock: u64,
+    /// Wall-clock start of this process's run, checked against
+    /// `resource_budget.max_wall_clock_ms` in `check_budget`. Not part of
+    /// `OrchestrationSnapshot` (which is meant to be resumable/serializable
+    /// — `Instant` is neither): `resume()` restarts this window rather than
+    /// resuming the original run's elapsed time, a narrower, deliberate
+    /// limitation short of full cross-process wall-clock persistence.
+    started_at: Instant,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -230,6 +238,7 @@ impl Supervisor {
             extra_sink: None,
             drivers,
             clock: 1,
+            started_at: Instant::now(),
         };
         supervisor.apply(OrchestrationTransition::BeginContract)?;
         supervisor.emit(
@@ -257,6 +266,7 @@ impl Supervisor {
             extra_sink: None,
             drivers,
             clock: 1,
+            started_at: Instant::now(),
         })
     }
 
@@ -957,6 +967,7 @@ impl Supervisor {
             || self.snapshot.repair_rounds > b.max_repair_rounds
             || self.snapshot.strategist_calls > b.max_strategist_calls
             || self.snapshot.tokens_used > b.max_tokens
+            || self.started_at.elapsed() > Duration::from_millis(b.max_wall_clock_ms)
         {
             return Err(SupervisorError::BudgetExceeded);
         }
@@ -1675,5 +1686,25 @@ mod tests {
         let panel = VerifierPanel::for_policy(&policy);
         assert!(panel.assignments.len() >= 2);
         assert_eq!(panel.aggregation_policy, AggregationPolicy::Unanimous);
+    }
+
+    #[test]
+    fn wall_clock_budget_forces_blocked_not_an_unbounded_run() {
+        let id = GoalId::new();
+        let mut c = contract(id);
+        c.resource_budget = OrchestrationBudget {
+            max_wall_clock_ms: 1,
+            ..OrchestrationBudget::default()
+        };
+        let drivers = SupervisorDrivers::fakes(FakeScript {
+            task_id: id,
+            evidence: vec![],
+            include_evidence: false,
+            refute_n: 0,
+            fail_checks: false,
+        });
+        let mut sup = Supervisor::start(c, identity(), drivers).expect("start");
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(sup.advance(), Err(SupervisorError::BudgetExceeded));
     }
 }

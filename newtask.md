@@ -530,6 +530,52 @@ rollback metadata) and explicitly states signing is unimplemented pending that k
 future reader auditing release-integrity guarantees isn't misled into believing tamper-evidence exists. Full
 `rapid` crate suite unaffected (doc-only change) and `cargo build --workspace --tests` pass.
 
+**Fresh review pass, 2026-08-30, `crates/agent-runtime/src/orchestration/supervisor.rs::check_budget` — 4 of
+7 documented budget caps were silent no-ops; fixed the one genuinely self-contained dimension, documented the
+other three as needing plumbing that doesn't exist in this Supervisor's model at all yet.**
+`OrchestrationBudget`'s own doc comment: "Caps that force Blocked rather than an infinite repair loop." Only
+`max_verification_rounds`, `max_repair_rounds`, and `max_strategist_calls` were ever actually checked.
+`max_tokens` was checked but dead anyway — `tokens_used` (`OrchestrationSnapshot`) is initialized to `0` and
+never incremented anywhere in the workspace (confirmed via grep). `max_agent_spawns` and `max_tool_executions`
+were never checked at all, and — more fundamentally — `Supervisor` has no method anywhere that represents "an
+agent was spawned" or "a tool was executed"; there's no event source to count in the first place, confirmed
+via `grep -n "pub fn " supervisor.rs`. `max_wall_clock_ms` was likewise never checked, and
+`OrchestrationSnapshot` had no timestamp field to check it against. This is real and reachable in production:
+`apps/rapid/src/goal_claim.rs` constructs a live `OrchestrationBudget` (`max_wall_clock_ms: 600_000`, a real
+10-minute cap evidently intended to bound the run) and drives the `Supervisor` through repeated `advance()`
+calls, each of which calls `check_budget()` first — the configured 10-minute backstop was a complete no-op
+regardless of how long the loop actually ran.
+
+**Fixed the one dimension that's genuinely self-contained: `max_wall_clock_ms`.** Added `started_at: Instant`
+directly on `Supervisor` (not on `OrchestrationSnapshot`, whose own doc comment — "Serializable orchestration
+snapshot for resume" — signals intent to eventually persist it, and `Instant` can never survive that; putting
+a non-resumable timestamp there would misrepresent what's actually resumable), set at both `start()` and
+`resume()`, checked in `check_budget()` via `started_at.elapsed() > Duration::from_millis(max_wall_clock_ms)`.
+**Deliberate, narrower limitation, stated in the field's own doc comment:** `resume()` restarts this window
+rather than resuming the original run's elapsed wall-clock time, since `Instant` values from a prior process
+don't survive a restart — full cross-process persistence would need an absolute wall-clock timestamp instead
+and a decision about how that interacts with resume semantics, which this fix doesn't attempt. Verified via
+the standard temporary-revert cycle: the new test failed with `Ok(Discovering)` instead of
+`Err(BudgetExceeded)` against the reverted check, confirming it fails closed only because the real check ran.
+
+**Deliberately not attempted, three dimensions, each needing real design/plumbing work, not a quick fix:**
+- `max_agent_spawns` / `max_tool_executions`: `Supervisor` has no concept of either event in its current state
+  machine at all — these aren't miscounted, there's nothing counting them because nothing in this crate emits
+  such an event. Wiring this correctly needs a decision about where the count comes from: today's host-owned
+  drivers (`goal_claim.rs`'s `HostPhases`) don't spawn agents or invoke arbitrary tools through this
+  Supervisor at all (matches this document's own note: "Model-backed planner/implementer/verifier drivers do
+  not exist yet, so every injected driver is host-owned"), so there's no real occurrence to count yet either.
+- `max_tokens`: same shape — no LLM call currently happens inside this Supervisor's own round-driving methods
+  (`run_checks`/`verify`/`repair`/`strategize` are all host-deterministic today), so there's no real token-
+  usage event to report. Wiring this needs the same model-backed-driver work as the two above, not a small
+  local fix.
+
+Bolting on fake counters for these three (e.g., incrementing on every `advance()` call regardless of what
+actually happened) would create the same false-safety-net problem as this document's `run_release_manifest`
+finding just above: it would look like enforcement without actually bounding the thing the doc comment
+promises to bound. New test `wall_clock_budget_forces_blocked_not_an_unbounded_run`. Full `agent-runtime`
+crate suite (270 tests, up from 269) and `cargo build --workspace --tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
