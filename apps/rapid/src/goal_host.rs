@@ -211,6 +211,7 @@ impl GoalHost {
                         "criterion_id": ve.criterion_id(),
                         "satisfied": ve.satisfied(),
                         "reason": ve.reason().map(|reason| format!("{reason:?}")),
+                        "retryable": ve.reason().map(|reason| reason.retryable()),
                     })
                 })
                 .collect::<Vec<_>>()
@@ -423,6 +424,15 @@ mod tests {
                 .expect("attestation")
                 .starts_with("sha256:")
         );
+        // No evidence recorded yet: `c1` is unsatisfied for a final reason
+        // (`missing_evidence`), so `retryable` must read `false`, not
+        // `null` — the field is only absent for an already-satisfied
+        // criterion (see `CriterionUnsatisfied::retryable`, `newtask.md`
+        // §2.4).
+        let verdict = &doc["verdicts"][0];
+        assert_eq!(verdict["satisfied"], false);
+        assert_eq!(verdict["reason"], "MissingEvidence");
+        assert_eq!(verdict["retryable"], false);
     }
 
     fn scratch_dir(name: &str) -> std::path::PathBuf {

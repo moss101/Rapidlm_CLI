@@ -400,6 +400,36 @@ error, timeout, or invalid output must yield `INDETERMINATE`, never silent succe
   to confirm or fix the tri-state shape, then auditing every verifier call site for fail-closed behavior
   per `REJ-006`.
 - **Sev/Effort:** P0 / S (audit) → M (if the fix is real, not confirmatory).
+- **Audited 2026-08-29 (commit `6ded0d6`) — this note was missing from the file even though that commit's
+  own message pointed here; corrected 2026-08-30 to actually say what was found and decided.**
+  `crates/agent-runtime/src/evidence.rs::CriterionEvaluator` is the real goal-completion gate (`harness::
+  assertions::Verdict` is a different, unrelated binary type for test-harness assertions over exported
+  ledger records — not this gate). Confirmed: `CriterionVerdict.satisfied` is a plain `bool`, not tri-
+  state, and every error/cancellation path in `evaluate_with_backing` already collapses to `satisfied:
+  false` (fail-closed, matching `REJ-006`'s safety bar) rather than ever defaulting to success. **Decision:
+  a literal `VERIFIED | REJECTED | INDETERMINATE` enum was deliberately NOT built.** Forcing one in would
+  have meant either (a) letting `INDETERMINATE` NOT block completion — violating `REJ-006` outright — or
+  (b) making it block identically to `REJECTED`, at which point it's a relabeling with no behavioral
+  difference, not a real tri-state gate. Instead: `CriterionUnsatisfied` gained three new reasons
+  (`LedgerEventNotFound`/`LedgerEventWrongKind`/`LedgerUnavailable`, replacing one collapsed
+  `UnbackedEvidence` for agent-cited ledger references) plus a `retryable()` classifier — `true` only for
+  `UnavailableStatus`/`ErrorStatus`/`LedgerUnavailable` (the verifier itself couldn't produce a definite
+  result and a rerun with zero new evidence might succeed), `false` for every other reason (`FailedStatus`,
+  `MissingEvidence`, etc. — a genuinely new observation is required). The gate's own behavior is
+  unchanged either way (`satisfied` stays `false` for both); `retryable` is a caller-facing "try again" vs.
+  "this is final" signal layered on top, not a second axis the gate itself consults.
+  **Wiring gap found and closed 2026-08-30:** `retryable()` had zero call sites outside its own unit tests
+  in `evidence.rs` — the exact "built but unwired" pattern from this document's own §0a meta-finding.
+  `apps/rapid/src/goal_host.rs::export`'s per-criterion JSON now includes `"retryable"` (`null` only when
+  the criterion is satisfied and has no reason at all); `apps/rapid/src/interactive.rs`'s `goal verify`
+  text output now appends `, retryable` to an unsatisfied criterion's line when true. New test
+  (`export_emits_snapshot_verdicts_and_attestation`, extended) asserts `retryable: false` for a
+  `MissingEvidence` criterion — the `true` branch itself is already covered by `evidence.rs`'s own
+  `retryable()` unit tests; constructing a genuine `LedgerUnavailable` scenario through `GoalHost`'s public
+  API would need real ledger-resolver-failure plumbing this pass didn't build. **Still open:** no CLI
+  surface reads `CriterionVerdicts::allowed()`'s all-satisfied invariant any differently when every
+  unsatisfied criterion happens to be retryable (e.g. "try again shortly" vs. a hard stop) — `retryable` is
+  visible per-criterion now, but nothing yet rolls it up to a turn-level "retry advisable" signal.
 
 ### 2.5 Structured `PlanGraph`/`TodoState` outside the transcript + stall detection
 

@@ -544,14 +544,24 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
                     if verdict.satisfied() {
                         println!("- criterion {}: satisfied", verdict.criterion_id());
                     } else {
-                        let reason = verdict
-                            .reason()
-                            .map(|r| r.as_str())
-                            .unwrap_or("unsatisfied");
-                        println!(
-                            "- criterion {}: unsatisfied ({reason})",
-                            verdict.criterion_id()
-                        );
+                        let reason = verdict.reason();
+                        let label = reason.map(|r| r.as_str()).unwrap_or("unsatisfied");
+                        // `retryable`: the same check could pass later with no
+                        // new evidence at all (e.g. a ledger resolver outage)
+                        // versus a final verdict that needs a genuinely new
+                        // observation to change (see `CriterionUnsatisfied::
+                        // retryable`, `newtask.md` §2.4).
+                        if reason.is_some_and(|r| r.retryable()) {
+                            println!(
+                                "- criterion {}: unsatisfied ({label}, retryable)",
+                                verdict.criterion_id()
+                            );
+                        } else {
+                            println!(
+                                "- criterion {}: unsatisfied ({label})",
+                                verdict.criterion_id()
+                            );
+                        }
                     }
                 }
             }
