@@ -8,7 +8,6 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::io::Read;
 use std::time::Duration;
 
 use capability_broker::{
@@ -16,8 +15,8 @@ use capability_broker::{
     ResourceDescriptor,
 };
 use process_supervisor::{
-    DEFAULT_GRACE, ExecBinding, ExecSpec, JobHandle, MAX_STDIN_BYTES, SecretOrValue, StdinSpec,
-    TerminalStatus, await_exit, spawn,
+    DEFAULT_GRACE, ExecBinding, ExecSpec, MAX_STDIN_BYTES, SecretOrValue, StdinSpec, TerminalStatus,
+    await_exit_draining, spawn,
 };
 use protocol::{ApiError, ArtifactId, ErrorCode, JobId, LeaseId, SandboxTier, SessionId, TraceId};
 use sandbox::SandboxNetwork;
@@ -1059,9 +1058,14 @@ pub fn run_command_hook(
     let mut handle = spawn(exec, lease).map_err(map_spawn)?;
     let job_id = handle.job_id();
     let lease_id = handle.lease_id();
-    let report =
-        await_exit(&mut handle, &ctx.cancel, DEFAULT_GRACE).map_err(|_| HookError::Wait)?;
-    let (stdout, stderr) = collect_output(&mut handle, spec.sandbox.output_limit, &ctx.cancel)?;
+    // Draining stdout/stderr concurrently with the wait (not after) avoids
+    // deadlocking on a hook whose combined output exceeds the OS pipe buffer
+    // before it exits.
+    let cap = usize::try_from(spec.sandbox.output_limit).unwrap_or(usize::MAX);
+    let (report, stdout, stderr) = await_exit_draining(&mut handle, &ctx.cancel, DEFAULT_GRACE, cap)
+        .map_err(|_| HookError::Wait)?;
+    let stdout = HookCapture::from_bytes(stdout.bytes, stdout.truncated);
+    let stderr = HookCapture::from_bytes(stderr.bytes, stderr.truncated);
     drop(handle);
     let status = status_from_terminal(report.status());
     let (decision, grant_attempted) = parse_hook_output(event.event, status, stdout.excerpt());
@@ -1131,9 +1135,14 @@ fn run_prepared(
     let mut handle = spawn(exec, lease).map_err(map_spawn)?;
     let job_id = handle.job_id();
     let lease_id = handle.lease_id();
-    let report =
-        await_exit(&mut handle, &ctx.cancel, DEFAULT_GRACE).map_err(|_| HookError::Wait)?;
-    let (stdout, stderr) = collect_output(&mut handle, spec.sandbox.output_limit, &ctx.cancel)?;
+    // Draining stdout/stderr concurrently with the wait (not after) avoids
+    // deadlocking on a hook whose combined output exceeds the OS pipe buffer
+    // before it exits.
+    let cap = usize::try_from(spec.sandbox.output_limit).unwrap_or(usize::MAX);
+    let (report, stdout, stderr) = await_exit_draining(&mut handle, &ctx.cancel, DEFAULT_GRACE, cap)
+        .map_err(|_| HookError::Wait)?;
+    let stdout = HookCapture::from_bytes(stdout.bytes, stdout.truncated);
+    let stderr = HookCapture::from_bytes(stderr.bytes, stderr.truncated);
     drop(handle);
     let status = status_from_terminal(report.status());
     let (decision, grant_attempted) = parse_hook_output(event.event, status, stdout.excerpt());
@@ -1220,53 +1229,6 @@ fn status_from_terminal(status: TerminalStatus) -> HookRunStatus {
     }
 }
 
-fn collect_output(
-    handle: &mut JobHandle,
-    limit: u64,
-    cancel: &CancellationToken,
-) -> Result<(HookCapture, HookCapture), HookError> {
-    cancel.check().map_err(|_| HookError::Cancelled)?;
-    let cap = usize::try_from(limit).unwrap_or(usize::MAX);
-    let stdout = match handle.child_mut().stdout.take() {
-        Some(pipe) => read_capped(pipe, cap, cancel)?,
-        None => HookCapture::empty(),
-    };
-    cancel.check().map_err(|_| HookError::Cancelled)?;
-    let stderr = match handle.child_mut().stderr.take() {
-        Some(pipe) => read_capped(pipe, cap, cancel)?,
-        None => HookCapture::empty(),
-    };
-    Ok((stdout, stderr))
-}
-
-fn read_capped<R: Read>(
-    mut pipe: R,
-    cap: usize,
-    cancel: &CancellationToken,
-) -> Result<HookCapture, HookError> {
-    let mut buf = vec![0u8; 4096];
-    let mut out = Vec::new();
-    let mut truncated = false;
-    loop {
-        cancel.check().map_err(|_| HookError::Cancelled)?;
-        let n = pipe.read(&mut buf).map_err(|_| HookError::Wait)?;
-        if n == 0 {
-            break;
-        }
-        let room = cap.saturating_sub(out.len());
-        if n > room {
-            out.extend_from_slice(&buf[..room]);
-            truncated = true;
-            break;
-        }
-        out.extend_from_slice(&buf[..n]);
-        if out.len() >= cap {
-            truncated = true;
-            break;
-        }
-    }
-    Ok(HookCapture::from_bytes(out, truncated))
-}
 
 fn bind_env(
     spec: &HookSpec,

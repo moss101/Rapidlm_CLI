@@ -11,8 +11,9 @@ pub mod spawn;
 pub mod trigger;
 
 pub use cancel::{
-    CancelError, DEFAULT_GRACE, GracePeriod, MAX_GRACE, ProcessExit, SignalKind, TerminalStatus,
-    TerminateAction, TerminateReport, TerminationCause, await_exit, terminate_tree,
+    CancelError, DEFAULT_GRACE, DrainedStream, GracePeriod, MAX_GRACE, ProcessExit, SignalKind,
+    TerminalStatus, TerminateAction, TerminateReport, TerminationCause, await_exit,
+    await_exit_draining, terminate_tree,
 };
 pub use jobs::{
     ClientDisconnectReport, JOB_RECORD_SCHEMA, JobError, JobEventMeta, JobLifetime, JobOutcome,

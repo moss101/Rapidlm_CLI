@@ -275,6 +275,57 @@ touches graph readiness at all today (matches this document's own §0 note that 
 surface yet) — but a real, demonstrable bug in the scheduler's own contract, worth having fixed before
 fan-out is ever wired into a real run.
 
+**Fresh review pass, 2026-08-30, three separate check-command/hook/external-agent runners — all three read a
+child's stdout/stderr only after the wait loop reported it exited, deadlocking on any output past the OS pipe
+buffer and misreporting a finished process as timed out.** The shape: spawn a child with
+`Stdio::piped()` stdout/stderr, poll `try_wait()` in a loop until it returns `Some` (or a deadline hits), and
+only then read the pipes. A child that writes more than the OS pipe buffer (commonly 16-64 KiB, platform-
+dependent) before exiting blocks inside its own `write(2)` call once that buffer fills — nobody is reading it
+— so it never reaches exit, the poll loop never sees `Some`, and the deadline eventually fires and kills a
+process that had already finished its real work. This is not a hypothetical edge case: 64 KiB is an entirely
+ordinary amount of chatter for a compiler, test runner, or linter.
+
+Three call sites had this shape:
+1. **`apps/rapid/src/goal_claim.rs::run_check_command`** — backs `goal claim`'s deterministic-check
+   acceptance evidence (module doc: "the host executes the checks for real"). A genuinely passing check
+   command whose combined output exceeds 64 KiB (`MAX_CHECK_OUTPUT_BYTES`) would be misreported as
+   `timed_out: true, passed: false`, blocking legitimate goal completion for up to `MAX_TIMEOUT_SECS` (600s).
+2. **`apps/rapid/src/external_agents.rs::SupervisedCliRunner::run`** — a productive external CLI agent run
+   past `MAX_AGENT_RESULT_BYTES` (256 KiB) would be misreported as failed/lost, discarding all its output.
+3. **`crates/plugin-host/src/hooks.rs::run_command_hook`/`run_prepared`** — the module's own doc comment
+   claims "**Timeout and nonzero exit stay distinct**"; a verbose lint/format hook past its `output_limit`
+   (default 64 KiB, `DEFAULT_HOOK_OUTPUT_BYTES`) would be misreported as `HookRunStatus::TimedOut`, which
+   (depending on `failure_policy`) can incorrectly `Block` the gated tool call.
+
+**Confirmed directly, not just from the review agent's report:** added
+`cancel::tests::plain_await_exit_deadlocks_on_output_past_the_pipe_buffer` to
+`crates/process-supervisor` — spawns `/bin/dd if=/dev/zero bs=1024 count=200` (200 KiB, run through
+`process_supervisor::spawn`/`await_exit` exactly like the three call sites) and confirms `await_exit` alone
+reports `TerminalStatus::TimedOut` even though the child would exit near-instantly if drained. Then confirmed
+the same command, run through the new fix, exits cleanly (below).
+
+**Fixed with one reusable primitive plus three call-site updates, rather than three separate ad-hoc fixes:**
+new `process_supervisor::cancel::await_exit_draining` spawns a background thread per stdout/stderr pipe
+*before* calling the existing `await_exit`, each thread draining its pipe to EOF via a new `drain_capped`
+helper. Two things distinguish this from simply "read on another thread": (1) both pipes must be taken and
+handed to their reader threads *before* `await_exit` starts polling, since `await_exit` may call
+`terminate_tree` (kill) on timeout/cancel — the pipes stay valid file descriptors independent of the `Child`
+handle, so this is safe and matches the concurrent-drain pattern `apps/rapid/src/exec_tools.rs`'s own job
+runner already uses correctly. (2) `drain_capped` deliberately never stops reading once it hits its byte cap
+— it keeps consuming (and discarding) bytes to EOF. A drain that stopped at the cap would let the pipe fill
+again for any output beyond it and reintroduce the identical deadlock, just at a larger threshold; a test
+(`await_exit_draining_truncates_at_cap_but_still_drains_to_avoid_deadlock`) specifically pins this down with
+a tiny 64-byte cap against the same 200 KiB `dd` command. `goal_claim.rs` doesn't use `process_supervisor`'s
+`JobHandle` at all (raw `std::process::Command`), so it got a small local `drain_capped` copy of the same
+shape rather than a forced dependency change. `plugin-host/src/hooks.rs`'s old `collect_output`/`read_capped`
+(the post-wait, cap-stops-reading version) were deleted outright as dead code once both its call sites moved
+to `await_exit_draining`. Every fix in this finding was verified with the standard temporary-revert cycle:
+`goal_claim.rs`'s new test failed against the un-fixed body with a real 5-second timeout observed, then
+passed once the real fix was restored. Full suites: `process-supervisor` (105 tests, up from 102),
+`plugin-host` (117 tests, unchanged — no new plugin-host-specific test since the mechanism is already covered
+by `process-supervisor`'s own tests and the fix is a straight swap to the same audited primitive), `rapid`
+(327 tests, up from 326). `cargo build --workspace --tests` passes.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

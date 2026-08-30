@@ -180,6 +180,13 @@ struct CheckRun {
 
 /// Execute one operator-authorized command directly (no shell), bounded by a
 /// poll deadline. Output is captured and hashed; nothing is echoed.
+///
+/// Stdout/stderr are drained on background threads for the whole wait, not
+/// read afterward: a check command that writes more than the OS pipe buffer
+/// (commonly 16-64 KiB) before exiting would otherwise block in `write(2)`
+/// once that buffer fills, so it would never reach the `try_wait` loop's
+/// success case and get misreported as timed out even though it had already
+/// finished — a real risk for anything as ordinary as a verbose test run.
 fn run_check_command(spec: &CheckSpec, timeout: Duration) -> Result<CheckRun, GoalClaimError> {
     let mut parts = spec.command.split_whitespace();
     let Some(program) = parts.next() else {
@@ -191,6 +198,12 @@ fn run_check_command(spec: &CheckSpec, timeout: Duration) -> Result<CheckRun, Go
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|_| GoalClaimError::CheckSpawn)?;
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_reader =
+        stdout_pipe.map(|pipe| std::thread::spawn(move || drain_capped(pipe, MAX_CHECK_OUTPUT_BYTES)));
+    let stderr_reader =
+        stderr_pipe.map(|pipe| std::thread::spawn(move || drain_capped(pipe, MAX_CHECK_OUTPUT_BYTES)));
     let start = Instant::now();
     let mut timed_out = false;
     let status = loop {
@@ -209,11 +222,11 @@ fn run_check_command(spec: &CheckSpec, timeout: Duration) -> Result<CheckRun, Go
     };
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let mut output = Vec::new();
-    if let Some(stream) = child.stdout.take() {
-        let _ = stream.take(MAX_CHECK_OUTPUT_BYTES).read_to_end(&mut output);
+    if let Some(reader) = stdout_reader {
+        output.extend(reader.join().unwrap_or_default());
     }
-    if let Some(stream) = child.stderr.take() {
-        let _ = stream.take(MAX_CHECK_OUTPUT_BYTES).read_to_end(&mut output);
+    if let Some(reader) = stderr_reader {
+        output.extend(reader.join().unwrap_or_default());
     }
     Ok(CheckRun {
         passed: !timed_out && status.success(),
@@ -222,6 +235,27 @@ fn run_check_command(spec: &CheckSpec, timeout: Duration) -> Result<CheckRun, Go
         duration_ms,
         output,
     })
+}
+
+/// Reads `pipe` to EOF, keeping only the first `cap` bytes. Never stops
+/// early on overflow: draining must continue for the whole stream or the
+/// child could block on a full pipe exactly as before, just past `cap`
+/// instead of past the (much smaller) OS pipe buffer.
+fn drain_capped<R: Read>(mut pipe: R, cap: u64) -> Vec<u8> {
+    let cap = usize::try_from(cap).unwrap_or(usize::MAX);
+    let mut buf = [0u8; 8192];
+    let mut out = Vec::new();
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let room = cap.saturating_sub(out.len());
+                let take = room.min(n);
+                out.extend_from_slice(&buf[..take]);
+            }
+        }
+    }
+    out
 }
 
 /// Host-owned phase drivers. Discovery/planning are derived from the goal
@@ -955,5 +989,28 @@ mod tests {
             requirement_id: requirement_id.to_owned(),
             command: command.to_owned(),
         }
+    }
+
+    /// dd's output (200 KiB) comfortably exceeds every common OS pipe buffer
+    /// (typically 16-64 KiB). A check command must not be misreported as
+    /// timed out just because it writes more than that before exiting.
+    #[cfg(unix)]
+    #[test]
+    fn check_command_writing_past_the_pipe_buffer_does_not_time_out() {
+        let spec = CheckSpec {
+            requirement_id: "c1".into(),
+            command: "/bin/dd if=/dev/zero bs=1024 count=200".into(),
+        };
+        let run = run_check_command(&spec, Duration::from_secs(5)).expect("run");
+        assert!(
+            !run.timed_out,
+            "output past the pipe buffer must not deadlock the wait into a false timeout"
+        );
+        assert!(run.passed);
+        assert!(
+            run.output.len() >= MAX_CHECK_OUTPUT_BYTES as usize,
+            "captured output should hit its cap, not come back empty/truncated-to-nothing: got {} bytes",
+            run.output.len()
+        );
     }
 }

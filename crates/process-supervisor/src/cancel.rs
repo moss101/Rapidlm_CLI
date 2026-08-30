@@ -6,6 +6,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::io::Read;
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -289,6 +290,77 @@ pub fn await_exit(
         if !slice.is_zero() {
             thread::sleep(slice);
         }
+    }
+}
+
+/// Bounded capture of one drained stream. `truncated` means the child wrote
+/// more than `cap` bytes; the excess was read and discarded, never stored.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DrainedStream {
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
+/// [`await_exit`], but concurrently draining stdout/stderr on background
+/// threads instead of leaving them unread until the child exits.
+///
+/// `await_exit` alone only polls [`Child::try_wait`] — it never reads the
+/// child's pipes. A child that writes more than the OS pipe buffer (commonly
+/// 16-64 KiB, varies by platform) before exiting blocks in `write(2)` once
+/// that buffer fills, so it never reaches exit; the poll loop then reports a
+/// timeout even though the child had already finished useful work. Draining
+/// must run for the whole wait, not just until `cap` is reached: a reader
+/// that stops once truncated would let the pipe fill again and reintroduce
+/// the exact same deadlock for any output past the cap.
+///
+/// Must be called before anything else reads or takes the child's stdout/
+/// stderr — this function takes both pipes itself.
+///
+/// [`Child::try_wait`]: std::process::Child::try_wait
+pub fn await_exit_draining(
+    job: &mut JobHandle,
+    cancel: &CancellationToken,
+    grace: Duration,
+    cap: usize,
+) -> Result<(TerminateReport, DrainedStream, DrainedStream), CancelError> {
+    let stdout = job.child_mut().stdout.take();
+    let stderr = job.child_mut().stderr.take();
+    let stdout_reader = stdout.map(|pipe| thread::spawn(move || drain_capped(pipe, cap)));
+    let stderr_reader = stderr.map(|pipe| thread::spawn(move || drain_capped(pipe, cap)));
+    let report = await_exit(job, cancel, grace)?;
+    let join = |reader: Option<thread::JoinHandle<DrainedStream>>| {
+        reader.and_then(|handle| handle.join().ok()).unwrap_or_default()
+    };
+    Ok((report, join(stdout_reader), join(stderr_reader)))
+}
+
+/// Reads `pipe` to EOF, keeping only the first `cap` bytes. Never stops
+/// early on overflow: the caller relies on this to keep draining so the
+/// child is never blocked on a full pipe, no matter how much it writes.
+fn drain_capped<R: Read>(mut pipe: R, cap: usize) -> DrainedStream {
+    let mut buf = [0u8; 8192];
+    let mut out = Vec::new();
+    let mut truncated = false;
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let room = cap.saturating_sub(out.len());
+                if room > 0 {
+                    let take = room.min(n);
+                    out.extend_from_slice(&buf[..take]);
+                    if take < n {
+                        truncated = true;
+                    }
+                } else {
+                    truncated = true;
+                }
+            }
+        }
+    }
+    DrainedStream {
+        bytes: out,
+        truncated,
     }
 }
 
@@ -926,5 +998,80 @@ capability = "proc.exec"
             second.actions().is_empty(),
             "re-signaling a reaped group risks PID reuse"
         );
+    }
+
+    /// dd's output comfortably exceeds every common OS pipe buffer size
+    /// (typically 16-64 KiB), so a reader that never drains it blocks the
+    /// child in `write(2)` well before it can exit on its own.
+    #[cfg(unix)]
+    fn big_output_script() -> Vec<String> {
+        let sh = require_bin("/bin/sh");
+        let dd = require_bin("/bin/dd");
+        vec![
+            sh,
+            "-c".to_owned(),
+            format!("{dd} if=/dev/zero bs=1024 count=200 2>/dev/null"),
+        ]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plain_await_exit_deadlocks_on_output_past_the_pipe_buffer() {
+        let script = big_output_script();
+        let argv: Vec<&str> = script.iter().map(String::as_str).collect();
+        let mut handle = spawn_argv(&argv, Some(Duration::from_millis(300)));
+        let report = await_exit(&mut handle, &CancellationToken::new(), DEFAULT_GRACE)
+            .expect("await");
+        assert!(
+            report.status().is_timeout(),
+            "a child blocked writing to an undrained pipe must be misreported as timed out \
+             by a wait loop that never reads its stdout: status was {:?}",
+            report.status()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn await_exit_draining_reads_output_past_the_pipe_buffer_without_deadlock() {
+        let script = big_output_script();
+        let argv: Vec<&str> = script.iter().map(String::as_str).collect();
+        let mut handle = spawn_argv(&argv, Some(Duration::from_secs(5)));
+        let (report, stdout, stderr) = await_exit_draining(
+            &mut handle,
+            &CancellationToken::new(),
+            DEFAULT_GRACE,
+            1024 * 1024,
+        )
+        .expect("await draining");
+        assert!(
+            !report.status().is_timeout(),
+            "draining concurrently with the wait must let the child actually exit: status was {:?}",
+            report.status()
+        );
+        assert!(matches!(report.status(), TerminalStatus::Exited(_)));
+        assert_eq!(stdout.bytes.len(), 200 * 1024);
+        assert!(stdout.bytes.iter().all(|b| *b == 0));
+        assert!(!stdout.truncated);
+        assert!(stderr.bytes.is_empty());
+        assert!(!stderr.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn await_exit_draining_truncates_at_cap_but_still_drains_to_avoid_deadlock() {
+        let script = big_output_script();
+        let argv: Vec<&str> = script.iter().map(String::as_str).collect();
+        let mut handle = spawn_argv(&argv, Some(Duration::from_secs(5)));
+        let (report, stdout, _stderr) =
+            await_exit_draining(&mut handle, &CancellationToken::new(), DEFAULT_GRACE, 64)
+                .expect("await draining");
+        assert!(
+            !report.status().is_timeout(),
+            "truncating at a small cap must not stop the drain thread from reading to EOF, \
+             or the child would block on the pipe exactly as before: status was {:?}",
+            report.status()
+        );
+        assert_eq!(stdout.bytes.len(), 64);
+        assert!(stdout.truncated);
     }
 }

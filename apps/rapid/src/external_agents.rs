@@ -14,7 +14,7 @@ use acp::stdio::{JsonRpcId, JsonRpcMessage, StdioError};
 use acp::v1::StopReason;
 use capability_broker::{CancellationToken, CanonicalHostPath, LeaseUseGuard, PrincipalRef};
 use process_supervisor::{
-    ExecBinding, ExecSpec, SecretOrValue, StdinSpec, await_exit, spawn, DEFAULT_GRACE,
+    ExecBinding, ExecSpec, SecretOrValue, StdinSpec, await_exit_draining, spawn, DEFAULT_GRACE,
 };
 use protocol::SessionId;
 
@@ -481,20 +481,13 @@ impl CliRunner for SupervisedCliRunner {
         let _ = task;
         let mut handle = spawn(exec, lease)
             .map_err(|_| ExternalAgentError::Supervised("spawn".into()))?;
-        let report = await_exit(&mut handle, cancel, DEFAULT_GRACE)
+        // Draining stdout concurrently with the wait (not after) avoids
+        // deadlocking on an agent whose combined output exceeds the OS pipe
+        // buffer before it exits.
+        let cap = usize::try_from(self.output_limit).unwrap_or(usize::MAX);
+        let (report, stdout, _stderr) = await_exit_draining(&mut handle, cancel, DEFAULT_GRACE, cap)
             .map_err(|_| ExternalAgentError::Supervised("await".into()))?;
-        // Bounded stdout drain from the child pipe (mirrors hook capture).
-        let stdout_bytes = match handle.child_mut().stdout.take() {
-            Some(pipe) => {
-                use std::io::Read;
-                let mut buf = Vec::new();
-                let cap = self.output_limit as usize;
-                let _ = pipe.take((cap as u64).saturating_add(1)).read_to_end(&mut buf);
-                buf.truncate(cap);
-                buf
-            }
-            None => Vec::new(),
-        };
+        let stdout_bytes = stdout.bytes;
         drop(handle);
         let status = report.status();
         let (ok, code) = match status {
