@@ -1247,6 +1247,10 @@ struct LiveSubagentRunner {
     /// same quality gate as the parent's own instead of silently skipping
     /// it.
     shadow_diagnostics: Option<crate::shadow_diagnostics::ShadowDiagnosticsConfig>,
+    /// Whether the parent traces its own tool calls to stderr — carried
+    /// into every child so a headless `rapid exec` run watching its own
+    /// stderr sees a delegated subagent's tool calls too, not silence.
+    trace_calls: bool,
 }
 
 impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
@@ -1298,6 +1302,7 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         if let Some(shadow) = self.shadow_diagnostics.clone() {
             tools.set_shadow_diagnostics(shadow);
         }
+        tools.set_trace_calls(self.trace_calls);
         // Subagents run in the same trusted project as the parent (only
         // spawned when the workspace is trusted), so they get the same
         // AGENTS.md rules and system prompt as the top-level turn instead of
@@ -1808,6 +1813,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         if let Some(turn_budgets) = tools.turn_budget_handles() {
             let hooks = tools.hooks_config();
             let shadow_diagnostics = tools.shadow_diagnostics_config();
+            let trace_calls = tools.trace_calls_enabled();
             tools.set_subagent_runner(std::sync::Arc::new(LiveSubagentRunner {
                 active: active.clone(),
                 root: root.clone(),
@@ -1815,6 +1821,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                 turn_budgets,
                 hooks,
                 shadow_diagnostics,
+                trace_calls,
             }));
         }
     }

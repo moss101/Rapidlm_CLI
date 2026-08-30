@@ -330,6 +330,23 @@ but cannot interrupt for new ones — escalate via the foreground parent).
   codebase's established direction of narrowing subagent scope (write-scope confinement, permission-mode
   capping, nested-spawn denial) — an unshared, empty allowlist makes a child strictly *more* restricted
   than the parent, which is the safe direction to leave a gap in, not one that needs closing.
+- **Fifth and final instance of this shape, completing an exhaustive field-by-field pass over
+  `WorkspaceTools`'s every subagent-relevant field: `trace_calls`.** Headless `rapid exec` unconditionally
+  enables per-tool-call stderr tracing on its own tools (`exec_turn`, `interactive.rs`) but every subagent
+  child defaulted to `false` — a user watching a headless run's stderr saw every top-level tool call
+  traced and every delegated subagent's tool calls completely silent, the same call just invisible once
+  routed through `task_spawn`. Lower stakes than the previous four (a debug/observability convenience,
+  not a security or quality control), but zero-cost to close with the same pattern: new
+  `WorkspaceTools::trace_calls_enabled()` (mirrors the other three getters), read from the parent and
+  applied via the already-existing `set_trace_calls` in `LiveSubagentRunner::run`. New unit test
+  `trace_calls_enabled_reflects_set_trace_calls_for_subagent_propagation` covers the getter/setter
+  roundtrip directly (verifying the actual stderr output of a live subagent turn would need a heavier
+  integration harness this pass didn't build). Full `-p rapid` suite (308 lib tests) and
+  `cargo build --workspace --tests` pass. **This closes the audit**: every field on `WorkspaceTools` that
+  a subagent's tools carry (`permissions`, `read_only`, `jobs`, `trace_calls`, `subagents`,
+  `fetch_allowlist`, `hooks`, `shadow_diagnostics`, `ask_stdin`, `mcp`/`mcp_surface`, `subagent_spawns`,
+  `bytes_written`/`fetch_bytes`, `nested_spawn_allowed`) has now been individually checked for this shape,
+  not just "some fields, spot-checked."
 - **Correction + partial fix (2026-08-30):** `AgentResultEnvelope`'s exact field list already exists —
   `crates/agent-runtime/src/agent/model.rs`'s `AgentResult` carries `summary, evidence, workspace_view,
   patch_summary, artifacts, claims, open_questions, blockers, context_lineage` (all with accessors) —

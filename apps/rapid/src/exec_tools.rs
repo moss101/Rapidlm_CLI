@@ -650,6 +650,15 @@ impl WorkspaceTools {
         self.trace_calls = trace;
     }
 
+    /// Whether this instance traces its own tool calls: a subagent child
+    /// should match the parent's setting, or a headless `rapid exec` run
+    /// watching its own stderr sees every top-level tool call traced but
+    /// none of a delegated subagent's — the same call, just routed through
+    /// `task_spawn`, going silent.
+    pub(crate) fn trace_calls_enabled(&self) -> bool {
+        self.trace_calls
+    }
+
     /// Register configured stdio MCP servers: spawn, initialize, list tools,
     /// and record `mcp__<server>__<tool>` names on the surface. Servers that
     /// fail to start or handshake are recorded as offline (calls to them
@@ -3660,6 +3669,15 @@ impl ExecTools {
         }
     }
 
+    /// Whether this instance traces its own tool calls (`false` on the
+    /// no-op surface). See `WorkspaceTools::trace_calls_enabled`.
+    pub(crate) fn trace_calls_enabled(&self) -> bool {
+        match self {
+            Self::Workspace(tools) => tools.trace_calls_enabled(),
+            Self::Noop(_) => false,
+        }
+    }
+
     /// Hosts web_fetch may fetch despite resolving private (local fixtures).
     pub fn set_fetch_allowlist(&mut self, allowlist: Vec<String>) {
         if let Self::Workspace(tools) = self {
@@ -4421,6 +4439,22 @@ use std::sync::{Arc, Mutex};
         }
         // The refused write must never have touched disk.
         assert!(!root.0.join("b.txt").exists());
+    }
+
+    #[test]
+    fn trace_calls_enabled_reflects_set_trace_calls_for_subagent_propagation() {
+        let root = TempRoot::new("trace-flag");
+        let mut tools = permissive_workspace(&root.0);
+        assert!(
+            !tools.trace_calls_enabled(),
+            "tracing is off by default (the interactive TUI's own setting)"
+        );
+        tools.set_trace_calls(true);
+        assert!(
+            tools.trace_calls_enabled(),
+            "headless exec's setting must be readable so LiveSubagentRunner can propagate it \
+             to every child, not just the parent"
+        );
     }
 
     #[test]
