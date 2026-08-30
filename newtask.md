@@ -177,6 +177,48 @@ verifiable by inspection. Full `event-ledger` crate suite (87 tests, unchanged) 
 (confirmed via grep), so this was latent, not actively firing — but a real bug in the module's own stated
 contract, worth having fixed before it's ever wired into a scheduled GC.
 
+**Fresh review pass, 2026-08-30, `crates/auth` and `crates/workspace` — both actively used (unlike the
+mostly-dormant crates above), so these two are live, not latent.** Two real bugs, both fixed.
+
+**1. `crates/auth/src/file_keychain.rs::write_owner_only` wrote secret plaintext world/group-readable
+before chmod'ing it private.** `fs::write(path, bytes)` creates a file at the process's default,
+umask-derived mode (typically `0644`) and only *after* the full secret was already on disk did a second
+step chmod it to `0600` — a real window where a freshly-stored provider API key/OAuth token was readable
+by any local reader that sampled the directory in between the two steps, on any host with a permissive
+umask. `crates/auth/src/local_daemon.rs::create_private_file` already gets this right elsewhere in the same
+crate (`OpenOptions::mode(TOKEN_FILE_MODE)` set *at creation time*, combined with `create_new(true)`),
+which is what made the `file_keychain.rs` path stand out as the inconsistent one. **Fixed:** `write_owner_
+only` now opens with `OpenOptions::new().write(true).create(true).truncate(true)` plus `.mode(0o600)` on
+Unix — the file is created with the restrictive mode atomically, no window — while keeping `create` (not
+`create_new`) so re-`put()`-ing an existing item (credential rotation) still overwrites rather than
+erroring. Kept the post-write `chmod` too, as a defense-in-depth backstop for the case where the file
+already existed from an older, less careful write (`mode()` at open time only applies when the call
+actually creates the file). Extended the existing `put_get_round_trips_and_reports_available` test to
+confirm re-`put`-ing the same item still overwrites correctly (including truncating a shorter replacement
+secret). Full `auth` crate suite (71 tests) and `cargo build --workspace --tests` pass.
+
+**2. `crates/workspace/src/checkpoint.rs::rollback_applied` was a guaranteed no-op on the one call path
+that actually needs it, leaving a rewind-apply half-finished with no indication anything went wrong.**
+`apply_plan`'s loop applies a plan's ops one at a time and, on any failure (including a cancellation
+detected via `index_cancel`), calls `rollback_applied(source, &ops[..applied], cancel)` to undo the prefix
+already written — but it passed the *same* `cancel` token that had just been used to detect the abort.
+`rollback_applied`'s own loop began each iteration with `if cancel.is_cancelled() { return; }`, so when
+triggered by cancellation specifically, it exited on its very first iteration having undone nothing; even
+without that explicit guard, `DirectBackend::write`/`delete` (which the rollback loop calls) check
+cancellation internally too, so every restore/delete would have failed closed against the same signal
+regardless. A rewind-apply interrupted partway through a multi-file plan left whatever prefix had already
+landed permanently mixed into the workspace — the caller only ever sees `CheckpointError::Cancelled`,
+which this module's own "apply is refused when..." framing implies means nothing happened. **Fixed:**
+`rollback_applied` no longer takes a `cancel` parameter at all — it constructs its own fresh, never-
+cancelled token internally, so cleanup always runs to completion regardless of why the forward pass
+stopped; rollback is a compensating action, not discretionary work that should itself be interruptible by
+the same signal that triggered the need for it. New test `rollback_applied_always_restores_regardless_of_
+cancellation_state`: builds a real two-file rewind plan via `plan_rewind`, manually applies the first op
+(simulating "the forward pass got this far before stopping"), then confirms `rollback_applied` restores it
+— verified to actually catch the old bug by temporarily reintroducing an already-cancelled token inside the
+fixed function and confirming the same test fails exactly as predicted, before restoring the real fix. Full
+`workspace` crate suite (171 tests, up from 170) and `cargo build --workspace --tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

@@ -8,6 +8,7 @@
 //! of it, not a second credential authority.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -181,9 +182,29 @@ fn item_key(item: &KeychainItemMeta) -> String {
 }
 
 fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    fs::write(path, bytes).map_err(|_| StoreError::PersistenceBlocked {
+    let blocked = || StoreError::PersistenceBlocked {
         reason: crate::store::PersistenceBlockReason::KeychainUnavailable,
-    })?;
+    };
+    // Open with the owner-only mode already set, rather than `fs::write`
+    // (which creates the file at the process's default, umask-derived mode
+    // — typically world/group-readable) followed by a chmod: that ordering
+    // left a real window where a fresh secret file was created and fully
+    // written before ever being restricted, readable by any local reader
+    // that sampled the directory in between. `create` (not `create_new`)
+    // still allows overwriting an existing item's stored secret.
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path).map_err(|_| blocked())?;
+    file.write_all(bytes).map_err(|_| blocked())?;
+    // Defense in depth: `mode()` above only applies when this call actually
+    // creates the file — if it already existed (e.g. from an older, less
+    // careful write, or a platform where open-time mode isn't honored),
+    // tighten it explicitly too rather than trust it was already correct.
     restrict_permissions(path);
     Ok(())
 }
@@ -268,6 +289,13 @@ mod tests {
             reopened.get(&item(), &cancel).expect("reopened"),
             b"sk-super-secret"
         );
+
+        // Re-putting the same item (rotation) must overwrite, not fail and
+        // not leave stale trailing bytes behind if the new secret is
+        // shorter — `write_owner_only` opens with `create` + `truncate`,
+        // not `create_new`, specifically so this keeps working.
+        keychain.put(&item(), b"short", &cancel).expect("re-put");
+        assert_eq!(keychain.get(&item(), &cancel).expect("get after re-put"), b"short");
     }
 
     #[test]

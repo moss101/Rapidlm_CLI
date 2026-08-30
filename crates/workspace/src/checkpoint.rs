@@ -627,11 +627,11 @@ fn apply_plan(
 ) -> Result<(), CheckpointError> {
     for (applied, op) in ops.iter().enumerate() {
         if index_cancel(applied, cancel).is_err() {
-            rollback_applied(source, &ops[..applied], cancel);
+            rollback_applied(source, &ops[..applied]);
             return Err(CheckpointError::Cancelled);
         }
         if let Err(err) = apply_one(source, op, cancel) {
-            rollback_applied(source, &ops[..applied], cancel);
+            rollback_applied(source, &ops[..applied]);
             return Err(err);
         }
     }
@@ -668,14 +668,25 @@ fn apply_one(
     Ok(())
 }
 
-fn rollback_applied(source: &DirectBackend, applied: &[PlannedOp], cancel: &CancellationToken) {
+/// Undo an already-applied prefix of a rewind plan. Deliberately uses a
+/// fresh, never-cancelled token for every restore/delete rather than the
+/// caller's own `cancel` — the one call site this fires from
+/// (`apply_plan`'s cancellation branch) is only reached once that token is
+/// *already* cancelled, and `DirectBackend::write`/`delete` both check
+/// cancellation internally too, so reusing it here would make rollback a
+/// guaranteed no-op on the exact path that needs it most: the already-
+/// applied ops would stay mixed into the workspace with no indication
+/// anything went wrong, since the caller only ever sees `Cancelled`, which
+/// (per this module's own "apply is refused..." framing) implies nothing
+/// happened. Rollback is a cleanup/compensating action, not discretionary
+/// work — it must run to completion regardless of why the forward pass
+/// stopped.
+fn rollback_applied(source: &DirectBackend, applied: &[PlannedOp]) {
+    let cancel = CancellationToken::new();
     for op in applied.iter().rev() {
-        if cancel.is_cancelled() {
-            return;
-        }
         let _ = match (&op.previous, op.before) {
-            (Some(bytes), _) => source.write(&op.path, bytes, op.after.as_ref(), cancel),
-            (None, _) => match source.delete(&op.path, op.after.as_ref(), cancel) {
+            (Some(bytes), _) => source.write(&op.path, bytes, op.after.as_ref(), &cancel),
+            (None, _) => match source.delete(&op.path, op.after.as_ref(), &cancel) {
                 Ok(_) => Ok(None),
                 Err(DirectError::NotFound | DirectError::UnresolvedPath) => Ok(None),
                 Err(err) => Err(err),
@@ -1471,6 +1482,67 @@ mod tests {
             manager.checkpoint(backend(&ro).view(), backend(&ro), "x", &token),
             Err(CheckpointError::Cancelled)
         );
+    }
+
+    #[test]
+    fn rollback_applied_always_restores_regardless_of_cancellation_state() {
+        // `rollback_applied` used to take the caller's own `cancel` token and
+        // both check it directly (`if cancel.is_cancelled() { return; }`)
+        // and pass it into `DirectBackend::write`/`delete`, which check it
+        // again internally. Its one real call site (`apply_plan`'s
+        // cancellation branch) is only reached once that token is *already*
+        // cancelled — meaning rollback was a guaranteed no-op on exactly the
+        // path that needed it: an interrupted multi-file apply would leave
+        // whatever prefix had already landed permanently mixed into the
+        // workspace, with the caller only ever seeing `Cancelled` (implying
+        // nothing happened). This constructs a real, two-file rewind plan,
+        // manually applies the first op (simulating "already applied" when
+        // the forward pass stopped), then confirms `rollback_applied` — now
+        // signature-incapable of ever seeing an interfering cancellation —
+        // actually restores it.
+        let fx = fixture(ViewAccess::ReadWrite);
+        let a = repo("src/a.rs");
+        let b = repo("src/b.rs");
+        backend(&fx).write(&a, b"a1\n", None, &cancel()).expect("write a").expect("entry");
+        backend(&fx).write(&b, b"b1\n", None, &cancel()).expect("write b").expect("entry");
+        let manager = CheckpointManager::new();
+        let snap = manager
+            .checkpoint(backend(&fx).view(), backend(&fx), "before", &cancel())
+            .expect("checkpoint");
+        backend(&fx).write(&a, b"a2\n", None, &cancel()).expect("update a").expect("entry");
+        backend(&fx).write(&b, b"b2\n", None, &cancel()).expect("update b").expect("entry");
+
+        let stored = {
+            let inner = manager.lock().expect("lock");
+            inner
+                .checkpoints
+                .get(&snap.id())
+                .cloned()
+                .expect("stored checkpoint")
+        };
+        let journal = backend(&fx).journal().expect("journal");
+        let (ops, conflicts) = plan_rewind(backend(&fx), &stored, &journal, &cancel()).expect("plan");
+        assert!(conflicts.is_empty());
+        assert_eq!(ops.len(), 2, "both files need restoring");
+
+        // Simulate "the forward pass applied op 0, then stopped" — actually
+        // apply just the first op, exactly like `apply_plan`'s loop would.
+        apply_one(backend(&fx), &ops[0], &cancel()).expect("apply first op");
+        assert_eq!(
+            backend(&fx).read(&ops[0].path, &cancel()).expect("read after apply"),
+            b"a1\n",
+            "the first op's own restore must have landed"
+        );
+
+        rollback_applied(backend(&fx), &ops[..1]);
+        assert_eq!(
+            backend(&fx).read(&ops[0].path, &cancel()).expect("read after rollback"),
+            b"a2\n",
+            "rollback must undo the applied op, restoring the pre-rewind (modified) content"
+        );
+        // The second file was never touched by either the simulated partial
+        // apply or the rollback — it must be untouched throughout.
+        assert_eq!(backend(&fx).read(&b, &cancel()).expect("b untouched"), b"b2\n");
     }
 
     #[test]
