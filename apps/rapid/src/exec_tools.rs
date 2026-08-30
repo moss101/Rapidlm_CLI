@@ -116,6 +116,13 @@ pub const MAX_WRITE_BYTES: usize = 64 * 1024;
 /// any real coding task (scaffolding hundreds of files), tight enough to
 /// stop a genuinely pathological loop.
 pub const MAX_TOTAL_WRITE_BYTES_PER_TURN: u64 = 64 * 1024 * 1024;
+/// Resource ceiling (Modbit `WRK-017`'s network axis): cumulative bytes
+/// requested via `web_fetch` in one turn. Reserved against the call's own
+/// `max_bytes` *before* the request goes out (a conservative worst-case,
+/// not the actual response size, which isn't known until after the network
+/// round trip) — the same "bound the call count, not just each call's own
+/// size" shape as the disk-write budget above.
+pub const MAX_TOTAL_FETCH_BYTES_PER_TURN: u64 = 16 * 1024 * 1024;
 /// Hard byte cap on one file read returned to the model.
 pub const MAX_READ_BYTES: usize = 4 * 1024;
 /// Default 1-indexed start line for `repo_read`.
@@ -576,6 +583,10 @@ pub struct WorkspaceTools {
     /// written via `workspace_write`/`workspace_patch` this turn — see
     /// `MAX_TOTAL_WRITE_BYTES_PER_TURN`'s own doc comment for why.
     bytes_written: Arc<AtomicU64>,
+    /// Resource ceiling (Modbit `WRK-017`'s network axis): cumulative bytes
+    /// requested via `web_fetch` this turn — see
+    /// `MAX_TOTAL_FETCH_BYTES_PER_TURN`'s own doc comment for why.
+    fetch_bytes: Arc<AtomicU64>,
 }
 
 impl WorkspaceTools {
@@ -610,6 +621,7 @@ impl WorkspaceTools {
             mcp_surface: Arc::new(Mutex::new(Vec::new())),
             subagent_spawns: Arc::new(AtomicU64::new(0)),
             bytes_written: Arc::new(AtomicU64::new(0)),
+            fetch_bytes: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -794,6 +806,20 @@ impl WorkspaceTools {
             self.bytes_written.fetch_sub(bytes, Ordering::SeqCst);
             return Some(format!(
                 "per-turn disk-write budget exhausted: {MAX_TOTAL_WRITE_BYTES_PER_TURN} bytes already written this turn"
+            ));
+        }
+        None
+    }
+
+    /// Same shape as [`Self::reserve_write_budget`], for `web_fetch`'s
+    /// network egress instead of disk writes.
+    fn reserve_fetch_budget(&self, bytes: usize) -> Option<String> {
+        let bytes = bytes as u64;
+        let previous = self.fetch_bytes.fetch_add(bytes, Ordering::SeqCst);
+        if previous.saturating_add(bytes) > MAX_TOTAL_FETCH_BYTES_PER_TURN {
+            self.fetch_bytes.fetch_sub(bytes, Ordering::SeqCst);
+            return Some(format!(
+                "per-turn web_fetch budget exhausted: {MAX_TOTAL_FETCH_BYTES_PER_TURN} bytes already requested this turn"
             ));
         }
         None
@@ -1953,6 +1979,13 @@ impl WorkspaceTools {
         _cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         let (url, max_bytes) = parse_web_fetch_args(call.arguments())?;
+        if let Some(detail) = self.reserve_fetch_budget(max_bytes) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&detail)),
+            });
+        }
         match crate::web_fetch::fetch_page(&url, &self.fetch_allowlist, max_bytes) {
             Ok(text) if text.is_empty() => Ok(ToolStepResult::Succeeded {
                 call_id: call.call_id().to_owned(),
@@ -6199,6 +6232,35 @@ for line in sys.stdin:
                 );
             }
             other => panic!("expected capped fetch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn web_fetch_refuses_once_the_per_turn_network_budget_is_reached() {
+        let root = TempRoot::new("fetch-budget");
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_fetch_allowlist(vec!["127.0.0.1".to_owned()]);
+        let cancel = CancellationToken::new();
+
+        // Pre-load the counter to just under the ceiling — the refusal must
+        // fire before any network request goes out, so no fixture server is
+        // needed to prove it.
+        tools
+            .fetch_bytes
+            .store(MAX_TOTAL_FETCH_BYTES_PER_TURN - 10, Ordering::SeqCst);
+
+        let call = make_call(
+            "c1",
+            WEB_FETCH_TOOL,
+            r#"{"url":"http://127.0.0.1:1/unreachable","max_bytes":1024}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("handled") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.unwrap().contains("web_fetch budget exhausted"));
+            }
+            other => panic!("expected a budget refusal, got {other:?}"),
         }
     }
 

@@ -659,6 +659,15 @@ not a byte-accurate disk-usage monitor (a single `fs::write` beyond the file's o
 separately accounted for, e.g. overwriting a large file with a similarly large one; the ceiling is on
 cumulative *written* bytes this turn, not net disk delta).
 
+**Network axis, 2026-08-30: same shape, applied to `web_fetch`.** `MAX_TOTAL_FETCH_BYTES_PER_TURN`
+(16 MB) enforced via a `fetch_bytes: Arc<AtomicU64>` counter and `reserve_fetch_budget()` (identical
+reserve-then-rollback shape to the disk one), reserved against each call's own requested `max_bytes`
+*before* the network round trip — a conservative worst-case, since the actual response size isn't known
+until after the request. **CPU and RAM remain the two axes with no shortcut available**: unlike
+concurrency/disk/network, there's no existing per-call counter or size argument to chokepoint against —
+bounding either genuinely needs real OS-level resource monitoring (rlimits, cgroups, or platform-specific
+APIs), which is real, separate, and was correctly identified as the hard part of this item from the start.
+
 - **Where it lands:** Credential Broker: wire `SecretBroker` into `apps/rapid`'s credential path once a
   real multi-secret scenario exists — premature before that. Resource Governor: new work, `sandbox` or a
   new small crate; encode its "budgets can't buy a fake pass" anti-pattern into whatever implements
