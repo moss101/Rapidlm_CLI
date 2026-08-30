@@ -1449,6 +1449,32 @@ publishes.
   attempted here. Both halves of the original fork remain open; this narrows *which* narrower path is
   actually safe, rather than leaving "just mutate the snapshot" looking like the easy option it initially
   appears to be.
+- **Checked whether `GoalCommand::RecordUsage` — the "architecturally consistent" path the note above
+  left open — is actually consistent, 2026-08-30, before starting to implement it. It isn't, and a third
+  option doesn't obviously fit either.** `GoalCommand`'s own doc comment (`crates/agent-runtime/src/goal/
+  state.rs:113`) states the contract directly: "Create/replace/pause/resume/block/complete/cancel. Field
+  edits are not a lifecycle edge; a new contract is atomically substituted via `Replace`." A usage bump is
+  exactly a field edit, not a lifecycle transition (the goal's `state` doesn't change) — adding `RecordUsage`
+  would be the first variant in this enum that violates its own documented rule, not a natural extension
+  of it. It also isn't contained: `GoalCommandKind` mirrors `GoalCommand` 1:1 (used for typed error
+  reporting, `InvalidTransition { command: GoalCommandKind }`), and `GoalEffect.event: GoalEventKind` is a
+  third enum in the same family — a new command needs a new entry in both, plus whatever ledger-event
+  replay/projection logic reconstructs a `GoalSnapshot` from persisted history (not traced fully this
+  pass), so this is a ripple through a small family of tightly-coupled wire-relevant enums, not a
+  contained one-file addition. **Considered a third option** — model usage accrual as a separate
+  host-level store the way `record_evidence` does (`apps/rapid/src/goal_host.rs::GoalHost::record_evidence`
+  writes into `self.evidence: EvidenceService`, entirely outside `GoalCommand`/`apply()`/the ledger-recorded
+  lifecycle machine). This doesn't obviously fit either: `EvidenceService` holds structured, potentially-
+  numerous records where "a separate store" is a natural shape, while `GoalUsage` is already, by design, a
+  plain field *on* `GoalSnapshot` itself (`turns`/`tokens`/`active_ms`/`cost`, defaulting to zero) — moving
+  it to a side-store would mean `GoalSnapshot.usage` permanently reads zero while the real numbers live
+  somewhere else, an odd split for a field that's supposed to round-trip through `save`/`load`/`export`
+  alongside everything else on the same snapshot. **No safe path was found and none was attempted.** All
+  three options this document has now considered (direct snapshot mutation, a new lifecycle command, a
+  side-store) have a real, specific problem; the actual fix needs someone with full context on
+  `agent-runtime::goal`'s event-sourcing guarantees to decide the right shape, not a guess made while
+  scoping an unrelated metric this document was trying to close out. `GoalDriver`/`GoalUsage` wiring stays
+  the genuinely open blocker for this item and for §3.3, unchanged from the prior correction.
 
 ---
 
