@@ -1509,6 +1509,7 @@ impl WorkspaceTools {
                 ),
             });
         }
+        let command_advisory = scan_command_advisory(self.root(), &args.argv);
         let mut command = std::process::Command::new(&args.argv[0]);
         command
             .args(&args.argv[1..])
@@ -1554,9 +1555,14 @@ impl WorkspaceTools {
         match status {
             Ok(status) => {
                 let code = status.code().unwrap_or(-1);
+                let mut summary = format!("exit {code}\n{output_text}");
+                if let Some(note) = command_advisory {
+                    summary.push('\n');
+                    summary.push_str(&note);
+                }
                 Ok(ToolStepResult::Succeeded {
                     call_id: call.call_id().to_owned(),
-                    summary: format!("exit {code}\n{output_text}"),
+                    summary,
                 })
             }
             Err(ToolStepError::Cancelled) => Err(ToolStepError::Cancelled),
@@ -2448,6 +2454,74 @@ fn scan_for_secrets_advisory(root: &Path, path: &str, content: &[u8]) -> Option<
         .collect();
     Some(format!(
         "advisory: possible secrets detected: {} — verify before committing, or dismiss a \
+         false positive with `rapid findings dismiss <fingerprint>`",
+        details.join(", ")
+    ))
+}
+
+/// `capability_broker::Resolver` for a path already made absolute by the
+/// caller (`resolve_program`, below) — mirrors `p9_commands.rs`'s
+/// `FrozenPathResolver` exactly (a trivial, always-available impl duplicated
+/// rather than shared across modules for two callers this small).
+struct AlreadyResolvedPathResolver;
+
+impl capability_broker::Resolver for AlreadyResolvedPathResolver {
+    fn resolve_cwd(
+        &self,
+        requested: &str,
+    ) -> Result<capability_broker::CanonicalHostPath, capability_broker::CommandNormalizeError> {
+        capability_broker::CanonicalHostPath::from_resolved(requested)
+    }
+
+    fn resolve_executable(
+        &self,
+        requested: &str,
+        _cwd: &capability_broker::CanonicalHostPath,
+    ) -> Result<capability_broker::CanonicalHostPath, capability_broker::CommandNormalizeError> {
+        capability_broker::CanonicalHostPath::from_resolved(requested)
+            .map_err(|_| capability_broker::CommandNormalizeError::UnresolvedExecutable)
+    }
+}
+
+/// Advisory-only dangerous-command scan of a `shell_exec` call (Modbit
+/// `VER-007`'s `CommandFinding` scanner — real, mature, built, with zero
+/// call sites anywhere in `apps/rapid` before this; see `newtask.md` §2.9's
+/// note on why this needed a real `Resolver`/`normalize_exec` ceremony,
+/// unlike the secrets scanner's simpler path). Same shape throughout:
+/// `argv[0]` is resolved to an absolute path via `sandbox_exec::
+/// resolve_program` (the same `$PATH`/root-relative resolution the
+/// non-macOS sandbox path already uses) purely so the scanner has a
+/// well-formed `CanonicalCommand` to classify — this never runs the
+/// command, never gates it, and a resolution failure is silently `None`,
+/// not a refusal. Findings are dismissible via the same
+/// `FindingsStore` every other scanner in this file uses (fingerprint-hex
+/// keyed, not scanner-specific).
+fn scan_command_advisory(root: &Path, argv: &[String]) -> Option<String> {
+    let mut resolved_argv = argv.to_vec();
+    resolved_argv[0] = crate::sandbox_exec::resolve_program(root, argv.first()?).ok()?;
+    let root_str = root.to_str()?;
+    let intent = capability_broker::ExecIntent::argv(resolved_argv, root_str, Vec::<String>::new());
+    let cancel = capability_broker::CancellationToken::new();
+    let command =
+        capability_broker::normalize_exec(&intent, &AlreadyResolvedPathResolver, &cancel).ok()?;
+    let scanner = security::CommandRiskScanner::new();
+    let scan_cancel = security::CommandScanCancellation::new();
+    let report = scanner.scan(&command, &scan_cancel).ok()?;
+    let store = crate::findings_store::FindingsStore::load(root);
+    let findings: Vec<&security::CommandFinding> = report
+        .findings()
+        .iter()
+        .filter(|finding| !store.is_dismissed(finding.fingerprint().as_hex()))
+        .collect();
+    if findings.is_empty() {
+        return None;
+    }
+    let details: Vec<String> = findings
+        .iter()
+        .map(|finding| format!("{} ({})", finding.rule_id(), finding.fingerprint().as_hex()))
+        .collect();
+    Some(format!(
+        "advisory: possible dangerous command detected: {} — verify before running, or dismiss a \
          false positive with `rapid findings dismiss <fingerprint>`",
         details.join(", ")
     ))
@@ -4789,6 +4863,44 @@ use std::sync::{Arc, Mutex};
                 assert!(summary.starts_with("exit 3"), "{summary}");
             }
             other => panic!("expected exit-code outcome, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_exec_flags_a_dangerous_command_but_never_blocks_it() {
+        let root = TempRoot::new("shell-command-advisory");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        // A real, resolvable rm -rf against a harmless nonexistent path:
+        // proves the scan runs (and the command still executes) without
+        // needing to actually destroy anything.
+        let call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["rm","-rf","not-a-real-path-xyz"]}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.starts_with("exit 0"), "{summary}");
+                assert!(
+                    summary.contains("advisory: possible dangerous command"),
+                    "{summary}"
+                );
+                assert!(summary.contains("command.rm_destructive"), "{summary}");
+            }
+            other => panic!("expected the command to still run, got {other:?}"),
+        }
+
+        // Ordinary commands carry no advisory note at all.
+        let clean = make_call("c2", SHELL_EXEC_TOOL, r#"{"argv":["true"]}"#);
+        let validated = tools.validate(&clean, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(!summary.contains("advisory"), "{summary}");
+            }
+            other => panic!("expected clean success, got {other:?}"),
         }
     }
 

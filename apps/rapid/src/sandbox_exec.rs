@@ -119,7 +119,7 @@ fn build_spec(
 /// `$PATH`. Needed because `HostRestrictedBackend` deliberately refuses to
 /// run a relative/unresolved program (see its `relative_executable_is_rejected`
 /// test) — unlike `std::process::Command`, it does no implicit PATH search.
-fn resolve_program(root: &Path, program: &str) -> Result<String, SandboxRunError> {
+pub(crate) fn resolve_program(root: &Path, program: &str) -> Result<String, SandboxRunError> {
     let candidate = if program.starts_with('/') {
         Path::new(program).to_path_buf()
     } else if program.contains('/') {

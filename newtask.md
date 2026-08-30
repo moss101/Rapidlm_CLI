@@ -636,6 +636,25 @@ their results become evidence, not just a console warning).
   `ShellString` handling), not a copy of `scan_for_secrets_advisory`'s shape — noted precisely rather than
   forced through under time pressure. `PatchFinding`/`ExternalFinding` weren't checked with the same
   rigor and may or may not have the same shape; verify each independently before assuming either way.
+- **Correction — `CommandFinding` WAS wired in after all, 2026-08-30, reversing the assessment above once
+  the integration was precisely scoped.** The "real, self-contained integration on the same order as
+  building `sandbox_exec.rs`" turned out to be reusable rather than duplicable: `sandbox_exec::
+  resolve_program` (executable PATH/root-relative resolution) was made `pub(crate)` and reused as-is, and
+  the `Resolver` ceremony needed only a trivial "already resolved, just validate" impl — copied from
+  `p9_commands.rs`'s existing `FrozenPathResolver` as `exec_tools.rs::AlreadyResolvedPathResolver`. New
+  `exec_tools.rs::scan_command_advisory(root, argv)`: resolves `argv[0]` via `resolve_program`, builds an
+  `ExecIntent`/`CanonicalCommand` via `normalize_exec`, runs `security::CommandRiskScanner::scan`, and
+  filters findings through the same `FindingsStore` from the secrets correction above (so `rapid findings
+  dismiss <fingerprint>` works uniformly across both scanners — `FindingsStore` is keyed by fingerprint hex
+  string, not a scanner-specific type, exactly because it was built generic). Wired into `execute_shell`'s
+  plain synchronous path only (not the sandboxed or background paths), appending an advisory note to the
+  success summary the same way `scan_for_secrets_advisory` does — never blocking, matching the same
+  model-correctable-not-fatal philosophy. Verified with a new `#[cfg(unix)]` test
+  (`shell_exec_flags_a_dangerous_command_but_never_blocks_it`, using `rm -rf <path>` to trigger
+  `command.rm_destructive`) plus the full `-p rapid` lib+integration suite (292 lib tests, all integration
+  binaries) and a full `cargo build --workspace --tests`, all green. **Still not covered:** the sandboxed
+  and background `shell_exec` paths (same rationale as secrets' shadow-diagnostics gap — scoped narrow to
+  keep the change reviewable), and `PatchFinding`/`ExternalFinding` remain entirely unattempted.
 
 ### 2.10 Scoped Credential Broker + Resource Governor
 
