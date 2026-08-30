@@ -772,6 +772,27 @@ rejects a stale writer. Named explicitly to "prevent desktop/CLI/cloud dual-resu
   this pass — genuinely minor compared to the safety property itself, which is what this item was actually
   named for. Downgrading from P1/M ("build this") to P3/S ("polish the conflict message if it ever comes
   up as a real UX complaint") given the hard safety guarantee already holds.
+- **The conflict-message half of that P3/S polish closed 2026-08-30 — but narrower than a first read of
+  "Session conflict" suggests, checked by grepping every occurrence in the crate before touching any of
+  them.** `"Session conflict"` as a literal string appears six times across `crates/kernel`
+  (`client.rs` ×3, `turn/guard.rs`, `session/service.rs`, and transitively via `recovery`), but five of
+  those six genuinely describe the same real-world situation — an occupied lease, a stale `expected_seq`,
+  or a seq-out-of-range subscribe request are all "somebody else already moved this session, retry" from
+  a caller's point of view, and using one consistent message for them is correct, not a bug. **Only
+  `ledger_api`'s combination of `LedgerError::SessionExists` and `LedgerError::SequenceConflict` was a
+  real conflation** — a client-side id collision on session *creation* has nothing to do with the
+  cross-process dual-writer race `AGT-018`'s fencing exists to catch, and both fell into "Session
+  conflict" the same way. Split into `"A session with this id already exists"` /
+  `"Another writer already advanced this session past the expected sequence"`, same `ErrorCode::
+  SessionConflict` for both (severity is genuinely equal — this is a message-clarity fix, not a
+  reclassification). New test `ledger_api_gives_session_exists_and_sequence_conflict_distinct_messages`
+  constructs both `LedgerError` variants directly (no real session/ledger needed) and asserts the codes
+  match but the messages don't. Confirmed no existing test depended on the old shared string (every
+  existing assertion on this path checks `.code()`, never `.message()`). Full `-p kernel` suite (166 lib
+  tests), full `-p rapid` suite (323 lib tests + integration binaries), and `cargo build --workspace
+  --tests` all pass. `TurnSubmissionGuard`'s in-process generation counter (this note's other named
+  "polish" item) remains untouched — genuinely lower value now that the real fencing is known to live at
+  the ledger layer, not something to chase without a concrete reason to.
 
 ### 2.7 Context Pack Compiler / Workspace Capsule + Next-Edit-Ripple + retrieval-before-edit guardrail
 

@@ -911,9 +911,24 @@ fn ledger_api(err: LedgerError, trace: TraceId) -> ApiError {
         LedgerError::SessionNotFound { .. } | LedgerError::EventNotFound { .. } => {
             api_error(ErrorCode::SessionNotFound, "Session not found", trace)
         }
-        LedgerError::SessionExists { .. } | LedgerError::SequenceConflict { .. } => {
-            api_error(ErrorCode::SessionConflict, "Session conflict", trace)
-        }
+        // Same `ErrorCode` (neither is more or less severe than the other),
+        // but two genuinely different situations — creating a session whose
+        // id already exists is a client-side collision, while a sequence
+        // conflict is the real cross-process dual-writer race `AGT-018`'s
+        // fencing exists to catch (`newtask.md` §2.6). Every other `"Session
+        // conflict"` message elsewhere in this crate (`turn/guard.rs`,
+        // `session/service.rs`, `subscribe_sync` below) already describes
+        // this same single scenario consistently and is left alone.
+        LedgerError::SessionExists { .. } => api_error(
+            ErrorCode::SessionConflict,
+            "A session with this id already exists",
+            trace,
+        ),
+        LedgerError::SequenceConflict { .. } => api_error(
+            ErrorCode::SessionConflict,
+            "Another writer already advanced this session past the expected sequence",
+            trace,
+        ),
         LedgerError::Corrupt(_)
         | LedgerError::ForeignKeysDisabled
         | LedgerError::InvalidTimestamp
@@ -1137,6 +1152,29 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::SessionConflict);
         assert_eq!(err.code().as_str(), "session.conflict");
         assert!(!err.retryable());
+    }
+
+    #[test]
+    fn ledger_api_gives_session_exists_and_sequence_conflict_distinct_messages() {
+        // Both share `ErrorCode::SessionConflict` (neither is more severe
+        // than the other), but they're different situations — a client-side
+        // id collision versus the real cross-process dual-writer race
+        // `AGT-018`'s fencing exists to catch — so a caller reading the
+        // message shouldn't see the same generic text for both.
+        let session_id = SessionId::new();
+        let trace = TraceId::new();
+        let exists = ledger_api(LedgerError::SessionExists { session_id }, trace);
+        let conflict = ledger_api(
+            LedgerError::SequenceConflict {
+                session_id,
+                expected: 1,
+                actual: 2,
+            },
+            trace,
+        );
+        assert_eq!(exists.code(), ErrorCode::SessionConflict);
+        assert_eq!(conflict.code(), ErrorCode::SessionConflict);
+        assert_ne!(exists.message(), conflict.message());
     }
 
     #[test]
