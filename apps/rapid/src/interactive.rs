@@ -1108,6 +1108,15 @@ fn exec_permission_lattice(
         );
         lattice = lattice.with_denied_tools(patterns.iter().cloned());
     }
+    // Same "applied unconditionally, no merge order to get wrong" shape as
+    // denied_tools above — a deployment-wide write confinement independent
+    // of any per-task_spawn write_scope (see `PermissionLattice::
+    // admin_write_scope`'s own doc comment for why the two never share a
+    // field).
+    if let Some(scope) = managed_policy.as_ref().and_then(|policy| policy.confine_writes_to()) {
+        eprintln!("warning: managed policy confines every write to '{scope}'");
+        lattice = lattice.with_admin_write_scope(scope);
+    }
     Ok(lattice)
 }
 

@@ -496,6 +496,27 @@ default; adopt the classifier-as-safety-net idea, not the classifier-as-default 
   ceiling added to the same "managed policy, applied once, never re-checked against a competing layer"
   shape `max_permission_mode` already established, not the general merge-order primitive `CAP-001`/
   `AuthorizationEpoch` actually ask for.
+- **A third `CAP-001` dimension, `confine_writes_to` (an admin-level, deployment-wide write-scope
+  ceiling), implemented 2026-08-30 — after finding and deliberately avoiding a real bypass the naive
+  version would have had.** The obvious implementation — reuse `PermissionLattice::with_write_scope`,
+  the exact mechanism `task_spawn`'s own narrower scope already uses — turns out to be actively unsafe
+  for this purpose: `with_write_scope` *overwrites* rather than intersects (correct for its actual use,
+  where each `task_spawn` call sets its own child's scope from scratch), so a subagent's own `write_scope`
+  argument would silently replace an admin's confinement instead of narrowing within it — a real
+  bypass a managed deployment would have no way to detect. **Fixed by not reusing the field**: new,
+  fully independent `PermissionLattice::admin_write_scope: Option<String>` /
+  `with_admin_write_scope()` / `DecisionReason::AdminWriteScopeViolation`, checked in `evaluate()`
+  *before* the per-`task_spawn` `write_scope` (both must hold when both are set — an admin ceiling and a
+  subagent's own narrower scope compose as an intersection, never an override). `managed_config.rs` gained
+  `confine_writes_to: Option<String>`, validated through `protocol::RepoPath::parse` (the same relative/
+  no-traversal check every other workspace-relative path in this codebase already goes through, not a
+  second, possibly-divergent one) and applied unconditionally in `exec_permission_lattice`, same
+  no-merge-order-needed shape as `denied_tools`. New test
+  `admin_write_scope_wins_over_bypass_permissions_and_write_scope_never_overwrites_it` constructs exactly
+  the bypass scenario above (a lattice with `admin_write_scope("src")`, then `.with_write_scope("docs")`
+  layered on top as `task_spawn` would) and confirms the admin ceiling still holds *and* the subagent's
+  own narrower scope still independently applies too — both constraints active at once, neither silently
+  dropped. Full `-p rapid` suite (316 lib tests) and `cargo build --workspace --tests` pass.
 
 ### 2.4 `CompletionContract` (tri-state) + `VerificationPlane`
 

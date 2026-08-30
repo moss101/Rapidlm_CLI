@@ -256,6 +256,13 @@ pub enum DecisionReason {
     /// never widen past). Checked before every rule/grant/mode, same
     /// precedence as `WriteScopeViolation`.
     AdminToolDenied,
+    /// Denied by an admin/managed-policy write-scope ceiling (Modbit
+    /// `CAP-001`) — distinct from `WriteScopeViolation` (a `task_spawn`
+    /// subagent's own narrower scope) so a denial reads as "the deployment
+    /// confines every write here" rather than "this specific delegated
+    /// task was scoped down." Checked before `write_scope`, every rule,
+    /// grant, and mode.
+    AdminWriteScopeViolation,
 }
 
 impl DecisionReason {
@@ -274,6 +281,7 @@ impl DecisionReason {
             Self::UntrustedProject => "untrusted_project",
             Self::WriteScopeViolation => "write_scope_violation",
             Self::AdminToolDenied => "admin_tool_denied",
+            Self::AdminWriteScopeViolation => "admin_write_scope_violation",
         }
     }
 
@@ -293,6 +301,9 @@ impl DecisionReason {
             Self::UntrustedProject => "the project is not trusted; every tool call is refused",
             Self::WriteScopeViolation => "outside the write scope this subagent was confined to",
             Self::AdminToolDenied => "this tool is banned by managed policy; no setting can re-enable it",
+            Self::AdminWriteScopeViolation => {
+                "outside the write scope managed policy confines this deployment to"
+            }
         }
     }
 }
@@ -339,6 +350,16 @@ pub struct PermissionLattice {
     /// rule/grant/mode — see `DecisionReason::AdminToolDenied`. Empty:
     /// no additional restriction, today's unmanaged behavior.
     denied_tools: Vec<ToolPattern>,
+    /// Workspace-relative path prefix an admin/managed policy confines
+    /// every write-classified call to (Modbit `CAP-001`), independent of
+    /// — and checked before — the per-`task_spawn` `write_scope` above.
+    /// Deliberately a *separate* field rather than reusing `write_scope`:
+    /// `with_write_scope` overwrites (by design, for `task_spawn`'s "each
+    /// call sets this subagent's own scope" use), and a subagent's own
+    /// scope argument overwriting an admin ceiling instead of narrowing
+    /// within it would silently defeat the ceiling. `None`: no additional
+    /// restriction, today's unmanaged behavior.
+    admin_write_scope: Option<String>,
 }
 
 impl PermissionLattice {
@@ -349,6 +370,7 @@ impl PermissionLattice {
             grants: Vec::new(),
             write_scope: None,
             denied_tools: Vec::new(),
+            admin_write_scope: None,
         }
     }
 
@@ -387,6 +409,16 @@ impl PermissionLattice {
         self
     }
 
+    /// Confine every write-classified call, deployment-wide, to `scope` or
+    /// its descendants (Modbit `CAP-001`) — independent of `with_write_scope`,
+    /// which a `task_spawn` call may still set its own (narrower-in-intent)
+    /// scope through without affecting this one. See `admin_write_scope`'s
+    /// own doc comment for why the two must not share a field.
+    pub fn with_admin_write_scope(mut self, scope: impl Into<String>) -> Self {
+        self.admin_write_scope = Some(scope.into());
+        self
+    }
+
     pub const fn mode(&self) -> PermissionMode {
         self.mode
     }
@@ -401,6 +433,10 @@ impl PermissionLattice {
 
     pub fn denied_tools(&self) -> &[ToolPattern] {
         &self.denied_tools
+    }
+
+    pub fn admin_write_scope(&self) -> Option<&str> {
+        self.admin_write_scope.as_deref()
     }
 
     /// Lattice for a `task_spawn` child. The child is the model's own choice
@@ -425,6 +461,7 @@ impl PermissionLattice {
             grants: self.grants.clone(),
             write_scope: self.write_scope.clone(),
             denied_tools: self.denied_tools.clone(),
+            admin_write_scope: self.admin_write_scope.clone(),
         }
     }
 
@@ -438,6 +475,17 @@ impl PermissionLattice {
         // including bypassPermissions) may ever widen past.
         if self.denied_tools.iter().any(|pattern| pattern.matches(tool, subject)) {
             return Decision::Deny(DecisionReason::AdminToolDenied);
+        }
+        // -0.5. Admin/managed-policy write-scope ceiling — same precedence
+        // as the tool ban above, and deliberately checked *before* the
+        // per-`task_spawn` write_scope below: a subagent's own scope
+        // argument must never be able to widen past a deployment-wide
+        // confinement, only add a further restriction inside it.
+        if class == ToolClass::FileEdit
+            && let Some(scope) = &self.admin_write_scope
+            && !path_within_scope(scope, subject)
+        {
+            return Decision::Deny(DecisionReason::AdminWriteScopeViolation);
         }
         // 0. Write-scope ceiling, checked before everything else — a rule,
         // grant, or mode may only make a write *harder* to get inside the
@@ -881,6 +929,51 @@ mod tests {
             lattice.evaluate("shell_exec", "ls -la", ToolClass::Other),
             Decision::Allow(DecisionReason::BypassAllow),
             "a non-matching argv for the same tool is unaffected"
+        );
+    }
+
+    #[test]
+    fn admin_write_scope_wins_over_bypass_permissions_and_write_scope_never_overwrites_it() {
+        let lattice = PermissionLattice::new(PermissionMode::BypassPermissions)
+            .with_admin_write_scope("src");
+
+        assert_eq!(
+            lattice.evaluate("workspace_write", "docs/readme.md", ToolClass::FileEdit),
+            Decision::Deny(DecisionReason::AdminWriteScopeViolation),
+            "outside the admin ceiling: denied even under bypassPermissions"
+        );
+        assert_eq!(
+            lattice.evaluate("workspace_write", "src/lib.rs", ToolClass::FileEdit),
+            Decision::Allow(DecisionReason::BypassAllow),
+            "inside the admin ceiling: unaffected"
+        );
+
+        // The exact scenario this field exists to prevent: a `task_spawn`
+        // call setting its own (unrelated, wider) write_scope must never be
+        // able to widen past the admin ceiling — the two fields are
+        // independent, so `with_write_scope` cannot overwrite
+        // `admin_write_scope` the way it would if they shared one field.
+        let subagent_widened = lattice.with_write_scope("docs");
+        assert_eq!(
+            subagent_widened.evaluate("workspace_write", "docs/readme.md", ToolClass::FileEdit),
+            Decision::Deny(DecisionReason::AdminWriteScopeViolation),
+            "a subagent's own write_scope must not escape the admin ceiling"
+        );
+        assert_eq!(
+            subagent_widened.evaluate("workspace_write", "src/lib.rs", ToolClass::FileEdit),
+            Decision::Deny(DecisionReason::WriteScopeViolation),
+            "still confined by its own narrower write_scope too — both must hold"
+        );
+    }
+
+    #[test]
+    fn admin_write_scope_survives_for_subagent_narrowing() {
+        let parent = PermissionLattice::new(PermissionMode::Default).with_admin_write_scope("src");
+        let child = parent.for_subagent();
+        assert_eq!(child.admin_write_scope(), Some("src"));
+        assert_eq!(
+            child.evaluate("workspace_write", "docs/readme.md", ToolClass::FileEdit),
+            Decision::Deny(DecisionReason::AdminWriteScopeViolation)
         );
     }
 

@@ -18,7 +18,12 @@
 //! * `denied_tools` bans specific tools outright, applied as
 //!   `PermissionLattice::with_denied_tools` — checked before every rule,
 //!   grant, and mode (including `bypassPermissions`), so nothing downstream
-//!   can ever re-enable a banned tool.
+//!   can ever re-enable a banned tool;
+//! * `confine_writes_to` applies `PermissionLattice::with_admin_write_scope`
+//!   — a deployment-wide write confinement independent of (and checked
+//!   before) any per-`task_spawn` `write_scope`, so a subagent's own scope
+//!   argument can only add a further restriction inside it, never widen
+//!   past it.
 //!
 //! Every gate outcome is reported with field id, origin, and remediation so
 //! operators can see exactly which layer decided what.
@@ -150,6 +155,10 @@ pub struct ManagedPolicy {
     /// Tools banned outright regardless of project/user settings or mode
     /// (Modbit `CAP-001`), applied via `PermissionLattice::with_denied_tools`.
     denied_tools: Option<Vec<crate::permissions::ToolPattern>>,
+    /// Workspace-relative path prefix every write is confined to, deployment
+    /// -wide (Modbit `CAP-001`), applied via
+    /// `PermissionLattice::with_admin_write_scope`.
+    confine_writes_to: Option<String>,
 }
 
 impl ManagedPolicy {
@@ -163,6 +172,7 @@ impl ManagedPolicy {
     /// min_reasoning_effort = "high"
     /// max_permission_mode = "acceptEdits"
     /// denied_tools = ["shell_exec"]
+    /// confine_writes_to = "src"
     /// ```
     pub fn parse(toml_str: &str) -> Result<Self, ManagedConfigError> {
         let value: toml::Value =
@@ -204,6 +214,7 @@ impl ManagedPolicy {
                     | "min_reasoning_effort"
                     | "max_permission_mode"
                     | "denied_tools"
+                    | "confine_writes_to"
             ) {
                 return Err(ManagedConfigError::UnknownField {
                     field: format!("policy.{key}"),
@@ -340,12 +351,34 @@ impl ManagedPolicy {
                 Some(patterns)
             }
         };
+        let confine_writes_to = match policy.get("confine_writes_to") {
+            None => None,
+            Some(raw) => {
+                let raw = raw.as_str().ok_or_else(|| {
+                    ManagedConfigError::PolicyField(field_error(
+                        "policy.confine_writes_to",
+                        "must be a workspace-relative path string",
+                    ))
+                })?;
+                // Reuse the same relative/no-traversal validation every
+                // other workspace-relative path in this codebase goes
+                // through, rather than a second, possibly-divergent check.
+                let repo_path = protocol::RepoPath::parse(raw).map_err(|_| {
+                    ManagedConfigError::PolicyField(field_error(
+                        "policy.confine_writes_to",
+                        "must be a workspace-relative path with no '..' or absolute segments",
+                    ))
+                })?;
+                Some(repo_path.as_str().to_owned())
+            }
+        };
         Ok(Self {
             locked_default,
             allowed_providers,
             min_reasoning_effort,
             max_permission_mode,
             denied_tools,
+            confine_writes_to,
         })
     }
 
@@ -367,6 +400,10 @@ impl ManagedPolicy {
 
     pub fn denied_tools(&self) -> Option<&[crate::permissions::ToolPattern]> {
         self.denied_tools.as_deref()
+    }
+
+    pub fn confine_writes_to(&self) -> Option<&str> {
+        self.confine_writes_to.as_deref()
     }
 }
 
@@ -634,7 +671,7 @@ base_url = "http://gateway.internal:8080"
     #[test]
     fn parse_reads_all_policy_fields_and_rejects_unknowns() {
         let policy = parse_policy(&policy_doc(
-            "locked_default = \"cloud\"\nallowed_providers = [\"anthropic\"]\nmin_reasoning_effort = \"high\"\nmax_permission_mode = \"acceptEdits\"\ndenied_tools = [\"shell_exec\"]\n",
+            "locked_default = \"cloud\"\nallowed_providers = [\"anthropic\"]\nmin_reasoning_effort = \"high\"\nmax_permission_mode = \"acceptEdits\"\ndenied_tools = [\"shell_exec\"]\nconfine_writes_to = \"src\"\n",
         ));
         assert_eq!(policy.locked_default(), Some("cloud"));
         assert_eq!(
@@ -650,6 +687,7 @@ base_url = "http://gateway.internal:8080"
             policy.denied_tools(),
             Some([crate::permissions::ToolPattern::parse("shell_exec").expect("pattern")].as_slice())
         );
+        assert_eq!(policy.confine_writes_to(), Some("src"));
         let bad = format!("schema = \"{MANAGED_SCHEMA}\"\nsurprise = 1\n[policy]\n");
         let err = ManagedPolicy::parse(&bad).expect_err("unknown field");
         assert!(err.to_string().contains("unknown field 'surprise'"));
@@ -793,6 +831,17 @@ reasoning_effort = "low"
     fn parse_rejects_an_empty_denied_tools_array() {
         let err = ManagedPolicy::parse(&policy_doc("denied_tools = []\n")).expect_err("empty");
         assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn parse_rejects_an_absolute_or_traversing_confine_writes_to() {
+        let absolute = ManagedPolicy::parse(&policy_doc("confine_writes_to = \"/etc\"\n"))
+            .expect_err("absolute path");
+        assert!(absolute.to_string().contains("no '..' or absolute segments"));
+
+        let traversal = ManagedPolicy::parse(&policy_doc("confine_writes_to = \"../outside\"\n"))
+            .expect_err("traversal");
+        assert!(traversal.to_string().contains("no '..' or absolute segments"));
     }
 
     #[test]
