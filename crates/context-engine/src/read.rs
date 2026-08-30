@@ -402,6 +402,12 @@ fn slice_text(
         }
         if taken >= max_lines {
             stop = Some(TruncationReason::LineWindow);
+            // A limit that can't admit even the first considered line must
+            // still advance the cursor past it, or a caller that follows
+            // `next_line` retries the same `start_line` forever.
+            if taken == 0 {
+                end_line = line_no;
+            }
             break;
         }
 
@@ -411,6 +417,9 @@ fn slice_text(
         }
         if out.len().saturating_add(emitted.len()) > limits.max_bytes {
             stop = Some(TruncationReason::MaxBytes);
+            if taken == 0 {
+                end_line = line_no;
+            }
             break;
         }
         out.push_str(emitted);
@@ -433,6 +442,9 @@ fn slice_text(
             }
             stop = Some(TruncationReason::TokenBudget);
             clamped = true;
+            if taken == 0 {
+                end_line = line_no;
+            }
             break;
         }
 
@@ -732,5 +744,56 @@ mod tests {
     fn error_display_is_safe() {
         assert_eq!(ReadError::NotFound.to_string(), "not_found");
         assert!(!ReadError::PathEscapesRoot.to_string().contains('/'));
+    }
+
+    #[test]
+    fn max_bytes_smaller_than_the_first_line_still_advances_the_cursor() {
+        let dir = TempDir::new();
+        dir.write("src/lib.rs", b"hello\nworld\n");
+        let first = read_repo(
+            &dir.path,
+            &ReadRequest::new(path("src/lib.rs")),
+            &ReadLimits::new().max_bytes(1),
+        )
+        .expect("read");
+        assert!(first.text().is_empty());
+        let cursor = first.cursor().expect("cursor").clone();
+        assert_eq!(cursor.reason(), TruncationReason::MaxBytes);
+        assert_eq!(
+            cursor.next_line(),
+            2,
+            "a limit that can't admit even the first line must still skip past it"
+        );
+
+        let second = read_repo(
+            &dir.path,
+            &ReadRequest::new(path("src/lib.rs")).cursor(cursor),
+            &ReadLimits::new().max_bytes(1),
+        )
+        .expect("read");
+        assert_ne!(
+            second.cursor().map(|c| c.next_line()),
+            Some(2),
+            "following the cursor must make forward progress, not repeat the same line forever"
+        );
+    }
+
+    #[test]
+    fn max_tokens_smaller_than_the_first_line_still_advances_the_cursor() {
+        let dir = TempDir::new();
+        dir.write("src/lib.rs", b"a very normal first line of code\nsecond\n");
+        let first = read_repo(
+            &dir.path,
+            &ReadRequest::new(path("src/lib.rs")),
+            &ReadLimits::new().max_tokens(1),
+        )
+        .expect("read");
+        let cursor = first.cursor().expect("cursor").clone();
+        assert_eq!(cursor.reason(), TruncationReason::TokenBudget);
+        assert_eq!(
+            cursor.next_line(),
+            2,
+            "a token limit that can't admit even the first line must still skip past it"
+        );
     }
 }

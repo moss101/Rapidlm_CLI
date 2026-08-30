@@ -416,6 +416,41 @@ Full suites, each up by exactly its one new test: `acp` (46, up from 41), `secur
 `tui` (211, up from 210), `tool-gateway` (53, up from 52), `trajectory` (3, up from 2), `telemetry` (25, up
 from 24), `rapid` (328, up from 327). `cargo build --workspace --tests` passes.
 
+**Fresh review pass, 2026-08-30, `crates/context-engine/src/read.rs::slice_text` — a limit that can't admit
+even the first considered line returns a continuation cursor that points back at the exact same line,
+contradicting the module's entire reason for existing.** The doc comment at the top of the file (`read.rs:3`)
+states: "Truncation always returns a structured continuation cursor and the reason." — the whole point of
+`ReadCursor`/`next_line` (`read.rs:56`: "Resume point after a bounded read") is that a caller can retry with
+`start_line = cursor.next_line()` and make forward progress. But `end_line` (the local variable the cursor's
+`next_line` is computed from) is only advanced at `read.rs:439-442`, *after* the `max_bytes` check
+(`read.rs:412-415`) and the `max_tokens` check (`read.rs:425-437`) — both of which can `break` the loop
+before that update ever runs, specifically when the very first line considered in the call (`taken == 0`)
+already exceeds the limit by itself (e.g. a single line longer than `max_bytes`, or one whose token estimate
+alone exceeds `max_tokens`). When that happens, `end_line` is still at its pre-loop value
+(`start_line.saturating_sub(1)`, `read.rs:379`), so `cursor.next_line = end_line + 1 = start_line` —
+identical to the line just requested. A caller that follows the documented "resume point" contract (as
+`read_repo`'s own cursor-to-`start_line` wiring at `read.rs:346-350` does) retries the exact same
+`start_line` forever, gets the exact same empty-`text` response and identical cursor every time. Confirmed
+directly with a reproduction test before touching any fix code: `ReadLimits::new().max_bytes(1)` against a
+2-line file returns `cursor.next_line() == 1` (same as the requested `start_line`) — verified via the
+standard temporary-revert cycle (reverting the `MaxBytes` branch's new one-line fix made the test fail with
+exactly `left: 1, right: 2`, confirming the test catches the bug, before the fix was restored). **Fixed:**
+when either break fires with `taken == 0`, also set `end_line = line_no` so the cursor skips past the single
+line that couldn't fit rather than repeating it — the caller loses that one line's content (unavoidable under
+the given limits) but the cursor now always makes monotonic forward progress. Applied the same guard to the
+`LineWindow` break too (`taken >= max_lines` with `max_lines == 0`) for defensive completeness, even though
+`validate_limits` (`read.rs:552-561`) already rejects `max_lines == 0` before `slice_text` ever runs, so that
+specific path isn't reachable via the public `read_repo` entry point today — matches this session's
+`crates/tui::sanitize_preview` precedent of fixing a currently-unreachable instance of the same shape rather
+than leaving a latent trap. Two new tests, one per genuinely reachable reason (`MaxBytes`, `TokenBudget`).
+**Latent, not yet actively firing:** confirmed via grep that `read_repo` has zero callers anywhere outside its
+own tests — `apps/rapid`'s real `repo_read` tool (`apps/rapid/src/exec_tools.rs::execute_repo_read`) has its
+own, entirely separate implementation and does not call this module at all, the same "fully-built, well-
+tested, currently unwired" shape already documented repeatedly in this file (context-engine retrieval,
+`crates/sandbox`, `crates/capability-broker`) — but a real, demonstrable bug in the module's own contract,
+worth having fixed before anything wires a real `repo.read` continuation loop into it. Full `context-engine`
+crate suite (310 tests, up from 308) and `cargo build --workspace --tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
