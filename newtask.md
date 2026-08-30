@@ -598,6 +598,40 @@ on all four paths. New test `deserialize_never_trusts_a_forged_retryable_bit` co
 `protocol` crate suite (71 tests, up from 70) and `cargo build --workspace --tests` pass — significant given
 `protocol` is a dependency of nearly every other crate in the workspace.
 
+**Fresh review pass, 2026-08-30, `crates/handoff/src/lib.rs` — the module's own "who is expected to accept"
+and single-writer invariants were never actually checked in `accept()`/`detach()`.** Two bugs in the same
+"one identity field validated, its sibling identity field silently trusted" family already documented
+earlier in this file (this crate's *other*, separately-documented finding — the cross-process TOCTOU in
+`acquire()`/`accept()` needing real file locking — is a different, distinct issue; both remain latent, this
+crate still has zero callers anywhere in the repo, confirmed via grep).
+
+**Bug 1: `accept()` never checked the caller-supplied `new_owner` against `bundle.new_owner`.**
+`HandoffBundle::new_owner`'s own field doc: "Who is expected to accept." But `accept()` took a `new_owner: &str`
+parameter, validated only that it was a *well-formed* owner string (`valid_owner`), and used it directly to
+construct the new `ExecutionOwnership` — never comparing it to `bundle.new_owner` at all. Since `detach()`
+clears the ledger before the real acceptor calls `accept()`, any caller who obtains the bundle can call
+`accept(&ledger, &bundle, "attacker")` in that empty-ledger window and take ownership under an arbitrary
+string, contradicting "who is expected to accept" and this crate's "single-writer invariant" framing.
+**Fixed:** added `if new_owner != bundle.new_owner { return Err(InvalidOwner) }`, placed *after* the existing
+`AlreadyOwned` check (not before) specifically to preserve an existing test's precedence expectation — when
+a slot is already occupied, that's reported as `AlreadyOwned` regardless of which wrong owner string the
+caller also happened to supply; ordering doesn't affect the security property either way (both checks must
+still pass), only which error variant surfaces when multiple problems apply at once.
+
+**Bug 2: `detach()` never checked the caller-supplied `session_id` against the ledger's actual owned session.**
+`detach()` validated `ownership.owner != previous_owner` but never `ownership.session_id != session_id` —
+the caller-supplied `session_id` flowed straight into the returned `HandoffBundle` unchecked. A caller that
+supplies the correct `previous_owner` string but an unrelated `session_id` got back a bundle whose
+`session_id` never matched the session whose ownership record was actually validated. **Fixed:** added
+`if ownership.session_id != session_id { return Err(InvalidOwner) }` right alongside the existing owner
+check.
+
+Both verified with the standard temporary-revert cycle: reverting each check independently made its
+corresponding new test (`accept_rejects_a_caller_that_is_not_the_bundles_expected_new_owner`,
+`detach_rejects_a_session_id_that_does_not_match_the_owned_session`) fail with exactly the predicted
+assertion, confirming each test genuinely catches its bug, before both fixes were restored. Full `handoff`
+crate suite (10 tests, up from 8) and `cargo build --workspace --tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

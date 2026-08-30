@@ -260,6 +260,9 @@ pub fn detach(
             by: ownership.owner.clone(),
         });
     }
+    if ownership.session_id != session_id {
+        return Err(HandoffError::InvalidOwner);
+    }
     let bundle = HandoffBundle {
         id: HandoffId::new(),
         session_id,
@@ -287,6 +290,9 @@ pub fn accept(
         return Err(HandoffError::AlreadyOwned {
             by: existing.owner.clone(),
         });
+    }
+    if new_owner != bundle.new_owner {
+        return Err(HandoffError::InvalidOwner);
     }
     let ownership = ExecutionOwnership {
         session_id: bundle.session_id,
@@ -484,6 +490,10 @@ mod tests {
         SessionId::from_str("018f3c8a-7e2b-7a10-8c4d-0123456789ab").expect("session")
     }
 
+    fn other_session() -> SessionId {
+        SessionId::from_str("018f3c8a-7e2b-7a10-8c4d-fedcba987654").expect("session")
+    }
+
     fn scratch(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("rapidlm-handoff-{name}-{}", std::process::id()))
     }
@@ -521,6 +531,45 @@ mod tests {
             super::accept(&ledger, &bundle, "other-daemon"),
             Err(HandoffError::AlreadyOwned { .. })
         ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn accept_rejects_a_caller_that_is_not_the_bundles_expected_new_owner() {
+        let path = scratch("accept-wrong-owner");
+        let _ = std::fs::remove_file(&path);
+        let ledger = OwnershipLedger::new(path.clone());
+        super::acquire(&ledger, session(), "foreground", 1).expect("acquire");
+        let bundle = super::detach(&ledger, session(), "foreground", "daemon", 1000).expect("detach");
+        // Ledger is empty right after detach; a third party must not be able
+        // to accept under a different owner string than the bundle names.
+        assert!(ledger.load().expect("load").is_none());
+        assert!(matches!(
+            super::accept(&ledger, &bundle, "attacker"),
+            Err(HandoffError::InvalidOwner)
+        ));
+        // The rejected attempt must not have taken ownership.
+        assert!(ledger.load().expect("load").is_none());
+        // The legitimate owner can still accept afterward.
+        let ownership = super::accept(&ledger, &bundle, "daemon").expect("accept");
+        assert_eq!(ownership.owner, "daemon");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn detach_rejects_a_session_id_that_does_not_match_the_owned_session() {
+        let path = scratch("detach-wrong-session");
+        let _ = std::fs::remove_file(&path);
+        let ledger = OwnershipLedger::new(path.clone());
+        super::acquire(&ledger, session(), "foreground", 1).expect("acquire");
+        assert!(matches!(
+            super::detach(&ledger, other_session(), "foreground", "daemon", 1000),
+            Err(HandoffError::InvalidOwner)
+        ));
+        // Ownership must be untouched by the rejected attempt.
+        let still_owned = ledger.load().expect("load").expect("still owned");
+        assert_eq!(still_owned.session_id, session());
+        assert_eq!(still_owned.owner, "foreground");
         let _ = std::fs::remove_file(&path);
     }
 
