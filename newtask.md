@@ -793,8 +793,31 @@ rejects a stale writer. Named explicitly to "prevent desktop/CLI/cloud dual-resu
   --tests` all pass. `TurnSubmissionGuard`'s in-process generation counter (this note's other named
   "polish" item) remains untouched — genuinely lower value now that the real fencing is known to live at
   the ledger layer, not something to chase without a concrete reason to.
-
-### 2.7 Context Pack Compiler / Workspace Capsule + Next-Edit-Ripple + retrieval-before-edit guardrail
+- **New finding, 2026-08-30: a whole crash-recovery pipeline exists, is real and tested, and is never
+  invoked — but fixing the wiring wouldn't currently do anything observable, because the feature that
+  would need it is itself one of the already-documented no-op `KernelAction` variants.**
+  `crates/kernel/src/recovery/mod.rs::RecoveryManager::recover_session` (module doc: "verifies storage,
+  loads the newest compatible checkpoint... replays later committed events, applies interrupt/pause
+  actions... idempotent across repeated startup") is exactly the mechanism that should clear a session's
+  `active_turn` marker after a crash mid-turn. It has zero callers anywhere outside `crates/kernel`'s own
+  tests and `crates/kernel/tests/crash_recovery.rs`. Traced the actual consequence: `TurnSubmissionGuard::
+  validate_seq` (§2.6's own subject above) refuses `submit_turn` whenever `snapshot.active_turn().is_some
+  ()` — durably true forever once a turn starts, cleared only by that turn completing/failing/being
+  interrupted through the normal path. A process killed mid-turn leaves `active_turn` durably `Some` with
+  no live process left to ever clear it; without `recover_session` (or equivalent) running on the next
+  open, that session can never submit another turn again — every future attempt hits `SessionConflict`
+  permanently. **But this has no current observable path to a user**, because the only way to reconnect to
+  an existing session at all is `KernelAction::ResumeSession`, and the earlier audit of `apply_kernel_
+  action` (this same section's TUI-dispatch finding under Phase 1 §1.4 item 13) already confirmed
+  `ResumeSession` is one of the 30 variants that hits the silent `KernelApi::Approve | KernelApi::Dispatch
+  => {}` no-op arm — resume itself doesn't work yet, crashed or not. Wiring `recover_session` in without
+  also building real resume dispatch would fix nothing a user could exercise, and building real resume
+  dispatch is itself real, separate feature work (this document's own TUI finding already flagged it as
+  needing dedicated attention, not a quick pass) — so this is disclosed as a real, latent bug that will
+  matter the moment `ResumeSession` gets properly implemented, not attempted as its own fix now. Not
+  confused with two other things named "recovery" in this codebase, checked directly: `host.rs`'s
+  `LiveRecoveryController` is unrelated context-overflow/compaction recovery (§2.7), and `GoalCommand::
+  Pause`'s `process_recovered` is an in-memory goal-pause flag, not this ledger-level pipeline.
 
 **Correction to the correction (2026-08-29):** the "verified genuinely absent" note directly below was
 itself wrong — a methodology bug, not a re-check of source: the grep only covered
@@ -1360,6 +1383,27 @@ cause. Full `-p rapid` suite (305 lib tests) and `cargo build --workspace --test
   new small crate; encode its "budgets can't buy a fake pass" anti-pattern into whatever implements
   `CompletionContract` in §2.4.
 - **Sev/Effort:** P2 / M (broker wiring) + L (governor, new feature).
+- **New finding, 2026-08-30: a companion to the Credential Broker gap above — `capability-broker`'s own
+  audit-trail subsystem is fully built and tested but has zero callers anywhere, including from the one
+  real lease-minting call site this codebase now has.** `crates/capability-broker/src/audit.rs`
+  (`audit_decision`, `audit_approval_requested`/`resolved`/`expired`, `audit_lease_issued`/`used`/
+  `expired`/`rejected`, plus `MemoryAuditStore`/`LedgerAuditStore`) is real, tested, durable-record
+  machinery for exactly `WRK-016`'s own intent ("mint short-TTL, audience/run/workspace-scoped
+  credentials... "), but grep confirms none of it is called from anywhere outside its own crate. Per this
+  section's own 2026-08-30 entry above, `apps/rapid/src/sandbox_exec.rs::run_sandboxed` is "the first
+  production code path in the repo to mint a real `CapabilityLease`" (the full `evaluate` → `request_
+  approval` → `resolve` → `issue` ceremony) — and that call site never calls any `audit_*` function, so
+  the one real capability decision happening in production today leaves no audit record despite the
+  recording machinery being ready. **Checked why this isn't a small wiring fix before flagging it as
+  one:** every `audit_*` function takes a `store: &impl CapabilityAuditStore`, and `CapabilityAuditRecord`
+  requires a real `session_id: SessionId` (`AuditContext` carries `agent_id`/`trace_id` too) — `sandbox_
+  exec.rs`'s call site has none of these readily available (it's a one-shot tool-execution path, not
+  session-scoped), and the only store that would make the audit trail durably meaningful,
+  `LedgerAuditStore`, needs a real ledger to write to that this call site has no access to (the kernel's
+  session ledger is a separate subsystem entirely, established elsewhere in this document). Wiring this in
+  for real needs the same kind of session/store plumbing decision this section's Credential Broker note
+  already correctly deferred as "premature before a real scenario exists" — not attempted here for the
+  same reason, but named precisely rather than left as an unexplained dormant module.
 
 ---
 
