@@ -499,7 +499,14 @@ impl Drop for JobRegistry {
 /// from the reference CLIs: types are general-purpose | explore | plan, and
 /// children never get the spawn tool (depth limit 1).
 pub trait SubagentRunner: Send + Sync {
-    fn run(&self, prompt: &str, agent_type: &str) -> Result<SubagentReport, String>;
+    /// `write_scope`: confine the child's writes to this workspace-relative
+    /// path or its descendants (Modbit `CAP-008`); `None` is unscoped.
+    fn run(
+        &self,
+        prompt: &str,
+        agent_type: &str,
+        write_scope: Option<&str>,
+    ) -> Result<SubagentReport, String>;
 }
 
 /// Structured result of one `task_spawn` child run. Kept typed across the
@@ -1945,7 +1952,7 @@ impl WorkspaceTools {
                 crate::hooks::HOOK_TIMEOUT,
             );
         }
-        let outcome = runner.run(&args.prompt, &args.agent_type);
+        let outcome = runner.run(&args.prompt, &args.agent_type, args.write_scope.as_deref());
         if !self.hooks.subagent_stop.is_empty() {
             let (status, ok) = match &outcome {
                 Ok(report) => (report.status.clone(), true),
@@ -2286,6 +2293,10 @@ struct JobIdArgs {
 struct TaskSpawnArgs {
     prompt: String,
     agent_type: String,
+    /// Optional workspace-relative path the child may write inside, never
+    /// outside (Modbit `CAP-008`: a narrow write scope). `None`: unscoped,
+    /// today's existing behavior.
+    write_scope: Option<String>,
 }
 
 struct EmptyArgs;
@@ -2806,10 +2817,11 @@ fn parse_web_fetch_args(raw: &str) -> Result<(String, usize), ToolStepError> {
     Ok((url.to_owned(), max_bytes))
 }
 
-/// Parse bounded `{"prompt", "type"?, "description"?}` subagent arguments.
-/// Types adopt the reference-CLI standard: general-purpose | explore | plan.
+/// Parse bounded `{"prompt", "type"?, "description"?, "write_scope"?}`
+/// subagent arguments. Types adopt the reference-CLI standard:
+/// general-purpose | explore | plan.
 fn parse_task_args(raw: &str) -> Result<TaskSpawnArgs, ToolStepError> {
-    const ALLOWED: &[&str] = &["prompt", "type", "description"];
+    const ALLOWED: &[&str] = &["prompt", "type", "description", "write_scope"];
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
     let object = value.as_object().ok_or(ToolStepError::Invalid)?;
     if !object.keys().all(|key| ALLOWED.contains(&key.as_str()))
@@ -2834,9 +2846,18 @@ fn parse_task_args(raw: &str) -> Result<TaskSpawnArgs, ToolStepError> {
         }
         None => "general-purpose".to_owned(),
     };
+    let write_scope = match object.get("write_scope") {
+        Some(value) => {
+            let raw_scope = value.as_str().ok_or(ToolStepError::Invalid)?;
+            let checked = checked_relative(raw_scope)?;
+            Some(checked.to_string_lossy().into_owned())
+        }
+        None => None,
+    };
     Ok(TaskSpawnArgs {
         prompt: prompt.to_owned(),
         agent_type,
+        write_scope,
     })
 }
 
@@ -3492,7 +3513,7 @@ impl WorkspaceTools {
             ),
             ToolSurface::new(
                 TASK_SPAWN_TOOL,
-                "Spawn a subagent (depth 1: it cannot spawn further agents) for a focused                  task and return its final report. Types: general-purpose (full tools),                  explore (read-only), plan (read-only). Arguments JSON:                  {\"prompt\":\"<task>\",\"type\":\"explore\"}.",
+                "Spawn a subagent (depth 1: it cannot spawn further agents) for a focused                  task and return its final report. Types: general-purpose (full tools),                  explore (read-only), plan (read-only). Optionally confine its writes to                  one workspace-relative path with write_scope. Arguments JSON:                  {\"prompt\":\"<task>\",\"type\":\"explore\",\"write_scope\":\"src/feature\"}.",
                 arguments_schema(
                     "Spawn a subagent for a focused task",
                     serde_json::json!({
@@ -3500,7 +3521,10 @@ impl WorkspaceTools {
                         "type": {"type": "string",
                                  "enum": ["general-purpose", "explore", "plan"],
                                  "description": "subagent type"},
-                        "description": {"type": "string", "description": "short label"}
+                        "description": {"type": "string", "description": "short label"},
+                        "write_scope": {"type": "string",
+                                        "description": "workspace-relative path the subagent may write \
+                                         inside, never outside (e.g. \"src/feature\")"}
                     }),
                     &["prompt"],
                 ),
@@ -5382,7 +5406,7 @@ use std::sync::{Arc, Mutex};
             calls: Arc<StdMutex<Vec<(String, String)>>>,
         }
         impl crate::exec_tools::SubagentRunner for FakeRunner {
-            fn run(&self, prompt: &str, agent_type: &str) -> Result<SubagentReport, String> {
+            fn run(&self, prompt: &str, agent_type: &str, _write_scope: Option<&str>) -> Result<SubagentReport, String> {
                 self.calls
                     .lock()
                     .expect("lock")
@@ -5459,10 +5483,79 @@ use std::sync::{Arc, Mutex};
     }
 
     #[test]
+    fn task_spawn_forwards_write_scope_to_the_runner_and_validates_the_path() {
+        use std::sync::Mutex as StdMutex;
+        struct ScopeCapturingRunner {
+            seen: Arc<StdMutex<Vec<Option<String>>>>,
+        }
+        impl crate::exec_tools::SubagentRunner for ScopeCapturingRunner {
+            fn run(
+                &self,
+                _prompt: &str,
+                _agent_type: &str,
+                write_scope: Option<&str>,
+            ) -> Result<SubagentReport, String> {
+                self.seen.lock().expect("lock").push(write_scope.map(str::to_owned));
+                Ok(SubagentReport {
+                    summary: "done".to_owned(),
+                    status: "succeeded".to_owned(),
+                    tool_calls: 0,
+                    tokens: 1,
+                    cost_usd_micros: None,
+                    stop_reason: None,
+                    claims: Vec::new(),
+                    blockers: Vec::new(),
+                    open_questions: Vec::new(),
+                    patch_summary: None,
+                })
+            }
+        }
+
+        let root = TempRoot::new("spawn-scope");
+        let mut tools = permissive_workspace(&root.0);
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        tools.subagents =
+            Some(Arc::new(ScopeCapturingRunner { seen: Arc::clone(&seen) }) as Arc<dyn SubagentRunner>);
+        let cancel = CancellationToken::new();
+
+        // With a scope: forwarded verbatim.
+        let call = make_call(
+            "c1",
+            TASK_SPAWN_TOOL,
+            r#"{"prompt":"x","type":"explore","write_scope":"src/feature"}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("v");
+        tools.execute(&validated, &cancel).expect("e");
+
+        // Without one: forwarded as None, not a default/empty string.
+        let call2 = make_call("c2", TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
+        let validated2 = tools.validate(&call2, &cancel).expect("v");
+        tools.execute(&validated2, &cancel).expect("e");
+
+        assert_eq!(
+            seen.lock().expect("lock").clone(),
+            vec![Some("src/feature".to_owned()), None]
+        );
+
+        // An escaping scope is refused the same way any other tool path is:
+        // a handled, model-visible failure, never a dead turn.
+        let escaping = make_call(
+            "c3",
+            TASK_SPAWN_TOOL,
+            r#"{"prompt":"x","type":"explore","write_scope":"../outside"}"#,
+        );
+        let validated = tools.validate(&escaping, &cancel).expect("v");
+        match tools.execute(&validated, &cancel).expect("handled") {
+            ToolStepResult::Failed { handled, .. } => assert!(handled),
+            other => panic!("expected a handled refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn task_spawn_refuses_once_the_per_turn_budget_is_exhausted() {
         struct CountingRunner(Arc<AtomicU64>);
         impl crate::exec_tools::SubagentRunner for CountingRunner {
-            fn run(&self, _prompt: &str, _agent_type: &str) -> Result<SubagentReport, String> {
+            fn run(&self, _prompt: &str, _agent_type: &str, _write_scope: Option<&str>) -> Result<SubagentReport, String> {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(SubagentReport {
                     summary: "done".to_owned(),
@@ -5516,7 +5609,7 @@ use std::sync::{Arc, Mutex};
     fn task_spawn_report_renders_cost_only_when_reported() {
         struct CostRunner(Option<u64>);
         impl crate::exec_tools::SubagentRunner for CostRunner {
-            fn run(&self, _prompt: &str, _agent_type: &str) -> Result<SubagentReport, String> {
+            fn run(&self, _prompt: &str, _agent_type: &str, _write_scope: Option<&str>) -> Result<SubagentReport, String> {
                 Ok(SubagentReport {
                     summary: "done".to_owned(),
                     status: "succeeded".to_owned(),
@@ -5564,7 +5657,7 @@ use std::sync::{Arc, Mutex};
     fn task_spawn_report_surfaces_claims_blockers_questions_and_patch_summary() {
         struct RichRunner;
         impl crate::exec_tools::SubagentRunner for RichRunner {
-            fn run(&self, _prompt: &str, _agent_type: &str) -> Result<SubagentReport, String> {
+            fn run(&self, _prompt: &str, _agent_type: &str, _write_scope: Option<&str>) -> Result<SubagentReport, String> {
                 Ok(SubagentReport {
                     summary: "done".to_owned(),
                     status: "succeeded".to_owned(),

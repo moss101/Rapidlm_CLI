@@ -198,6 +198,20 @@ pub fn glob_match(pattern: &str, value: &str) -> bool {
     p == pattern.len()
 }
 
+/// Is `subject` equal to `scope` or a path under it? Segment-aware: `scope`
+/// = "src" must not match `subject` = "src-other/file.rs" (a naive string
+/// prefix would).
+fn path_within_scope(scope: &str, subject: &str) -> bool {
+    let scope = scope.trim_end_matches('/');
+    if scope.is_empty() {
+        return true;
+    }
+    subject == scope
+        || subject
+            .strip_prefix(scope)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 fn valid_rule_ident(tool: &str) -> bool {
     if tool.is_empty() || tool.len() > MAX_PATTERN_BYTES {
         return false;
@@ -229,6 +243,13 @@ pub enum DecisionReason {
     PlanModeDeny,
     DontAskDeny,
     UntrustedProject,
+    /// Denied by a lattice-level `write_scope` ceiling (Modbit `CAP-008`/
+    /// `AgentExecutionCapsule`'s narrow write scope) — a subagent confined
+    /// to a subtree tried to mutate something outside it. Checked before
+    /// every rule/grant/mode, since a scope ceiling is not something a
+    /// lower-trust layer (a rule the child's own prompt could talk the
+    /// model into proposing) may widen.
+    WriteScopeViolation,
 }
 
 impl DecisionReason {
@@ -245,6 +266,7 @@ impl DecisionReason {
             Self::PlanModeDeny => "plan_mode_deny",
             Self::DontAskDeny => "dont_ask_deny",
             Self::UntrustedProject => "untrusted_project",
+            Self::WriteScopeViolation => "write_scope_violation",
         }
     }
 
@@ -262,6 +284,7 @@ impl DecisionReason {
             Self::PlanModeDeny => "plan mode is read-only; this call mutates state",
             Self::DontAskDeny => "dontAsk mode silently refuses calls that are not pre-approved",
             Self::UntrustedProject => "the project is not trusted; every tool call is refused",
+            Self::WriteScopeViolation => "outside the write scope this subagent was confined to",
         }
     }
 }
@@ -297,6 +320,12 @@ pub struct PermissionLattice {
     mode: PermissionMode,
     rules: Vec<ToolRule>,
     grants: Vec<ToolPattern>,
+    /// Workspace-relative path prefix a write-classified call's subject
+    /// must fall under (Modbit `CAP-008`: a narrow write scope for a
+    /// subagent, checked before every rule/grant/mode — see
+    /// `DecisionReason::WriteScopeViolation`). `None`: no additional
+    /// restriction, today's unscoped behavior.
+    write_scope: Option<String>,
 }
 
 impl PermissionLattice {
@@ -305,6 +334,7 @@ impl PermissionLattice {
             mode,
             rules: Vec::new(),
             grants: Vec::new(),
+            write_scope: None,
         }
     }
 
@@ -324,12 +354,25 @@ impl PermissionLattice {
         self
     }
 
+    /// Confine every write-classified call to `scope` (a workspace-relative
+    /// path prefix) or its descendants — read-classified calls are
+    /// unaffected. Rules, grants, and mode can only make a write *harder* to
+    /// get inside the scope; none of them can widen past it.
+    pub fn with_write_scope(mut self, scope: impl Into<String>) -> Self {
+        self.write_scope = Some(scope.into());
+        self
+    }
+
     pub const fn mode(&self) -> PermissionMode {
         self.mode
     }
 
     pub fn rules(&self) -> &[ToolRule] {
         &self.rules
+    }
+
+    pub fn write_scope(&self) -> Option<&str> {
+        self.write_scope.as_deref()
     }
 
     /// Lattice for a `task_spawn` child. The child is the model's own choice
@@ -352,6 +395,7 @@ impl PermissionLattice {
             },
             rules: self.rules.clone(),
             grants: self.grants.clone(),
+            write_scope: self.write_scope.clone(),
         }
     }
 
@@ -359,6 +403,17 @@ impl PermissionLattice {
     /// rule-matching context (workspace-relative path for file tools, joined
     /// argv for `shell_exec`).
     pub fn evaluate(&self, tool: &str, subject: &str, class: ToolClass) -> Decision {
+        // 0. Write-scope ceiling, checked before everything else — a rule,
+        // grant, or mode may only make a write *harder* to get inside the
+        // scope, never widen past it. Scoped to genuine file-edit calls
+        // only: `shell_exec`'s `subject` is joined argv, not a workspace
+        // path, so applying a path-prefix check to it would be meaningless.
+        if class == ToolClass::FileEdit
+            && let Some(scope) = &self.write_scope
+            && !path_within_scope(scope, subject)
+        {
+            return Decision::Deny(DecisionReason::WriteScopeViolation);
+        }
         // 1. Rules, by precedence not insertion order: deny wins, then ask,
         // then allow.
         for rule in &self.rules {
@@ -689,6 +744,54 @@ mod tests {
             let lattice = PermissionLattice::new(mode);
             assert_eq!(lattice.for_subagent().mode(), mode, "{mode} passes through");
         }
+    }
+
+    #[test]
+    fn write_scope_confines_file_edits_but_never_shell_exec() {
+        // BypassPermissions would allow everything unconditionally — the
+        // scope ceiling must still win over even the most permissive mode.
+        let lattice =
+            PermissionLattice::new(PermissionMode::BypassPermissions).with_write_scope("src/feature");
+
+        assert_eq!(
+            lattice.evaluate("workspace_write", "src/feature/mod.rs", ToolClass::FileEdit),
+            Decision::Allow(DecisionReason::BypassAllow),
+            "inside the scope: unaffected"
+        );
+        assert_eq!(
+            lattice.evaluate("workspace_write", "src/feature", ToolClass::FileEdit),
+            Decision::Allow(DecisionReason::BypassAllow),
+            "the scope root itself counts as inside"
+        );
+        assert_eq!(
+            lattice.evaluate("workspace_write", "src/other.rs", ToolClass::FileEdit),
+            Decision::Deny(DecisionReason::WriteScopeViolation),
+            "outside the scope: denied even under bypassPermissions"
+        );
+        assert_eq!(
+            lattice.evaluate("workspace_write", "src/feature-other/x.rs", ToolClass::FileEdit),
+            Decision::Deny(DecisionReason::WriteScopeViolation),
+            "segment-aware: a sibling directory sharing the prefix string must not match"
+        );
+        // shell_exec's subject is joined argv, not a path — the scope must
+        // never apply to it, or a legitimate command would be misdenied for
+        // merely containing the scope string as a substring coincidence.
+        assert_eq!(
+            lattice.evaluate("shell_exec", "rm -rf src/other.rs", ToolClass::Other),
+            Decision::Allow(DecisionReason::BypassAllow),
+            "shell_exec is never subject to the write scope"
+        );
+    }
+
+    #[test]
+    fn write_scope_survives_for_subagent_narrowing() {
+        let parent = PermissionLattice::new(PermissionMode::Default).with_write_scope("src");
+        let child = parent.for_subagent();
+        assert_eq!(child.write_scope(), Some("src"));
+        assert_eq!(
+            child.evaluate("workspace_write", "docs/readme.md", ToolClass::FileEdit),
+            Decision::Deny(DecisionReason::WriteScopeViolation)
+        );
     }
 
     #[test]

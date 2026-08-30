@@ -1223,7 +1223,12 @@ struct LiveSubagentRunner {
 }
 
 impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
-    fn run(&self, prompt: &str, agent_type: &str) -> Result<crate::exec_tools::SubagentReport, String> {
+    fn run(
+        &self,
+        prompt: &str,
+        agent_type: &str,
+        write_scope: Option<&str>,
+    ) -> Result<crate::exec_tools::SubagentReport, String> {
         use crate::exec_tools::ExecTools;
         let store = auth::InMemoryCredentialStore::new();
         let model = crate::model::ConfiguredModel::build(&self.active, &store)
@@ -1234,7 +1239,10 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // human never reviewed for this specific sub-task. Rules and
         // persisted grants still carry over unchanged. See
         // `PermissionLattice::for_subagent`.
-        let child_permissions = self.permissions.for_subagent();
+        let mut child_permissions = self.permissions.for_subagent();
+        if let Some(scope) = write_scope {
+            child_permissions = child_permissions.with_write_scope(scope);
+        }
         let mut tools = if agent_type == "explore" || agent_type == "plan" {
             ExecTools::read_only_with_permissions(&self.root, child_permissions)
         } else {

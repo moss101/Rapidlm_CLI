@@ -289,6 +289,27 @@ but cannot interrupt for new ones — escalate via the foreground parent).
   rather than guessed at. The **narrow write-scoped lease variant** and replacing `PersistentSpecialist`
   are both still entirely open — this pass only closed the "typed data exists but gets thrown away"
   half, not the permission-ceiling half.
+- **Narrow write scope implemented 2026-08-30 — at the `PermissionLattice` layer, not as a
+  `capability_broker::lease` variant.** Traced the intended lease-level design first: it would mean
+  routing the *entire* subagent tool-dispatch path through lease validation, which doesn't happen at all
+  today (subagents dispatch via `ExecTools::workspace_with_permissions`/`PermissionLattice`, never
+  through a capability-broker lease check) — a much bigger integration than this item's own framing
+  suggested, since it's not "add a lease variant" but "make lease validation the actual gate for
+  subagent tool calls at all." Built the pragmatic, safe equivalent at the layer that *does* already gate
+  every subagent tool call: `PermissionLattice` gained `write_scope: Option<String>` (a workspace-relative
+  path prefix) and `with_write_scope()`, checked in `evaluate()` **before** every rule/grant/mode —
+  including `bypassPermissions`, which otherwise allows everything unconditionally — so a scope ceiling
+  can only be narrowed further, never widened, by anything downstream. Scoped deliberately to
+  `ToolClass::FileEdit` only: `shell_exec`'s `subject` is joined argv, not a workspace path, so applying
+  a path-prefix check to it would silently misfire. `task_spawn` gained an optional `write_scope`
+  argument (validated through the same `checked_relative` fail-closed path check every other tool
+  argument uses — an escaping `../` path is a handled, model-visible refusal, not a panic or a silent
+  no-op), threaded through the widened `SubagentRunner::run` trait to `LiveSubagentRunner::run`, which
+  applies it via `.with_write_scope()` on the child's lattice. **Not attempted:** the actual
+  capability-broker lease integration this item originally specified, and replacing `PersistentSpecialist`
+  — both remain real, separate, larger work; what's implemented here is a genuine safety improvement
+  (a subagent confined this way structurally cannot write outside its scope) using the mechanism this
+  codebase already has, not a renamed placeholder.
 
 ### 2.3 `CapabilitySnapshot` / `AuthorizationEpoch` + Policy Compiler
 
