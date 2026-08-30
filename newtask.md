@@ -926,6 +926,22 @@ their results become evidence, not just a console warning).
   remains of `VER-009`:** only a shell-string-wrapped `git commit`/`git merge` invocation, which
   `shell_exec`'s own "no shell string is ever interpreted" design makes structurally undetectable at this
   layer without a much bigger change to how commands are parsed.
+- **Correction (2026-08-30): the gap is narrower and more concrete than "shell-string-wrapped" alone —
+  checked both gates' exact match condition directly.** `scan_git_commit_gate`/`scan_git_merge_gate`
+  require `argv[1]` to be exactly `"commit"`/`"merge"`. A plain `git -C <path> commit ...` or
+  `git -c key=value commit ...` (git's own global flags before the subcommand — not shell-string wrapping,
+  a completely ordinary argv shape) has `argv[1]` be `"-C"`/`"-c"`, not `"commit"`, and skips the gate
+  entirely. Considered and rejected two fixes rather than force one through: (a) a shell-string heuristic
+  scanning `["sh"/"bash", "-c", "<script>"]` for `git commit`/`git merge` — rejected because a heuristic
+  extraction subtly wrong about what the script actually runs would give *false confidence* that
+  shell-wrapped commits are caught, worse than the honestly-documented gap; (b) a git-global-flag skip
+  parser (walk past `-C <path>`, `-c <k>=<v>`, etc. to find the real subcommand) — rejected because git
+  has enough flags that consume a following argument that getting the skip count wrong risks silently
+  checking the wrong token as the subcommand, another false-confidence failure mode, for a case
+  (`execute_shell` already runs every command with `current_dir(self.root())`, so `-C` is rarely needed in
+  practice) unlikely to be common. Left as a precisely documented boundary rather than a fix with a hidden
+  failure mode: the gate covers the ordinary, by-far-most-common `git commit`/`git merge` invocation shape
+  a model would actually produce, not every syntactically valid one.
 
 ### 2.10 Scoped Credential Broker + Resource Governor
 
