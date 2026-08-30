@@ -146,6 +146,37 @@ callers anywhere outside this crate, confirmed), but a genuine, demonstrable div
 invariant and actual behavior for whenever `handoff` does get wired in — worth fixing before that happens,
 not after.
 
+**Fresh review pass, 2026-08-30, this time over `event-ledger`/`capability-broker` (actively used crates,
+not dormant ones) — one confirmed bug, in `event-ledger::retention`, fixed; everything else checked
+(checkpoint load/apply ordering, lease TTL boundary, single-use replay rejection, approval-resolution state
+machine, cron claim/complete) held up against its own stated invariants.** `RetentionService::collect`'s
+"delete unreferenced published blobs" loop checked every artifact's rootedness against a `BTreeSet`
+snapshot (`rooted_ids()`) taken *once*, at the very top of the call — but `pin()` (the function that's
+supposed to make a blob GC-immune) writes its own `artifact_refs` row independently, with no
+synchronization against a concurrently-running `collect()`. A `pin()` call committing after the snapshot
+was taken but before `collect()`'s loop reached that specific artifact was invisible to the stale
+in-memory set, so the blob got deleted anyway — directly contradicting the module's own doc comment
+("Missing roots fail closed: GC never deletes a blob that still has a catalog row pointing at it"), and
+worse than merely "unenforced": it's a *dangling pin*, since the `artifact_refs` row survives pointing at
+nothing. Not fully fixable atomically — `artifact_refs`/`checkpoints` are SQL tables in the ledger's own
+SQLite database, but the published blobs `collect()` actually deletes are plain files under a completely
+separate `ArtifactStore` (filesystem-only, no SQL at all), so there's no single transaction that could ever
+span both the rootedness check and the delete. **Fixed the achievable half:** replaced the one-time
+snapshot with a fresh, single-artifact `is_rooted()` query run immediately before each artifact's own
+deletion, narrowing the race window from "however long the whole `collect()` sweep takes" down to "the gap
+between one lookup and one delete for one specific artifact" — the standard mitigation for a TOCTOU that
+can't be made fully atomic across two storage systems. **Deliberately did not force a concurrent
+reproduction test**, the same call made for the `vcs::provenance` atomicity fix above: reliably landing a
+background `pin()` inside the now-much-narrower per-artifact window is exactly the kind of race a test can
+almost never hit deterministically without either flakiness or a test-only pause hook added to production
+code. The three existing tests (`gc_keeps_pinned_and_deletes_unreferenced`, `checkpoint_artifact_is_a_gc_
+root`, `unpin_then_gc_removes_blob`) already cover the non-racing behavior and pass unchanged; the fix's
+correctness rests on the check now happening at the latest possible point before the irreversible action,
+verifiable by inspection. Full `event-ledger` crate suite (87 tests, unchanged) and `cargo build
+--workspace --tests` pass. `RetentionService` has zero callers anywhere outside its own tests today
+(confirmed via grep), so this was latent, not actively firing — but a real bug in the module's own stated
+contract, worth having fixed before it's ever wired into a scheduled GC.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

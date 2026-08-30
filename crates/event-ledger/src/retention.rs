@@ -5,9 +5,7 @@
 //! roots fail closed: GC never deletes a blob that still has a catalog row
 //! pointing at it from `checkpoints`.
 
-use std::collections::BTreeSet;
 use std::fmt;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -147,49 +145,35 @@ impl RetentionService {
     }
 
     /// Delete published blobs that have no checkpoint or artifact_refs root.
+    ///
+    /// Rootedness is re-checked per artifact, immediately before deleting
+    /// it, rather than once against a snapshot taken at the top of this
+    /// call: `artifact_refs`/`checkpoints` (SQL) and the published blobs
+    /// themselves (plain files under `ArtifactStore`'s root, a different
+    /// storage system with no transaction shared with the SQL side) can't
+    /// be checked-and-deleted as one atomic step, so a `pin()` racing this
+    /// call is only safe if it's visible by the time *that specific
+    /// artifact's* turn in this loop comes up — a one-time snapshot taken
+    /// before the loop starts would silently miss any pin committed after
+    /// it, however close together, deleting a blob a concurrent caller had
+    /// just made GC-immune. Per-artifact re-checking narrows that window to
+    /// the gap between one lookup and one delete; it can't close it
+    /// entirely without unifying the two storage systems.
     pub fn collect(&self, cancel: &CancellationToken) -> Result<u64, RetentionError> {
         cancel.check()?;
-        let roots = self.rooted_ids(cancel)?;
         let artifact_cancel = crate::artifact_store::CancellationToken::new();
         let published = self.artifacts.list_published(&artifact_cancel)?;
+        let conn = self.connect()?;
         let mut removed = 0u64;
         for id in published {
             cancel.check()?;
-            if roots.contains(&id) {
+            if is_rooted(&conn, &id)? {
                 continue;
             }
             self.artifacts.unpublish(&id)?;
             removed += 1;
         }
         Ok(removed)
-    }
-
-    fn rooted_ids(
-        &self,
-        cancel: &CancellationToken,
-    ) -> Result<BTreeSet<ArtifactId>, RetentionError> {
-        cancel.check()?;
-        let conn = self.connect()?;
-        let mut ids = BTreeSet::new();
-        let mut stmt = conn.prepare("SELECT artifact_id FROM artifact_refs")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        for row in rows {
-            cancel.check()?;
-            let wire = row?;
-            let id = ArtifactId::from_str(&wire)
-                .map_err(|_| RetentionError::Corrupt("invalid artifact_id in refs"))?;
-            ids.insert(id);
-        }
-        let mut stmt = conn.prepare("SELECT artifact_id FROM checkpoints")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        for row in rows {
-            cancel.check()?;
-            let wire = row?;
-            let id = ArtifactId::from_str(&wire)
-                .map_err(|_| RetentionError::Corrupt("invalid checkpoint artifact_id"))?;
-            ids.insert(id);
-        }
-        Ok(ids)
     }
 
     fn connect(&self) -> Result<Connection, RetentionError> {
@@ -206,6 +190,28 @@ fn validate_root_key(key: &str) -> Result<(), RetentionError> {
         return Err(RetentionError::InvalidRoot);
     }
     Ok(())
+}
+
+/// Whether `id` currently has any `artifact_refs` row or `checkpoints` row —
+/// a single, fresh, per-artifact query (not a cached/batched snapshot), so
+/// `collect()` always sees a `pin()`/checkpoint write already committed by
+/// the time it checks this specific artifact.
+fn is_rooted(conn: &Connection, id: &ArtifactId) -> Result<bool, RetentionError> {
+    let wire = id.to_string();
+    let in_refs: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM artifact_refs WHERE artifact_id = ?1)",
+        params![wire],
+        |row| row.get(0),
+    )?;
+    if in_refs {
+        return Ok(true);
+    }
+    let in_checkpoints: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE artifact_id = ?1)",
+        params![wire],
+        |row| row.get(0),
+    )?;
+    Ok(in_checkpoints)
 }
 
 impl fmt::Display for RetentionError {
