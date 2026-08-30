@@ -1630,6 +1630,24 @@ impl WorkspaceTools {
                 "tool shell_exec: argv={:?} background={} sandbox={}", args.argv, args.background, args.sandbox
             ));
         }
+        // `PatchPolicyGate` (Modbit `VER-009`) must run before any branch
+        // below can spawn the real command. It used to sit only on the plain
+        // synchronous path (after both the `sandbox` and `background`
+        // branches' own early `return`s), so a `git commit`/`git merge` call
+        // with `"background": true` (any platform) or `"sandbox": true`
+        // (macOS) skipped the gate entirely — the model-visible way to
+        // bypass the exact secret-scanning block this gate exists to
+        // enforce, not merely the already-documented shell-string-wrapping
+        // limitation. Checked once, unconditionally, before any branching.
+        if let Some(reason) = scan_git_commit_gate(self.root(), &args.argv)
+            .or_else(|| scan_git_merge_gate(self.root(), &args.argv))
+        {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&reason)),
+            });
+        }
         if args.sandbox {
             // Seatbelt confinement (macOS): workspace writes allowed, other
             // writes denied. Runs as an async background job — see
@@ -1714,15 +1732,6 @@ impl WorkspaceTools {
             return Ok(ToolStepResult::Succeeded {
                 call_id: call.call_id().to_owned(),
                 summary,
-            });
-        }
-        if let Some(reason) = scan_git_commit_gate(self.root(), &args.argv)
-            .or_else(|| scan_git_merge_gate(self.root(), &args.argv))
-        {
-            return Ok(ToolStepResult::Failed {
-                call_id: call.call_id().to_owned(),
-                handled: true,
-                detail: Some(bounded_detail(&reason)),
             });
         }
         let command_advisory = scan_command_advisory(self.root(), &args.argv);
@@ -5207,6 +5216,74 @@ use std::sync::{Arc, Mutex};
             .output()
             .expect("git log");
         assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 2, "seed + the real commit");
+    }
+
+    #[test]
+    fn background_and_sandbox_shell_exec_cannot_bypass_the_git_commit_gate() {
+        // `scan_git_commit_gate`/`scan_git_merge_gate` used to sit only on
+        // `execute_shell`'s plain synchronous path, reached after both the
+        // `sandbox` and `background` branches' own early `return`s — so
+        // `{"argv":["git","commit",...],"background":true}` would start the
+        // real commit as a background job with no gate check at all, a
+        // model-visible way to bypass the exact secret-scanning block this
+        // gate exists to enforce. The fix moved the gate to run once,
+        // unconditionally, before any of the three branches.
+        let root = TempRoot::new("commit-gate-background-bypass");
+        git_init(&root.0);
+        let configure = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root.0)
+                .args(args)
+                .output()
+                .expect("git config");
+            assert!(out.status.success());
+        };
+        configure(&["config", "user.name", "t"]);
+        configure(&["config", "user.email", "t@t.invalid"]);
+
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let token = format!("ghp_{}", "f".repeat(36));
+        fs::write(root.0.join("config.rs"), format!("const TOKEN: &str = \"{token}\";\n"))
+            .expect("write secret file");
+        let stage = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["add", "config.rs"])
+            .output()
+            .expect("git add");
+        assert!(stage.status.success());
+
+        let call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["git","commit","-m","add config"],"background":true}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                let detail = detail.expect("detail");
+                assert!(detail.contains("commit blocked"), "{detail}");
+            }
+            other => panic!(
+                "expected background:true to be gated identically to the plain path, got {other:?}"
+            ),
+        }
+        // The real proof: no background job ever started, and the commit
+        // never actually happened.
+        let log = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["log", "--oneline"])
+            .output()
+            .expect("git log");
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).lines().count(),
+            1,
+            "only the seed commit — the gated commit must never have run, even as a background job"
+        );
     }
 
     #[test]

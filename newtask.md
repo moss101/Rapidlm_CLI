@@ -1238,6 +1238,26 @@ their results become evidence, not just a console warning).
   remains of `VER-009`:** only a shell-string-wrapped `git commit`/`git merge` invocation, which
   `shell_exec`'s own "no shell string is ever interpreted" design makes structurally undetectable at this
   layer without a much bigger change to how commands are parsed.
+- **Real gate bypass found and fixed 2026-08-30, more serious than the shell-string-wrapping limitation
+  above: `background: true`/`sandbox: true` skipped the gate entirely, not merely a documented edge case.**
+  `execute_shell` (`exec_tools.rs`) branches on `args.sandbox`/`args.background` *before* reaching the
+  `scan_git_commit_gate`/`scan_git_merge_gate` check — both branches `return` early (starting a real
+  background/sandboxed job via `self.jobs.start`) without ever routing through the gate, which only sat on
+  the plain synchronous path below both branches. A model could bypass the entire secret-scanning
+  pre-commit/pre-merge block simply by adding `"background": true` to the same `shell_exec` call —
+  confirmed with a real reproduction: `{"argv":["git","commit","-m","..."],"background":true}` against a
+  repo with a staged secret returned `Succeeded { summary: "started background job job-1: git commit ..." }`
+  and the commit genuinely landed, where the identical call without `background` was correctly blocked.
+  This is the same "validate after the side effect is already running" shape as the `resolve_in_root`
+  symlink-escape fix earlier this session, just for a process-spawn side effect instead of a filesystem
+  one. **Fixed:** moved the gate check to run once, unconditionally, immediately after parsing `args` and
+  before any of the three branches (`sandbox`/`background`/plain) — the old check at the bottom of the
+  plain path is now dead code given the new one already covers it and was removed rather than left
+  redundant. New test `background_and_sandbox_shell_exec_cannot_bypass_the_git_commit_gate`: reproduced the
+  bypass against the pre-fix code first (confirmed the exact `"started background job"` success and a real
+  second commit landing), then confirmed the fix gates `background: true` identically to the plain path
+  (blocked, and `git log` shows only the seed commit — the job never starts at all). Full `-p rapid` suite
+  (325 lib tests) and `cargo build --workspace --tests` pass.
 - **Correction (2026-08-30): the gap is narrower and more concrete than "shell-string-wrapped" alone —
   checked both gates' exact match condition directly.** `scan_git_commit_gate`/`scan_git_merge_gate`
   require `argv[1]` to be exactly `"commit"`/`"merge"`. A plain `git -C <path> commit ...` or
