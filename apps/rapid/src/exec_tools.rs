@@ -1232,29 +1232,21 @@ impl WorkspaceTools {
                 detail: Some(bounded_detail(&detail)),
             });
         }
-        if is_team_memory_path(&args.path) {
-            if let Some(note) =
-                scan_for_secrets_advisory(self.root(), &args.path, args.content.as_bytes())
-            {
-                // .rapidlm/MEMORY.md is git-committed and team-shared (Modbit
-                // row 12's `.qwen/team-memory/` parity): unlike an ordinary
-                // write, a likely secret here is never advisory-only. Verify
-                // before writing, same "never touch the real tree on a
-                // failure" discipline shadow diagnostics uses. A dismissed
-                // fingerprint (`rapid findings dismiss`) still unblocks —
-                // that dismissal already represents a human decision that
-                // it isn't a real secret.
-                return Ok(ToolStepResult::Failed {
-                    call_id: call.call_id().to_owned(),
-                    handled: true,
-                    detail: Some(bounded_detail(&format!(
-                        "write blocked: {} is git-committed, team-shared memory, where secret \
-                         scanning is mandatory, not advisory; redact and retry, or dismiss a \
-                         false positive first.\n{note}",
-                        args.path
-                    ))),
-                });
-            }
+        // .rapidlm/MEMORY.md is git-committed and team-shared (Modbit row
+        // 12's `.qwen/team-memory/` parity): unlike an ordinary write, a
+        // likely secret here is never advisory-only. Verify before writing,
+        // same "never touch the real tree on a failure" discipline shadow
+        // diagnostics uses. A dismissed fingerprint (`rapid findings
+        // dismiss`) still unblocks — that dismissal already represents a
+        // human decision that it isn't a real secret.
+        if let Some(detail) =
+            team_memory_gate(self.root(), &args.path, args.content.as_bytes(), "write")
+        {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&detail)),
+            });
         }
         if let Some(config) = self
             .shadow_diagnostics
@@ -1551,6 +1543,15 @@ impl WorkspaceTools {
                     detail: Some(bounded_detail(&detail)),
                 });
             }
+            if let Some(detail) =
+                team_memory_gate(self.root(), &args.path, updated.as_bytes(), "patch")
+            {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&detail)),
+                });
+            }
             fs::write(&target, updated.as_bytes()).map_err(|_| ToolStepError::Failed)?;
             let mut summary = format!("replaced {exact_occurrences} occurrence(s) in {}", args.path);
             append_write_advisories(&mut summary, self.root(), &args.path, updated.as_bytes());
@@ -1597,6 +1598,14 @@ impl WorkspaceTools {
             updated.replace_range(range.clone(), &args.new);
         }
         if let Some(detail) = self.reserve_write_budget(updated.len()) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&detail)),
+            });
+        }
+        if let Some(detail) = team_memory_gate(self.root(), &args.path, updated.as_bytes(), "patch")
+        {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
@@ -2518,10 +2527,27 @@ fn walk_all_files(
 /// The one git-committed, team-shared memory file this codebase has today
 /// (`apps/rapid/src/host.rs::load_memory_index`) — narrower than Qwen's
 /// `.qwen/team-memory/` directory tier (Modbit row 12), but the part that
-/// makes `workspace_write`'s secret-scan gate here mandatory rather than
-/// advisory (see the call site in `execute_write`).
+/// makes the secret-scan gate below mandatory rather than advisory.
 fn is_team_memory_path(path: &str) -> bool {
     path == ".rapidlm/MEMORY.md"
+}
+
+/// Mandatory (not advisory) secret gate on `.rapidlm/MEMORY.md`'s *final*
+/// content, shared by `execute_write` and both of `execute_patch`'s tiers —
+/// a patch is just as real a way to put a secret into this file as a full
+/// write is, so both must be gated identically, not just the one a
+/// mandatory check happened to be added to first. `None` for any other
+/// path (advisory-only, unaffected) or when nothing was found.
+fn team_memory_gate(root: &Path, path: &str, content: &[u8], action: &str) -> Option<String> {
+    if !is_team_memory_path(path) {
+        return None;
+    }
+    let note = scan_for_secrets_advisory(root, path, content)?;
+    Some(format!(
+        "{action} blocked: {path} is git-committed, team-shared memory, where secret \
+         scanning is mandatory, not advisory; redact and retry, or dismiss a \
+         false positive first.\n{note}",
+    ))
 }
 
 fn checked_relative(relative: &str) -> Result<&Path, ToolStepError> {
@@ -5091,6 +5117,64 @@ use std::sync::{Arc, Mutex};
             other => panic!("expected the write to succeed after dismissal, got {other:?}"),
         }
         assert!(root.0.join(".rapidlm/MEMORY.md").exists());
+    }
+
+    #[test]
+    fn patching_a_likely_secret_into_team_memory_is_blocked_not_advisory() {
+        // The mandatory (not advisory) secret gate on `.rapidlm/MEMORY.md`
+        // was only ever checked in `execute_write`. `workspace_patch` edits
+        // the same file's content through a completely different function
+        // and never checked `is_team_memory_path` at all, so a model could
+        // trivially bypass the mandatory gate: write a clean MEMORY.md via
+        // `workspace_write`, then splice a secret in via `workspace_patch`.
+        let root = TempRoot::new("patch-team-memory-block");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        let seed = ProposedToolCall::new(
+            "c1",
+            WORKSPACE_WRITE_TOOL,
+            &serde_json::to_string(&serde_json::json!({
+                "path": ".rapidlm/MEMORY.md",
+                "content": "- placeholder\n"
+            }))
+            .expect("encode call"),
+        )
+        .expect("call");
+        let validated = tools.validate(&seed, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { .. } => {}
+            other => panic!("expected the clean seed write to succeed, got {other:?}"),
+        }
+
+        let token = format!("ghp_{}", "d".repeat(36));
+        let patch = ProposedToolCall::new(
+            "c2",
+            WORKSPACE_PATCH_TOOL,
+            &serde_json::to_string(&serde_json::json!({
+                "path": ".rapidlm/MEMORY.md",
+                "old": "placeholder",
+                "new": format!("API token: {token}")
+            }))
+            .expect("encode call"),
+        )
+        .expect("call");
+        let validated = tools.validate(&patch, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                let detail = detail.expect("detail");
+                assert!(detail.contains("mandatory"), "{detail}");
+            }
+            other => panic!(
+                "expected the patch to be gated identically to a direct write, got {other:?}"
+            ),
+        }
+        let content = fs::read_to_string(root.0.join(".rapidlm/MEMORY.md")).expect("still present");
+        assert!(
+            !content.contains(&token),
+            "the secret must never land in team-shared memory via a patch either"
+        );
     }
 
     #[test]
