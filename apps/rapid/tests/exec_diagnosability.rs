@@ -219,6 +219,36 @@ fn tool_failure_names_failing_tool_and_error_on_stderr() {
 }
 
 #[test]
+fn jsonl_flag_reports_a_failed_turn_with_no_assistant_message_record() {
+    let home = temp_dir("jsonl-fail-home");
+    let project = home.join("project");
+    std::fs::create_dir_all(&project).expect("project");
+    trusted_project(&home, &project);
+    let server = spawn_scripted_server(vec![(200, SHELL_FAIL_BODY.to_owned())]);
+    let config = write_config(&home, server.addr);
+
+    let (code, stdout, stderr) = run_exec(
+        &project,
+        &home,
+        &config,
+        &["--jsonl", "run the impossible command"],
+    );
+
+    assert_eq!(code, Some(5), "stdout: {stdout} stderr: {stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    // No assistant.message record: the turn never produced a real result.
+    assert_eq!(lines.len(), 2, "schema + session.finished only: {stdout}");
+    let schema: serde_json::Value = serde_json::from_str(lines[0]).expect("valid JSON line");
+    assert_eq!(schema["type"], "rapid.schema");
+    let finished: serde_json::Value = serde_json::from_str(lines[1]).expect("valid JSON line");
+    assert_eq!(finished["type"], "session.finished");
+    assert_eq!(finished["data"]["exit_code"], 5);
+    // The tool-failure diagnostic still reaches stderr unchanged.
+    assert!(stderr.contains("failing tool: shell_exec"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn json_schema_flag_prints_the_validated_result_instead_of_the_summary() {
     let home = temp_dir("jsonschema-ok-home");
     let project = home.join("project");
@@ -265,6 +295,52 @@ fn json_schema_flag_prints_the_validated_result_instead_of_the_summary() {
         !stdout.contains("hello from scripted model"),
         "the model's own terminal text must not leak into structured-output stdout: {stdout}"
     );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn jsonl_flag_writes_versioned_protocol_records_and_keeps_diagnostics_on_stderr() {
+    let home = temp_dir("jsonl-ok-home");
+    let project = home.join("project");
+    std::fs::create_dir_all(&project).expect("project");
+    trusted_project(&home, &project);
+    let server = spawn_scripted_server(vec![(200, TERMINAL_BODY.to_owned())]);
+    let config = write_config(&home, server.addr);
+
+    let (code, stdout, stderr) =
+        run_exec(&project, &home, &config, &["--jsonl", "say hello"]);
+
+    assert_eq!(code, Some(0), "stdout: {stdout} stderr: {stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "schema + assistant.message + session.finished: {stdout}");
+
+    let schema: serde_json::Value = serde_json::from_str(lines[0]).expect("valid JSON line");
+    assert_eq!(schema["type"], "rapid.schema");
+    assert_eq!(schema["schema"], 1);
+    assert_eq!(schema["data"]["version"], 1);
+
+    let message: serde_json::Value = serde_json::from_str(lines[1]).expect("valid JSON line");
+    assert_eq!(message["type"], "assistant.message");
+    assert!(message["session_id"].is_string(), "{message}");
+    assert!(
+        message["data"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("hello from scripted model"),
+        "{message}"
+    );
+
+    let finished: serde_json::Value = serde_json::from_str(lines[2]).expect("valid JSON line");
+    assert_eq!(finished["type"], "session.finished");
+    assert_eq!(finished["data"]["exit_code"], 0);
+    assert_eq!(
+        finished["session_id"], message["session_id"],
+        "every record in one run shares the same session id"
+    );
+
+    // Diagnostics (the human-oriented "tokens used" line) still go to
+    // stderr — stdout stays protocol-only either way.
+    assert!(stderr.contains("tokens used:"), "{stderr}");
     let _ = std::fs::remove_dir_all(&home);
 }
 

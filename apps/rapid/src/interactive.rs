@@ -224,7 +224,7 @@ usage: rapid [subcommand]
 /// errors. Documents the prompt argument, the exec flags, and the env vars
 /// that shape a headless run.
 pub const EXEC_USAGE: &str = "\
-usage: rapid exec <prompt> [--verbose] [--max-wall-time <seconds>] [--json-schema <path>]
+usage: rapid exec <prompt> [--verbose] [--max-wall-time <seconds>] [--json-schema <path>] [--jsonl]
 
 Run one headless agent turn with the configured model. The final response is
 printed to stdout; diagnostics go to stderr; a non-zero exit code reports a
@@ -242,6 +242,10 @@ Options:
                           with matching arguments, printed to stdout in place
                           of the usual text summary. A schema-conformant
                           result is never produced without a matching call.
+  --jsonl                 Write the turn's outcome as JSONL protocol records
+                          (schema + assistant.message + session.finished)
+                          instead of plain text. Covers only the turn
+                          outcome itself, not a pre-flight setup failure.
   -h, --help              Print this help
 
 Environment:
@@ -823,12 +827,22 @@ struct ExecArgs {
     /// structured output (`newtask.md` §1.5/#16). The file's contents are
     /// read and parsed later, not here — this only carries the path.
     json_schema: Option<PathBuf>,
+    /// `--jsonl`: write the turn's outcome as versioned JSONL protocol
+    /// records (`headless::jsonl`) instead of plain text — covers only the
+    /// turn-execution outcome itself, not a pre-flight setup failure (bad
+    /// model config, bad `--json-schema`), which still exits with a typed
+    /// code but without a `session.finished` record. See `newtask.md` §2.8's
+    /// correction: this reuses the JSONL contract for `rapid exec`, not the
+    /// separate, unbuilt `rapid run <goal/playbook>` durable-graph command
+    /// the contract's own doc comment was originally scoped to.
+    jsonl: bool,
 }
 
 fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
     let mut verbose = false;
     let mut max_wall_time = None;
     let mut json_schema = None;
+    let mut jsonl = false;
     let mut words: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -841,6 +855,8 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
         } else if args[i] == "--json-schema" {
             i += 1;
             json_schema = Some(PathBuf::from(args.get(i)?));
+        } else if args[i] == "--jsonl" {
+            jsonl = true;
         } else {
             words.push(&args[i]);
         }
@@ -855,6 +871,7 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
         verbose,
         max_wall_time,
         json_schema,
+        jsonl,
     })
 }
 
@@ -949,13 +966,16 @@ fn is_effective_success(outcome: &ExecOutcome) -> bool {
 /// maps to the same `Provider` bucket the JSONL contract already uses for
 /// provider errors; an unclassified cause (e.g. a tool-failure stop, which
 /// carries `failure_detail` instead) falls back to `Runtime`.
-fn exec_turn_exit_code(status: AgentTerminalStatus, failure_cause: Option<FailureCause>) -> i32 {
+fn exec_turn_exit_code(
+    status: AgentTerminalStatus,
+    failure_cause: Option<FailureCause>,
+) -> JsonlExitCode {
     if status == AgentTerminalStatus::Cancelled {
-        return JsonlExitCode::Interrupted.as_i32();
+        return JsonlExitCode::Interrupted;
     }
     match failure_cause {
-        Some(FailureCause::Unspecified) | None => JsonlExitCode::Runtime.as_i32(),
-        Some(_) => JsonlExitCode::Provider.as_i32(),
+        Some(FailureCause::Unspecified) | None => JsonlExitCode::Runtime,
+        Some(_) => JsonlExitCode::Provider,
     }
 }
 
@@ -1448,7 +1468,8 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
     .permissions_profile("work")
     .build()
     .map_err(|_| InteractiveError::Internal)?;
-    let request = AgentExecutionRequest::new(spec, protocol::SessionId::new());
+    let session_id = protocol::SessionId::new();
+    let request = AgentExecutionRequest::new(spec, session_id);
     let cancel = agent_runtime::CancellationToken::new();
     if let Some(max_wall_time) = parsed.max_wall_time {
         spawn_wall_time_watchdog(cancel.clone(), max_wall_time);
@@ -1750,7 +1771,21 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             diag,
         )
     };
-    match run_result {
+    // `--jsonl`: everything above stays exactly as for plain-text exec; only
+    // the outcome below is reported differently. `rapid_schema` is written
+    // now (not earlier) since nothing before this point can fail *after* a
+    // session conceptually exists — see `ExecArgs::jsonl`'s doc comment.
+    let mut jsonl_io = parsed.jsonl.then(|| {
+        let mut io = crate::headless::jsonl::JsonlIo::stdio();
+        let _ = crate::headless::jsonl::JsonlRecord::rapid_schema(
+            crate::headless::jsonl::now_rfc3339(),
+        )
+        .map(|record| io.records().write(&record));
+        io
+    });
+    // `text` is the same content the plain-text path would have printed;
+    // `code` is the typed exit code either path returns.
+    let (text, code): (Option<String>, JsonlExitCode) = match run_result {
         Ok(outcome) if outcome.result.status() == AgentTerminalStatus::Succeeded => {
             let captured = json_schema_capture.borrow();
             if json_schema_requested && captured.is_none() {
@@ -1758,18 +1793,19 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                     "--json-schema was set but the model never called the synthetic tool \
                      with a schema-conformant result"
                 );
-                return Ok(JsonlExitCode::Runtime.as_i32());
+                (None, JsonlExitCode::Runtime)
+            } else {
+                let text = captured
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| outcome.result.summary().to_owned());
+                let mut line = format!("tokens used: {}", outcome.tokens);
+                if let Some(cost_usd_micros) = outcome.cost_usd_micros {
+                    line.push_str(&format!(" ({})", format_usd_micros(cost_usd_micros)));
+                }
+                crate::exec_diag::stderr_line(&line);
+                (Some(text), JsonlExitCode::Success)
             }
-            match captured.as_ref() {
-                Some(json) => println!("{json}"),
-                None => println!("{}", outcome.result.summary()),
-            }
-            let mut line = format!("tokens used: {}", outcome.tokens);
-            if let Some(cost_usd_micros) = outcome.cost_usd_micros {
-                line.push_str(&format!(" ({})", format_usd_micros(cost_usd_micros)));
-            }
-            crate::exec_diag::stderr_line(&line);
-            Ok(0)
         }
         Ok(outcome) => {
             let mut message =
@@ -1786,27 +1822,48 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                     outcome.tool_calls
                 ));
                 crate::exec_diag::stderr_line(&message);
-                return Ok(0);
+                (None, JsonlExitCode::Success)
+            } else {
+                if outcome.failure_cause.is_none()
+                    && !matches!(&workspace, Some((_, TrustStatus::Trusted)))
+                {
+                    message.push_str(" (workspace tools are disabled: project is not trusted)");
+                }
+                crate::exec_diag::stderr_line(&message);
+                let code = exec_turn_exit_code(outcome.result.status(), outcome.failure_cause);
+                (None, code)
             }
-            if outcome.failure_cause.is_none()
-                && !matches!(&workspace, Some((_, TrustStatus::Trusted)))
-            {
-                message.push_str(" (workspace tools are disabled: project is not trusted)");
-            }
-            crate::exec_diag::stderr_line(&message);
-            Ok(exec_turn_exit_code(
-                outcome.result.status(),
-                outcome.failure_cause,
-            ))
         }
         Err(err) => {
             eprintln!("{err}");
-            Ok(match err.error_code() {
-                Some(code) => JsonlExitCode::from_error_code(code, false).as_i32(),
-                None => JsonlExitCode::Interrupted.as_i32(),
-            })
+            let code = match err.error_code() {
+                Some(code) => JsonlExitCode::from_error_code(code, false),
+                None => JsonlExitCode::Interrupted,
+            };
+            (None, code)
         }
+    };
+    if let Some(io) = jsonl_io.as_mut() {
+        if let Some(text) = &text {
+            let _ = crate::headless::jsonl::JsonlRecord::assistant_message(
+                session_id,
+                1,
+                crate::headless::jsonl::now_rfc3339(),
+                text,
+            )
+            .map(|record| io.records().write(&record));
+        }
+        let _ = crate::headless::jsonl::JsonlRecord::session_finished(
+            session_id,
+            2,
+            crate::headless::jsonl::now_rfc3339(),
+            code,
+        )
+        .map(|record| io.records().write(&record));
+    } else if let Some(text) = &text {
+        println!("{text}");
     }
+    Ok(code.as_i32())
 }
 
 /// Start kernel, in-process client, and TUI; restore and quiesce on every path.

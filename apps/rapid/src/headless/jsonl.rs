@@ -19,6 +19,16 @@ use serde_json::value::RawValue;
 /// JSONL protocol schema written on every constructed record.
 pub const JSONL_SCHEMA: u16 = 1;
 
+/// Wall-clock "now" as RFC3339 (UTC, `Z` suffix) for a record's `time` field.
+/// `time::error::Format` can only fail on an allocation failure formatting
+/// into a `String`, never on the timestamp itself — fresh `now_utc()` is
+/// always in-range for `Rfc3339`.
+pub fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("formatting the current time as RFC3339 cannot fail")
+}
+
 /// Maximum UTF-8 bytes of one compact JSON object (excluding the trailing newline).
 pub const MAX_JSONL_LINE_BYTES: usize = 1024 * 1024;
 
@@ -160,6 +170,25 @@ impl JsonlRecord {
             seq: 0,
             time: time.into(),
             data: raw_json(&serde_json::json!({ "version": JSONL_SCHEMA }))?,
+        })
+    }
+
+    /// The model's final text (`EventKind::ModelCompleted`'s own JSONL type,
+    /// constructed directly rather than through `from_event` — no committed
+    /// ledger event backs a one-shot `rapid exec --jsonl` run).
+    pub fn assistant_message(
+        session_id: SessionId,
+        seq: u64,
+        time: impl Into<String>,
+        text: &str,
+    ) -> Result<Self, JsonlError> {
+        Ok(Self {
+            schema: JSONL_SCHEMA,
+            record_type: "assistant.message".to_owned(),
+            session_id: Some(session_id),
+            seq,
+            time: time.into(),
+            data: raw_json(&serde_json::json!({ "text": text }))?,
         })
     }
 
@@ -533,6 +562,15 @@ mod tests {
         r#"{"goal.budget_exhausted":6,"goal.evidence_missing":6}"#;
     const GOLDEN_OUTCOMES: &str = r#"{"goal_incomplete_require_complete":6,"goal_incomplete_without_flag":0,"interrupted":130,"policy":3,"provider":4,"resource_exhausted":8,"runtime":5,"sandbox":7,"success":0,"usage":2}"#;
 
+    #[test]
+    fn now_rfc3339_produces_a_real_parseable_recent_utc_timestamp() {
+        let stamp = now_rfc3339();
+        assert!(stamp.ends_with('Z'), "{stamp}");
+        let parsed: event_ledger::event::RecordedAt =
+            stamp.parse().expect("must round-trip through the ledger's own RFC3339 parser");
+        assert_eq!(parsed.as_str(), stamp);
+    }
+
     fn session_id() -> SessionId {
         SESSION_ID.parse().expect("session id")
     }
@@ -607,6 +645,12 @@ mod tests {
         .expect("map")
         .expect("assistant.message");
         assert_eq!(encode(&message), GOLDEN_ASSISTANT_MESSAGE);
+
+        // Same wire shape whether the record comes from a committed ledger
+        // event or is constructed directly for a one-shot, non-durable run.
+        let direct_message =
+            JsonlRecord::assistant_message(session_id(), 3, TIME, "Hello").expect("message");
+        assert_eq!(encode(&direct_message), GOLDEN_ASSISTANT_MESSAGE);
 
         let tool = JsonlRecord::from_event(
             &envelope(EventKind::ToolCompleted, 42, json!({})),

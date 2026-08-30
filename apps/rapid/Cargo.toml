@@ -81,3 +81,7 @@ serde_json = { version = "1", features = ["raw_value"] }
 # are always a fully-inline, caller-supplied document, never fetched over the
 # network.
 jsonschema = { version = "0.52.0", default-features = false }
+# time: MIT/Apache-2.0; already resolved transitively (Cargo.lock), promoted
+# to a direct dep for `--jsonl`'s RFC3339 `time` field. `formatting`-only:
+# this crate only ever stamps "now", never parses a caller-supplied one.
+time = { version = "0.3.55", default-features = false, features = ["formatting"] }
