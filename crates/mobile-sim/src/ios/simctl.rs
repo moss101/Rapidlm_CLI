@@ -8,9 +8,8 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Debug};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -1278,50 +1277,25 @@ fn run_xcrun(
     if !cfg!(target_os = "macos") {
         return Err(IosSimctlError::CapabilityUnavailable);
     }
-    let mut child = Command::new(XCRUN_PATH)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| IosSimctlError::Io)?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        if cancel.is_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(IosSimctlError::Cancelled);
+    let buf = crate::host_process::run_bounded_capturing_stdout(
+        Path::new(XCRUN_PATH),
+        args,
+        None,
+        timeout,
+        MAX_HOST_OUTPUT_BYTES,
+        cancel,
+    )
+    .map_err(|err| match err {
+        crate::host_process::HostRunError::TimeoutInvalid => IosSimctlError::TimeoutInvalid,
+        crate::host_process::HostRunError::Cancelled => IosSimctlError::Cancelled,
+        crate::host_process::HostRunError::Timeout => IosSimctlError::Timeout,
+        crate::host_process::HostRunError::NonZeroExit
+        | crate::host_process::HostRunError::OutputTooLarge => IosSimctlError::Backend,
+        crate::host_process::HostRunError::Spawn | crate::host_process::HostRunError::Wait => {
+            IosSimctlError::Io
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(IosSimctlError::Timeout);
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return Err(IosSimctlError::Backend);
-                }
-                let mut stdout = child.stdout.take().ok_or(IosSimctlError::Io)?;
-                let mut buf = Vec::new();
-                stdout
-                    .by_ref()
-                    .take(MAX_HOST_OUTPUT_BYTES as u64 + 1)
-                    .read_to_end(&mut buf)
-                    .map_err(|_| IosSimctlError::Io)?;
-                if buf.len() > MAX_HOST_OUTPUT_BYTES {
-                    return Err(IosSimctlError::Backend);
-                }
-                return String::from_utf8(buf).map_err(|_| IosSimctlError::Backend);
-            }
-            Ok(None) => std::thread::sleep(HOST_POLL),
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(IosSimctlError::Io);
-            }
-        }
-    }
+    })?;
+    String::from_utf8(buf).map_err(|_| IosSimctlError::Backend)
 }
 
 #[cfg(test)]

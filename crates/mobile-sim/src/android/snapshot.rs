@@ -8,11 +8,10 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Debug};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use capability_broker::CancellationToken;
 use protocol::{ArtifactId, ErrorCode, RuntimeId};
@@ -40,7 +39,6 @@ pub const MAX_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Isolated baseline snapshot used by [`SnapshotRequest::reset_baseline`].
 pub const BASELINE_SNAPSHOT_NAME: &str = "rapidlm-baseline";
 
-const HOST_POLL: Duration = Duration::from_millis(10);
 const MAX_HOST_OUTPUT_BYTES: usize = 64 * 1024;
 const SNAPSHOT_DIR: &str = "snapshots";
 const SNAPSHOT_MARKER: &str = "rapidlm.android.snapshot.v1";
@@ -1278,54 +1276,24 @@ fn run_adb(
     cancel: &CancellationToken,
 ) -> Result<Vec<u8>, AndroidSnapshotError> {
     check_cancel(cancel)?;
-    if timeout.is_zero() {
-        return Err(AndroidSnapshotError::TimeoutInvalid);
-    }
-    let mut child = Command::new(adb)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| AndroidSnapshotError::Io)?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        if cancel.is_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AndroidSnapshotError::Cancelled);
+    crate::host_process::run_bounded_capturing_stdout(
+        adb,
+        args,
+        Some(cwd),
+        timeout,
+        MAX_HOST_OUTPUT_BYTES,
+        cancel,
+    )
+    .map_err(|err| match err {
+        crate::host_process::HostRunError::TimeoutInvalid => AndroidSnapshotError::TimeoutInvalid,
+        crate::host_process::HostRunError::Cancelled => AndroidSnapshotError::Cancelled,
+        crate::host_process::HostRunError::Timeout => AndroidSnapshotError::Timeout,
+        crate::host_process::HostRunError::NonZeroExit
+        | crate::host_process::HostRunError::OutputTooLarge => AndroidSnapshotError::Backend,
+        crate::host_process::HostRunError::Spawn | crate::host_process::HostRunError::Wait => {
+            AndroidSnapshotError::Io
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AndroidSnapshotError::Timeout);
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return Err(AndroidSnapshotError::Backend);
-                }
-                let mut stdout = child.stdout.take().ok_or(AndroidSnapshotError::Io)?;
-                let mut buf = Vec::new();
-                stdout
-                    .by_ref()
-                    .take(MAX_HOST_OUTPUT_BYTES as u64 + 1)
-                    .read_to_end(&mut buf)
-                    .map_err(|_| AndroidSnapshotError::Io)?;
-                if buf.len() > MAX_HOST_OUTPUT_BYTES {
-                    return Err(AndroidSnapshotError::Backend);
-                }
-                return Ok(buf);
-            }
-            Ok(None) => std::thread::sleep(HOST_POLL),
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(AndroidSnapshotError::Io);
-            }
-        }
-    }
+    })
 }
 
 #[cfg(test)]

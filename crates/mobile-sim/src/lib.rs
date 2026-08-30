@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod android;
+mod host_process;
 pub mod ios;
 pub mod trace;
 

@@ -7,11 +7,9 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Debug};
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use capability_broker::{CancellationToken, SecretHandle};
 use protocol::{ArtifactId, ArtifactRef, ErrorCode, RedactionClass, RuntimeId};
@@ -67,7 +65,6 @@ pub const DEFAULT_ACTION_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SCREENSHOT_MEDIA_TYPE: &str = "image/png";
 
 const REDACTED_SCREENSHOT: &[u8] = b"rapidlm.android.screenshot.redacted.v1";
-const HOST_POLL: Duration = Duration::from_millis(10);
 const MAX_HOST_OUTPUT_BYTES: usize = MAX_HIERARCHY_BYTES;
 
 /// Identity of one device capture. Distinct from [`AndroidDeviceId`].
@@ -3181,54 +3178,23 @@ fn run_adb(
     cancel: &CancellationToken,
 ) -> Result<Vec<u8>, AndroidActionError> {
     check_cancel(cancel)?;
-    if timeout.is_zero() {
-        return Err(AndroidActionError::TimeoutInvalid);
-    }
-    let mut child = Command::new(program)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| AndroidActionError::Backend)?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        if cancel.is_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AndroidActionError::Cancelled);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AndroidActionError::Timeout);
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return Err(AndroidActionError::Backend);
-                }
-                let mut stdout = child.stdout.take().ok_or(AndroidActionError::Backend)?;
-                let mut buf = Vec::new();
-                stdout
-                    .by_ref()
-                    .take(MAX_HOST_OUTPUT_BYTES as u64 + 1)
-                    .read_to_end(&mut buf)
-                    .map_err(|_| AndroidActionError::Backend)?;
-                if buf.len() > MAX_HOST_OUTPUT_BYTES {
-                    return Err(AndroidActionError::HierarchyBound);
-                }
-                return Ok(buf);
-            }
-            Ok(None) => std::thread::sleep(HOST_POLL),
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(AndroidActionError::Backend);
-            }
-        }
-    }
+    crate::host_process::run_bounded_capturing_stdout(
+        program,
+        args,
+        Some(cwd),
+        timeout,
+        MAX_HOST_OUTPUT_BYTES,
+        cancel,
+    )
+    .map_err(|err| match err {
+        crate::host_process::HostRunError::TimeoutInvalid => AndroidActionError::TimeoutInvalid,
+        crate::host_process::HostRunError::Cancelled => AndroidActionError::Cancelled,
+        crate::host_process::HostRunError::Timeout => AndroidActionError::Timeout,
+        crate::host_process::HostRunError::OutputTooLarge => AndroidActionError::HierarchyBound,
+        crate::host_process::HostRunError::NonZeroExit
+        | crate::host_process::HostRunError::Spawn
+        | crate::host_process::HostRunError::Wait => AndroidActionError::Backend,
+    })
 }
 
 #[cfg(test)]

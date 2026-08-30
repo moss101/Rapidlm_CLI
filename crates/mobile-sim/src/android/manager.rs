@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Debug};
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -2009,54 +2009,25 @@ fn run_bounded(
     cancel: &CancellationToken,
 ) -> Result<String, AndroidManagerError> {
     check_cancel(cancel)?;
-    if timeout.is_zero() {
-        return Err(AndroidManagerError::TimeoutInvalid);
-    }
-    let mut child = Command::new(program)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| AndroidManagerError::Io)?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        if cancel.is_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AndroidManagerError::Cancelled);
+    let buf = crate::host_process::run_bounded_capturing_stdout(
+        program,
+        args,
+        Some(cwd),
+        timeout,
+        MAX_HOST_OUTPUT_BYTES,
+        cancel,
+    )
+    .map_err(|err| match err {
+        crate::host_process::HostRunError::TimeoutInvalid => AndroidManagerError::TimeoutInvalid,
+        crate::host_process::HostRunError::Cancelled => AndroidManagerError::Cancelled,
+        crate::host_process::HostRunError::Timeout => AndroidManagerError::Timeout,
+        crate::host_process::HostRunError::NonZeroExit
+        | crate::host_process::HostRunError::OutputTooLarge => AndroidManagerError::Backend,
+        crate::host_process::HostRunError::Spawn | crate::host_process::HostRunError::Wait => {
+            AndroidManagerError::Io
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AndroidManagerError::Timeout);
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return Err(AndroidManagerError::Backend);
-                }
-                let mut stdout = child.stdout.take().ok_or(AndroidManagerError::Io)?;
-                let mut buf = Vec::new();
-                stdout
-                    .by_ref()
-                    .take(MAX_HOST_OUTPUT_BYTES as u64 + 1)
-                    .read_to_end(&mut buf)
-                    .map_err(|_| AndroidManagerError::Io)?;
-                if buf.len() > MAX_HOST_OUTPUT_BYTES {
-                    return Err(AndroidManagerError::Backend);
-                }
-                return String::from_utf8(buf).map_err(|_| AndroidManagerError::Backend);
-            }
-            Ok(None) => std::thread::sleep(HOST_POLL),
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(AndroidManagerError::Io);
-            }
-        }
-    }
+    })?;
+    String::from_utf8(buf).map_err(|_| AndroidManagerError::Backend)
 }
 
 #[cfg(test)]

@@ -326,6 +326,44 @@ passed once the real fix was restored. Full suites: `process-supervisor` (105 te
 by `process-supervisor`'s own tests and the fix is a straight swap to the same audited primitive), `rapid`
 (327 tests, up from 326). `cargo build --workspace --tests` passes.
 
+**Same finding family, a 4th crate: `crates/mobile-sim` had the identical read-after-wait pipe-deadlock bug
+in all four of its hand-rolled host-process runners, unfixed because the crate doesn't depend on
+`process-supervisor` at all.** `android::manager::run_bounded`, `android::action::run_adb`,
+`android::snapshot::run_adb`, and `ios::simctl::run_xcrun` were four independent, byte-for-byte identical
+copies (a shared copy-paste ancestor, same shape as this session's earlier Seatbelt-backend-parity finding):
+spawn with `stdout(Stdio::piped())`, poll `try_wait()` to completion, read stdout only inside the
+`Ok(Some(status))` arm. `ios::simctl.rs`'s own doc comment anticipates the risk directly — `pub const
+MAX_HOST_OUTPUT_BYTES: usize = 64 * 1024;` sits right below `/// Maximum \`simctl list\` stdout retained.`,
+already above macOS's fixed 16 KiB pipe buffer. Worse in `android::action::run_adb`: `HostAdbUi::dump()`
+calls it for `TypedAdbCommand::Screenshot`, building `adb ... exec-out screencap -p` — a raw PNG piped over
+stdout, essentially always well over the pipe buffer, so real device screenshots would deadlock and time out
+on virtually every call, not an edge case.
+
+**Fixed with one new shared module, `crates/mobile-sim/src/host_process.rs`** (`pub(crate)`,
+`run_bounded_capturing_stdout` + `HostRunError`), mirroring `process-supervisor::cancel::await_exit_draining`
+locally since this crate doesn't depend on that crate: takes the child's stdout pipe and spawns a drain-to-
+EOF reader thread *before* the `try_wait` poll loop starts, same "never stop draining early at the cap"
+discipline as every other fix in this family (a reader that stopped at the cap would let the pipe fill again
+past it and reintroduce the identical deadlock at a larger threshold — pinned down by
+`host_process::tests::truncation_at_a_small_cap_still_drains_without_deadlock`, cap=64 bytes against a 200 KiB
+`dd` write). All four call sites now route through this one function, each mapping its generic `HostRunError`
+back to its own local error enum (preserving each site's exact existing variant choices, including
+`action.rs`'s pre-existing `HierarchyBound` vs `Backend` distinction — `OutputTooLarge` maps to
+`HierarchyBound` there specifically, `Backend` everywhere else, matching what each file already did).
+Deleted the now-dead per-file `HOST_POLL` constants and unused `Read`/`Command`/`Stdio`/`Instant` imports
+in three of the four files (the fourth, `ios::simctl.rs`, still uses `Instant`/`HOST_POLL` elsewhere).
+`host_process.rs`'s own tests directly reproduce the mechanism with the same `/bin/dd if=/dev/zero bs=1024
+count=200` approach used for the other three sites in this finding family:
+`output_past_the_pipe_buffer_does_not_deadlock` confirms 200 KiB drains cleanly without a false timeout;
+`nonzero_exit_is_reported`/`zero_timeout_is_rejected_before_spawning`/
+`already_cancelled_token_is_rejected_before_spawning` cover the surrounding contract. No additional
+site-specific regression test was added at each of the four call sites — the shared primitive is the thing
+that was actually broken and is now directly, thoroughly tested, and all four sites are a mechanical,
+verified-by-compilation wire-up to it (the same call made for `vcs::provenance`'s atomicity fix earlier this
+session: a well-tested shared primitive doesn't need re-proving at every call site). Full `mobile-sim` crate
+suite (105 tests, up from 99: 6 new in `host_process.rs`, zero removed — confirmed via `#[test]` counts
+against the pre-fix commit) and `cargo build --workspace --tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
