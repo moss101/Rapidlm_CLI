@@ -1258,32 +1258,70 @@ impl WorkspaceTools {
             Err(_) => return Err(ToolStepError::Failed),
         };
         let contents = String::from_utf8(bytes).map_err(|_| ToolStepError::Invalid)?;
-        let occurrences = contents.matches(&args.old).count();
-        if occurrences == 0 {
+        let exact_occurrences = contents.matches(&args.old).count();
+        if exact_occurrences > 0 {
+            if exact_occurrences > 1 && !args.replace_all {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&format!(
+                        "{}: old text matches {exact_occurrences} locations; expand old text or set replace_all",
+                        args.path
+                    ))),
+                });
+            }
+            let updated = contents.replace(&args.old, &args.new);
+            fs::write(&target, updated.as_bytes()).map_err(|_| ToolStepError::Failed)?;
+            return Ok(ToolStepResult::Succeeded {
+                call_id: call.call_id().to_owned(),
+                summary: format!("replaced {exact_occurrences} occurrence(s) in {}", args.path),
+            });
+        }
+        // Second tier: the exact substring wasn't found, but the same lines
+        // may exist with different indentation/spacing (a very common model
+        // mistake — reindented or reflowed `old` text). Never re-flows the
+        // replacement: `new` is spliced in exactly as given, only the *match*
+        // is whitespace-tolerant.
+        let loose_matches = find_whitespace_insensitive(&contents, &args.old);
+        if loose_matches.is_empty() {
+            let mut detail = format!("{}: old text not found", args.path);
+            if let Some((line_no, line_text)) = suggest_closest_line(&contents, &args.old) {
+                detail.push_str(&format!("; closest existing line {line_no}: {line_text}"));
+            }
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&detail)),
+            });
+        }
+        if loose_matches.len() > 1 && !args.replace_all {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
                 detail: Some(bounded_detail(&format!(
-                    "{}: old text not found",
-                    args.path
+                    "{}: old text matches {} locations after ignoring whitespace; expand old text or set replace_all",
+                    args.path,
+                    loose_matches.len()
                 ))),
             });
         }
-        if occurrences > 1 && !args.replace_all {
-            return Ok(ToolStepResult::Failed {
-                call_id: call.call_id().to_owned(),
-                handled: true,
-                detail: Some(bounded_detail(&format!(
-                    "{}: old text matches {occurrences} locations; expand old text or set replace_all",
-                    args.path
-                ))),
-            });
+        let selected = if args.replace_all {
+            loose_matches.as_slice()
+        } else {
+            &loose_matches[..1]
+        };
+        let mut updated = contents.clone();
+        for range in selected.iter().rev() {
+            updated.replace_range(range.clone(), &args.new);
         }
-        let updated = contents.replace(&args.old, &args.new);
         fs::write(&target, updated.as_bytes()).map_err(|_| ToolStepError::Failed)?;
         Ok(ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
-            summary: format!("replaced {occurrences} occurrence(s) in {}", args.path),
+            summary: format!(
+                "replaced {} occurrence(s) in {} (whitespace-insensitive match)",
+                selected.len(),
+                args.path
+            ),
         })
     }
 
@@ -2288,6 +2326,93 @@ fn parse_path_argument(raw: &str) -> Option<String> {
     let path = object.get("path")?.as_str()?;
     checked_relative(path).ok()?;
     Some(path.to_owned())
+}
+
+/// Byte ranges of each line in `text`, split on `\n` and excluding the
+/// newline itself (`\r` immediately before it is also excluded) — matches
+/// what `str::lines()` yields, but with byte offsets into `text`.
+fn line_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    for (i, ch) in text.char_indices() {
+        if ch == '\n' {
+            let end = if i > start && text.as_bytes()[i - 1] == b'\r' {
+                i - 1
+            } else {
+                i
+            };
+            ranges.push(start..end);
+            start = i + 1;
+        }
+    }
+    if start <= text.len() {
+        ranges.push(start..text.len());
+    }
+    ranges
+}
+
+/// Two lines are "loosely" equal when their whitespace-split tokens match
+/// exactly — tolerant of reindentation and reflowed spacing (leading,
+/// trailing, or internal run-length differences), never of an actual
+/// content difference.
+fn lines_match_loosely(a: &str, b: &str) -> bool {
+    a.split_whitespace().eq(b.split_whitespace())
+}
+
+/// Whitespace-insensitive fallback for `execute_patch`'s exact substring
+/// match: every contiguous, non-overlapping byte range in `contents` whose
+/// lines match `needle`'s lines via `lines_match_loosely`. Never re-flows or
+/// reindents anything — only the *search* tolerates whitespace differences,
+/// the eventual replacement still splices the caller's `new` text in as-is.
+fn find_whitespace_insensitive(contents: &str, needle: &str) -> Vec<std::ops::Range<usize>> {
+    let needle_lines: Vec<&str> = needle.lines().collect();
+    if needle_lines.is_empty() {
+        return Vec::new();
+    }
+    let content_ranges = line_ranges(contents);
+    let mut matches = Vec::new();
+    let mut i = 0;
+    while i + needle_lines.len() <= content_ranges.len() {
+        let window = &content_ranges[i..i + needle_lines.len()];
+        let all_match = window
+            .iter()
+            .zip(&needle_lines)
+            .all(|(range, needle_line)| lines_match_loosely(&contents[range.clone()], needle_line));
+        if all_match {
+            let start = window[0].start;
+            let end = window[window.len() - 1].end;
+            matches.push(start..end);
+            i += needle_lines.len(); // non-overlapping
+        } else {
+            i += 1;
+        }
+    }
+    matches
+}
+
+/// Third tier, advisory only: the single existing line most similar to
+/// `needle`'s first non-empty line, by shared-token overlap — a hint the
+/// model can use to correct `old` on retry. `None` when nothing shares even
+/// one token; naming an unrelated line is worse than no hint at all.
+fn suggest_closest_line(contents: &str, needle: &str) -> Option<(usize, String)> {
+    let needle_first_line = needle.lines().find(|line| !line.trim().is_empty())?;
+    let needle_tokens: std::collections::HashSet<&str> =
+        needle_first_line.split_whitespace().collect();
+    if needle_tokens.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, usize, &str)> = None;
+    for (idx, line) in contents.lines().enumerate() {
+        let line_tokens: std::collections::HashSet<&str> = line.split_whitespace().collect();
+        let score = needle_tokens.intersection(&line_tokens).count();
+        if score == 0 {
+            continue;
+        }
+        if best.is_none_or(|(_, best_score, _)| score > best_score) {
+            best = Some((idx, score, line));
+        }
+    }
+    best.map(|(idx, _, line)| (idx + 1, line.trim().to_owned()))
 }
 
 /// Parse bounded `{"path", "old", "new", "replace_all"?}` patch arguments.
@@ -4116,6 +4241,116 @@ use std::sync::{Arc, Mutex};
                 assert!(detail.unwrap().contains("not found"));
             }
             other => panic!("expected not-found failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_patch_falls_back_to_whitespace_insensitive_match_when_exact_fails() {
+        let root = TempRoot::new("patch-loose");
+        // Real file is 4-space indented; the model's `old` guesses tabs and
+        // trailing whitespace on the second line — same tokens, different
+        // whitespace, so the exact substring match must fail first.
+        fs::write(
+            &root.0.join("code.rs"),
+            "fn f() {\n    let x = 1;\n    let y = 2;\n}\n",
+        )
+        .expect("seed");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let old = "let x = 1;\n\tlet y = 2;   ";
+        let new = "let x = 10;\nlet y = 20;"; // deliberately un-indented
+        let call = make_call(
+            "c1",
+            WORKSPACE_PATCH_TOOL,
+            &format!(
+                r#"{{"path":"code.rs","old":{},"new":{}}}"#,
+                serde_json::to_string(old).expect("encode old"),
+                serde_json::to_string(new).expect("encode new"),
+            ),
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("whitespace-insensitive match"), "{summary}");
+            }
+            other => panic!("expected a whitespace-insensitive success, got {other:?}"),
+        }
+        let contents = fs::read_to_string(root.0.join("code.rs")).expect("read");
+        // The replacement is spliced in exactly as given — no attempt to
+        // reindent it to match the matched region's real (4-space) source
+        // indentation, proven by the un-indented `new` text surviving as-is.
+        assert!(contents.contains("let x = 10;\nlet y = 20;"), "{contents}");
+    }
+
+    #[test]
+    fn workspace_patch_reports_ambiguity_for_multiple_whitespace_insensitive_matches() {
+        let root = TempRoot::new("patch-loose-ambiguous");
+        fs::write(
+            &root.0.join("code.rs"),
+            "fn a() {\n    let x = 1;\n}\nfn b() {\n\tlet x = 1;\n}\n",
+        )
+        .expect("seed");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        // Exact match finds neither occurrence: `old`'s "2 spaces + tab"
+        // indentation is a substring of neither the real 4-space nor the
+        // real tab-indented line; the loose match finds both.
+        let call = make_call(
+            "c1",
+            WORKSPACE_PATCH_TOOL,
+            r#"{"path":"code.rs","old":"  \tlet x = 1;","new":"let x = 9;"}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("handled") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                let detail = detail.unwrap();
+                assert!(detail.contains("2 locations"), "{detail}");
+                assert!(detail.contains("ignoring whitespace"), "{detail}");
+            }
+            other => panic!("expected an ambiguity refusal, got {other:?}"),
+        }
+        // replace_all applies both.
+        let call = make_call(
+            "c2",
+            WORKSPACE_PATCH_TOOL,
+            r#"{"path":"code.rs","old":"  \tlet x = 1;","new":"let x = 9;","replace_all":true}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("replaced 2 occurrence"), "{summary}");
+            }
+            other => panic!("expected replace_all success, got {other:?}"),
+        }
+        let contents = fs::read_to_string(root.0.join("code.rs")).expect("read");
+        assert_eq!(contents.matches("let x = 9;").count(), 2, "{contents}");
+    }
+
+    #[test]
+    fn workspace_patch_reports_the_closest_line_when_nothing_matches_even_loosely() {
+        let root = TempRoot::new("patch-hint");
+        fs::write(&root.0.join("code.rs"), "fn greet(name: &str) {\n    println!(\"hi\");\n}\n")
+            .expect("seed");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let call = make_call(
+            "c1",
+            WORKSPACE_PATCH_TOOL,
+            r#"{"path":"code.rs","old":"fn greet(name: &str, loud: bool) {","new":"x"}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("handled") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                let detail = detail.unwrap();
+                assert!(detail.contains("not found"), "{detail}");
+                assert!(
+                    detail.contains("closest existing line 1: fn greet(name: &str) {"),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected a not-found failure with a hint, got {other:?}"),
         }
     }
 

@@ -214,6 +214,31 @@ expected hash before reversal, `ReversibilityClass` for irreversible/compensatab
   execution (`MergeTransaction` above, Arena-style execution in Phase 3) is unsafe without this. Build the
   primitive before anything that calls it.
 - **Sev/Effort:** P0 / L.
+- **Correction (2026-08-30): the "audit workspace.patch's match ladder" pointer targeted the wrong
+  crate, and the match-ladder half is now fixed independently of the L-effort transaction migration.**
+  `crates/workspace/src/transaction.rs` already implements almost exactly `MergeTransaction`
+  (`WorkspaceTransaction`/`TransactionManager`, base-revision staleness checks, `rollback`/
+  `rollback_on_failure`, pluggable `VerificationHook`s) and is wired into `agent-runtime`'s
+  `MergeHandoff`/`ResultStore`, `event-ledger`, `kernel::session::fork`, and `acp::v1` — but **none of it
+  reaches `apps/rapid`** (zero `use workspace::` in `exec_tools.rs`). The actual match ladder Grok Build's
+  `search_replace` compares against lives entirely in `apps/rapid/src/exec_tools.rs::execute_patch`
+  (`crates/workspace/src/patch/model.rs`'s `SemanticPatch`/`PatchOp` is byte-range-based, not text-search,
+  so it has no ladder to audit — a different mechanism from what `WORKSPACE_PATCH_TOOL` actually uses).
+  **Implemented the two missing tiers in `execute_patch` itself:** tier 2, whitespace-insensitive fallback
+  (`find_whitespace_insensitive`/`lines_match_loosely`) — when the exact substring match finds zero
+  occurrences, retries line-by-line with each line's whitespace-split tokens compared instead of its raw
+  text, tolerant of reindentation/reflowed spacing but never of an actual content difference; applies the
+  same unique-vs-ambiguous-without-`replace_all` policy as the exact tier, and splices `new` in verbatim
+  at the located byte range (deliberately never reindents the replacement to match the matched region's
+  real indentation — that is a second, harder, separately-risky problem this doesn't attempt). Tier 3,
+  context-suggestion (`suggest_closest_line`, advisory only) — when even the loose tier finds nothing,
+  names the single existing line most similar to `old`'s first line by shared-token overlap, so the model
+  has something concrete to correct on retry instead of a bare "not found". **Still not done:** migrating
+  `apps/rapid`'s actual writes onto the already-built, already-wired-elsewhere `WorkspaceTransaction` (the
+  genuinely L-effort, atomicity/provenance/multi-file half of this item) and the `UndoAction`/`UndoPlan`/
+  `ReversibilityClass` types (`CheckpointManager`/`RewindOp`/`RewindPreview` in `workspace::checkpoint`
+  already give optimistic-concurrency-checked, previewable, reversible undo, unnamed as such — a
+  wiring/naming task, not a build-from-scratch one, but not attempted in this pass).
 
 ### 2.2 `AgentExecutionCapsule` + `AgentResultEnvelope` + write-scoped narrow leases
 
@@ -362,10 +387,12 @@ files/symbols/tests/config as change-impact follow-up after an edit, revision/ev
 retrieved; surface *inadequate context* as a distinct condition rather than editing blind).
 
 - **Where it lands:** RapidLM's V3 invariant #12 ("subagents receive minimal typed task/context envelopes,
-  not the full parent transcript") already states this goal — `context_retrieval.rs`'s new
-  `PreservedLiveContext`/`CompileInput` types are the concrete substrate to formalize into a named,
-  reusable capsule. Next-Edit-Ripple builds directly on `context_engine::index::graph::CodeGraph`, which
-  `gaps.md` finding #5 already confirmed exists and is scout-reachable but unused for call-site validation.
+  not the full parent transcript") already states this goal — `apps/rapid/src/host.rs`'s
+  `PreservedLiveContext` (not `context_retrieval.rs` — corrected 2026-08-30; it's the live context
+  envelope used throughout `host.rs`/`interactive.rs`/`exec_tools.rs`/`model.rs`) is the concrete
+  substrate to formalize into a named, reusable capsule. Next-Edit-Ripple builds directly on
+  `context_engine::index::graph::CodeGraph`, which `gaps.md` finding #5 already confirmed exists and is
+  scout-reachable but unused for call-site validation.
 - **Sev/Effort:** P1 / M.
 
 ### 2.8 Model router upgrade: capability catalog + `RouterDecisionRecord` + real cost accounting
