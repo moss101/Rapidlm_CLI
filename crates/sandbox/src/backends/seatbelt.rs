@@ -53,10 +53,28 @@ pub const MAX_LIVE_SEATBELT_SANDBOXES: usize = 64;
 const SEATBELT_VERSION: &str = "seatbelt";
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+const POSIX_SH: &[&str] = &["/bin/sh", "/usr/bin/sh"];
+/// Fixed helper: set RLIMIT_CPU then exec the already-validated argv.
+/// Integers and program argv are positional; nothing is interpolated.
+/// Same technique `host_restricted.rs::APPLY_CPU_RLIMIT` uses — duplicated
+/// rather than shared since it's a fixed, trivial three-line script, unlike
+/// the mount/path-validation logic this module already reuses from there.
+const APPLY_CPU_RLIMIT: &str = r#"ulimit -t "$1" || exit 125
+shift
+exec "$@""#;
+
 fn sandbox_exec_binary() -> Option<&'static str> {
     ["/usr/bin/sandbox-exec", "/bin/sandbox-exec"]
         .into_iter()
         .find(|path| Path::new(path).is_file())
+}
+
+fn first_existing(candidates: &[&'static str]) -> Option<&'static str> {
+    candidates.iter().copied().find(|path| Path::new(path).is_file())
+}
+
+fn cpu_limit_seconds(cpu_millis: u32) -> u64 {
+    u64::from(cpu_millis.div_ceil(1_000)).max(1)
 }
 
 /// Prepared, immutable plan for one handle. `profile_path` is a real file on
@@ -69,6 +87,7 @@ struct SeatbeltPlan {
     cwd_host: CanonicalHostPath,
     timeout: Duration,
     output_limit: u64,
+    cpu_millis: u32,
 }
 
 struct PreparedSession {
@@ -178,6 +197,7 @@ impl SandboxBackend for SeatbeltBackend {
             cwd_host,
             timeout: spec.timeout(),
             output_limit: spec.output_limit(),
+            cpu_millis: spec.cpu_millis(),
         };
         let mut sessions = self.lock_sessions()?;
         if sessions.len() >= MAX_LIVE_SEATBELT_SANDBOXES {
@@ -281,8 +301,21 @@ fn run_seatbelt(
 ) -> Result<SandboxExecResult, SandboxError> {
     check_cancel(cancel)?;
     let argv = request.argv();
-    let mut command = Command::new(&plan.sandbox_exec);
-    command.arg("-f").arg(&plan.profile_path);
+    // CPU ceiling: same `sh -c 'ulimit -t ...; exec ...'` wrapper technique
+    // `host_restricted.rs` uses, applied to the whole `sandbox-exec`
+    // invocation — `exec` replaces the process image (and the rlimit
+    // survives it) while keeping the `current_dir` set below, since `exec`
+    // never changes the calling process's cwd.
+    let sh = first_existing(POSIX_SH).ok_or(SandboxError::ResourceLimit)?;
+    let secs = cpu_limit_seconds(plan.cpu_millis).to_string();
+    let mut command = Command::new(sh);
+    command.arg("-c");
+    command.arg(APPLY_CPU_RLIMIT);
+    command.arg("seatbelt");
+    command.arg(secs);
+    command.arg(&plan.sandbox_exec);
+    command.arg("-f");
+    command.arg(&plan.profile_path);
     command.args(argv);
     command.current_dir(plan.cwd_host.as_str());
     command.env_clear();
@@ -816,6 +849,43 @@ capability = "fs.read"
             SandboxError::Cancelled
         );
 
+        backend.destroy(&handle, &live).expect("destroy");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cpu_ceiling_kills_a_command_that_exceeds_it_before_the_wall_clock_timeout() {
+        if !seatbelt_available() {
+            return;
+        }
+        let backend = SeatbeltBackend::new();
+        let ws = TempWorkspace::new();
+        // Explicit, low cpu_millis, matching apps/rapid/src/sandbox_exec.rs's
+        // own regression test: pure shell-builtin arithmetic (no subprocess
+        // per iteration — RLIMIT_CPU only counts the process it's set on,
+        // not descendants it forks and waits on, so a `date`-spawning loop
+        // would never trip it regardless of wall-clock duration). This
+        // iteration count is measured directly on real hardware
+        // (`time /bin/sh -c '...'`) at ~4 real/CPU seconds, comfortably past
+        // the 1-second ceiling this test sets.
+        let spec = SandboxSpec::builder(SandboxTier::HostRestricted)
+            .cwd(cwd())
+            .mount(ws.mount("src", MountMode::ReadWrite))
+            .cpu_millis(1_000)
+            .build()
+            .expect("spec");
+        let lease = proc_lease();
+        let live = CancellationToken::new();
+        let handle = backend.prepare(&spec, &lease, &live).expect("prepare");
+        let request = SandboxExecRequest::new(
+            ["/bin/sh", "-c", "i=0; while [ $i -lt 1500000 ]; do i=$((i+1)); done"],
+            Duration::from_secs(30),
+            1024,
+        )
+        .expect("request");
+        let result = backend.exec(&handle, &request, &lease, &live).expect("exec");
+        assert_ne!(result.exit().code(), Some(0), "the CPU ceiling should kill it first");
+        assert!(!result.exit().timed_out(), "killed by the CPU limit, not the wall-clock timeout");
         backend.destroy(&handle, &live).expect("destroy");
     }
 

@@ -338,18 +338,21 @@ mod tests {
         // SIGXCPU well under any wall-clock timeout, with no output and no
         // informative error — a legitimate command, not a runaway one.
         let root = temp_root("cpu-heavy");
-        // A wall-clock-bounded busy loop (~3 real/CPU seconds, single-
-        // threaded) rather than a fixed iteration count: portable and
-        // predictable regardless of this machine's shell-arithmetic
-        // throughput, unlike counting iterations to hit a target duration.
+        // Pure shell-builtin arithmetic (`[`/`$(())`), no subprocess per
+        // iteration: a loop that shells out to `date` on every pass barely
+        // touches this *process's own* CPU time no matter how long it runs
+        // wall-clock-wise (RLIMIT_CPU only counts the process it's set on,
+        // not descendants it forks and waits on). This iteration count is
+        // measured directly on real hardware (`time /bin/sh -c '...'`) at
+        // ~4 real/CPU seconds — comfortably past the *old* 1-CPU-second
+        // default (the actual bug) and comfortably under the new 30-second
+        // one, with margin for slower CI hardware in both directions.
         let argv = vec![
             "sh".to_owned(),
             "-c".to_owned(),
-            "end=$(($(date +%s)+3)); while [ $(date +%s) -lt $end ]; do :; done; \
-             echo done-looping"
-                .to_owned(),
+            "i=0; while [ $i -lt 1500000 ]; do i=$((i+1)); done; echo done-looping".to_owned(),
         ];
-        let outcome = run_sandboxed(&root, &argv, Duration::from_secs(15), 4096).expect("run");
+        let outcome = run_sandboxed(&root, &argv, Duration::from_secs(30), 4096).expect("run");
         assert_eq!(outcome.exit_code, Some(0), "signal={:?}", outcome.signal);
         assert!(!outcome.timed_out);
         let output = String::from_utf8_lossy(&outcome.output);

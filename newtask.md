@@ -854,6 +854,39 @@ enforcement at all yet — only timeout/cancel — a real, separate gap in that 
 attempted here; and disk/network ceilings for the sandboxed exec path itself (distinct from the per-turn
 disk/network budgets in §2.10's earlier paragraph, which cover `workspace_write`/`web_fetch`, not
 sandboxed shell commands) remain unaddressed.
+- **`SeatbeltBackend`'s own CPU gap closed too, 2026-08-30, same session as the backend itself.** Reused
+  `host_restricted.rs`'s exact `sh -c 'ulimit -t "$1" || exit 125; shift; exec "$@"'` wrapper technique
+  (duplicated rather than shared — a fixed three-line script, unlike the mount/path-validation logic this
+  module already reuses from `host_restricted.rs`), applied to the whole `sandbox-exec` invocation:
+  `exec` replaces the process image and the rlimit survives it, while `current_dir` (set on the same
+  `Command`) is unaffected since `exec` never changes cwd. `SeatbeltPlan` gained a `cpu_millis` field
+  captured from `spec.cpu_millis()` in `prepare`. New `cpu_ceiling_kills_a_command_that_exceeds_it_
+  before_the_wall_clock_timeout` test, calibrated the same careful way as the `apps/rapid` fix's own test
+  (see next paragraph) — a real, measured shell loop that reliably exceeds a 1-second CPU ceiling.
+  Memory (RSS) monitoring remains unenforced for this backend — `host_restricted.rs`'s own memory
+  enforcement needs a background sampling thread this backend's simpler `wait_child` loop doesn't have;
+  not attempted here, a real, separate gap.
+- **Correction, same day: the first version of both new CPU tests was itself broken, and silently proved
+  nothing — worth recording exactly why, since it's a real testing-methodology trap.** Both this fix's
+  first regression test and the `SeatbeltBackend` CPU test originally used a *wall-clock-bounded* busy
+  loop (`end=$(($(date +%s)+3)); while [ $(date +%s) -lt $end ]; do :; done`) chosen for "predictable
+  duration regardless of shell-arithmetic throughput." That reasoning was wrong: `date +%s` forks a new
+  subprocess every iteration, and `RLIMIT_CPU` only counts the CPU time of the *one process it's set on*
+  — a parent shell that spends nearly all its wall-clock time blocked in `fork`/`wait` on child processes
+  accumulates almost no CPU time of its own, so this loop could run for any number of real seconds
+  without ever approaching even a 1-second CPU ceiling. Both tests "passed" under the buggy 1-second
+  default too, meaning they verified nothing about the actual fix — caught only by deliberately re-running
+  each test against the reverted (buggy) default and noticing it *still* passed, which should never happen
+  for a real regression test. Also discovered mid-investigation: a naive large iteration count for the
+  *positive* case (200,000,000, guessed from how long it took a `ulimit -t 1`-killed run to receive
+  `SIGXCPU`, which is not the same as how long the loop takes to actually finish) turned out to need
+  **over 120 real seconds** to complete — confirmed by directly timing `/bin/sh -c '...'` outside any
+  sandbox at all. Fixed by measuring real throughput directly (`time /bin/sh -c 'i=0; while [ $i -lt N ];
+  do i=$((i+1)); done'` at a few values of `N`) and picking `N = 1,500,000` (~4 real/CPU seconds,
+  confirmed by direct timing), a pure shell-builtin loop with no subprocess forking. Re-verified both
+  fixed tests fail under the reverted 1-second default and pass under the real one before trusting them.
+  Lesson for future sandbox/rlimit tests in this codebase: never trust a resource-ceiling test that
+  hasn't been run against a deliberately-broken version of the fix it claims to verify.
 
 **Disk axis, 2026-08-30: a real per-turn ceiling landed without needing any OS-level monitoring —
 the same "count what's already flowing through a chokepoint" trick as the concurrency fix above,
