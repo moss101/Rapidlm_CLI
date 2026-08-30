@@ -1049,7 +1049,7 @@ impl WorkspaceTools {
         }
         fs::write(&target, args.content.as_bytes()).map_err(|_| ToolStepError::Failed)?;
         let mut summary = format!("wrote {} bytes to {}", args.content.len(), args.path);
-        if let Some(note) = scan_for_secrets_advisory(&args.path, args.content.as_bytes()) {
+        if let Some(note) = scan_for_secrets_advisory(self.root(), &args.path, args.content.as_bytes()) {
             summary.push('\n');
             summary.push_str(&note);
         }
@@ -2322,8 +2322,12 @@ struct RepoSearchArgs {
 /// — the model sees it and can redact/rewrite if the flag is real, the same
 /// model-correctable-not-fatal shape every other advisory in this codebase
 /// uses. `None` on a scan failure (bad path, oversized content) or no
-/// findings; failures are silent since this is advisory, not a gate.
-fn scan_for_secrets_advisory(path: &str, content: &[u8]) -> Option<String> {
+/// (non-dismissed) findings; failures are silent since this is advisory,
+/// not a gate. Findings already dismissed via `rapid findings dismiss`
+/// (`crate::findings_store::FindingsStore`, keyed by content-hash
+/// fingerprint) never resurface on a rerun — but a *changed* finding at the
+/// same location gets a different fingerprint and is never silently hidden.
+fn scan_for_secrets_advisory(root: &Path, path: &str, content: &[u8]) -> Option<String> {
     let repo_path = protocol::RepoPath::parse(path).ok()?;
     let target = security::ScanTarget::staged_diff(repo_path, content.to_vec()).ok()?;
     let mut request = security::ScanRequest::new();
@@ -2331,13 +2335,23 @@ fn scan_for_secrets_advisory(path: &str, content: &[u8]) -> Option<String> {
     let scanner = security::SecretScanner::new();
     let cancel = security::ScanCancellation::new();
     let report = scanner.scan(&request, &cancel).ok()?;
-    if report.findings().is_empty() {
+    let store = crate::findings_store::FindingsStore::load(root);
+    let findings: Vec<&security::Finding> = report
+        .findings()
+        .iter()
+        .filter(|finding| !store.is_dismissed(finding.fingerprint().as_hex()))
+        .collect();
+    if findings.is_empty() {
         return None;
     }
-    let rules: Vec<&str> = report.findings().iter().map(security::Finding::rule_id).collect();
+    let details: Vec<String> = findings
+        .iter()
+        .map(|finding| format!("{} ({})", finding.rule_id(), finding.fingerprint().as_hex()))
+        .collect();
     Some(format!(
-        "advisory: possible secret(s) detected ({}) — verify before committing",
-        rules.join(", ")
+        "advisory: possible secrets detected: {} — verify before committing, or dismiss a \
+         false positive with `rapid findings dismiss <fingerprint>`",
+        details.join(", ")
     ))
 }
 
@@ -3778,6 +3792,58 @@ use std::sync::{Arc, Mutex};
                 assert!(!summary.contains("advisory"), "{summary}");
             }
             other => panic!("expected clean success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dismissed_secret_findings_never_resurface_after_a_rerun() {
+        let root = TempRoot::new("write-secret-dismissed");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let token = format!("ghp_{}", "b".repeat(36));
+        let content = format!("const TOKEN: &str = \"{token}\";\n");
+        let call = ProposedToolCall::new(
+            "c1",
+            WORKSPACE_WRITE_TOOL,
+            &serde_json::to_string(&serde_json::json!({"path": "config.rs", "content": &content}))
+                .expect("encode call"),
+        )
+        .expect("call");
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        let fingerprint = match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("advisory: possible secret"), "{summary}");
+                // Extract the fingerprint hex from "rule_id (fingerprint)".
+                let start = summary.find('(').expect("fingerprint present") + 1;
+                let end = summary[start..].find(')').expect("closing paren") + start;
+                summary[start..end].to_owned()
+            }
+            other => panic!("expected success (advisory only), got {other:?}"),
+        };
+
+        // `tools.root()` (canonicalized, e.g. resolving macOS's /tmp ->
+        // /private/tmp symlink) is what the scan itself reads/writes
+        // against — not the raw `TempRoot` path, which can differ.
+        let canonical_root = tools.root().to_path_buf();
+        let mut store = crate::findings_store::FindingsStore::load(&canonical_root);
+        store.dismiss(&fingerprint, "test fixture, not a real secret");
+        store.save(&canonical_root).expect("save dismissal");
+
+        // Same content, rewritten (e.g. the model re-saves the file):
+        // the already-dismissed finding must not resurface.
+        let call2 = ProposedToolCall::new(
+            "c2",
+            WORKSPACE_WRITE_TOOL,
+            &serde_json::to_string(&serde_json::json!({"path": "config.rs", "content": &content}))
+                .expect("encode call"),
+        )
+        .expect("call");
+        let validated2 = tools.validate(&call2, &cancel).expect("validate");
+        match tools.execute(&validated2, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(!summary.contains("advisory"), "{summary}");
+            }
+            other => panic!("expected clean success after dismissal, got {other:?}"),
         }
     }
 

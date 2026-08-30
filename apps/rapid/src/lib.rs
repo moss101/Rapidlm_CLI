@@ -7,6 +7,7 @@ pub mod context_retrieval;
 pub mod exec_diag;
 pub mod exec_tools;
 pub mod external_agents;
+pub mod findings_store;
 pub mod goal_claim;
 pub mod goal_host;
 pub mod headless;

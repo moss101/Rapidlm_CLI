@@ -547,6 +547,7 @@ pub const RAPID_SUBCOMMANDS: &[(&str, &str)] = &[
     ("sessions", "list or search sessions"),
     ("inspect-export", "export a session's event ledger (--format jsonl|md|html)"),
     ("cron", "durable prompt cron (add/list/remove/poll)"),
+    ("findings", "persisted scanner findings (list/dismiss)"),
     ("agents", "project agent definitions (list/validate/scaffold)"),
     ("plugins", "plugin trust lifecycle (validate/register/list/approve/reject/hook-test)"),
     ("doctor", "sandbox/policy/credential diagnostics"),
@@ -748,6 +749,135 @@ fn elide_prompt(prompt: &str) -> String {
     }
     let head: String = prompt.chars().take(MAX_ECHO_CHARS).collect();
     format!("{head}…")
+}
+
+/// `rapid findings list [--root <path>]`; `rapid findings dismiss
+/// <fingerprint> --reason <text> [--root <path>]`.
+///
+/// The write side of `crate::findings_store::FindingsStore` (Modbit
+/// `VER-007`/`VER-008`): a dismissal is keyed by a scanner finding's own
+/// content-hash fingerprint (printed alongside every advisory
+/// `workspace_write` emits), so it survives reruns without needing a line
+/// number, and a *changed* finding at the same location gets a different
+/// fingerprint and is never silently hidden by an old dismissal.
+pub fn run_findings(args: &[String]) -> Result<i32, P9CommandError> {
+    let mut root = std::env::current_dir().map_err(P9CommandError::Io)?;
+    let mut rest: Vec<&String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--root" {
+            i += 1;
+            root = args.get(i).map(PathBuf::from).ok_or(P9CommandError::Usage)?;
+        } else {
+            rest.push(&args[i]);
+        }
+        i += 1;
+    }
+    let mode = rest.first().map(|s| s.as_str()).ok_or(P9CommandError::Usage)?;
+    match mode {
+        "list" => {
+            let store = crate::findings_store::FindingsStore::load(&root);
+            println!("schema=rapidlm.findings count={}", store.len());
+            for (fingerprint, entry) in store.entries() {
+                println!("fingerprint={fingerprint} reason={}", entry.reason);
+            }
+            Ok(0)
+        }
+        "dismiss" => {
+            let fingerprint = rest.get(1).ok_or(P9CommandError::Usage)?.as_str();
+            let mut reason: Option<&str> = None;
+            let mut j = 2;
+            while j < rest.len() {
+                match rest[j].as_str() {
+                    "--reason" => {
+                        j += 1;
+                        reason = rest.get(j).map(|s| s.as_str());
+                    }
+                    _ => return Err(P9CommandError::Usage),
+                }
+                j += 1;
+            }
+            let reason = reason.ok_or(P9CommandError::Usage)?;
+            let mut store = crate::findings_store::FindingsStore::load(&root);
+            store.dismiss(fingerprint, reason);
+            store.save(&root).map_err(P9CommandError::Io)?;
+            println!("schema=rapidlm.findings dismissed fingerprint={fingerprint}");
+            Ok(0)
+        }
+        _ => Err(P9CommandError::Usage),
+    }
+}
+
+#[cfg(test)]
+mod findings_tests {
+    use super::*;
+    static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-p9-findings-{tag}-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    #[test]
+    fn list_on_an_empty_project_reports_zero() {
+        let root = temp_root("empty");
+        let args = vec![
+            "list".to_owned(),
+            "--root".to_owned(),
+            root.to_string_lossy().into_owned(),
+        ];
+        let code = run_findings(&args).expect("list");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn dismiss_persists_and_list_reports_it() {
+        let root = temp_root("dismiss");
+        let dismiss_args = vec![
+            "dismiss".to_owned(),
+            "abc123".to_owned(),
+            "--reason".to_owned(),
+            "test fixture".to_owned(),
+            "--root".to_owned(),
+            root.to_string_lossy().into_owned(),
+        ];
+        let code = run_findings(&dismiss_args).expect("dismiss");
+        assert_eq!(code, 0);
+
+        let store = crate::findings_store::FindingsStore::load(&root);
+        assert!(store.is_dismissed("abc123"));
+        let (fingerprint, entry) = store.entries().next().expect("one entry");
+        assert_eq!(fingerprint, "abc123");
+        assert_eq!(entry.reason, "test fixture");
+    }
+
+    #[test]
+    fn dismiss_without_a_reason_is_a_usage_error() {
+        let root = temp_root("no-reason");
+        let args = vec![
+            "dismiss".to_owned(),
+            "abc123".to_owned(),
+            "--root".to_owned(),
+            root.to_string_lossy().into_owned(),
+        ];
+        assert!(matches!(run_findings(&args), Err(P9CommandError::Usage)));
+    }
+
+    #[test]
+    fn unknown_mode_is_a_usage_error() {
+        let root = temp_root("unknown-mode");
+        let args = vec![
+            "surprise".to_owned(),
+            "--root".to_owned(),
+            root.to_string_lossy().into_owned(),
+        ];
+        assert!(matches!(run_findings(&args), Err(P9CommandError::Usage)));
+    }
 }
 
 /// `rapid agents list|validate [--dir <path>]`; `rapid agents scaffold <id>`.

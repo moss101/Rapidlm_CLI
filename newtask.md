@@ -560,6 +560,26 @@ their results become evidence, not just a console warning).
   exists anywhere in the crate) remain entirely unattempted. Also not covered: `execute_write`'s shadow-
   diagnostics branches and `execute_patch`'s written content — scoped to the one plain-write path to keep
   this change reviewable, not a signal that those paths are exempt from the same risk.
+- **Persistence half of `VER-007` implemented 2026-08-30 — the "dismissed findings survive reruns keyed
+  by content hash" part specifically, not the full `PatchPolicyGate`.** New
+  `apps/rapid/src/findings_store.rs::FindingsStore`: a project-local `.rapidlm/findings.json` (alongside
+  `.rapidlm/todos.json` — project-local, not per-user, since a team's triage decisions are project facts)
+  mapping a `FindingFingerprint`'s hex straight to a dismissal reason. `scan_for_secrets_advisory` now
+  loads it and filters out already-dismissed fingerprints before building its advisory note, so a
+  dismissed finding never resurfaces on a rerun of the *same* content — but a changed finding at the same
+  location gets a different fingerprint (the hash covers rule/path/byte-range/match-content) and is never
+  silently hidden by an old dismissal, exactly `VER-007`'s stated invariant. New `rapid findings
+  list|dismiss <fingerprint> --reason <text> [--root <path>]` CLI surface (`p9_commands.rs::run_findings`)
+  makes it actually usable, not just inert plumbing — every advisory note itself now also prints the
+  fingerprint so there's something to pass to `dismiss`. Caught a real bug in this pass, not just in the
+  new code: the advisory message's own wording, `"possible secret(s) detected"`, put an unrelated `(` (in
+  `"secret(s)"`) before the fingerprint's own parenthesis — a naive fingerprint-extraction test failed
+  silently on the wrong substring until traced; fixed by rewording to `"possible secrets detected"`
+  rather than papering over it in the test. **Still not attempted, and this is the bulk of `PatchPolicyGate`
+  (`VER-009`) itself:** an actual gate (something that can block a commit/merge, not just advise), the
+  three other dormant scanners (patch/command/external) wired the same way, and any concept of "results
+  become evidence" (a durable, queryable record of what was checked and why it passed/failed) — a
+  dismissal file recording what a human decided is not the same as the gate deciding anything itself.
 
 ### 2.10 Scoped Credential Broker + Resource Governor
 
@@ -635,6 +655,24 @@ existing `security::scanners::secrets::Finding` pattern (§2.9) to give backgrou
 "reviewable suggestion" output shape instead of inventing a new one per feature.
 
 - **Sev/Effort:** P2 / M. Depends on §2.2.
+- **Correction (2026-08-30): the premise overstates what `rapid cron` actually does — it's not "runs
+  durable background prompts" yet, only "durably schedules them."** Traced `rapid cron poll`
+  (`p9_commands.rs::run_cron`, `"poll"` arm) end to end: it calls `scheduler::PromptCron::poll()`, which
+  does real claim-lease-firing job-lifecycle bookkeeping (due-time tracking, requeue, quarantine after
+  repeated failures — all genuinely implemented, tested at the `scheduler` crate level), and the
+  fired jobs are just **printed** (`id=... session=... prompt=...`) — confirmed via grep that neither
+  `p9_commands.rs` nor `crates/scheduler` contains a single reference to `run_live_exec`,
+  `AgentExecutionRequest`, or any other real turn-execution entry point. **A fired cron job never
+  actually runs its prompt through a model or a tool call at all** — the whole background-automation
+  surface this item wants to add a "propose, don't auto-apply" tier *to* doesn't exist as an executing
+  system yet; there's nothing behind "poll" but a scheduler and a print statement. This is a bigger,
+  more foundational gap than the tiering distinction §3.2 itself asks for, and it changes the shape of
+  the real task: building execution-on-fire at all, with a deliberately read-only/propose-only mode as
+  the *first* mode it supports (never a mode added after a full-execution one already shipped), rather
+  than adding a tier to something that runs. Deliberately not attempted in this pass — wiring real turn
+  execution into a background/unattended path carries genuine safety weight (getting a "propose-only,
+  never applies" guarantee subtly wrong here is a very different risk than a CLI flag defaulting wrong)
+  and deserves dedicated design attention, not a rushed pass alongside unrelated work.
 
 ### 3.3 Verified-success-per-token as a tracked, reported metric
 
