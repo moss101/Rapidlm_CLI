@@ -1148,6 +1148,21 @@ their results become evidence, not just a console warning).
   practice) unlikely to be common. Left as a precisely documented boundary rather than a fix with a hidden
   failure mode: the gate covers the ordinary, by-far-most-common `git commit`/`git merge` invocation shape
   a model would actually produce, not every syntactically valid one.
+- **Why `ExternalFinding` specifically has stayed unattempted across every prior correction in this
+  section, checked directly against its source 2026-08-30 rather than left as an unexplained gap.**
+  `crates/security/src/scanners/external.rs` isn't a pure-content scanner like the other three
+  (`security::scanners::secrets`/`CommandFinding`/`PatchFinding` all take bytes already in hand and need
+  no external state) — it's a real "External SAST/SCA scanner adapter": it shells out to a *configured,
+  externally-installed* scanner binary (Semgrep/Trivy-shaped, `ExternalScannerKind::{Sast,Sca,Container}`)
+  inside a supervised sandbox, then normalizes that tool's SARIF 2.1.0 output into RapidLM findings.
+  Wiring it into `apps/rapid` isn't the same shape as the other three at all: it needs a real, new
+  configuration surface (which scanner binary/argv is configured, per project or globally — nothing in
+  `.rapidlm/settings.json` today has a slot for this) and a policy decision about *when* it runs (unlike
+  the always-on, free, in-process secrets/patch/command scans, invoking a real external process on every
+  write would be slow and often simply `Unavailable` when no scanner is installed — this likely wants an
+  explicit `rapid scan` entry point, not a hook on every tool call). This is new user-facing feature and
+  config-surface work, not a wiring task the way `CommandFinding`/`PatchFinding` were — correctly left
+  alone this whole section rather than a gap anyone missed.
 
 ### 2.10 Scoped Credential Broker + Resource Governor
 
