@@ -1913,11 +1913,22 @@ fn decode_chunked(
             }
             break;
         }
-        if body.len() + len > max_body {
+        // `len` comes straight from a hex chunk-size line: only the line's
+        // *byte length* is bounded (`MAX_HEADER_LINE_BYTES`), not the value
+        // it encodes, so a malicious/compromised provider can send a value
+        // right up to `usize::MAX`. Checked, not raw, addition — a running
+        // total that would overflow can never be a legitimate body size
+        // under any real `max_body`, so mapping the overflow itself to
+        // `BoundExceeded` is exact, not an approximation.
+        let new_len = body
+            .len()
+            .checked_add(len)
+            .ok_or(ProviderError::BoundExceeded)?;
+        if new_len > max_body {
             return Err(ProviderError::BoundExceeded);
         }
         let start = body.len();
-        body.resize(start + len, 0);
+        body.resize(new_len, 0);
         read_exact_some(input, &mut body[start..], cancel, deadline)?;
         if !read_line_crlf(input, cancel, deadline)?.is_empty() {
             return Err(ProviderError::Permanent);
@@ -3137,6 +3148,27 @@ mod tests {
         let huge = format!("{:x}\r\n", 4096).into_bytes();
         assert_eq!(
             decode_chunked(&mut huge.as_slice(), 1024, &cancel, deadline),
+            Err(ProviderError::BoundExceeded)
+        );
+    }
+
+    #[test]
+    fn a_chunk_size_that_would_overflow_the_running_total_fails_closed_not_a_panic() {
+        // A malicious/compromised provider can send any hex value up to
+        // usize::MAX as a chunk size (only the *line* is length-bounded, not
+        // the value it encodes). A prior unchecked `body.len() + len` wrapped
+        // to a small number when the two summed past usize::MAX, silently
+        // passing the bound check, then `body.resize(start + len, 0)` wrapped
+        // the same way and truncated the buffer while `start` stayed put —
+        // `&mut body[start..]` then panicked on an out-of-range slice. Both
+        // additions must be checked instead.
+        let cancel = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut wire = Vec::new();
+        wire.extend_from_slice(b"a\r\n0123456789\r\n");
+        wire.extend_from_slice(format!("{:x}\r\n", usize::MAX - 9).as_bytes());
+        assert_eq!(
+            decode_chunked(&mut wire.as_slice(), 1024, &cancel, deadline),
             Err(ProviderError::BoundExceeded)
         );
     }

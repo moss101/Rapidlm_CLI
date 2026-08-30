@@ -988,6 +988,27 @@ model, routing reason, policy version, estimated vs. actual cost — "routing mu
   — no policy-versioning concept exists anywhere yet to cite, and per-decision cost attribution would need
   threading `CostAccumulator`'s per-step values back into whichever attempt they belonged to, not just the
   turn-level total this codebase currently tracks; both are real, separate follow-up.
+- **Unrelated security fix found while auditing this crate, 2026-08-30: an integer overflow in chunked
+  HTTP decoding let any configured provider crash the process.** `crates/llm-router/src/providers/
+  openai_compatible.rs::decode_chunked` (shared by both the OpenAI-compatible and Anthropic adapters via
+  `HttpTransport`) parses each `Transfer-Encoding: chunked` chunk-size line as a hex `usize` with only the
+  *line's byte length* bounded (`MAX_HEADER_LINE_BYTES`, 8 KiB) — nothing bounds the *value* it can
+  encode, so a malicious or compromised provider can send a chunk size up to `usize::MAX`. The running
+  total (`body.len() + len`) and the resize target (`start + len`) both used raw, unchecked addition: a
+  second chunk sized to wrap the sum past `usize::MAX` back to a small number silently passed the
+  `> max_body` bound check, then wrapped the resize target too, truncating the buffer while `start`
+  stayed put — `&mut body[start..]` then panicked on an out-of-range slice (or, in a debug build, the
+  addition itself panics first with "attempt to add with overflow" — either way, one crafted response
+  crashes the process, not just a bad completion). **Fixed:** both additions now go through `body.len()
+  .checked_add(len)`, mapping the overflow case itself to `ProviderError::BoundExceeded` — exact, not an
+  approximation, since no legitimate chunk size ever needs to overflow a 64-bit sum against any real
+  `max_body`. New test `a_chunk_size_that_would_overflow_the_running_total_fails_closed_not_a_panic`:
+  confirmed it reproduces the real panic against the unfixed code first (`attempt to add with overflow`
+  at the exact line), then confirmed the fix turns it into a clean `Err(BoundExceeded)`. The existing
+  `truncated_or_oversized_chunked_bodies_fail_closed` test never combined a nonzero prior body length with
+  a wrap-inducing size, which is why this wasn't caught before. Full `-p llm-router` suite (139 lib
+  tests), full `-p rapid` suite (323 lib tests + integration binaries), and `cargo build --workspace
+  --tests` all pass.
 
 ### 2.9 Persisted, content-hash-keyed review findings + `PatchPolicyGate`
 
