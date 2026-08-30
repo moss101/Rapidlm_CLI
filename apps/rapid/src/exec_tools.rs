@@ -1560,7 +1560,9 @@ impl WorkspaceTools {
                 summary,
             });
         }
-        if let Some(reason) = scan_git_commit_gate(self.root(), &args.argv) {
+        if let Some(reason) = scan_git_commit_gate(self.root(), &args.argv)
+            .or_else(|| scan_git_merge_gate(self.root(), &args.argv))
+        {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
@@ -2513,6 +2515,37 @@ fn sandboxed_status_line(exit_code: Option<i32>, timed_out: bool, signal: Option
     }
 }
 
+/// Run a git subcommand rooted at `root` with a clean environment, ignoring
+/// any secrets a real environment might otherwise leak in (`GIT_ASKPASS`,
+/// credential helpers). Shared by both `PatchPolicyGate` boundaries below.
+fn run_git(root: &Path, args: &[&str]) -> Option<std::process::Output> {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env_clear()
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+}
+
+/// Scan `(path, content)` pairs with the same two scanners
+/// `workspace_write`/`workspace_patch` already use, collecting every
+/// non-dismissed finding's own advisory text verbatim. Shared by both
+/// `PatchPolicyGate` boundaries — the only thing that differs between them
+/// is *which* files and content count as "about to become permanent."
+fn collect_content_findings(root: &Path, files: impl Iterator<Item = (String, Vec<u8>)>) -> Vec<String> {
+    let mut findings = Vec::new();
+    for (path, content) in files {
+        if let Some(note) = scan_for_secrets_advisory(root, &path, &content) {
+            findings.push(note);
+        }
+        if let Some(note) = scan_patch_advisory(root, &path, &content) {
+            findings.push(note);
+        }
+    }
+    findings
+}
+
 /// Blocking pre-commit gate (Modbit `VER-009` `PatchPolicyGate`): when
 /// `shell_exec`'s plain path is about to run `git commit`, every staged
 /// file is scanned exactly the way `workspace_write`/`workspace_patch`
@@ -2528,46 +2561,22 @@ fn sandboxed_status_line(exit_code: Option<i32>, timed_out: bool, signal: Option
 /// blocks) on anything that isn't a real, readable git repo with staged
 /// changes: this can only ever narrow which commits succeed, never widen
 /// what's allowed, so a repo this can't introspect must not be blocked by
-/// a check that can't run. `git merge` (the item's other named boundary)
-/// is not covered — a separate, similarly-shaped follow-up, not attempted.
+/// a check that can't run.
 fn scan_git_commit_gate(root: &Path, argv: &[String]) -> Option<String> {
     if argv.len() < 2 || argv[0] != "git" || argv[1] != "commit" {
         return None;
     }
-    let staged = std::process::Command::new("git")
-        .args(["diff", "--cached", "--name-only", "--diff-filter=ACMR"])
-        .current_dir(root)
-        .env_clear()
-        .output()
-        .ok()?;
-    if !staged.status.success() {
-        return None;
-    }
-    let mut findings = Vec::new();
-    for path in String::from_utf8_lossy(&staged.stdout).lines() {
-        let path = path.trim();
-        if path.is_empty() {
-            continue;
-        }
-        let Ok(show) = std::process::Command::new("git")
-            .arg("show")
-            .arg(format!(":{path}"))
-            .current_dir(root)
-            .env_clear()
-            .output()
-        else {
-            continue;
-        };
-        if !show.status.success() {
-            continue;
-        }
-        if let Some(note) = scan_for_secrets_advisory(root, path, &show.stdout) {
-            findings.push(note);
-        }
-        if let Some(note) = scan_patch_advisory(root, path, &show.stdout) {
-            findings.push(note);
-        }
-    }
+    let staged = run_git(root, &["diff", "--cached", "--name-only", "--diff-filter=ACMR"])?;
+    let files = String::from_utf8_lossy(&staged.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .filter_map(|path| {
+            let content = run_git(root, &["show", &format!(":{path}")])?.stdout;
+            Some((path.to_owned(), content))
+        })
+        .collect::<Vec<_>>();
+    let findings = collect_content_findings(root, files.into_iter());
     if findings.is_empty() {
         return None;
     }
@@ -2575,6 +2584,58 @@ fn scan_git_commit_gate(root: &Path, argv: &[String]) -> Option<String> {
         "commit blocked by the PatchPolicyGate: staged changes have unresolved findings:\n{}\n\
          dismiss a false positive with `rapid findings dismiss <fingerprint>`, or fix the issue, \
          then retry the commit.",
+        findings.join("\n")
+    ))
+}
+
+/// Blocking pre-merge gate (`PatchPolicyGate`'s other named boundary,
+/// alongside `scan_git_commit_gate`): when `shell_exec`'s plain path is
+/// about to run `git merge <ref>...`, every file the merge would actually
+/// bring in is scanned the same way. Unlike a commit, there is no single
+/// "staged" set to read — a merge's target refs are computed from `argv`
+/// itself (every trailing token that doesn't start with `-`; a merge with
+/// no such token, e.g. `git merge --continue`, is not this gate's concern
+/// and is left alone), then each ref's incoming content is compared against
+/// `HEAD` (`git diff --name-only HEAD <ref>`) and read via `git show
+/// <ref>:<path>` — never the working tree, which the merge hasn't touched
+/// yet. Fails open the same way the commit gate does: an unreadable repo,
+/// an unresolvable ref, or a deleted-by-incoming-branch path are all
+/// silently skipped rather than treated as a reason to block.
+fn scan_git_merge_gate(root: &Path, argv: &[String]) -> Option<String> {
+    if argv.len() < 2 || argv[0] != "git" || argv[1] != "merge" {
+        return None;
+    }
+    let targets: Vec<&str> = argv[2..]
+        .iter()
+        .map(String::as_str)
+        .filter(|arg| !arg.starts_with('-'))
+        .collect();
+    if targets.is_empty() {
+        return None;
+    }
+    let mut findings = Vec::new();
+    for target in &targets {
+        let Some(diff) = run_git(root, &["diff", "--name-only", "HEAD", target]) else {
+            continue;
+        };
+        let files = String::from_utf8_lossy(&diff.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .filter_map(|path| {
+                let content = run_git(root, &["show", &format!("{target}:{path}")])?.stdout;
+                Some((path.to_owned(), content))
+            })
+            .collect::<Vec<_>>();
+        findings.extend(collect_content_findings(root, files.into_iter()));
+    }
+    if findings.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "merge blocked by the PatchPolicyGate: incoming changes have unresolved findings:\n{}\n\
+         dismiss a false positive with `rapid findings dismiss <fingerprint>`, or fix the issue, \
+         then retry the merge.",
         findings.join("\n")
     ))
 }
@@ -4611,6 +4672,61 @@ use std::sync::{Arc, Mutex};
             }
             other => panic!("expected the clean commit to succeed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn git_merge_is_blocked_by_an_unresolved_secret_in_the_incoming_branch() {
+        let root = TempRoot::new("merge-gate");
+        git_init(&root.0);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root.0)
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["config", "user.name", "t"]);
+        git(&["config", "user.email", "t@t.invalid"]);
+        git(&["checkout", "-b", "feature"]);
+        let token = format!("ghp_{}", "g".repeat(36));
+        fs::write(root.0.join("config.rs"), format!("const TOKEN: &str = \"{token}\";\n"))
+            .expect("write secret file");
+        git(&["add", "config.rs"]);
+        git(&["commit", "-m", "add config on feature"]);
+        git(&["checkout", "main"]);
+
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let merge_call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","merge","feature"]}"#);
+        let validated = tools.validate(&merge_call, &cancel).expect("validate");
+        let fingerprint = match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                let detail = detail.expect("detail");
+                assert!(detail.contains("merge blocked"), "{detail}");
+                assert!(detail.contains("advisory: possible secret"), "{detail}");
+                let start = detail.find('(').expect("fingerprint present") + 1;
+                let end = detail[start..].find(')').expect("closing paren") + start;
+                detail[start..end].to_owned()
+            }
+            other => panic!("expected the merge to be blocked, got {other:?}"),
+        };
+        // The merge must never actually have happened.
+        assert!(!root.0.join("config.rs").exists());
+
+        let canonical_root = tools.root().to_path_buf();
+        let mut store = crate::findings_store::FindingsStore::load(&canonical_root);
+        store.dismiss(&fingerprint, "test fixture, not a real secret");
+        store.save(&canonical_root).expect("save dismissal");
+        let retry = make_call("c2", SHELL_EXEC_TOOL, r#"{"argv":["git","merge","feature"]}"#);
+        let validated = tools.validate(&retry, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { .. } => {}
+            other => panic!("expected the merge to succeed after dismissal, got {other:?}"),
+        }
+        assert!(root.0.join("config.rs").exists(), "the merge should have actually run this time");
     }
 
     #[test]

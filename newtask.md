@@ -808,11 +808,27 @@ their results become evidence, not just a console warning).
   dismiss`) and `git_commit_with_no_findings_is_never_gated` (a clean staged file commits normally). Full
   `-p rapid` suite (301 lib tests) and `cargo build --workspace --tests` pass. **Explicitly not covered:**
   `git commit` wrapped in a shell string (`["sh", "-c", "git commit ..."]`, undetectable since `shell_exec`
-  never interprets shell strings) is not gated; `git merge` (this item's other named boundary) is a
-  separate, similarly-shaped follow-up; and "results become evidence" (a durable, queryable record of
-  what was checked, distinct from a dismissal file recording a human's decision) remains the one part of
-  `VER-009` genuinely unaddressed — the gate now decides something real, but that decision isn't recorded
-  anywhere durable beyond the commit either succeeding or being refused.
+  never interprets shell strings) is not gated; and "results become evidence" (a durable, queryable record
+  of what was checked, distinct from a dismissal file recording a human's decision) remains the one part
+  of `VER-009` genuinely unaddressed — the gate now decides something real, but that decision isn't
+  recorded anywhere durable beyond the commit either succeeding or being refused.
+- **`git merge` gate implemented 2026-08-30, the same day — the "separate, similarly-shaped follow-up"
+  flagged above.** New `scan_git_merge_gate(root, argv)`, sharing the actual scanning (`collect_content_
+  findings`, extracted from what was `scan_git_commit_gate`'s inline loop) with the commit gate rather
+  than duplicating it — the only real difference between the two boundaries is *which* files count as
+  "about to become permanent." A merge has no single "staged" set to read the way a commit does, so the
+  target ref(s) are read straight from `argv` (every trailing token after `git merge` that doesn't start
+  with `-`; a flag-only invocation like `git merge --continue` has no such token and is correctly left
+  alone), the changed-file list comes from `git diff --name-only HEAD <ref>`, and each file's *incoming*
+  content is read via `git show <ref>:<path>` — deliberately never the working tree, which an unmerged
+  branch hasn't touched yet. Both gates are checked at the same `execute_shell` call site
+  (`scan_git_commit_gate(...).or_else(|| scan_git_merge_gate(...))`). New test
+  `git_merge_is_blocked_by_an_unresolved_secret_in_the_incoming_branch`: a real second branch with a real
+  staged-then-committed secret, a real blocked merge (confirmed by the target file never landing on disk),
+  then a real successful merge after `rapid findings dismiss`. Full `-p rapid` suite (302 lib tests) and
+  `cargo build --workspace --tests` pass. Both named `PatchPolicyGate` boundaries (`VER-009`: "before
+  commit/merge") are now real gates, not advisories — only the durable-evidence half of `VER-009` and a
+  shell-string-wrapped invocation of either command remain open.
 
 ### 2.10 Scoped Credential Broker + Resource Governor
 
