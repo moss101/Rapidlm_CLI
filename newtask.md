@@ -1450,6 +1450,24 @@ genuine OS-level work — this is disk specifically, and specifically the "unbou
 not a byte-accurate disk-usage monitor (a single `fs::write` beyond the file's own existing size isn't
 separately accounted for, e.g. overwriting a large file with a similarly large one; the ceiling is on
 cumulative *written* bytes this turn, not net disk delta).
+- **Explicit scope note, 2026-08-30, added after checking whether this axis' "checked in `execute_write`/
+  `execute_patch`" language could be misread as covering more than it does.** `shell_exec` can write
+  arbitrary bytes to disk inside the workspace via ordinary shell commands (`dd`, `curl -o`, redirection,
+  a heredoc) — none of `execute_shell`'s three branches (plain, background, sandboxed) call `reserve_
+  write_budget`, so a shell-driven write is completely outside `MAX_TOTAL_WRITE_BYTES_PER_TURN`'s
+  accounting. Confirmed this isn't the same "settled, tested, documented exclusion" shape as `write_scope`
+  deliberately not covering `shell_exec` (that one has both an explanatory comment and a dedicated test;
+  this one has neither anywhere near `execute_shell` or `reserve_write_budget`). It also isn't a small
+  wiring gap the way the `git commit`/`git merge` gate and the team-memory patch gate were, both fixed
+  earlier this session: those were the *same* check, trivially applicable to a sibling code path that was
+  just never wired to it. This one is structurally different — `reserve_write_budget` pre-reserves a
+  *known* byte count before a structured `workspace_write`/`workspace_patch` call runs; a shell command's
+  eventual disk footprint isn't known until (if ever) it finishes, so pre-reservation doesn't apply the
+  same way, and accounting for it after the fact would need real OS-level disk-usage monitoring of the
+  child process — the same category of work this section already calls out as an open, separate gap for
+  CPU and RAM, just not previously named for disk specifically. Not attempted here; recorded as a precise
+  scope boundary on the "disk axis... implemented" claim above rather than left to be misread as
+  comprehensive.
 
 **Network axis, 2026-08-30: same shape, applied to `web_fetch`.** `MAX_TOTAL_FETCH_BYTES_PER_TURN`
 (16 MB) enforced via a `fetch_bytes: Arc<AtomicU64>` counter and `reserve_fetch_budget()` (identical
