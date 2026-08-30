@@ -1009,6 +1009,29 @@ model, routing reason, policy version, estimated vs. actual cost — "routing mu
   a wrap-inducing size, which is why this wasn't caught before. Full `-p llm-router` suite (139 lib
   tests), full `-p rapid` suite (323 lib tests + integration binaries), and `cargo build --workspace
   --tests` all pass.
+- **Second unrelated security fix, 2026-08-30, same audit sweep: a symlinked intermediate directory could
+  get real directories created outside the workspace root before the escape was ever detected.**
+  `apps/rapid/src/exec_tools.rs::WorkspaceTools::resolve_in_root` already correctly refused a symlinked
+  *leaf* (`ln -s /etc/passwd leak.txt`, tested by the existing `symlinked_leaf_escape_is_refused_on_read_
+  and_write`) — but its handling of the containing *directory* had a real ordering flaw: it called
+  `fs::create_dir_all(parent)` on the whole parent path first, then canonicalized and rejected it only
+  afterward if it resolved outside the root. If an intermediate component were a pre-existing symlink into
+  a directory outside the workspace (`ln -s /tmp/evil root/link`, then a write to `link/sub/file.txt`),
+  `create_dir_all` would follow that symlink and create `sub` inside `/tmp/evil` *before* the
+  canonicalize-and-reject check ever ran — the final file write was still correctly refused, but the
+  escape (a real directory created outside the root) had already happened on disk. Confirmed with a real
+  reproduction before fixing: a new test failed against the unfixed code exactly this way. **Fixed:**
+  `resolve_in_root` now walks the path one component at a time — for each intermediate level, check first
+  (`symlink_metadata` + canonicalize + `starts_with(root)`) and only create that single level
+  (`fs::create_dir`, not `create_dir_all`) if it's genuinely missing, before ever stepping into the next
+  component. Nothing is created or entered past the point a symlink is found to lead outside the root,
+  closing the exact race the old "create everything, then check" ordering had. New test
+  `symlinked_intermediate_directory_creates_nothing_outside_the_root`: seeds a directory symlink, attempts
+  a nested write through it, confirms the write is refused *and* that no directory was created outside the
+  root — reproduced against the unfixed code first (failed exactly as predicted), then confirmed passing
+  after the fix. Full `-p rapid` suite (324 lib tests, both symlink tests passing together) and
+  `cargo build --workspace --tests` pass — including every existing nested-directory write test, so the
+  common (non-symlinked) case is unaffected.
 
 ### 2.9 Persisted, content-hash-keyed review findings + `PatchPolicyGate`
 

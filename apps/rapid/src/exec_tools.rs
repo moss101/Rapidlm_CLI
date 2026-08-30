@@ -894,23 +894,45 @@ impl WorkspaceTools {
     }
 
     /// Resolve a checked relative path inside the root. The containing
-    /// directory is created if missing and canonicalized, so a symlinked
+    /// directory is created one level at a time if missing, each level
+    /// checked before the next is created or entered, so a symlinked
     /// directory cannot move the target outside the workspace.
     fn resolve_in_root(&self, relative: &str) -> Result<PathBuf, ToolStepError> {
-        let target = self.root.join(checked_relative(relative)?);
-        if let Some(parent) = target.parent() {
-            let _ = fs::create_dir_all(parent);
-            let resolved = parent.canonicalize().map_err(|_| ToolStepError::Invalid)?;
-            if !resolved.starts_with(self.root()) {
-                return Err(ToolStepError::Invalid);
+        let relative = checked_relative(relative)?;
+        let mut components: Vec<Component<'_>> = relative.components().collect();
+        // `checked_relative` already guarantees at least one component (empty
+        // strings are rejected), so this only defends against a future
+        // change to that contract, not a case reachable today.
+        let leaf = components.pop().ok_or(ToolStepError::Invalid)?;
+        // Walk one path component at a time rather than resolving the whole
+        // parent in one `create_dir_all`: creating every level first and
+        // checking only afterward means a symlinked intermediate directory
+        // (`ln -s /tmp/evil root/link`, then a write to `link/sub/file.txt`)
+        // would have `sub` created inside `/tmp/evil` by `create_dir_all`
+        // *before* the canonicalize-and-reject check ever ran — the escape
+        // already happened on disk even though the final write was still
+        // refused. Checking (and, if missing, creating) each level before
+        // stepping into the next means nothing is ever created or entered
+        // past the point a symlink is found to lead outside the root.
+        let mut current = self.root.clone();
+        for component in components {
+            current.push(component);
+            if current.symlink_metadata().is_ok() {
+                let resolved = current.canonicalize().map_err(|_| ToolStepError::Invalid)?;
+                if !resolved.starts_with(self.root()) {
+                    return Err(ToolStepError::Invalid);
+                }
+            } else {
+                fs::create_dir(&current).map_err(|_| ToolStepError::Invalid)?;
             }
         }
-        // The parent check above only proves the containing directory sits
-        // inside the workspace; a symlinked leaf (`ln -s /etc/passwd
-        // leak.txt`) would still resolve outside the root on open/read/write.
+        let target = current.join(leaf);
+        // The loop above only proves every containing directory sits inside
+        // the workspace; a symlinked leaf (`ln -s /etc/passwd leak.txt`)
+        // would still resolve outside the root on open/read/write.
         // `symlink_metadata` detects existence without following the link, so
-        // a not-yet-created file (nothing to check) is left to the parent
-        // check above.
+        // a not-yet-created file (nothing to check) is left to the loop
+        // above.
         if target.symlink_metadata().is_ok() {
             let resolved = target.canonicalize().map_err(|_| ToolStepError::Invalid)?;
             if !resolved.starts_with(self.root()) {
@@ -5474,6 +5496,40 @@ use std::sync::{Arc, Mutex};
             fs::read_to_string(&secret).expect("outside file still readable"),
             "outside-secret",
             "the write must never follow the symlink outside the workspace root"
+        );
+    }
+
+    #[test]
+    fn symlinked_intermediate_directory_creates_nothing_outside_the_root() {
+        // `resolve_in_root` canonicalizes the parent directory and rejects it
+        // if that lands outside the root — but `fs::create_dir_all(parent)`
+        // runs *before* that check, on the raw (symlink-following) path. If
+        // an intermediate path component is a symlink into a directory
+        // outside the workspace, `create_dir_all` can create real
+        // directories out there before the canonicalize-and-reject check
+        // ever runs, even though the final write is still correctly refused.
+        let root = TempRoot::new("symlink-intermediate");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        let outside = TempRoot::new("symlink-intermediate-outside");
+        std::os::unix::fs::symlink(&outside.0, root.0.join("link")).expect("dir symlink");
+
+        let write = ProposedToolCall::new(
+            "c1",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"link/subdir/file.txt","content":"pwned"}"#,
+        )
+        .expect("call");
+        let validated = tools.validate(&write, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel) {
+            Ok(ToolStepResult::Failed { .. }) | Ok(ToolStepResult::Denied { .. }) | Err(_) => {}
+            other => panic!("expected the write through the symlinked directory to be refused, got {other:?}"),
+        }
+        assert!(
+            !outside.0.join("subdir").exists(),
+            "no directory should ever be created outside the workspace root, \
+             even when the final write itself is refused"
         );
     }
 
