@@ -46,7 +46,8 @@ use crate::backend::{
     SandboxSpec,
 };
 use crate::backends::host_restricted::{
-    is_forbidden_host_source, pid_rss_kb, resolve_cwd, resolve_existing_dir,
+    is_forbidden_host_source, isolate_process_group, resolve_cwd, resolve_existing_dir,
+    sample_process_group, terminate_process_group,
 };
 
 /// Maximum prepared Seatbelt sandboxes retained by one backend.
@@ -91,6 +92,7 @@ struct SeatbeltPlan {
     output_limit: u64,
     cpu_millis: u32,
     memory_mb: u32,
+    pids: u32,
 }
 
 struct PreparedSession {
@@ -202,6 +204,7 @@ impl SandboxBackend for SeatbeltBackend {
             output_limit: spec.output_limit(),
             cpu_millis: spec.cpu_millis(),
             memory_mb: spec.memory_mb(),
+            pids: spec.pids(),
         };
         let mut sessions = self.lock_sessions()?;
         if sessions.len() >= MAX_LIVE_SEATBELT_SANDBOXES {
@@ -326,6 +329,12 @@ fn run_seatbelt(
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    // Own process group: the target program's own descendants (if it forks
+    // any) share it too, since group membership survives `exec` the same
+    // way the CPU rlimit above does — needed so memory/pid-count monitoring
+    // covers more than just the single pid the exec chain hands back, and so
+    // termination below can reap the whole group, not just that one pid.
+    isolate_process_group(&mut command);
     let mut child = command.spawn().map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             SandboxError::ForbiddenMount
@@ -339,6 +348,7 @@ fn run_seatbelt(
         request.timeout(),
         request.output_limit(),
         plan.memory_mb,
+        plan.pids,
         cancel,
     );
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -399,6 +409,18 @@ fn run_seatbelt(
             ),
             output,
         )),
+        WaitOutcome::PidsExceeded { output } => Ok(SandboxExecResult::new(
+            SandboxExit::new(
+                None,
+                None,
+                SandboxExitReason::PolicyViolation,
+                false,
+                false,
+                true,
+                usage(elapsed_ms, &output),
+            ),
+            output,
+        )),
     }
 }
 
@@ -417,6 +439,9 @@ enum WaitOutcome {
     Oom {
         output: Vec<u8>,
     },
+    PidsExceeded {
+        output: Vec<u8>,
+    },
 }
 
 fn wait_child(
@@ -424,6 +449,7 @@ fn wait_child(
     timeout: Duration,
     output_limit: u64,
     memory_mb: u32,
+    pids: u32,
     cancel: &CancellationToken,
 ) -> WaitOutcome {
     let cap = usize::try_from(output_limit).unwrap_or(usize::MAX);
@@ -432,37 +458,39 @@ fn wait_child(
     let stdout_reader = stdout.map(|pipe| thread::spawn(move || read_capped(pipe, cap)));
     let stderr_reader = stderr.map(|pipe| thread::spawn(move || read_capped(pipe, cap)));
     let deadline = Instant::now() + timeout;
-    let pid = child.id();
+    // `isolate_process_group` put this child in its own process group with
+    // pgid == its own pid, so `pid` doubles as the group id `sample_process_
+    // group` needs — covers whatever the target program itself forks, not
+    // just the single pid the `sh -c '...; exec sandbox-exec ...'` chain
+    // hands back.
+    let pgid = child.id();
     enum Stop {
         Timeout,
         Cancelled,
         Oom,
+        PidsExceeded,
     }
     let outcome = loop {
         if let Ok(Some(status)) = child.try_wait() {
             break Ok(status);
         }
         if cancel.is_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_process_group(child);
             break Err(Stop::Cancelled);
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_process_group(child);
             break Err(Stop::Timeout);
         }
-        // Single-pid RSS check: unlike `host_restricted.rs`'s process-group
-        // model, `sh -c '...; exec sandbox-exec ...'` execs straight through
-        // to the final target (the whole chain shares one pid, `exec` never
-        // changes it), so there is no group to sum across — reusing
-        // `pid_rss_kb` directly is exact here, not an approximation.
-        if let Some(rss_kb) = pid_rss_kb(pid)
-            && rss_kb.div_ceil(1024) > u64::from(memory_mb)
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            break Err(Stop::Oom);
+        if let Some((group_pids, memory_peak_mb)) = sample_process_group(pgid) {
+            if memory_peak_mb > u64::from(memory_mb) {
+                terminate_process_group(child);
+                break Err(Stop::Oom);
+            }
+            if group_pids > pids {
+                terminate_process_group(child);
+                break Err(Stop::PidsExceeded);
+            }
         }
         thread::sleep(POLL_INTERVAL);
     };
@@ -476,6 +504,7 @@ fn wait_child(
         Err(Stop::Cancelled) => WaitOutcome::Cancelled { output },
         Err(Stop::Timeout) => WaitOutcome::TimedOut { output },
         Err(Stop::Oom) => WaitOutcome::Oom { output },
+        Err(Stop::PidsExceeded) => WaitOutcome::PidsExceeded { output },
     }
 }
 
@@ -970,6 +999,47 @@ capability = "fs.read"
         let result = backend.exec(&handle, &request, &lease, &live).expect("exec");
         assert!(result.exit().oom(), "the memory ceiling should have killed it");
         assert!(!result.exit().timed_out(), "killed by the memory limit, not the wall-clock timeout");
+        backend.destroy(&handle, &live).expect("destroy");
+    }
+
+    #[test]
+    fn pid_count_ceiling_kills_a_command_that_forks_past_it() {
+        if !seatbelt_available() {
+            return;
+        }
+        // Same reproduction shape as `host_restricted.rs::advertised_pids_
+        // bound_is_enforced`: a shell script backgrounds two `sleep`
+        // children and waits on them, so the group holds the inner shell
+        // plus both children — 3 processes against a ceiling of 1. Relies
+        // on the same "a non-interactive `sh -c` script's background jobs
+        // stay in the parent's process group" behavior that test already
+        // depends on; `isolate_process_group` on the outer wrapper survives
+        // every `exec` in the chain (the CPU-rlimit wrapper, then `sandbox-
+        // exec`'s own exec of this script), so the inner shell and its
+        // children all land in the one group `sample_process_group` reads.
+        let backend = SeatbeltBackend::new();
+        let ws = TempWorkspace::new();
+        let spec = SandboxSpec::builder(SandboxTier::HostRestricted)
+            .cwd(cwd())
+            .mount(ws.mount("src", MountMode::ReadWrite))
+            .pids(1)
+            .build()
+            .expect("spec");
+        let lease = proc_lease();
+        let live = CancellationToken::new();
+        let handle = backend.prepare(&spec, &lease, &live).expect("prepare");
+        let request = SandboxExecRequest::new(
+            ["/bin/sh", "-c", "/bin/sleep 30 & /bin/sleep 30 & wait"],
+            Duration::from_secs(30),
+            1024,
+        )
+        .expect("request");
+        let result = backend.exec(&handle, &request, &lease, &live).expect("exec");
+        assert!(
+            result.exit().policy_violation(),
+            "the pid-count ceiling should have killed it"
+        );
+        assert!(!result.exit().timed_out(), "killed by the pid ceiling, not the wall-clock timeout");
         backend.destroy(&handle, &live).expect("destroy");
     }
 

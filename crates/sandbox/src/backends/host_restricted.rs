@@ -911,7 +911,11 @@ fn read_capped(mut pipe: impl Read, cap: usize) -> (Vec<u8>, bool) {
     }
 }
 
-fn isolate_process_group(command: &mut Command) {
+/// `pub(crate)` so `seatbelt.rs` can put its own spawned command in its own
+/// process group too — needed for real memory/pid-count monitoring across
+/// whatever the target program itself forks, not just the one pid the
+/// `sh -c '...; exec sandbox-exec ...'` chain hands back.
+pub(crate) fn isolate_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -925,7 +929,9 @@ fn isolate_process_group(command: &mut Command) {
     }
 }
 
-fn terminate_process_group(child: &mut Child) {
+/// `pub(crate)` for `seatbelt.rs`'s reuse — same graceful TERM-then-KILL
+/// sequence for every group member, not just the one tracked pid.
+pub(crate) fn terminate_process_group(child: &mut Child) {
     let pid = child.id();
     if pid >= 2 {
         let _ = signal_group(pid, GroupSignal::Term);
@@ -1015,7 +1021,9 @@ fn platform_signal_group(_pgid: u32, _kind: GroupSignal) -> Result<(), SandboxEr
 }
 
 /// `(pids, memory_mb)` for the dedicated process group. `None` if unreadable.
-fn sample_process_group(pgid: u32) -> Option<(u32, u64)> {
+/// `pub(crate)` for `seatbelt.rs`'s reuse, once it isolates its own spawned
+/// command into a process group too.
+pub(crate) fn sample_process_group(pgid: u32) -> Option<(u32, u64)> {
     if pgid < 2 {
         return None;
     }
@@ -1096,11 +1104,8 @@ fn ps_group(pgid: u32) -> Option<Vec<u32>> {
     }
 }
 
-/// Resident set size for one pid, in KB. `pub(crate)` so `seatbelt.rs` can
-/// reuse it for its own (single-pid, no process-group) memory ceiling —
-/// same reuse-tested-logic-rather-than-duplicate-it rationale as this
-/// module's mount/cwd-resolution and forbidden-host-source helpers.
-pub(crate) fn pid_rss_kb(pid: u32) -> Option<u64> {
+/// Resident set size for one pid, in KB.
+fn pid_rss_kb(pid: u32) -> Option<u64> {
     let program = first_existing(PS_PROGRAMS)?;
     let output = Command::new(program)
         .args(["-o", "rss=", "-p", &pid.to_string()])

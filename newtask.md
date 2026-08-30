@@ -1428,9 +1428,35 @@ sandboxed shell commands) remain unaddressed.
   demands:** temporarily raised the ceiling to 4096 MB and re-ran — the test correctly failed, running the
   full 30-second timeout with no kill, confirming the check is genuinely load-bearing before restoring the
   real 64 MB ceiling. Full `sandbox` crate suite (96 tests, up from 95) and `cargo build --workspace
-  --tests` pass. `SeatbeltBackend` now enforces both CPU and memory ceilings, matching `HostRestrictedBackend`'s
-  coverage exactly; only the two backends' still-separate (job-based vs. this synchronous one) execution
-  paths in `apps/rapid` remain unmerged, per this section's own earlier note.
+  --tests` pass.
+- **Correction, same day: the "matching `HostRestrictedBackend`'s coverage exactly" claim just above was
+  wrong on two counts, caught while checking whether the other two backends (`container.rs`/`gvisor.rs`)
+  had the same memory gap Seatbelt did — they didn't; both already had full CPU+memory+pid-count
+  enforcement, confirming Seatbelt was genuinely the one outlier, not a symptom of a wider pattern.**
+  First: the single-pid RSS check above only tracked the one pid the `sh -c '...; exec sandbox-exec ...'`
+  chain hands back — a target program that forks its own children would have those children's memory go
+  completely uncounted, unlike `HostRestrictedBackend`'s process-group-wide sampling. Second: Seatbelt still
+  had no pid-*count* ceiling at all, a fourth dimension `host_restricted.rs`/`container.rs`/`gvisor.rs` all
+  already enforce (`WaitOutcome::PidsExceeded`) that this backend simply never gained. **Fixed properly
+  instead of leaving the overstated claim standing:** `run_seatbelt`'s spawned command now calls
+  `isolate_process_group` (made `pub(crate)` on `host_restricted.rs`, reused rather than duplicated) —
+  process-group membership survives every `exec` in the chain (the CPU-rlimit wrapper, then `sandbox-exec`'s
+  own exec of the target) exactly the way the CPU rlimit itself does, so the target's own forked children
+  land in the same group. `wait_child` now calls `host_restricted.rs::sample_process_group` (also made
+  `pub(crate)`) instead of the single-pid `pid_rss_kb`, checking *both* memory and pid-count against
+  `SeatbeltPlan`'s `memory_mb`/new `pids` field every poll, and uses the reused `terminate_process_group`
+  (also `pub(crate)` now) for every termination path (timeout/cancel/oom/pids-exceeded) instead of a bare
+  `child.kill()` — killing the whole group, not just the one tracked pid. New test `pid_count_ceiling_
+  kills_a_command_that_forks_past_it`: the same reproduction shape as `host_restricted.rs`'s own
+  `advertised_pids_bound_is_enforced` (a shell script backgrounds two `sleep` children against a ceiling of
+  1), verified not vacuous the identical way (temporarily raised to 64, confirmed it then ran the full
+  timeout with no kill, before restoring 1). Confirmed no regression to existing timeout/cancel semantics
+  from switching to `terminate_process_group`'s graceful TERM-then-KILL sequence: all 13 pre-existing
+  Seatbelt tests still pass, and the full 97-test `sandbox` suite still completes in ~2.4 seconds. Full
+  `-p rapid` suite (326 lib tests) and `cargo build --workspace --tests` pass too. `SeatbeltBackend` now
+  genuinely matches its three siblings on all three resource dimensions (CPU/memory/pid-count); only the
+  still-separate execution paths in `apps/rapid` (job-based vs. this synchronous backend) remain unmerged,
+  per this section's own earlier note.
 - **Correction, same day: the first version of both new CPU tests was itself broken, and silently proved
   nothing — worth recording exactly why, since it's a real testing-methodology trap.** Both this fix's
   first regression test and the `SeatbeltBackend` CPU test originally used a *wall-clock-bounded* busy
