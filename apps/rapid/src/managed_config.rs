@@ -27,7 +27,10 @@
 //! * `max_write_bytes_per_turn`/`max_fetch_bytes_per_turn` lower
 //!   `apps/rapid`'s own built-in per-turn disk/network ceilings
 //!   (`WorkspaceTools::narrow_write_ceiling`/`narrow_fetch_ceiling` —
-//!   narrow-only, a larger value than the built-in default is a no-op).
+//!   narrow-only, a larger value than the built-in default is a no-op);
+//! * `max_subagent_spawns_per_turn` lowers the built-in `task_spawn` count
+//!   ceiling the same narrow-only way
+//!   (`WorkspaceTools::narrow_subagent_spawn_ceiling`).
 //!
 //! Every gate outcome is reported with field id, origin, and remediation so
 //! operators can see exactly which layer decided what.
@@ -169,6 +172,9 @@ pub struct ManagedPolicy {
     /// Per-turn `web_fetch` ceiling override, same shape as
     /// `max_write_bytes_per_turn`.
     max_fetch_bytes_per_turn: Option<u64>,
+    /// Per-turn `task_spawn` count ceiling override, applied via
+    /// `WorkspaceTools::narrow_subagent_spawn_ceiling` — narrow-only.
+    max_subagent_spawns_per_turn: Option<u64>,
 }
 
 impl ManagedPolicy {
@@ -183,6 +189,7 @@ impl ManagedPolicy {
     /// max_permission_mode = "acceptEdits"
     /// denied_tools = ["shell_exec"]
     /// confine_writes_to = "src"
+    /// max_subagent_spawns_per_turn = 8
     /// ```
     pub fn parse(toml_str: &str) -> Result<Self, ManagedConfigError> {
         let value: toml::Value =
@@ -227,6 +234,7 @@ impl ManagedPolicy {
                     | "confine_writes_to"
                     | "max_write_bytes_per_turn"
                     | "max_fetch_bytes_per_turn"
+                    | "max_subagent_spawns_per_turn"
             ) {
                 return Err(ManagedConfigError::UnknownField {
                     field: format!("policy.{key}"),
@@ -386,6 +394,8 @@ impl ManagedPolicy {
         };
         let max_write_bytes_per_turn = parse_positive_integer(policy, "max_write_bytes_per_turn")?;
         let max_fetch_bytes_per_turn = parse_positive_integer(policy, "max_fetch_bytes_per_turn")?;
+        let max_subagent_spawns_per_turn =
+            parse_positive_integer(policy, "max_subagent_spawns_per_turn")?;
         Ok(Self {
             locked_default,
             allowed_providers,
@@ -395,6 +405,7 @@ impl ManagedPolicy {
             confine_writes_to,
             max_write_bytes_per_turn,
             max_fetch_bytes_per_turn,
+            max_subagent_spawns_per_turn,
         })
     }
 
@@ -428,6 +439,10 @@ impl ManagedPolicy {
 
     pub fn max_fetch_bytes_per_turn(&self) -> Option<u64> {
         self.max_fetch_bytes_per_turn
+    }
+
+    pub fn max_subagent_spawns_per_turn(&self) -> Option<u64> {
+        self.max_subagent_spawns_per_turn
     }
 }
 
@@ -730,7 +745,7 @@ base_url = "http://gateway.internal:8080"
     #[test]
     fn parse_reads_all_policy_fields_and_rejects_unknowns() {
         let policy = parse_policy(&policy_doc(
-            "locked_default = \"cloud\"\nallowed_providers = [\"anthropic\"]\nmin_reasoning_effort = \"high\"\nmax_permission_mode = \"acceptEdits\"\ndenied_tools = [\"shell_exec\"]\nconfine_writes_to = \"src\"\nmax_write_bytes_per_turn = 1024\nmax_fetch_bytes_per_turn = 2048\n",
+            "locked_default = \"cloud\"\nallowed_providers = [\"anthropic\"]\nmin_reasoning_effort = \"high\"\nmax_permission_mode = \"acceptEdits\"\ndenied_tools = [\"shell_exec\"]\nconfine_writes_to = \"src\"\nmax_write_bytes_per_turn = 1024\nmax_fetch_bytes_per_turn = 2048\nmax_subagent_spawns_per_turn = 8\n",
         ));
         assert_eq!(policy.locked_default(), Some("cloud"));
         assert_eq!(
@@ -749,6 +764,7 @@ base_url = "http://gateway.internal:8080"
         assert_eq!(policy.confine_writes_to(), Some("src"));
         assert_eq!(policy.max_write_bytes_per_turn(), Some(1024));
         assert_eq!(policy.max_fetch_bytes_per_turn(), Some(2048));
+        assert_eq!(policy.max_subagent_spawns_per_turn(), Some(8));
         let bad = format!("schema = \"{MANAGED_SCHEMA}\"\nsurprise = 1\n[policy]\n");
         let err = ManagedPolicy::parse(&bad).expect_err("unknown field");
         assert!(err.to_string().contains("unknown field 'surprise'"));
@@ -914,6 +930,10 @@ reasoning_effort = "low"
         let negative = ManagedPolicy::parse(&policy_doc("max_fetch_bytes_per_turn = -1\n"))
             .expect_err("negative");
         assert!(negative.to_string().contains("must be a positive integer"));
+
+        let zero_spawns = ManagedPolicy::parse(&policy_doc("max_subagent_spawns_per_turn = 0\n"))
+            .expect_err("zero spawns");
+        assert!(zero_spawns.to_string().contains("must be a positive integer"));
     }
 
     #[test]

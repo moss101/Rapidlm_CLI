@@ -612,6 +612,13 @@ pub struct WorkspaceTools {
     max_write_bytes: u64,
     /// Same shape as `max_write_bytes`, for `web_fetch`'s per-turn ceiling.
     max_fetch_bytes: u64,
+    /// Per-turn `task_spawn` count ceiling (Modbit `WRK-017`/`CAP-001`),
+    /// same admin-lowerable shape as `max_write_bytes`/`max_fetch_bytes`.
+    /// Deliberately *not* propagated to subagent children the way the byte
+    /// ceilings are: `disable_nested_spawn` already makes `task_spawn`
+    /// unreachable from a child entirely, so a child's own copy of this
+    /// field is dead data, not a gap.
+    max_subagent_spawns: u64,
 }
 
 impl WorkspaceTools {
@@ -650,6 +657,7 @@ impl WorkspaceTools {
             nested_spawn_allowed: true,
             max_write_bytes: MAX_TOTAL_WRITE_BYTES_PER_TURN,
             max_fetch_bytes: MAX_TOTAL_FETCH_BYTES_PER_TURN,
+            max_subagent_spawns: MAX_SUBAGENT_SPAWNS_PER_TURN,
         })
     }
 
@@ -862,6 +870,17 @@ impl WorkspaceTools {
     /// Same shape as `narrow_write_ceiling`, for the network ceiling.
     pub(crate) fn narrow_fetch_ceiling(&mut self, max: u64) {
         self.max_fetch_bytes = self.max_fetch_bytes.min(max);
+    }
+
+    /// Same shape as `narrow_write_ceiling`, for the per-turn `task_spawn`
+    /// count ceiling.
+    pub(crate) fn narrow_subagent_spawn_ceiling(&mut self, max: u64) {
+        self.max_subagent_spawns = self.max_subagent_spawns.min(max);
+    }
+
+    #[cfg(test)]
+    fn subagent_spawn_ceiling(&self) -> u64 {
+        self.max_subagent_spawns
     }
 
     /// Attach the subagent runner (composition root only; children are built
@@ -2198,12 +2217,13 @@ impl WorkspaceTools {
                 )),
             });
         };
-        if self.subagent_spawns.fetch_add(1, Ordering::SeqCst) >= MAX_SUBAGENT_SPAWNS_PER_TURN {
+        if self.subagent_spawns.fetch_add(1, Ordering::SeqCst) >= self.max_subagent_spawns {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
                 detail: Some(bounded_detail(&format!(
-                    "task_spawn budget exhausted: {MAX_SUBAGENT_SPAWNS_PER_TURN} subagents already started this turn"
+                    "task_spawn budget exhausted: {} subagents already started this turn",
+                    self.max_subagent_spawns
                 ))),
             });
         }
@@ -3814,6 +3834,14 @@ impl ExecTools {
         }
     }
 
+    /// Lower the per-turn `task_spawn` count ceiling (no-op on the no-op
+    /// surface). See `WorkspaceTools::narrow_subagent_spawn_ceiling`.
+    pub(crate) fn narrow_subagent_spawn_ceiling(&mut self, max: u64) {
+        if let Self::Workspace(tools) = self {
+            tools.narrow_subagent_spawn_ceiling(max);
+        }
+    }
+
     /// The trusted workspace surface with an explicit permission lattice.
     pub fn workspace_with_permissions(
         root: &Path,
@@ -4489,6 +4517,67 @@ use std::sync::{Arc, Mutex};
             }
             other => panic!("expected the narrowed ceiling to refuse the write, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn narrow_subagent_spawn_ceiling_only_ever_lowers_never_raises() {
+        let root = TempRoot::new("narrow-spawn-ceiling");
+        let mut tools = permissive_workspace(&root.0);
+        assert_eq!(tools.subagent_spawn_ceiling(), MAX_SUBAGENT_SPAWNS_PER_TURN);
+
+        tools.narrow_subagent_spawn_ceiling(2);
+        assert_eq!(tools.subagent_spawn_ceiling(), 2);
+
+        tools.narrow_subagent_spawn_ceiling(MAX_SUBAGENT_SPAWNS_PER_TURN);
+        assert_eq!(
+            tools.subagent_spawn_ceiling(),
+            2,
+            "a larger value must never widen an already-narrower ceiling"
+        );
+
+        use std::sync::Mutex as StdMutex;
+        struct FakeRunner {
+            calls: Arc<StdMutex<Vec<()>>>,
+        }
+        impl crate::exec_tools::SubagentRunner for FakeRunner {
+            fn run(&self, _prompt: &str, _agent_type: &str, _write_scope: Option<&str>) -> Result<SubagentReport, String> {
+                self.calls.lock().expect("lock").push(());
+                Ok(SubagentReport {
+                    summary: "done".to_owned(),
+                    status: "succeeded".to_owned(),
+                    tool_calls: 0,
+                    tokens: 0,
+                    cost_usd_micros: None,
+                    stop_reason: None,
+                    claims: Vec::new(),
+                    blockers: Vec::new(),
+                    open_questions: Vec::new(),
+                    patch_summary: None,
+                    artifacts: Vec::new(),
+                })
+            }
+        }
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        tools.subagents = Some(Arc::new(FakeRunner { calls: calls.clone() }) as Arc<dyn SubagentRunner>);
+        let cancel = CancellationToken::new();
+        for i in 0..2 {
+            let call = make_call(&format!("c{i}"), TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
+            let validated = tools.validate(&call, &cancel).expect("v");
+            match tools.execute(&validated, &cancel).expect("execute") {
+                ToolStepResult::Succeeded { .. } => {}
+                other => panic!("expected spawn {i} within the narrowed budget to succeed, got {other:?}"),
+            }
+        }
+        let over = make_call("c-over", TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
+        let validated = tools.validate(&over, &cancel).expect("v");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.unwrap().contains("task_spawn budget exhausted: 2 subagents"));
+            }
+            other => panic!("expected the narrowed spawn ceiling to refuse, got {other:?}"),
+        }
+        assert_eq!(calls.lock().expect("lock").len(), 2, "the runner never even ran past the cap");
     }
 
     #[test]

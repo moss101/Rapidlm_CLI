@@ -540,6 +540,25 @@ default; adopt the classifier-as-safety-net idea, not the classifier-as-default 
   `CAP-001`'s Policy Compiler now has four real, independently-tested admin dimensions (mode ceiling, tool
   ban, write confinement, resource ceilings); the full multi-layer merge-order primitive across arbitrary
   settings sources remains the one part of `CAP-001`/`AuthorizationEpoch` genuinely unbuilt.
+- **A fifth `CAP-001`/`WRK-017` dimension, 2026-08-30: `max_subagent_spawns_per_turn` — an admin-lowerable
+  ceiling on how many `task_spawn` calls one turn may make.** Same narrow-only shape as the byte ceilings:
+  `WorkspaceTools` gained a `max_subagent_spawns: u64` field (defaulting to the existing
+  `MAX_SUBAGENT_SPAWNS_PER_TURN` constant) that `execute_task_spawn`'s budget check now compares against
+  instead of the constant directly, plus a `narrow_subagent_spawn_ceiling` setter that takes the minimum of
+  the current value and the requested one — verified by
+  `narrow_subagent_spawn_ceiling_only_ever_lowers_never_raises`, which narrows the ceiling to 2, confirms a
+  call with the original (larger) constant is a no-op, then drives two real `task_spawn` calls through a
+  `FakeRunner` and confirms a third is refused with the interpolated ceiling in the error message.
+  Deliberately **not** propagated to subagent children the way the byte ceilings are: `disable_nested_spawn`
+  already makes `task_spawn` unreachable from a child entirely, so a child's own copy of this field would be
+  dead data, not a gap — no `LiveSubagentRunner` field was added for it. `managed_config.rs` gained
+  `max_subagent_spawns_per_turn: Option<u64>`, parsed through the same `parse_positive_integer` helper as
+  the byte ceilings (rejecting zero, since a ceiling of zero would refuse every `task_spawn` call), and
+  applied in `exec_turn` alongside `max_write_bytes_per_turn`/`max_fetch_bytes_per_turn` in the same
+  re-loaded-policy block. Full `-p rapid` suite (319 lib tests), `cargo test -p rapid --tests` (all
+  integration binaries), and `cargo build --workspace --tests` pass. `CAP-001`'s Policy Compiler now has
+  five real, independently-tested admin dimensions; the full multi-layer merge-order primitive across
+  arbitrary settings sources remains the one part of `CAP-001`/`AuthorizationEpoch` genuinely unbuilt.
 
 ### 2.4 `CompletionContract` (tri-state) + `VerificationPlane`
 

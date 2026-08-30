@@ -1641,6 +1641,9 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
         if let Some(max) = policy.max_fetch_bytes_per_turn() {
             tools.narrow_fetch_ceiling(max);
         }
+        if let Some(max) = policy.max_subagent_spawns_per_turn() {
+            tools.narrow_subagent_spawn_ceiling(max);
+        }
     }
     // Observability for the fail-closed default: when headless exec runs
     // without workspace tools (or under a mode that refuses every call), say
