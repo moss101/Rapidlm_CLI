@@ -261,7 +261,7 @@ impl RuntimeGraph {
         for e in self
             .edges
             .iter()
-            .filter(|e| e.to == id && e.kind.is_executable_dependency())
+            .filter(|e| e.to == id && e.kind.gates_readiness())
         {
             let pred = self.nodes.get(&e.from);
             let ok = match e.condition {

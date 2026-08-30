@@ -310,6 +310,20 @@ mod tests {
     }
 
     #[test]
+    fn fanned_out_shards_are_ready_immediately_not_deadlocked_on_parent() {
+        let (mut svc, dir) = open_service();
+        let graph = svc.create("root").expect("create");
+        let shards = svc.fan_out(graph.graph_id, graph.root, 2).expect("fanout");
+        let ready = svc.snapshot(graph.graph_id).unwrap().ready_set();
+        assert!(
+            ready.contains(&shards[0]) && ready.contains(&shards[1]),
+            "fanned-out shards must be schedulable without waiting on the still-pending/running \
+             parent that decomposed into them; ready set was {ready:?}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn resource_and_workspace_conflicts_block_ready() {
         let (mut svc, dir) = open_service();
         let graph = svc.create("root").expect("create");

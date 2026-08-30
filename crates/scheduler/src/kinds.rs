@@ -162,10 +162,24 @@ impl EdgeKind {
         }
     }
 
+    /// Edges that must stay acyclic (checked by `has_executable_cycle`).
+    /// Includes `DecomposesInto`: a task cannot decompose into its own
+    /// ancestor any more than it can depend on its own ancestor.
     pub const fn is_executable_dependency(self) -> bool {
         matches!(
             self,
             Self::DependsOn | Self::ScheduledAfter | Self::JoinsAt | Self::DecomposesInto
         )
+    }
+
+    /// Edges whose predecessor must reach the required state before a node
+    /// is considered ready to run (`Graph::is_ready`'s gating loop).
+    /// Deliberately excludes `DecomposesInto`: it expresses parent -> child
+    /// structural composition (e.g. `GraphService::fan_out`'s shards), not
+    /// execution order. A parent typically only succeeds once its fanned-out
+    /// children do, so gating a child's readiness on its parent already
+    /// having succeeded would make every decomposition deadlock.
+    pub const fn gates_readiness(self) -> bool {
+        matches!(self, Self::DependsOn | Self::ScheduledAfter | Self::JoinsAt)
     }
 }

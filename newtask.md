@@ -245,6 +245,36 @@ the fix temporarily reverted to the old locator-summing logic, the test failed w
 the fix makes it pass. Full `context-engine` crate suite (308 tests, up from 307) and `cargo build
 --workspace --tests` pass.
 
+**Fresh review pass, 2026-08-30, `crates/scheduler` — `GraphService::fan_out` deadlocked every shard it
+created, against its own graph's stated readiness contract.** `EdgeKind::is_executable_dependency()`
+(`kinds.rs`) included `DecomposesInto` alongside `DependsOn`/`ScheduledAfter`/`JoinsAt`, and `Graph::is_ready`
+(`graph.rs`) gated a node's readiness on *every* `is_executable_dependency()` predecessor edge into it
+having reached the required state (default `EdgeCondition::PredecessorSucceeded`). `fan_out` (`service.rs`)
+creates shard nodes wired `parent --DecomposesInto--> shard`, and `orch.rs::GraphBackedRun::start` wires
+`goal --DecomposesInto--> task` the same way — but a parent that has just decomposed into children is
+`Pending`/`Running`, not `Succeeded` (a parent's own completion normally depends on its children finishing,
+not the reverse), so every shard's `is_ready` check failed on its very first predecessor edge and could
+never become ready by itself. **Confirmed directly** (not just from the earlier review agent's report) with
+a new test added specifically to reproduce it before touching any fix code:
+`fanned_out_shards_are_ready_immediately_not_deadlocked_on_parent` calls `fan_out` on a fresh graph and
+asserts both shards appear in `ready_set()` — against the unfixed code this failed with `ready set was
+[<root>]` (neither shard present), exactly the predicted deadlock. **Why the existing
+`join_ready_requires_all_predecessors_and_fanout_creates_shards` test never caught this:** it calls
+`fan_out` then immediately force-sets both shards to `Succeeded` via `set_state` directly, never once
+checking whether the shards were actually `ready` first — it exercises the `Join` node's own predecessor
+logic, not whether a freshly-fanned-out shard is schedulable at all. **Fixed:** added a new
+`EdgeKind::gates_readiness()` (`DependsOn | ScheduledAfter | JoinsAt` — deliberately excluding
+`DecomposesInto`) and switched `Graph::is_ready`'s gating loop (`graph.rs:264`) to use it instead of
+`is_executable_dependency()`. Deliberately did **not** remove `DecomposesInto` from
+`is_executable_dependency()` itself: that method is also `proposal.rs::has_executable_cycle`'s only input,
+and a decomposition graph should still be acyclic (a task must not decompose into its own ancestor) even
+though it shouldn't gate readiness — so the two concerns now have two correctly-scoped methods instead of
+one overloaded one. Full `scheduler` crate suite (24 tests, up from 23) and `cargo build --workspace --tests`
+pass. **Latent, not yet actively firing:** confirmed via grep that `apps/rapid` never calls `fan_out` or
+touches graph readiness at all today (matches this document's own §0 note that `rapid graph` has no CLI
+surface yet) — but a real, demonstrable bug in the scheduler's own contract, worth having fixed before
+fan-out is ever wired into a real run.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
