@@ -564,11 +564,18 @@ impl ProvenanceStore {
                 limit: self.max_edges,
             });
         }
+        // Cancellation is checked in full before this point (the pre-lock
+        // pass above, and the check just above this comment) — once the
+        // batch starts landing in `inner`, it runs to completion with no
+        // further check, since bailing out via `?` partway through this
+        // loop while already holding the lock would leave some edges
+        // permanently written and others not, violating this function's own
+        // "atomically... on cancel failure nothing is written" doc comment.
+        // Safe to run uninterrupted: every iteration is a cheap in-memory
+        // push/insert, never I/O, so a full `max_edges`-sized batch still
+        // completes in negligible time.
         let first = inner.edges.len();
-        for (i, edge) in edges.into_iter().enumerate() {
-            if i % CANCEL_STRIDE == 0 {
-                cancel.check()?;
-            }
+        for edge in edges {
             let idx = inner.edges.len();
             inner.by_from.entry(edge.from).or_default().push(idx);
             inner.by_to.entry(edge.to).or_default().push(idx);

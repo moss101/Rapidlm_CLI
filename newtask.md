@@ -104,6 +104,48 @@ record) before confirming the fix closes it. Full `telemetry` crate suite (24 te
 not the "gate bypass" pattern search specifically — worth noting since it means that review methodology is
 also productive here, independent of whether the surrounding crate is even wired in yet.
 
+**Same review pass, `crates/vcs::provenance`: `ProvenanceStore::append_all` contradicted its own "append a
+bounded batch atomically... on cancel failure nothing is written" doc comment.** The mutation loop (once
+the store's mutex was already locked and edges were being pushed into `inner.edges`/`by_from`/`by_to`)
+re-checked cancellation every `CANCEL_STRIDE` (8) edges and returned early via `?` on a hit — but any edges
+already pushed in that same call's earlier iterations stayed permanently in the append-only store. A
+partial batch from `record_patch_attribution` (which can write up to 7+ edges per patch: agent/evidence/
+goal/workspace/verification/commit/symbols) would leave a misleading trail — e.g. a patch with `ProducedBy`
+recorded but `VerifiedBy` silently missing, which `lineage_for_patch` would then report as if complete.
+**Fixed:** removed the mid-loop check entirely — cancellation is already checked in full *before* the lock
+is taken (both an initial check and a full pass over the whole batch) and once more immediately after
+locking, so by the time mutation starts, either the whole batch commits or the function has already
+returned without touching `inner` at all. **Deliberately did not add a new test for the specific race this
+fixes:** the old bug's window was a handful of cheap in-memory operations between `CANCEL_STRIDE`-aligned
+checks — a genuinely single-digit-nanosecond race a concurrent test could almost never land inside
+reliably (the exact "flaky test that proves nothing" trap this session's own CPU-ceiling test correction
+already documented, just for a timing-race reason instead of a wrong-proxy-metric one). The existing
+`cancelled_record_writes_nothing`/`bound_exceeded_is_atomic` tests already cover the *pre*-mutation
+guarantees (pre-cancelled token, over-bound batch) and still pass unchanged; the fix's correctness for the
+mid-mutation case rests on the code no longer having a mid-loop exit point at all, verifiable by inspection
+rather than a race-dependent test. Full `vcs` crate suite (16 tests, unchanged) and `cargo build
+--workspace --tests` pass.
+
+**Same review pass, `handoff`: a real cross-process TOCTOU race that defeats the module's entire stated
+purpose — documented, not attempted, given the fix needs real file locking.** The module doc comment
+claims this protocol "enforces the single-writer invariant across processes via file-based persistence"
+and names "duplicate-writer rejection: only one active writer per session" as an explicit guarantee. Both
+`acquire()` and `accept()` do a plain check-then-write: `ledger.load()` (a plain `fs::read`) to see if an
+owner already exists, then — if not — `ledger.save()` (write-tmp-then-rename) to claim ownership. There is
+no advisory lock, no `O_EXCL`/`create_new` atomic-create, no synchronization spanning the gap between the
+two calls (confirmed via grep — no locking primitive anywhere in this file or its dependencies). Two
+processes racing `accept()` on the same bundle (a stale foreground CLI and a daemon, or two daemon
+instances after a crash-restart) can both `load()` and see nothing, both pass the check, and both
+`save()` — the loser's write is silently clobbered by the winner's `rename`, and *both* callers return
+`Ok`, believing they hold exclusive ownership. That is exactly the duplicate-writer scenario this protocol
+exists to make impossible. **Not attempted:** a real fix needs genuine cross-process mutual exclusion
+(an advisory file lock via `flock`, or an atomic `O_EXCL` create as the actual ownership claim instead of
+a separate load-then-save pair) — real, non-trivial systems work with real platform differences (Unix
+`flock` vs. Windows locking semantics), not a small logic fix like the two just above. Latent today (zero
+callers anywhere outside this crate, confirmed), but a genuine, demonstrable divergence between the stated
+invariant and actual behavior for whenever `handoff` does get wired in — worth fixing before that happens,
+not after.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
