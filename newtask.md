@@ -783,6 +783,36 @@ their results become evidence, not just a console warning).
   `shadow_diagnostics_applies_a_passing_write_for_real` to also assert a secret introduced through that
   path is flagged, not just the plain path. Full `-p rapid` suite (297 lib tests, unchanged count since
   this extended an existing test rather than adding a new one) and `cargo build --workspace --tests` pass.
+- **The actual `PatchPolicyGate` (`VER-009`) — the one piece of this whole section repeatedly flagged as
+  "the bulk of it remains unattempted" across every prior correction — implemented 2026-08-30 for its
+  single most meaningful boundary: `git commit`.** Every scanner wired this session (secrets, patch-
+  policy) was advisory-only by design — a note the model sees and can act on, never a block. This item's
+  actual ask was different: a real gate that blocks the commit boundary itself. New `exec_tools.rs::
+  scan_git_commit_gate(root, argv)`: when `shell_exec`'s plain path is about to run a plain `["git",
+  "commit", ...]` call, it reads `git diff --cached --name-only` for the staged file list, `git show
+  :<path>` for each file's staged content (not working-tree content — the two can differ), and runs
+  `scan_for_secrets_advisory`/`scan_patch_advisory` on each — the exact same scans and the exact same
+  `FindingsStore` dismiss mechanism every other scanner in this file already uses, reused verbatim rather
+  than reimplemented. Any non-dismissed finding refuses the commit outright (`ToolStepResult::Failed`,
+  handled, model-visible) *before the `git commit` process is even spawned* — the real, qualitative
+  difference from every other scanner call site, which only ever appends a note to an already-succeeded
+  result. Fails open on anything that isn't a real, introspectable git repo with staged changes (a repo
+  `git diff --cached` can't run against must not be blocked by a check that can't run) — this can only
+  ever narrow which commits succeed, never widen what's allowed. Caught a real bug in the message wording
+  while writing the test, the same class as the earlier `"secret(s)"` bug this session already fixed once:
+  `"unresolved findings (PatchPolicyGate):"` put a confusable `(` before the finding's own `(fingerprint)`
+  parenthesis; reworded to `"blocked by the PatchPolicyGate: staged changes have unresolved findings:"`
+  rather than patching around it in the test. Two new tests:
+  `git_commit_is_blocked_by_an_unresolved_secret_in_staged_content` (a real git repo, a real staged secret,
+  a real blocked commit confirmed via `git log`, then a real successful commit after `rapid findings
+  dismiss`) and `git_commit_with_no_findings_is_never_gated` (a clean staged file commits normally). Full
+  `-p rapid` suite (301 lib tests) and `cargo build --workspace --tests` pass. **Explicitly not covered:**
+  `git commit` wrapped in a shell string (`["sh", "-c", "git commit ..."]`, undetectable since `shell_exec`
+  never interprets shell strings) is not gated; `git merge` (this item's other named boundary) is a
+  separate, similarly-shaped follow-up; and "results become evidence" (a durable, queryable record of
+  what was checked, distinct from a dismissal file recording a human's decision) remains the one part of
+  `VER-009` genuinely unaddressed — the gate now decides something real, but that decision isn't recorded
+  anywhere durable beyond the commit either succeeding or being refused.
 
 ### 2.10 Scoped Credential Broker + Resource Governor
 

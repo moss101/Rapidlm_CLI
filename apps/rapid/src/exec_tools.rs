@@ -1560,6 +1560,13 @@ impl WorkspaceTools {
                 summary,
             });
         }
+        if let Some(reason) = scan_git_commit_gate(self.root(), &args.argv) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&reason)),
+            });
+        }
         let command_advisory = scan_command_advisory(self.root(), &args.argv);
         let mut command = std::process::Command::new(&args.argv[0]);
         command
@@ -2504,6 +2511,72 @@ fn sandboxed_status_line(exit_code: Option<i32>, timed_out: bool, signal: Option
             None => "no exit code (signalled)".to_owned(),
         },
     }
+}
+
+/// Blocking pre-commit gate (Modbit `VER-009` `PatchPolicyGate`): when
+/// `shell_exec`'s plain path is about to run `git commit`, every staged
+/// file is scanned exactly the way `workspace_write`/`workspace_patch`
+/// already scan their own content (`scan_for_secrets_advisory`,
+/// `scan_patch_advisory` — reused verbatim, same `FindingsStore`-backed
+/// dismiss mechanism and message text) — but here a finding blocks the
+/// commit outright instead of only appending an advisory note, since
+/// "gate before commit" is this item's whole point, unlike every other
+/// scanner call site in this file. Only matches a plain `argv[0] ==
+/// "git"`/`argv[1] == "commit"` call; a `git commit` wrapped in a shell
+/// string (`["sh", "-c", "git commit ..."]`) is not detected — a real,
+/// known scope limit, not an oversight. Fails open (returns `None`, never
+/// blocks) on anything that isn't a real, readable git repo with staged
+/// changes: this can only ever narrow which commits succeed, never widen
+/// what's allowed, so a repo this can't introspect must not be blocked by
+/// a check that can't run. `git merge` (the item's other named boundary)
+/// is not covered — a separate, similarly-shaped follow-up, not attempted.
+fn scan_git_commit_gate(root: &Path, argv: &[String]) -> Option<String> {
+    if argv.len() < 2 || argv[0] != "git" || argv[1] != "commit" {
+        return None;
+    }
+    let staged = std::process::Command::new("git")
+        .args(["diff", "--cached", "--name-only", "--diff-filter=ACMR"])
+        .current_dir(root)
+        .env_clear()
+        .output()
+        .ok()?;
+    if !staged.status.success() {
+        return None;
+    }
+    let mut findings = Vec::new();
+    for path in String::from_utf8_lossy(&staged.stdout).lines() {
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let Ok(show) = std::process::Command::new("git")
+            .arg("show")
+            .arg(format!(":{path}"))
+            .current_dir(root)
+            .env_clear()
+            .output()
+        else {
+            continue;
+        };
+        if !show.status.success() {
+            continue;
+        }
+        if let Some(note) = scan_for_secrets_advisory(root, path, &show.stdout) {
+            findings.push(note);
+        }
+        if let Some(note) = scan_patch_advisory(root, path, &show.stdout) {
+            findings.push(note);
+        }
+    }
+    if findings.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "commit blocked by the PatchPolicyGate: staged changes have unresolved findings:\n{}\n\
+         dismiss a false positive with `rapid findings dismiss <fingerprint>`, or fix the issue, \
+         then retry the commit.",
+        findings.join("\n")
+    ))
 }
 
 /// Every advisory-only content scan a successful write/patch can trigger,
@@ -4426,6 +4499,118 @@ use std::sync::{Arc, Mutex};
         fs::write(dir.join("seed.txt"), b"seed\n").expect("seed");
         run(&["add", "seed.txt"]);
         run(&["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-m", "seed"]);
+    }
+
+    #[test]
+    fn git_commit_is_blocked_by_an_unresolved_secret_in_staged_content() {
+        let root = TempRoot::new("commit-gate");
+        git_init(&root.0);
+        // Unlike git_init's own one-off `-c user.name=...`, this persists to
+        // .git/config so a later plain `git commit` (as `execute_shell`
+        // itself would run it, with no way to inject `-c` flags) succeeds.
+        let configure = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root.0)
+                .args(args)
+                .output()
+                .expect("git config");
+            assert!(out.status.success());
+        };
+        configure(&["config", "user.name", "t"]);
+        configure(&["config", "user.email", "t@t.invalid"]);
+
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let token = format!("ghp_{}", "f".repeat(36));
+        fs::write(root.0.join("config.rs"), format!("const TOKEN: &str = \"{token}\";\n"))
+            .expect("write secret file");
+        let stage = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["add", "config.rs"])
+            .output()
+            .expect("git add");
+        assert!(stage.status.success());
+
+        let commit_call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","add config"]}"#);
+        let validated = tools.validate(&commit_call, &cancel).expect("validate");
+        let fingerprint = match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                let detail = detail.expect("detail");
+                assert!(detail.contains("commit blocked"), "{detail}");
+                assert!(detail.contains("advisory: possible secret"), "{detail}");
+                let start = detail.find('(').expect("fingerprint present") + 1;
+                let end = detail[start..].find(')').expect("closing paren") + start;
+                detail[start..end].to_owned()
+            }
+            other => panic!("expected the commit to be blocked, got {other:?}"),
+        };
+        // The commit must never actually have happened.
+        let log = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["log", "--oneline"])
+            .output()
+            .expect("git log");
+        assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 1, "only the seed commit");
+
+        // Dismissing the fingerprint unblocks the commit.
+        let canonical_root = tools.root().to_path_buf();
+        let mut store = crate::findings_store::FindingsStore::load(&canonical_root);
+        store.dismiss(&fingerprint, "test fixture, not a real secret");
+        store.save(&canonical_root).expect("save dismissal");
+        let retry = make_call("c2", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","add config"]}"#);
+        let validated = tools.validate(&retry, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { .. } => {}
+            other => panic!("expected the commit to succeed after dismissal, got {other:?}"),
+        }
+        let log = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["log", "--oneline"])
+            .output()
+            .expect("git log");
+        assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 2, "seed + the real commit");
+    }
+
+    #[test]
+    fn git_commit_with_no_findings_is_never_gated() {
+        let root = TempRoot::new("commit-gate-clean");
+        git_init(&root.0);
+        let configure = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root.0)
+                .args(args)
+                .output()
+                .expect("git config");
+            assert!(out.status.success());
+        };
+        configure(&["config", "user.name", "t"]);
+        configure(&["config", "user.email", "t@t.invalid"]);
+
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        fs::write(root.0.join("plain.rs"), "fn main() {}\n").expect("write");
+        let stage = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["add", "plain.rs"])
+            .output()
+            .expect("git add");
+        assert!(stage.status.success());
+
+        let call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","add plain"]}"#);
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(!summary.contains("commit blocked"), "{summary}");
+            }
+            other => panic!("expected the clean commit to succeed, got {other:?}"),
+        }
     }
 
     #[test]
