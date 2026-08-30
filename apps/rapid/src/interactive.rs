@@ -564,6 +564,13 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
                         }
                     }
                 }
+                // Turn-level rollup of the per-criterion `retryable` flags
+                // above: only printed when completion is actually blocked,
+                // since "retry advisable" is meaningless once already
+                // complete.
+                if !allowed {
+                    println!("retry advisable: {}", verdicts.retry_advisable());
+                }
             }
             Ok(0)
         }

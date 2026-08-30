@@ -203,7 +203,9 @@ impl GoalHost {
         let snapshot = self.machine.snapshot()?;
         let snapshot_json = serde_json::to_string(snapshot).ok()?;
         let attestation = protocol::ArtifactId::from_bytes(snapshot_json.as_bytes()).to_string();
-        let verdicts = self.validate(cancel).map(|v| {
+        let validated = self.validate(cancel);
+        let retry_advisable = validated.as_ref().map(|v| v.retry_advisable());
+        let verdicts = validated.as_ref().map(|v| {
             v.verdicts()
                 .iter()
                 .map(|ve| {
@@ -219,6 +221,11 @@ impl GoalHost {
         let doc = serde_json::json!({
             "snapshot": serde_json::from_str::<serde_json::Value>(&snapshot_json).ok(),
             "verdicts": verdicts,
+            // Turn-level rollup (Modbit `VER-002`/`AGT-025`, `newtask.md`
+            // §2.4): true only when every currently-blocking criterion could
+            // resolve without new evidence — see `CriterionVerdicts::
+            // retry_advisable`.
+            "retry_advisable": retry_advisable,
             "complete": self.can_complete(cancel),
             "attestation": attestation,
         });
@@ -433,6 +440,10 @@ mod tests {
         assert_eq!(verdict["satisfied"], false);
         assert_eq!(verdict["reason"], "MissingEvidence");
         assert_eq!(verdict["retryable"], false);
+        // Turn-level rollup: the one blocker isn't retryable, so the whole
+        // turn's rollup must read `false` too, not just the per-criterion
+        // field.
+        assert_eq!(doc["retry_advisable"], false);
     }
 
     fn scratch_dir(name: &str) -> std::path::PathBuf {

@@ -634,10 +634,28 @@ error, timeout, or invalid output must yield `INDETERMINATE`, never silent succe
   (`export_emits_snapshot_verdicts_and_attestation`, extended) asserts `retryable: false` for a
   `MissingEvidence` criterion — the `true` branch itself is already covered by `evidence.rs`'s own
   `retryable()` unit tests; constructing a genuine `LedgerUnavailable` scenario through `GoalHost`'s public
-  API would need real ledger-resolver-failure plumbing this pass didn't build. **Still open:** no CLI
-  surface reads `CriterionVerdicts::allowed()`'s all-satisfied invariant any differently when every
-  unsatisfied criterion happens to be retryable (e.g. "try again shortly" vs. a hard stop) — `retryable` is
-  visible per-criterion now, but nothing yet rolls it up to a turn-level "retry advisable" signal.
+  API would need real ledger-resolver-failure plumbing this pass didn't build.
+- **Turn-level rollup closed 2026-08-30.** New `CriterionVerdicts::retry_advisable()` (`crates/agent-
+  runtime/src/evidence.rs`): true only when completion is currently blocked *and* every blocking
+  criterion's reason is retryable — false the moment even one blocker needs a genuinely new observation
+  (a single non-retryable reason sinks the whole rollup, deliberately not "any criterion is retryable"),
+  and false when nothing is blocked at all (an already-satisfied goal has nothing to retry). Also
+  explicitly guards the degenerate empty-verdicts case (`allowed()` reads `false` for zero criteria, which
+  would otherwise vacuously satisfy an "all blockers are retryable" check with no blockers to check).
+  Wired into both existing surfaces: `goal_host.rs::export`'s JSON gained a top-level `"retry_advisable"`
+  key alongside the per-criterion `"retryable"` fields; `interactive.rs`'s `goal verify` text output prints
+  `retry advisable: <bool>` once, after the per-criterion lines, only when `complete: false` (printing it
+  for an already-complete goal would be meaningless). Three new tests in `evidence.rs`: all-satisfied →
+  `false`; a single resolver-outage blocker → `true`, the same blocker as a structural rejection
+  (`NotFound`) → `false`; and the actual crux case, two criteria where one is resolver-outage-blocked
+  (retryable) and the other has zero evidence recorded at all (`MissingEvidence`, not retryable) →
+  `false`, confirming one bad blocker overrides an otherwise-retryable one rather than a naive "any
+  retryable" implementation reading `true`. `export_emits_snapshot_verdicts_and_attestation` extended with
+  a `retry_advisable: false` assertion for its existing `MissingEvidence` fixture. Full `agent-runtime`
+  suite (269 lib tests), full `-p rapid` suite (321 lib tests + all integration binaries), and
+  `cargo build --workspace --tests` pass. This closes the "Still open" gap `AGT-025`/`VER-002`'s tri-state
+  audit left behind; the "literal `VERIFIED\|REJECTED\|INDETERMINATE` enum deliberately not built" decision
+  two paragraphs above still stands unchanged.
 
 ### 2.5 Structured `PlanGraph`/`TodoState` outside the transcript + stall detection
 
@@ -645,13 +663,11 @@ error, timeout, or invalid output must yield `INDETERMINATE`, never silent succe
 `detect_stall()` (`apps/rapid/src/host.rs`) scans the last `STALL_WINDOW` (6) tool exchanges for an
 identical `(tool, arguments)` call repeated at least `STALL_REPEAT_THRESHOLD` (3) times — a model stuck
 re-reading the same file with no distinct progress — and, when found, logs a `--verbose` diagnostic
-line via the existing `StepDiag` mechanism on `SupervisedModel::step`. Deliberately diagnostic-only:
-never fails or alters the turn, and does **not** inject the warning into the model's own context so it
-could see and react to it — that's real follow-up work (would need to thread a warning string into the
-prompt/context-packet pipeline), not attempted here. Tests confirm exact-repeat detection, that varied
-arguments (real progress) don't false-positive even with the same tool name repeating, that two repeats
-stays under threshold, and that an old repetition outside the window doesn't count against a turn that
-moved on.
+line via the existing `StepDiag` mechanism on `SupervisedModel::step`. Tests confirm exact-repeat
+detection, that varied arguments (real progress) don't false-positive even with the same tool name
+repeating, that two repeats stays under threshold, and that an old repetition outside the window doesn't
+count against a turn that moved on. **Update 2026-08-30: the warning is no longer diagnostic-only** —
+see the dated correction below, which wires it into the model's own context too.
 
 Modbit: `AGT-016` (plan nodes carry status, dependencies, owner, evidence requirements, attempts, and
 blockers as durable state outside the transcript — compaction cannot silently change task truth),

@@ -933,6 +933,22 @@ impl CriterionVerdicts {
     pub fn allowed(&self) -> bool {
         !self.verdicts.is_empty() && self.verdicts.iter().all(|v| v.satisfied)
     }
+
+    /// Turn-level rollup of [`CriterionUnsatisfied::retryable`] (Modbit
+    /// `VER-002`/`AGT-025`, `newtask.md` §2.4): true only when completion is
+    /// currently blocked and *every* blocking criterion could resolve without
+    /// any new evidence — never when nothing is blocked (nothing to retry)
+    /// and never when even one blocker needs a genuinely new observation, in
+    /// which case retrying alone can't help regardless of the others.
+    pub fn retry_advisable(&self) -> bool {
+        !self.verdicts.is_empty()
+            && !self.allowed()
+            && self
+                .verdicts
+                .iter()
+                .filter(|v| !v.satisfied)
+                .all(|v| v.reason.is_some_and(CriterionUnsatisfied::retryable))
+    }
 }
 
 impl CompletionCheck {
@@ -2165,6 +2181,91 @@ mod tests {
                 "only a resolver outage should be marked retryable, got {backing_error:?}"
             );
         }
+    }
+
+    #[test]
+    fn retry_advisable_is_false_once_every_criterion_is_satisfied() {
+        let goal = goal_with_test_requirement();
+        let mut service = EvidenceService::new();
+        service.record(passing_test()).expect("record");
+        let verdicts = service.validate_goal(&goal);
+        assert!(verdicts.allowed());
+        assert!(!verdicts.retry_advisable(), "nothing is blocked, nothing to retry");
+    }
+
+    #[test]
+    fn retry_advisable_tracks_whether_the_single_blocker_is_retryable() {
+        let retryable_goal = goal_with_kinds(&["command"]);
+        let mut service = EvidenceService::new();
+        service.set_backing_resolver(std::sync::Arc::new(AlwaysErrResolver(
+            BackingError::Unavailable,
+        )));
+        let spec = agent_command_record().with_ledger_ref(backed_ref());
+        service.record(spec).expect("record");
+        let verdicts = service.validate_goal(&retryable_goal);
+        assert!(!verdicts.allowed());
+        assert!(verdicts.retry_advisable(), "a resolver outage alone should read as retryable");
+
+        let final_goal = goal_with_kinds(&["command"]);
+        let mut service = EvidenceService::new();
+        service.set_backing_resolver(std::sync::Arc::new(AlwaysErrResolver(
+            BackingError::NotFound,
+        )));
+        let spec = agent_command_record().with_ledger_ref(backed_ref());
+        service.record(spec).expect("record");
+        let verdicts = service.validate_goal(&final_goal);
+        assert!(!verdicts.allowed());
+        assert!(
+            !verdicts.retry_advisable(),
+            "a structural rejection needs a new observation, not a rerun"
+        );
+    }
+
+    #[test]
+    fn retry_advisable_requires_every_blocker_to_be_retryable_not_just_one() {
+        // Two criteria: c1 blocked by a resolver outage (retryable), c2
+        // blocked by missing evidence entirely (not retryable — a genuinely
+        // new observation is required). One non-retryable blocker must sink
+        // the whole rollup, even with a retryable blocker alongside it.
+        let spec = GoalSpec::new(
+            goal_id(),
+            "ship auth",
+            vec![
+                Criterion::new("c1", "tests pass").expect("criterion"),
+                Criterion::new("c2", "docs updated").expect("criterion"),
+            ],
+            GoalBudget::new(None, None, None, None),
+            vec![
+                EvidenceRequirement::new("c1", vec!["command".to_owned()]).expect("req"),
+                EvidenceRequirement::new("c2", vec!["command".to_owned()]).expect("req"),
+            ],
+        )
+        .expect("spec");
+        let mut machine = GoalStateMachine::new();
+        machine
+            .apply(GoalCommand::Create(spec), &GoalActor::Human)
+            .expect("create");
+        let goal = machine.snapshot().expect("snapshot").clone();
+
+        let mut service = EvidenceService::new();
+        service.set_backing_resolver(std::sync::Arc::new(AlwaysErrResolver(
+            BackingError::Unavailable,
+        )));
+        // Only c1 gets a (retryable-blocked) record; c2 gets none at all.
+        let spec = agent_command_record().with_ledger_ref(backed_ref());
+        service.record(spec).expect("record");
+        let verdicts = service.validate_goal(&goal);
+        assert!(!verdicts.allowed());
+        let c2 = verdicts
+            .verdicts()
+            .iter()
+            .find(|v| v.criterion_id() == "c2")
+            .expect("c2 verdict");
+        assert_eq!(c2.reason(), Some(CriterionUnsatisfied::MissingEvidence));
+        assert!(
+            !verdicts.retry_advisable(),
+            "c2's missing-evidence blocker isn't retryable, so the rollup must not be either"
+        );
     }
 
     #[test]
