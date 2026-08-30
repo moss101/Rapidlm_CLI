@@ -286,7 +286,21 @@ but cannot interrupt for new ones — escalate via the foreground parent).
   (`Vec<ArtifactRef>`, content-addressed blob refs with a `RedactionClass`) — surfacing these needs a
   real decision about redaction-aware rendering (a `Secret`-class artifact ref probably shouldn't even
   be named in plain text) that a straight `.to_string()` would get wrong by default, so left untouched
-  rather than guessed at. The **narrow write-scoped lease variant** and replacing `PersistentSpecialist`
+  rather than guessed at.
+- **`artifacts()` closed 2026-08-30 — checked `protocol::ArtifactRef`'s actual shape and the redaction
+  worry doesn't apply.** `ArtifactRef` is `{ id: ArtifactId, media_type: String, bytes: u64, redaction:
+  RedactionClass }` — a content-addressed SHA-256 hash, a generic media type, a byte count, and the class
+  itself; there is no name/path/locator field at all, so no field carries the artifact's actual content or
+  anything content-derived beyond its hash. Naming a `Secret`-class ref this way discloses nothing the
+  reference architecture wasn't already designed to disclose (the point of a content-addressed reference
+  is that a party can hold and pass it along without ever seeing the payload). `SubagentReport` gained
+  `artifacts: Vec<String>`, rendered uniformly across every `RedactionClass` as `"{id} ({media_type},
+  {bytes}B, {redaction})"` — the class itself is shown, not hidden, so a parent model reading a subagent's
+  result can see *that* a secret artifact exists and its size without ever seeing what it contains.
+  `execute_task_spawn` appends `\nartifact: ...` lines the same way claims/blockers do. New assertion in
+  `task_spawn_report_surfaces_claims_blockers_questions_and_patch_summary` covers a `secret`-class
+  artifact by name, confirming the display choice explicitly rather than leaving it implicit. The **narrow
+  write-scoped lease variant** and replacing `PersistentSpecialist`
   are both still entirely open — this pass only closed the "typed data exists but gets thrown away"
   half, not the permission-ceiling half.
 - **Narrow write scope implemented 2026-08-30 — at the `PermissionLattice` layer, not as a

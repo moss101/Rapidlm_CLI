@@ -553,6 +553,16 @@ pub struct SubagentReport {
     /// `AgentResult::patch_summary()`, pre-rendered as one line, when the
     /// child's turn included a workspace patch.
     pub patch_summary: Option<String>,
+    /// `AgentResult::artifacts()`, pre-rendered as `"{id} ({media_type},
+    /// {bytes}B, {redaction})"` lines. Safe to render uniformly across every
+    /// `RedactionClass` including `Secret`: `protocol::ArtifactRef` is
+    /// metadata-only (a content-addressed hash, a media type, a byte count,
+    /// and the class itself) — none of those fields carry the artifact's
+    /// actual content, so naming a secret artifact's reference is exactly
+    /// the point of a reference architecture, not a leak of it. Was left
+    /// unattempted when `claims`/`blockers`/etc. were added (see `newtask.md`
+    /// §2.2) specifically pending this check.
+    pub artifacts: Vec<String>,
 }
 
 /// Bounded tools rooted at one canonical workspace directory, with the
@@ -2112,6 +2122,9 @@ impl WorkspaceTools {
                 }
                 for question in &report.open_questions {
                     summary.push_str(&format!("\nopen question: {question}"));
+                }
+                for artifact in &report.artifacts {
+                    summary.push_str(&format!("\nartifact: {artifact}"));
                 }
                 Ok(ToolStepResult::Succeeded {
                     call_id: call.call_id().to_owned(),
@@ -5894,6 +5907,7 @@ use std::sync::{Arc, Mutex};
                     blockers: Vec::new(),
                     open_questions: Vec::new(),
                     patch_summary: None,
+                    artifacts: Vec::new(),
                 })
             }
         }
@@ -5979,6 +5993,7 @@ use std::sync::{Arc, Mutex};
                     blockers: Vec::new(),
                     open_questions: Vec::new(),
                     patch_summary: None,
+                    artifacts: Vec::new(),
                 })
             }
         }
@@ -6040,6 +6055,7 @@ use std::sync::{Arc, Mutex};
                     blockers: Vec::new(),
                     open_questions: Vec::new(),
                     patch_summary: None,
+                    artifacts: Vec::new(),
                 })
             }
         }
@@ -6093,6 +6109,7 @@ use std::sync::{Arc, Mutex};
                     blockers: Vec::new(),
                     open_questions: Vec::new(),
                     patch_summary: None,
+                    artifacts: Vec::new(),
                 })
             }
         }
@@ -6141,6 +6158,7 @@ use std::sync::{Arc, Mutex};
                     blockers: vec!["[policy] needs human approval".to_owned()],
                     open_questions: vec!["should this also touch the docs?".to_owned()],
                     patch_summary: Some("2 file(s) changed, +10 -3".to_owned()),
+                    artifacts: vec!["sha256:deadbeef (text/plain, 12B, secret)".to_owned()],
                 })
             }
         }
@@ -6163,6 +6181,13 @@ use std::sync::{Arc, Mutex};
                 );
                 assert!(
                     summary.contains("patch: 2 file(s) changed, +10 -3"),
+                    "{summary}"
+                );
+                // A Secret-class artifact ref is still named: it's a content
+                // hash + size + media type, never the actual content, so
+                // there's nothing to redact.
+                assert!(
+                    summary.contains("artifact: sha256:deadbeef (text/plain, 12B, secret)"),
                     "{summary}"
                 );
             }

@@ -1334,6 +1334,17 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
                 patch.deletions()
             )
         });
+        let artifacts = outcome
+            .result
+            .artifacts()
+            .iter()
+            .map(|artifact| {
+                format!(
+                    "{} ({}, {}B, {})",
+                    artifact.id, artifact.media_type, artifact.bytes, artifact.redaction
+                )
+            })
+            .collect();
         Ok(crate::exec_tools::SubagentReport {
             summary,
             status: outcome.result.status().as_str().to_owned(),
@@ -1345,6 +1356,7 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             blockers,
             open_questions,
             patch_summary,
+            artifacts,
         })
     }
 }
