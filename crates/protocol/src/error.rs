@@ -560,9 +560,15 @@ impl<'de> Visitor<'de> for ApiErrorVisitor {
             }
         }
 
-        let code = code.ok_or_else(|| de::Error::missing_field("code"))?;
+        let code: ErrorCode = code.ok_or_else(|| de::Error::missing_field("code"))?;
         let message: String = message.ok_or_else(|| de::Error::missing_field("message"))?;
-        let retryable = retryable.ok_or_else(|| de::Error::missing_field("retryable"))?;
+        // Required on the wire (schema stability), but never trusted: retryable
+        // is a derived property of `code`, not independent data, so a forged or
+        // stale wire value must not override ErrorCode::is_retryable().
+        // Required on the wire (schema stability), but never trusted: retryable
+        // is a derived property of `code`, not independent data, so a forged or
+        // stale wire value must not override ErrorCode::is_retryable().
+        let _retryable: bool = retryable.ok_or_else(|| de::Error::missing_field("retryable"))?;
         let trace_id = trace_id.ok_or_else(|| de::Error::missing_field("trace_id"))?;
         let details = details.ok_or_else(|| de::Error::missing_field("details"))?;
         validate_message(&message).map_err(de::Error::custom)?;
@@ -570,7 +576,7 @@ impl<'de> Visitor<'de> for ApiErrorVisitor {
         Ok(ApiError {
             code,
             message,
-            retryable,
+            retryable: code.is_retryable(),
             trace_id,
             details,
         })
@@ -808,5 +814,29 @@ mod tests {
     fn deserialize_rejects_source_chain_details() {
         let json = r#"{"code":"internal.unexpected","message":"An unexpected internal error occurred","retryable":false,"trace_id":"018f3c8a-7e2b-7a10-8c4d-0123456789ab","details":{"cause":"password=hunter2"}}"#;
         assert!(serde_json::from_str::<ApiError>(json).is_err());
+    }
+
+    #[test]
+    fn deserialize_never_trusts_a_forged_retryable_bit() {
+        // policy.denied is deliberately non-retryable (is_retryable's own
+        // "conservative default" comment), but the wire value here forges
+        // retryable:true. Deserialize must recompute from `code`, not trust
+        // the wire bit, or a forged/stale peer could mark a fail-closed
+        // error as safe to auto-retry.
+        assert!(!ErrorCode::PolicyDenied.is_retryable());
+        let json = r#"{"code":"policy.denied","message":"Action denied by project policy","retryable":true,"trace_id":"018f3c8a-7e2b-7a10-8c4d-0123456789ab","details":{}}"#;
+        let decoded: ApiError = serde_json::from_str(json).expect("decode");
+        assert_eq!(decoded.code(), ErrorCode::PolicyDenied);
+        assert!(
+            !decoded.retryable(),
+            "retryable must follow ErrorCode::is_retryable, never the wire value"
+        );
+
+        // The reverse forgery (retryable:false on a genuinely retryable code)
+        // must also be corrected, not just the fail-closed direction.
+        assert!(ErrorCode::ProcessTimeout.is_retryable());
+        let json = r#"{"code":"process.timeout","message":"the operation timed out","retryable":false,"trace_id":"018f3c8a-7e2b-7a10-8c4d-0123456789ab","details":{}}"#;
+        let decoded: ApiError = serde_json::from_str(json).expect("decode");
+        assert!(decoded.retryable());
     }
 }

@@ -576,6 +576,28 @@ finding just above: it would look like enforcement without actually bounding the
 promises to bound. New test `wall_clock_budget_forces_blocked_not_an_unbounded_run`. Full `agent-runtime`
 crate suite (270 tests, up from 269) and `cargo build --workspace --tests` pass.
 
+**Fresh review pass, 2026-08-30, `crates/protocol/src/error.rs::ApiError`'s `Deserialize` impl trusted a
+forged `retryable` bit instead of deriving it from `code`.** The doc comment on `ApiError::new`:
+"`retryable` follows [`ErrorCode::is_retryable`]." All three in-process constructors (`new`,
+`new_with_details`, `from_unknown`) correctly set `retryable: code.is_retryable()` — but the fourth
+construction path, `Deserialize` (the one actually used for wire/cross-process data, per this module's own
+"Wire form matches the domain-model public error object"), took `retryable` straight off the wire with no
+recomputation or cross-check against `code`. `ErrorCode::is_retryable()` is a deliberately small allowlist
+("Conservative default: only clearly transient codes are retryable") that excludes `PolicyDenied` — a
+fail-closed error a client should never auto-retry. Confirmed directly with the standard temporary-revert
+cycle: `{"code":"policy.denied",...,"retryable":true,...}` decodes successfully and reports
+`retryable() == true` against the un-fixed code (reverting the fix made the new test fail exactly as
+predicted), even though `ErrorCode::PolicyDenied.is_retryable() == false` — a forged or stale peer response
+could mark a policy-denial as safe to auto-retry, or the reverse (mark a genuinely transient error as
+permanently failed), and nothing in the deserialization path would catch either direction. **Fixed:** the
+wire `retryable` field is still required (unchanged schema — `missing_field` still fires if it's absent, so
+no wire-format break), but its *value* is discarded and replaced with `code.is_retryable()` after `code`
+itself is parsed — the same derivation the three in-process constructors already use, now applied uniformly
+on all four paths. New test `deserialize_never_trusts_a_forged_retryable_bit` covers both forgery directions
+(a non-retryable code force-marked retryable, and a retryable code force-marked non-retryable). Full
+`protocol` crate suite (71 tests, up from 70) and `cargo build --workspace --tests` pass — significant given
+`protocol` is a dependency of nearly every other crate in the workspace.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
