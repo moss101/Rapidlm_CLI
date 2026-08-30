@@ -623,6 +623,19 @@ their results become evidence, not just a console warning).
   three other dormant scanners (patch/command/external) wired the same way, and any concept of "results
   become evidence" (a durable, queryable record of what was checked and why it passed/failed) — a
   dismissal file recording what a human decided is not the same as the gate deciding anything itself.
+- **Checked whether `CommandFinding` (the `shell_exec` scanner) is as quick a wire-up as `secrets` was,
+  2026-08-30 — it is not, and here is exactly why, for whoever picks this up next.**
+  `security::scanners::command::CommandRiskScanner::scan` takes a
+  `capability_broker::CanonicalCommand`, not a raw argv `Vec<String>` — and `CanonicalCommand` has no
+  public constructor; it's only built via `normalize_exec()` against a real `Resolver` impl (executable
+  PATH resolution + cwd canonicalization, the exact ceremony `apps/rapid/src/sandbox_exec.rs::
+  resolve_program` already implements standalone for a different purpose). `execute_shell`
+  (`exec_tools.rs`) has none of this machinery today — no `Resolver`, no `normalize_exec` call anywhere
+  in `apps/rapid`. Wiring this scanner in is thus a real, self-contained integration on the same order as
+  building `sandbox_exec.rs` was (a `Resolver` impl, `normalize_exec` call, `ShellMode::Argv` vs.
+  `ShellString` handling), not a copy of `scan_for_secrets_advisory`'s shape — noted precisely rather than
+  forced through under time pressure. `PatchFinding`/`ExternalFinding` weren't checked with the same
+  rigor and may or may not have the same shape; verify each independently before assuming either way.
 
 ### 2.10 Scoped Credential Broker + Resource Governor
 
