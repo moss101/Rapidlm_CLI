@@ -233,6 +233,26 @@ but cannot interrupt for new ones — escalate via the foreground parent).
 - **Guardrail (Modbit `AGT-010`, bounded recursive delegation):** nested delegation off by default; an
   explicit max-depth profile only, never unbounded. Also see `REJ-007` below.
 - **Sev/Effort:** P0 / M.
+- **Correction + partial fix (2026-08-30):** `AgentResultEnvelope`'s exact field list already exists —
+  `crates/agent-runtime/src/agent/model.rs`'s `AgentResult` carries `summary, evidence, workspace_view,
+  patch_summary, artifacts, claims, open_questions, blockers, context_lineage` (all with accessors) —
+  but `apps/rapid/src/interactive.rs`'s `LiveSubagentRunner::run` only ever read `.summary()` and
+  `.status()` before constructing `SubagentReport`, silently discarding claims/blockers/open_questions/
+  patch_summary before they ever reached the parent model's tool-result text. **Fixed the discard, not
+  the type shape:** `SubagentReport` (`apps/rapid/src/exec_tools.rs`) gained `claims: Vec<String>`,
+  `blockers: Vec<String>`, `open_questions: Vec<String>`, `patch_summary: Option<String>` — pre-rendered
+  as text lines (`"{criterion}: {text} ({result})"`, `"[{kind}] {summary}"`, etc.) at construction time,
+  matching this codebase's existing convention of flattening typed enums to `String` at the tool-result
+  boundary (e.g. `stop_reason`) rather than smuggling a second JSON-typed channel through a text-only
+  tool result. `execute_task_spawn` now appends non-empty ones to the returned summary (`\nclaim: ...`,
+  `\nblocker: ...`, etc.), so a parent model actually sees what a subagent asserted, was blocked by, or
+  left open instead of only its prose summary. **Deliberately not done:** `artifacts()`
+  (`Vec<ArtifactRef>`, content-addressed blob refs with a `RedactionClass`) — surfacing these needs a
+  real decision about redaction-aware rendering (a `Secret`-class artifact ref probably shouldn't even
+  be named in plain text) that a straight `.to_string()` would get wrong by default, so left untouched
+  rather than guessed at. The **narrow write-scoped lease variant** and replacing `PersistentSpecialist`
+  are both still entirely open — this pass only closed the "typed data exists but gets thrown away"
+  half, not the permission-ceiling half.
 
 ### 2.3 `CapabilitySnapshot` / `AuthorizationEpoch` + Policy Compiler
 

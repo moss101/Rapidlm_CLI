@@ -511,6 +511,17 @@ pub struct SubagentReport {
     /// `None` when no step reported one — see `ExecOutcome::cost_usd_micros`.
     pub cost_usd_micros: Option<u64>,
     pub stop_reason: Option<String>,
+    /// `AgentResult::claims()`, pre-rendered as "text (result)" lines. Was
+    /// silently dropped before this field existed even though the child's
+    /// `AgentResult` already carried it (see `newtask.md` §2.2).
+    pub claims: Vec<String>,
+    /// `AgentResult::blockers()`, pre-rendered as "[kind] summary" lines.
+    pub blockers: Vec<String>,
+    /// `AgentResult::open_questions()`, verbatim.
+    pub open_questions: Vec<String>,
+    /// `AgentResult::patch_summary()`, pre-rendered as one line, when the
+    /// child's turn included a workspace patch.
+    pub patch_summary: Option<String>,
 }
 
 /// Bounded tools rooted at one canonical workspace directory, with the
@@ -1900,9 +1911,22 @@ impl WorkspaceTools {
                     header.push_str(&format!(" stop_reason={reason}"));
                 }
                 header.push(']');
+                let mut summary = format!("{header}:\n{body}");
+                if let Some(patch_summary) = &report.patch_summary {
+                    summary.push_str(&format!("\npatch: {patch_summary}"));
+                }
+                for claim in &report.claims {
+                    summary.push_str(&format!("\nclaim: {claim}"));
+                }
+                for blocker in &report.blockers {
+                    summary.push_str(&format!("\nblocker: {blocker}"));
+                }
+                for question in &report.open_questions {
+                    summary.push_str(&format!("\nopen question: {question}"));
+                }
                 Ok(ToolStepResult::Succeeded {
                     call_id: call.call_id().to_owned(),
-                    summary: format!("{header}:\n{body}"),
+                    summary,
                 })
             }
             Err(reason) => Ok(ToolStepResult::Failed {
@@ -4958,6 +4982,10 @@ use std::sync::{Arc, Mutex};
                     tokens: 512,
                     cost_usd_micros: None,
                     stop_reason: None,
+                    claims: Vec::new(),
+                    blockers: Vec::new(),
+                    open_questions: Vec::new(),
+                    patch_summary: None,
                 })
             }
         }
@@ -5030,6 +5058,10 @@ use std::sync::{Arc, Mutex};
                     tokens: 10,
                     cost_usd_micros: self.0,
                     stop_reason: None,
+                    claims: Vec::new(),
+                    blockers: Vec::new(),
+                    open_questions: Vec::new(),
+                    patch_summary: None,
                 })
             }
         }
@@ -5057,6 +5089,51 @@ use std::sync::{Arc, Mutex};
         match tools2.execute(&validated2, &CancellationToken::new()).expect("e") {
             ToolStepResult::Succeeded { summary, .. } => {
                 assert!(!summary.contains("cost_usd_micros"), "{summary}");
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_spawn_report_surfaces_claims_blockers_questions_and_patch_summary() {
+        struct RichRunner;
+        impl crate::exec_tools::SubagentRunner for RichRunner {
+            fn run(&self, _prompt: &str, _agent_type: &str) -> Result<SubagentReport, String> {
+                Ok(SubagentReport {
+                    summary: "done".to_owned(),
+                    status: "succeeded".to_owned(),
+                    tool_calls: 2,
+                    tokens: 20,
+                    cost_usd_micros: None,
+                    stop_reason: None,
+                    claims: vec!["tests pass (satisfied)".to_owned()],
+                    blockers: vec!["[policy] needs human approval".to_owned()],
+                    open_questions: vec!["should this also touch the docs?".to_owned()],
+                    patch_summary: Some("2 file(s) changed, +10 -3".to_owned()),
+                })
+            }
+        }
+
+        let root = TempRoot::new("spawn-rich");
+        let mut tools = permissive_workspace(&root.0);
+        tools.subagents = Some(Arc::new(RichRunner) as Arc<dyn SubagentRunner>);
+        let call = make_call("c1", TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
+        let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
+        match tools.execute(&validated, &CancellationToken::new()).expect("e") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("claim: tests pass (satisfied)"), "{summary}");
+                assert!(
+                    summary.contains("blocker: [policy] needs human approval"),
+                    "{summary}"
+                );
+                assert!(
+                    summary.contains("open question: should this also touch the docs?"),
+                    "{summary}"
+                );
+                assert!(
+                    summary.contains("patch: 2 file(s) changed, +10 -3"),
+                    "{summary}"
+                );
             }
             other => panic!("expected success, got {other:?}"),
         }

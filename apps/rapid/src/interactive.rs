@@ -1255,6 +1255,33 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
                 outcome.tool_calls
             ));
         }
+        let claims = outcome
+            .result
+            .claims()
+            .iter()
+            .map(|claim| {
+                let prefix = claim
+                    .criterion_id()
+                    .map(|id| format!("{id}: "))
+                    .unwrap_or_default();
+                format!("{prefix}{} ({})", claim.text(), claim.result().as_str())
+            })
+            .collect();
+        let blockers = outcome
+            .result
+            .blockers()
+            .iter()
+            .map(|blocker| format!("[{}] {}", blocker.kind().as_str(), blocker.summary()))
+            .collect();
+        let open_questions = outcome.result.open_questions().to_vec();
+        let patch_summary = outcome.result.patch_summary().map(|patch| {
+            format!(
+                "{} file(s) changed, +{} -{}",
+                patch.files_changed(),
+                patch.additions(),
+                patch.deletions()
+            )
+        });
         Ok(crate::exec_tools::SubagentReport {
             summary,
             status: outcome.result.status().as_str().to_owned(),
@@ -1262,6 +1289,10 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             tokens: outcome.tokens,
             cost_usd_micros: outcome.cost_usd_micros,
             stop_reason: outcome.stop_reason.map(|reason| reason.as_str().to_owned()),
+            claims,
+            blockers,
+            open_questions,
+            patch_summary,
         })
     }
 }
