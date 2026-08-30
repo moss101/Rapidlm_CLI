@@ -834,6 +834,33 @@ a slogan already in the README into a real, differentiating metric neither Grok 
 publishes.
 
 - **Sev/Effort:** P2 / S once §2.4 and §2.8 land.
+- **Correction (2026-08-30): §2.4 and §2.8 have now both landed, but this item's own "then it's just S"
+  claim turns out to rest on a third, previously-undocumented precondition that hasn't — checked while
+  scoping this as the next tractable pick.** §2.8's cost/token accounting (`ExecOutcome.tokens`/
+  `cost_usd_micros`, `apps/rapid/src/host.rs`) and §2.4's verified-completion gate
+  (`CriterionEvaluator`/`GoalHost::can_complete`) are both real, but they live on two objects that never
+  meet: `ExecOutcome` is per-`rapid exec`-invocation and forgotten once that process exits, while
+  "verified" (a goal's evidence gate passing) is a property of a *goal*, not a single exec call — and a
+  goal's own usage tracking is a fourth, separate, still-entirely-dormant subsystem. `crates/agent-runtime/
+  src/goal/state.rs::GoalUsage` (`turns`/`tokens`/`active_ms`/`cost` — exactly the shape this metric
+  needs) and the full `GoalBudgetGuard`/`GoalDriver` machinery that accrues and enforces it
+  (`crates/agent-runtime/src/goal/driver.rs::GoalDriver::next`, `crates/agent-runtime/src/goal/budget.rs`,
+  both with real, passing tests — e.g. `active_usage_accrues_and_writes_back`) have **zero call sites
+  anywhere outside `agent-runtime` itself** (confirmed by grep across `apps/rapid` and every other crate) —
+  the same "mature, tested, fully unwired" shape this document keeps finding elsewhere (context-engine,
+  `sandbox`, now `agent-runtime`'s own goal driver). `apps/rapid/src/goal_host.rs` never references
+  `GoalUsage`/`GoalDriver` at all: a goal's `usage` field stays `GoalUsage::default()` (all zeros) for its
+  entire life regardless of how many real tokens/dollars `rapid exec` actually spends against it, and
+  `GoalBudgetGuard`'s ceiling enforcement (the actual mechanism behind `GoalCommand::Block { budget_exhausted:
+  true }`) is consequently never exercised by anything real either — a goal today can never budget-exhaust
+  in production, only in `agent-runtime`'s own unit tests. **This means the metric's real blocker isn't
+  §2.4/§2.8 (both done) — it's wiring per-turn usage into the active goal at all**, and `GoalDriver::next`'s
+  shape (generic over the model/tool driver, i.e. designed as an orchestration loop of its own) suggests
+  that isn't a small "call this after your own turn" addition: it would mean either routing `apps/rapid`'s
+  existing turn loop (`interactive.rs`/`host.rs`'s fallback-chain/retry/stall-detection machinery) through
+  `GoalDriver` instead, or building a narrower usage-only update path alongside it — a real design decision,
+  not confirmed or attempted here. Re-scoping this item's effort to M (goal-usage wiring) → S (the metric
+  itself, once usage is real) rather than the S this row currently claims.
 
 ---
 
