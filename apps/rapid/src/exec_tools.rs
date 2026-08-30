@@ -2515,6 +2515,37 @@ fn sandboxed_status_line(exit_code: Option<i32>, timed_out: bool, signal: Option
     }
 }
 
+/// Append a durable, queryable record of one `PatchPolicyGate` decision to
+/// `.rapidlm/gate_log.jsonl` (Modbit `VER-009`'s "results become evidence,
+/// not just a console warning" — the one part of this item the gate itself
+/// doesn't close on its own). One JSON object per line, append-only, for
+/// both outcomes — a clean pass is as much "what was checked" as a block
+/// is. A write failure here never affects the gate's own decision:
+/// recording evidence is itself advisory, the same "never let a secondary
+/// concern break the primary check" posture already used everywhere else
+/// in this file.
+fn record_gate_decision(root: &Path, boundary: &str, blocked: bool, findings: &[String]) {
+    let record = serde_json::json!({
+        "schema": 1,
+        "time": crate::headless::jsonl::now_rfc3339(),
+        "boundary": boundary,
+        "blocked": blocked,
+        "findings": findings,
+    });
+    let Ok(mut line) = serde_json::to_string(&record) else {
+        return;
+    };
+    line.push('\n');
+    let path = root.join(".rapidlm").join("gate_log.jsonl");
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 /// Run a git subcommand rooted at `root` with a clean environment, ignoring
 /// any secrets a real environment might otherwise leak in (`GIT_ASKPASS`,
 /// credential helpers). Shared by both `PatchPolicyGate` boundaries below.
@@ -2577,6 +2608,7 @@ fn scan_git_commit_gate(root: &Path, argv: &[String]) -> Option<String> {
         })
         .collect::<Vec<_>>();
     let findings = collect_content_findings(root, files.into_iter());
+    record_gate_decision(root, "commit", !findings.is_empty(), &findings);
     if findings.is_empty() {
         return None;
     }
@@ -2629,6 +2661,7 @@ fn scan_git_merge_gate(root: &Path, argv: &[String]) -> Option<String> {
             .collect::<Vec<_>>();
         findings.extend(collect_content_findings(root, files.into_iter()));
     }
+    record_gate_decision(root, "merge", !findings.is_empty(), &findings);
     if findings.is_empty() {
         return None;
     }
@@ -4672,6 +4705,69 @@ use std::sync::{Arc, Mutex};
             }
             other => panic!("expected the clean commit to succeed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn git_commit_gate_decisions_are_recorded_durably_blocked_and_clean_alike() {
+        let root = TempRoot::new("commit-gate-log");
+        git_init(&root.0);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root.0)
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["config", "user.name", "t"]);
+        git(&["config", "user.email", "t@t.invalid"]);
+
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let token = format!("ghp_{}", "h".repeat(36));
+        fs::write(root.0.join("config.rs"), format!("const TOKEN: &str = \"{token}\";\n"))
+            .expect("write secret file");
+        git(&["add", "config.rs"]);
+        let blocked_call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","x"]}"#);
+        let validated = tools.validate(&blocked_call, &cancel).expect("validate");
+        let fingerprint = match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { detail, .. } => {
+                let detail = detail.expect("detail");
+                let start = detail.find('(').expect("fingerprint present") + 1;
+                let end = detail[start..].find(')').expect("closing paren") + start;
+                detail[start..end].to_owned()
+            }
+            other => panic!("expected the commit to be blocked, got {other:?}"),
+        };
+
+        let canonical_root = tools.root().to_path_buf();
+        let mut store = crate::findings_store::FindingsStore::load(&canonical_root);
+        store.dismiss(&fingerprint, "test fixture, not a real secret");
+        store.save(&canonical_root).expect("save dismissal");
+        let clean_call = make_call("c2", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","x"]}"#);
+        let validated = tools.validate(&clean_call, &cancel).expect("validate");
+        assert!(matches!(
+            tools.execute(&validated, &cancel).expect("execute"),
+            ToolStepResult::Succeeded { .. }
+        ));
+
+        let log = fs::read_to_string(canonical_root.join(".rapidlm/gate_log.jsonl")).expect("gate log");
+        let lines: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("json line"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        assert_eq!(lines[0]["boundary"], "commit");
+        assert_eq!(lines[0]["blocked"], true);
+        assert!(!lines[0]["findings"].as_array().expect("findings array").is_empty());
+        assert!(lines[0]["time"].as_str().is_some_and(|t| !t.is_empty()));
+        assert_eq!(lines[1]["boundary"], "commit");
+        assert_eq!(lines[1]["blocked"], false);
+        assert!(
+            lines[1]["findings"].as_array().expect("findings array").is_empty(),
+            "the dismissed finding must not resurface in a clean pass's own record"
+        );
     }
 
     #[test]

@@ -829,6 +829,25 @@ their results become evidence, not just a console warning).
   `cargo build --workspace --tests` pass. Both named `PatchPolicyGate` boundaries (`VER-009`: "before
   commit/merge") are now real gates, not advisories — only the durable-evidence half of `VER-009` and a
   shell-string-wrapped invocation of either command remain open.
+- **Durable-evidence half of `VER-009` implemented 2026-08-30, the same day — "results become evidence,
+  not just a console warning."** New `record_gate_decision(root, boundary, blocked, findings)`: appends
+  one JSON object per line to `.rapidlm/gate_log.jsonl` (`{schema, time, boundary: "commit"|"merge",
+  blocked, findings}`) after *every* gate check that actually ran — a clean pass as much as a block,
+  since "what was checked and why it passed" is as much evidence as "what was checked and why it failed."
+  Deliberately minimal rather than a full ledger integration: no new `event-ledger` event kind, no
+  `EvidenceRecord`/`EvidenceService` involvement (that system is goal-criterion-scoped, and conflating a
+  general security-gate audit trail with goal-completion evidence would blur two genuinely different
+  concepts) — just a durable, append-only, greppable/`jq`-able file, matching the same "a plain file is
+  the honest tool for this" choice `FindingsStore` itself already made for dismissals. A write failure
+  here never affects the gate's own decision — recording is advisory to the gate, not a second gate. New
+  test `git_commit_gate_decisions_are_recorded_durably_blocked_and_clean_alike`: a real blocked commit, a
+  real dismissal, a real clean commit, then both `.rapidlm/gate_log.jsonl` lines parsed and asserted on
+  (`blocked: true` with a non-empty findings array for the first, `blocked: false` with an empty one for
+  the second — confirming a dismissed finding doesn't silently resurface in its own evidence record
+  either). Full `-p rapid` suite (303 lib tests) and `cargo build --workspace --tests` pass. **What
+  remains of `VER-009`:** only a shell-string-wrapped `git commit`/`git merge` invocation, which
+  `shell_exec`'s own "no shell string is ever interpreted" design makes structurally undetectable at this
+  layer without a much bigger change to how commands are parsed.
 
 ### 2.10 Scoped Credential Broker + Resource Governor
 
