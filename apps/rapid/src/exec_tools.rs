@@ -1048,9 +1048,14 @@ impl WorkspaceTools {
             }
         }
         fs::write(&target, args.content.as_bytes()).map_err(|_| ToolStepError::Failed)?;
+        let mut summary = format!("wrote {} bytes to {}", args.content.len(), args.path);
+        if let Some(note) = scan_for_secrets_advisory(&args.path, args.content.as_bytes()) {
+            summary.push('\n');
+            summary.push_str(&note);
+        }
         Ok(ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
-            summary: format!("wrote {} bytes to {}", args.content.len(), args.path),
+            summary,
         })
     }
 
@@ -2306,6 +2311,34 @@ struct RepoSearchArgs {
     pattern: String,
     head_limit: usize,
     offset: usize,
+}
+
+/// Advisory-only secret scan of newly-written content (Modbit `VER-007`/
+/// `VER-008`'s `Finding` model, already built in `security::scanners::secrets`
+/// but with zero call sites anywhere in `apps/rapid` before this — see
+/// `newtask.md` §2.9). Never blocks the write: a scanner false positive
+/// (e.g. a high-entropy test fixture) must never break a legitimate
+/// workflow, so this only appends a note to the tool's own success summary
+/// — the model sees it and can redact/rewrite if the flag is real, the same
+/// model-correctable-not-fatal shape every other advisory in this codebase
+/// uses. `None` on a scan failure (bad path, oversized content) or no
+/// findings; failures are silent since this is advisory, not a gate.
+fn scan_for_secrets_advisory(path: &str, content: &[u8]) -> Option<String> {
+    let repo_path = protocol::RepoPath::parse(path).ok()?;
+    let target = security::ScanTarget::staged_diff(repo_path, content.to_vec()).ok()?;
+    let mut request = security::ScanRequest::new();
+    request.push_target(target).ok()?;
+    let scanner = security::SecretScanner::new();
+    let cancel = security::ScanCancellation::new();
+    let report = scanner.scan(&request, &cancel).ok()?;
+    if report.findings().is_empty() {
+        return None;
+    }
+    let rules: Vec<&str> = report.findings().iter().map(security::Finding::rule_id).collect();
+    Some(format!(
+        "advisory: possible secret(s) detected ({}) — verify before committing",
+        rules.join(", ")
+    ))
 }
 
 /// Parse bounded `{"path": ..., "content": ...}` arguments; unknown keys,
@@ -3704,6 +3737,48 @@ use std::sync::{Arc, Mutex};
             .map(|call| validate_one(tools, call))
             .collect();
         tools.execute_batch(&validated, &CancellationToken::new())
+    }
+
+    #[test]
+    fn workspace_write_flags_a_likely_secret_but_never_blocks_the_write() {
+        let root = TempRoot::new("write-secret-advisory");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let token = format!("ghp_{}", "a".repeat(36));
+        let content = format!("const TOKEN: &str = \"{token}\";\n");
+        let call = ProposedToolCall::new(
+            "c1",
+            WORKSPACE_WRITE_TOOL,
+            &serde_json::to_string(&serde_json::json!({"path": "config.rs", "content": content}))
+                .expect("encode call"),
+        )
+        .expect("call");
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("advisory: possible secret"), "{summary}");
+                assert!(summary.contains("secrets.github_token"), "{summary}");
+            }
+            other => panic!("expected success (advisory only), got {other:?}"),
+        }
+        // The write itself is never blocked or altered by the scan.
+        let written = fs::read(root.0.join("config.rs")).expect("file exists");
+        assert_eq!(written, content.as_bytes());
+
+        // Ordinary content carries no advisory note at all.
+        let clean_call = ProposedToolCall::new(
+            "c2",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"plain.rs","content":"fn main() {}"}"#,
+        )
+        .expect("call");
+        let validated = tools.validate(&clean_call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(!summary.contains("advisory"), "{summary}");
+            }
+            other => panic!("expected clean success, got {other:?}"),
+        }
     }
 
     #[test]

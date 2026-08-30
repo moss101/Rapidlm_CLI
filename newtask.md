@@ -466,6 +466,26 @@ their results become evidence, not just a console warning).
   general review findings and key persistence by content hash rather than by line number (line numbers
   shift; content hashes don't).
 - **Sev/Effort:** P2 / M.
+- **Correction + partial fix (2026-08-30): the secrets scanner is more built than the doc credits, and
+  now has its first production call site — advisory-only, not the `PatchPolicyGate` this item actually
+  asks for.** Beyond `security::scanners::secrets::Finding`/`FindingFingerprint` (a real, mature,
+  prefix/pattern-based scanner: AWS keys, GitHub/Slack tokens, private keys, connection strings, high-
+  entropy assignments), there are three more parallel typed `Finding`+content-hash-fingerprint scanners —
+  `PatchFinding`, `CommandFinding`, `ExternalFinding` (`scanners/patch.rs`, `command.rs`, `external.rs`)
+  — all already content-hash-keyed (`VER-007`'s actual ask), all with zero call sites anywhere in
+  `apps/rapid`, entirely dormant. **Implemented:** `apps/rapid/src/exec_tools.rs::execute_write`'s plain
+  (non-shadow-diagnostics) write path now runs the secrets scanner over newly-written content and appends
+  an advisory note to the tool's own success summary when it finds something (`"advisory: possible
+  secret(s) detected (rule_id, ...) — verify before committing"`) — deliberately never blocking the
+  write: a scanner false positive (e.g. a high-entropy test fixture) must never break a legitimate
+  workflow, matching this codebase's model-correctable-not-fatal philosophy (the model sees the note in
+  its own tool result and can redact/rewrite if the flag is real). **Explicitly not `PatchPolicyGate`:**
+  this is a notification, not a gate — nothing here blocks a commit/merge, nothing becomes durable
+  evidence, and the other three scanners (patch/command/external) and the dismiss/resolve/triage
+  persistence store this item's title actually names (confirmed: no dismiss/resolved/triage persistence
+  exists anywhere in the crate) remain entirely unattempted. Also not covered: `execute_write`'s shadow-
+  diagnostics branches and `execute_patch`'s written content — scoped to the one plain-write path to keep
+  this change reviewable, not a signal that those paths are exempt from the same risk.
 
 ### 2.10 Scoped Credential Broker + Resource Governor
 
