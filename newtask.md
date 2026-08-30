@@ -64,6 +64,24 @@ not individually re-audited against source with the same rigor as the Phase 1 co
 and §2.9 got a quick spot-check, noted inline; §2.2–§2.5, §2.7, §2.8's `RouterDecisionRecord` half, and
 §2.10 did not). Treat every remaining Phase 2/3 row as a hypothesis to verify, not a confirmed gap.
 
+**Update, 2026-08-30: the pattern kept recurring outside `apps/rapid` too, in crates this document had
+never named — worth a consolidated pointer so a future pass doesn't rediscover each one independently.**
+`crates/kernel::recovery::RecoveryManager` (a full crash-recovery pipeline — checkpoint load, event
+replay, stale in-flight interrupt), `crates/capability-broker::audit` (the whole audit-trail record
+system for lease/approval decisions), `crates/handoff` (the entire foreground→daemon ownership-transfer
+protocol, `SessionExecutionLease`/generation bumping), and `crates/vcs::provenance` (an append-only
+provenance graph binding goal/evidence/agent/patch/commit identities) are each real, tested, and have
+**zero callers anywhere outside their own crate.** Two (`RecoveryManager`, `handoff`) are downstream of
+the same root cause the second meta-finding paragraph above already names — `apps/rapid`'s interactive
+session loop doesn't run a live turn through the kernel at all, so nothing ever reaches the code paths
+(resume, crash-recovery-on-open, foreground/daemon handoff) that would call them. The other two
+(`capability-broker::audit`, `vcs::provenance`) hit the same wall as §2.10's Credential Broker note
+already did: wiring either in for real needs a durable store and session/agent identity available at the
+call site, which the one real call site that exists (`sandbox_exec.rs`'s lease-minting ceremony) doesn't
+have — "premature before a real scenario exists," not a small wiring gap. None of these four were
+implemented or scoped further this pass; flagging them here so effort isn't spent re-discovering the same
+"tested but zero callers" fact independently for each one.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
