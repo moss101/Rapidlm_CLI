@@ -640,6 +640,25 @@ call returns), so there is no actual concurrent-subagent risk in this codebase's
 unbounded-sequential-total one, which is what WRK-017's spirit ("budgets can't buy a fake pass" aside)
 is really protecting against here. CPU/RAM/disk/network ceilings are still real, separate, OS-level work.
 
+**Disk axis, 2026-08-30: a real per-turn ceiling landed without needing any OS-level monitoring —
+the same "count what's already flowing through a chokepoint" trick as the concurrency fix above,
+not the OS-level work the "still real, separate" note above assumed disk required.** Every
+`workspace_write`/`workspace_patch` call already bounds its own content size
+(`MAX_WRITE_BYTES` = 64 KB), but nothing bounded the *count* of calls — a runaway loop writing
+max-size files repeatedly could consume unbounded disk with no single call ever exceeding its own cap,
+exactly the same shape as the `task_spawn` gap already fixed. **Implemented:** `MAX_TOTAL_WRITE_BYTES_PER_TURN`
+(64 MB, 1024x the per-call cap — generous enough for any real coding task, tight enough to stop a
+genuinely pathological loop) enforced via a `bytes_written: Arc<AtomicU64>` counter on `WorkspaceTools`
+and a `reserve_write_budget()` helper (atomic reserve-then-rollback-if-over, safe against two concurrent
+near-the-limit writes on different paths racing each other — same-path writes already serialize via
+`write_group_key`), checked in both `execute_write` (all three of its write points: the two shadow-
+diagnostics branches and the plain path) and both of `execute_patch`'s write points before the bytes
+ever reach `fs::write`, so a refused write never touches disk. CPU/RAM/network ceilings still remain
+genuine OS-level work — this is disk specifically, and specifically the "unbounded call count" shape,
+not a byte-accurate disk-usage monitor (a single `fs::write` beyond the file's own existing size isn't
+separately accounted for, e.g. overwriting a large file with a similarly large one; the ceiling is on
+cumulative *written* bytes this turn, not net disk delta).
+
 - **Where it lands:** Credential Broker: wire `SecretBroker` into `apps/rapid`'s credential path once a
   real multi-secret scenario exists — premature before that. Resource Governor: new work, `sandbox` or a
   new small crate; encode its "budgets can't buy a fake pass" anti-pattern into whatever implements

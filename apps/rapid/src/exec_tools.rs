@@ -107,6 +107,15 @@ pub const MAX_TOOL_ARGUMENTS_BYTES: usize = 8 * 1024;
 pub const MAX_TOOL_PATH_BYTES: usize = 512;
 /// Hard byte cap on one file write.
 pub const MAX_WRITE_BYTES: usize = 64 * 1024;
+/// Resource ceiling (Modbit `WRK-017`'s disk axis): cumulative bytes written
+/// to disk across `workspace_write`/`workspace_patch` calls in one turn.
+/// Per-call content is already bounded (`MAX_WRITE_BYTES`), but nothing
+/// bounded the *count* of calls — a runaway loop writing max-size files
+/// repeatedly could otherwise consume unbounded disk with no single call
+/// ever exceeding its own cap. 1024x the per-call cap: generous enough for
+/// any real coding task (scaffolding hundreds of files), tight enough to
+/// stop a genuinely pathological loop.
+pub const MAX_TOTAL_WRITE_BYTES_PER_TURN: u64 = 64 * 1024 * 1024;
 /// Hard byte cap on one file read returned to the model.
 pub const MAX_READ_BYTES: usize = 4 * 1024;
 /// Default 1-indexed start line for `repo_read`.
@@ -563,6 +572,10 @@ pub struct WorkspaceTools {
     /// risk is an unbounded *total* per turn, not concurrent execution).
     /// See `newtask.md` §2.10.
     subagent_spawns: Arc<AtomicU64>,
+    /// Resource ceiling (Modbit `WRK-017`'s disk axis): cumulative bytes
+    /// written via `workspace_write`/`workspace_patch` this turn — see
+    /// `MAX_TOTAL_WRITE_BYTES_PER_TURN`'s own doc comment for why.
+    bytes_written: Arc<AtomicU64>,
 }
 
 impl WorkspaceTools {
@@ -596,6 +609,7 @@ impl WorkspaceTools {
             mcp: Arc::new(Mutex::new(Vec::new())),
             mcp_surface: Arc::new(Mutex::new(Vec::new())),
             subagent_spawns: Arc::new(AtomicU64::new(0)),
+            bytes_written: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -764,6 +778,25 @@ impl WorkspaceTools {
             }
         }
         Ok(target)
+    }
+
+    /// Reserve `bytes` against the per-turn disk-write budget before
+    /// actually writing. Atomic across concurrent write-classified calls on
+    /// different paths (same-path writes already serialize via
+    /// `write_group_key`): `fetch_add` first, then roll back with
+    /// `fetch_sub` if that pushed the total over budget, so two concurrent
+    /// near-the-limit writes can't both slip through a check-then-add race.
+    /// `Some(detail)` when refused; `None` when the reservation succeeded.
+    fn reserve_write_budget(&self, bytes: usize) -> Option<String> {
+        let bytes = bytes as u64;
+        let previous = self.bytes_written.fetch_add(bytes, Ordering::SeqCst);
+        if previous.saturating_add(bytes) > MAX_TOTAL_WRITE_BYTES_PER_TURN {
+            self.bytes_written.fetch_sub(bytes, Ordering::SeqCst);
+            return Some(format!(
+                "per-turn disk-write budget exhausted: {MAX_TOTAL_WRITE_BYTES_PER_TURN} bytes already written this turn"
+            ));
+        }
+        None
     }
 
     /// Rule-matching subject for one call: the workspace-relative path for
@@ -1005,6 +1038,13 @@ impl WorkspaceTools {
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_write_args(call.arguments())?;
         let target = self.resolve_in_root(&args.path)?;
+        if let Some(detail) = self.reserve_write_budget(args.content.len()) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&detail)),
+            });
+        }
         if let Some(config) = self
             .shadow_diagnostics
             .as_ref()
@@ -1292,6 +1332,13 @@ impl WorkspaceTools {
                 });
             }
             let updated = contents.replace(&args.old, &args.new);
+            if let Some(detail) = self.reserve_write_budget(updated.len()) {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&detail)),
+                });
+            }
             fs::write(&target, updated.as_bytes()).map_err(|_| ToolStepError::Failed)?;
             return Ok(ToolStepResult::Succeeded {
                 call_id: call.call_id().to_owned(),
@@ -1334,6 +1381,13 @@ impl WorkspaceTools {
         let mut updated = contents.clone();
         for range in selected.iter().rev() {
             updated.replace_range(range.clone(), &args.new);
+        }
+        if let Some(detail) = self.reserve_write_budget(updated.len()) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&detail)),
+            });
         }
         fs::write(&target, updated.as_bytes()).map_err(|_| ToolStepError::Failed)?;
         Ok(ToolStepResult::Succeeded {
@@ -3775,6 +3829,81 @@ use std::sync::{Arc, Mutex};
             .map(|call| validate_one(tools, call))
             .collect();
         tools.execute_batch(&validated, &CancellationToken::new())
+    }
+
+    #[test]
+    fn write_budget_refuses_once_the_per_turn_disk_ceiling_is_reached() {
+        let root = TempRoot::new("write-budget");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        // Pre-load the counter to just under the ceiling instead of
+        // actually writing 64 MB — same effect, instant instead of slow.
+        tools
+            .bytes_written
+            .store(MAX_TOTAL_WRITE_BYTES_PER_TURN - 10, Ordering::SeqCst);
+
+        let small = ProposedToolCall::new(
+            "c1",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"a.txt","content":"short"}"#,
+        )
+        .expect("call");
+        let validated = tools.validate(&small, &cancel).expect("v");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { .. } => {}
+            other => panic!("a write within budget must still succeed, got {other:?}"),
+        }
+
+        let over = ProposedToolCall::new(
+            "c2",
+            WORKSPACE_WRITE_TOOL,
+            &serde_json::to_string(&serde_json::json!({
+                "path": "b.txt",
+                "content": "x".repeat(1024),
+            }))
+            .expect("encode call"),
+        )
+        .expect("call");
+        let validated = tools.validate(&over, &cancel).expect("v");
+        match tools.execute(&validated, &cancel).expect("handled") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.unwrap().contains("disk-write budget exhausted"));
+            }
+            other => panic!("expected a budget refusal, got {other:?}"),
+        }
+        // The refused write must never have touched disk.
+        assert!(!root.0.join("b.txt").exists());
+    }
+
+    #[test]
+    fn execute_patch_shares_the_same_per_turn_write_budget() {
+        let root = TempRoot::new("patch-budget");
+        fs::write(root.0.join("code.rs"), "fn a() {}\n").expect("seed");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        tools
+            .bytes_written
+            .store(MAX_TOTAL_WRITE_BYTES_PER_TURN - 5, Ordering::SeqCst);
+
+        let call = make_call(
+            "c1",
+            WORKSPACE_PATCH_TOOL,
+            r#"{"path":"code.rs","old":"fn a() {}","new":"fn b() {}"}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("v");
+        match tools.execute(&validated, &cancel).expect("handled") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.unwrap().contains("disk-write budget exhausted"));
+            }
+            other => panic!("expected a budget refusal, got {other:?}"),
+        }
+        // The refused patch must never have touched the file.
+        let contents = fs::read_to_string(root.0.join("code.rs")).expect("read");
+        assert_eq!(contents, "fn a() {}\n");
     }
 
     #[test]
