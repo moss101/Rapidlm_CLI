@@ -172,37 +172,32 @@ impl ResultStore {
                 return Err(ResultError::from(AgentModelError::ResultViewMismatch));
             }
 
-        {
-            let inner = self.lock()?;
-            check_cancel(cancel)?;
-            if inner.records.contains_key(&agent.spec().id()) {
-                return Err(ResultError::AlreadyCompleted {
-                    agent_id: agent.spec().id(),
-                });
-            }
-            if inner.records.len() >= self.max_results {
-                return Err(ResultError::BoundExceeded);
-            }
+        // The duplicate/bound check and the insert must share one lock
+        // acquisition with agent.complete() in between: agent.complete()
+        // moves `agent` to a terminal state with no way back (validate_
+        // transition rejects any transition once terminal), so re-checking
+        // under a second, separately-acquired lock left a window where a
+        // concurrent completer could win the race after this one already
+        // mutated `agent` — stranding it terminal with no stored result and
+        // no way to retry.
+        let mut inner = self.lock()?;
+        check_cancel(cancel)?;
+        if inner.records.contains_key(&agent.spec().id()) {
+            return Err(ResultError::AlreadyCompleted {
+                agent_id: agent.spec().id(),
+            });
         }
-
+        if inner.records.len() >= self.max_results {
+            return Err(ResultError::BoundExceeded);
+        }
         agent.complete(result.clone(), cancel)?;
         let stored = StoredHandoff {
             parent,
             result: result.clone(),
             merge: None,
         };
-        {
-            let mut inner = self.lock()?;
-            if inner.records.contains_key(&stored.result.agent_id()) {
-                return Err(ResultError::AlreadyCompleted {
-                    agent_id: stored.result.agent_id(),
-                });
-            }
-            if inner.records.len() >= self.max_results {
-                return Err(ResultError::BoundExceeded);
-            }
-            inner.records.insert(stored.result.agent_id(), stored);
-        }
+        inner.records.insert(stored.result.agent_id(), stored);
+        drop(inner);
 
         events.emit(ResultEvent::Completed {
             agent_id: result.agent_id(),
@@ -1128,6 +1123,49 @@ mod tests {
         .expect_err("shared");
         assert!(matches!(err, ResultError::SharedWriteView { .. }));
         let _ = parent_view;
+    }
+
+    #[test]
+    fn concurrent_completions_never_strand_the_losing_agent_when_the_store_is_full() {
+        // A sequential call sequence never exercises the race: the loser's
+        // own pre-check already sees the store full before it ever calls
+        // agent.complete(). Two threads racing to complete two *different*
+        // children against a max_results(1) store are needed to land both
+        // in the window between the pre-check and the insert.
+        let store = std::sync::Arc::new(ResultStore::with_limit(1));
+        let parent_id = parent();
+        let mut agent1 = running_child(parent_id, WorkspaceViewId::new());
+        let mut agent2 = running_child(parent_id, WorkspaceViewId::new());
+        let result1 = child_result(&agent1, "first child done");
+        let result2 = child_result(&agent2, "second child done");
+
+        let store1 = std::sync::Arc::clone(&store);
+        let t1 = std::thread::spawn(move || {
+            let mut events = Vec::new();
+            let outcome = complete_agent(&store1, &mut agent1, result1, &mut events, &cancel());
+            (agent1, outcome)
+        });
+        let store2 = std::sync::Arc::clone(&store);
+        let t2 = std::thread::spawn(move || {
+            let mut events = Vec::new();
+            let outcome = complete_agent(&store2, &mut agent2, result2, &mut events, &cancel());
+            (agent2, outcome)
+        });
+        let (agent1, outcome1) = t1.join().expect("t1");
+        let (agent2, outcome2) = t2.join().expect("t2");
+
+        let (winner_ok, loser_state, loser_err) = if outcome1.is_ok() {
+            (outcome1.is_ok(), agent2.state(), outcome2.err())
+        } else {
+            (outcome2.is_ok(), agent1.state(), outcome1.err())
+        };
+        assert!(winner_ok, "exactly one of the two racing completions must succeed");
+        assert_eq!(loser_err, Some(ResultError::BoundExceeded));
+        assert_eq!(
+            loser_state,
+            AgentState::Running,
+            "the losing agent must not be stranded terminal with no stored result"
+        );
     }
 
     #[test]

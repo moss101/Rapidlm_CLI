@@ -685,6 +685,35 @@ wired into `task_spawn` yet — but a real, demonstrable resource-leak bug in th
 worth having fixed before this becomes the real subagent-spawn path. Full `agent-runtime` crate suite (271
 tests, up from 270) and `cargo build --workspace --tests` pass.
 
+**Fresh review pass, 2026-08-30, `crates/agent-runtime/src/agent/result.rs::ResultStore::complete` — a
+genuine concurrent race could strand a completed child agent with no stored result and no way to retry.**
+The file's own header claims "`complete_agent` records the typed summary, evidence, and view." `complete`
+checked the duplicate/bound conditions under one lock acquisition, released the lock, then called
+`agent.complete(result, cancel)` — an **irreversible** mutation (`Agent::complete` sets a terminal
+`AgentState`, and `validate_transition` rejects any transition once `from.is_terminal()`, so a terminal agent
+can never be completed again) — before re-acquiring the lock and re-checking the *same* conditions right
+before the insert. Two threads racing to complete two *different* children against a shared, bounded
+`ResultStore` could both pass the first (pre-mutation) check before either inserted, both call
+`agent.complete()` (both now terminal), and then only one would win the second check and actually get
+inserted — the loser returns `Err(BoundExceeded)` with its agent permanently `Succeeded`/`Failed` but no
+corresponding record in the store: `inspect_result` returns `AgentNotFound` forever, and retrying `complete()`
+now fails with `InvalidTransition` since the agent is already terminal. Confirmed directly with a genuine
+2-thread test (not a synthetic single-threaded sequence — a sequential call never lands in the race window,
+since the *first* call's own pre-check already sees the store full before any mutation happens, which is
+exactly why the existing `store_bound_and_shared_view_fail_closed` test never caught this) and the standard
+temporary-revert cycle: run 20 times against the reverted two-separate-locks code, the new test failed ~75%
+of the time with the loser's agent left `Succeeded` instead of `Running`; restored the fix and reran 20
+times, passed every time — deterministic now, since the race window no longer exists. **Fixed:** merged the
+two separately-acquired lock blocks into one critical section that holds the lock across the whole
+check → `agent.complete()` → insert sequence, so a losing thread now fails the bound/duplicate check *before*
+ever calling `agent.complete()`, leaving its agent's state untouched and safely retryable. New test
+`concurrent_completions_never_strand_the_losing_agent_when_the_store_is_full`. **Latent, not yet actively
+firing:** confirmed via grep that `ResultStore`/`complete_agent` have zero callers anywhere in `apps/` —
+same not-yet-wired-in subagent-spawn subsystem as the `spawn.rs::spawn_agent` finding just above, and the
+same reasoning applies: a real, demonstrable bug worth having fixed before this becomes the live child-
+completion path. Full `agent-runtime` crate suite (272 tests, up from 271) and `cargo build --workspace
+--tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
