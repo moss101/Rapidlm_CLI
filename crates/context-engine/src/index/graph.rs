@@ -737,6 +737,51 @@ impl CodeGraph {
         Ok(out)
     }
 
+    /// Symbols defined in `path` (Modbit `CTX-017` Next-Edit-Ripple: the
+    /// step that resolves a file-level edit to the symbol(s) [`Self::impact`]
+    /// actually needs). A direct indexed lookup, not a traversal — no
+    /// hop/node budget applies.
+    pub fn symbols_at_path(
+        &self,
+        repo_id: RepoId,
+        path: &RepoPath,
+    ) -> Result<Vec<SymbolLocator>, GraphError> {
+        let started = Instant::now();
+        check_bounds(&self.limits.cancel, started, self.limits.timeout)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT locator FROM context_graph_symbols
+             WHERE repo_id = ?1 AND path = ?2
+             ORDER BY locator ASC",
+        )?;
+        let repo_s = repo_id.to_string();
+        let mut rows = stmt.query(params![repo_s, path.as_str()])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let locator: String = row.get(0)?;
+            out.push(SymbolLocator::new(repo_id, locator)?);
+        }
+        check_bounds(&self.limits.cancel, started, self.limits.timeout)?;
+        Ok(out)
+    }
+
+    /// Best-effort display label (fully-qualified name, defining path) for
+    /// one locator. [`Self::impact`]'s edges carry only opaque
+    /// [`SymbolLocator`]s; this resolves one back to something a caller can
+    /// show a user. `None` on any lookup failure or unindexed locator —
+    /// display is advisory, never a hard error.
+    pub fn symbol_label(&self, locator: &SymbolLocator) -> Option<(String, RepoPath)> {
+        let repo_s = locator.repo_id().to_string();
+        let row: Result<(String, String), _> = self.conn.query_row(
+            "SELECT fq_name, path FROM context_graph_symbols
+             WHERE repo_id = ?1 AND locator = ?2",
+            params![repo_s, locator.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        );
+        let (fq_name, path) = row.ok()?;
+        let path = RepoPath::parse(&path).ok()?;
+        Some((fq_name, path))
+    }
+
     #[cfg(test)]
     fn fail_next_commit(&self) {
         self.fail_before_commit.store(true, Ordering::SeqCst);
@@ -1763,6 +1808,58 @@ fn helper() -> u32 { 1 }
             graph.impact(&c_fn, 1, 0).expect_err("limit"),
             GraphError::InvalidLimit
         ));
+    }
+
+    #[test]
+    fn symbols_at_path_finds_only_that_files_symbols() {
+        let mut graph = open_mem();
+        let repo = RepoId::new();
+        let a = document(repo, "src/a.rs", SourceLanguage::Rust, "fn a() { b(); }\n");
+        let b = document(repo, "src/b.rs", SourceLanguage::Rust, "fn b() {}\n");
+        graph.upsert_document(&a).expect("a");
+        graph.upsert_document(&b).expect("b");
+
+        let a_fn = locator_of(&a, SymbolKind::Function, "a");
+        let b_fn = locator_of(&b, SymbolKind::Function, "b");
+        let found = graph.symbols_at_path(repo, &path("src/a.rs")).expect("lookup");
+        assert!(found.contains(&a_fn), "{found:?}");
+        assert!(!found.contains(&b_fn), "b.rs's symbols must not leak in");
+
+        let none = graph
+            .symbols_at_path(repo, &path("src/missing.rs"))
+            .expect("lookup missing");
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn symbol_label_resolves_next_edit_ripple_end_to_end() {
+        let mut graph = open_mem();
+        let repo = RepoId::new();
+        let a = document(repo, "src/a.rs", SourceLanguage::Rust, "fn a() { b(); }\n");
+        let b = document(repo, "src/b.rs", SourceLanguage::Rust, "fn b() {}\n");
+        graph.upsert_document(&a).expect("a");
+        graph.upsert_document(&b).expect("b");
+
+        // The Next-Edit-Ripple flow end to end: given the file just edited
+        // (b.rs), find its symbols, then find what would be impacted by
+        // changing them, then resolve those impacted symbols to a
+        // human-showable (name, path).
+        let symbols = graph.symbols_at_path(repo, &path("src/b.rs")).expect("lookup");
+        let b_fn = locator_of(&b, SymbolKind::Function, "b");
+        assert!(symbols.contains(&b_fn), "{symbols:?}");
+        let impacted = graph.impact(&b_fn, 1, 64).expect("impact");
+        let labelled: Vec<(String, RepoPath)> = impacted
+            .iter()
+            .filter_map(|edge| graph.symbol_label(edge.from()))
+            .collect();
+        assert!(
+            labelled.iter().any(|(name, p)| name == "a" && *p == path("src/a.rs")),
+            "{labelled:?}"
+        );
+
+        assert!(graph.symbol_label(&locator_of(&a, SymbolKind::Function, "a")).is_some());
+        let bogus = SymbolLocator::new(repo, "nope").expect("locator");
+        assert!(graph.symbol_label(&bogus).is_none());
     }
 
     #[test]

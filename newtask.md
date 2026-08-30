@@ -523,6 +523,35 @@ itself unwired from `apps/rapid` — `compact_packet` is only ever called from w
 `compact_policy.rs`, in the same crate, never from the exec loop. So Phase 1 §1.4 row 13's "explicit
 fast-path" framing undersells it: compaction isn't reachable *at all* today, deterministic or model-based.
 
+**Next-Edit-Ripple implemented 2026-08-30 — the "genuine, moderate-sized wiring work" the note above
+anticipated, not the traversal algorithm (already existed).** Two small, additive `context-engine` reads
+closed the "resolve a file to symbols, resolve a symbol back to a file" gap `CodeGraph::impact()` itself
+never needed for its own BFS: `CodeGraph::symbols_at_path(repo_id, path)` (a direct indexed query against
+`context_graph_symbols`'s existing `path` column — no schema change) and `CodeGraph::symbol_label(locator)`
+(resolves one `impact()` edge endpoint back to a `(fq_name, RepoPath)` for display, `None` on any lookup
+miss — advisory, never a hard error). New `apps/rapid/src/context_retrieval.rs::ripple_advisory(root, path)`
+sits alongside the existing `retrieve()` (same module, same persistent `.rapidlm/index/`, same fail-open/
+bounded-timeout philosophy): after a successful `workspace_write`/`workspace_patch`, it walks (stat/
+eligibility only, no parsing — bounded by `MAX_RIPPLE_WALK_FILES`) looking specifically for the one
+just-written path, indexes only that match, then calls `impact()` on that file's symbols and renders the
+callers it finds as an advisory note appended to the tool's own summary — the same shape every other
+scanner advisory in `exec_tools.rs` already uses. Deliberately does **not** re-walk and re-index the whole
+repo per write the way `retrieve()` does once per turn (a multi-edit turn would otherwise pay a full walk
+per edit) — indexing is scoped to the one changed file only. **Important, explicitly documented
+limitation:** a caller only shows up if it was already indexed by an earlier `retrieve()` call this
+session (persisted across turns, but genuinely absent on a fresh project or if retrieval was skipped) —
+this is "what the graph already knows," not an on-demand full dependency audit; verified this precisely
+with a test that fails without an earlier `retrieve()` call and passes with one. New tests: two in
+`context-engine::index::graph` (`symbols_at_path_finds_only_that_files_symbols`,
+`symbol_label_resolves_next_edit_ripple_end_to_end`, the latter exercising the whole
+resolve→impact→resolve chain against a real two-file call graph) and one in `apps/rapid`
+(`ripple_advisory_names_the_file_that_calls_the_edited_function`, covering the positive case, an
+uncalled function producing no advisory, and a nonexistent path failing open). Full `context-engine`
+suite (307 tests, up from 305) and full `rapid` lib+integration suite (295 lib tests) both pass, plus
+`cargo build --workspace --tests`. **Still not attempted:** `CTX-013`/`CTX-014`'s full Context Pack
+Compiler/Workspace Capsule and `CTX-003`'s retrieval-before-edit guardrail (surfacing *inadequate*
+context as a distinct condition) — this closes only the Next-Edit-Ripple half of this section.
+
 Modbit: `CTX-013`/`CTX-014` (a bounded, provenance-carrying, task-specific context package for execution
 and handoff — "a context package grants no permissions"), `CTX-017` (tagged MOAT — graph-driven affected
 files/symbols/tests/config as change-impact follow-up after an edit, revision/evidence bound), `CTX-003`

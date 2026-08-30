@@ -1164,6 +1164,10 @@ impl WorkspaceTools {
             summary.push('\n');
             summary.push_str(&note);
         }
+        if let Some(note) = crate::context_retrieval::ripple_advisory(self.root(), &args.path) {
+            summary.push('\n');
+            summary.push_str(&note);
+        }
         Ok(ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
             summary,
@@ -1404,9 +1408,14 @@ impl WorkspaceTools {
                 });
             }
             fs::write(&target, updated.as_bytes()).map_err(|_| ToolStepError::Failed)?;
+            let mut summary = format!("replaced {exact_occurrences} occurrence(s) in {}", args.path);
+            if let Some(note) = crate::context_retrieval::ripple_advisory(self.root(), &args.path) {
+                summary.push('\n');
+                summary.push_str(&note);
+            }
             return Ok(ToolStepResult::Succeeded {
                 call_id: call.call_id().to_owned(),
-                summary: format!("replaced {exact_occurrences} occurrence(s) in {}", args.path),
+                summary,
             });
         }
         // Second tier: the exact substring wasn't found, but the same lines
@@ -1454,13 +1463,18 @@ impl WorkspaceTools {
             });
         }
         fs::write(&target, updated.as_bytes()).map_err(|_| ToolStepError::Failed)?;
+        let mut summary = format!(
+            "replaced {} occurrence(s) in {} (whitespace-insensitive match)",
+            selected.len(),
+            args.path
+        );
+        if let Some(note) = crate::context_retrieval::ripple_advisory(self.root(), &args.path) {
+            summary.push('\n');
+            summary.push_str(&note);
+        }
         Ok(ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
-            summary: format!(
-                "replaced {} occurrence(s) in {} (whitespace-insensitive match)",
-                selected.len(),
-                args.path
-            ),
+            summary,
         })
     }
 

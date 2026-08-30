@@ -25,11 +25,12 @@ use std::time::{Duration, Instant};
 use context_engine::CancellationToken;
 use context_engine::compile::{CompileInput, CompileReason};
 use context_engine::ingest::pipeline::{IndexPipeline, PipelineLimits};
-use context_engine::ingest::walk::{RepoScope, WalkLimits, walk_manifest};
+use context_engine::ingest::walk::{RepoScope, WalkLimits, walk_manifest, walk_repo};
 use context_engine::need::{CompletenessRequirement, InformationNeed, NegativeClaimPolicy, ScopeSet};
 use context_engine::repo_manifest::WorkspaceManifest;
 use context_engine::retrieval::candidates::{Freshness, TrustClass};
 use context_engine::scout::{ScoutLimits, ScoutSources, scout};
+use protocol::RepoPath;
 
 /// Wall-clock budget for the whole walk+index+scout pass. Bounded so an
 /// unindexable or huge repo degrades to "no retrieval" rather than stalling
@@ -46,6 +47,21 @@ pub const MAX_SNIPPET_BYTES: usize = 4096;
 /// Task-prompt bytes carried into the scout question (the need's own cap).
 const MAX_QUESTION_BYTES: usize = 512;
 const INDEX_DIR_NAME: &str = ".rapidlm/index";
+
+/// Wall-clock budget for one `ripple_advisory` call — shorter than
+/// `RETRIEVAL_TIMEOUT` since this runs synchronously inside a tool call the
+/// model is waiting on, not once at turn start.
+const RIPPLE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Files scanned (not indexed — see `ripple_advisory`'s doc comment) while
+/// searching the walk for the one just-written path, before giving up.
+const MAX_RIPPLE_WALK_FILES: usize = 20_000;
+/// `impact()`'s own hop/result caps for a ripple advisory: shallow and
+/// narrow on purpose (a "here's what to check" advisory, not a full
+/// transitive dependency audit).
+const RIPPLE_HOPS: u32 = 2;
+const RIPPLE_LIMIT: u32 = 64;
+/// Impacted paths named in one advisory line.
+const MAX_RIPPLE_PATHS_LISTED: usize = 8;
 
 /// Retrieve proactive context for `task_prompt` against the repo at `root`.
 /// Never fails the caller — logs a one-line warning and returns an empty
@@ -135,6 +151,86 @@ fn retrieve_inner(
     }
     watcher.stop();
     Ok(blocks)
+}
+
+/// Next-Edit-Ripple advisory (Modbit `CTX-017`): after a successful write to
+/// `path`, re-index just that one file into the same persistent
+/// `.rapidlm/index/` graph [`retrieve`] builds, then report which other
+/// already-indexed files define symbols that reference the ones the edit
+/// touched — a "you may also need to check these" note appended to the
+/// tool's own summary, never a block.
+///
+/// Fails open like `retrieve`: any error (bad path, no manifest, indexing
+/// failure, timeout) is a silent `None`. Deliberately does not re-walk and
+/// re-index the whole repo the way `retrieve` does at turn start — a turn
+/// with many edits would otherwise pay a full walk per write. Instead this
+/// walks (stats/eligibility-checks only, no parsing) looking specifically
+/// for the one candidate matching `path`, bounded by
+/// `MAX_RIPPLE_WALK_FILES`, and indexes only that single match. A repo
+/// larger than the walk bound, or one where `path` sorts very late in walk
+/// order, can miss the advisory entirely — accepted for an advisory
+/// feature, not the correctness-bearing write path itself.
+///
+/// **Important limitation:** only `path` itself gets (re)indexed here — its
+/// *callers* are found only if they were already indexed by an earlier
+/// `retrieve()` call this session (persisted at `.rapidlm/index/`, so this
+/// includes prior turns, not just the current one). On a project with no
+/// index yet and retrieval skipped or not yet run, this returns `None` even
+/// when real callers exist on disk, because the graph simply hasn't seen
+/// them. This is a "what we already know" advisory, not an on-demand full
+/// dependency audit of the repository.
+pub fn ripple_advisory(root: &Path, path: &str) -> Option<String> {
+    let cancel = CancellationToken::new();
+    let watcher = spawn_timeout_watcher(cancel.clone(), RIPPLE_TIMEOUT);
+    let result = ripple_advisory_inner(root, path, &cancel);
+    watcher.stop();
+    result
+}
+
+fn ripple_advisory_inner(root: &Path, path: &str, cancel: &CancellationToken) -> Option<String> {
+    let target = RepoPath::parse(path).ok()?;
+    let manifest = build_manifest(root, cancel).ok()?;
+    let repo = manifest.repo_by_alias("main")?;
+    let repo_id = repo.id();
+
+    let walk_limits = WalkLimits::default();
+    let candidate = walk_repo(repo, &walk_limits, cancel)
+        .take(MAX_RIPPLE_WALK_FILES)
+        .filter_map(Result::ok)
+        .find(|candidate| candidate.path() == &target)?;
+
+    let index_dir = root.join(INDEX_DIR_NAME);
+    let limits = PipelineLimits::new()
+        .timeout(RIPPLE_TIMEOUT)
+        .cancellation(cancel.clone());
+    let mut pipeline = IndexPipeline::open(&index_dir, manifest.clone(), limits).ok()?;
+    pipeline.index_file(&candidate).ok()?;
+
+    let symbols = pipeline.graph().symbols_at_path(repo_id, &target).ok()?;
+    let mut impacted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for symbol in &symbols {
+        let Ok(edges) = pipeline.graph().impact(symbol, RIPPLE_HOPS, RIPPLE_LIMIT) else {
+            continue;
+        };
+        for edge in &edges {
+            if let Some((_, impacted_path)) = pipeline.graph().symbol_label(edge.from())
+                && impacted_path.as_str() != path
+            {
+                impacted.insert(impacted_path.as_str().to_owned());
+            }
+        }
+    }
+    if impacted.is_empty() {
+        return None;
+    }
+    let listed: Vec<String> = impacted.iter().take(MAX_RIPPLE_PATHS_LISTED).cloned().collect();
+    let more = impacted.len().saturating_sub(listed.len());
+    let suffix = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+    Some(format!(
+        "advisory: editing {path} may affect code that references it in: {}{suffix} — verify \
+         they still work",
+        listed.join(", ")
+    ))
 }
 
 fn build_manifest(root: &Path, cancel: &CancellationToken) -> Result<WorkspaceManifest, String> {
@@ -232,6 +328,31 @@ mod tests {
             blocks.iter().any(|block| block.text().contains("LRUCache")),
             "expected a block referencing LRUCache, got {blocks:?}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ripple_advisory_names_the_file_that_calls_the_edited_function() {
+        let root = temp_dir("ripple");
+        std::fs::write(root.join("a.rs"), "fn a() { b(); }\n").expect("seed a");
+        std::fs::write(root.join("b.rs"), "fn b() {}\n").expect("seed b");
+        // In real use, `retrieve()` already indexed the whole repo (a.rs
+        // included) once at turn start; `ripple_advisory` only needs to
+        // freshen the one file the current turn just wrote (b.rs), not
+        // every caller of it.
+        let _ = retrieve(&root, "b", 4096);
+
+        let advisory = ripple_advisory(&root, "b.rs").expect("advisory expected");
+        assert!(advisory.contains("a.rs"), "{advisory}");
+        assert!(advisory.starts_with("advisory: editing b.rs"), "{advisory}");
+
+        // A function nothing else calls carries no ripple advisory at all.
+        std::fs::write(root.join("lonely.rs"), "fn lonely() {}\n").expect("seed lonely");
+        assert!(ripple_advisory(&root, "lonely.rs").is_none());
+
+        // An unknown/nonexistent path fails open rather than panicking.
+        assert!(ripple_advisory(&root, "does-not-exist.rs").is_none());
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
