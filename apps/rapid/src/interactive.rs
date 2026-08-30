@@ -1455,6 +1455,12 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
         .as_ref()
         .and_then(|(root, _)| crate::host::load_memory_index(root));
     let preserved = preserved.with_memory_index(memory_index);
+    // Plan/todo projection: .rapidlm/todos.json (written by todo_write)
+    // survives compaction and a fresh invocation, not just the transcript.
+    let todos_index = workspace
+        .as_ref()
+        .and_then(|(root, _)| crate::host::load_todos_index(root));
+    let preserved = preserved.with_todos_index(todos_index);
     // Proactive context retrieval: only for a trusted project (it walks the
     // tree and writes an incremental index under .rapidlm/index/). Fails
     // open inside retrieve() itself — an unindexable or slow repo yields no

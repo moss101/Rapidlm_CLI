@@ -118,6 +118,7 @@ pub struct PreservedLiveContext {
     reminders_block: Option<String>,
     system_prompt: Option<String>,
     memory_index: Option<String>,
+    todos_index: Option<String>,
     retrieved_context: Vec<CompileInput>,
 }
 
@@ -158,6 +159,7 @@ impl PreservedLiveContext {
             reminders_block: None,
             system_prompt: None,
             memory_index: None,
+            todos_index: None,
             retrieved_context: Vec::new(),
         })
     }
@@ -188,6 +190,24 @@ impl PreservedLiveContext {
 
     pub fn memory_index(&self) -> Option<&str> {
         self.memory_index.as_deref()
+    }
+
+    /// Attach the persisted plan/todo projection (`.rapidlm/todos.json`,
+    /// written by the `todo_write` tool) so it survives compaction instead
+    /// of only living in the transcript (Modbit `AGT-016`). Same bounds
+    /// discipline as `with_memory_index`.
+    pub fn with_todos_index(mut self, todos: Option<String>) -> Self {
+        let within_bounds = todos.as_ref().is_none_or(|text| {
+            !text.is_empty() && text.len() <= MAX_MEMORY_INDEX_BYTES
+        });
+        if within_bounds {
+            self.todos_index = todos;
+        }
+        self
+    }
+
+    pub fn todos_index(&self) -> Option<&str> {
+        self.todos_index.as_deref()
     }
 
     /// Attach the rendered dynamic system prompt for this turn. Empty or
@@ -1194,6 +1214,34 @@ pub fn load_memory_index(root: &Path) -> Option<String> {
     Some(bounded.join("\n"))
 }
 
+/// Load the persisted plan/todo state (`.rapidlm/todos.json`, written by the
+/// `todo_write` tool) as a readable projection for `with_todos_index`
+/// (Modbit `AGT-016`: plan state as durable state outside the transcript,
+/// not prompt-only — this is the model-visible half; `scheduler`'s
+/// `NodeState` graph is the separate structured-state half, not wired to
+/// this pass — see `newtask.md` §2.5). Missing/corrupt file, or a file with
+/// no entries → None, matching `load_memory_index`'s fail-open shape:
+/// persisted plan state is advisory context, not something a turn should
+/// fail to start over. Malformed individual entries are skipped, not fatal
+/// to the whole projection.
+pub fn load_todos_index(root: &Path) -> Option<String> {
+    let bytes = fs::read(root.join(crate::exec_tools::TODOS_PATH)).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let entries = value.get("todos")?.as_array()?;
+    let lines: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| {
+            let content = entry.get("content")?.as_str()?;
+            let status = entry.get("status")?.as_str()?;
+            Some(format!("- [{status}] {content}"))
+        })
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(lines.join("\n"))
+}
+
 /// Compile a live [`ContextPacket`] from preserved state + optional compaction
 /// summary. This is the single Context-Fabric rebuild path.
 pub fn build_packet(
@@ -1213,6 +1261,12 @@ pub fn build_packet(
         ctx = ctx.system(CompileInput::new(
             "memory/index",
             memory.to_owned(),
+        ));
+    }
+    if let Some(todos) = preserved.todos_index() {
+        ctx = ctx.system(CompileInput::new(
+            "plan/todos",
+            todos.to_owned(),
         ));
     }
     if !preserved.agents_rules.is_empty() {
@@ -1634,6 +1688,66 @@ mod tests {
         // None adds no block.
         let packet = build_packet(&preserved(), None).expect("packet");
         assert!(packet.blocks().iter().all(|b| !b.text().contains("reminders schema")));
+    }
+
+    #[test]
+    fn todos_index_is_compiled_into_the_packet_as_a_system_block() {
+        let text = "- [in_progress] wire the thing\n- [pending] test it";
+        let with_todos = preserved().with_todos_index(Some(text.to_owned()));
+        let packet = build_packet(&with_todos, None).expect("packet");
+        let block = packet
+            .blocks()
+            .iter()
+            .find(|b| b.text().contains("wire the thing"))
+            .expect("todos block in packet");
+        assert_eq!(block.source(), context_engine::compile::ContextSource::System);
+        // None adds no block.
+        let packet = build_packet(&preserved(), None).expect("packet");
+        assert!(packet.blocks().iter().all(|b| !b.text().contains("wire the thing")));
+    }
+
+    #[test]
+    fn load_todos_index_renders_persisted_entries_and_fails_open() {
+        let root = std::env::temp_dir().join(format!(
+            "rapidlm-host-todos-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".rapidlm")).expect("dir");
+
+        // Missing file: None, not an error.
+        assert!(load_todos_index(&root).is_none());
+
+        // Corrupt JSON: None.
+        std::fs::write(root.join(crate::exec_tools::TODOS_PATH), b"not json").expect("write");
+        assert!(load_todos_index(&root).is_none());
+
+        // Empty todos array: None (nothing worth injecting).
+        std::fs::write(
+            root.join(crate::exec_tools::TODOS_PATH),
+            br#"{"schema":1,"todos":[]}"#,
+        )
+        .expect("write");
+        assert!(load_todos_index(&root).is_none());
+
+        // Real entries, including one malformed entry that must be skipped
+        // without failing the whole projection.
+        std::fs::write(
+            root.join(crate::exec_tools::TODOS_PATH),
+            br#"{"schema":1,"todos":[
+                {"id":"1","content":"wire the thing","status":"in_progress"},
+                {"id":"2","content":"test it","status":"pending"},
+                {"id":"3","status":"pending"}
+            ]}"#,
+        )
+        .expect("write");
+        let rendered = load_todos_index(&root).expect("rendered");
+        assert_eq!(rendered, "- [in_progress] wire the thing\n- [pending] test it");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

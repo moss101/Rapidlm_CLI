@@ -425,6 +425,28 @@ blocker, rather than looping autonomously).
   compaction, not a new state machine. `todo_write` tool exists; wire its state to the graph rather than
   keeping it prompt-only.
 - **Sev/Effort:** P1 / M.
+- **Model-visible projection implemented 2026-08-30 — the exact "survives compaction, not prompt-only"
+  half this item's "where it lands" note asked for.** `todo_write` already persisted durably to
+  `.rapidlm/todos.json`, but nothing ever read it back into context — the model only ever saw its own
+  todos through the transcript, so compaction (or a fresh `rapid exec` invocation in the same project)
+  could lose track of them entirely. Found the fix by tracing how `.rapidlm/MEMORY.md` already achieves
+  exactly this for the memory index: `PreservedLiveContext::with_memory_index` feeds a plain string into
+  `build_packet` via `CompileInput::new("memory/index", text)` — `CompileInput`, not the closed
+  `context_engine::compile::ContextBlock` (an internal-only type the compile pipeline constructs from
+  `CompileInput`, with no public constructor of its own — this was the exact wall the stall-detection
+  injection hit and correctly declined to force through; todos needed no such wall, since this injection
+  point was already open and proven). Mirrored the pattern exactly: new `host::load_todos_index(root)`
+  reads and renders `.rapidlm/todos.json` (fail-open on missing/corrupt — persisted plan state is
+  advisory context, not something a turn should fail to start over; a malformed individual entry is
+  skipped, not fatal to the whole projection), `PreservedLiveContext::with_todos_index`/`todos_index()`
+  mirror `with_memory_index`/`memory_index()` field-for-field, and `build_packet` compiles it as a
+  `"plan/todos"` system block whenever present. **Deliberately not attempted:** the `scheduler::NodeState`
+  graph half — this is the durable, *readable* projection into context, not a structured state machine
+  with dependencies/owner/evidence-requirements/attempts that `todo_write`'s flat id/content/status shape
+  doesn't carry at all; wiring the stall-detection warning into context (this item's other still-open
+  half, `AGT-017`) also remains undone — that one genuinely does need a decision about which turn-loop
+  layer computes it in time to feed `build_packet`, since `detect_stall` runs inside `SupervisedModel::step`,
+  after context for that step was already compiled, not before it like the todos/memory case.
 
 ### 2.6 `SessionLease` + fencing generation
 
