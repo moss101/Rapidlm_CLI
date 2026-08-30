@@ -1533,6 +1533,16 @@ further scrutiny of `fixtures.rs` in isolation, and consider whether the fix bel
 infrastructure (bounded parallelism, e.g. `cargo test --workspace -- --test-threads=N`) rather than in
 `computer-use`'s own code.
 
+**Confirmation, 2026-08-30: a full `cargo test --workspace` run (accepting the ~minutes-long cost, exactly
+as recommended above) completed cleanly — no hang, no failures, anywhere.** 73 test binaries (lib +
+integration + doc-tests across every crate), every one `test result: ok`, zero `FAILED`/panicked lines in
+the full log. `computer-use`'s own `fixtures.rs` ran twice in this one workspace run (it's exercised by
+two separate test binaries) — both times all 8 (then 6) tests passed with no hang, consistent with the
+resource-contention hypothesis above rather than a real bug: on a machine not under that same sustained
+background load, the full suite — including the specific file that hung before — runs clean. Not
+conclusive proof the hang can never recur under contention, but a real, full-cost reproduction attempt
+that found nothing wrong, which is itself the evidence this note asked the next person to go gather.
+
 ## Source ledger
 
 - This session's three-way parity research (RapidLM vs. Grok Build vs. Qwen Code), published as an
