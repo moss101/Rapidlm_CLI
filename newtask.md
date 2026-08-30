@@ -771,9 +771,18 @@ their results become evidence, not just a console warning).
   a secret introduced via an exact-match patch, and a `patch.ci_permissions_broaden` finding reached only
   through the whitespace-insensitive fallback (confirming the scan runs on that tier too, not just the
   exact-match one). Full `-p rapid` suite (297 lib tests) and `cargo build --workspace --tests` pass.
-  `execute_write`'s shadow-diagnostics branches remain the one write path in this file with no scanner
-  coverage at all — a real change to verify-then-apply semantics (scan before the shadow-diagnostics
-  candidate is even accepted, not after), deliberately left for its own pass.
+- **`execute_write`'s shadow-diagnostics branches closed too, 2026-08-30 — every write/patch path in
+  `exec_tools.rs` now runs the same three scans.** Rather than repeat the three `if let Some(note) = ...`
+  blocks a fifth and sixth time, extracted `append_write_advisories(summary, root, path, content)` — the
+  one place all three scanners (secrets, patch-policy, ripple) are called from now, used by
+  `execute_write`'s plain path, both its shadow-diagnostics outcomes (`Passed`/`Skipped`), and both
+  `execute_patch` match tiers alike, instead of five near-identical call sites drifting independently.
+  Scans run *after* shadow diagnostics has already decided to apply the write (still advisory-only,
+  appended to the same success summary) — not *before* the shadow-diagnostics candidate is accepted, which
+  would be a real, different verify-then-apply semantics change and wasn't attempted. Extended
+  `shadow_diagnostics_applies_a_passing_write_for_real` to also assert a secret introduced through that
+  path is flagged, not just the plain path. Full `-p rapid` suite (297 lib tests, unchanged count since
+  this extended an existing test rather than adding a new one) and `cargo build --workspace --tests` pass.
 
 ### 2.10 Scoped Credential Broker + Resource Governor
 

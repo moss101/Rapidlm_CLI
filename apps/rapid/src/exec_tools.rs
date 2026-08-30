@@ -1127,13 +1127,15 @@ impl WorkspaceTools {
                 }
                 ShadowVerifyOutcome::Passed { diagnostics_tail } => {
                     fs::write(&target, args.content.as_bytes()).map_err(|_| ToolStepError::Failed)?;
+                    let mut summary = format!(
+                        "wrote {} bytes to {} (shadow diagnostics: ok)\n{diagnostics_tail}",
+                        args.content.len(),
+                        args.path
+                    );
+                    append_write_advisories(&mut summary, self.root(), &args.path, args.content.as_bytes());
                     return Ok(ToolStepResult::Succeeded {
                         call_id: call.call_id().to_owned(),
-                        summary: bounded_detail(&format!(
-                            "wrote {} bytes to {} (shadow diagnostics: ok)\n{diagnostics_tail}",
-                            args.content.len(),
-                            args.path
-                        )),
+                        summary: bounded_detail(&summary),
                     });
                 }
                 ShadowVerifyOutcome::Skipped { reason } => {
@@ -1143,31 +1145,22 @@ impl WorkspaceTools {
                     // not silently invisible.
                     fs::write(&target, args.content.as_bytes())
                         .map_err(|_| ToolStepError::Failed)?;
+                    let mut summary = format!(
+                        "wrote {} bytes to {} (shadow diagnostics skipped: {reason})",
+                        args.content.len(),
+                        args.path
+                    );
+                    append_write_advisories(&mut summary, self.root(), &args.path, args.content.as_bytes());
                     return Ok(ToolStepResult::Succeeded {
                         call_id: call.call_id().to_owned(),
-                        summary: bounded_detail(&format!(
-                            "wrote {} bytes to {} (shadow diagnostics skipped: {reason})",
-                            args.content.len(),
-                            args.path
-                        )),
+                        summary: bounded_detail(&summary),
                     });
                 }
             }
         }
         fs::write(&target, args.content.as_bytes()).map_err(|_| ToolStepError::Failed)?;
         let mut summary = format!("wrote {} bytes to {}", args.content.len(), args.path);
-        if let Some(note) = scan_for_secrets_advisory(self.root(), &args.path, args.content.as_bytes()) {
-            summary.push('\n');
-            summary.push_str(&note);
-        }
-        if let Some(note) = scan_patch_advisory(self.root(), &args.path, args.content.as_bytes()) {
-            summary.push('\n');
-            summary.push_str(&note);
-        }
-        if let Some(note) = crate::context_retrieval::ripple_advisory(self.root(), &args.path) {
-            summary.push('\n');
-            summary.push_str(&note);
-        }
+        append_write_advisories(&mut summary, self.root(), &args.path, args.content.as_bytes());
         Ok(ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
             summary,
@@ -1409,18 +1402,7 @@ impl WorkspaceTools {
             }
             fs::write(&target, updated.as_bytes()).map_err(|_| ToolStepError::Failed)?;
             let mut summary = format!("replaced {exact_occurrences} occurrence(s) in {}", args.path);
-            if let Some(note) = scan_for_secrets_advisory(self.root(), &args.path, updated.as_bytes()) {
-                summary.push('\n');
-                summary.push_str(&note);
-            }
-            if let Some(note) = scan_patch_advisory(self.root(), &args.path, updated.as_bytes()) {
-                summary.push('\n');
-                summary.push_str(&note);
-            }
-            if let Some(note) = crate::context_retrieval::ripple_advisory(self.root(), &args.path) {
-                summary.push('\n');
-                summary.push_str(&note);
-            }
+            append_write_advisories(&mut summary, self.root(), &args.path, updated.as_bytes());
             return Ok(ToolStepResult::Succeeded {
                 call_id: call.call_id().to_owned(),
                 summary,
@@ -1476,18 +1458,7 @@ impl WorkspaceTools {
             selected.len(),
             args.path
         );
-        if let Some(note) = scan_for_secrets_advisory(self.root(), &args.path, updated.as_bytes()) {
-            summary.push('\n');
-            summary.push_str(&note);
-        }
-        if let Some(note) = scan_patch_advisory(self.root(), &args.path, updated.as_bytes()) {
-            summary.push('\n');
-            summary.push_str(&note);
-        }
-        if let Some(note) = crate::context_retrieval::ripple_advisory(self.root(), &args.path) {
-            summary.push('\n');
-            summary.push_str(&note);
-        }
+        append_write_advisories(&mut summary, self.root(), &args.path, updated.as_bytes());
         Ok(ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
             summary,
@@ -2510,6 +2481,27 @@ struct RepoSearchArgs {
     pattern: String,
     head_limit: usize,
     offset: usize,
+}
+
+/// Every advisory-only content scan a successful write/patch can trigger,
+/// in one place: secrets, patch-policy, and Next-Edit-Ripple. Every write
+/// path in this file (`execute_write`'s plain and shadow-diagnostics
+/// branches, both `execute_patch` match tiers) funnels through this rather
+/// than repeating the same three calls, so a future fourth scanner has one
+/// call site to add, not five.
+fn append_write_advisories(summary: &mut String, root: &Path, path: &str, content: &[u8]) {
+    if let Some(note) = scan_for_secrets_advisory(root, path, content) {
+        summary.push('\n');
+        summary.push_str(&note);
+    }
+    if let Some(note) = scan_patch_advisory(root, path, content) {
+        summary.push('\n');
+        summary.push_str(&note);
+    }
+    if let Some(note) = crate::context_retrieval::ripple_advisory(root, path) {
+        summary.push('\n');
+        summary.push_str(&note);
+    }
 }
 
 /// Advisory-only secret scan of newly-written content (Modbit `VER-007`/
@@ -4458,24 +4450,27 @@ use std::sync::{Arc, Mutex};
             .expect("parsed"),
         );
         let cancel = CancellationToken::new();
+        let token = format!("ghp_{}", "e".repeat(36));
+        let content = format!("has MARKER inside; token {token}");
         let call = ProposedToolCall::new(
             "c1",
             WORKSPACE_WRITE_TOOL,
-            r#"{"path":"good.txt","content":"has MARKER inside"}"#,
+            &serde_json::to_string(&serde_json::json!({"path": "good.txt", "content": &content}))
+                .expect("encode call"),
         )
         .expect("call");
         let validated = tools.validate(&call, &cancel).expect("validate");
         let result = tools.execute(&validated, &cancel).expect("execute");
         match result {
             ToolStepResult::Succeeded { summary, .. } => {
-                assert!(summary.contains("shadow diagnostics: ok"));
+                assert!(summary.contains("shadow diagnostics: ok"), "{summary}");
+                // The shadow-diagnostics success path scans its written
+                // content too, not just the plain (no-shadow-config) path.
+                assert!(summary.contains("advisory: possible secret"), "{summary}");
             }
             other => panic!("expected success, got {other:?}"),
         }
-        assert_eq!(
-            fs::read(root.0.join("good.txt")).expect("written"),
-            b"has MARKER inside"
-        );
+        assert_eq!(fs::read(root.0.join("good.txt")).expect("written"), content.as_bytes());
     }
 
     #[test]
