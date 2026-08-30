@@ -1654,8 +1654,13 @@ impl WorkspaceTools {
             ) {
                 Ok(outcome) => {
                     let output = bounded_text(&outcome.output, MAX_SHELL_OUTPUT_BYTES);
-                    let status =
-                        sandboxed_status_line(outcome.exit_code, outcome.timed_out, outcome.signal);
+                    let status = sandboxed_status_line(
+                        outcome.exit_code,
+                        outcome.timed_out,
+                        outcome.signal,
+                        outcome.oom,
+                        outcome.policy_violation,
+                    );
                     let mut summary = format!("sandboxed {status}\n{output}");
                     if let Some(note) = scan_command_advisory(self.root(), &args.argv) {
                         summary.push('\n');
@@ -2631,12 +2636,29 @@ const SIGXCPU: i32 = 24;
 /// under the crate's own generic defaults, which is exactly why
 /// `sandbox_exec::build_spec` now sets an explicit, wider CPU/memory
 /// ceiling instead of inheriting them.
-fn sandboxed_status_line(exit_code: Option<i32>, timed_out: bool, signal: Option<i32>) -> String {
+///
+/// `oom`/`policy_violation` close the same gap for the memory and
+/// process-count ceilings: unlike the CPU case, `HostRestrictedBackend`
+/// reports both with no signal number at all (`SandboxExit::signal()` is
+/// `None` for both `WaitOutcome::Oom` and `::PidsExceeded`), so without
+/// these flags either one fell into the exact same generic "no exit code
+/// (signalled)" message the CPU fix above was written to eliminate.
+fn sandboxed_status_line(
+    exit_code: Option<i32>,
+    timed_out: bool,
+    signal: Option<i32>,
+    oom: bool,
+    policy_violation: bool,
+) -> String {
     match exit_code {
         Some(code) => format!("exit {code}"),
         None if timed_out => "timed out".to_owned(),
         None if signal == Some(SIGXCPU) => {
             "killed: sandbox CPU-time limit exceeded (SIGXCPU)".to_owned()
+        }
+        None if oom => "killed: sandbox memory limit exceeded (OOM)".to_owned(),
+        None if policy_violation => {
+            "killed: sandbox process-count limit exceeded".to_owned()
         }
         None => match signal {
             Some(signal) => format!("no exit code (signal {signal})"),
@@ -6176,14 +6198,37 @@ use std::sync::{Arc, Mutex};
 
     #[test]
     fn sandboxed_status_line_names_the_cpu_limit_specifically() {
-        assert_eq!(sandboxed_status_line(Some(0), false, None), "exit 0");
-        assert_eq!(sandboxed_status_line(None, true, None), "timed out");
+        assert_eq!(sandboxed_status_line(Some(0), false, None, false, false), "exit 0");
+        assert_eq!(sandboxed_status_line(None, true, None, false, false), "timed out");
         assert_eq!(
-            sandboxed_status_line(None, false, Some(24)),
+            sandboxed_status_line(None, false, Some(24), false, false),
             "killed: sandbox CPU-time limit exceeded (SIGXCPU)"
         );
-        assert_eq!(sandboxed_status_line(None, false, Some(9)), "no exit code (signal 9)");
-        assert_eq!(sandboxed_status_line(None, false, None), "no exit code (signalled)");
+        assert_eq!(
+            sandboxed_status_line(None, false, Some(9), false, false),
+            "no exit code (signal 9)"
+        );
+        assert_eq!(
+            sandboxed_status_line(None, false, None, false, false),
+            "no exit code (signalled)"
+        );
+    }
+
+    #[test]
+    fn sandboxed_status_line_names_the_memory_and_process_count_limits_specifically() {
+        // Both `oom` and `policy_violation` are reported by the sandbox
+        // backend with no signal number at all (`SandboxExit::signal()` is
+        // `None` for both), so without these flags either case fell into
+        // the exact same generic "no exit code (signalled)" message the
+        // CPU-limit fix above was written to eliminate for `SIGXCPU`.
+        assert_eq!(
+            sandboxed_status_line(None, false, None, true, false),
+            "killed: sandbox memory limit exceeded (OOM)"
+        );
+        assert_eq!(
+            sandboxed_status_line(None, false, None, false, true),
+            "killed: sandbox process-count limit exceeded"
+        );
     }
 
     #[test]

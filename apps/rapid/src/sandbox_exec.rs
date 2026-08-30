@@ -95,6 +95,15 @@ pub struct SandboxRunOutcome {
     /// Without this, that case was previously indistinguishable from any
     /// other signal death, reported only as "no exit code (signalled)".
     pub signal: Option<i32>,
+    /// The sandbox's own memory ceiling killed the process (`SandboxExit::
+    /// oom`). Reported with no `signal` at all by the backend, so without
+    /// this flag an OOM kill was indistinguishable from any other silent
+    /// signal death too — the same gap the CPU/`signal` field closed for
+    /// `SIGXCPU`, just for the axis that doesn't surface as a signal number.
+    pub oom: bool,
+    /// The sandbox's process-count ceiling was exceeded (`SandboxExit::
+    /// policy_violation`) — same "reported with no signal" shape as `oom`.
+    pub policy_violation: bool,
     pub output: Vec<u8>,
 }
 
@@ -265,6 +274,8 @@ pub fn run_sandboxed(
         exit_code: result.exit().code(),
         timed_out: result.exit().timed_out(),
         signal: result.exit().signal(),
+        oom: result.exit().oom(),
+        policy_violation: result.exit().policy_violation(),
         output: result.output().to_vec(),
     })
 }

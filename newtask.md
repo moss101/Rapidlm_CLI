@@ -1234,6 +1234,25 @@ enforcement at all yet — only timeout/cancel — a real, separate gap in that 
 attempted here; and disk/network ceilings for the sandboxed exec path itself (distinct from the per-turn
 disk/network budgets in §2.10's earlier paragraph, which cover `workspace_write`/`web_fetch`, not
 sandboxed shell commands) remain unaddressed.
+- **The OOM/pid-limit half of this same "named instead of generic" gap closed 2026-08-30 — found while
+  auditing this section for other small, precisely-scoped follow-ups.** The CPU-limit naming fix above
+  only handled the one axis that surfaces as a signal number (`SIGXCPU`). `HostRestrictedBackend`'s other
+  two kill paths — `WaitOutcome::Oom` (the memory ceiling) and `WaitOutcome::PidsExceeded` (the process-
+  count ceiling) — report with `SandboxExit::signal()` as `None`, not a signal number at all
+  (`crates/sandbox/src/backends/host_restricted.rs:705-721`), so both fell through to the exact same
+  generic `"no exit code (signalled)"` the CPU fix was written to eliminate — `SandboxExit` already had
+  working, tested `oom()`/`policy_violation()` accessors for exactly this, `apps/rapid/src/sandbox_exec.rs
+  ::run_sandboxed` just never read them into `SandboxRunOutcome`. **Fixed:** `SandboxRunOutcome` gained
+  `oom: bool`/`policy_violation: bool` fields (populated from those two accessors); `exec_tools.rs::
+  sandboxed_status_line` gained two more named cases — `"killed: sandbox memory limit exceeded (OOM)"`
+  and `"killed: sandbox process-count limit exceeded"` — checked before falling through to the generic
+  signal-number cases, mirroring the `SIGXCPU` arm exactly. New test `sandboxed_status_line_names_the_
+  memory_and_process_count_limits_specifically`; the existing `sandboxed_status_line_names_the_cpu_limit_
+  specifically` updated for the two new parameters. Full `-p rapid` suite (323 lib tests) and
+  `cargo build --workspace --tests` pass. This is purely a diagnostics/reporting fix — the sandbox already
+  enforced both ceilings correctly before this; a command that hit either one was already killed, it just
+  reported an unhelpfully generic reason. `SeatbeltBackend`'s own missing RSS enforcement (next paragraph)
+  remains the one real *enforcement* gap this pass didn't touch.
 - **`SeatbeltBackend`'s own CPU gap closed too, 2026-08-30, same session as the backend itself.** Reused
   `host_restricted.rs`'s exact `sh -c 'ulimit -t "$1" || exit 125; shift; exec "$@"'` wrapper technique
   (duplicated rather than shared — a fixed three-line script, unlike the mount/path-validation logic this
