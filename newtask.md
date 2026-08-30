@@ -475,6 +475,39 @@ exercise the race; the fix's TOCTOU-closing property rests on the read now being
 verifiable by inspection rather than a race-dependent test. Full `rapid` crate suite (330 tests, up from 328)
 and `cargo build --workspace --tests` pass.
 
+**Fresh review pass, 2026-08-30, `crates/tui/src/panels/trace_jobs.rs::view_artifact` — on the last locally-
+cached page, the returned cursor pointed back at the start of that page instead of past everything already
+captured.** The doc comment reads: "Cursor the kernel ArtifactReader should use for the next remote page."
+Both `Jobs`/`Traces` arms computed the offset as `page_offset(&row.excerpt_lines, self.selection.log_page)` —
+the byte offset of the *start* of the currently selected local page — even when that page is the last one
+locally cached and `more` is true because the backing artifact genuinely has more remote content
+(`remote_more`, driven by `row.truncated` or `artifact.bytes > row.cursor`). `row.cursor` — the real "bytes
+already captured from the backing artifact" tracker, already used correctly elsewhere in this file
+(`view_logs`'s `page_from_lines` call) — was never consulted when building the `ArtifactCursor`. Confirmed
+directly with the file's own fixture (`fixture_jobs()`: 40-line excerpt, 3 local pages of 16/16/8,
+`row.cursor == 40`, `truncated == true`) via the standard temporary-revert cycle: selecting the last page (2)
+and calling `view_artifact` returned offset `448` (the byte start of page 2) before the fix, `40` (the real
+captured-cursor) after — the reverted version was confirmed to produce the wrong value first, then the fix
+restored. A real kernel `ArtifactReader` handed offset 448 would re-serve bytes already rendered on screen
+instead of the genuinely new remote content the `more: true` flag promises. **Fixed:** new `next_view_offset`
+helper — while there is still a locally-cached page ahead, keeps returning `page_offset` (so re-deriving a
+specific already-cached page's bytes stays consistent with what's on screen, preserving the existing test's
+asserted behavior for non-terminal pages); once the selection is on the last cached page, returns `row.cursor`
+instead. Scoped to the `Jobs` arm only, which is the only one with the underlying data: `SpanObservation`/
+`SpanRowView` have no `cursor`/`truncated` fields at all (confirmed by struct definition, `trace_jobs.rs`
+~lines 133-143 vs. 147-156), an asymmetry in the data model this fix does not attempt to correct — the
+`Traces` arm still uses the original `page_offset`-only logic, left as a separate, more foundational gap
+(spans can carry an artifact via `SpanObservation::with_artifact` but have no way to track how much of it has
+been captured, so the "resume past the cache" case can't be computed correctly for spans without first adding
+that tracking). New test `view_artifact_on_the_last_local_page_resumes_past_captured_bytes_not_the_page_start`
+covers the `Jobs` case; the existing `viewing_uses_artifact_cursor_not_pid` test (which only exercised pages 0
+and 1, never the terminal page) still passes unchanged, confirming the fix didn't disturb the non-terminal-
+page behavior it already locked in. **Latent, not yet actively firing:** confirmed via grep that
+`TraceJobsViewModel` has zero production callers anywhere in `apps/` — only re-exported from `crates/tui`'s
+own `lib.rs` — the same "fully-built, unwired seam" shape documented repeatedly in this file, worth having
+fixed before a real kernel-client consumer starts calling `view_artifact` to page through live remote logs.
+Full `tui` crate suite (212 tests, up from 211) and `cargo build --workspace --tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

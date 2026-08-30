@@ -885,7 +885,7 @@ impl TraceJobsViewModel {
                     span_id: None,
                     cursor: ArtifactCursor {
                         artifact,
-                        offset: page_offset(&row.excerpt_lines, self.selection.log_page),
+                        offset: next_view_offset(&row.excerpt_lines, row.cursor, self.selection.log_page),
                     },
                 })
             }
@@ -901,6 +901,10 @@ impl TraceJobsViewModel {
                     job_id: None,
                     span_id: Some(row.span_id),
                     cursor: ArtifactCursor {
+                        // SpanObservation/SpanRowView track no captured-bytes
+                        // cursor at all (unlike JobObservation/JobRowView),
+                        // so the terminal-page fix below doesn't apply here
+                        // yet — see newtask.md.
                         artifact,
                         offset: page_offset(&row.excerpt_lines, self.selection.log_page),
                     },
@@ -1235,6 +1239,25 @@ fn page_offset(lines: &[String], page: u32) -> u64 {
     excerpt_bytes(&lines[..start.min(lines.len())])
 }
 
+/// Cursor for `view_artifact`'s kernel-bound fetch. While there is still a
+/// locally-cached page ahead, this is the start of the currently selected
+/// page (so re-deriving that specific page's bytes from the artifact stays
+/// consistent with what's on screen). Once the selection is on the last
+/// locally-cached page, `page_offset` would point back at the *start* of
+/// that page — bytes already rendered — instead of past everything cached
+/// so far; `row.cursor` (bytes actually captured from the backing artifact)
+/// is the only value that correctly resumes into genuinely new remote
+/// content from there.
+fn next_view_offset(lines: &[String], captured_cursor: u64, page: u32) -> u64 {
+    let count = page_count(lines.len());
+    let page = clamp_log_page(count, page);
+    if page + 1 < count {
+        page_offset(lines, page)
+    } else {
+        captured_cursor
+    }
+}
+
 fn excerpt_bytes(lines: &[String]) -> u64 {
     lines.iter().map(|line| line.len() as u64 + 1).sum()
 }
@@ -1519,6 +1542,21 @@ log page:1/3 cursor:0 more:yes
                 .golden()
                 .to_ascii_lowercase()
                 .contains("pid")
+        );
+    }
+
+    #[test]
+    fn view_artifact_on_the_last_local_page_resumes_past_captured_bytes_not_the_page_start() {
+        // Job A's fixture: 40 lines (3 pages of 16/16/8), row.cursor == 40,
+        // truncated == true (so `more` is still set on the last page).
+        let model = fixture_model().select_log_page(2).expect("select page 2");
+        let intent = model.view_artifact(&cancel()).expect("cursor");
+        assert_eq!(
+            intent.cursor().offset(),
+            40,
+            "on the last cached page, the cursor must resume from the real \
+             captured-bytes position, not the start of the currently viewed \
+             page (which would re-serve already-rendered content)"
         );
     }
 
