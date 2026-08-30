@@ -45,7 +45,9 @@ use crate::backend::{
     SandboxExecResult, SandboxExit, SandboxExitReason, SandboxHandle, SandboxId, SandboxNetwork,
     SandboxSpec,
 };
-use crate::backends::host_restricted::{is_forbidden_host_source, resolve_cwd, resolve_existing_dir};
+use crate::backends::host_restricted::{
+    is_forbidden_host_source, pid_rss_kb, resolve_cwd, resolve_existing_dir,
+};
 
 /// Maximum prepared Seatbelt sandboxes retained by one backend.
 pub const MAX_LIVE_SEATBELT_SANDBOXES: usize = 64;
@@ -88,6 +90,7 @@ struct SeatbeltPlan {
     timeout: Duration,
     output_limit: u64,
     cpu_millis: u32,
+    memory_mb: u32,
 }
 
 struct PreparedSession {
@@ -198,6 +201,7 @@ impl SandboxBackend for SeatbeltBackend {
             timeout: spec.timeout(),
             output_limit: spec.output_limit(),
             cpu_millis: spec.cpu_millis(),
+            memory_mb: spec.memory_mb(),
         };
         let mut sessions = self.lock_sessions()?;
         if sessions.len() >= MAX_LIVE_SEATBELT_SANDBOXES {
@@ -330,7 +334,13 @@ fn run_seatbelt(
         }
     })?;
     let started = Instant::now();
-    let outcome = wait_child(&mut child, request.timeout(), request.output_limit(), cancel);
+    let outcome = wait_child(
+        &mut child,
+        request.timeout(),
+        request.output_limit(),
+        plan.memory_mb,
+        cancel,
+    );
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     fn usage(elapsed_ms: u64, output: &[u8]) -> ResourceUsage {
         ResourceUsage::new(
@@ -377,6 +387,18 @@ fn run_seatbelt(
             ),
             output,
         )),
+        WaitOutcome::Oom { output } => Ok(SandboxExecResult::new(
+            SandboxExit::new(
+                None,
+                None,
+                SandboxExitReason::Oom,
+                true,
+                false,
+                false,
+                usage(elapsed_ms, &output),
+            ),
+            output,
+        )),
     }
 }
 
@@ -392,12 +414,16 @@ enum WaitOutcome {
     Cancelled {
         output: Vec<u8>,
     },
+    Oom {
+        output: Vec<u8>,
+    },
 }
 
 fn wait_child(
     child: &mut Child,
     timeout: Duration,
     output_limit: u64,
+    memory_mb: u32,
     cancel: &CancellationToken,
 ) -> WaitOutcome {
     let cap = usize::try_from(output_limit).unwrap_or(usize::MAX);
@@ -406,31 +432,50 @@ fn wait_child(
     let stdout_reader = stdout.map(|pipe| thread::spawn(move || read_capped(pipe, cap)));
     let stderr_reader = stderr.map(|pipe| thread::spawn(move || read_capped(pipe, cap)));
     let deadline = Instant::now() + timeout;
-    let status = loop {
+    let pid = child.id();
+    enum Stop {
+        Timeout,
+        Cancelled,
+        Oom,
+    }
+    let outcome = loop {
         if let Ok(Some(status)) = child.try_wait() {
-            break Some(status);
+            break Ok(status);
         }
         if cancel.is_cancelled() {
             let _ = child.kill();
             let _ = child.wait();
-            break None;
+            break Err(Stop::Cancelled);
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            break None;
+            break Err(Stop::Timeout);
+        }
+        // Single-pid RSS check: unlike `host_restricted.rs`'s process-group
+        // model, `sh -c '...; exec sandbox-exec ...'` execs straight through
+        // to the final target (the whole chain shares one pid, `exec` never
+        // changes it), so there is no group to sum across — reusing
+        // `pid_rss_kb` directly is exact here, not an approximation.
+        if let Some(rss_kb) = pid_rss_kb(pid)
+            && rss_kb.div_ceil(1024) > u64::from(memory_mb)
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            break Err(Stop::Oom);
         }
         thread::sleep(POLL_INTERVAL);
     };
     let output = join_output(stdout_reader, stderr_reader);
-    match status {
-        Some(status) => WaitOutcome::Finished {
+    match outcome {
+        Ok(status) => WaitOutcome::Finished {
             code: status.code(),
             signal: exit_signal(&status),
             output,
         },
-        None if cancel.is_cancelled() => WaitOutcome::Cancelled { output },
-        None => WaitOutcome::TimedOut { output },
+        Err(Stop::Cancelled) => WaitOutcome::Cancelled { output },
+        Err(Stop::Timeout) => WaitOutcome::TimedOut { output },
+        Err(Stop::Oom) => WaitOutcome::Oom { output },
     }
 }
 
@@ -886,6 +931,45 @@ capability = "fs.read"
         let result = backend.exec(&handle, &request, &lease, &live).expect("exec");
         assert_ne!(result.exit().code(), Some(0), "the CPU ceiling should kill it first");
         assert!(!result.exit().timed_out(), "killed by the CPU limit, not the wall-clock timeout");
+        backend.destroy(&handle, &live).expect("destroy");
+    }
+
+    #[test]
+    fn memory_ceiling_kills_a_command_that_exceeds_it_before_the_wall_clock_timeout() {
+        if !seatbelt_available() {
+            return;
+        }
+        let backend = SeatbeltBackend::new();
+        let ws = TempWorkspace::new();
+        // `/usr/bin/python3` (a stable, standard macOS system path) allocates
+        // and holds a real 200 MB `bytearray` — a `dd`/`yes`-style stream
+        // through a small buffer would never show up in RSS the way a held
+        // allocation does, which is exactly the "measure the real thing, not
+        // a proxy for it" lesson this session's own CPU-ceiling test
+        // (`cpu_ceiling_kills_a_command...`) already learned the hard way.
+        // 64 MB ceiling, comfortably below the 200 MB allocation.
+        let spec = SandboxSpec::builder(SandboxTier::HostRestricted)
+            .cwd(cwd())
+            .mount(ws.mount("src", MountMode::ReadWrite))
+            .memory_mb(64)
+            .build()
+            .expect("spec");
+        let lease = proc_lease();
+        let live = CancellationToken::new();
+        let handle = backend.prepare(&spec, &lease, &live).expect("prepare");
+        let request = SandboxExecRequest::new(
+            [
+                "/usr/bin/python3",
+                "-c",
+                "import time; b = bytearray(200 * 1024 * 1024); time.sleep(30)",
+            ],
+            Duration::from_secs(30),
+            1024,
+        )
+        .expect("request");
+        let result = backend.exec(&handle, &request, &lease, &live).expect("exec");
+        assert!(result.exit().oom(), "the memory ceiling should have killed it");
+        assert!(!result.exit().timed_out(), "killed by the memory limit, not the wall-clock timeout");
         backend.destroy(&handle, &live).expect("destroy");
     }
 

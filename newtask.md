@@ -1410,6 +1410,27 @@ sandboxed shell commands) remain unaddressed.
   Memory (RSS) monitoring remains unenforced for this backend — `host_restricted.rs`'s own memory
   enforcement needs a background sampling thread this backend's simpler `wait_child` loop doesn't have;
   not attempted here, a real, separate gap.
+- **Memory (RSS) enforcement closed for this backend too, 2026-08-30.** Turned out to need no background
+  sampling thread after all — `host_restricted.rs`'s own poll loop doesn't use one either; it just samples
+  inline on the same 10ms cadence it already checks `try_wait`/the deadline on. Reused that exact idea,
+  simplified for this backend's single-process model: `sh -c '...; exec sandbox-exec ...'` execs straight
+  through to the final target program, so (unlike `host_restricted.rs`'s process-group tree) the whole
+  chain shares one pid and there's no group to sum RSS across — `host_restricted.rs::pid_rss_kb` (made
+  `pub(crate)` for this, same reuse-not-duplicate rationale as the mount/cwd helpers this module already
+  shares) is exact here, not an approximation. `SeatbeltPlan` gained a `memory_mb` field from `spec.
+  memory_mb()`; `wait_child`'s poll loop now checks `pid_rss_kb(pid)` against it alongside the existing
+  cancel/deadline checks, killing and returning a new `WaitOutcome::Oom` (mapped to `SandboxExit::oom() ==
+  true`) on breach. New test `memory_ceiling_kills_a_command_that_exceeds_it_before_the_wall_clock_timeout`:
+  `/usr/bin/python3 -c "... bytearray(200 * 1024 * 1024) ..."` allocates and holds a real 200 MB buffer
+  against a 64 MB ceiling — chosen deliberately over a `dd`/`yes`-style stream, which would never show up
+  in RSS the way a held allocation does, the identical "measure the real thing" lesson the CPU test above
+  already learned the hard way. **Verified the test isn't vacuous, the same discipline that correction
+  demands:** temporarily raised the ceiling to 4096 MB and re-ran — the test correctly failed, running the
+  full 30-second timeout with no kill, confirming the check is genuinely load-bearing before restoring the
+  real 64 MB ceiling. Full `sandbox` crate suite (96 tests, up from 95) and `cargo build --workspace
+  --tests` pass. `SeatbeltBackend` now enforces both CPU and memory ceilings, matching `HostRestrictedBackend`'s
+  coverage exactly; only the two backends' still-separate (job-based vs. this synchronous one) execution
+  paths in `apps/rapid` remain unmerged, per this section's own earlier note.
 - **Correction, same day: the first version of both new CPU tests was itself broken, and silently proved
   nothing — worth recording exactly why, since it's a real testing-methodology trap.** Both this fix's
   first regression test and the `SeatbeltBackend` CPU test originally used a *wall-clock-bounded* busy

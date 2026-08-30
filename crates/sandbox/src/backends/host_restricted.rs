@@ -1096,7 +1096,11 @@ fn ps_group(pgid: u32) -> Option<Vec<u32>> {
     }
 }
 
-fn pid_rss_kb(pid: u32) -> Option<u64> {
+/// Resident set size for one pid, in KB. `pub(crate)` so `seatbelt.rs` can
+/// reuse it for its own (single-pid, no process-group) memory ceiling —
+/// same reuse-tested-logic-rather-than-duplicate-it rationale as this
+/// module's mount/cwd-resolution and forbidden-host-source helpers.
+pub(crate) fn pid_rss_kb(pid: u32) -> Option<u64> {
     let program = first_existing(PS_PROGRAMS)?;
     let output = Command::new(program)
         .args(["-o", "rss=", "-p", &pid.to_string()])
