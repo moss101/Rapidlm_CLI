@@ -650,10 +650,38 @@ blocker, rather than looping autonomously).
   `"plan/todos"` system block whenever present. **Deliberately not attempted:** the `scheduler::NodeState`
   graph half — this is the durable, *readable* projection into context, not a structured state machine
   with dependencies/owner/evidence-requirements/attempts that `todo_write`'s flat id/content/status shape
-  doesn't carry at all; wiring the stall-detection warning into context (this item's other still-open
-  half, `AGT-017`) also remains undone — that one genuinely does need a decision about which turn-loop
-  layer computes it in time to feed `build_packet`, since `detect_stall` runs inside `SupervisedModel::step`,
-  after context for that step was already compiled, not before it like the todos/memory case.
+  doesn't carry at all.
+- **`AGT-017`'s other still-open half — wiring the stall-detection warning into context — closed
+  2026-08-30, at the layer this item's own note above said needed a decision.** Found the right layer by
+  tracing exactly why `SupervisedModel::step` (where `detect_stall` already ran, diagnostic-only) is too
+  late: it receives `blocks: &[ContextBlock]` already extracted from `live.packet().blocks()` one layer up,
+  in `LiveContextModelDriver::step` — by the time `SupervisedModel` sees them, the packet for that step is
+  already fixed. `LiveContextModelDriver::step` is the one layer that holds both `input` (so it can call
+  `detect_stall(input.history())` itself) and the shared `Rc<RefCell<LiveContext>>` (so it can rebuild the
+  packet in place) — exactly the "before it's compiled" seam the todos/memory case had and this one didn't.
+  **Implemented:** a new `PreservedLiveContext::stall_warning`/`with_stall_warning` field (module-private
+  setter — set only by the driver itself, never a public caller), compiled into a `"diagnostics/stall"`
+  system block by `build_packet` (`"Stall detected: {warning}"`), and `LiveContextModelDriver::step` now
+  recomputes `detect_stall` on every step and rebuilds the packet in place whenever the result changes —
+  a new stall appearing, or a prior one resolving once the model makes distinct progress — so the warning
+  is visible on the very same step it's first detected, not one step late, and disappears again once it's
+  no longer true. Best-effort: a rebuild failure here is silently skipped, never fails the turn. **One real
+  wrinkle found and fixed along the way:** rebuilding the packet needs the current compaction summary too
+  (`build_packet(preserved, summary)`), but `summary` lived only on `LiveRecoveryController`, a sibling
+  struct the driver has no handle to. Rather than thread it through, moved `summary: Option<String>` onto
+  `LiveContext` itself (shared by both, since both now need to rebuild the same packet) — safe because
+  `LiveRecoveryController::summary()` was verified dead code (grepped the whole workspace, zero callers)
+  before being removed, not just assumed unused. New tests
+  `stall_warning_is_compiled_into_the_packet_as_a_system_block` (bounds-checked like every other block, via
+  a new `MAX_STALL_WARNING_BYTES`) and `live_context_model_driver_injects_and_clears_the_stall_block_
+  across_steps` (drives a real `LiveContextModelDriver` through three steps — no stall, a real stall,
+  resolved progress — and asserts the block appears and disappears in `live.packet()` itself, not just in
+  `build_packet`'s output in isolation). Full `-p rapid` suite (321 lib tests), `cargo test -p rapid --tests`
+  (all integration binaries), and `cargo build --workspace --tests` pass — including the pre-existing
+  compaction-recovery tests (`overflow_rebuilds_live_context_and_recovers`, `repeated_overflow_fails_
+  closed_with_typed_limit`), confirming the `summary` relocation didn't change compaction behavior. This
+  closes `AGT-017` for this item; the `scheduler::NodeState` structured-graph half of `AGT-016` (dependencies/
+  owner/evidence-requirements/attempts) remains the one genuinely open piece of §2.5.
 
 ### 2.6 `SessionLease` + fencing generation
 

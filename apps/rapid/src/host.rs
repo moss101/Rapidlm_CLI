@@ -67,6 +67,10 @@ pub const MAX_ARTIFACTS: usize = 64;
 pub const MAX_COMPACTION_SUMMARY: usize = 8 * 1024;
 /// Byte cap for the rendered active-reminders block.
 pub const MAX_REMINDERS_BLOCK_BYTES: usize = 8 * 1024;
+/// Byte cap for the model-visible stall-warning block (Modbit `AGT-017`):
+/// generous for a formatted sentence, tight enough to bound an adversarial
+/// tool name.
+pub const MAX_STALL_WARNING_BYTES: usize = 1024;
 
 /// Maximum retry attempts for a transient-class step failure; a turn makes at
 /// most `MAX_TRANSIENT_RETRIES + 1` step invocations per model step. Five
@@ -119,6 +123,7 @@ pub struct PreservedLiveContext {
     system_prompt: Option<String>,
     memory_index: Option<String>,
     todos_index: Option<String>,
+    stall_warning: Option<String>,
     retrieved_context: Vec<CompileInput>,
 }
 
@@ -160,6 +165,7 @@ impl PreservedLiveContext {
             system_prompt: None,
             memory_index: None,
             todos_index: None,
+            stall_warning: None,
             retrieved_context: Vec::new(),
         })
     }
@@ -208,6 +214,25 @@ impl PreservedLiveContext {
 
     pub fn todos_index(&self) -> Option<&str> {
         self.todos_index.as_deref()
+    }
+
+    /// Attach the current stall-detection warning (Modbit `AGT-017`) so the
+    /// model sees its own repeated-call pattern instead of only an operator
+    /// seeing it in `--verbose` diagnostics. Set/cleared by
+    /// `LiveContextModelDriver::step` on every step as the pattern
+    /// appears/resolves — never by a caller directly.
+    fn with_stall_warning(mut self, warning: Option<String>) -> Self {
+        let within_bounds = warning.as_ref().is_none_or(|text| {
+            !text.is_empty() && text.len() <= MAX_STALL_WARNING_BYTES
+        });
+        if within_bounds {
+            self.stall_warning = warning;
+        }
+        self
+    }
+
+    pub fn stall_warning(&self) -> Option<&str> {
+        self.stall_warning.as_deref()
     }
 
     /// Attach the rendered dynamic system prompt for this turn. Empty or
@@ -267,6 +292,10 @@ pub struct LiveContext {
     packet: ContextPacket,
     revision: ArtifactId,
     preserved: PreservedLiveContext,
+    /// The compaction summary currently baked into `packet`, if any — kept
+    /// here (not solely on `LiveRecoveryController`) so any packet rebuild,
+    /// not only a compaction rebuild, can preserve it.
+    summary: Option<String>,
 }
 
 impl LiveContext {
@@ -278,6 +307,9 @@ impl LiveContext {
     }
     pub fn preserved(&self) -> &PreservedLiveContext {
         &self.preserved
+    }
+    pub fn summary(&self) -> Option<&str> {
+        self.summary.as_deref()
     }
 }
 
@@ -309,6 +341,21 @@ impl<B: LiveModelCall> ModelDriver for LiveContextModelDriver<B> {
         if cancel.is_cancelled() {
             return Err(ModelStepError::Cancelled);
         }
+        // Model-visible stall surfacing (Modbit `AGT-017`): recompute on
+        // every step and, when it changes (a new stall appears or an old one
+        // resolves), rebuild the packet so the model sees the pattern
+        // itself, not just an operator watching `--verbose`. Best-effort: a
+        // rebuild failure here is silently skipped, never fails the turn —
+        // this is diagnostic enrichment, not something a turn depends on.
+        let warning = detect_stall(input.history());
+        if warning.as_deref() != self.live.borrow().preserved().stall_warning() {
+            let mut live = self.live.borrow_mut();
+            let preserved = live.preserved.clone().with_stall_warning(warning);
+            if let Ok(packet) = build_packet(&preserved, live.summary()) {
+                live.packet = packet;
+                live.preserved = preserved;
+            }
+        }
         let live = self.live.borrow();
         self.backing.step(live.packet().blocks(), input, cancel)
     }
@@ -317,13 +364,6 @@ impl<B: LiveModelCall> ModelDriver for LiveContextModelDriver<B> {
 /// Rebuilds the live context via the Context Fabric on a typed overflow.
 pub struct LiveRecoveryController {
     live: Rc<RefCell<LiveContext>>,
-    summary: Option<String>,
-}
-
-impl LiveRecoveryController {
-    pub fn summary(&self) -> Option<&str> {
-        self.summary.as_deref()
-    }
 }
 
 impl ContextController for LiveRecoveryController {
@@ -335,7 +375,7 @@ impl ContextController for LiveRecoveryController {
         // still-oversized summary. (Checking only the summary's own byte
         // length, as before, doesn't verify shrinkage against the budget at
         // all; that machinery existed in context-engine but had no caller.)
-        {
+        let new_summary = {
             let live = self.live.borrow();
             let hard_tokens = live
                 .preserved()
@@ -360,14 +400,14 @@ impl ContextController for LiveRecoveryController {
                 .map(|compacted| compacted.summary().to_owned())
                 .unwrap_or_default();
             if summary.is_empty() || summary.len() > MAX_COMPACTION_SUMMARY {
-                self.summary = None;
+                None
             } else {
-                self.summary = Some(summary);
+                Some(summary)
             }
-        }
+        };
         let new_packet = {
             let live = self.live.borrow();
-            match build_packet(live.preserved(), self.summary.as_deref()) {
+            match build_packet(live.preserved(), new_summary.as_deref()) {
                 Ok(packet) => packet,
                 Err(_) => return ContextRecoveryDecision::NotRecoverable,
             }
@@ -376,6 +416,7 @@ impl ContextController for LiveRecoveryController {
             let mut live = self.live.borrow_mut();
             live.packet = new_packet;
             live.revision = ArtifactId::from_bytes(b"context/live-recovery");
+            live.summary = new_summary;
         }
         ContextRecoveryDecision::Recovered
     }
@@ -417,6 +458,7 @@ impl<B: LiveModelCall> LiveContextHost<B> {
             packet,
             revision,
             preserved,
+            summary: None,
         }));
         let model = LiveContextModelDriver {
             live: Rc::clone(&live),
@@ -424,7 +466,6 @@ impl<B: LiveModelCall> LiveContextHost<B> {
         };
         let controller = LiveRecoveryController {
             live: Rc::clone(&live),
-            summary: None,
         };
         Ok(Self {
             live,
@@ -1269,6 +1310,12 @@ pub fn build_packet(
             todos.to_owned(),
         ));
     }
+    if let Some(warning) = preserved.stall_warning() {
+        ctx = ctx.system(CompileInput::new(
+            "diagnostics/stall",
+            format!("Stall detected: {warning}"),
+        ));
+    }
     if !preserved.agents_rules.is_empty() {
         ctx = ctx.system(CompileInput::new(
             "rules/agents",
@@ -1704,6 +1751,91 @@ mod tests {
         // None adds no block.
         let packet = build_packet(&preserved(), None).expect("packet");
         assert!(packet.blocks().iter().all(|b| !b.text().contains("wire the thing")));
+    }
+
+    #[test]
+    fn stall_warning_is_compiled_into_the_packet_as_a_system_block() {
+        let with_warning =
+            preserved().with_stall_warning(Some("repo_read repeated 3x".to_owned()));
+        let packet = build_packet(&with_warning, None).expect("packet");
+        let block = packet
+            .blocks()
+            .iter()
+            .find(|b| b.text().contains("repo_read repeated 3x"))
+            .expect("stall block in packet");
+        assert_eq!(block.source(), context_engine::compile::ContextSource::System);
+        assert!(block.text().starts_with("Stall detected:"));
+        // Out-of-bounds is refused: nothing enters the packet.
+        let oversized = "x".repeat(MAX_STALL_WARNING_BYTES + 1);
+        let with_oversized = preserved().with_stall_warning(Some(oversized));
+        let packet = build_packet(&with_oversized, None).expect("packet");
+        assert!(packet.blocks().iter().all(|b| !b.text().contains("Stall detected")));
+        // None adds no block.
+        let packet = build_packet(&preserved(), None).expect("packet");
+        assert!(packet.blocks().iter().all(|b| !b.text().contains("Stall detected")));
+    }
+
+    #[test]
+    fn live_context_model_driver_injects_and_clears_the_stall_block_across_steps() {
+        // End-to-end wiring test for Modbit `AGT-017`'s "model sees its own
+        // stall" half: `LiveContextModelDriver::step` is the layer that
+        // rebuilds the packet, not `build_packet` in isolation.
+        let base = preserved();
+        let live = Rc::new(RefCell::new(LiveContext {
+            packet: build_packet(&base, None).expect("packet"),
+            revision: ArtifactId::from_bytes(b"test/stall-wiring"),
+            preserved: base,
+            summary: None,
+        }));
+        let backing = ScriptedBacking::new(vec![ok_terminal("s1"), ok_terminal("s2"), ok_terminal("s3")]);
+        let mut driver = LiveContextModelDriver {
+            live: Rc::clone(&live),
+            backing,
+        };
+
+        // No history yet: no stall block.
+        driver
+            .step(&ModelStepInput::without_tools(1), &CancellationToken::new())
+            .expect("step 1");
+        assert!(live.borrow().preserved().stall_warning().is_none());
+        assert!(live.borrow().packet().blocks().iter().all(|b| !b.text().contains("Stall detected")));
+
+        // A real stall: the same call repeated with no distinct progress.
+        let stalled = vec![
+            exchange("repo_read", r#"{"path":"a.rs"}"#),
+            exchange("repo_read", r#"{"path":"a.rs"}"#),
+            exchange("repo_read", r#"{"path":"a.rs"}"#),
+        ];
+        driver
+            .step(
+                &ModelStepInput::with_history(2, &stalled, &[]),
+                &CancellationToken::new(),
+            )
+            .expect("step 2");
+        assert!(live.borrow().preserved().stall_warning().is_some());
+        assert!(
+            live.borrow()
+                .packet()
+                .blocks()
+                .iter()
+                .any(|b| b.text().contains("Stall detected") && b.text().contains("repo_read"))
+        );
+
+        // Distinct progress: the warning clears from both preserved state and
+        // the packet, not just left stale from the prior step.
+        let varied = vec![
+            exchange("repo_read", r#"{"path":"a.rs"}"#),
+            exchange("repo_read", r#"{"path":"b.rs"}"#),
+            exchange("repo_read", r#"{"path":"c.rs"}"#),
+        ];
+        driver
+            .step(
+                &ModelStepInput::with_history(3, &varied, &[]),
+                &CancellationToken::new(),
+            )
+            .expect("step 3");
+        assert!(live.borrow().preserved().stall_warning().is_none());
+        assert!(live.borrow().packet().blocks().iter().all(|b| !b.text().contains("Stall detected")));
     }
 
     #[test]
