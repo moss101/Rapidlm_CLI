@@ -1511,13 +1511,18 @@ impl WorkspaceTools {
                 sandboxed.push(profile_path.to_string_lossy().into_owned());
                 sandboxed.extend(args.argv.iter().cloned());
                 let job_id = self.jobs.start(&sandboxed, self.root(), args.timeout)?;
+                let mut summary = format!(
+                    "started sandboxed job {job_id}: {} (timeout {}s); poll with job_status",
+                    sandboxed[3..].join(" "),
+                    args.timeout.as_secs()
+                );
+                if let Some(note) = scan_command_advisory(self.root(), &args.argv) {
+                    summary.push('\n');
+                    summary.push_str(&note);
+                }
                 return Ok(ToolStepResult::Succeeded {
                     call_id: call.call_id().to_owned(),
-                    summary: format!(
-                        "started sandboxed job {job_id}: {} (timeout {}s); poll with job_status",
-                        sandboxed[3..].join(" "),
-                        args.timeout.as_secs()
-                    ),
+                    summary,
                 });
             }
             // Non-macOS (or sandbox-exec missing): the tiered `sandbox`
@@ -1538,9 +1543,14 @@ impl WorkspaceTools {
                         None if outcome.timed_out => "timed out".to_owned(),
                         None => "no exit code (signalled)".to_owned(),
                     };
+                    let mut summary = format!("sandboxed {status}\n{output}");
+                    if let Some(note) = scan_command_advisory(self.root(), &args.argv) {
+                        summary.push('\n');
+                        summary.push_str(&note);
+                    }
                     Ok(ToolStepResult::Succeeded {
                         call_id: call.call_id().to_owned(),
-                        summary: format!("sandboxed {status}\n{output}"),
+                        summary,
                     })
                 }
                 Err(err) => Ok(ToolStepResult::Failed {
@@ -1552,13 +1562,18 @@ impl WorkspaceTools {
         }
         if args.background {
             let job_id = self.jobs.start(&args.argv, self.root(), args.timeout)?;
+            let mut summary = format!(
+                "started background job {job_id}: {} (timeout {}s); poll with job_status / read with job_output",
+                args.argv.join(" "),
+                args.timeout.as_secs()
+            );
+            if let Some(note) = scan_command_advisory(self.root(), &args.argv) {
+                summary.push('\n');
+                summary.push_str(&note);
+            }
             return Ok(ToolStepResult::Succeeded {
                 call_id: call.call_id().to_owned(),
-                summary: format!(
-                    "started background job {job_id}: {} (timeout {}s); poll with job_status / read with job_output",
-                    args.argv.join(" "),
-                    args.timeout.as_secs()
-                ),
+                summary,
             });
         }
         let command_advisory = scan_command_advisory(self.root(), &args.argv);
@@ -5126,6 +5141,55 @@ use std::sync::{Arc, Mutex};
                 assert!(!summary.contains("advisory"), "{summary}");
             }
             other => panic!("expected clean success, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_exec_flags_a_dangerous_command_on_the_background_and_sandboxed_paths_too() {
+        let root = TempRoot::new("shell-command-advisory-bg-sandbox");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        let background = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["rm","-rf","not-a-real-path-xyz"],"background":true}"#,
+        );
+        let validated = tools.validate(&background, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.starts_with("started background job"), "{summary}");
+                assert!(
+                    summary.contains("advisory: possible dangerous command"),
+                    "{summary}"
+                );
+                assert!(summary.contains("command.rm_destructive"), "{summary}");
+            }
+            other => panic!("expected background start, got {other:?}"),
+        }
+
+        let sandboxed = make_call(
+            "c2",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["rm","-rf","not-a-real-path-xyz"],"sandbox":true}"#,
+        );
+        let validated = tools.validate(&sandboxed, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(
+                    summary.starts_with("started sandboxed job")
+                        || summary.starts_with("sandboxed "),
+                    "expected a sandboxed-path summary (job-based on macOS, synchronous \
+                     elsewhere): {summary}"
+                );
+                assert!(
+                    summary.contains("advisory: possible dangerous command"),
+                    "{summary}"
+                );
+                assert!(summary.contains("command.rm_destructive"), "{summary}");
+            }
+            other => panic!("expected sandboxed start, got {other:?}"),
         }
     }
 

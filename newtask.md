@@ -744,6 +744,21 @@ their results become evidence, not just a console warning).
   Actions workflow to trigger `patch.ci_permissions_broaden`) plus the full `-p rapid` lib+integration
   suite (293 lib tests) and `cargo build --workspace --tests`, all green. **Still unattempted:**
   `ExternalFinding`, and the same shadow-diagnostics/`execute_patch` paths the secrets scanner also skips.
+- **`CommandFinding`'s "not covered" background/sandboxed paths closed 2026-08-30.** `scan_command_advisory`
+  had only ever been wired into `execute_shell`'s plain synchronous path; the macOS Seatbelt job path, the
+  non-macOS `sandbox_exec::run_sandboxed` path, and the plain background-job path (`self.jobs.start`) all
+  ran a command's real argv unscanned. All three now call the same `scan_command_advisory(self.root(),
+  &args.argv)` (the real argv, not the Seatbelt-wrapped `sandboxed` vec that prepends `sandbox-exec -f
+  <profile>`) and append the note to their own success summary — `"started sandboxed job ..."`, `"sandboxed
+  exit ..."`, `"started background job ..."` all now carry the advisory the same way the plain path's
+  `"exit 0 ..."` already did. New `#[cfg(unix)]` test
+  (`shell_exec_flags_a_dangerous_command_on_the_background_and_sandboxed_paths_too`) exercises both the
+  background and sandboxed paths with a real `rm -rf` against a harmless nonexistent target, on this
+  actual macOS dev machine (so the Seatbelt branch, not the `run_sandboxed` fallback, is what's really
+  covered here — `run_sandboxed`'s own branch gets no direct test since `find_sandbox_exec()` always
+  succeeds on macOS). Full `-p rapid` suite (296 lib tests) and `cargo build --workspace --tests` pass.
+  `ExternalFinding` and `execute_patch`'s equivalent command-adjacent surfaces remain the only pieces of
+  this section still untouched.
 
 ### 2.10 Scoped Credential Broker + Resource Governor
 
