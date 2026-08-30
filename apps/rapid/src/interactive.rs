@@ -331,7 +331,7 @@ fn p9(
 
 fn run_subcommand(args: &[String]) -> Result<i32, InteractiveError> {
     match args.first().map(String::as_str) {
-        Some("exec") => exec_turn(&args[1..]),
+        Some("exec") => exec_turn(&args[1..], None),
         Some("goal") => run_goal_command(&args[1..]),
         Some("playbook-compile") => p9(&args[1..], crate::p9_commands::run_playbook_compile),
         Some("mcp-tools") => p9(&args[1..], crate::p9_commands::run_mcp_tools),
@@ -1044,6 +1044,7 @@ fn exec_permission_mode() -> Result<crate::permissions::PermissionMode, String> 
 
 fn exec_permission_lattice(
     canonical_root: Option<&Path>,
+    forced_mode: Option<crate::permissions::PermissionMode>,
 ) -> Result<crate::permissions::PermissionLattice, String> {
     use crate::permissions::{
         PermissionLattice, PermissionMode, ProjectSettings, ToolPattern, parse_grants,
@@ -1079,6 +1080,15 @@ fn exec_permission_lattice(
         }
     }
     let mode = mode.unwrap_or(PermissionMode::Default);
+    // A caller-forced mode (e.g. `rapid cron`'s propose-only execution,
+    // Modbit `AGT-008`/§3.2) overrides every other source unconditionally —
+    // this is a hard ceiling the caller itself imposes, not a user
+    // preference, so it must win over env/settings precedence rather than
+    // just seed it. Composes safely with the managed-policy gate below
+    // regardless of order: `Plan`, the only mode ever forced today, is
+    // already the least permissive of all six, so gating it against any
+    // ceiling is always a no-op.
+    let mode = forced_mode.unwrap_or(mode);
     // Managed-policy ceiling (Modbit `CAP-001`): a project's own settings or
     // `RAPIDLM_PERMISSION_MODE` may only narrow the resolved mode, never
     // widen it past whatever an administrator allows. A configured-but-
@@ -1520,7 +1530,16 @@ fn build_live_context(
 /// failure — never a synthetic completion). Workspace file tools are granted
 /// only when the project is explicitly trusted; anything else stays a
 /// fail-closed refusal. `--verbose` opts into bounded step diagnostics.
-fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
+///
+/// `forced_mode` overrides every other permission-mode source unconditionally
+/// (env, project settings, Claude-compat `defaultMode`) — used by `rapid
+/// cron`'s propose-only execution to guarantee `Plan` mode regardless of the
+/// ambient environment. `None` (the interactive `rapid exec` CLI entry) keeps
+/// the existing precedence untouched.
+pub(crate) fn exec_turn(
+    args: &[String],
+    forced_mode: Option<crate::permissions::PermissionMode>,
+) -> Result<i32, InteractiveError> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print!("{EXEC_USAGE}");
         return Ok(0);
@@ -1618,7 +1637,7 @@ fn exec_turn(args: &[String]) -> Result<i32, InteractiveError> {
     // below (subagent tools, the refuses-all warning) instead of re-resolving
     // the mode/env at every call site.
     let permission_lattice =
-        match exec_permission_lattice(workspace.as_ref().map(|(root, _)| root.as_path())) {
+        match exec_permission_lattice(workspace.as_ref().map(|(root, _)| root.as_path()), forced_mode) {
             Ok(lattice) => lattice,
             Err(reason) => {
                 eprintln!("permission configuration error: {reason}");
@@ -2931,6 +2950,28 @@ mod tests {
         // (unbounded, same as before this flag existed) is unchanged.
         let unbounded: Vec<String> = vec!["just".to_owned(), "a".to_owned(), "prompt".to_owned()];
         assert_eq!(parse_exec_args(&unbounded).expect("parses").max_wall_time, None);
+    }
+
+    #[test]
+    fn forced_mode_overrides_env_and_settings_resolution() {
+        // `rapid cron`'s propose-only execution (Modbit `AGT-008`/§3.2)
+        // depends on `forced_mode` winning over whatever the ambient
+        // environment/project settings would otherwise resolve — proven here
+        // by requesting two different modes and confirming both distinctly
+        // come back out, rather than both collapsing to one ambient default
+        // (which would mean `forced_mode` was silently ignored).
+        let plan = exec_permission_lattice(None, Some(crate::permissions::PermissionMode::Plan))
+            .expect("lattice");
+        assert_eq!(plan.mode(), crate::permissions::PermissionMode::Plan);
+        let accept_edits = exec_permission_lattice(
+            None,
+            Some(crate::permissions::PermissionMode::AcceptEdits),
+        )
+        .expect("lattice");
+        assert_eq!(
+            accept_edits.mode(),
+            crate::permissions::PermissionMode::AcceptEdits
+        );
     }
 
     #[test]

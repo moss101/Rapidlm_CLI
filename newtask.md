@@ -1354,6 +1354,44 @@ existing `security::scanners::secrets::Finding` pattern (§2.9) to give backgrou
   execution into a background/unattended path carries genuine safety weight (getting a "propose-only,
   never applies" guarantee subtly wrong here is a very different risk than a CLI flag defaulting wrong)
   and deserves dedicated design attention, not a rushed pass alongside unrelated work.
+- **Execution-on-fire implemented 2026-08-30, exactly the "propose-only as the first mode" shape the
+  correction above called for — riding on an already-proven safety primitive rather than inventing a new
+  one.** `evaluate()` (`apps/rapid/src/permissions.rs`) already denies every non-read-only tool call
+  unconditionally in `PermissionMode::Plan`, before the mode table is even consulted for anything else,
+  and read-only calls stay allowed in every mode — a real, independently-tested "can explore, can never
+  mutate" guarantee that already existed for the interactive `plan` mode. Reusing it (rather than building
+  a parallel "propose-only" concept from scratch) is what makes this safe to ship in one pass: the hard
+  safety property comes from code this session did not need to write or newly trust. **Implemented:**
+  `exec_turn` (`interactive.rs`) gained a `forced_mode: Option<PermissionMode>` parameter that
+  unconditionally overrides env/project-settings/Claude-compat mode resolution (composes safely with the
+  managed-policy ceiling regardless of order, since `Plan` is already the least permissive of all six
+  modes — gating it can only ever be a no-op); `rapid cron poll`'s fired-job loop (`p9_commands.rs`) now
+  calls `exec_turn(&[due.prompt], Some(PermissionMode::Plan))` for each due job instead of only printing
+  it, reporting `outcome=exit:<code>` or `outcome=error:<detail>` per job. **Deliberately not attempted,
+  disclosed rather than silently gapped:** no failure-count integration with `PromptCron::quarantine` —
+  `poll()`'s own quarantine logic already covers unparseable schedules; wiring repeated *execution*
+  failures into it needs a real policy decision (how many consecutive failures, quarantine vs. just
+  keep retrying) this pass didn't make, so a job that fails every time will keep firing and failing
+  forever rather than being caught by quarantine, a known, named limitation, not silently
+  auto-handled; session continuity (a cron job's `session_id` is still just an opaque string, never
+  threaded into real session/ledger state) also remains out of scope, unchanged from before. **Testing
+  note, disclosed for the same reason:** `rapid cron`'s schedule grammar has a one-minute floor (rejects
+  sub-minute schedules), so a fast, deterministic, real-binary end-to-end test isn't possible without
+  either waiting up to 60 real seconds or widening internal visibility purely for testability — neither
+  worth it for one test. New `binary_cron_poll_runs_the_fired_job_in_plan_mode_and_denies_the_patch`
+  (`configured_model_integration.rs`) is a genuine, real, non-mocked-safety-property end-to-end test —
+  loopback model server, real `rapid cron add`/`rapid cron poll` subprocess invocations, `RAPIDLM_
+  PERMISSION_MODE=acceptEdits` deliberately set in the environment to prove the forced mode overrides an
+  *explicit* permissive setting, not just an absent one — but marked `#[ignore]` (the first and only use
+  of that attribute in this codebase) with a doc comment explaining exactly why, runnable on demand via
+  `cargo test -- --ignored`, and **actually run once during this pass, confirmed passing** (fired=1,
+  outcome=exit:0, file unmodified, ≥2 requests reached the loopback server) before being committed — not
+  merely written and trusted to compile. A second, fast unit test,
+  `forced_mode_overrides_env_and_settings_resolution` (`interactive.rs`), covers the parameter-threading
+  behavior on every normal `cargo test` run by requesting two different forced modes and confirming both
+  distinctly come back out (proving the parameter, not some fixed ambient default, decides the outcome).
+  Full `-p rapid` suite (322 lib tests), `cargo test -p rapid --tests` (the new binary-level test correctly
+  sits at 1 ignored, not slowing the normal suite), and `cargo build --workspace --tests` all pass.
 
 ### 3.3 Verified-success-per-token as a tracked, reported metric
 

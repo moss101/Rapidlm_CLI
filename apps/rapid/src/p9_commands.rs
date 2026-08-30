@@ -719,6 +719,16 @@ pub fn run_cron(args: &[String]) -> Result<i32, P9CommandError> {
                 report.fired.len(),
                 report.quarantined
             );
+            // Modbit `AGT-008`/§3.2: a fired job now actually runs its prompt
+            // through a real turn, not just a print statement — but only ever
+            // in the "propose, never auto-apply" mode this feature's first
+            // pass is scoped to. `forced_mode` overrides whatever the ambient
+            // environment/project settings say: `evaluate()` (`permissions.rs`)
+            // denies every non-read-only tool call unconditionally in `Plan`
+            // mode, before the mode table is even consulted for anything else,
+            // so a cron-fired turn can explore (read-only tools stay allowed
+            // in every mode) and produce a proposal, but can never write,
+            // patch, or run a mutating shell command unattended.
             for due in &report.fired {
                 println!(
                     "id={} session={} prompt={}",
@@ -726,6 +736,13 @@ pub fn run_cron(args: &[String]) -> Result<i32, P9CommandError> {
                     due.session_id.as_deref().unwrap_or("-"),
                     elide_prompt(&due.prompt),
                 );
+                match crate::interactive::exec_turn(
+                    &[due.prompt.clone()],
+                    Some(crate::permissions::PermissionMode::Plan),
+                ) {
+                    Ok(code) => println!("id={} outcome=exit:{code}", due.id),
+                    Err(err) => println!("id={} outcome=error:{err:?}", due.id),
+                }
             }
             Ok(0)
         }

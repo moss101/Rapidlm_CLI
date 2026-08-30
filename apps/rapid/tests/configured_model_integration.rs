@@ -701,3 +701,101 @@ fn binary_exec_in_default_mode_denies_the_patch_and_keeps_disk_intact() {
         "the denial must be a model-visible tool result: {last}"
     );
 }
+
+fn run_rapid_cron_in(
+    project: &PathBuf,
+    home: &PathBuf,
+    config_path: &PathBuf,
+    db_path: &PathBuf,
+    args: &[&str],
+) -> (Option<i32>, String, String) {
+    let mut full_args = vec!["cron".to_owned(), "--db".to_owned(), db_path.display().to_string()];
+    full_args.extend(args.iter().map(|s| (*s).to_owned()));
+    let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
+        .args(&full_args)
+        .current_dir(project)
+        .env("HOME", home)
+        .env_remove("RAPIDLM_HOME")
+        .env_remove("RAPIDLM_MODEL")
+        .env("RAPIDLM_CONFIG", config_path)
+        // Set deliberately permissive — the whole point of this test is that
+        // `rapid cron poll` must force `plan` mode regardless of what the
+        // ambient environment says, not merely default to it.
+        .env("RAPIDLM_PERMISSION_MODE", "acceptEdits")
+        .output()
+        .expect("run rapid cron");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Seconds until the top of the next minute, plus a one-second buffer —
+/// `rapid cron`'s schedule grammar has a one-minute floor (Modbit `AGT-008`/
+/// `newtask.md` §3.2), so there is no faster way to get a real, un-mocked
+/// `rapid cron poll` invocation to see a genuinely due job.
+fn seconds_until_next_minute_boundary() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    (60 - (now % 60)) + 1
+}
+
+#[test]
+#[ignore = "waits for a real minute boundary (rapid cron's schedule grammar has a one-minute \
+            floor); run explicitly with `cargo test -- --ignored` to verify end to end"]
+fn binary_cron_poll_runs_the_fired_job_in_plan_mode_and_denies_the_patch() {
+    let server = spawn_scripted_server(vec![
+        (200, patch_tool_call_body()),
+        (200, terminal_body("nothing to change")),
+    ]);
+    let env = TrustedProject::new("cron-plan-mode");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let db_path = env.home.join("cron.sqlite");
+
+    let (add_code, add_stdout, add_stderr) = run_rapid_cron_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &db_path,
+        &["add", "--prompt", "patch notes.txt by replacing alpha with beta", "--schedule", "* * * * *"],
+    );
+    assert_eq!(add_code, Some(0), "cron add stderr: {add_stderr}");
+    assert!(add_stdout.contains("status=active"), "add stdout: {add_stdout}");
+
+    std::thread::sleep(std::time::Duration::from_secs(seconds_until_next_minute_boundary()));
+
+    let (poll_code, poll_stdout, poll_stderr) =
+        run_rapid_cron_in(&env.project, &env.home, &config_path, &db_path, &["poll"]);
+    assert_eq!(poll_code, Some(0), "cron poll stderr: {poll_stderr}");
+    assert!(poll_stdout.contains("fired=1"), "poll stdout: {poll_stdout}");
+    assert!(
+        poll_stdout.contains("outcome=exit:0"),
+        "the fired job's turn must have actually run: {poll_stdout}"
+    );
+
+    // The real point of this test: even though the ambient environment set
+    // `RAPIDLM_PERMISSION_MODE=acceptEdits` (which would apply the patch for
+    // `rapid exec` directly — see the sibling `accept_edits` test above),
+    // the cron-fired turn ran forced into `plan` mode and the patch was
+    // denied, not applied.
+    let content =
+        std::fs::read_to_string(env.project.join("notes.txt")).expect("file still present");
+    assert_eq!(
+        content, "alpha\n",
+        "a cron-fired turn must never apply a mutation, even in an acceptEdits environment"
+    );
+    let requests = server.requests.lock().expect("requests");
+    assert!(
+        requests.len() >= 2,
+        "the model must have actually been called, not skipped: {}",
+        requests.len()
+    );
+}
