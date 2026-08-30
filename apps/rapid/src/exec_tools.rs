@@ -226,7 +226,6 @@ impl JobRegistry {
             .lock()
             .map_err(|_| ToolStepError::Failed)?
             .insert(id.clone(), shared.clone());
-        eprintln!("DEBUG jobs.start: spawning supervisor for {id}");
 
         // Everything the supervisor touches is owned and 'static: the job
         // must outlive the tool call (and even a batch dispatch thread).
@@ -245,9 +244,7 @@ impl JobRegistry {
         let spawned = std::thread::Builder::new()
             .name("rapidlm-job".to_owned())
             .spawn(move || {
-                let _ = std::fs::write("/tmp/supervisor-entered", "yes");
                 let started = Instant::now();
-                eprintln!("DEBUG supervisor entered");
                 // Spawn under the child lock (scoped: the guard must drop
                 // before the loop re-locks to publish the child).
                 let spawned_child = {
@@ -282,7 +279,6 @@ impl JobRegistry {
                     Box::new(child.stdout.take().expect("stdout piped")),
                     Box::new(child.stderr.take().expect("stderr piped")),
                 ];
-                eprintln!("DEBUG supervisor: child spawned, pipes taken");
                 if let Ok(mut slot) = worker.child.lock() {
                     *slot = Some(child);
                 }
@@ -329,7 +325,6 @@ impl JobRegistry {
                         if let Ok(mut state) = worker.state.lock() {
                             *state = JobState::Completed(status.code().unwrap_or(-1));
                         }
-                        eprintln!("DEBUG supervisor: job completed {}", status.code().unwrap_or(-1));
                         break;
                     }
                     if worker.cancelled.load(Ordering::SeqCst) {
@@ -634,15 +629,9 @@ impl WorkspaceTools {
             let tools = match session.initialize(&cancel) {
                 Ok(_) => match session.tools_list(&capability_broker::CancellationToken::new()) {
                     Ok(tools) => tools,
-                    Err(err) => {
-                        eprintln!("DEBUG tools_list error: {err:?}");
-                        Vec::new()
-                    }
+                    Err(_) => Vec::new(),
                 },
-                Err(err) => {
-                    eprintln!("DEBUG initialize error: {err:?}");
-                    Vec::new()
-                }
+                Err(_) => Vec::new(),
             };
             {
                 let mut surface = self.mcp_surface.lock().expect("mcp surface");
@@ -5550,9 +5539,10 @@ for line in sys.stdin:
             .iter()
             .map(|tool| tool.name().to_owned())
             .collect();
-        eprintln!("DEBUG registrations: {:?}", tools.mcp_surface.lock().map(|s| s.len()));
-        eprintln!("DEBUG connections: {}", tools.mcp.lock().map(|c| c.len()).unwrap_or(0));
-        eprintln!("DEBUG surface: {surface:?}");
+        assert!(
+            surface.iter().any(|name| name == "mcp__demo__echo"),
+            "echo tool advertised after registration: {surface:?}"
+        );
 
         // Dead server: registration records an offline marker tool whose
         // invocation fails with a typed handled error.
