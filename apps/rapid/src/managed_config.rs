@@ -1,5 +1,7 @@
 //! Enterprise managed-config layer: a managed policy document that gates
-//! user model configuration.
+//! user model configuration and the permission mode (Modbit `CAP-001`:
+//! hard invariants merge with lower-trust layers only ever restricting,
+//! never widening — this is that merge, scoped so far to the fields below).
 //!
 //! Administrators point `RAPIDLM_MANAGED_CONFIG` at a policy file. Gates are
 //! enforced, not advisory:
@@ -8,7 +10,11 @@
 //! * `allowed_providers` is an allowlist; a user model entry on a
 //!   non-allowed provider is a hard, field-level error with a remediation
 //!   string (fail closed — the turn never runs on a forbidden provider);
-//! * `min_reasoning_effort` raises any configured effort below the floor.
+//! * `min_reasoning_effort` raises any configured effort below the floor;
+//! * `max_permission_mode` lowers a resolved permission mode that exceeds
+//!   the ceiling (`gate_permission_mode`) — a project's `.rapidlm/
+//!   settings.json` or `RAPIDLM_PERMISSION_MODE` can request `bypassPermissions`,
+//!   but never actually get more than an admin allows.
 //!
 //! Every gate outcome is reported with field id, origin, and remediation so
 //! operators can see exactly which layer decided what.
@@ -133,6 +139,10 @@ pub struct ManagedPolicy {
     allowed_providers: Option<Vec<String>>,
     /// Any configured effort below this floor is raised to it.
     min_reasoning_effort: Option<ReasoningEffort>,
+    /// Ceiling on the resolved permission mode (Modbit `CAP-001`): a
+    /// project's `.rapidlm/settings.json` or `RAPIDLM_PERMISSION_MODE` may
+    /// only narrow what this allows, never widen past it.
+    max_permission_mode: Option<crate::permissions::PermissionMode>,
 }
 
 impl ManagedPolicy {
@@ -144,6 +154,7 @@ impl ManagedPolicy {
     /// locked_default = "cloud"
     /// allowed_providers = ["openai-compatible", "anthropic"]
     /// min_reasoning_effort = "high"
+    /// max_permission_mode = "acceptEdits"
     /// ```
     pub fn parse(toml_str: &str) -> Result<Self, ManagedConfigError> {
         let value: toml::Value =
@@ -180,7 +191,10 @@ impl ManagedPolicy {
         for key in policy.keys() {
             if !matches!(
                 key.as_str(),
-                "locked_default" | "allowed_providers" | "min_reasoning_effort"
+                "locked_default"
+                    | "allowed_providers"
+                    | "min_reasoning_effort"
+                    | "max_permission_mode"
             ) {
                 return Err(ManagedConfigError::UnknownField {
                     field: format!("policy.{key}"),
@@ -262,10 +276,32 @@ impl ManagedPolicy {
                 Some(effort)
             }
         };
+        let max_permission_mode = match policy.get("max_permission_mode") {
+            None => None,
+            Some(raw) => {
+                let raw = raw.as_str().ok_or_else(|| {
+                    ManagedConfigError::PolicyField(field_error(
+                        "policy.max_permission_mode",
+                        "must be a string naming a permission mode",
+                    ))
+                })?;
+                let mode = crate::permissions::PermissionMode::parse(raw).ok_or_else(|| {
+                    ManagedConfigError::PolicyField(field_error(
+                        "policy.max_permission_mode",
+                        &format!(
+                            "'{raw}' is not a permission mode; expected one of {}",
+                            crate::permissions::MODE_NAMES.join(", ")
+                        ),
+                    ))
+                })?;
+                Some(mode)
+            }
+        };
         Ok(Self {
             locked_default,
             allowed_providers,
             min_reasoning_effort,
+            max_permission_mode,
         })
     }
 
@@ -280,6 +316,38 @@ impl ManagedPolicy {
     pub fn min_reasoning_effort(&self) -> Option<ReasoningEffort> {
         self.min_reasoning_effort
     }
+
+    pub fn max_permission_mode(&self) -> Option<crate::permissions::PermissionMode> {
+        self.max_permission_mode
+    }
+}
+
+/// Gate a resolved permission mode against the managed ceiling: only ever
+/// narrows what mode resolution already decided, never widens it. Mirrors
+/// `min_reasoning_effort`'s silent-enforcement shape (report, don't refuse
+/// the whole run) — automatically becoming *more* restrictive is always
+/// safe, unlike a model misconfiguration that could break every request.
+pub fn gate_permission_mode(
+    mode: crate::permissions::PermissionMode,
+    policy: Option<&ManagedPolicy>,
+) -> (crate::permissions::PermissionMode, Option<GateReportEntry>) {
+    let Some(ceiling) = policy.and_then(ManagedPolicy::max_permission_mode) else {
+        return (mode, None);
+    };
+    if mode.permissiveness_rank() <= ceiling.permissiveness_rank() {
+        return (mode, None);
+    }
+    let report = GateReportEntry {
+        field_id: "permission.mode".to_string(),
+        origin: ConfigOrigin::Managed,
+        detail: format!(
+            "mode lowered from '{}' to the managed ceiling '{}'",
+            mode.as_str(),
+            ceiling.as_str()
+        ),
+        remediation: "contact your administrator to raise the managed permission-mode ceiling",
+    };
+    (ceiling, Some(report))
 }
 
 fn field_error(field_id: &str, reason: &str) -> ConfigFieldError {
@@ -518,7 +586,7 @@ base_url = "http://gateway.internal:8080"
     #[test]
     fn parse_reads_all_policy_fields_and_rejects_unknowns() {
         let policy = parse_policy(&policy_doc(
-            "locked_default = \"cloud\"\nallowed_providers = [\"anthropic\"]\nmin_reasoning_effort = \"high\"\n",
+            "locked_default = \"cloud\"\nallowed_providers = [\"anthropic\"]\nmin_reasoning_effort = \"high\"\nmax_permission_mode = \"acceptEdits\"\n",
         ));
         assert_eq!(policy.locked_default(), Some("cloud"));
         assert_eq!(
@@ -526,6 +594,10 @@ base_url = "http://gateway.internal:8080"
             Some(["anthropic".to_owned()].as_slice())
         );
         assert_eq!(policy.min_reasoning_effort(), Some(ReasoningEffort::High));
+        assert_eq!(
+            policy.max_permission_mode(),
+            Some(crate::permissions::PermissionMode::AcceptEdits)
+        );
         let bad = format!("schema = \"{MANAGED_SCHEMA}\"\nsurprise = 1\n[policy]\n");
         let err = ManagedPolicy::parse(&bad).expect_err("unknown field");
         assert!(err.to_string().contains("unknown field 'surprise'"));
@@ -650,5 +722,45 @@ reasoning_effort = "low"
         let gated = resolve_gated(&[], &config, Some(&policy)).expect("gated");
         assert_eq!(gated.active.entry.reasoning_effort, Some(ReasoningEffort::Ultra));
         assert!(gated.reports.is_empty());
+    }
+
+    #[test]
+    fn parse_rejects_an_unknown_permission_mode_name() {
+        let err = ManagedPolicy::parse(&policy_doc("max_permission_mode = \"godmode\"\n"))
+            .expect_err("unknown mode");
+        assert!(err.to_string().contains("not a permission mode"));
+    }
+
+    #[test]
+    fn gate_permission_mode_only_ever_narrows_never_widens() {
+        use crate::permissions::PermissionMode;
+        let policy = parse_policy(&policy_doc("max_permission_mode = \"acceptEdits\"\n"));
+
+        // Requesting more than the ceiling: lowered, and reported.
+        let (mode, report) = gate_permission_mode(PermissionMode::BypassPermissions, Some(&policy));
+        assert_eq!(mode, PermissionMode::AcceptEdits);
+        let report = report.expect("must be reported");
+        assert_eq!(report.field_id, "permission.mode");
+        assert_eq!(report.origin, ConfigOrigin::Managed);
+
+        // At or under the ceiling: passed through untouched, no report.
+        let (mode, report) = gate_permission_mode(PermissionMode::Default, Some(&policy));
+        assert_eq!(mode, PermissionMode::Default);
+        assert!(report.is_none());
+        let (mode, report) = gate_permission_mode(PermissionMode::AcceptEdits, Some(&policy));
+        assert_eq!(mode, PermissionMode::AcceptEdits);
+        assert!(report.is_none());
+
+        // Plan is the strictest mode of all six — always passes through
+        // even against the tightest possible ceiling.
+        let strict = parse_policy(&policy_doc("max_permission_mode = \"plan\"\n"));
+        let (mode, report) = gate_permission_mode(PermissionMode::Plan, Some(&strict));
+        assert_eq!(mode, PermissionMode::Plan);
+        assert!(report.is_none());
+
+        // No policy at all: never gates.
+        let (mode, report) = gate_permission_mode(PermissionMode::BypassPermissions, None);
+        assert_eq!(mode, PermissionMode::BypassPermissions);
+        assert!(report.is_none());
     }
 }

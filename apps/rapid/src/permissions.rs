@@ -64,6 +64,24 @@ impl PermissionMode {
         Self::DontAsk,
         Self::BypassPermissions,
     ];
+
+    /// Permissiveness order for managed-policy ceiling gates (Modbit
+    /// `CAP-001`: lower-trust layers may only restrict, never widen).
+    /// `Plan` is deliberately the strictest of all six — it denies every
+    /// write-classified call outright (`evaluate`'s `PlanModeDeny` arm),
+    /// stricter than `Default`'s "ask" — not a position in `Self::ALL`'s
+    /// declaration order, which exists only to match `MODE_NAMES`'s lookup
+    /// table and carries no permissiveness meaning.
+    pub const fn permissiveness_rank(self) -> u8 {
+        match self {
+            Self::Plan => 0,
+            Self::Default => 1,
+            Self::AcceptEdits => 2,
+            Self::Auto => 3,
+            Self::DontAsk => 4,
+            Self::BypassPermissions => 5,
+        }
+    }
 }
 
 impl fmt::Display for PermissionMode {

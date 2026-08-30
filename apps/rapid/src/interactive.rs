@@ -1061,6 +1061,18 @@ fn exec_permission_lattice(
         }
     }
     let mode = mode.unwrap_or(PermissionMode::Default);
+    // Managed-policy ceiling (Modbit `CAP-001`): a project's own settings or
+    // `RAPIDLM_PERMISSION_MODE` may only narrow the resolved mode, never
+    // widen it past whatever an administrator allows. A configured-but-
+    // unreadable policy document fails closed here too, matching
+    // `load_policy`'s own documented invariant — it must never silently
+    // become "no policy".
+    let managed_policy = crate::managed_config::load_policy(&std::env::vars().collect::<Vec<_>>())
+        .map_err(|err| format!("managed policy could not be loaded: {err}"))?;
+    let (mode, gate_report) = crate::managed_config::gate_permission_mode(mode, managed_policy.as_ref());
+    if let Some(report) = gate_report {
+        eprintln!("warning: {report}");
+    }
     let mut lattice = PermissionLattice::new(mode).with_rules(rules);
     // Persisted grants, keyed by canonical project root.
     if let (Some(root), Some(home)) = (canonical_root, exec_user_home()) {

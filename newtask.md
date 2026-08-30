@@ -335,11 +335,32 @@ default; adopt the classifier-as-safety-net idea, not the classifier-as-default 
   — no mutation API exists to guard against in the first place, so the "immutable per-round snapshot"
   property already holds unconditionally, not just by convention. A wrapper type here would rename an
   already-total invariant, not enforce a new one — declining to build it, per this document's own standing
-  rule against ceremony with no load-bearing behavior behind it. **What's still genuinely open:** the
-  Policy Compiler (`CAP-001`, hard-invariants → admin → profile → user → project → agent monotonic merge
-  order) and `AuthorizationEpoch` — neither exists, and neither has a shortcut; both are real, separate
-  design work, more so now that the merge order matters across a project's settings files in ways
-  `exec_permission_lattice`'s current flat merge doesn't yet express.
+  rule against ceremony with no load-bearing behavior behind it.
+- **Policy Compiler (`CAP-001`) half: a real instance of the exact pattern already existed one file
+  over, extended to the permission-mode domain, 2026-08-30.** `apps/rapid/src/managed_config.rs`
+  (`RAPIDLM_MANAGED_CONFIG`) already implements CAP-001's "hard invariants merge, lower-trust layers may
+  only restrict, never widen" shape — just scoped to model configuration (`locked_default`,
+  `allowed_providers`, `min_reasoning_effort`, each enforced managed > env > user > default). But
+  `exec_permission_lattice()` (the actual tool-approval mode/rule resolution) had zero connection to it:
+  a project's `.rapidlm/settings.json` or `RAPIDLM_PERMISSION_MODE` could set `bypassPermissions` freely,
+  with no admin ceiling at all. **Implemented:** a new `max_permission_mode` field on `ManagedPolicy` plus
+  `gate_permission_mode()`, wired into `exec_permission_lattice()` right after mode resolution — narrows
+  the resolved mode down to the managed ceiling when it's exceeded (reported via a new
+  `GateReportEntry`, `eprintln!`'d as a warning), passes through untouched otherwise, mirroring
+  `min_reasoning_effort`'s existing silent-enforcement shape rather than hard-refusing the whole run
+  (becoming *more* restrictive is always safe; a model misconfiguration hard-refusal is not the same
+  risk). Needed a real permissiveness ranking to compare modes at all — added
+  `PermissionMode::permissiveness_rank()`; confirmed from `evaluate()`'s own logic (not guessed) that
+  `Plan` is the strictest of all six (denies every write-classified call outright, `PlanModeDeny`), not a
+  position in the enum's declaration order (which only matches `MODE_NAMES`'s lookup table). A configured-
+  but-unreadable `RAPIDLM_MANAGED_CONFIG` now fails `exec_permission_lattice` closed too, matching
+  `load_policy`'s own already-documented invariant that it must never silently become "no policy" — this
+  path previously didn't call `load_policy` at all, so the invariant had nothing to apply to. **Not
+  attempted, and this is the bulk of `CAP-001` and all of `AuthorizationEpoch`:** the full hard-invariants
+  → admin → execution-profile → user → project → agent merge *order* across multiple settings sources
+  (today's merge is a flat union of `.rapidlm/settings.json` + `.claude/settings.json` rules, with no
+  concept of which layer "wins" a conflict beyond the two special-cased fields above) — real, separate
+  design work.
 
 ### 2.4 `CompletionContract` (tri-state) + `VerificationPlane`
 
