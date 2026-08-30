@@ -164,9 +164,16 @@ impl PersistentSpecialist {
         self.observed_generation
     }
 
-    /// Deliver a typed message into a bounded mailbox.
+    /// Deliver a typed message into a bounded mailbox. A message already
+    /// stale relative to the last observed generation is silently dropped —
+    /// `mark_observed`'s own doc comment promises a specialist never serves
+    /// stale repository state, and this is the sibling path that would
+    /// otherwise let one back in.
     pub fn deliver(&mut self, message: SpecialistMessage) -> Result<(), SpecialistError> {
         self.check_cancel()?;
+        if !message_generation_is_current(self.observed_generation)(&message) {
+            return Ok(());
+        }
         if self.mailbox.len() >= self.config.mailbox_limit {
             return Err(SpecialistError::MailboxFull);
         }
@@ -471,6 +478,30 @@ mod tests {
             ),
             "stale gen-5 observation must be invalidated on advance"
         );
+    }
+
+    #[test]
+    fn deliver_drops_a_message_already_stale_at_delivery_time() {
+        let mut s = specialist(AgentRole::Explorer);
+        s.mark_observed(5).expect("gen5");
+        s.deliver(SpecialistMessage::Observe {
+            locator: "stale".into(),
+            generation: 2,
+        })
+        .expect("delivery itself is not an error, just a no-op");
+        assert!(
+            s.mailbox().is_empty(),
+            "a message older than the already-observed generation must never enter the mailbox"
+        );
+        assert!(s.pop_mail().is_none());
+
+        // A current-or-newer message still delivers normally.
+        s.deliver(SpecialistMessage::Observe {
+            locator: "fresh".into(),
+            generation: 5,
+        })
+        .expect("current generation delivers");
+        assert_eq!(s.mailbox().len(), 1);
     }
 
     #[test]

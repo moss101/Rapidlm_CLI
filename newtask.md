@@ -714,6 +714,30 @@ same reasoning applies: a real, demonstrable bug worth having fixed before this 
 completion path. Full `agent-runtime` crate suite (272 tests, up from 271) and `cargo build --workspace
 --tests` pass.
 
+**Fresh review pass, 2026-08-30, `crates/agent-runtime/src/specialist.rs::PersistentSpecialist::deliver` —
+the sibling path to `mark_observed` had no generation gate at all.** `mark_observed`'s own doc comment: "A
+generation change invalidates observations from older generations so a specialist never serves stale
+repository state." That guarantee is enforced entirely by `mark_observed`'s `retain()` call, which sweeps the
+mailbox using `message_generation_is_current`. But `deliver()` — the only other function that touches the
+mailbox — accepted every message unconditionally, with no check against `self.observed_generation` at all.
+Concretely: `mark_observed(5)` then `deliver(Observe { generation: 2, .. })` succeeded and queued the stale
+message, which `pop_mail()` would hand back exactly as if it were current — directly contradicting "a
+specialist never serves stale repository state." A second symptom followed from the same gap: since
+`mark_observed`'s `retain()` only runs when the generation argument *changes* (`if generation !=
+self.observed_generation`), a redundant re-confirmation at the same generation skipped the sweep entirely,
+though this specific symptom becomes moot once `deliver()` itself gates on entry (below), since nothing stale
+can get in for a same-generation re-confirmation to need sweeping. **Fixed:** `deliver()` now applies the
+same `message_generation_is_current(self.observed_generation)` predicate `mark_observed` already uses, and
+silently drops (returns `Ok(())`, not an error) a message that's already stale at delivery time — matching
+`retain()`'s own framing of staleness as invalidation, not a caller error. Verified with the standard
+temporary-revert cycle: reverting the new gate made the test fail with the mailbox containing the stale
+message, restoring it passes. New test `deliver_drops_a_message_already_stale_at_delivery_time`. **Latent,
+not yet actively firing:** confirmed via grep that `PersistentSpecialist`/`SpecialistPool` have zero callers
+anywhere outside this file's own tests — this control-plane component isn't wired into a host yet — but a
+real, demonstrable contract violation in the public API against its own documented invariant, worth having
+fixed before it is. Full `agent-runtime` crate suite (273 tests, up from 272) and `cargo build --workspace
+--tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
