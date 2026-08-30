@@ -76,6 +76,11 @@ pub const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(600);
 pub const MAX_SPAWN_PROMPT_BYTES: usize = 16 * 1024;
 /// Hard byte cap on one subagent's returned report.
 pub const MAX_SUBAGENT_REPORT_BYTES: usize = 16 * 1024;
+/// Maximum `task_spawn` calls per turn (Modbit `WRK-017`'s concurrency
+/// ceiling, narrowed to a total-per-turn cap — see `subagent_spawns`'s doc
+/// comment on `WorkspaceTools` for why). A runaway loop that keeps spawning
+/// subagents burns real tokens/cost/time with nothing else stopping it.
+pub const MAX_SUBAGENT_SPAWNS_PER_TURN: u64 = 32;
 /// Hard byte cap for the plan file.
 pub const MAX_PLAN_BYTES: usize = 16 * 1024;
 /// Adopted subagent types (the names both reference CLIs standardized on).
@@ -537,6 +542,12 @@ pub struct WorkspaceTools {
     ask_stdin: Option<Arc<dyn Fn(&str, &[String], Duration) -> Result<String, String> + Send + Sync>>,
     mcp: Arc<Mutex<Vec<McpConnection>>>,
     mcp_surface: Arc<Mutex<Vec<(String, String, mcp::transport::McpToolDescriptor)>>>,
+    /// Resource ceiling (Modbit `WRK-017`'s concurrency axis, narrowed to
+    /// this codebase's actual shape: `task_spawn` runs synchronously, one
+    /// subagent at a time, never several in parallel — so the real runaway
+    /// risk is an unbounded *total* per turn, not concurrent execution).
+    /// See `newtask.md` §2.10.
+    subagent_spawns: Arc<AtomicU64>,
 }
 
 impl WorkspaceTools {
@@ -569,6 +580,7 @@ impl WorkspaceTools {
             ask_stdin: None,
             mcp: Arc::new(Mutex::new(Vec::new())),
             mcp_surface: Arc::new(Mutex::new(Vec::new())),
+            subagent_spawns: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1903,6 +1915,15 @@ impl WorkspaceTools {
                 )),
             });
         };
+        if self.subagent_spawns.fetch_add(1, Ordering::SeqCst) >= MAX_SUBAGENT_SPAWNS_PER_TURN {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "task_spawn budget exhausted: {MAX_SUBAGENT_SPAWNS_PER_TURN} subagents already started this turn"
+                ))),
+            });
+        }
         if !self.hooks.subagent_start.is_empty() {
             let _ = crate::hooks::run_notify_hooks(
                 &self.hooks.subagent_start,
@@ -5268,6 +5289,60 @@ use std::sync::{Arc, Mutex};
         let surface: Vec<&str> = surface_owned.iter().map(|name| name.as_str()).collect();
         assert!(!surface.contains(&TASK_SPAWN_TOOL), "depth 1 enforced: {surface:?}");
         assert!(surface.contains(&REPO_READ_TOOL), "reads stay available");
+    }
+
+    #[test]
+    fn task_spawn_refuses_once_the_per_turn_budget_is_exhausted() {
+        struct CountingRunner(Arc<AtomicU64>);
+        impl crate::exec_tools::SubagentRunner for CountingRunner {
+            fn run(&self, _prompt: &str, _agent_type: &str) -> Result<SubagentReport, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(SubagentReport {
+                    summary: "done".to_owned(),
+                    status: "succeeded".to_owned(),
+                    tool_calls: 0,
+                    tokens: 1,
+                    cost_usd_micros: None,
+                    stop_reason: None,
+                    claims: Vec::new(),
+                    blockers: Vec::new(),
+                    open_questions: Vec::new(),
+                    patch_summary: None,
+                })
+            }
+        }
+
+        let root = TempRoot::new("spawn-budget");
+        let mut tools = permissive_workspace(&root.0);
+        let ran = Arc::new(AtomicU64::new(0));
+        tools.subagents = Some(Arc::new(CountingRunner(Arc::clone(&ran))) as Arc<dyn SubagentRunner>);
+        let cancel = CancellationToken::new();
+        let call = make_call("c1", TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
+
+        for _ in 0..MAX_SUBAGENT_SPAWNS_PER_TURN {
+            let validated = tools.validate(&call, &cancel).expect("v");
+            match tools.execute(&validated, &cancel).expect("e") {
+                ToolStepResult::Succeeded { .. } => {}
+                other => panic!("expected success under budget, got {other:?}"),
+            }
+        }
+        assert_eq!(ran.load(Ordering::SeqCst), MAX_SUBAGENT_SPAWNS_PER_TURN);
+
+        // One more call over budget is a handled, model-visible refusal —
+        // the runner is never even invoked.
+        let validated = tools.validate(&call, &cancel).expect("v");
+        match tools.execute(&validated, &cancel).expect("handled") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.unwrap().contains("budget exhausted"));
+            }
+            other => panic!("expected a budget refusal, got {other:?}"),
+        }
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            MAX_SUBAGENT_SPAWNS_PER_TURN,
+            "the runner must not run once the budget is exhausted"
+        );
     }
 
     #[test]

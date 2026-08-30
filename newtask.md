@@ -456,7 +456,22 @@ attempted here. **Implemented 2026-08-29, the one ceiling that doesn't need OS-l
 `rapid exec --max-wall-time <seconds>` (`apps/rapid/src/interactive.rs`, `spawn_wall_time_watchdog`) —
 a background thread that cancels the turn's existing `CancellationToken` (the same cooperative signal
 Ctrl-C already sends, checked by every model step and tool call) once the deadline passes. CPU/RAM/disk/
-network/concurrency ceilings remain real, separate future work.
+network ceilings remain real, separate future work needing actual OS-level monitoring.
+
+**Correction (2026-08-30): the concurrency axis was already narrower than claimed, and is now fully
+covered for this codebase's actual shape.** `apps/rapid/src/exec_tools.rs::MAX_BACKGROUND_JOBS` (16) was
+already a real, pre-existing concurrency ceiling on live `shell_exec background: true` jobs — the "no
+concurrency ceiling type exists anywhere" claim above was wrong for that one axis. The genuinely open gap
+was `task_spawn`: unbounded, no cap on how many subagents one turn could start — a runaway or adversarial
+loop could burn real tokens/cost/wall-time with nothing stopping it. **Implemented 2026-08-30:** a new
+`MAX_SUBAGENT_SPAWNS_PER_TURN` (32) enforced via a `subagent_spawns: Arc<AtomicU64>` counter on
+`WorkspaceTools`, checked before every `task_spawn` call; once exhausted, the call is a typed, handled,
+model-visible failure (`"task_spawn budget exhausted"`), never a hard kill — the runner is never even
+invoked past the cap. Named a *total-per-turn* cap rather than "concurrency" deliberately:
+`execute_task_spawn` already runs synchronously (blocks until the child turn finishes before the tool
+call returns), so there is no actual concurrent-subagent risk in this codebase's design to cap — only an
+unbounded-sequential-total one, which is what WRK-017's spirit ("budgets can't buy a fake pass" aside)
+is really protecting against here. CPU/RAM/disk/network ceilings are still real, separate, OS-level work.
 
 - **Where it lands:** Credential Broker: wire `SecretBroker` into `apps/rapid`'s credential path once a
   real multi-secret scenario exists — premature before that. Resource Governor: new work, `sandbox` or a
