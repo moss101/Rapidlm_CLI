@@ -660,6 +660,31 @@ the diff shows a straight-line `let result = retrieve_inner(...); watcher.stop()
 no `?` in between, mirroring `ripple_advisory`'s already-trusted structure exactly. Full `rapid` crate suite
 (331 tests, up from 330) and `cargo build --workspace --tests` pass.
 
+**Fresh review pass, 2026-08-30, `crates/agent-runtime/src/agent/spawn.rs::spawn_agent` — the scheduler
+cleanup pattern used for two error paths was silently skipped for four others in between.** The function
+consistently rolls back the scheduler's record on failure at the start (`Spawned`-emit failure: `scheduler.
+cancel(child_id)`) and at the end (turn-execution `Cancelled`/`Failed` arms: `scheduler.cancel`/`finish`) —
+but the stretch in between (`check_cancel`, `scheduler.start()`, two `agent.transition()` calls, the
+`Started`-emit) used bare `?` with no equivalent cleanup, even though by the time any of these can fail the
+scheduler record has already moved past `Queued` (via `enqueue()`) or `Running` (via `start()`), with no
+other path back to a terminal state. Confirmed reachable, not just a contrived mock: the built-in
+`SpawnEventSink for Vec<SpawnEvent>` is bounded at `MAX_SPAWN_EVENTS = 32` and fails once already holding 32
+— a shared lifecycle sink naturally accumulates 2 events per successful spawn, so the 17th spawn in a session
+fills it to exactly 32 on its own `Spawned` emit, then its `Started` emit fails at precisely the point cleanup
+was skipped. Verified directly with the standard temporary-revert cycle: reverting just the `Started`-emit
+error handling back to bare `?` made the new test fail with `left: Running, right: Cancelled` — the
+scheduler record left stuck at `Running` forever, no terminal state ever recorded, exactly as predicted —
+before the fix was restored. **Fixed:** added a `cancel_on_err` closure (`|err| { scheduler.cancel(child_id);
+err }`) and applied `.map_err(cancel_on_err)` uniformly across all four previously-bare `?` points, matching
+the same cleanup the function already performs at its other two failure sites. New test `started_event_
+failure_still_cancels_the_scheduler_record` (a `RejectSecondEventSink` that accepts `Spawned` but rejects
+`Started`, confirming the scheduler record ends up `Cancelled` rather than stuck at `Running`). **Latent, not
+yet actively firing:** confirmed via grep that `spawn_agent` has zero callers anywhere in `apps/` — this
+matches the session's own earlier note that "there is no write-scoped, narrowly-leased child run path at all"
+wired into `task_spawn` yet — but a real, demonstrable resource-leak bug in the function's own error handling,
+worth having fixed before this becomes the real subagent-spawn path. Full `agent-runtime` crate suite (271
+tests, up from 270) and `cargo build --workspace --tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

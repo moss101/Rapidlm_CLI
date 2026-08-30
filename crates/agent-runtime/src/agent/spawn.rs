@@ -629,20 +629,37 @@ where
         return Err(err);
     }
 
-    check_cancel(cancel)?;
-    let handle = env.scheduler.start(handle.id()).map_err(SpawnError::from)?;
+    // From here until turn execution starts, the scheduler record is either
+    // Queued or Running with no other path back to a terminal state; every
+    // early return in this stretch must cancel it explicitly, matching the
+    // Spawned-emit-failure handling just above and the turn-execution
+    // failure handling just below.
+    let cancel_on_err = |err: SpawnError| -> SpawnError {
+        let _ = env.scheduler.cancel(child_id);
+        err
+    };
+    check_cancel(cancel).map_err(cancel_on_err)?;
+    let handle = env
+        .scheduler
+        .start(handle.id())
+        .map_err(SpawnError::from)
+        .map_err(cancel_on_err)?;
     agent
         .transition(AgentState::Starting, cancel)
-        .map_err(SpawnError::from)?;
+        .map_err(SpawnError::from)
+        .map_err(cancel_on_err)?;
     agent
         .transition(AgentState::Running, cancel)
-        .map_err(SpawnError::from)?;
+        .map_err(SpawnError::from)
+        .map_err(cancel_on_err)?;
 
     let turn_id = TurnId::new();
-    env.lifecycle.emit(SpawnEvent::Started {
-        agent_id: child_id,
-        turn_id,
-    })?;
+    env.lifecycle
+        .emit(SpawnEvent::Started {
+            agent_id: child_id,
+            turn_id,
+        })
+        .map_err(cancel_on_err)?;
 
     // The authoritative subagent execution path runs through the canonical
     // host-owned `AgentExecutor`. The child turn's terminal output and host
@@ -999,6 +1016,13 @@ mod tests {
 
     struct RejectingSink;
 
+    /// Accepts the first emitted event (`Spawned`), rejects every one after
+    /// (`Started`) — isolates the failure to after the scheduler record has
+    /// already moved past `Queued`.
+    struct RejectSecondEventSink {
+        calls: Cell<u32>,
+    }
+
     struct RecordingWorktree {
         calls: Cell<u32>,
         last: Cell<Option<WorkspaceViewId>>,
@@ -1083,6 +1107,18 @@ mod tests {
     impl SpawnEventSink for RejectingSink {
         fn emit(&mut self, _event: SpawnEvent) -> Result<(), SpawnError> {
             Err(SpawnError::EventSink)
+        }
+    }
+
+    impl SpawnEventSink for RejectSecondEventSink {
+        fn emit(&mut self, _event: SpawnEvent) -> Result<(), SpawnError> {
+            let calls = self.calls.get().saturating_add(1);
+            self.calls.set(calls);
+            if calls >= 2 {
+                Err(SpawnError::EventSink)
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1404,6 +1440,42 @@ mod tests {
         assert_eq!(err, SpawnError::EventSink);
         assert_eq!(model.steps.get(), 0);
         assert!(turn_events.is_empty());
+    }
+
+    #[test]
+    fn started_event_failure_still_cancels_the_scheduler_record() {
+        // Spawned succeeds (Queued -> the scheduler admits the record), but
+        // Started fails after scheduler.start()/agent transitions already
+        // moved it to Running — that Running record must still end up
+        // Cancelled, not stuck forever with no terminal state.
+        let views = ViewRegistry::new();
+        let scheduler = scheduler();
+        let mut model = CountingModel::new();
+        let mut tools = NoTools;
+        let mut lifecycle = RejectSecondEventSink {
+            calls: Cell::new(0),
+        };
+        let mut turn_events = Vec::new();
+        let child_id = AgentId::new();
+        let req = builder(AgentId::new(), WorkspaceAccess::ReadOnly)
+            .parent_access(WorkspaceAccess::ReadOnly)
+            .with_id(child_id)
+            .build()
+            .expect("request");
+        let mut env = SpawnEnv::new(
+            &scheduler,
+            &views,
+            &(),
+            &mut model,
+            &mut tools,
+            &mut lifecycle,
+            &mut turn_events,
+        );
+        let err = spawn_agent(req, &mut env, &CancellationToken::new()).expect_err("started emit");
+        assert_eq!(err, SpawnError::EventSink);
+        assert_eq!(model.steps.get(), 0, "turn must never execute");
+        let record = scheduler.get(child_id).expect("record still tracked");
+        assert_eq!(record.state(), ScheduleState::Cancelled);
     }
 
     #[test]
