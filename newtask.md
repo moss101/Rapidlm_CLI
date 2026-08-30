@@ -740,6 +740,38 @@ rejects a stale writer. Named explicitly to "prevent desktop/CLI/cloud dual-resu
   than one concurrent surface — otherwise two clients resuming the same session is a real corruption path,
   not a hypothetical one.
 - **Sev/Effort:** P1 / M.
+- **Audited 2026-08-30: the actual safety property `AGT-018` asks for already exists, durably and
+  cross-process, traced end to end rather than assumed from the type name alone.** Two layers exist, and
+  it matters which one is doing the real work. Layer one, `crates/kernel/src/turn/guard.rs`'s
+  `TurnSubmissionGuard`/`TurnLease` — `session_id`/`turn_id`/`expected_seq`/`generation` fields, a single
+  `occupied: Mutex<HashMap<SessionId, u64>>` admitting one lease per session, a `next_generation:
+  AtomicU64` — looks exactly like `SessionLease` by name and shape, but its own doc comment says
+  "in-process," and it genuinely is: `apps/rapid` opens a fresh `InProcessKernelClient` per CLI invocation
+  (`interactive.rs:2838`), so two separate `rapid` processes (desktop app, CLI terminal, cloud daemon) each
+  get their own empty `occupied` map and never see each other through this layer alone. Layer two is the
+  one that actually matters here: `submit_turn_sync` (`crates/kernel/src/client.rs:440`) appends
+  `EventKind::TurnStarted` via `EventLedger::append` with `AppendOptions { expected_seq: Some(req.
+  expected_seq), .. }`, and `append` (`crates/event-ledger/src/ledger.rs:190`) runs inside a SQLite
+  `TransactionBehavior::Immediate` transaction that re-reads the durable `last_seq` and returns
+  `LedgerError::SequenceConflict` on a mismatch *before* inserting the row — a real, durable,
+  cross-process compare-and-append, enforced by SQLite's own transactional file locking on the shared
+  ledger file every surface points at, not by anything in-memory. `SequenceConflict` maps to a typed
+  `ErrorCode::SessionConflict` (`client.rs:914`), not a generic/opaque failure, so a stale writer gets a
+  specific, actionable error. **This is functionally the fencing property `AGT-018` asks for** — a second,
+  stale writer's turn-start is durably rejected — just implemented as "the ledger's own `seq` is the
+  fencing token, checked transactionally" rather than a dedicated named lease-generation field visible at
+  the API layer. `TurnSubmissionGuard`'s in-process layer is a genuine but secondary optimization on top
+  (an immediate local `Conflict` without a wasted DB round-trip within one process), not the actual
+  safety boundary. `fork_session`/`rewind` don't need the same analysis: fork always targets a brand-new
+  session id (no contention with the source session), and `rewind_sync` is read-only replay (no ledger
+  write at all). **Re-scoping, not closing:** the core "prevent dual-resume corruption" property is real
+  and already shipped; what's still genuinely open is polish, not safety — e.g. whether a `SessionConflict`
+  surfaces to an end user as "another surface is actively using this session" (actionable) versus a bare
+  typed-but-generic conflict message, and whether `TurnSubmissionGuard`'s in-process generation counter is
+  worth exposing at all now that the real fencing lives one layer down. Neither was investigated further
+  this pass — genuinely minor compared to the safety property itself, which is what this item was actually
+  named for. Downgrading from P1/M ("build this") to P3/S ("polish the conflict message if it ever comes
+  up as a real UX complaint") given the hard safety guarantee already holds.
 
 ### 2.7 Context Pack Compiler / Workspace Capsule + Next-Edit-Ripple + retrieval-before-edit guardrail
 
