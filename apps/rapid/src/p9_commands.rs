@@ -1892,8 +1892,14 @@ mod insights_tests {
 }
 
 /// `rapid release-manifest <version> <artifact>...`: P13-012/013/014 — build a
-/// release manifest with content digests, an HMAC signature over the digest
-/// list, and rollback recovery fields; verification is fail-closed.
+/// release manifest with real content digests and rollback recovery fields.
+///
+/// Does **not** sign the manifest: an HMAC signature and a fail-closed
+/// `verify` path would need a real key-management decision first (a release
+/// signing key held by CI/maintainers is not something a local `rapid`
+/// binary can hold or check itself) — deliberately not implemented until
+/// that decision is made, tracked in `newtask.md`. Do not treat the
+/// `artifacts` list in the emitted JSON as tamper-evident.
 pub fn run_release_manifest(args: &[String]) -> Result<i32, P9CommandError> {
     if args.len() < 2 {
         return Err(P9CommandError::Usage);

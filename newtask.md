@@ -508,6 +508,28 @@ own `lib.rs` — the same "fully-built, unwired seam" shape documented repeatedl
 fixed before a real kernel-client consumer starts calling `view_artifact` to page through live remote logs.
 Full `tui` crate suite (212 tests, up from 211) and `cargo build --workspace --tests` pass.
 
+**Fresh review pass, 2026-08-30, `apps/rapid/src/p9_commands.rs::run_release_manifest` — a stale doc comment
+claiming a security feature that was never built, corrected rather than rushed.** The doc comment claimed:
+"build a release manifest with content digests, an HMAC signature over the digest list, and rollback recovery
+fields; verification is fail-closed." The implementation genuinely computes real content digests
+(`protocol::ArtifactId::from_bytes`) and emits rollback metadata, but never computes an HMAC, never emits a
+`signature` field, and there is no `verify` subcommand or verification path anywhere — confirmed via
+`grep -rn "signature\|hmac"` across the whole repo, which turns up nothing outside this one doc comment. A
+manifest's `artifacts` list (path/digest pairs) is not tamper-evident at all today: anyone can edit a digest
+or path in the emitted JSON with nothing to catch it. **Deliberately not implemented, not a quick fix:**
+signing needs a real key-management decision first — a release signing key held by CI/maintainers is
+structurally not something a local `rapid` binary distributed to end users can hold or check itself (unlike
+`capability-broker`'s existing `hmac_sha256`/`LeaseIssuer::from_key`, which signs with a key the *caller*
+already possesses at the point of use). Bolting on a plausible-looking HMAC using some locally-generated or
+binary-embedded key would be actively worse than the honest current state: it would create the appearance of
+tamper-evidence without a real answer to "who holds the verification key and how do they know it's the
+legitimate one" — the same category of judgment call as this session's other documented not-attempted items
+(`handoff`'s cross-process locking, the capability-broker audit trail's durable-store decision). **Fixed the
+part that was actually safe to fix:** the doc comment now accurately describes what's implemented (digests +
+rollback metadata) and explicitly states signing is unimplemented pending that key-management decision, so a
+future reader auditing release-integrity guarantees isn't misled into believing tamper-evidence exists. Full
+`rapid` crate suite unaffected (doc-only change) and `cargo build --workspace --tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
