@@ -451,6 +451,30 @@ tested, currently unwired" shape already documented repeatedly in this file (con
 worth having fixed before anything wires a real `repo.read` continuation loop into it. Full `context-engine`
 crate suite (310 tests, up from 308) and `cargo build --workspace --tests` pass.
 
+**Fresh review pass, 2026-08-30, `apps/rapid/src/p9_commands.rs::read_bounded_file` — a stat-then-read TOCTOU
+contradicting its own doc comment.** The doc comment reads: "Read a file whose size is checked before the
+read so an oversized input is rejected without buffering it." The implementation was a plain `fs::metadata`
+size check followed by a separate `fs::read` call — a file that grows between those two syscalls (a local
+edit, a symlink swap) can pass the size check and still be fully buffered by the subsequent unconditional
+`fs::read`, exactly contradicting "rejected without buffering it." Lower severity than the TOCTOU bugs fixed
+earlier this session (`resolve_in_root`, `RetentionService::collect`, etc.): every caller passes a local,
+CLI-operator-supplied path (plugin manifests, hook-spec documents, fixture events — not adversarial network
+input), so the race window is narrow and the caller is generally trusted. Fixed anyway since it's a one-line-
+shape change and directly contradicts a doc-commented guarantee. **Fixed:** replaced the stat-then-read pair
+with a single bounded read — `File::open` then `.take(max_bytes + 1).read_to_end(&mut buf)`, rejecting only
+after checking the buffer's actual length. This closes the TOCTOU gap (the size check and the read are no
+longer two separate syscalls with a window between them) and also more faithfully satisfies the doc comment's
+"without buffering it" intent: memory use is now capped at `max_bytes + 1` regardless of how large the file
+actually is, rather than trusting a stale stat result. **Deliberately did not attempt a race-reproduction
+test** — the same call made for this session's `vcs::provenance` atomicity fix: reliably growing a file in the
+single-digit-millisecond window between two syscalls is not a race a test can land deterministically without
+flakiness or a test-only pause hook. Added two boundary-behavior tests instead (`read_bounded_file_accepts_
+at_the_limit_and_rejects_one_byte_over`, `read_bounded_file_never_buffers_past_the_cap_even_for_a_much_larger_
+file`) — confirmed both also pass unchanged against the old stat-then-read code, precisely because they don't
+exercise the race; the fix's TOCTOU-closing property rests on the read now being a single bounded operation,
+verifiable by inspection rather than a race-dependent test. Full `rapid` crate suite (330 tests, up from 328)
+and `cargo build --workspace --tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

@@ -1277,16 +1277,26 @@ fn default_trust_catalog() -> PathBuf {
         .join(plugin_host::TRUST_CATALOG_FILE)
 }
 
-/// Read a file whose size is checked before the read so an oversized input
-/// is rejected without buffering it.
+/// Reads a file, rejecting it once its content exceeds `max_bytes`. Reads
+/// through a `max_bytes + 1` cap rather than trusting a preceding
+/// `fs::metadata` size check: a stat-then-read gap lets the file grow
+/// between the two calls (a local edit or a symlink swap mid-read), which
+/// would silently buffer an oversized file despite the check having passed.
+/// Capping the read itself means at most `max_bytes + 1` bytes are ever
+/// buffered, regardless of how large the file actually is.
 fn read_bounded_file(path: &str, max_bytes: usize) -> Result<Vec<u8>, P9CommandError> {
-    let meta = std::fs::metadata(path).map_err(P9CommandError::Io)?;
-    if meta.len() > max_bytes as u64 {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(P9CommandError::Io)?;
+    let mut buf = Vec::new();
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(P9CommandError::Io)?;
+    if buf.len() > max_bytes {
         return Err(P9CommandError::Agent(format!(
             "file exceeds the {max_bytes}-byte limit: {path}"
         )));
     }
-    std::fs::read(path).map_err(P9CommandError::Io)
+    Ok(buf)
 }
 
 /// Resolve the stored identity for a plugin id from the catalog. Absent
@@ -2065,5 +2075,36 @@ mod release_tests {
         drop(std::fs::remove_file(&manifest_path));
         drop(std::fs::remove_dir(&dir));
         assert!(code.is_err(), "ambient capability must fail validation");
+    }
+
+    #[test]
+    fn read_bounded_file_accepts_at_the_limit_and_rejects_one_byte_over() {
+        let path = std::env::temp_dir().join(format!(
+            "rapidlm-p13-bounded-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"12345").unwrap();
+        assert_eq!(read_bounded_file(path.to_str().unwrap(), 5).unwrap(), b"12345");
+
+        std::fs::write(&path, b"123456").unwrap();
+        let err = read_bounded_file(path.to_str().unwrap(), 5).unwrap_err();
+        assert!(matches!(err, P9CommandError::Agent(_)));
+
+        drop(std::fs::remove_file(&path));
+    }
+
+    #[test]
+    fn read_bounded_file_never_buffers_past_the_cap_even_for_a_much_larger_file() {
+        // A file far larger than max_bytes must still be rejected cheaply,
+        // not read in full before the size is checked (the TOCTOU this
+        // function's own doc comment exists to avoid).
+        let path = std::env::temp_dir().join(format!(
+            "rapidlm-p13-oversized-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, vec![b'x'; 1_000_000]).unwrap();
+        let err = read_bounded_file(path.to_str().unwrap(), 64).unwrap_err();
+        assert!(matches!(err, P9CommandError::Agent(_)));
+        drop(std::fs::remove_file(&path));
     }
 }
