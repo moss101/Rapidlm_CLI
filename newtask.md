@@ -655,6 +655,22 @@ their results become evidence, not just a console warning).
   binaries) and a full `cargo build --workspace --tests`, all green. **Still not covered:** the sandboxed
   and background `shell_exec` paths (same rationale as secrets' shadow-diagnostics gap — scoped narrow to
   keep the change reviewable), and `PatchFinding`/`ExternalFinding` remain entirely unattempted.
+- **Correction — `PatchFinding` wired in too, 2026-08-30, and it needed none of `CommandFinding`'s
+  ceremony.** Checked independently as flagged above: `security::PatchScanTarget::create` takes a
+  `protocol::RepoPath` directly, no `Resolver`/`normalize_exec` involved — the simplest of the three
+  dormant scanners to wire. New `exec_tools.rs::scan_patch_advisory(root, path, content)`: parses
+  `args.path` as a `RepoPath` (already relative/traversal-free from `checked_relative`), builds a
+  `PatchScanTarget::create(.., executable: false)` unconditionally (this write path has no chmod
+  capability, so a target it produces is never actually executable, and the content-scanning rules that
+  can fire here — credential paths/material, CI-release paths, sudoers, hook paths — don't distinguish
+  `Create` from `Replace`; only `Delete`/`Move` do, and this path never produces either), runs
+  `security::PatchScanner`, and filters through the same `FindingsStore` the other two scanners use.
+  Wired into `execute_write`'s plain path alongside (not instead of) the secrets scan — a single write can
+  now carry both advisory notes. Verified with a new test
+  (`workspace_write_flags_a_patch_policy_issue_but_never_blocks_the_write`, writing a `write-all` GitHub
+  Actions workflow to trigger `patch.ci_permissions_broaden`) plus the full `-p rapid` lib+integration
+  suite (293 lib tests) and `cargo build --workspace --tests`, all green. **Still unattempted:**
+  `ExternalFinding`, and the same shadow-diagnostics/`execute_patch` paths the secrets scanner also skips.
 
 ### 2.10 Scoped Credential Broker + Resource Governor
 

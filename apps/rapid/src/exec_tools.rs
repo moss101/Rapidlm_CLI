@@ -1126,6 +1126,10 @@ impl WorkspaceTools {
             summary.push('\n');
             summary.push_str(&note);
         }
+        if let Some(note) = scan_patch_advisory(self.root(), &args.path, args.content.as_bytes()) {
+            summary.push('\n');
+            summary.push_str(&note);
+        }
         Ok(ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
             summary,
@@ -2523,6 +2527,48 @@ fn scan_command_advisory(root: &Path, argv: &[String]) -> Option<String> {
     Some(format!(
         "advisory: possible dangerous command detected: {} — verify before running, or dismiss a \
          false positive with `rapid findings dismiss <fingerprint>`",
+        details.join(", ")
+    ))
+}
+
+/// Advisory-only staged-patch scan of newly-written content (Modbit
+/// `VER-007`'s `PatchFinding` scanner — permission broadening, credential
+/// handling, CI/release changes, executable hooks — real, mature, built,
+/// with zero call sites anywhere in `apps/rapid` before this). Unlike
+/// `CommandFinding`, `PatchScanTarget::create` needed no `Resolver`/
+/// `normalize_exec` ceremony — it takes a `protocol::RepoPath` directly,
+/// which `args.path` already satisfies (workspace-relative, no `..`,
+/// already validated by `checked_relative` before this runs). Always
+/// scanned as `Create` with `executable: false`: this write path has no
+/// chmod capability, so a target it produces is never actually executable,
+/// and the content-scanning rules (credentials, CI/release paths, sudoers)
+/// that can fire here don't distinguish `Create` from `Replace` — only
+/// `Delete`/`Move`, which this path never produces. Same dismiss/never-
+/// block shape as every other scanner in this file.
+fn scan_patch_advisory(root: &Path, path: &str, content: &[u8]) -> Option<String> {
+    let repo_path = protocol::RepoPath::parse(path).ok()?;
+    let target = security::PatchScanTarget::create(repo_path, content.to_vec(), false).ok()?;
+    let mut request = security::PatchScanRequest::new();
+    request.push_target(target).ok()?;
+    let scanner = security::PatchScanner::new();
+    let cancel = security::PatchScanCancellation::new();
+    let report = scanner.scan(&request, &cancel).ok()?;
+    let store = crate::findings_store::FindingsStore::load(root);
+    let findings: Vec<&security::PatchFinding> = report
+        .findings()
+        .iter()
+        .filter(|finding| !store.is_dismissed(finding.fingerprint().as_hex()))
+        .collect();
+    if findings.is_empty() {
+        return None;
+    }
+    let details: Vec<String> = findings
+        .iter()
+        .map(|finding| format!("{} ({})", finding.rule_id(), finding.fingerprint().as_hex()))
+        .collect();
+    Some(format!(
+        "advisory: possible patch-policy issue detected: {} — verify before committing, or \
+         dismiss a false positive with `rapid findings dismiss <fingerprint>`",
         details.join(", ")
     ))
 }
@@ -4104,6 +4150,53 @@ use std::sync::{Arc, Mutex};
                 assert!(!summary.contains("advisory"), "{summary}");
             }
             other => panic!("expected clean success after dismissal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_write_flags_a_patch_policy_issue_but_never_blocks_the_write() {
+        let root = TempRoot::new("write-patch-advisory");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let content = "name: release\npermissions: write-all\njobs: {}\n";
+        let call = ProposedToolCall::new(
+            "c1",
+            WORKSPACE_WRITE_TOOL,
+            &serde_json::to_string(&serde_json::json!({
+                "path": ".github/workflows/release.yml",
+                "content": content
+            }))
+            .expect("encode call"),
+        )
+        .expect("call");
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(
+                    summary.contains("advisory: possible patch-policy issue"),
+                    "{summary}"
+                );
+                assert!(summary.contains("patch.ci_permissions_broaden"), "{summary}");
+            }
+            other => panic!("expected success (advisory only), got {other:?}"),
+        }
+        // The write itself is never blocked or altered by the scan.
+        let written = fs::read(root.0.join(".github/workflows/release.yml")).expect("file exists");
+        assert_eq!(written, content.as_bytes());
+
+        // Ordinary content carries no advisory note at all.
+        let clean_call = ProposedToolCall::new(
+            "c2",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"plain.rs","content":"fn main() {}"}"#,
+        )
+        .expect("call");
+        let validated = tools.validate(&clean_call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(!summary.contains("advisory"), "{summary}");
+            }
+            other => panic!("expected clean success, got {other:?}"),
         }
     }
 
