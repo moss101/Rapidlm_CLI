@@ -632,6 +632,34 @@ corresponding new test (`accept_rejects_a_caller_that_is_not_the_bundles_expecte
 assertion, confirming each test genuinely catches its bug, before both fixes were restored. Full `handoff`
 crate suite (10 tests, up from 8) and `cargo build --workspace --tests` pass.
 
+**Fresh review pass, 2026-08-30, `apps/rapid/src/context_retrieval.rs::retrieve_inner` leaked its timeout-
+watcher thread on every error path.** `TimeoutWatcher`'s own doc comment: "Fires `cancel.cancel()` after
+`timeout` unless `stop()` is called first." `retrieve_inner` spawned the watcher at its own top, then had
+four `?`-early-return points (`build_manifest`, `IndexPipeline::open`, `InformationNeed::new`, `scout`)
+before its only `watcher.stop()` call, which sat right before the final `Ok(blocks)` — any of those four
+failing skipped `stop()` entirely, leaving the spawned thread sleeping in 20ms increments for up to the full
+`RETRIEVAL_TIMEOUT` (8 seconds) before firing `cancel.cancel()` into an already-abandoned token. Reachable via
+the module's own existing test scenario: `retrieve(root, ...)` on a nonexistent root trips `build_manifest`'s
+`?` immediately, so every failed retrieval (broken workspace root, index-open failure, malformed need, scout
+failure) leaked a live thread for up to 8 seconds — in a tight loop of repeated `rapid exec` turns against a
+workspace whose indexing keeps failing, these could pile up concurrently before self-terminating. The sibling
+function one block below in the same file, `ripple_advisory`, already gets this right: it spawns the watcher
+in the outer function, calls the fallible `_inner` version, then calls `watcher.stop()` unconditionally
+*before* branching on the result — `retrieve_inner` just never followed its own neighbor's pattern. **Fixed:**
+restructured `retrieve()`/`retrieve_inner` to match `ripple_advisory`'s exact shape — spawn the watcher and
+call `retrieve_inner` (now taking `cancel: &CancellationToken` as a parameter instead of owning it) from the
+outer `retrieve()`, call `watcher.stop()` unconditionally on the very next line before matching on the
+`Result`, so there is no longer any early-return point between spawning the watcher and stopping it. New test
+`timeout_watcher_is_stopped_even_when_retrieve_inner_errors_early` directly exercises the watcher/stop
+mechanism (spawn with a short test timeout, call `retrieve_inner` against a nonexistent root, call `stop()`,
+then sleep past the timeout and confirm `cancel` was never tripped) — it can't observe `retrieve()`'s own
+internal thread lifecycle from outside the deliberately black-box public API (`Vec`/`Option` return, no
+thread handle exposed), so `retrieve()`'s own "no early-return between spawn and stop" guarantee is verified
+by inspection instead, the same discipline used for a few other hard-to-black-box-test fixes this session —
+the diff shows a straight-line `let result = retrieve_inner(...); watcher.stop(); match result { ... }` with
+no `?` in between, mirroring `ripple_advisory`'s already-trusted structure exactly. Full `rapid` crate suite
+(331 tests, up from 330) and `cargo build --workspace --tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
