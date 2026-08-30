@@ -373,7 +373,14 @@ fn validate_mount(mount: &SandboxMount) -> Result<(), SandboxError> {
     }
 }
 
-fn resolve_cwd(cwd: &RepoPath, mounts: &[SandboxMount]) -> Result<CanonicalHostPath, SandboxError> {
+/// Shared with `seatbelt.rs`: the mount/cwd resolution algorithm (best-
+/// matching-prefix mount, forbidden-source checks on both the raw and
+/// canonicalized path) is security-relevant and already tested here —
+/// reused verbatim rather than risk a second, subtly different copy.
+pub(crate) fn resolve_cwd(
+    cwd: &RepoPath,
+    mounts: &[SandboxMount],
+) -> Result<CanonicalHostPath, SandboxError> {
     let mut best: Option<(&SandboxMount, usize)> = None;
     for mount in mounts {
         if !matches!(mount.mode(), MountMode::ReadOnly | MountMode::ReadWrite) {
@@ -438,7 +445,7 @@ fn join_host(
     CanonicalHostPath::from_resolved(&joined).map_err(|_| SandboxError::ForbiddenMount)
 }
 
-fn resolve_existing_dir(path: &Path) -> Result<CanonicalHostPath, SandboxError> {
+pub(crate) fn resolve_existing_dir(path: &Path) -> Result<CanonicalHostPath, SandboxError> {
     let canon = fs::canonicalize(path).map_err(|_| SandboxError::ForbiddenMount)?;
     let meta = fs::metadata(&canon).map_err(|_| SandboxError::ForbiddenMount)?;
     if !meta.is_dir() {
@@ -482,7 +489,7 @@ fn path_is_within(parent: &str, child: &str) -> bool {
         || child.starts_with(parent) && child.as_bytes().get(parent.len()) == Some(&b'/')
 }
 
-fn is_forbidden_host_source(path: &str) -> bool {
+pub(crate) fn is_forbidden_host_source(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let trimmed = lower.trim_end_matches('/');
     if trimmed.is_empty() || trimmed == "/" {

@@ -27,3 +27,4 @@ pub use backends::remote::{
     WorkLeaseIssuer, WorkerAttestation, WorkerAttestationClass, WorkerId, WorkerPlatform,
     WorkerProfile,
 };
+pub use backends::seatbelt::{MAX_LIVE_SEATBELT_SANDBOXES, SeatbeltBackend};
