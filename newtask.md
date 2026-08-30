@@ -294,6 +294,23 @@ but cannot interrupt for new ones — escalate via the foreground parent).
   that a call attempted anyway under `BypassPermissions` (chosen specifically so no *other* gate would
   have denied it first) is refused with an `AGT-010`-labeled reason. Full `-p rapid` suite (304 lib tests)
   and `cargo build --workspace --tests` pass.
+- **A third instance of the same "child starts fresh instead of inheriting" shape, found while checking
+  what else a subagent's tools default to that the parent's don't: project hooks.** `WorkspaceTools::
+  open_with_permissions` defaults `hooks: HooksConfig::default()` (empty), and — same as the disk/network
+  budgets — nothing in `LiveSubagentRunner::run` ever called `set_hooks` on the child. A configured
+  `pre_tool_use` hook (a real policy-enforcement surface: a security scanner, an approval webhook, a
+  linter gate) protects the parent's own tool calls but was silently bypassable by asking a subagent to
+  make the same call instead — delegation as a policy-evasion vector, not merely a resource-accounting
+  gap like the previous two instances. **Fixed:** new `WorkspaceTools::hooks_config()` (clones the
+  configured `HooksConfig`, mirroring `turn_budget_handles()`'s shape) read from the parent right where
+  `LiveSubagentRunner` is constructed, stored on it, and applied via the *already-existing* `set_hooks`
+  on every child `LiveSubagentRunner::run` builds — no new setter needed, unlike the budget fix. New test
+  `subagent_children_inherit_the_parents_policy_hooks`: a `pre_tool_use` hook that denies every call,
+  confirmed to *not* gate an unshared child's own tools (the vulnerability was real) and confirmed to gate
+  a child with the parent's hooks propagated (fixed). Full `-p rapid` suite (306 lib tests) and
+  `cargo build --workspace --tests` pass. `session_start`/`session_end` hooks are deliberately not
+  propagated — those fire once per `rapid exec` process, not per tool call, so a subagent (which runs
+  inside the same process, not a new one) firing them again would be a duplicate, not a fix.
 - **Correction + partial fix (2026-08-30):** `AgentResultEnvelope`'s exact field list already exists —
   `crates/agent-runtime/src/agent/model.rs`'s `AgentResult` carries `summary, evidence, workspace_view,
   patch_summary, artifacts, claims, open_questions, blockers, context_lineage` (all with accessors) —

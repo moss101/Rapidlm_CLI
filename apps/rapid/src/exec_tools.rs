@@ -743,6 +743,15 @@ impl WorkspaceTools {
         self.hooks = hooks;
     }
 
+    /// Clone the configured project hooks: hooks are a policy-enforcement
+    /// surface (a `pre_tool_use` hook that gates a dangerous call on the
+    /// parent must not be bypassable by asking a subagent to do it
+    /// instead), so a subagent child should inherit them via `set_hooks`
+    /// rather than start from `HooksConfig::default()`.
+    pub(crate) fn hooks_config(&self) -> crate::hooks::HooksConfig {
+        self.hooks.clone()
+    }
+
     /// Attach the interactive answer source for ask_user. The closure
     /// receives the rendered prompt and the options; it returns the chosen
     /// option (composition root reads stdin and enforces the timeout).
@@ -3655,6 +3664,16 @@ impl ExecTools {
         }
     }
 
+    /// Clone the configured project hooks (`HooksConfig::default()` on the
+    /// no-op surface, which never runs any tool call a hook could gate
+    /// anyway). See `WorkspaceTools::hooks_config`.
+    pub(crate) fn hooks_config(&self) -> crate::hooks::HooksConfig {
+        match self {
+            Self::Workspace(tools) => tools.hooks_config(),
+            Self::Noop(_) => crate::hooks::HooksConfig::default(),
+        }
+    }
+
     /// Attach the shadow-diagnostics command (no-op on the no-op surface).
     pub fn set_shadow_diagnostics(
         &mut self,
@@ -4379,6 +4398,54 @@ use std::sync::{Arc, Mutex};
             other => panic!("expected a budget refusal, got {other:?}"),
         }
         // The refused write must never have touched disk.
+        assert!(!root.0.join("b.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subagent_children_inherit_the_parents_policy_hooks() {
+        let root = TempRoot::new("hook-inherit");
+        let mut parent = permissive_workspace(&root.0);
+        parent.set_hooks(crate::hooks::HooksConfig {
+            pre_tool_use: vec!["exit 1".to_owned()],
+            ..Default::default()
+        });
+
+        let cancel = CancellationToken::new();
+        let call = ProposedToolCall::new(
+            "c1",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"a.txt","content":"hi"}"#,
+        )
+        .expect("call");
+
+        // Sanity check: a fresh child with no hooks of its own is not
+        // gated — confirming the vulnerability this closes was real, not
+        // already impossible.
+        let mut unshared_child = permissive_workspace(&root.0);
+        let validated = unshared_child.validate(&call, &cancel).expect("v");
+        match unshared_child.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { .. } => {}
+            other => panic!("sanity check: an unhooked child should succeed, got {other:?}"),
+        }
+
+        // With the parent's hooks propagated (what LiveSubagentRunner::run
+        // now does via `hooks_config()`/`set_hooks()`), the same call the
+        // parent's own pre_tool_use hook would deny is denied for the
+        // child too — delegation is no longer a way around it.
+        let mut child = permissive_workspace(&root.0);
+        child.set_hooks(parent.hooks_config());
+        let call2 = ProposedToolCall::new(
+            "c2",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"b.txt","content":"hi"}"#,
+        )
+        .expect("call");
+        let validated = child.validate(&call2, &cancel).expect("v");
+        match child.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Denied { .. } => {}
+            other => panic!("expected the inherited hook to deny the child's call, got {other:?}"),
+        }
         assert!(!root.0.join("b.txt").exists());
     }
 

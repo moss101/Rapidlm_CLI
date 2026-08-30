@@ -1237,6 +1237,11 @@ struct LiveSubagentRunner {
     /// share_turn_budgets`'s own doc comment for why a fresh-per-child
     /// counter under-enforces a "per-turn" ceiling.
     turn_budgets: (std::sync::Arc<std::sync::atomic::AtomicU64>, std::sync::Arc<std::sync::atomic::AtomicU64>),
+    /// The parent's configured project hooks, cloned into every child so a
+    /// `pre_tool_use`/`post_tool_use` policy hook that gates the parent's
+    /// own tool calls also gates its subagents' — without this, delegating
+    /// a call to a subagent silently bypassed every hook.
+    hooks: crate::hooks::HooksConfig,
 }
 
 impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
@@ -1278,6 +1283,10 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // doc comment.
         let (bytes_written, fetch_bytes) = self.turn_budgets.clone();
         tools.share_turn_budgets(bytes_written, fetch_bytes);
+        // Policy hooks (pre_tool_use/post_tool_use/subagent_start/
+        // subagent_stop) must apply to a subagent's own tool calls too, or
+        // delegation becomes a way to route around them entirely.
+        tools.set_hooks(self.hooks.clone());
         // Subagents run in the same trusted project as the parent (only
         // spawned when the workspace is trusted), so they get the same
         // AGENTS.md rules and system prompt as the top-level turn instead of
@@ -1786,11 +1795,13 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         (child_model_config.as_ref(), workspace.as_ref())
     {
         if let Some(turn_budgets) = tools.turn_budget_handles() {
+            let hooks = tools.hooks_config();
             tools.set_subagent_runner(std::sync::Arc::new(LiveSubagentRunner {
                 active: active.clone(),
                 root: root.clone(),
                 permissions: permission_lattice.clone(),
                 turn_budgets,
+                hooks,
             }));
         }
     }
