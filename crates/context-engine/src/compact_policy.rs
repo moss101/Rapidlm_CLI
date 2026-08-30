@@ -17,7 +17,7 @@
 use std::fmt;
 
 use crate::compact::{compact_packet, CompactError, CompactMethod, CompactedContext, PacketSummarizer};
-use crate::compile::explain_packet;
+use crate::compile::{ContextPacket, ContextSource, explain_packet};
 use crate::repo_manifest::CancellationToken;
 
 /// Fail closed when the compacted replacement still reaches this bound.
@@ -223,7 +223,7 @@ pub fn compact_with_policy(
             CompactError::Cancelled => CompactPolicyError::Cancelled,
             CompactError::InvalidPacket => CompactPolicyError::InvalidPacket,
         })?;
-    let after = estimate_compacted_tokens(&compacted);
+    let after = estimate_compacted_tokens(packet, &compacted);
     if after >= policy.hard_tokens() {
         return Err(CompactPolicyError::StillOverHard {
             estimate: after,
@@ -251,18 +251,25 @@ fn estimate_packet_tokens(packet: &crate::compile::ContextPacket) -> u32 {
     explain_packet(packet).included_tokens()
 }
 
-/// Replacement-side estimate: `bytes / 4` over the summary plus retained
-/// locators. Deliberately conservative and deterministic.
-fn estimate_compacted_tokens(compacted: &CompactedContext) -> u32 {
-    let estimate = |text: &str| (text.len() as u32).div_ceil(4);
-    estimate(compacted.summary())
-        .saturating_add(
-            compacted
-                .retained_locators()
-                .iter()
-                .map(|locator| estimate(locator))
-                .fold(0u32, u32::saturating_add),
-        )
+/// Replacement-side estimate: the *real* mandatory/system block tokens from
+/// the original packet — `compact_packet` never touches these, it only ever
+/// replaces the non-mandatory blocks with `compacted.summary()` — plus
+/// `bytes / 4` over the summary text. Deliberately conservative and
+/// deterministic, and critically measures what actually survives into the
+/// rebuilt packet: `compacted.retained_locators()` holds short locator
+/// *labels* (`"system/prompt"`, a handful of bytes each), not the mandatory
+/// content they name, so summing those instead of the real blocks' own
+/// `estimated_tokens()` made this check pass almost regardless of the real
+/// post-compaction size — see `newtask.md`'s note on this fix.
+fn estimate_compacted_tokens(packet: &ContextPacket, compacted: &CompactedContext) -> u32 {
+    let mandatory_tokens: u32 = packet
+        .blocks()
+        .iter()
+        .filter(|block| block.is_mandatory() || block.source() == ContextSource::System)
+        .map(|block| block.estimated_tokens())
+        .fold(0u32, u32::saturating_add);
+    let summary_tokens = (compacted.summary().len() as u32).div_ceil(4);
+    mandatory_tokens.saturating_add(summary_tokens)
 }
 
 #[cfg(test)]
@@ -403,6 +410,40 @@ mod tests {
         }
         assert_eq!(err.as_str(), "still_over_hard");
         assert!(err.to_string().contains("hard threshold"));
+    }
+
+    #[test]
+    fn hard_check_measures_real_mandatory_content_not_locator_labels() {
+        // `retained_locators()` holds short locator *labels* (e.g. the
+        // 4-byte string "task"), not the mandatory content they name — this
+        // packet's mandatory block alone is 45 real tokens, but its locator
+        // label estimates to ~1 token. A hard threshold of 50 means
+        // compaction (which only ever replaces the *optional* "noise" block
+        // with a summary, never the mandatory one) can never bring the real
+        // post-compaction size under 50: mandatory content alone is already
+        // most of the way there. The old locator-label-based estimate would
+        // have summed to only a handful of tokens (nowhere near 50) and
+        // wrongly reported `verified: true`.
+        let policy = CompactionPolicy::new(1, 50, CompactionStrategy::DeterministicOnly).expect("policy");
+        let packet = compile(
+            &CompileContext::new(100, 20)
+                .safety_margin(0)
+                .user(block("task", 45))
+                .retrieved(block("noise", 30).score(1)),
+        )
+        .expect("compile");
+        let err = compact_with_policy(&packet, &policy, None, &CancellationToken::new())
+            .expect_err("mandatory content alone is too close to the hard cap");
+        match err {
+            CompactPolicyError::StillOverHard { estimate, hard } => {
+                assert_eq!(hard, 50);
+                assert!(
+                    estimate >= 45,
+                    "estimate must reflect the real 45-token mandatory block, got {estimate}"
+                );
+            }
+            other => panic!("expected StillOverHard, got {other:?}"),
+        }
     }
 
     #[test]

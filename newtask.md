@@ -219,6 +219,32 @@ cancellation_state`: builds a real two-file rewind plan via `plan_rewind`, manua
 fixed function and confirming the same test fails exactly as predicted, before restoring the real fix. Full
 `workspace` crate suite (171 tests, up from 170) and `cargo build --workspace --tests` pass.
 
+**Fresh review pass, 2026-08-30, `crates/context-engine::compact_policy` — the crate's own fail-closed
+hard-limit safety check was measuring the wrong thing, on the actively-used compaction path.**
+`compact_with_policy`'s stated contract (its own doc comment) is: after compaction, verify the result via
+`estimate_compacted_tokens` and return `StillOverHard` rather than silently hand back a context that still
+blows the hard cap. But `estimate_compacted_tokens(compacted: &CompactedContext)` summed the byte-length of
+`compacted.retained_locators()` — short block-ID strings like `"task"` (a handful of bytes each, `compact.rs`
+confirms `retained_locators` is `block.locator().to_string()`, never content) — instead of the actual
+mandatory/system block content that survives compaction untouched. `apps/rapid/src/host.rs::
+LiveRecoveryController::recover_from_overflow`, the one real call site, rebuilds the final packet via
+`build_packet(preserved, summary)` from the *original* mandatory content regardless of what
+`CompactedContext` reported, so the safety check was verifying a handful of locator-label bytes while the
+context actually handed back to the model could still be arbitrarily over the hard cap — the exact scenario
+the check exists to catch. **Fixed:** `estimate_compacted_tokens` now takes `(packet: &ContextPacket,
+compacted: &CompactedContext)` and sums real `estimated_tokens()` over every block that is `is_mandatory()`
+or `source() == ContextSource::System` in the original packet, plus the summary's own byte-length estimate
+— i.e., it measures what `recover_from_overflow` will actually rebuild, not a proxy for it. **Why the
+existing `replacement_over_hard_fails_closed` test never caught this:** it used a degenerate `hard=2`-token
+threshold, which the check exceeds trivially regardless of which quantity is being summed — it could never
+have distinguished a correct estimate from a broken one. New test
+`hard_check_measures_real_mandatory_content_not_locator_labels` uses a realistic `hard=50` threshold with a
+45-token mandatory block and a 30-token optional block, and was verified to actually catch the old bug: with
+the fix temporarily reverted to the old locator-summing logic, the test failed with `after_estimate_tokens:
+21` against `before_tokens: 45` (the check passing when it should fail-closed), exactly as predicted; restoring
+the fix makes it pass. Full `context-engine` crate suite (308 tests, up from 307) and `cargo build
+--workspace --tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
