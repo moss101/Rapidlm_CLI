@@ -844,6 +844,54 @@ impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
     }
 }
 
+/// One routing decision made mid-turn by a [`FallbackChainModel`] (Modbit
+/// `MOD-005`: "routing must be auditable" — a real, typed, queryable record
+/// rather than only an ephemeral `--verbose` diagnostic line). The common
+/// case — a turn that never needed to retry or fall back — produces zero
+/// records, not a record saying so; absence *is* the "used the requested
+/// model with no incident" signal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouterDecisionRecord {
+    pub requested_model: String,
+    pub resolved_model: String,
+    pub reason: RouterDecisionReason,
+}
+
+/// Why a step's resolved model differs from (or repeats) the one requested.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RouterDecisionReason {
+    /// Same model, retried after a transient failure.
+    RetrySame,
+    /// Switched to a different model in the configured chain.
+    FallbackTo,
+    /// The chain gave up; `resolved_model` is unset (`stop_reason` names why).
+    Stop(String),
+}
+
+/// Shared, append-only log of routing decisions for one turn. `Arc<Mutex<_>>`
+/// mirrors `CostAccumulator`'s shape: a handle is cloned out to the caller
+/// before the model is moved into `SelectedModel`/`run_live_exec`, then read
+/// back after the turn resolves.
+#[derive(Clone, Default)]
+pub struct RouterDecisionLog(std::sync::Arc<std::sync::Mutex<Vec<RouterDecisionRecord>>>);
+
+impl RouterDecisionLog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn push(&self, record: RouterDecisionRecord) {
+        if let Ok(mut log) = self.0.lock() {
+            log.push(record);
+        }
+    }
+
+    /// Every decision recorded so far, in order.
+    pub fn snapshot(&self) -> Vec<RouterDecisionRecord> {
+        self.0.lock().map(|log| log.clone()).unwrap_or_default()
+    }
+}
+
 /// A model backing bound to a user-configured ordered fallback chain
 /// (`[models] fallback = [...]`). Fully self-contained — it does its own
 /// retry-with-backoff and cross-model fallback internally and always
@@ -861,6 +909,7 @@ pub struct FallbackChainModel<B> {
     backends: Vec<(ModelRef, B)>,
     controller: FallbackController,
     diag: Option<StepDiag>,
+    decisions: RouterDecisionLog,
 }
 
 impl<B: LiveModelCall> FallbackChainModel<B> {
@@ -869,7 +918,14 @@ impl<B: LiveModelCall> FallbackChainModel<B> {
     /// builds both from the same resolved `[models] fallback` list, so this
     /// invariant holds by construction.
     pub fn new(backends: Vec<(ModelRef, B)>, controller: FallbackController, diag: Option<StepDiag>) -> Self {
-        Self { backends, controller, diag }
+        Self { backends, controller, diag, decisions: RouterDecisionLog::new() }
+    }
+
+    /// Shared handle to this chain's routing-decision log, readable after
+    /// the turn ends regardless of how many times this model is subsequently
+    /// borrowed — clone it out before moving `self` into `SelectedModel`.
+    pub fn decisions(&self) -> RouterDecisionLog {
+        self.decisions.clone()
     }
 
     fn backend_mut(&mut self, target: &ModelRef) -> &mut B {
@@ -929,6 +985,11 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                         "fallback model={} outcome=retry backoff_ms={backoff_ms}",
                         model_label(&current)
                     ));
+                    self.decisions.push(RouterDecisionRecord {
+                        requested_model: model_label(&current),
+                        resolved_model: model_label(&current),
+                        reason: RouterDecisionReason::RetrySame,
+                    });
                     if !sleep_millis_cancellable(cancel, *backoff_ms) {
                         return Err(ModelStepError::Cancelled);
                     }
@@ -939,6 +1000,11 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                         model_label(&current),
                         model_label(to)
                     ));
+                    self.decisions.push(RouterDecisionRecord {
+                        requested_model: model_label(&current),
+                        resolved_model: model_label(to),
+                        reason: RouterDecisionReason::FallbackTo,
+                    });
                     if !sleep_millis_cancellable(cancel, *backoff_ms) {
                         return Err(ModelStepError::Cancelled);
                     }
@@ -949,6 +1015,11 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                         model_label(&current),
                         reason.as_str()
                     ));
+                    self.decisions.push(RouterDecisionRecord {
+                        requested_model: model_label(&current),
+                        resolved_model: String::new(),
+                        reason: RouterDecisionReason::Stop(reason.as_str().to_owned()),
+                    });
                     return Err(err);
                 }
                 FallbackPlan::PartiallyStreamed { reason, .. } | FallbackPlan::ToolSideEffect { reason, .. } => {
@@ -957,6 +1028,11 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                         model_label(&current),
                         reason.as_str()
                     ));
+                    self.decisions.push(RouterDecisionRecord {
+                        requested_model: model_label(&current),
+                        resolved_model: String::new(),
+                        reason: RouterDecisionReason::Stop(reason.as_str().to_owned()),
+                    });
                     return Err(err);
                 }
             }
@@ -1416,6 +1492,14 @@ mod tests {
             }
             other => panic!("expected terminal, got {other:?}"),
         }
+        // RouterDecisionRecord (Modbit MOD-005): every retry/fallback is
+        // captured, not just diagnosed to stderr.
+        let decisions = chain.decisions().snapshot();
+        assert_eq!(decisions.len(), 3, "{decisions:?}");
+        assert!(matches!(decisions[0].reason, RouterDecisionReason::RetrySame));
+        assert!(matches!(decisions[1].reason, RouterDecisionReason::RetrySame));
+        assert!(matches!(decisions[2].reason, RouterDecisionReason::FallbackTo));
+        assert!(decisions[2].resolved_model.contains("ling-3"), "{decisions:?}");
     }
 
     #[test]

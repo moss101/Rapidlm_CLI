@@ -192,6 +192,31 @@ impl JsonlRecord {
         })
     }
 
+    /// One mid-turn routing decision (Modbit `MOD-005`: "routing must be
+    /// auditable"). `reason` is a short machine-stable tag
+    /// (`"retry_same"`/`"fallback_to"`/`"stop"`), not free text.
+    pub fn router_decision(
+        session_id: SessionId,
+        seq: u64,
+        time: impl Into<String>,
+        requested_model: &str,
+        resolved_model: &str,
+        reason: &str,
+    ) -> Result<Self, JsonlError> {
+        Ok(Self {
+            schema: JSONL_SCHEMA,
+            record_type: "router.decision".to_owned(),
+            session_id: Some(session_id),
+            seq,
+            time: time.into(),
+            data: raw_json(&serde_json::json!({
+                "requested_model": requested_model,
+                "resolved_model": resolved_model,
+                "reason": reason,
+            }))?,
+        })
+    }
+
     /// Process-end `session.finished` with the mapped exit code.
     pub fn session_finished(
         session_id: SessionId,
@@ -569,6 +594,25 @@ mod tests {
         let parsed: event_ledger::event::RecordedAt =
             stamp.parse().expect("must round-trip through the ledger's own RFC3339 parser");
         assert_eq!(parsed.as_str(), stamp);
+    }
+
+    #[test]
+    fn router_decision_carries_requested_resolved_and_reason() {
+        let record = JsonlRecord::router_decision(
+            session_id(),
+            1,
+            TIME,
+            "openai/gpt-5",
+            "anthropic/claude",
+            "fallback_to",
+        )
+        .expect("router decision");
+        assert_eq!(
+            encode(&record),
+            format!(
+                r#"{{"schema":1,"type":"router.decision","session_id":"{SESSION_ID}","seq":1,"time":"{TIME}","data":{{"reason":"fallback_to","requested_model":"openai/gpt-5","resolved_model":"anthropic/claude"}}}}"#
+            )
+        );
     }
 
     fn session_id() -> SessionId {

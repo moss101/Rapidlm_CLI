@@ -38,7 +38,8 @@ use crate::goal_host::{EVIDENCE_FILE, GOAL_FILE, SESSIONS_DB_FILE, GoalHost};
 use crate::headless::jsonl::JsonlExitCode;
 use crate::exec_tools::ExecTools;
 use crate::host::{
-    ExecOutcome, FallbackChainModel, PreservedLiveContext, StepDiag, UnconfiguredModel, run_live_exec,
+    ExecOutcome, FallbackChainModel, PreservedLiveContext, RouterDecisionReason, StepDiag,
+    UnconfiguredModel, run_live_exec,
 };
 use crate::model::{ConfiguredModel, SelectedModel};
 use crate::user_config::ModelSelection;
@@ -1629,6 +1630,11 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         .iter()
         .map(|_| auth::InMemoryCredentialStore::new())
         .collect();
+    // Routing-decision log (Modbit `MOD-005`: "routing must be auditable").
+    // Only the fallback-chain branch below can ever produce a decision; every
+    // other branch keeps an empty log — absence *is* the "no incident"
+    // signal, not a missing feature.
+    let mut router_decisions = crate::host::RouterDecisionLog::new();
     let backing = if unconfigured {
         SelectedModel::Unconfigured(UnconfiguredModel)
     } else if models.len() == 1 {
@@ -1693,9 +1699,9 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             ) {
                 Ok(controller) => {
                     let diag = parsed.verbose.then(|| StepDiag::stderr(&base_url));
-                    SelectedModel::FallbackChain(Box::new(FallbackChainModel::new(
-                        backends, controller, diag,
-                    )))
+                    let chain = FallbackChainModel::new(backends, controller, diag);
+                    router_decisions = chain.decisions();
+                    SelectedModel::FallbackChain(Box::new(chain))
                 }
                 Err(err) => {
                     eprintln!("warning: fallback chain configuration failed ({err}); using the primary model only");
@@ -1783,6 +1789,36 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         .map(|record| io.records().write(&record));
         io
     });
+    // Routing decisions (Modbit `MOD-005`): always on stderr — a fallback
+    // switching the model mid-turn is operationally significant enough to
+    // surface unconditionally, not gated behind `--verbose` — and, in
+    // `--jsonl` mode, one `router.decision` record per entry, ahead of the
+    // outcome records below so `seq` stays monotonic across the whole run.
+    let mut next_jsonl_seq = 1u64;
+    for decision in router_decisions.snapshot() {
+        let (reason_tag, resolved) = match &decision.reason {
+            RouterDecisionReason::RetrySame => ("retry_same", decision.resolved_model.as_str()),
+            RouterDecisionReason::FallbackTo => ("fallback_to", decision.resolved_model.as_str()),
+            RouterDecisionReason::Stop(why) => (why.as_str(), ""),
+        };
+        eprintln!(
+            "router: requested={} resolved={} reason={reason_tag}",
+            decision.requested_model, decision.resolved_model
+        );
+        if let Some(io) = jsonl_io.as_mut() {
+            if let Ok(record) = crate::headless::jsonl::JsonlRecord::router_decision(
+                session_id,
+                next_jsonl_seq,
+                crate::headless::jsonl::now_rfc3339(),
+                &decision.requested_model,
+                resolved,
+                reason_tag,
+            ) {
+                let _ = io.records().write(&record);
+                next_jsonl_seq += 1;
+            }
+        }
+    }
     // `text` is the same content the plain-text path would have printed;
     // `code` is the typed exit code either path returns.
     let (text, code): (Option<String>, JsonlExitCode) = match run_result {
@@ -1847,15 +1883,16 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         if let Some(text) = &text {
             let _ = crate::headless::jsonl::JsonlRecord::assistant_message(
                 session_id,
-                1,
+                next_jsonl_seq,
                 crate::headless::jsonl::now_rfc3339(),
                 text,
             )
             .map(|record| io.records().write(&record));
+            next_jsonl_seq += 1;
         }
         let _ = crate::headless::jsonl::JsonlRecord::session_finished(
             session_id,
-            2,
+            next_jsonl_seq,
             crate::headless::jsonl::now_rfc3339(),
             code,
         )

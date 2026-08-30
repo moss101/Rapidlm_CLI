@@ -45,6 +45,17 @@ repeatedly during this pass:
   over rule/path/range/match) for one `Finding` type already exists — substantially what Phase 2 §2.9
   (persisted, content-hash-keyed findings) asks for, at least for secrets scanning specifically.
 
+**A second, opposite pattern also showed up, and matters just as much for anything touching the
+interactive TUI specifically:** `run_interactive`'s `SessionLoop` (`apps/rapid/src/interactive.rs`) only
+ever drives `InProcessKernelClient`'s session/turn *ledger bookkeeping* — `submit_turn_sync`
+(`crates/kernel/src/client.rs:420`) validates a lease and appends a `TurnStarted` event, nothing more.
+There is no live agent-turn/tool-dispatch loop in that path at all: `crates/kernel` has zero references
+to `ToolDriver`/`PermissionLattice`/`ExecTools`/`AgentExecutor` and doesn't even depend on `agent-runtime`.
+Confirmed while scoping §2.3's CAP-005 half, and it explains the `/compact` no-op §1.4/#13 already found
+independently (`KernelApi::Dispatch => {}`) — both are the same root cause, not two unrelated bugs. Any
+future TUI-touching item in this document should assume "the live chat session doesn't actually run
+turns yet" as a starting fact, not verify it fresh each time.
+
 **Practical consequence for whoever picks up a Phase 2 item below: spend 15 minutes grepping for the
 primitive before writing new code.** The likely real task is "wire crate X into `apps/rapid`," not
 "build X" — a smaller, safer, and differently-shaped piece of work than the item's original prose
@@ -305,6 +316,30 @@ default; adopt the classifier-as-safety-net idea, not the classifier-as-default 
   the missing piece — a frozen, auditable snapshot per turn, and an explicit merge order so a project's
   `.rapidlm/settings.json` can never widen what a user or admin policy already restricted.
 - **Sev/Effort:** P1 / M.
+- **CAP-005 half resolved by verification, 2026-08-30 — and it surfaced a much bigger finding.** Traced
+  the TUI's lattice-construction call site this pass names as unconfirmed: `run_interactive` →
+  `run_started_session` builds one `ServiceGraph` service, `KernelRuntime`, and its `SessionLoop` only
+  ever calls `CreateSession`/`SubmitTurn`/`Interrupt`/`ForkSession`/`RewindSession`/`SubscribeEvents`
+  against `InProcessKernelClient`. `submit_turn_sync` (`crates/kernel/src/client.rs:420`) does nothing
+  but validate a turn-lease, append a `TurnStarted` ledger event, and store the lease — no LLM call, no
+  tool call, no `ExecTools`/`AgentExecutor`/`PermissionLattice` anywhere in it, and `crates/kernel` has
+  zero references to any of those types at all (confirmed by grep), doesn't even depend on `agent-runtime`
+  in its `Cargo.toml`. **The interactive TUI has no live agent-turn/tool-dispatch loop yet at all** — typing
+  a prompt into the live chat records `TurnStarted` and returns; nothing in-process invokes a model or
+  runs a tool for that turn. This is the same shape as the `/compact` no-op found in §1.4/#13's correction
+  (dispatched by the TUI, landing on a silent no-op because the underlying mechanism doesn't exist yet) —
+  a real, load-bearing architecture gap, bigger than and separate from CAP-005 itself. Given this, CAP-005
+  genuinely doesn't apply to the TUI yet: there's no turn execution there for a snapshot to protect.
+  **For the one path that does exist (`rapid exec`), checked whether a `CapabilitySnapshot` wrapper would
+  add anything real:** `PermissionLattice` (`apps/rapid/src/permissions.rs`) has zero `&mut self` methods
+  — no mutation API exists to guard against in the first place, so the "immutable per-round snapshot"
+  property already holds unconditionally, not just by convention. A wrapper type here would rename an
+  already-total invariant, not enforce a new one — declining to build it, per this document's own standing
+  rule against ceremony with no load-bearing behavior behind it. **What's still genuinely open:** the
+  Policy Compiler (`CAP-001`, hard-invariants → admin → profile → user → project → agent monotonic merge
+  order) and `AuthorizationEpoch` — neither exists, and neither has a shortcut; both are real, separate
+  design work, more so now that the merge order matters across a project's settings files in ways
+  `exec_permission_lattice`'s current flat merge doesn't yet express.
 
 ### 2.4 `CompletionContract` (tri-state) + `VerificationPlane`
 
@@ -452,6 +487,24 @@ model, routing reason, policy version, estimated vs. actual cost — "routing mu
   `xai-grok-models/default_models.json` as the closest open reference for the catalog *shape*, not its
   content) + `headless` (surface `cost_usd` in the JSON contract, closing Phase 1 §1.5 row 17).
 - **Sev/Effort:** P1 / M.
+- **`RouterDecisionRecord` implemented 2026-08-30.** `apps/rapid/src/host.rs::FallbackChainModel::step`
+  already computed exactly the shape `MOD-005` asks for at every retry/fallback/stop decision — it just
+  threw the information away into an ephemeral `--verbose`-gated diagnostic string (`diag_line`) instead
+  of a structured, queryable record. Added `RouterDecisionRecord` (`requested_model`, `resolved_model`,
+  `reason: RouterDecisionReason` — `RetrySame`/`FallbackTo`/`Stop(reason)`) and `RouterDecisionLog`, an
+  `Arc<Mutex<Vec<_>>>` handle mirroring `CostAccumulator`'s existing shape: cloned out of the
+  `FallbackChainModel` before it's moved into `SelectedModel`/`run_live_exec`, read back in
+  `interactive.rs::exec_turn` once the turn resolves. The common case — a turn that never needed to retry
+  or fall back — produces zero records, not a record saying so; absence *is* the "used the requested
+  model, no incident" signal. Surfaced two ways: unconditionally on stderr (a mid-turn model switch is
+  operationally significant enough to show without `--verbose`) and, in `--jsonl` mode, one new
+  `router.decision` record per entry (`requested_model`/`resolved_model`/`reason`, the last a short
+  machine-stable tag: `"retry_same"`/`"fallback_to"`/a `StopReason::as_str()` value) written after
+  `rapid.schema` and before the outcome records, with `seq` kept monotonic across all of them. **Not
+  attempted:** `policy_version` and `estimated vs. actual cost` per decision (`MOD-005`'s full field list)
+  — no policy-versioning concept exists anywhere yet to cite, and per-decision cost attribution would need
+  threading `CostAccumulator`'s per-step values back into whichever attempt they belonged to, not just the
+  turn-level total this codebase currently tracks; both are real, separate follow-up.
 
 ### 2.9 Persisted, content-hash-keyed review findings + `PatchPolicyGate`
 
