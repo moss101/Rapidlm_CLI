@@ -1230,6 +1230,24 @@ publishes.
   `GoalDriver` instead, or building a narrower usage-only update path alongside it — a real design decision,
   not confirmed or attempted here. Re-scoping this item's effort to M (goal-usage wiring) → S (the metric
   itself, once usage is real) rather than the S this row currently claims.
+- **Checked the "narrower usage-only update path" half of that fork directly, 2026-08-30, rather than
+  leaving both options equally open — one of them is a real trap.** The obvious version of "narrower path":
+  skip `GoalCommand`/`GoalStateMachine::apply` entirely and just call `GoalStateMachine::from_snapshot
+  (snapshot.with_usage(new_usage))` directly from `apps/rapid`'s `GoalHost` after each turn — no new
+  command variant, minimal code. This is unsafe to ship as-is: every other `GoalHost` mutation either goes
+  through `apply(GoalCommand, actor, cancel)` (a real lifecycle transition, ledger-recorded) or
+  `record_evidence` (a genuinely separate, dedicated store, `EvidenceService`, not a `GoalSnapshot` field
+  swap). `from_snapshot` has no such precedent for *incremental* mutation of an already-active goal — it
+  exists to load a persisted snapshot wholesale, not to patch one field on a live one. Swapping the
+  `machine` field's snapshot on every turn would silently skip whatever ledger-event recording
+  `apply`'s callers rely on for reconstructability, an architectural property (event-sourcing) this pass
+  didn't have enough context on `agent-runtime::goal`'s actual guarantees to safely bypass. The
+  architecturally consistent version — a new `GoalCommand::RecordUsage { .. }` variant handled in
+  `apply()`'s match, so a usage bump *is* a real, ledger-recorded lifecycle event like every other mutation
+  — is real, additional design/implementation work on `agent-runtime::goal::state`'s core enum, not
+  attempted here. Both halves of the original fork remain open; this narrows *which* narrower path is
+  actually safe, rather than leaving "just mutate the snapshot" looking like the easy option it initially
+  appears to be.
 
 ---
 
