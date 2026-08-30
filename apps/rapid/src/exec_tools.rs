@@ -784,6 +784,28 @@ impl WorkspaceTools {
         self.nested_spawn_allowed = false;
     }
 
+    /// Clone the shared disk/network resource-ceiling counters (Modbit
+    /// `WRK-017`) for a caller that wants a subagent child to count against
+    /// the *same* per-turn budget as the parent — see `share_turn_budgets`.
+    pub(crate) fn turn_budget_handles(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+        (self.bytes_written.clone(), self.fetch_bytes.clone())
+    }
+
+    /// Replace this instance's own disk/network counters with the parent's
+    /// (Modbit `WRK-017`): without this, `open_with_permissions` gives every
+    /// subagent child a *fresh* `bytes_written`/`fetch_bytes` starting at
+    /// zero, so `MAX_TOTAL_WRITE_BYTES_PER_TURN`/`MAX_TOTAL_FETCH_BYTES_PER_TURN`
+    /// only ever bounded one tool instance, not the turn — a turn spawning
+    /// up to `MAX_SUBAGENT_SPAWNS_PER_TURN` subagents could write/fetch up
+    /// to 33x either ceiling in aggregate, not the ~1x the constant names
+    /// imply. Called on every subagent child's own tools
+    /// (`LiveSubagentRunner::run`) with the handles the parent's own
+    /// `turn_budget_handles()` returned.
+    pub(crate) fn share_turn_budgets(&mut self, bytes_written: Arc<AtomicU64>, fetch_bytes: Arc<AtomicU64>) {
+        self.bytes_written = bytes_written;
+        self.fetch_bytes = fetch_bytes;
+    }
+
     /// Attach the subagent runner (composition root only; children are built
     /// without one, which enforces the depth limit structurally).
     pub fn set_subagent_runner(&mut self, runner: Arc<dyn SubagentRunner>) {
@@ -3658,6 +3680,24 @@ impl ExecTools {
         }
     }
 
+    /// Clone this turn's disk/network resource-ceiling counters (`None` on
+    /// the no-op surface, which never writes or fetches at all). See
+    /// `WorkspaceTools::turn_budget_handles`.
+    pub(crate) fn turn_budget_handles(&self) -> Option<(Arc<AtomicU64>, Arc<AtomicU64>)> {
+        match self {
+            Self::Workspace(tools) => Some(tools.turn_budget_handles()),
+            Self::Noop(_) => None,
+        }
+    }
+
+    /// Adopt the parent's disk/network resource-ceiling counters (no-op on
+    /// the no-op surface). See `WorkspaceTools::share_turn_budgets`.
+    pub(crate) fn share_turn_budgets(&mut self, bytes_written: Arc<AtomicU64>, fetch_bytes: Arc<AtomicU64>) {
+        if let Self::Workspace(tools) = self {
+            tools.share_turn_budgets(bytes_written, fetch_bytes);
+        }
+    }
+
     /// The trusted workspace surface with an explicit permission lattice.
     pub fn workspace_with_permissions(
         root: &Path,
@@ -4340,6 +4380,61 @@ use std::sync::{Arc, Mutex};
         }
         // The refused write must never have touched disk.
         assert!(!root.0.join("b.txt").exists());
+    }
+
+    #[test]
+    fn subagent_children_share_the_parents_per_turn_disk_budget() {
+        let root = TempRoot::new("shared-budget");
+        let parent = permissive_workspace(&root.0);
+        parent
+            .bytes_written
+            .store(MAX_TOTAL_WRITE_BYTES_PER_TURN - 10, Ordering::SeqCst);
+
+        // Without `open_with_permissions` (used both for the top-level turn
+        // and, before this fix, silently for every subagent child too), a
+        // freshly-constructed child got its own `bytes_written` starting at
+        // zero — a turn spawning many subagents could write well past
+        // `MAX_TOTAL_WRITE_BYTES_PER_TURN` in aggregate. `share_turn_budgets`
+        // is what `LiveSubagentRunner::run` now calls on every child so it
+        // counts against the same counter instead.
+        let mut child = permissive_workspace(&root.0);
+        let (bytes_written, fetch_bytes) = parent.turn_budget_handles();
+        child.share_turn_budgets(bytes_written, fetch_bytes);
+
+        let cancel = CancellationToken::new();
+        let over = ProposedToolCall::new(
+            "c1",
+            WORKSPACE_WRITE_TOOL,
+            &serde_json::to_string(&serde_json::json!({"path": "b.txt", "content": "x".repeat(1024)}))
+                .expect("encode call"),
+        )
+        .expect("call");
+        let validated = child.validate(&over, &cancel).expect("v");
+        match child.execute(&validated, &cancel).expect("handled") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.unwrap().contains("disk-write budget exhausted"));
+            }
+            other => panic!("expected the child's write to hit the shared budget, got {other:?}"),
+        }
+        assert!(!root.0.join("b.txt").exists());
+
+        // Sanity check: an unshared, genuinely fresh child's own budget is
+        // not exhausted — proving the refusal above came from sharing, not
+        // from some unrelated cause.
+        let mut unshared_child = permissive_workspace(&root.0);
+        let clean = ProposedToolCall::new(
+            "c2",
+            WORKSPACE_WRITE_TOOL,
+            &serde_json::to_string(&serde_json::json!({"path": "c.txt", "content": "x".repeat(1024)}))
+                .expect("encode call"),
+        )
+        .expect("call");
+        let validated = unshared_child.validate(&clean, &cancel).expect("v");
+        match unshared_child.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { .. } => {}
+            other => panic!("sanity check: a genuinely fresh child should not be budget-exhausted, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1006,6 +1006,25 @@ concurrency/disk/network, there's no existing per-call counter or size argument 
 bounding either genuinely needs real OS-level resource monitoring (rlimits, cgroups, or platform-specific
 APIs), which is real, separate, and was correctly identified as the hard part of this item from the start.
 
+**Correction, 2026-08-30: the disk/network ceilings just above bounded one tool *instance*, not the
+turn — found while auditing §2.2's `AGT-010` nested-delegation fix for the same "fresh counter per
+child" shape and checking whether it also applied here.** It did: `WorkspaceTools::open_with_permissions`
+builds a brand-new `Arc::new(AtomicU64::new(0))` for `bytes_written`/`fetch_bytes` every time it's
+called — including every subagent child `LiveSubagentRunner::run` constructs. Since a turn can spawn up
+to `MAX_SUBAGENT_SPAWNS_PER_TURN` (32) subagents (each now capped at depth 1, so this is a *bounded*
+multiplier, not the unbounded shape the nested-delegation bug had), the real aggregate ceiling for one
+turn was `(1 + 32) × 64 MB` disk and `(1 + 32) × 16 MB` network — 33x either constant's name, not the ~1x
+"per turn" implies. **Fixed:** new `WorkspaceTools::turn_budget_handles()`/`share_turn_budgets()` — the
+parent clones its own `bytes_written`/`fetch_bytes` `Arc`s and hands them to `LiveSubagentRunner`, which
+now calls `share_turn_budgets` on every child's tools (right alongside `disable_nested_spawn`) instead of
+letting `open_with_permissions` hand it a fresh pair. `subagent_spawns` itself needed no equivalent fix:
+now that nested spawn is disabled by default, a child can never reach `execute_task_spawn` at all, so
+its own fresh (and now unreachable) counter is moot. New test
+`subagent_children_share_the_parents_per_turn_disk_budget`: a parent pre-loaded near the disk ceiling, a
+child sharing its handles refused for hitting the *shared* budget, and a genuinely separate unshared
+child's own write succeeding normally — confirming the refusal came from sharing, not from some other
+cause. Full `-p rapid` suite (305 lib tests) and `cargo build --workspace --tests` pass.
+
 - **Where it lands:** Credential Broker: wire `SecretBroker` into `apps/rapid`'s credential path once a
   real multi-secret scenario exists — premature before that. Resource Governor: new work, `sandbox` or a
   new small crate; encode its "budgets can't buy a fake pass" anti-pattern into whatever implements

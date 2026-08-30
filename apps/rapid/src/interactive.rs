@@ -1230,6 +1230,13 @@ struct LiveSubagentRunner {
     /// subagents, instead of each child starting from a bare, ruleless
     /// lattice.
     permissions: crate::permissions::PermissionLattice,
+    /// The parent's own disk/network resource-ceiling counters (Modbit
+    /// `WRK-017`), shared into every child so the whole turn — parent plus
+    /// every subagent it spawns — counts against one budget instead of each
+    /// subagent getting its own fresh one. See `ExecTools::
+    /// share_turn_budgets`'s own doc comment for why a fresh-per-child
+    /// counter under-enforces a "per-turn" ceiling.
+    turn_budgets: (std::sync::Arc<std::sync::atomic::AtomicU64>, std::sync::Arc<std::sync::atomic::AtomicU64>),
 }
 
 impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
@@ -1266,6 +1273,11 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // — unbounded nesting was possible for any non-explore/plan
         // agent_type. See `newtask.md` §2.2.
         tools.disable_nested_spawn();
+        // Share the parent's disk/network budget (Modbit WRK-017) rather
+        // than let this child start a fresh one — see `turn_budgets`'s own
+        // doc comment.
+        let (bytes_written, fetch_bytes) = self.turn_budgets.clone();
+        tools.share_turn_budgets(bytes_written, fetch_bytes);
         // Subagents run in the same trusted project as the parent (only
         // spawned when the workspace is trusted), so they get the same
         // AGENTS.md rules and system prompt as the top-level turn instead of
@@ -1773,11 +1785,14 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     if let (Some(active), Some((root, TrustStatus::Trusted))) =
         (child_model_config.as_ref(), workspace.as_ref())
     {
-        tools.set_subagent_runner(std::sync::Arc::new(LiveSubagentRunner {
-            active: active.clone(),
-            root: root.clone(),
-            permissions: permission_lattice.clone(),
-        }));
+        if let Some(turn_budgets) = tools.turn_budget_handles() {
+            tools.set_subagent_runner(std::sync::Arc::new(LiveSubagentRunner {
+                active: active.clone(),
+                root: root.clone(),
+                permissions: permission_lattice.clone(),
+                turn_budgets,
+            }));
+        }
     }
     let diag = parsed.verbose.then(|| StepDiag::stderr(&base_url));
     // `--json-schema`: wrap the tool driver with the synthetic-tool
