@@ -82,6 +82,28 @@ have — "premature before a real scenario exists," not a small wiring gap. None
 implemented or scoped further this pass; flagging them here so effort isn't spent re-discovering the same
 "tested but zero callers" fact independently for each one.
 
+**Update, 2026-08-30: `crates/telemetry` (also zero callers outside its own crate) got the same "dormant"
+survey, but turned up something different — a real bug in the code itself, not just an unwired crate,
+fixed rather than only documented.** `crates/telemetry/src/lib.rs::is_forbidden_key` — the live redaction
+gate every attribute passes through in `emit_span`/`emit_log`/`emit_metric` before a record reaches any
+sink, including the network-capable `OtlpSink` — matches literal keys `"code"`/`"source_code"` and suffix
+patterns for `_prompt`/`_secret`/`_token`, but had no `_code` suffix rule. `crates/telemetry/src/export.rs
+::is_content_key` (the redaction list for the separate, local-only diagnostic-bundle exporter) has the
+identical list *plus* `ends_with("_code")` — confirmed by direct comparison, not assumption. An attribute
+keyed `"patch_code"`, `"diff_code"`, or `"generated_code"` would have been classified `FieldClass::Safe` by
+the live gate and reached every sink unredacted, directly contradicting the module's own stated invariant
+("Default fields exclude prompt, code... Redaction runs before any exporter sees a record", threat
+`T-012`) — the same "check exists on one path, not the sibling path with the same effect" shape this
+session already fixed twice elsewhere (the `git commit`/`git merge` gate, the team-memory secret gate).
+**Fixed:** added the missing `|| normalized_key.ends_with("_code")` to `is_forbidden_key`, matching
+`export.rs`'s list exactly. Extended the existing `protected_keys_are_omitted_not_exported` test with a
+`"patch_code"` attribute and confirmed it reproduces the bug against the unfixed code first (the test's own
+`omitted_attributes` count assertion failed, and the un-redacted value would have reached the exported
+record) before confirming the fix closes it. Full `telemetry` crate suite (24 tests) and `cargo build
+--workspace --tests` pass. Found via a general correctness-review pass over the four dormant crates above,
+not the "gate bypass" pattern search specifically — worth noting since it means that review methodology is
+also productive here, independent of whether the surrounding crate is even wired in yet.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

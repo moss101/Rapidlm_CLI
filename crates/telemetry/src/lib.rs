@@ -1413,6 +1413,7 @@ pub(crate) fn is_forbidden_key(normalized_key: &str) -> bool {
     ) || normalized_key.ends_with("_prompt")
         || normalized_key.ends_with("_secret")
         || normalized_key.ends_with("_token")
+        || normalized_key.ends_with("_code")
         || normalized_key.contains("chain_of_thought")
 }
 
@@ -1661,6 +1662,7 @@ mod tests {
                     ("api.key", CANARY),
                     ("tool_output", "ls -la"),
                     ("code", "fn main() {}"),
+                    ("patch_code", "fn secret_impl() {}"),
                     ("query", "token=1"),
                     ("provider", "openai"),
                 ],
@@ -1669,7 +1671,7 @@ mod tests {
                 &CancellationToken::new(),
             )
             .expect("emit");
-        assert!(outcome.omitted_attributes >= 7);
+        assert!(outcome.omitted_attributes >= 8);
         let rec = &local.snapshot().expect("snap")[0];
         for key in [
             "prompt",
@@ -1677,6 +1679,7 @@ mod tests {
             "api_key",
             "tool_output",
             "code",
+            "patch_code",
             "query",
         ] {
             assert!(rec.attributes.get(key).is_none(), "exported {key}");
@@ -1685,6 +1688,7 @@ mod tests {
         let json = serialized(std::slice::from_ref(rec));
         assert!(!json.contains(CANARY));
         assert!(!json.contains("fn main"));
+        assert!(!json.contains("secret_impl"));
     }
 
     #[test]
