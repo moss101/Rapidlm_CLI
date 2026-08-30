@@ -22,6 +22,7 @@ pub mod permissions;
 pub mod preview;
 pub mod sandbox_exec;
 pub mod shadow_diagnostics;
+pub mod structured_output;
 pub mod user_config;
 pub mod web_fetch;
 

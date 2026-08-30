@@ -76,3 +76,8 @@ serde = { version = "1", features = ["derive"] }
 # serde_json: MIT/Apache-2.0; compact one-object-per-line encoding.
 # `raw_value` keeps ApiError field order inside `data` instead of sorting keys.
 serde_json = { version = "1", features = ["raw_value"] }
+# jsonschema: MIT. `--json-schema` structured-output validation. Default
+# features pull in reqwest for remote $ref resolution — disabled: schemas here
+# are always a fully-inline, caller-supplied document, never fetched over the
+# network.
+jsonschema = { version = "0.52.0", default-features = false }

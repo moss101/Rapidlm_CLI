@@ -224,7 +224,7 @@ usage: rapid [subcommand]
 /// errors. Documents the prompt argument, the exec flags, and the env vars
 /// that shape a headless run.
 pub const EXEC_USAGE: &str = "\
-usage: rapid exec <prompt> [--verbose] [--max-wall-time <seconds>]
+usage: rapid exec <prompt> [--verbose] [--max-wall-time <seconds>] [--json-schema <path>]
 
 Run one headless agent turn with the configured model. The final response is
 printed to stdout; diagnostics go to stderr; a non-zero exit code reports a
@@ -237,6 +237,11 @@ Options:
   --verbose               Per-attempt model and turn diagnostics on stderr
   --max-wall-time <secs>  Cancel the turn if it runs longer than this many
                           seconds (cooperative: the same signal Ctrl-C sends)
+  --json-schema <path>    Constrain the result to a JSON Schema document read
+                          from <path>: the model must call a synthetic tool
+                          with matching arguments, printed to stdout in place
+                          of the usual text summary. A schema-conformant
+                          result is never produced without a matching call.
   -h, --help              Print this help
 
 Environment:
@@ -814,11 +819,16 @@ struct ExecArgs {
     /// Enforced cooperatively via the same `CancellationToken` every model
     /// step and tool call already checks, not a hard process kill.
     max_wall_time: Option<Duration>,
+    /// `--json-schema <path>`: constrain the turn to Qwen-Code-style
+    /// structured output (`newtask.md` §1.5/#16). The file's contents are
+    /// read and parsed later, not here — this only carries the path.
+    json_schema: Option<PathBuf>,
 }
 
 fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
     let mut verbose = false;
     let mut max_wall_time = None;
+    let mut json_schema = None;
     let mut words: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -828,6 +838,9 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
             i += 1;
             let secs: u64 = args.get(i)?.parse().ok()?;
             max_wall_time = Some(Duration::from_secs(secs));
+        } else if args[i] == "--json-schema" {
+            i += 1;
+            json_schema = Some(PathBuf::from(args.get(i)?));
         } else {
             words.push(&args[i]);
         }
@@ -841,6 +854,7 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
         prompt,
         verbose,
         max_wall_time,
+        json_schema,
     })
 }
 
@@ -1652,18 +1666,73 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         }));
     }
     let diag = parsed.verbose.then(|| StepDiag::stderr(&base_url));
-    match run_live_exec(
-        preserved,
-        backing,
-        &request,
-        &mut tools,
-        &mut events,
-        &cancel,
-        ContextRetryPolicy::default(),
-        diag,
-    ) {
+    // `--json-schema`: wrap the tool driver with the synthetic-tool
+    // constrained-output adapter. Reading/parsing/compiling the schema stays
+    // outside `run_live_exec` so a bad `--json-schema` fails before spending
+    // any model calls, as a typed Usage error, not a mid-turn surprise.
+    let json_schema_requested = parsed.json_schema.is_some();
+    let json_schema_capture: std::rc::Rc<std::cell::RefCell<Option<String>>>;
+    let run_result = if let Some(schema_path) = parsed.json_schema.as_ref() {
+        let schema_text = match std::fs::read_to_string(schema_path) {
+            Ok(text) => text,
+            Err(err) => {
+                eprintln!("--json-schema: failed to read {}: {err}", schema_path.display());
+                return Ok(JsonlExitCode::Usage.as_i32());
+            }
+        };
+        let schema_value: serde_json::Value = match serde_json::from_str(&schema_text) {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!("--json-schema: {} is not valid JSON: {err}", schema_path.display());
+                return Ok(JsonlExitCode::Usage.as_i32());
+            }
+        };
+        let mut wrapped =
+            match crate::structured_output::StructuredOutputTools::new(tools, schema_value) {
+                Ok(wrapped) => wrapped,
+                Err(err) => {
+                    eprintln!("{err}");
+                    return Ok(JsonlExitCode::Usage.as_i32());
+                }
+            };
+        json_schema_capture = wrapped.captured_result();
+        run_live_exec(
+            preserved,
+            backing,
+            &request,
+            &mut wrapped,
+            &mut events,
+            &cancel,
+            ContextRetryPolicy::default(),
+            diag,
+        )
+    } else {
+        json_schema_capture = std::rc::Rc::new(std::cell::RefCell::new(None));
+        run_live_exec(
+            preserved,
+            backing,
+            &request,
+            &mut tools,
+            &mut events,
+            &cancel,
+            ContextRetryPolicy::default(),
+            diag,
+        )
+    };
+    match run_result {
         Ok(outcome) if outcome.result.status() == AgentTerminalStatus::Succeeded => {
-            println!("{}", outcome.result.summary());
+            let captured = json_schema_capture.borrow();
+            if json_schema_requested && captured.is_none() {
+                eprintln!(
+                    "--json-schema was set but the model never called the synthetic tool \
+                     with a schema-conformant result"
+                );
+                return Ok(JsonlExitCode::Runtime.as_i32());
+            }
+            match captured.as_ref() {
+                Some(json) => println!("{json}"),
+                None => println!("{}", outcome.result.summary()),
+            }
             let mut line = format!("tokens used: {}", outcome.tokens);
             if let Some(cost_usd_micros) = outcome.cost_usd_micros {
                 line.push_str(&format!(" ({})", format_usd_micros(cost_usd_micros)));

@@ -219,6 +219,94 @@ fn tool_failure_names_failing_tool_and_error_on_stderr() {
 }
 
 #[test]
+fn json_schema_flag_prints_the_validated_result_instead_of_the_summary() {
+    let home = temp_dir("jsonschema-ok-home");
+    let project = home.join("project");
+    std::fs::create_dir_all(&project).expect("project");
+    trusted_project(&home, &project);
+    let schema_path = home.join("schema.json");
+    std::fs::write(
+        &schema_path,
+        r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}"#,
+    )
+    .expect("write schema");
+    let responses = vec![
+        (
+            200,
+            tool_call_body(
+                "call_1",
+                "emit_structured_result",
+                r#"{\"answer\":\"42\"}"#,
+            ),
+        ),
+        (200, TERMINAL_BODY.to_owned()),
+    ];
+    let server = spawn_scripted_server(responses);
+    let config = write_config(&home, server.addr);
+
+    let (code, stdout, stderr) = run_exec(
+        &project,
+        &home,
+        &config,
+        &[
+            "--json-schema",
+            schema_path.to_str().expect("utf-8 path"),
+            "return the structured answer",
+        ],
+    );
+
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        r#"{"answer":"42"}"#,
+        "stdout must be the validated result, not the model's own summary text"
+    );
+    assert!(
+        !stdout.contains("hello from scripted model"),
+        "the model's own terminal text must not leak into structured-output stdout: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn json_schema_flag_fails_typed_when_the_model_never_calls_the_synthetic_tool() {
+    let home = temp_dir("jsonschema-missing-home");
+    let project = home.join("project");
+    std::fs::create_dir_all(&project).expect("project");
+    trusted_project(&home, &project);
+    let schema_path = home.join("schema.json");
+    std::fs::write(
+        &schema_path,
+        r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#,
+    )
+    .expect("write schema");
+    // The model just answers in plain text and never calls the synthetic
+    // tool at all — the constrained-output contract was not met.
+    let server = spawn_scripted_server(vec![(200, TERMINAL_BODY.to_owned())]);
+    let config = write_config(&home, server.addr);
+
+    let (code, stdout, stderr) = run_exec(
+        &project,
+        &home,
+        &config,
+        &[
+            "--json-schema",
+            schema_path.to_str().expect("utf-8 path"),
+            "return the structured answer",
+        ],
+    );
+
+    // JsonlExitCode::Runtime: the turn otherwise "succeeded" but never
+    // produced the promised structured result.
+    assert_eq!(code, Some(5), "stdout: {stdout} stderr: {stderr}");
+    assert!(
+        stderr.contains("never called the synthetic tool"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn empty_final_response_after_committed_work_exits_zero() {
     let home = temp_dir("emptyexit-home");
     let project = home.join("project");
