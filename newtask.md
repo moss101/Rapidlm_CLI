@@ -760,6 +760,20 @@ Also newly confirmed: `context-engine::compact`'s whole compaction system (`comp
 itself unwired from `apps/rapid` — `compact_packet` is only ever called from within
 `compact_policy.rs`, in the same crate, never from the exec loop. So Phase 1 §1.4 row 13's "explicit
 fast-path" framing undersells it: compaction isn't reachable *at all* today, deterministic or model-based.
+**Correction (2026-08-30): this specific "not reachable at all" claim is now stale — checked directly
+against `apps/rapid/src/host.rs`, not re-assumed.** `LiveRecoveryController::recover_from_overflow` calls
+`compact_with_policy(live.packet(), &policy, None, &CeCancel::new())` on every real context overflow (a
+long-lived automatic path with its own dedicated tests, e.g. `overflow_rebuilds_live_context_and_recovers`
+— this predates the current implementation pass, not something added by it), and `compact_with_policy`
+itself calls `compact_packet` internally (`compact_policy.rs:221`). So the narrow literal claim (`compact_
+packet` itself has exactly one call site, inside `compact_policy.rs`) still holds, but "compaction isn't
+reachable at all today" does not — the deterministic fallback path runs, automatically, whenever a real
+turn overflows its context budget. This actually matches §1.4 item 13's own more careful framing exactly
+(automatic fallback already existed; only an *explicit, user-requested* mode was ever the real gap) —
+that item's framing was right and this paragraph's stronger claim was the one that needed correcting. The
+explicit-mode gap folds into the TUI kernel-dispatch finding under item 13 itself: `/compact` is one of the
+30 `KernelAction` variants confirmed silently no-op in `apply_kernel_action`, not a separate unwired-crate
+problem the way this paragraph originally framed it.
 
 **Next-Edit-Ripple implemented 2026-08-30 — the "genuine, moderate-sized wiring work" the note above
 anticipated, not the traversal algorithm (already existed).** Two small, additive `context-engine` reads
