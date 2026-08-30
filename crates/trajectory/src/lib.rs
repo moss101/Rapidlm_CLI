@@ -60,7 +60,7 @@ impl TrajectoryCollector {
         }
         let mut excerpt = text.to_owned();
         if excerpt.len() > MAX_TEXT_BYTES {
-            excerpt.truncate(MAX_TEXT_BYTES);
+            truncate_to_char_boundary(&mut excerpt, MAX_TEXT_BYTES);
         }
         self.events.push(TrajectoryEvent {
             seq,
@@ -78,6 +78,19 @@ impl TrajectoryCollector {
     pub fn dropped_secrets(&self) -> u64 {
         self.dropped_secrets
     }
+}
+
+/// Truncates `s` to at most `max` bytes without panicking on a multi-byte
+/// character straddling the cut. `String::truncate` panics unless `max` is a
+/// char boundary; a byte-length check alone (`s.len() > max`) does not make
+/// a raw `truncate(max)` call safe for arbitrary UTF-8 — `text` is caller-
+/// observed content, not a fixed literal.
+fn truncate_to_char_boundary(s: &mut String, max: usize) {
+    let mut cut = max.min(s.len());
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
 }
 
 #[cfg(test)]
@@ -109,5 +122,16 @@ mod tests {
         let mut c2 = TrajectoryCollector::new();
         c2.record(0, "model.completed", &long);
         assert_eq!(c2.events()[0].text_excerpt.len(), MAX_TEXT_BYTES);
+    }
+
+    #[test]
+    fn record_does_not_panic_when_a_multibyte_char_straddles_the_cap() {
+        // MAX_TEXT_BYTES - 1 ASCII bytes then one 4-byte char lands that
+        // char across the cut, since it starts one byte before the cap.
+        let text = format!("{}{}", "a".repeat(MAX_TEXT_BYTES - 1), '\u{1D518}');
+        assert!(!text.is_char_boundary(MAX_TEXT_BYTES));
+        let mut c = TrajectoryCollector::new();
+        assert!(c.record(0, "model.completed", &text));
+        assert!(c.events()[0].text_excerpt.len() <= MAX_TEXT_BYTES);
     }
 }

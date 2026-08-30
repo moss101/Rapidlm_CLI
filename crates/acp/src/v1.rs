@@ -208,7 +208,7 @@ impl FileDiff {
             return None;
         }
         if unified.len() > MAX_DIFF_BYTES {
-            unified.truncate(MAX_DIFF_BYTES);
+            truncate_to_char_boundary(&mut unified, MAX_DIFF_BYTES);
         }
         Some(Self { path, unified })
     }
@@ -1061,7 +1061,7 @@ fn file_edit_update(
         return None;
     }
     if unified.len() > MAX_DIFF_BYTES {
-        unified.truncate(MAX_DIFF_BYTES);
+        truncate_to_char_boundary(&mut unified, MAX_DIFF_BYTES);
     }
     let tool_call_id = tool_call_id(payload).unwrap_or_else(|| format!("edit:{path}"));
     Some(SessionUpdateNotification {
@@ -1083,7 +1083,7 @@ fn tool_call_id(payload: &Value) -> Option<String> {
 fn tool_title(payload: &Value) -> Option<String> {
     payload_string(payload, &["tool", "title", "name"]).map(|mut title| {
         if title.len() > MAX_TOOL_TITLE_BYTES {
-            title.truncate(MAX_TOOL_TITLE_BYTES);
+            truncate_to_char_boundary(&mut title, MAX_TOOL_TITLE_BYTES);
         }
         title
     })
@@ -1110,9 +1110,22 @@ fn text_from_payload(payload: &Value) -> Option<String> {
         return None;
     }
     if text.len() > MAX_UPDATE_TEXT_BYTES {
-        text.truncate(MAX_UPDATE_TEXT_BYTES);
+        truncate_to_char_boundary(&mut text, MAX_UPDATE_TEXT_BYTES);
     }
     Some(text)
+}
+
+/// Truncates `s` to at most `max` bytes without panicking on a multi-byte
+/// character straddling the cut. `String::truncate` panics unless `max` is a
+/// char boundary; a diff/title/chunk taken from a kernel event payload is
+/// arbitrary UTF-8, so a length check alone (`s.len() > max`) does not make
+/// a raw `truncate(max)` call safe.
+fn truncate_to_char_boundary(s: &mut String, max: usize) {
+    let mut cut = max.min(s.len());
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
 }
 
 fn payload_string(payload: &Value, keys: &[&str]) -> Option<String> {
@@ -1643,5 +1656,68 @@ mod tests {
                 "payload without path+diff must not map"
             );
         }
+    }
+
+    /// Builds a string one byte longer than `max`, with a 2-byte UTF-8
+    /// character's encoding straddling byte offset `max` exactly — the
+    /// specific shape a length check (`len() > max`) does not protect
+    /// against, since `String::truncate(max)` panics unless `max` is itself
+    /// a char boundary.
+    fn straddling_boundary(max: usize) -> String {
+        let mut s = "a".repeat(max - 1);
+        s.push('é');
+        assert_eq!(s.len(), max + 1);
+        assert!(!s.is_char_boundary(max), "test fixture must actually straddle the cut");
+        s
+    }
+
+    #[test]
+    fn truncate_to_char_boundary_never_panics_on_a_straddling_cut() {
+        let mut s = straddling_boundary(MAX_TOOL_TITLE_BYTES);
+        truncate_to_char_boundary(&mut s, MAX_TOOL_TITLE_BYTES);
+        assert!(s.len() <= MAX_TOOL_TITLE_BYTES);
+        assert_eq!(s, "a".repeat(MAX_TOOL_TITLE_BYTES - 1));
+    }
+
+    #[test]
+    fn tool_title_does_not_panic_on_a_straddling_multibyte_cut() {
+        let payload = serde_json::json!({"tool": straddling_boundary(MAX_TOOL_TITLE_BYTES)});
+        let title = tool_title(&payload).expect("title");
+        assert!(title.len() <= MAX_TOOL_TITLE_BYTES);
+    }
+
+    #[test]
+    fn text_from_payload_does_not_panic_on_a_straddling_multibyte_cut() {
+        let payload = serde_json::json!({"text": straddling_boundary(MAX_UPDATE_TEXT_BYTES)});
+        let text = text_from_payload(&payload).expect("text");
+        assert!(text.len() <= MAX_UPDATE_TEXT_BYTES);
+    }
+
+    #[test]
+    fn file_edit_update_does_not_panic_on_a_straddling_multibyte_diff() {
+        let payload = serde_json::json!({
+            "path": "a.rs",
+            "diff": straddling_boundary(MAX_DIFF_BYTES),
+        });
+        let mapped = map_kernel_event(&envelope(
+            EventKind::WorkspacePatchStaged,
+            SessionId::new(),
+            payload,
+        ))
+        .expect("mapped");
+        let MappedEvent::SessionUpdate(SessionUpdateNotification {
+            update: SessionUpdate::ToolCallUpdate { diff: Some(diff), .. },
+            ..
+        }) = mapped
+        else {
+            panic!("expected a tool-call diff update");
+        };
+        assert!(diff.unified().len() <= MAX_DIFF_BYTES);
+    }
+
+    #[test]
+    fn file_diff_new_does_not_panic_on_a_straddling_multibyte_unified_body() {
+        let diff = FileDiff::new("a.rs", straddling_boundary(MAX_DIFF_BYTES)).expect("diff");
+        assert!(diff.unified().len() <= MAX_DIFF_BYTES);
     }
 }

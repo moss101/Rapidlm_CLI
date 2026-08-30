@@ -569,7 +569,7 @@ impl RedactionPipeline {
             out = out.replace(needle, &placeholder);
         }
         if out.len() > MAX_ATTRIBUTE_VALUE_BYTES {
-            out.truncate(MAX_ATTRIBUTE_VALUE_BYTES);
+            truncate_to_char_boundary(&mut out, MAX_ATTRIBUTE_VALUE_BYTES);
         }
         Ok(out)
     }
@@ -1443,6 +1443,21 @@ fn placeholder(fingerprint: CanaryFingerprint) -> String {
     out
 }
 
+/// Truncates `s` to at most `max` bytes without panicking on a multi-byte
+/// character straddling the cut. `String::truncate` panics unless `max` is a
+/// char boundary; a byte-length check alone (`s.len() > max`) does not make
+/// a raw `truncate(max)` call safe — canary substitution can grow `text`
+/// past its original, already-bounded length (the placeholder is longer
+/// than a short needle), shifting an untouched multi-byte character across
+/// the cut.
+fn truncate_to_char_boundary(s: &mut String, max: usize) {
+    let mut cut = max.min(s.len());
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+}
+
 fn parse_opt<T: std::str::FromStr>(value: Option<&str>) -> Option<T> {
     value.and_then(|v| v.parse().ok())
 }
@@ -2009,5 +2024,27 @@ mod tests {
         let debug = format!("{pipeline:?}");
         assert!(!debug.contains(CANARY));
         assert!(debug.contains("canary_count"));
+    }
+
+    #[test]
+    fn redact_text_does_not_panic_when_growth_shifts_a_multibyte_char_onto_the_cap() {
+        // Placeholder (35 bytes: "[REDACTED:secret:" + 16 hex + "]") is
+        // longer than the 6-byte "SECRET" needle it replaces, so growth can
+        // push an untouched multi-byte character in the tail across
+        // MAX_ATTRIBUTE_VALUE_BYTES even though the original text was
+        // already within bound. 218 filler bytes place the 4-byte char at
+        // 35+218=253..257 in the replaced text, so the cap at 256 falls
+        // inside it, not on a boundary.
+        let mut pipeline = RedactionPipeline::new();
+        pipeline
+            .register_canary(b"SECRET", &CancellationToken::new())
+            .expect("register");
+        let text = format!("SECRET{}{}", "a".repeat(218), '\u{1D518}');
+        assert!(text.len() <= MAX_ATTRIBUTE_VALUE_BYTES);
+        let out = pipeline
+            .redact_text(&text, &CancellationToken::new())
+            .expect("redact");
+        assert!(out.len() <= MAX_ATTRIBUTE_VALUE_BYTES);
+        assert!(!out.contains("SECRET"));
     }
 }

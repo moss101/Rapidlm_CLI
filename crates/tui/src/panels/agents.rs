@@ -878,9 +878,24 @@ fn sanitize_preview(raw: &str) -> String {
     let mut out: String = cleaned.chars().take(MAX_PREVIEW_CHARS).collect();
     out.retain(|c| c != '\n' && c != '\t');
     if out.len() > MAX_AGENT_TEXT_BYTES {
-        out.truncate(MAX_AGENT_TEXT_BYTES);
+        truncate_to_char_boundary(&mut out, MAX_AGENT_TEXT_BYTES);
     }
     if out.is_empty() { "-".to_owned() } else { out }
+}
+
+/// Truncates `s` to at most `max` bytes without panicking on a multi-byte
+/// character straddling the cut. `String::truncate` panics unless `max` is a
+/// char boundary; a byte-length check alone (`s.len() > max`) does not make
+/// a raw `truncate(max)` call safe for arbitrary UTF-8. Not currently
+/// reachable here (`MAX_PREVIEW_CHARS` chars encode to at most 4x that many
+/// bytes, comfortably under `MAX_AGENT_TEXT_BYTES`), kept correct in case
+/// either constant changes.
+fn truncate_to_char_boundary(s: &mut String, max: usize) {
+    let mut cut = max.min(s.len());
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
 }
 
 fn fit_width(text: &str, width: usize) -> String {
@@ -1412,5 +1427,15 @@ selected:000000000018
             model.cancel(&cancel()),
             Err(AgentsPanelError::InvalidSelection)
         );
+    }
+
+    #[test]
+    fn truncate_to_char_boundary_never_panics_on_a_straddling_cut() {
+        let mut s = "a".repeat(127);
+        s.push('\u{1D518}'); // 4-byte char occupying bytes 127..131
+        assert!(!s.is_char_boundary(MAX_AGENT_TEXT_BYTES));
+        truncate_to_char_boundary(&mut s, MAX_AGENT_TEXT_BYTES);
+        assert!(s.len() <= MAX_AGENT_TEXT_BYTES);
+        assert_eq!(s, "a".repeat(127));
     }
 }

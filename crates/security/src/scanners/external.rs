@@ -1525,9 +1525,21 @@ fn sanitize_text(raw: &str) -> String {
         out.push(ch);
     }
     if out.len() > MAX_REMEDIATION_BYTES {
-        out.truncate(MAX_REMEDIATION_BYTES);
+        truncate_to_char_boundary(&mut out, MAX_REMEDIATION_BYTES);
     }
     out
+}
+
+/// Truncates `s` to at most `max` bytes without panicking on a multi-byte
+/// character straddling the cut. `String::truncate` panics unless `max` is a
+/// char boundary; a byte-length check alone (`s.len() > max`) does not make
+/// a raw `truncate(max)` call safe for arbitrary UTF-8.
+fn truncate_to_char_boundary(s: &mut String, max: usize) {
+    let mut cut = max.min(s.len());
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
 }
 
 fn write_hex_lower(bytes: &[u8], out: &mut [u8]) {
@@ -1972,5 +1984,18 @@ mod tests {
             "security.external_scan_malformed_sarif"
         );
         assert!(!ExternalScanError::MalformedSarif.retryable());
+    }
+
+    #[test]
+    fn sanitize_text_does_not_panic_when_a_multibyte_char_straddles_the_cap() {
+        // 255 ASCII bytes then one 4-byte char: the char-accumulation loop
+        // only checks the byte cap *before* pushing each char, so the final
+        // string overshoots to 259 bytes with the 4-byte char occupying
+        // bytes 255..259 — byte offset 256 (MAX_REMEDIATION_BYTES) falls
+        // inside it, not on a char boundary.
+        let raw = format!("{}{}", "a".repeat(255), '\u{1D518}');
+        assert!(!raw.is_char_boundary(256));
+        let out = sanitize_text(&raw);
+        assert!(out.len() <= MAX_REMEDIATION_BYTES);
     }
 }

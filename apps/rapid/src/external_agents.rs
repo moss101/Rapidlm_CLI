@@ -224,7 +224,7 @@ fn normalize_result(
 ) -> NormalizedAgentResult {
     let mut text = raw_text.to_owned();
     if text.len() > MAX_AGENT_RESULT_BYTES {
-        text.truncate(MAX_AGENT_RESULT_BYTES);
+        truncate_to_char_boundary(&mut text, MAX_AGENT_RESULT_BYTES);
     }
     NormalizedAgentResult {
         flavor,
@@ -233,6 +233,19 @@ fn normalize_result(
         text,
         trust_label: EXTERNAL_TRUST_LABEL,
     }
+}
+
+/// Truncates `s` to at most `max` bytes without panicking on a multi-byte
+/// character straddling the cut. `String::truncate` panics unless `max` is a
+/// char boundary; a byte-length check alone (`s.len() > max`) does not make
+/// a raw `truncate(max)` call safe — `raw_text` is an external agent's own
+/// stdout, not a fixed literal, and routinely contains non-ASCII.
+fn truncate_to_char_boundary(s: &mut String, max: usize) {
+    let mut cut = max.min(s.len());
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
 }
 
 /// Build the ACP `initialize` request (client -> external agent).
@@ -648,6 +661,23 @@ mod tests {
             &huge,
         );
         assert_eq!(normalized.text().len(), MAX_AGENT_RESULT_BYTES);
+    }
+
+    #[test]
+    fn normalize_result_does_not_panic_when_a_multibyte_char_straddles_the_cap() {
+        // MAX_AGENT_RESULT_BYTES - 1 ASCII bytes then one 4-byte char lands
+        // that char across the cut, since it starts one byte before the cap.
+        let raw = format!("{}{}", "x".repeat(MAX_AGENT_RESULT_BYTES - 1), '\u{1D518}');
+        assert!(!raw.is_char_boundary(MAX_AGENT_RESULT_BYTES));
+        let normalized = normalize_result(
+            AgentFlavor::Cli,
+            SessionId::new(),
+            AgentOutcome::Completed {
+                stop_reason: "exit_zero".to_owned(),
+            },
+            &raw,
+        );
+        assert!(normalized.text().len() <= MAX_AGENT_RESULT_BYTES);
     }
 
     #[test]

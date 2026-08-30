@@ -611,7 +611,7 @@ fn build_feedback(
     message.push_str(" confidence ");
     message.push_str(confidence.as_str());
     if message.len() > MAX_FEEDBACK_BYTES {
-        message.truncate(MAX_FEEDBACK_BYTES);
+        truncate_to_char_boundary(&mut message, MAX_FEEDBACK_BYTES);
     }
     RepairFeedback { message }
 }
@@ -619,9 +619,23 @@ fn build_feedback(
 fn feedback(message: &str) -> RepairFeedback {
     let mut truncated = message.to_owned();
     if truncated.len() > MAX_FEEDBACK_BYTES {
-        truncated = truncated[..MAX_FEEDBACK_BYTES].to_owned();
+        truncate_to_char_boundary(&mut truncated, MAX_FEEDBACK_BYTES);
     }
     RepairFeedback { message: truncated }
+}
+
+/// Truncates `s` to at most `max` bytes without panicking on a multi-byte
+/// character straddling the cut. `String::truncate`/slicing panics unless
+/// `max` is a char boundary; a byte-length check alone (`s.len() > max`)
+/// does not make a raw cut at `max` safe for arbitrary UTF-8 — `tool` and
+/// `model_family` in `build_feedback` come from the model/caller, not a
+/// fixed literal.
+fn truncate_to_char_boundary(s: &mut String, max: usize) {
+    let mut cut = max.min(s.len());
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
 }
 
 fn cancel_check(cancel: &CancellationToken) -> Result<(), RepairError> {
@@ -833,5 +847,22 @@ mod tests {
             RepairOutcome::Valid(_) => String::new(),
         };
         assert!(!message.contains("hunter2"));
+    }
+
+    #[test]
+    fn build_feedback_does_not_panic_when_model_family_straddles_the_cap() {
+        // "tool call was repaired for " is 27 bytes; 996 more ASCII bytes
+        // then a 4-byte char lands that char at bytes 1023..1027, so byte
+        // offset 1024 (MAX_FEEDBACK_BYTES) falls inside it, not on a
+        // boundary — model_family is caller/model-controlled, not a fixed
+        // literal, so this is reachable with real input.
+        let model_family = format!("{}{}", "a".repeat(996), '\u{1D518}');
+        let feedback = build_feedback(
+            &model_family,
+            "repo.read",
+            &[RepairRule::OptionalNullElision],
+            ConfidenceClass::Exact,
+        );
+        assert!(feedback.message.len() <= MAX_FEEDBACK_BYTES);
     }
 }

@@ -364,6 +364,58 @@ session: a well-tested shared primitive doesn't need re-proving at every call si
 suite (105 tests, up from 99: 6 new in `host_process.rs`, zero removed — confirmed via `#[test]` counts
 against the pre-fix commit) and `cargo build --workspace --tests` pass.
 
+**Fresh review pass, 2026-08-30, a different systemic bug: seven `str.truncate(N)`-after-byte-length-check
+sites across seven files in six crates can panic the whole process on a multi-byte character straddling the
+cut, contradicting each site's own "Maximum UTF-8 bytes" doc comment.** `String::truncate(new_len)` panics
+unless `new_len` is a char boundary — checking `s.len() > max` first does not make `s.truncate(max)` safe,
+since `max` can itself fall in the middle of a multi-byte character. Every site here guards a text field taken
+from external/model-controlled input (a diff body, a tool title, streamed model output, an external CLI
+agent's stdout, a repair-feedback model/tool name, collected trajectory text, a telemetry attribute value)
+where non-ASCII is entirely normal, not an edge case. Confirmed via direct repro before touching any fix code
+— `let mut s = "a".repeat(65535); s.push('é'); s.truncate(65536);` panics with `assertion failed:
+self.is_char_boundary(new_len)` — and via the standard temporary-revert cycle on one representative site
+(`crates/acp/src/v1.rs::tool_title`): reverting to raw `title.truncate(MAX_TOOL_TITLE_BYTES)` made the new
+test panic with that exact assertion, confirming the test genuinely catches the bug before the real fix was
+restored.
+
+**Fixed with the same small `truncate_to_char_boundary(s: &mut String, max: usize)` helper duplicated locally
+in each affected file** (walks back from `max` to the nearest char boundary before calling `s.truncate`) —
+duplicated rather than shared cross-crate since these six crates don't share a common low-level dependency for
+this, the same call made for `crates/mobile-sim`'s local `drain_capped` copy earlier in this document. Sites
+fixed, each with its own straddling-boundary regression test:
+- `crates/acp/src/v1.rs`: `FileDiff::new`/`file_edit_update` (`MAX_DIFF_BYTES`), `tool_title`
+  (`MAX_TOOL_TITLE_BYTES`), `text_from_payload` (`MAX_UPDATE_TEXT_BYTES`) — the highest-severity instance,
+  since this is a JSON-RPC handler shared by every ACP session; one bad event (an oversized diff/title/model-
+  output chunk with an unlucky UTF-8 boundary) would have killed the process for all sessions, not just the
+  offending one. 5 new tests.
+- `crates/security/src/scanners/external.rs::sanitize_text` (`MAX_REMEDIATION_BYTES`) — reachable because the
+  char-accumulation loop preceding the truncate only checks its own, different byte cap (`MAX_MESSAGE_BYTES`)
+  *before* pushing each char, so the loop can overshoot by up to 3 bytes past where the final truncate cuts.
+  1 new test.
+- `crates/tool-gateway/src/repair.rs`: `build_feedback` (model/tool name is caller-controlled, not a fixed
+  literal) and `feedback` (currently only called with fixed literals, fixed anyway since it's a general-purpose
+  private function). 1 new test on the reachable path.
+- `crates/trajectory/src/lib.rs::TrajectoryCollector::record` (`MAX_TEXT_BYTES`) — `text` is arbitrary observed
+  event content. 1 new test.
+- `crates/telemetry/src/lib.rs::RedactionPipeline::redact_text` (`MAX_ATTRIBUTE_VALUE_BYTES`) — subtler than
+  the others: the *original* text is already bound-checked before redaction, but canary substitution can
+  **grow** the string (the `[REDACTED:secret:<16 hex>]` placeholder is longer than a short needle), pushing an
+  untouched multi-byte character in the tail across the cap even though the pre-redaction text never came
+  close to it. 1 new test.
+- `apps/rapid/src/external_agents.rs::normalize_result` (`MAX_AGENT_RESULT_BYTES`) — `raw_text` is an external
+  CLI agent's own stdout (already passed through `String::from_utf8_lossy`, which guarantees valid UTF-8
+  overall but not that any given byte offset is a char boundary). 1 new test.
+- `crates/tui/src/panels/agents.rs::sanitize_preview` (`MAX_AGENT_TEXT_BYTES`) — fixed defensively but **not
+  currently reachable**: `MAX_PREVIEW_CHARS` (24) chars encode to at most 96 bytes, comfortably under
+  `MAX_AGENT_TEXT_BYTES` (128), so the truncate can never actually fire today. Fixed anyway since it's a one-
+  line change and removes a latent trap tied to two constants staying in this exact relationship — if either
+  changes later without someone re-deriving this bound, the trap goes live silently. 1 new test (of the helper
+  directly, since the call site itself isn't reachable).
+
+Full suites, each up by exactly its one new test: `acp` (46, up from 41), `security` (169, up from 168),
+`tui` (211, up from 210), `tool-gateway` (53, up from 52), `trajectory` (3, up from 2), `telemetry` (25, up
+from 24), `rapid` (328, up from 327). `cargo build --workspace --tests` passes.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
