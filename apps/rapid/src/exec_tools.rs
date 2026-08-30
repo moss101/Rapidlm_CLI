@@ -83,6 +83,14 @@ pub const MAX_SUBAGENT_REPORT_BYTES: usize = 16 * 1024;
 pub const MAX_SUBAGENT_SPAWNS_PER_TURN: u64 = 32;
 /// Hard byte cap for the plan file.
 pub const MAX_PLAN_BYTES: usize = 16 * 1024;
+/// Cumulative byte cap on MCP-registered tools eagerly injected into the
+/// advertised tool surface (Qwen Code's own cited number for the same
+/// problem — see `newtask.md` §1.3/#9). A misconfigured or adversarial MCP
+/// server can advertise arbitrarily many tools with arbitrarily large
+/// schemas, and every one is re-sent on every model request for the rest
+/// of the turn; this bounds the damage without building the fuller
+/// lazy-hydration (`search_tool`/`use_tool` meta-tools) redesign.
+pub const MAX_MCP_TOOL_SURFACE_BYTES: usize = 20 * 1024;
 /// Adopted subagent types (the names both reference CLIs standardized on).
 pub const AGENT_TYPES: &[&str] = &["general-purpose", "explore", "plan"];
 /// Tool name for fetching a web page (Claude `WebFetch` parity).
@@ -3498,17 +3506,35 @@ impl WorkspaceTools {
             ),
         ];
 
-        // Dynamically registered MCP tools.
+        // Dynamically registered MCP tools, bounded: first-registered-wins
+        // once the cumulative size crosses MAX_MCP_TOOL_SURFACE_BYTES (see
+        // its own doc comment for why this matters).
         if let Ok(registrations) = self.mcp_surface.lock() {
+            let mut budget_bytes = 0usize;
+            let mut omitted = 0usize;
             for (wire_name, _server, descriptor) in registrations.iter() {
                 let description = descriptor
                     .description
                     .clone()
                     .unwrap_or_else(|| format!("MCP tool {}", descriptor.name));
+                let schema_bytes = serde_json::to_string(&descriptor.input_schema)
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+                let entry_bytes = wire_name.len() + description.len() + schema_bytes;
+                if budget_bytes.saturating_add(entry_bytes) > MAX_MCP_TOOL_SURFACE_BYTES {
+                    omitted += 1;
+                    continue;
+                }
+                budget_bytes += entry_bytes;
                 surface.push(ToolSurface::new(
                     wire_name.clone(),
                     format!("[MCP] {description}"),
                     descriptor.input_schema.clone(),
+                ));
+            }
+            if omitted > 0 && self.trace_calls {
+                crate::exec_diag::stderr_line(&format!(
+                    "mcp tool surface: {omitted} tool(s) omitted past the {MAX_MCP_TOOL_SURFACE_BYTES}-byte cap"
                 ));
             }
         }
@@ -5659,6 +5685,44 @@ for line in sys.stdin:
             }
             other => panic!("expected MCP success, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mcp_tool_surface_is_bounded_and_first_registered_wins() {
+        let root = TempRoot::new("mcp-surface-cap");
+        let tools = permissive_workspace(&root.0);
+        // Each registration's schema alone is ~1 KB; enough entries blow
+        // past MAX_MCP_TOOL_SURFACE_BYTES (20 KB) well before running out.
+        let big_description = "x".repeat(1024);
+        {
+            let mut registrations = tools.mcp_surface.lock().expect("mcp surface");
+            for i in 0..40 {
+                registrations.push((
+                    format!("mcp__srv__tool{i}"),
+                    "srv".to_owned(),
+                    mcp::transport::McpToolDescriptor {
+                        name: format!("tool{i}"),
+                        description: Some(big_description.clone()),
+                        input_schema: serde_json::json!({}),
+                    },
+                ));
+            }
+        }
+        let surface = tools.tool_surface();
+        let mcp_tools = surface
+            .iter()
+            .filter(|t| t.name().starts_with("mcp__srv__"))
+            .count();
+        assert!(
+            mcp_tools < 40,
+            "the byte cap must omit some of the 40 registered tools: got {mcp_tools}"
+        );
+        assert!(mcp_tools > 0, "at least the earliest registrations must survive");
+        // First-registered-wins: tool0 always makes it in under the cap.
+        assert!(
+            surface.iter().any(|t| t.name() == "mcp__srv__tool0"),
+            "{surface:?}"
+        );
     }
 
     #[test]
