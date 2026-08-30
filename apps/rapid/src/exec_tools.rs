@@ -597,6 +597,14 @@ pub struct WorkspaceTools {
     /// requested via `web_fetch` this turn — see
     /// `MAX_TOTAL_FETCH_BYTES_PER_TURN`'s own doc comment for why.
     fetch_bytes: Arc<AtomicU64>,
+    /// Modbit `AGT-010`: bounded recursive delegation — nested delegation
+    /// off by default, an explicit max-depth profile only, never unbounded.
+    /// `true` for the top-level turn's own tools; a spawned subagent's
+    /// child tools have this set `false` (`disable_nested_spawn`) so
+    /// `task_spawn` is unavailable to it, capping delegation at depth 1 by
+    /// default. No opt-in "explicit max-depth profile" exists yet — that
+    /// half of `AGT-010` remains open, see `newtask.md` §2.2.
+    nested_spawn_allowed: bool,
 }
 
 impl WorkspaceTools {
@@ -632,6 +640,7 @@ impl WorkspaceTools {
             subagent_spawns: Arc::new(AtomicU64::new(0)),
             bytes_written: Arc::new(AtomicU64::new(0)),
             fetch_bytes: Arc::new(AtomicU64::new(0)),
+            nested_spawn_allowed: true,
         })
     }
 
@@ -763,6 +772,16 @@ impl WorkspaceTools {
         let mut tools = Self::open_with_permissions(root, permissions)?;
         tools.read_only = true;
         Ok(tools)
+    }
+
+    /// Cap delegation at depth 1 (Modbit `AGT-010`): `task_spawn` becomes
+    /// unavailable to these tools, both unadvertised (`tool_surface`) and
+    /// refused if called anyway (`execute_call_traced`) — the same
+    /// surface-plus-execution double guard `read_only` already uses for
+    /// write tools. Called on every subagent child's own tools
+    /// (`LiveSubagentRunner::run`), never on the top-level turn's.
+    pub fn disable_nested_spawn(&mut self) {
+        self.nested_spawn_allowed = false;
     }
 
     /// Attach the subagent runner (composition root only; children are built
@@ -950,6 +969,15 @@ impl WorkspaceTools {
                 call_id: call.call_id().to_owned(),
                 detail: Some(bounded_detail(
                     "this subagent scope is read-only; write tools are unavailable",
+                )),
+            });
+        }
+        if !self.nested_spawn_allowed && call.tool() == TASK_SPAWN_TOOL {
+            return Ok(ToolStepResult::Denied {
+                call_id: call.call_id().to_owned(),
+                detail: Some(bounded_detail(
+                    "nested delegation is disabled by default (Modbit AGT-010): a subagent \
+                     cannot itself spawn further subagents",
                 )),
             });
         }
@@ -3622,6 +3650,14 @@ impl ExecTools {
         }
     }
 
+    /// Cap delegation at depth 1 (Modbit `AGT-010`, no-op on the no-op
+    /// surface). See `WorkspaceTools::disable_nested_spawn`.
+    pub fn disable_nested_spawn(&mut self) {
+        if let Self::Workspace(tools) = self {
+            tools.disable_nested_spawn();
+        }
+    }
+
     /// The trusted workspace surface with an explicit permission lattice.
     pub fn workspace_with_permissions(
         root: &Path,
@@ -3657,6 +3693,9 @@ impl ToolDriver for WorkspaceTools {
         let mut surface = self.full_surface_impl();
         if self.read_only {
             surface.retain(|tool| tool_kind(tool.name()) == ToolKind::Read);
+        }
+        if !self.nested_spawn_allowed {
+            surface.retain(|tool| tool.name() != TASK_SPAWN_TOOL);
         }
         surface
     }
@@ -6542,6 +6581,56 @@ use std::sync::{Arc, Mutex};
         let surface: Vec<&str> = surface_owned.iter().map(|name| name.as_str()).collect();
         assert!(!surface.contains(&TASK_SPAWN_TOOL), "depth 1 enforced: {surface:?}");
         assert!(surface.contains(&REPO_READ_TOOL), "reads stay available");
+    }
+
+    #[test]
+    fn write_capable_subagent_children_cannot_spawn_further_subagents() {
+        let root = TempRoot::new("nested-spawn");
+        // Before disable_nested_spawn: a write-capable driver (the shape
+        // every non-explore/plan task_spawn child gets) keeps task_spawn in
+        // its own surface — confirming the bug this guards against was
+        // real, not hypothetical: nesting was unbounded for any
+        // write-capable agent_type before LiveSubagentRunner::run called
+        // disable_nested_spawn on the child it builds.
+        // BypassPermissions: nothing about the permission lattice itself
+        // should be what stops this call — the point of this test is that
+        // `disable_nested_spawn`'s own guard holds the line even when
+        // every other gate would let the call through.
+        let mut child = WorkspaceTools::open_with_permissions(
+            &root.0,
+            PermissionLattice::new(PermissionMode::BypassPermissions),
+        )
+        .expect("child");
+        let surface_before: Vec<String> =
+            child.tool_surface().iter().map(|tool| tool.name().to_owned()).collect();
+        assert!(
+            surface_before.iter().any(|name| name == TASK_SPAWN_TOOL),
+            "sanity check: a write-capable driver normally offers task_spawn"
+        );
+
+        child.disable_nested_spawn();
+        let surface_after: Vec<String> =
+            child.tool_surface().iter().map(|tool| tool.name().to_owned()).collect();
+        assert!(
+            !surface_after.iter().any(|name| name == TASK_SPAWN_TOOL),
+            "depth 1 enforced for write-capable children too: {surface_after:?}"
+        );
+        assert!(
+            surface_after.iter().any(|name| name == WORKSPACE_WRITE_TOOL),
+            "writes stay available"
+        );
+
+        // Defense in depth: even a call the model wasn't shown is refused,
+        // not silently dispatched.
+        let cancel = CancellationToken::new();
+        let call = make_call("c1", TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
+        let validated = child.validate(&call, &cancel).expect("validate");
+        match child.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Denied { detail, .. } => {
+                assert!(detail.expect("detail").contains("AGT-010"));
+            }
+            other => panic!("expected the nested spawn to be denied, got {other:?}"),
+        }
     }
 
     #[test]

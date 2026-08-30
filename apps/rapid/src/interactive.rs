@@ -1259,6 +1259,13 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             ExecTools::workspace_with_permissions(&self.root, child_permissions)
         }
         .map_err(|err| err.to_string())?;
+        // Bounded recursive delegation (Modbit AGT-010): a subagent must
+        // never itself spawn further subagents by default. Read-only
+        // children already lose task_spawn via the write-tool filter, but a
+        // write-capable child (the `else` branch above) previously kept it
+        // — unbounded nesting was possible for any non-explore/plan
+        // agent_type. See `newtask.md` §2.2.
+        tools.disable_nested_spawn();
         // Subagents run in the same trusted project as the parent (only
         // spawned when the workspace is trusted), so they get the same
         // AGENTS.md rules and system prompt as the top-level turn instead of

@@ -269,6 +269,31 @@ but cannot interrupt for new ones — escalate via the foreground parent).
 - **Guardrail (Modbit `AGT-010`, bounded recursive delegation):** nested delegation off by default; an
   explicit max-depth profile only, never unbounded. Also see `REJ-007` below.
 - **Sev/Effort:** P0 / M.
+- **`AGT-010` audited and fixed 2026-08-30 — real, exploitable unbounded nesting found, not hypothetical.**
+  Checked whether this guardrail already held given how much of §2.2 had already landed. It only half did:
+  `WorkspaceTools::open_read_only` (the `explore`/`plan` agent-type path) already excludes `task_spawn`
+  from its surface as a side effect of filtering to `ToolKind::Read` tools — confirmed by an existing test,
+  `depth 1 enforced`. But `task_spawn`'s *other* branch — any non-`explore`/`plan` agent type, which gets
+  a full write-capable `WorkspaceTools` via `open_with_permissions` — kept `task_spawn` in its own surface,
+  and `open_with_permissions` always builds a *fresh* `Arc::new(AtomicU64::new(0))` for
+  `subagent_spawns` (the `MAX_SUBAGENT_SPAWNS_PER_TURN` counter from §2.10's own correction) rather than
+  inheriting the parent's. Combined, this meant: a write-capable subagent could itself call `task_spawn`,
+  its child could too, and so on — unbounded in *depth*, with each level getting its own fresh budget of
+  32 (`32^depth` total possible spawns, not 32), the exact shape `AGT-010` explicitly names ("never
+  unbounded"). **Fixed:** new `WorkspaceTools::disable_nested_spawn()` (mirrors `read_only`'s own
+  surface-plus-execution double guard exactly — unadvertised in `tool_surface()`, refused in
+  `execute_call_traced()` if called anyway) called on every subagent child's own tools in
+  `LiveSubagentRunner::run` (`interactive.rs`), for both the read-only and write-capable branches alike —
+  the read-only branch already got this for free from its `ToolKind::Read` filter, but calling it there
+  too costs nothing and removes the asymmetry. This closes only the "off by default" half of `AGT-010`;
+  the "explicit max-depth profile" half (an opt-in, configurable way to allow depth > 1) does not exist
+  and was not attempted — the default is now correctly bounded, but there is no profile mechanism to widen
+  it deliberately if a future use case needs to. New test
+  `write_capable_subagent_children_cannot_spawn_further_subagents`: confirms `task_spawn` is present
+  before `disable_nested_spawn()` (proving the bug was real, not already-impossible), absent after, and
+  that a call attempted anyway under `BypassPermissions` (chosen specifically so no *other* gate would
+  have denied it first) is refused with an `AGT-010`-labeled reason. Full `-p rapid` suite (304 lib tests)
+  and `cargo build --workspace --tests` pass.
 - **Correction + partial fix (2026-08-30):** `AgentResultEnvelope`'s exact field list already exists —
   `crates/agent-runtime/src/agent/model.rs`'s `AgentResult` carries `summary, evidence, workspace_view,
   patch_summary, artifacts, claims, open_questions, blockers, context_lineage` (all with accessors) —
