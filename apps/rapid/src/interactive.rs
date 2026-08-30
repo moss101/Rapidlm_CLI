@@ -1097,6 +1097,17 @@ fn exec_permission_lattice(
             lattice = lattice.with_grants(patterns);
         }
     }
+    // Managed-policy tool ban (Modbit `CAP-001`, same layer as the mode
+    // ceiling above): applied unconditionally, since a pure addition to
+    // `denied_tools` has no lower-trust value to compare against — there is
+    // no "allow_tools" override checked earlier that could widen past it.
+    if let Some(patterns) = managed_policy.as_ref().and_then(|policy| policy.denied_tools()) {
+        eprintln!(
+            "warning: managed policy bans {} tool pattern(s) outright",
+            patterns.len()
+        );
+        lattice = lattice.with_denied_tools(patterns.iter().cloned());
+    }
     Ok(lattice)
 }
 

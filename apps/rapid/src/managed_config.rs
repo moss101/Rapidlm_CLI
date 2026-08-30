@@ -14,7 +14,11 @@
 //! * `max_permission_mode` lowers a resolved permission mode that exceeds
 //!   the ceiling (`gate_permission_mode`) — a project's `.rapidlm/
 //!   settings.json` or `RAPIDLM_PERMISSION_MODE` can request `bypassPermissions`,
-//!   but never actually get more than an admin allows.
+//!   but never actually get more than an admin allows;
+//! * `denied_tools` bans specific tools outright, applied as
+//!   `PermissionLattice::with_denied_tools` — checked before every rule,
+//!   grant, and mode (including `bypassPermissions`), so nothing downstream
+//!   can ever re-enable a banned tool.
 //!
 //! Every gate outcome is reported with field id, origin, and remediation so
 //! operators can see exactly which layer decided what.
@@ -143,6 +147,9 @@ pub struct ManagedPolicy {
     /// project's `.rapidlm/settings.json` or `RAPIDLM_PERMISSION_MODE` may
     /// only narrow what this allows, never widen past it.
     max_permission_mode: Option<crate::permissions::PermissionMode>,
+    /// Tools banned outright regardless of project/user settings or mode
+    /// (Modbit `CAP-001`), applied via `PermissionLattice::with_denied_tools`.
+    denied_tools: Option<Vec<crate::permissions::ToolPattern>>,
 }
 
 impl ManagedPolicy {
@@ -155,6 +162,7 @@ impl ManagedPolicy {
     /// allowed_providers = ["openai-compatible", "anthropic"]
     /// min_reasoning_effort = "high"
     /// max_permission_mode = "acceptEdits"
+    /// denied_tools = ["shell_exec"]
     /// ```
     pub fn parse(toml_str: &str) -> Result<Self, ManagedConfigError> {
         let value: toml::Value =
@@ -195,6 +203,7 @@ impl ManagedPolicy {
                     | "allowed_providers"
                     | "min_reasoning_effort"
                     | "max_permission_mode"
+                    | "denied_tools"
             ) {
                 return Err(ManagedConfigError::UnknownField {
                     field: format!("policy.{key}"),
@@ -297,11 +306,46 @@ impl ManagedPolicy {
                 Some(mode)
             }
         };
+        let denied_tools = match policy.get("denied_tools") {
+            None => None,
+            Some(raw) => {
+                let entries = raw.as_array().ok_or_else(|| {
+                    ManagedConfigError::PolicyField(field_error(
+                        "policy.denied_tools",
+                        "must be an array of tool names (optionally 'name(arg-glob)')",
+                    ))
+                })?;
+                let mut patterns = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let name = entry.as_str().ok_or_else(|| {
+                        ManagedConfigError::PolicyField(field_error(
+                            "policy.denied_tools",
+                            "entries must be strings",
+                        ))
+                    })?;
+                    let pattern = crate::permissions::ToolPattern::parse(name).ok_or_else(|| {
+                        ManagedConfigError::PolicyField(field_error(
+                            "policy.denied_tools",
+                            &format!("'{name}' is not a valid tool pattern"),
+                        ))
+                    })?;
+                    patterns.push(pattern);
+                }
+                if patterns.is_empty() {
+                    return Err(ManagedConfigError::PolicyField(field_error(
+                        "policy.denied_tools",
+                        "must not be empty; omit the key to ban nothing",
+                    )));
+                }
+                Some(patterns)
+            }
+        };
         Ok(Self {
             locked_default,
             allowed_providers,
             min_reasoning_effort,
             max_permission_mode,
+            denied_tools,
         })
     }
 
@@ -319,6 +363,10 @@ impl ManagedPolicy {
 
     pub fn max_permission_mode(&self) -> Option<crate::permissions::PermissionMode> {
         self.max_permission_mode
+    }
+
+    pub fn denied_tools(&self) -> Option<&[crate::permissions::ToolPattern]> {
+        self.denied_tools.as_deref()
     }
 }
 
@@ -586,7 +634,7 @@ base_url = "http://gateway.internal:8080"
     #[test]
     fn parse_reads_all_policy_fields_and_rejects_unknowns() {
         let policy = parse_policy(&policy_doc(
-            "locked_default = \"cloud\"\nallowed_providers = [\"anthropic\"]\nmin_reasoning_effort = \"high\"\nmax_permission_mode = \"acceptEdits\"\n",
+            "locked_default = \"cloud\"\nallowed_providers = [\"anthropic\"]\nmin_reasoning_effort = \"high\"\nmax_permission_mode = \"acceptEdits\"\ndenied_tools = [\"shell_exec\"]\n",
         ));
         assert_eq!(policy.locked_default(), Some("cloud"));
         assert_eq!(
@@ -597,6 +645,10 @@ base_url = "http://gateway.internal:8080"
         assert_eq!(
             policy.max_permission_mode(),
             Some(crate::permissions::PermissionMode::AcceptEdits)
+        );
+        assert_eq!(
+            policy.denied_tools(),
+            Some([crate::permissions::ToolPattern::parse("shell_exec").expect("pattern")].as_slice())
         );
         let bad = format!("schema = \"{MANAGED_SCHEMA}\"\nsurprise = 1\n[policy]\n");
         let err = ManagedPolicy::parse(&bad).expect_err("unknown field");
@@ -729,6 +781,18 @@ reasoning_effort = "low"
         let err = ManagedPolicy::parse(&policy_doc("max_permission_mode = \"godmode\"\n"))
             .expect_err("unknown mode");
         assert!(err.to_string().contains("not a permission mode"));
+    }
+
+    #[test]
+    fn parse_rejects_an_invalid_denied_tools_pattern() {
+        let err = ManagedPolicy::parse(&policy_doc("denied_tools = [\"\"]\n")).expect_err("bad pattern");
+        assert!(err.to_string().contains("not a valid tool pattern"));
+    }
+
+    #[test]
+    fn parse_rejects_an_empty_denied_tools_array() {
+        let err = ManagedPolicy::parse(&policy_doc("denied_tools = []\n")).expect_err("empty");
+        assert!(err.to_string().contains("must not be empty"));
     }
 
     #[test]

@@ -250,6 +250,12 @@ pub enum DecisionReason {
     /// lower-trust layer (a rule the child's own prompt could talk the
     /// model into proposing) may widen.
     WriteScopeViolation,
+    /// Denied by an admin/managed-policy tool ban (Modbit `CAP-001`'s Policy
+    /// Compiler: a hard, enterprise-level ceiling lower-trust layers — a
+    /// project's rules, a user's grants, even `bypassPermissions` — may
+    /// never widen past). Checked before every rule/grant/mode, same
+    /// precedence as `WriteScopeViolation`.
+    AdminToolDenied,
 }
 
 impl DecisionReason {
@@ -267,6 +273,7 @@ impl DecisionReason {
             Self::DontAskDeny => "dont_ask_deny",
             Self::UntrustedProject => "untrusted_project",
             Self::WriteScopeViolation => "write_scope_violation",
+            Self::AdminToolDenied => "admin_tool_denied",
         }
     }
 
@@ -285,6 +292,7 @@ impl DecisionReason {
             Self::DontAskDeny => "dontAsk mode silently refuses calls that are not pre-approved",
             Self::UntrustedProject => "the project is not trusted; every tool call is refused",
             Self::WriteScopeViolation => "outside the write scope this subagent was confined to",
+            Self::AdminToolDenied => "this tool is banned by managed policy; no setting can re-enable it",
         }
     }
 }
@@ -326,6 +334,11 @@ pub struct PermissionLattice {
     /// `DecisionReason::WriteScopeViolation`). `None`: no additional
     /// restriction, today's unscoped behavior.
     write_scope: Option<String>,
+    /// Tools an admin/managed policy has banned outright (Modbit `CAP-001`
+    /// Policy Compiler: an enterprise-level ceiling), checked before every
+    /// rule/grant/mode — see `DecisionReason::AdminToolDenied`. Empty:
+    /// no additional restriction, today's unmanaged behavior.
+    denied_tools: Vec<ToolPattern>,
 }
 
 impl PermissionLattice {
@@ -335,6 +348,7 @@ impl PermissionLattice {
             rules: Vec::new(),
             grants: Vec::new(),
             write_scope: None,
+            denied_tools: Vec::new(),
         }
     }
 
@@ -363,6 +377,16 @@ impl PermissionLattice {
         self
     }
 
+    /// Ban every tool matching `patterns` outright (Modbit `CAP-001`): no
+    /// rule, grant, or mode checked afterward — including `bypassPermissions`
+    /// — can re-allow one. Additive with any existing bans, never replaces
+    /// them, so an admin ceiling set once at construction can't be narrowed
+    /// away by a later call.
+    pub fn with_denied_tools(mut self, patterns: impl IntoIterator<Item = ToolPattern>) -> Self {
+        self.denied_tools.extend(patterns);
+        self
+    }
+
     pub const fn mode(&self) -> PermissionMode {
         self.mode
     }
@@ -373,6 +397,10 @@ impl PermissionLattice {
 
     pub fn write_scope(&self) -> Option<&str> {
         self.write_scope.as_deref()
+    }
+
+    pub fn denied_tools(&self) -> &[ToolPattern] {
+        &self.denied_tools
     }
 
     /// Lattice for a `task_spawn` child. The child is the model's own choice
@@ -396,6 +424,7 @@ impl PermissionLattice {
             rules: self.rules.clone(),
             grants: self.grants.clone(),
             write_scope: self.write_scope.clone(),
+            denied_tools: self.denied_tools.clone(),
         }
     }
 
@@ -403,6 +432,13 @@ impl PermissionLattice {
     /// rule-matching context (workspace-relative path for file tools, joined
     /// argv for `shell_exec`).
     pub fn evaluate(&self, tool: &str, subject: &str, class: ToolClass) -> Decision {
+        // -1. Admin/managed-policy tool ban, checked before absolutely
+        // everything else, including the write-scope ceiling below — the
+        // one restriction nothing downstream (a rule, a grant, any mode,
+        // including bypassPermissions) may ever widen past.
+        if self.denied_tools.iter().any(|pattern| pattern.matches(tool, subject)) {
+            return Decision::Deny(DecisionReason::AdminToolDenied);
+        }
         // 0. Write-scope ceiling, checked before everything else — a rule,
         // grant, or mode may only make a write *harder* to get inside the
         // scope, never widen past it. Scoped to genuine file-edit calls
@@ -791,6 +827,60 @@ mod tests {
         assert_eq!(
             child.evaluate("workspace_write", "docs/readme.md", ToolClass::FileEdit),
             Decision::Deny(DecisionReason::WriteScopeViolation)
+        );
+    }
+
+    #[test]
+    fn admin_denied_tools_win_over_bypass_permissions_and_allow_rules() {
+        // BypassPermissions plus an explicit allow rule would allow this
+        // call by every other mechanism the lattice has — the admin ban
+        // must still win over both.
+        let lattice = PermissionLattice::new(PermissionMode::BypassPermissions)
+            .with_rules(vec![ToolRule {
+                effect: RuleEffect::Allow,
+                pattern: ToolPattern::parse("shell_exec").expect("pattern"),
+            }])
+            .with_denied_tools([ToolPattern::parse("shell_exec").expect("pattern")]);
+
+        assert_eq!(
+            lattice.evaluate("shell_exec", "rm -rf /", ToolClass::Other),
+            Decision::Deny(DecisionReason::AdminToolDenied),
+            "an admin tool ban wins over bypassPermissions and an explicit allow rule alike"
+        );
+        // An unrelated tool is unaffected.
+        assert_eq!(
+            lattice.evaluate("workspace_read", "src/lib.rs", ToolClass::ReadOnly),
+            Decision::Allow(DecisionReason::ReadOnlyAutoAllow),
+        );
+    }
+
+    #[test]
+    fn admin_denied_tools_survive_for_subagent_narrowing() {
+        let parent = PermissionLattice::new(PermissionMode::Default)
+            .with_denied_tools([ToolPattern::parse("task_spawn").expect("pattern")]);
+        let child = parent.for_subagent();
+        assert_eq!(child.denied_tools().len(), 1);
+        assert_eq!(
+            child.evaluate("task_spawn", "explore", ToolClass::Other),
+            Decision::Deny(DecisionReason::AdminToolDenied)
+        );
+    }
+
+    #[test]
+    fn admin_denied_tools_respect_their_own_arg_glob() {
+        // A pattern with an arg glob only bans matching arguments, not the
+        // tool outright — same semantics as an ordinary deny rule's glob.
+        let lattice = PermissionLattice::new(PermissionMode::BypassPermissions)
+            .with_denied_tools([ToolPattern::parse("shell_exec(rm *)").expect("pattern")]);
+
+        assert_eq!(
+            lattice.evaluate("shell_exec", "rm -rf /tmp/x", ToolClass::Other),
+            Decision::Deny(DecisionReason::AdminToolDenied)
+        );
+        assert_eq!(
+            lattice.evaluate("shell_exec", "ls -la", ToolClass::Other),
+            Decision::Allow(DecisionReason::BypassAllow),
+            "a non-matching argv for the same tool is unaffected"
         );
     }
 

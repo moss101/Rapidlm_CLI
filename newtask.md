@@ -474,6 +474,28 @@ default; adopt the classifier-as-safety-net idea, not the classifier-as-default 
   (today's merge is a flat union of `.rapidlm/settings.json` + `.claude/settings.json` rules, with no
   concept of which layer "wins" a conflict beyond the two special-cased fields above) — real, separate
   design work.
+- **A second `CAP-001` dimension implemented 2026-08-30: `denied_tools` — an admin-level tool ban nothing
+  downstream can widen past.** `PermissionLattice` gained `denied_tools: Vec<ToolPattern>` (reusing the
+  existing `ToolPattern` type project/user deny rules already use — `Name` or `Name(arg-glob)`, same
+  parser) checked in `evaluate()` as step *-1*, before even the `write_scope` ceiling and every rule/grant/
+  mode including `bypassPermissions` — mirroring `write_scope`'s own precedent exactly (a lattice-level
+  ceiling checked first, not a rule appended to a list where insertion order would matter). Unlike
+  `max_permission_mode`, this needed no "gate" comparison function: a pure ban has no lower-trust value to
+  widen against, so `managed_config.rs`'s new `denied_tools: Option<Vec<ToolPattern>>` field (parsed from
+  a `policy.denied_tools = ["tool", "tool(arg-glob)"]` TOML array, validated against `ToolPattern::parse`
+  at load time) is applied unconditionally in `exec_permission_lattice` once loaded — no merge order to
+  get wrong, since there's no competing "allow_tools" layer to reconcile against. `for_subagent()` carries
+  `denied_tools` over unchanged, same as `write_scope`, so a banned tool stays banned for delegated work
+  too. New tests: `admin_denied_tools_win_over_bypass_permissions_and_allow_rules` (an explicit allow rule
+  plus `bypassPermissions` both present, the ban still wins), `admin_denied_tools_survive_for_subagent_
+  narrowing`, `admin_denied_tools_respect_their_own_arg_glob` (a pattern with an arg glob bans only
+  matching arguments, same semantics as an ordinary deny rule's glob) in `permissions.rs`, plus
+  `managed_config.rs` parse/validation tests (rejects an empty array, rejects an invalid pattern string,
+  reads a valid one back). Full `-p rapid` suite (313 lib tests) and `cargo build --workspace --tests`
+  pass. Still not attempted: the full multi-layer merge order noted above — this is one more absolute
+  ceiling added to the same "managed policy, applied once, never re-checked against a competing layer"
+  shape `max_permission_mode` already established, not the general merge-order primitive `CAP-001`/
+  `AuthorizationEpoch` actually ask for.
 
 ### 2.4 `CompletionContract` (tri-state) + `VerificationPlane`
 
