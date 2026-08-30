@@ -1071,6 +1071,30 @@ impl WorkspaceTools {
                 detail: Some(bounded_detail(&detail)),
             });
         }
+        if is_team_memory_path(&args.path) {
+            if let Some(note) =
+                scan_for_secrets_advisory(self.root(), &args.path, args.content.as_bytes())
+            {
+                // .rapidlm/MEMORY.md is git-committed and team-shared (Modbit
+                // row 12's `.qwen/team-memory/` parity): unlike an ordinary
+                // write, a likely secret here is never advisory-only. Verify
+                // before writing, same "never touch the real tree on a
+                // failure" discipline shadow diagnostics uses. A dismissed
+                // fingerprint (`rapid findings dismiss`) still unblocks —
+                // that dismissal already represents a human decision that
+                // it isn't a real secret.
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&format!(
+                        "write blocked: {} is git-committed, team-shared memory, where secret \
+                         scanning is mandatory, not advisory; redact and retry, or dismiss a \
+                         false positive first.\n{note}",
+                        args.path
+                    ))),
+                });
+            }
+        }
         if let Some(config) = self
             .shadow_diagnostics
             .as_ref()
@@ -2290,6 +2314,15 @@ fn walk_all_files(
 
 /// Pure relative-path checks shared by validation and execution: non-empty,
 /// bounded, no absolute form, no parent/root/prefix components.
+/// The one git-committed, team-shared memory file this codebase has today
+/// (`apps/rapid/src/host.rs::load_memory_index`) — narrower than Qwen's
+/// `.qwen/team-memory/` directory tier (Modbit row 12), but the part that
+/// makes `workspace_write`'s secret-scan gate here mandatory rather than
+/// advisory (see the call site in `execute_write`).
+fn is_team_memory_path(path: &str) -> bool {
+    path == ".rapidlm/MEMORY.md"
+}
+
 fn checked_relative(relative: &str) -> Result<&Path, ToolStepError> {
     if relative.is_empty() || relative.len() > MAX_TOOL_PATH_BYTES {
         return Err(ToolStepError::Invalid);
@@ -4198,6 +4231,78 @@ use std::sync::{Arc, Mutex};
             }
             other => panic!("expected clean success, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn writing_a_likely_secret_to_team_memory_is_blocked_not_advisory() {
+        let root = TempRoot::new("write-team-memory-block");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let token = format!("ghp_{}", "c".repeat(36));
+        let content = format!("- API token: {token}\n");
+        let call = ProposedToolCall::new(
+            "c1",
+            WORKSPACE_WRITE_TOOL,
+            &serde_json::to_string(&serde_json::json!({
+                "path": ".rapidlm/MEMORY.md",
+                "content": &content
+            }))
+            .expect("encode call"),
+        )
+        .expect("call");
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        let fingerprint = match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                let detail = detail.expect("detail");
+                assert!(detail.contains("write blocked"), "{detail}");
+                assert!(detail.contains("mandatory"), "{detail}");
+                let start = detail.find('(').expect("fingerprint present") + 1;
+                let end = detail[start..].find(')').expect("closing paren") + start;
+                detail[start..end].to_owned()
+            }
+            other => panic!("expected the write to be blocked, got {other:?}"),
+        };
+        // Never written: a blocked write must leave no trace.
+        assert!(!root.0.join(".rapidlm/MEMORY.md").exists());
+
+        // An ordinary file with the same content is advisory-only, never blocked.
+        let ordinary = ProposedToolCall::new(
+            "c2",
+            WORKSPACE_WRITE_TOOL,
+            &serde_json::to_string(&serde_json::json!({"path": "notes.md", "content": &content}))
+                .expect("encode call"),
+        )
+        .expect("call");
+        let validated = tools.validate(&ordinary, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("advisory: possible secret"), "{summary}");
+            }
+            other => panic!("expected an ordinary write to succeed, got {other:?}"),
+        }
+
+        // Dismissing the fingerprint unblocks the team-memory write too.
+        let canonical_root = tools.root().to_path_buf();
+        let mut store = crate::findings_store::FindingsStore::load(&canonical_root);
+        store.dismiss(&fingerprint, "test fixture, not a real secret");
+        store.save(&canonical_root).expect("save dismissal");
+        let retry = ProposedToolCall::new(
+            "c3",
+            WORKSPACE_WRITE_TOOL,
+            &serde_json::to_string(&serde_json::json!({
+                "path": ".rapidlm/MEMORY.md",
+                "content": &content
+            }))
+            .expect("encode call"),
+        )
+        .expect("call");
+        let validated = tools.validate(&retry, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { .. } => {}
+            other => panic!("expected the write to succeed after dismissal, got {other:?}"),
+        }
+        assert!(root.0.join(".rapidlm/MEMORY.md").exists());
     }
 
     #[test]
