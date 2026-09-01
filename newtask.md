@@ -967,6 +967,47 @@ Re-verify both before implementing rather than trusting the original row text.
   (`crates/tui`) this session has no prior tested familiarity with, unlike the `apps/rapid` core this
   session's other fixes are grounded in. Documenting the true scope precisely, rather than take a guess at
   a partial fix in unfamiliar territory, is the honest output of this pass.
+
+**Fresh review pass, 2026-08-31, `crates/kernel/src/ipc/server.rs::handle_connection` — an authenticated
+daemon only ever checked the client's grant once, at connect time, never again for the life of the
+connection.** `auth::local_daemon::SessionApiKind`'s own doc comment: "Session APIs that must not run before
+a live `ClientGrant`." `DaemonAuth::authorize_session_api`'s own doc comment: "Reject missing/wrong grants
+before any session API, including enumeration." But `handle_connection` ran the challenge/response handshake
+exactly once, then discarded the resulting grant (`let _ = &grant;`) and never referenced it again — every
+subsequent request on that connection went straight to `dispatch_method` with no re-check at all. Confirmed
+`authorize_session_api` and `enumerate_sessions` have zero callers anywhere in the workspace outside
+`local_daemon.rs`'s own tests before this fix — the function documented to gate "any session API" gated
+none of them in practice. **Concrete consequence:** `DaemonAuth::issue()` (token rotation — a normal,
+documented, callable-while-serving operation per its own `issue_rotates_token_and_invalidates_prior_
+challenges` test) is meant to invalidate prior credentials, but an already-open, already-authenticated
+connection kept full session-API access indefinitely regardless of rotation, since nothing on the request
+path ever re-consulted the daemon's current token state. Verified via the standard temporary-revert cycle:
+the new test failed at "must be rejected after rotation" against the reverted code (grant checked once,
+never again), confirming the test genuinely catches the gap, before the fix was restored. **Fixed:**
+`authorize_session_api` already re-validates a passed-in grant against the daemon's *current* token
+(`grant_mac` comparison inside `self.lock()`), so the fix is exactly "call it again per request" — no new
+crypto or state needed. Added `session_api_kind(method) -> Option<SessionApiKind>` (a clean 1:1 mapping for
+8 of the 9 wire methods `dispatch_method` actually handles; `Enumerate` has no corresponding wire method in
+this dispatch table at all) and threaded `auth`/`grant` through `handle_request` so every dispatched call
+re-authorizes against the live token before running, failing closed with the same `auth.required` response
+a rejected handshake already uses. New test `rotating_the_token_revokes_an_already_open_connections_session_
+apis`: authenticates a real connection via the full challenge/response protocol, confirms a call succeeds,
+rotates the token, confirms the *same* connection's next call is now rejected. **Latent, not yet actively
+firing:** confirmed via grep that `IpcServer::with_auth` and `kernel::ipc::client::DaemonClient` both have
+zero callers anywhere in `apps/` outside their own crate's tests — authenticated IPC isn't wired into any
+real daemon startup path today. **A second, related, deliberately-not-attempted gap surfaced investigating
+this:** `DaemonClient` (`crates/kernel/src/ipc/client.rs`, the only production IPC client in the workspace)
+implements no side of the auth challenge/response protocol at all — confirmed via `grep -i auth` returning
+zero matches in the whole file. Pairing an authenticated `IpcServer` with the real `DaemonClient` today fails
+every call (the client sends a request frame where the server expects a proof frame; the server's `auth.
+challenge` frame doesn't match any reply shape the client's decoder accepts) — a functional interop gap, not
+a security hole (fails closed, not open), but it means the fix above is not yet reachable through the only
+shipped client either. **Not attempted:** wiring real handshake support into `DaemonClient` needs a design
+decision this pass didn't make — the client's constructor has no notion of "the local daemon's identity/
+runtime dir" to construct an `auth::LocalDaemonClient` for proving, and disambiguating "does this server
+require auth at all" from the client side needs either a caller-supplied flag or a protocol-level signal,
+neither of which exists today. Full `kernel` crate suite (167 tests, up from 166) and `cargo build
+--workspace --tests` pass.
 - **Confirmed 2026-08-31, directly, why the "narrower" fix isn't actually narrow — the naive version of it
   would be a regression, not an improvement.** Traced the caller chain from `apply_kernel_action`
   (`interactive.rs:2358`) up: `dispatch_slash` propagates its error via `?` (`interactive.rs:2349`),

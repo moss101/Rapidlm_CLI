@@ -827,11 +827,12 @@ fn handle_connection<C>(
         },
         None => None,
     };
-    let _ = &grant;
     while !cancel.is_cancelled() {
         match read_frame(&mut stream, limits.max_frame_bytes) {
             Ok(body) => {
-                if let Err(err) = handle_request(&mut stream, &client, &cancel, limits, &body) {
+                if let Err(err) =
+                    handle_request(&mut stream, &client, &cancel, limits, &body, auth, grant.as_ref())
+                {
                     match err {
                         IpcError::Cancelled
                         | IpcError::Io
@@ -865,6 +866,8 @@ fn handle_request<C, W>(
     cancel: &CancellationToken,
     limits: IpcLimits,
     body: &[u8],
+    auth: Option<&auth::DaemonAuth>,
+    grant: Option<&auth::ClientGrant>,
 ) -> Result<(), IpcError>
 where
     C: KernelClient,
@@ -893,7 +896,46 @@ where
             );
         }
     };
+    // P10-002: the handshake at connect time only proves the grant was valid
+    // then — a daemon owner can rotate/revoke the token afterward (`auth::
+    // DaemonAuth::issue`) and an already-open connection must not keep
+    // running session APIs on the stale grant. Re-validate the same cached
+    // grant against the daemon's *current* token on every request, not just
+    // once at connect: `authorize_session_api` compares `grant`'s MAC
+    // against `self.lock()`'s live token, so a rotated token makes this
+    // fail closed exactly like a fresh connection presenting no proof would.
+    if let Some(auth) = auth
+        && let Some(kind) = session_api_kind(req.method.as_str())
+        && auth
+            .authorize_session_api(grant, kind, &auth::CancellationToken::new())
+            .is_err()
+    {
+        return write_transport_error(
+            writer,
+            &req.id,
+            IpcError::AuthRequired,
+            limits.max_frame_bytes,
+        );
+    }
     dispatch_method(writer, client, cancel, limits, &req)
+}
+
+/// Maps a wire method name onto the [`auth::SessionApiKind`] it must be
+/// authorized against. `None` for methods with no session-API gate (there
+/// are none today — every dispatched method below has a session-API kind).
+#[cfg(unix)]
+fn session_api_kind(method: &str) -> Option<auth::SessionApiKind> {
+    Some(match method {
+        "create_session" => auth::SessionApiKind::Create,
+        "get_session" => auth::SessionApiKind::Get,
+        "submit_turn" => auth::SessionApiKind::SubmitTurn,
+        "interrupt" => auth::SessionApiKind::Interrupt,
+        "subscribe" => auth::SessionApiKind::Subscribe,
+        "approve" => auth::SessionApiKind::Approve,
+        "fork_session" => auth::SessionApiKind::Fork,
+        "rewind" => auth::SessionApiKind::Rewind,
+        _ => return None,
+    })
 }
 
 #[cfg(unix)]
@@ -1853,6 +1895,96 @@ mod tests {
             ),
         );
         assert!(created.get("error").is_none(), "authenticated call succeeds");
+    }
+
+    #[test]
+    fn rotating_the_token_revokes_an_already_open_connections_session_apis() {
+        // The handshake only proves the grant was valid *at connect time*.
+        // A daemon owner can rotate the token afterward (DaemonAuth::issue)
+        // and an already-authenticated connection must not keep serving
+        // session APIs on the now-stale grant.
+        let tmp = TempIpc::create();
+        let runtime = temp_runtime("rotate");
+        let auth_cancel = auth::CancellationToken::new();
+        let daemon = std::sync::Arc::new(DaemonAuth::open(&runtime, &auth_cancel).expect("open"));
+        let _handle: DaemonTokenHandle = daemon.issue(&auth_cancel).expect("issue");
+        let server = IpcServer::bind(
+            ListenSpec::unix_socket(&tmp.sock),
+            tmp.client.clone(),
+            CancellationToken::new(),
+        )
+        .expect("bind")
+        .with_auth(daemon.clone());
+        let _guard = server.spawn().expect("spawn");
+
+        let mut stream = connect(&tmp.sock);
+        let challenge_frame = read_frame(&mut stream, MAX_FRAME_BYTES).expect("challenge frame");
+        let challenge_value: Value = serde_json::from_slice(&challenge_frame).expect("json");
+        let cid_hex = challenge_value["params"]["challenge_id"]
+            .as_str()
+            .expect("cid")
+            .to_owned();
+        let nonce_hex = challenge_value["params"]["nonce"]
+            .as_str()
+            .expect("nonce")
+            .to_owned();
+        let mut id_bytes = [0u8; 16];
+        id_bytes.copy_from_slice(&unhex(&cid_hex));
+        let mut nonce_bytes = [0u8; 32];
+        nonce_bytes.copy_from_slice(&unhex(&nonce_hex));
+        let challenge = auth::AuthChallenge::from_parts(id_bytes, nonce_bytes);
+        let client_auth =
+            auth::LocalDaemonClient::open(&runtime, &auth::CancellationToken::new()).expect("client open");
+        let proof = client_auth
+            .prove(&challenge, &auth::CancellationToken::new())
+            .expect("prove");
+        let proof_body = serde_json::json!({
+            "schema": 1u16,
+            "id": "auth-0",
+            "params": {
+                "challenge_id": proof.challenge_id_hex(),
+                "response": proof.response_hex(),
+            }
+        });
+        write_frame(&mut stream, &serde_json::to_vec(&proof_body).unwrap(), MAX_FRAME_BYTES)
+            .expect("write proof");
+
+        // The freshly authenticated connection can call a session API.
+        let created = exchange(
+            &mut stream,
+            &rpc(
+                "create_session",
+                "c1",
+                serde_json::json!({
+                    "project_id": ProjectId::new(),
+                    "actor": actor(),
+                    "trace_id": TraceId::new(),
+                }),
+            ),
+        );
+        assert!(created.get("error").is_none(), "call succeeds before rotation");
+
+        // Rotate the token — the daemon owner revoking/re-issuing while the
+        // connection stays open, exactly as `DaemonAuth::issue`'s own
+        // rotation test exercises.
+        let _rotated: DaemonTokenHandle = daemon.issue(&auth_cancel).expect("rotate");
+
+        // The same still-open connection must now be rejected, not keep
+        // running session APIs on the stale grant.
+        let rejected = exchange(
+            &mut stream,
+            &rpc(
+                "create_session",
+                "c2",
+                serde_json::json!({
+                    "project_id": ProjectId::new(),
+                    "actor": actor(),
+                    "trace_id": TraceId::new(),
+                }),
+            ),
+        );
+        let err = rejected.get("error").expect("must be rejected after rotation");
+        assert_eq!(err["code"], "auth.required");
     }
 
 }
