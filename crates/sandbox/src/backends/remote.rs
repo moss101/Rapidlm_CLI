@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use capability_broker::{CancellationToken, Capability, CapabilityLease};
 use protocol::{
@@ -1208,6 +1208,9 @@ fn require_proc_lease(lease: &CapabilityLease) -> Result<(), SandboxError> {
     if lease.capability() != Capability::ProcExec {
         return Err(SandboxError::LeaseInvalid);
     }
+    if lease.is_expired(Instant::now()) || lease.remaining_uses() == 0 {
+        return Err(SandboxError::LeaseInvalid);
+    }
     Ok(())
 }
 
@@ -1735,6 +1738,57 @@ capability = "fs.read"
         )
     }
 
+    /// A `ProcExec` lease issued far enough in the past (relative to real
+    /// wall-clock `Instant::now()`) that its default 60s TTL has already
+    /// elapsed — built by injecting a past `now` into `issue()`'s own
+    /// explicit-clock parameter, the same technique
+    /// `capability_broker::lease`'s own `expired_lease_is_rejected` test
+    /// uses, so nothing here actually sleeps.
+    fn expired_proc_lease() -> CapabilityLease {
+        let policies = proc_stack();
+        let capability = Capability::ProcExec;
+        let resource = ResourceDescriptor::Process(ProcessScope::new("test").expect("process"));
+        let actual = CanonicalAction::Resource {
+            capability,
+            resource: resource.clone(),
+        };
+        let request = ActionRequest::new(
+            principal(),
+            SessionId::new(),
+            capability,
+            resource,
+            actual,
+            "sandbox",
+        )
+        .expect("request");
+        let issued_at = Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .expect("earlier");
+        let decision = evaluate(&policies, &request, &CancellationToken::new()).expect("evaluate");
+        let approval = request_approval(&request, &decision, issued_at, &CancellationToken::new())
+            .expect("approval");
+        let approved = match approval
+            .resolve(
+                ApprovalChoice::Approve(ApprovalScopeId::Once),
+                &request,
+                issued_at,
+                &CancellationToken::new(),
+            )
+            .expect("resolve")
+        {
+            ApprovalResolution::Approved(approved) => approved,
+            ApprovalResolution::Denied => panic!("expected approved"),
+        };
+        issue(
+            &LeaseIssuer::from_key([0x42; 32]).expect("issuer"),
+            &approved,
+            &policies,
+            issued_at,
+            &CancellationToken::new(),
+        )
+        .expect("issue")
+    }
+
     fn fs_lease() -> CapabilityLease {
         issue_capability(
             Capability::FsRead,
@@ -2214,6 +2268,21 @@ capability = "fs.read"
         assert_eq!(
             backend.work_lease(&handle).expect_err("gone"),
             SandboxError::UnknownHandle
+        );
+    }
+
+    #[test]
+    fn require_proc_lease_rejects_an_already_expired_lease() {
+        let lease = expired_proc_lease();
+        assert!(lease.is_expired(Instant::now()));
+        let backend =
+            RemoteBackend::with_profile(issuer(), controller(), ready_profile()).expect("backend");
+        let live = CancellationToken::new();
+        assert_eq!(
+            backend
+                .prepare(&remote_sandbox_spec(), &lease, &live)
+                .expect_err("expired lease"),
+            SandboxError::LeaseInvalid
         );
     }
 

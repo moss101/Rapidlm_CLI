@@ -835,10 +835,41 @@ module doc says explicitly that wiring `apps/rapid` to prefer it over the existi
 `apps/rapid/src/exec_tools.rs` is separate follow-up work not attempted here — but a real, demonstrable defect
 in output handling worth having fixed before that wiring happens. (Found via a background review agent
 targeting `crates/sandbox` — a crate not previously reviewed this session — dispatched with the same
-recurring-bug-shape checklist used throughout this document; the same pass also flagged a `CapabilityLease`
-expiry check missing from `crates/sandbox/src/backends/remote.rs::require_proc_lease`, and a follow-up deep
-pass on `remote.rs` separately flagged a self-referential worker-identity check in `RemoteWorkLease::verify`'s
-only call site — both still being investigated/fixed as a follow-up to this entry.)
+recurring-bug-shape checklist used throughout this document; the same pass also flagged the
+`require_proc_lease` gap fixed in the next entry below, and a follow-up deep pass on `remote.rs` separately
+flagged a self-referential worker-identity check in `RemoteWorkLease::verify`'s only call site, not yet acted
+on as of this entry.)
+
+**Fresh review pass, 2026-09-02, `crates/sandbox/src/backends/remote.rs::require_proc_lease` — the sole
+backend, of five, that never checked a `CapabilityLease`'s expiry or remaining-uses before honoring it.**
+The identically-named, identically-purposed helper in all four sibling backends
+(`host_restricted.rs:1146-1154`, `container.rs`, `gvisor.rs`, `seatbelt.rs`) checks
+`lease.is_expired(Instant::now()) || lease.remaining_uses() == 0` in addition to the capability-type match;
+`remote.rs`'s version checked only `lease.capability() != Capability::ProcExec`, silently accepting a lease
+whose authorization window had already closed. `RemoteBackend` is also, per `IsolationStrength::of_tier`, the
+*strongest* isolation tier (`SandboxTier::RemoteWorker`/`MicroVm`) of the five — the one exception is on the
+highest-privilege path, not a lower one. Note `remote.rs` separately tracks its own `RemoteWorkLease`'s expiry
+(`spec.expires_at_unix_ms`) — that gates the remote-worker *assignment* `prepare()` mints, a distinct object
+from the caller-supplied `CapabilityLease` authorization grant this fix addresses; a fresh `RemoteWorkLease`
+can be minted from a `CapabilityLease` that is itself already expired. Reproduced via the standard
+temporary-revert cycle without any real waiting: `capability_broker::lease::issue`'s own signature takes an
+explicit `now: Instant` parameter (the same injection point `capability-broker`'s own
+`expired_lease_is_rejected` test uses), so a lease built with `now = Instant::now() - 120s` has an
+already-past `expires_at` (default TTL is a fixed 60s, confirmed via `LeaseConstraints::DEFAULT_MAX_TTL_SECS`
+— not independently overridable through the policy TOML schema, so this injection is the only fast way to get
+a genuinely expired lease here) — `backend.prepare()` with this lease succeeded against the reverted code
+(panicking the test with a live `SandboxHandle` instead of the expected error) and correctly returned
+`SandboxError::LeaseInvalid` once the fix was restored. **Fixed:** added the same
+`is_expired`/`remaining_uses` check the other four backends already use. New test
+`require_proc_lease_rejects_an_already_expired_lease`. (The `remaining_uses() == 0` half is, by inspection of
+`capability_broker::lease`, unreachable through the real issuance path today — `remaining_uses` is a fixed
+snapshot of `constraints.max_uses()` set once at `issue()` and never decremented on the `CapabilityLease`
+object itself, and `issue()` itself rejects `max_uses() == 0` — but it's added for parity with the other four
+backends' identical check and as a defensive backstop against a future lease representation that does
+decrement it.) Full `sandbox` crate suite (99 tests, up from 98) and `cargo build --workspace --tests` pass.
+**Latent, not yet actively firing:** confirmed via `grep -rln "RemoteBackend\|SandboxTier::RemoteWorker"
+apps/` (zero matches) that this backend is exercised only by its own crate's tests today; `apps/rapid/src/
+sandbox_exec.rs` registers only `HostRestrictedBackend`.
 
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
