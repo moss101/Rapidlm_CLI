@@ -758,6 +758,26 @@ exercise the race itself, the same testability ceiling documented for the origin
 the TOCTOU-closing property rests on the read now being a single bounded operation, verifiable by inspection).
 Full `agent-runtime` crate suite (274 tests, up from 273) and `cargo build --workspace --tests` pass.
 
+**Fresh review pass, 2026-08-31, `apps/rapid/src/web_fetch.rs::is_private_ip` — the IPv6 arm was missing the
+link-local check its own IPv4 sibling has, a real SSRF bypass in the live, model-callable `web_fetch` tool.**
+The module's own doc comment: "loopback/private/link-local are refused by default." The `IpAddr::V4` arm
+correctly checks `is_loopback() || is_private() || is_link_local() || is_unspecified() || is_broadcast()`, but
+the `IpAddr::V6` arm only checked `is_loopback() || is_unspecified() || <manual fc00::/7 ULA bitmask>` —
+`fe80::/10` (IPv6 link-local, the direct sibling of the IPv4 check `169.254.0.0/16` catches) was never
+checked at all. Confirmed and reproduced standalone before touching any fix code:
+`is_private_ip("fe80::1".parse().unwrap())` returns `false` against the un-fixed code, and
+`classify_fetch("http://[fe80::1]/x", &[])` returns `Ok(())` — the SSRF guard would let the live `web_fetch`
+tool (confirmed via `apps/rapid/src/exec_tools.rs::WEB_FETCH_TOOL` → `execute_web_fetch` →
+`crate::web_fetch::fetch_page` → `classify_fetch`, one of the 15 real model-callable tools) fetch an
+IPv6 link-local address with no refusal, exactly the class of address the module doc promises is blocked by
+default. Verified via the standard temporary-revert cycle: the new test failed with `unwrap_err()` called on
+an `Ok` value against the reverted code, confirming the test genuinely catches the gap, before the fix was
+restored. **Fixed:** added `v6.is_unicast_link_local()` (the direct IPv6 counterpart to `Ipv4Addr::
+is_link_local()`) to the V6 match arm. New test `classify_refuses_ipv6_link_local_without_allowlist`. This is
+the highest-severity, most clearly *live* finding from this document's stat-then-read/gate-asymmetry sweep —
+not a latent, unwired module, but an actively-shipped security guard on a real tool a model can call today.
+Full `rapid` crate suite (332 tests, up from 331) and `cargo build --workspace --tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

@@ -97,7 +97,10 @@ fn is_private_ip(ip: IpAddr) -> bool {
                 || v4.is_broadcast()
         }
         IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xfe00) == 0xfc00
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unicast_link_local()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
         }
     }
 }
@@ -289,6 +292,15 @@ mod tests {
         let refusal = classify_fetch("http://192.168.1.10/x", &[]).unwrap_err();
         assert!(matches!(refusal, FetchRefusal::PrivateTargetBlocked { .. }));
         let refusal = classify_fetch("http://[::1]/x", &[]).unwrap_err();
+        assert!(matches!(refusal, FetchRefusal::PrivateTargetBlocked { .. }));
+    }
+
+    #[test]
+    fn classify_refuses_ipv6_link_local_without_allowlist() {
+        // fe80::/10: the module doc promises "loopback/private/link-local are
+        // refused by default" — the IPv4 arm already checks is_link_local(),
+        // this pins down the IPv6 sibling doing the same.
+        let refusal = classify_fetch("http://[fe80::1]/x", &[]).unwrap_err();
         assert!(matches!(refusal, FetchRefusal::PrivateTargetBlocked { .. }));
     }
 
