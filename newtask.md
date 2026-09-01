@@ -871,6 +871,39 @@ decrement it.) Full `sandbox` crate suite (99 tests, up from 98) and `cargo buil
 apps/` (zero matches) that this backend is exercised only by its own crate's tests today; `apps/rapid/src/
 sandbox_exec.rs` registers only `HostRestrictedBackend`.
 
+**Fresh review pass, 2026-09-02, `crates/sandbox/src/backends/remote.rs::RemoteBackend::exec` — the
+worker-identity half of `RemoteWorkLease::verify` was a tautology at its only call site.** `verify`'s own
+parameter shape (`controller_id: ControllerId, worker_id: WorkerId`) exists to check the lease's embedded
+identity against an independently-known "expected" identity — the `controller_id` side of the same call
+already does this correctly, passing `self.controller_id` (the backend's own authoritative field). But the
+`worker_id` argument was `work_lease.worker_id` — the lease's own field, read off the very value being
+checked and handed right back to itself. `self.worker_id != worker_id` inside `verify` (lease.rs:837)
+collapses to `work_lease.worker_id != work_lease.worker_id`, unconditionally `false`; the check could never
+fail regardless of which worker is actually attached to the backend when `exec()` runs. Confirmed via the
+standard temporary-revert cycle: with a real, executable reproduction — `prepare()` a sandbox against
+`ready_profile()`, `attach_profile(other_ready_profile())` to swap in a different `WorkerId` before calling
+`exec()` on the same handle — the reverted code's `exec()` still reached its final `Err(SandboxError::
+HealthFailed)` fallthrough line (the module's own "no real Firecracker transport" stub) because `verify()`
+silently passed despite the worker swap, and the test failed asserting `HealthFailed == LeaseInvalid`;
+restoring the fix made `verify()` correctly reject with `LeaseInvalid` before ever reaching that fallthrough.
+**Fixed:** replaced `work_lease.worker_id` with `self.profile.as_ref().ok_or(TierUnavailable)?.id` — the
+backend's actual currently-attached worker, the same field `prepare()` itself uses when first minting the
+work lease. New test `exec_rejects_a_lease_bound_to_a_worker_no_longer_attached`. Full `sandbox` crate suite
+(100 tests, up from 99) and `cargo build --workspace --tests` pass. **Currently masked, not latent in the
+usual "unwired" sense:** this bug lives inside the same `RemoteBackend`/`SandboxTier::RemoteWorker` path the
+entry above already establishes has zero callers under `apps/` — but unlike that entry, even the crate's own
+`exec()` can't observe the consequence yet, since the very next line unconditionally fails closed with
+`HealthFailed` before any real dispatch happens. The check was dead code with no externally visible effect
+today, and would have stayed silently broken the moment a real Firecracker dispatch got wired in after that
+stub — worth fixing now while it's cheap and isolated, rather than after that wiring lands. (Found by the same
+background review agent's deep follow-up pass on `remote.rs`, dispatched after its first pass flagged the
+`require_proc_lease` gap fixed in the entry above; that same follow-up pass also flagged a lower-confidence,
+architectural note — `RemoteSandboxSpec::from_sandbox_spec`'s "required attestations" and `issue_work_lease`'s
+"presented attestations" are both read from the same `self.profile.attestations` field with nothing external
+in between, making `verify_required_attestations` tautological along this one wiring too, though the
+verification machinery itself is not broken — not acted on this pass; flagging here so it isn't
+independently rediscovered.)
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

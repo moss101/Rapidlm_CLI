@@ -1166,13 +1166,19 @@ impl SandboxBackend for RemoteBackend {
             return Err(SandboxError::OutputLimitInvalid);
         }
         let now = SystemTime::now();
-        work_lease.verify(
-            &self.issuer,
-            self.controller_id,
-            work_lease.worker_id,
-            now,
-            cancel,
-        )?;
+        // `worker_id` must be the backend's *currently attached* worker, not
+        // the lease's own field read back at itself — `work_lease.worker_id
+        // != work_lease.worker_id` is unconditionally false, which silently
+        // skipped the whole point of this check: catching a lease minted for
+        // a worker the backend is no longer attached to (e.g. after
+        // `attach_profile` swaps in a different worker between `prepare()`
+        // and `exec()`).
+        let attached_worker = self
+            .profile
+            .as_ref()
+            .ok_or(SandboxError::TierUnavailable)?
+            .id;
+        work_lease.verify(&self.issuer, self.controller_id, attached_worker, now, cancel)?;
         // No Firecracker transport in this protocol task. Fail closed; not a pass.
         Err(SandboxError::HealthFailed)
     }
@@ -1599,6 +1605,23 @@ mod tests {
         WorkerProfile::new(
             WorkerId::from_runtime(
                 RuntimeId::from_str("018f3c8a-7e2b-7a10-8c4d-0123456789ab").expect("worker"),
+            ),
+            WorkerPlatform::LinuxKvm,
+            [
+                platform_attestation(),
+                firecracker_attestation(),
+                jailer_attestation(),
+            ],
+        )
+        .expect("profile")
+    }
+
+    /// Same shape as [`ready_profile`], different `WorkerId` — a distinct
+    /// worker the backend could be re-attached to via `attach_profile`.
+    fn other_ready_profile() -> WorkerProfile {
+        WorkerProfile::new(
+            WorkerId::from_runtime(
+                RuntimeId::from_str("018f3c8a-7e2b-7a10-8c4d-0123456789ff").expect("worker"),
             ),
             WorkerPlatform::LinuxKvm,
             [
@@ -2268,6 +2291,30 @@ capability = "fs.read"
         assert_eq!(
             backend.work_lease(&handle).expect_err("gone"),
             SandboxError::UnknownHandle
+        );
+    }
+
+    #[test]
+    fn exec_rejects_a_lease_bound_to_a_worker_no_longer_attached() {
+        let mut backend =
+            RemoteBackend::with_profile(issuer(), controller(), ready_profile()).expect("backend");
+        let lease = proc_lease();
+        let live = CancellationToken::new();
+        let handle = backend
+            .prepare(&remote_sandbox_spec(), &lease, &live)
+            .expect("prepare");
+        // A different worker is now attached — the work lease `prepare()`
+        // minted is still bound to the original worker's id.
+        backend
+            .attach_profile(other_ready_profile())
+            .expect("attach");
+        let request =
+            SandboxExecRequest::new(["/bin/true"], Duration::from_secs(2), 4096).expect("request");
+        assert_eq!(
+            backend
+                .exec(&handle, &request, &lease, &live)
+                .expect_err("stale worker binding must be rejected"),
+            SandboxError::LeaseInvalid
         );
     }
 
