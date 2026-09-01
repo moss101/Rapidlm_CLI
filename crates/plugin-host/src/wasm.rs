@@ -1470,7 +1470,7 @@ impl PluginInstance {
         let deadline = Instant::now() + self.limits.max_duration;
         let mut fuel = self.limits.max_fuel;
         let mut stack: Vec<Val> = Vec::new();
-        self.call_inner(func_idx, args, &mut stack, &mut fuel, deadline, cancel)?;
+        self.call_inner(func_idx, args, &mut stack, &mut fuel, deadline, cancel, 0)?;
         let arity = self.func(func_idx)?.ty.results.len();
         if stack.len() < arity {
             return Err(WasmError::Trap);
@@ -1486,6 +1486,7 @@ impl PluginInstance {
         fuel: &mut u64,
         deadline: Instant,
         cancel: &CancellationToken,
+        depth: usize,
     ) -> Result<(), WasmError> {
         let header = self.func(func_idx)?.clone();
         match header.kind {
@@ -1575,7 +1576,17 @@ impl PluginInstance {
                     return Ok(());
                 }
                 Op::Call { func } => {
-                    if labels.len() + 1 > self.limits.max_stack_frames {
+                    // `labels` only tracks Block/Loop/If nesting within this
+                    // one activation and is reset to empty on every call
+                    // (including this recursive one) — it can never bound
+                    // cross-call recursion depth. `depth` is the real native
+                    // call-stack depth accumulated across `call_inner`
+                    // invocations; a guest that recurses without pushing any
+                    // structured-control labels (e.g. one bare self-call)
+                    // must still be stopped here, or it overflows the real
+                    // OS thread stack — an uncatchable process abort, not a
+                    // contained trap — long before fuel could exhaust it.
+                    if depth + 1 > self.limits.max_stack_frames {
                         return Err(WasmError::StackOverflow);
                     }
                     let callee = self.func(func)?.clone();
@@ -1583,7 +1594,7 @@ impl PluginInstance {
                         return Err(WasmError::Trap);
                     }
                     let args = stack.split_off(stack.len() - callee.ty.params.len());
-                    self.call_inner(func, &args, stack, fuel, deadline, cancel)?;
+                    self.call_inner(func, &args, stack, fuel, deadline, cancel, depth + 1)?;
                     pc += 1;
                 }
                 Op::Drop => {
@@ -2164,6 +2175,18 @@ mod tests {
         ])
     }
 
+    /// A single exported function whose body is nothing but `call 0` (itself)
+    /// followed by `end` — no block/loop/if, so it pushes zero structured
+    /// control labels on every activation.
+    fn self_recursive_wasm() -> Vec<u8> {
+        module(&[
+            type_section(&[&fn_type(&[], &[])]),
+            function_section(&[0]),
+            export_func("call", 0),
+            code_section(&[vec![0x00, 0x10, 0x00, 0x0b]]),
+        ])
+    }
+
     fn host_call_wasm(module_name: &str, field: &str) -> Vec<u8> {
         module(&[
             type_section(&[
@@ -2262,6 +2285,30 @@ mod tests {
             .expect_err("memory bomb must terminate");
         assert_eq!(err, WasmError::MemoryLimit);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn bare_self_recursion_is_stopped_by_max_stack_frames() {
+        // A guest function that calls itself with no Block/Loop/If never
+        // pushes a structured-control label, so a check keyed on label
+        // nesting can never see this recursion — it must be bounded by real
+        // call-stack depth instead, or it native-stack-overflows the host
+        // process (an uncatchable abort) well before `tight_limits()`'s
+        // 2_000-unit fuel cap could stop it.
+        let err = WasmPluginHost::new(tight_limits())
+            .instantiate(
+                &self_recursive_wasm(),
+                &load_manifest_ok(),
+                &[],
+                &CancellationToken::new(),
+            )
+            .expect("instantiate")
+            .call(
+                &PluginRequest::new("run", "{}").expect("req"),
+                &CancellationToken::new(),
+            )
+            .expect_err("unbounded self-recursion must be rejected");
+        assert_eq!(err, WasmError::StackOverflow);
     }
 
     #[test]

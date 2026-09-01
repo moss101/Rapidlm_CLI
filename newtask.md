@@ -778,6 +778,39 @@ the highest-severity, most clearly *live* finding from this document's stat-then
 not a latent, unwired module, but an actively-shipped security guard on a real tool a model can call today.
 Full `rapid` crate suite (332 tests, up from 331) and `cargo build --workspace --tests` pass.
 
+**Fresh review pass, 2026-09-01, `crates/plugin-host/src/wasm.rs::PluginInstance::call_inner` — the
+`max_stack_frames` sandbox limit never actually bounded guest recursion, because the only check comparing
+against it counted the wrong thing.** The module's own framing: "Capability-isolated... explicit fuel,
+wall-clock, and memory bounds," backed by `ResourceLimits::max_stack_frames` / `HARD_MAX_STACK_FRAMES` and a
+dedicated `WasmError::StackOverflow` variant that implies guest recursion fails closed once it's exceeded. The
+`Op::Call` handler instead checked `labels.len() + 1 > self.limits.max_stack_frames` — `labels` is the
+Block/Loop/If structured-control-nesting stack local to one `call_inner` activation, freshly (re-)declared
+`Vec::new()` on *every* call, including the recursive one, so it can never reflect depth accumulated across
+calls. A guest function that does nothing but call itself (`call $self` with no surrounding block/loop/if)
+keeps `labels` permanently empty at the check site — the condition `0 + 1 > max_stack_frames` is never true, no
+matter how deep the real native recursion goes — so the interpreter recurses on the actual OS thread stack
+until it exhausts it: an uncatchable process abort (`SIGABRT` via Rust's stack-overflow guard-page handler),
+not a contained `Trap`, directly defeating the sandbox's own stated purpose of bounding untrusted guest
+execution. Reproduced concretely before touching any fix code: a minimal hand-built WASM module (single
+exported function, body = `call 0; end`, i.e. it calls itself) run under `tight_limits()`
+(`max_stack_frames: 32`) crashed the entire test binary — `thread ... has overflowed its stack` / `fatal
+runtime error: stack overflow, aborting` / `signal: 6, SIGABRT` — confirming the check never fires for this
+shape of recursion. **Fixed:** threaded a real `depth: usize` parameter through `call_inner` (incremented by
+`call_inner`'s own recursive call site, seeded at `0` from `run_func`'s outer call) and changed the `Op::Call`
+guard to `if depth + 1 > self.limits.max_stack_frames { return Err(WasmError::StackOverflow) }` — a counter
+that actually reflects native call-stack depth across activations, unlike `labels`. New test
+`bare_self_recursion_is_stopped_by_max_stack_frames`, verified via the standard temporary-revert cycle: with
+the guard reverted back to `labels.len() + 1`, the test run genuinely reproduces the crash described above
+(`cargo test` process aborts with `SIGABRT`, not a graceful test failure); restoring the fix makes the same
+test pass cleanly (`Err(WasmError::StackOverflow)`) in under a millisecond. Full `plugin-host` crate suite
+(118 tests, up from 117) and `cargo build --workspace --tests` pass. **Latent, not yet actively firing:**
+confirmed via `grep -rln "PluginInstance::\|wasm::.*::call\b\|plugin_host::wasm" apps/` (zero matches) that
+this WASM execution path has no caller anywhere in `apps/rapid` today — the same "mechanism is broken but not
+yet wired into a real command" shape this document has already found repeatedly (§0a's `crates/sandbox`/
+`crates/capability-broker` notes above) — but a genuine, reproducible denial-of-service against the *host*
+process (not just the guest) in a component whose entire purpose is running untrusted code safely, worth
+having fixed before anything wires a real plugin-install command up to it.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
