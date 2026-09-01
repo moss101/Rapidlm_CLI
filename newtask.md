@@ -811,6 +811,35 @@ yet wired into a real command" shape this document has already found repeatedly 
 process (not just the guest) in a component whose entire purpose is running untrusted code safely, worth
 having fixed before anything wires a real plugin-install command up to it.
 
+**Fresh review pass, 2026-09-02, `crates/sandbox/src/backends/seatbelt.rs::read_capped` — the only one of
+this crate's four near-identical `read_capped` helpers that doesn't drain the pipe past the output cap.**
+`host_restricted.rs:889-912`, `container.rs`, and `gvisor.rs` all implement the same "cap the buffered bytes,
+then keep reading (and discarding) until EOF" shape once the cap is hit — `seatbelt.rs`'s version instead
+`return`ed the moment `buf.len() >= cap`, dropping `pipe` (the child's `ChildStdout`/`ChildStderr`) immediately
+and never reading anything the peer still had queued. Reproduced directly, without any sandbox/process
+machinery, by unit-testing the free function itself: a `UnixStream::pair()` with one side spawned to
+`write_all` a 4MiB payload (chosen to exceed both the 4096-byte cap and any realistic OS socket buffer) while
+the other side is handed to `read_capped`. Against the unfixed code, `read_capped` returns after the first
+~8KB read, dropping the reader half of the pair — the writer thread's still-in-flight `write_all` immediately
+fails with `Os { code: 32, kind: BrokenPipe, .. }` instead of completing, confirmed by running the new test
+against the reverted code before restoring the fix. (The originally-hypothesized failure mode for the
+equivalent real-child-process case was an infinite `write(2)` block rather than a broken pipe — not
+independently re-verified here since it depends on pipe-vs-socket and signal-disposition specifics the test
+doesn't need to settle; either way, the underlying defect is the same: the reader stops servicing the pipe
+while the peer still has output queued, and normal completion breaks.) **Fixed:** ported the same
+drain-to-EOF loop the three sibling backends already use. New test
+`read_capped_drains_the_pipe_past_the_cap_so_the_writer_never_blocks`. Full `sandbox` crate suite (98 tests,
+up from 97) and `cargo build --workspace --tests` pass. **Latent, not yet actively firing:** confirmed via
+`grep -rln "SeatbeltBackend"` that this backend has zero callers outside the crate's own tests — its own
+module doc says explicitly that wiring `apps/rapid` to prefer it over the existing job-based Seatbelt path in
+`apps/rapid/src/exec_tools.rs` is separate follow-up work not attempted here — but a real, demonstrable defect
+in output handling worth having fixed before that wiring happens. (Found via a background review agent
+targeting `crates/sandbox` — a crate not previously reviewed this session — dispatched with the same
+recurring-bug-shape checklist used throughout this document; the same pass also flagged a `CapabilityLease`
+expiry check missing from `crates/sandbox/src/backends/remote.rs::require_proc_lease`, and a follow-up deep
+pass on `remote.rs` separately flagged a self-referential worker-identity check in `RemoteWorkLease::verify`'s
+only call site — both still being investigated/fixed as a follow-up to this entry.)
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

@@ -529,6 +529,21 @@ fn read_capped(mut pipe: impl Read, cap: usize) -> Vec<u8> {
                 let take = n.min(room);
                 buf.extend_from_slice(&tmp[..take]);
                 if buf.len() >= cap {
+                    // The cap is hit, but the writer may still have more
+                    // queued. Returning immediately drops `pipe` here, which
+                    // closes the read end while the peer still has data
+                    // in flight — the peer's next write then fails (broken
+                    // pipe) or blocks, instead of completing normally, since
+                    // nobody is draining its output anymore. Keep reading
+                    // (and discarding) until EOF instead, mirroring the
+                    // sibling backends' `read_capped` (host_restricted.rs,
+                    // container.rs, gvisor.rs).
+                    let mut drain = [0u8; 8192];
+                    while let Ok(read) = pipe.read(&mut drain) {
+                        if read == 0 {
+                            break;
+                        }
+                    }
                     return buf;
                 }
             }
@@ -895,6 +910,34 @@ capability = "fs.read"
         let result = backend.exec(&handle, &request, &lease, &live).expect("exec");
         assert_ne!(result.exit().code(), Some(0), "curl must fail with network denied");
         backend.destroy(&handle, &live).expect("destroy");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_capped_drains_the_pipe_past_the_cap_so_the_writer_never_blocks() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+
+        let (reader, mut writer) = UnixStream::pair().expect("pair");
+        let cap = 4096usize;
+        // Far past both `cap` and any realistic OS socket buffer, so the
+        // writer genuinely blocks in `write_all` unless something keeps
+        // reading past the cap.
+        let payload_len = 4 * 1024 * 1024;
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let payload = vec![0x41u8; payload_len];
+            writer.write_all(&payload).expect("write_all");
+            drop(writer);
+            let _ = done_tx.send(());
+        });
+
+        let buf = read_capped(reader, cap);
+        assert_eq!(buf.len(), cap);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer must complete once the reader keeps draining past the cap");
     }
 
     #[test]
