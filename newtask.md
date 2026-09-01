@@ -904,6 +904,35 @@ in between, making `verify_required_attestations` tautological along this one wi
 verification machinery itself is not broken — not acted on this pass; flagging here so it isn't
 independently rediscovered.)
 
+**Fresh review pass, 2026-09-02, `crates/vcs/src/provenance.rs::PatchAttribution` — `symbols` had no bound of
+its own, unlike its sibling field `evidence`, letting it silently overflow the lineage read API's truncation
+cap with no error signal.** `record_patch_attribution` (line 594) checks `attribution.evidence.len() >
+MAX_EVIDENCE_REFS` (32) and rejects with `BoundExceeded`, but had no equivalent check for `attribution.
+symbols`, the only other `Vec`-shaped field on `PatchAttribution` (every other field is `Option<T>`, capped at
+one). `MAX_LINEAGE_NODES` (64) bounds how many nodes of one kind `lineage_for_patch`'s `push_unique` helper
+will collect before silently dropping the rest with no error — `evidence`'s 32-cap keeps it safely under that
+ceiling, but nothing kept `symbols` under it. Concretely: a `PatchAttribution` built with 70 `with_symbols(...)`
+entries (a plausible large refactor touching 70 functions) is accepted by `record_patch_attribution` and all
+70 `ModifiesSymbol` edges are correctly appended to the graph — but `lineage_for_patch`, the crate's own
+documented "walk patch edges" read API, silently returns only 64 of them, with no truncation flag, giving a
+caller an incomplete answer for a query the API's own doc comment ("Walk patch... edges back to agent and
+evidence") frames as authoritative. Verified via the standard temporary-revert cycle: the new test failed with
+`too many symbol refs: 0` (i.e. no error at all) against the reverted code, confirming the gap, before the fix
+was restored. **Fixed:** added `MAX_PATCH_SYMBOLS: usize = 32` (mirroring `MAX_EVIDENCE_REFS`'s value and
+framing) and the matching bound check in `record_patch_attribution`. New test `symbol_ref_bound`. Full `vcs`
+crate suite (17 tests, up from 16) and `cargo build --workspace --tests` pass. **Latent, not yet actively
+firing:** confirmed via `grep -rln "vcs::" .` (outside `crates/vcs`) that this crate has zero callers anywhere
+in the workspace, including `apps/rapid` — the same "mechanism is broken but not yet wired into a real
+command" shape this document keeps finding — but a genuine logic defect in the crate's own primary read API,
+worth having fixed before anything depends on `lineage_for_patch` for a complete answer. (Found by a
+background review agent doing this session's first pass over `crates/vcs`; the same pass also flagged that
+`RecordedAt`'s derived `Ord`/`PartialOrd` — plain byte-wise comparison of the wrapped RFC3339 string — is not
+chronologically correct once fractional-second timestamps are compared against whole-second ones, e.g.
+`"2026-08-15T12:00:00.500000000Z" < "2026-08-15T12:00:00Z"` under derived `Ord` despite being half a second
+*later*; confirmed by direct string comparison, not currently exercised by any sort/`BTreeSet`/`.cmp()` call
+anywhere in the crate or its callers, so left undocumented as a known caveat rather than fixed this pass — a
+real fix needs a parsed-timestamp representation, not a bigger change than this entry's scope.)
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

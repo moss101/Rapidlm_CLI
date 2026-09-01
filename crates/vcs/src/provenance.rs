@@ -30,6 +30,9 @@ pub const MAX_PROVENANCE_EDGES: usize = 8192;
 /// Maximum evidence IDs accepted on one patch attribution.
 pub const MAX_EVIDENCE_REFS: usize = 32;
 
+/// Maximum symbol IDs accepted on one patch attribution.
+pub const MAX_PATCH_SYMBOLS: usize = 32;
+
 /// Maximum nodes of one kind returned in a patch lineage.
 pub const MAX_LINEAGE_NODES: usize = 64;
 
@@ -593,6 +596,9 @@ impl ProvenanceStore {
     ) -> Result<usize, ProvenanceError> {
         cancel.check()?;
         if attribution.evidence.len() > MAX_EVIDENCE_REFS {
+            return Err(ProvenanceError::BoundExceeded);
+        }
+        if attribution.symbols.len() > MAX_PATCH_SYMBOLS {
             return Err(ProvenanceError::BoundExceeded);
         }
         let edges = attribution_edges(&attribution)?;
@@ -1493,6 +1499,27 @@ mod tests {
                 &cancel,
             )
             .expect_err("too many evidence refs");
+        assert_eq!(err, ProvenanceError::BoundExceeded);
+        assert!(store.is_empty().expect("empty"));
+    }
+
+    #[test]
+    fn symbol_ref_bound() {
+        // `symbols` had no bound of its own — unlike `evidence` above, it
+        // could grow past `MAX_LINEAGE_NODES` and silently truncate in
+        // `lineage_for_patch` with no error signal, since `push_unique`
+        // drops entries past the cap rather than reporting a bound.
+        let store = ProvenanceStore::new();
+        let cancel = CancellationToken::new();
+        let extra: Vec<ArtifactId> = (0..=MAX_PATCH_SYMBOLS)
+            .map(|i| ArtifactId::from_bytes(format!("symbol-{i}").as_bytes()))
+            .collect();
+        let err = store
+            .record_patch_attribution(
+                PatchAttribution::new(patch_hash(), agent(), at()).with_symbols(extra),
+                &cancel,
+            )
+            .expect_err("too many symbol refs");
         assert_eq!(err, ProvenanceError::BoundExceeded);
         assert!(store.is_empty().expect("empty"));
     }
