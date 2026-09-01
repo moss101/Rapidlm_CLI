@@ -967,6 +967,23 @@ Re-verify both before implementing rather than trusting the original row text.
   (`crates/tui`) this session has no prior tested familiarity with, unlike the `apps/rapid` core this
   session's other fixes are grounded in. Documenting the true scope precisely, rather than take a guess at
   a partial fix in unfamiliar territory, is the honest output of this pass.
+- **Confirmed 2026-08-31, directly, why the "narrower" fix isn't actually narrow — the naive version of it
+  would be a regression, not an improvement.** Traced the caller chain from `apply_kernel_action`
+  (`interactive.rs:2358`) up: `dispatch_slash` propagates its error via `?` (`interactive.rs:2349`),
+  `handle_input` propagates via `?` in turn, and `SessionLoop::run`'s own main loop (`interactive.rs:2253`)
+  calls `self.handle_input(input)?` — a bare `?` with no catch. So simply changing the silent `{}` arm to
+  `return Err(InteractiveError::NotImplemented)` (the obvious "quick" version of "surface a notice") would
+  propagate all the way up and **terminate the entire interactive TUI session** on the very first
+  unimplemented slash command a user types — replacing a silent no-op with a hard crash, strictly worse for
+  the user. Also checked whether the already-established `apps/rapid::exec_diag::stderr_line` pattern (used
+  for headless-exec diagnostics elsewhere in this codebase) could be reused here instead: no — that pattern
+  assumes plain stdout/stderr, but interactive mode owns the whole terminal via `crates/tui`'s rendering, so
+  a raw stderr write would interleave with and corrupt the live TUI frame instead of showing a clean message.
+  Both of these confirm, rather than overturn, the judgment already recorded above: a real fix needs an
+  actual non-fatal, TUI-native notification path (a new `LocalUiEvent` variant reduced into `AppState` and
+  rendered somewhere in the frame, with its own display/dismissal lifecycle) — genuine UI/UX design work in
+  an unfamiliar crate, not a one-line "return the right thing" fix. Leaving unattempted, now with concrete
+  evidence for why, instead of a guess.
 | 14 | ~~No rendered (`html`/`md`) export format~~ **Implemented 2026-08-29, completed 2026-08-30.** `rapid inspect-export <session> <file> --format md` renders a chronological Markdown list (`- **kind** (seq N, timestamp) — \`payload\``) alongside the existing (now-default, unchanged-behavior) `--format jsonl`. Deliberately generic, not per-event-kind prose: `EventKind` has dozens of variants across session/turn/model/tool/... families, and rendering each one's payload into readable sentences is real, separate work this doesn't attempt — the value here is a readable, chronological skim of a transcript without guessing at semantics this function doesn't actually know. **`--format html` added 2026-08-30:** same generic chronological-list rendering as `md`, as a minimal static page (`<!doctype html>` + a `<ul>` of `<li>` entries); every field (event kind, timestamp, JSON payload) goes through a new `html_escape()` — ledger payloads are untrusted-origin text (tool output, model text) and this file may be opened in a real browser, so escaping isn't optional even though it's a local file, not a network-facing surface. Caught and fixed one real regression while adding this: an existing test, `inspect_export_rejects_an_unknown_format`, used `"html"` as its example of a format that *should* be rejected — updated to `"xml"` instead, since `html` is now valid. | Not established | `/export {html,md,json,jsonl}` | `apps/rapid/src/p9_commands.rs::run_inspect_export` | ~~P2~~ done | S |
 
 ### 1.5 Headless / scripting contract
