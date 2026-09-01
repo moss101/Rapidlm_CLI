@@ -738,6 +738,26 @@ real, demonstrable contract violation in the public API against its own document
 fixed before it is. Full `agent-runtime` crate suite (273 tests, up from 272) and `cargo build --workspace
 --tests` pass.
 
+**Fresh review pass, 2026-08-31 — the standing autonomous loop hit an account-wide weekly rate limit on
+background review subagents mid-cycle; this and the following findings were investigated directly rather
+than via a dispatched agent, same verification discipline throughout.** `crates/agent-runtime/src/agent_defs.
+rs::load_directory` had the exact stat-then-read TOCTOU shape already fixed once this session in
+`apps/rapid/src/p9_commands.rs::read_bounded_file`, in a different module: `MAX_DEF_FILE_BYTES`'s own doc
+comment ("Maximum UTF-8 bytes in a definition file") was enforced by checking `meta.len()` from a
+`symlink_metadata` call taken *before* `fs::read_to_string(&path)` actually read the file — a file that grows
+between the two syscalls could pass the size check and still be fully buffered by the unconditional read.
+Unlike several other findings this session, this one is **live and reachable today**: confirmed via grep that
+`apps/rapid/src/p9_commands.rs` calls `agent_runtime::agent_defs::{full_inventory, load_directory}` directly
+from a real CLI command that scans `<project>/.rapidlm/agents/*.toml`. **Fixed** the same way as the earlier
+instance: replaced the stat-then-read pair with `File::open` + `.take(MAX_DEF_FILE_BYTES + 1).
+read_to_string(&mut buf)`, checking the actual buffered length instead of a stale stat result — caps memory
+at `MAX_DEF_FILE_BYTES + 1` regardless of the file's real size and closes the TOCTOU gap in the same step.
+New test `load_directory_rejects_a_file_over_the_byte_cap_without_buffering_it_in_full` (confirmed, via the
+standard temporary-revert cycle, that it also passes against the un-fixed stat-then-read code — it doesn't
+exercise the race itself, the same testability ceiling documented for the original `read_bounded_file` fix;
+the TOCTOU-closing property rests on the read now being a single bounded operation, verifiable by inspection).
+Full `agent-runtime` crate suite (274 tests, up from 273) and `cargo build --workspace --tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

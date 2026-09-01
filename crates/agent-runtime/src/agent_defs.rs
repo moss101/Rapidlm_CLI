@@ -15,6 +15,7 @@
 //!   implementation — granting a class the runtime cannot back is an error.
 
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::agent::model::AgentRole;
@@ -504,7 +505,15 @@ pub fn load_directory(
             });
             continue;
         }
-        if meta.len() as usize > MAX_DEF_FILE_BYTES {
+        // Read through a bounded cap rather than trusting `meta.len()`: the
+        // file can grow between the stat above and the read below, which
+        // would otherwise buffer past MAX_DEF_FILE_BYTES despite the check
+        // having passed.
+        let mut bytes = String::new();
+        std::fs::File::open(&path)?
+            .take(MAX_DEF_FILE_BYTES as u64 + 1)
+            .read_to_string(&mut bytes)?;
+        if bytes.len() > MAX_DEF_FILE_BYTES {
             inventory.rejected.push(RejectedDef {
                 path: path.clone(),
                 reason: AgentDefError::FileTooLarge {
@@ -515,7 +524,6 @@ pub fn load_directory(
             });
             continue;
         }
-        let bytes = std::fs::read_to_string(&path)?;
         let def = match AgentDefinition::parse(DefSource::Project(path.clone()), &bytes) {
             Ok(def) => def,
             Err(err) => {
@@ -753,6 +761,26 @@ mod tests {
         assert!(rejected_reasons.iter().any(|r| r.contains("unsupported schema")));
         #[cfg(unix)]
         assert!(rejected_reasons.iter().any(|r| r.contains("not a regular file")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_directory_rejects_a_file_over_the_byte_cap_without_buffering_it_in_full() {
+        let seq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rapidlm-agent-defs-oversized-{seq}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // Far larger than MAX_DEF_FILE_BYTES: the bounded read must still
+        // reject this cheaply via the post-read length check, not trust a
+        // stat taken before the read (the TOCTOU this fix closes).
+        std::fs::write(dir.join("huge.toml"), vec![b'#'; MAX_DEF_FILE_BYTES * 4]).expect("write");
+        let registry = full_registry();
+        let inventory = load_directory(&dir, &registry).expect("scan");
+        assert!(inventory.loaded.is_empty());
+        assert_eq!(inventory.rejected.len(), 1);
+        assert!(inventory.rejected[0].reason.contains("exceeds"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
