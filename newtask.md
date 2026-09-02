@@ -933,6 +933,37 @@ chronologically correct once fractional-second timestamps are compared against w
 anywhere in the crate or its callers, so left undocumented as a known caveat rather than fixed this pass — a
 real fix needs a parsed-timestamp representation, not a bigger change than this entry's scope.)
 
+**Fresh review pass, 2026-09-02 — a background review agent's `crates/event-ledger` finding was investigated
+and found to be a false positive; corrected here rather than silently dropped.** The agent flagged
+`CronStore::claim_due` (`crates/event-ledger/src/cron.rs`, then lines 311-312) as the sole method opening a
+bare `Connection::open(&self.path)` instead of going through `self.connect()`, which — every other method in
+the file does — calls `MigrationRunner::apply`, which sets `conn.busy_timeout(BUSY_TIMEOUT)` (5000ms). The
+claimed consequence: two concurrent `rapid cron poll` invocations racing for the same `BEGIN IMMEDIATE`
+transaction would have the loser fail immediately with `SQLITE_BUSY` instead of waiting out the winner,
+contradicting `claim_due`'s own doc comment ("two concurrent pollers can never claim the same row"). This is
+a real, live, reachable path (`apps/rapid/src/p9_commands.rs`'s `run_cron`'s `"poll"` arm →
+`scheduler::PromptCron::poll` → `CronStore::claim_due`), so it was investigated directly rather than deferred.
+**Investigation found the premise wrong:** a diagnostic test (two `rusqlite::Connection::open` handles against
+the same file, one holding an uncommitted `BEGIN IMMEDIATE`, timing the second's `BEGIN IMMEDIATE` attempt)
+measured a ~5.2s wait before `SQLITE_BUSY`, not an immediate failure — and grepping this workspace's pinned
+rusqlite source directly (`~/.cargo/registry/src/.../rusqlite-0.32.1/src/inner_connection.rs:119`) confirms why:
+`InnerConnection::open_with_flags` unconditionally calls `ffi::sqlite3_busy_timeout(db, 5000)` on every
+connection `Connection::open` creates, regardless of any application-level `.busy_timeout()` call — the exact
+same 5000ms `connect()`'s explicit call also sets. `claim_due`'s bare `Connection::open()` already had the
+identical busy-wait behavior every sibling method has; the gap the agent found is real (one method skips an
+explicit call the others make) but has no behavioral effect, because rusqlite's own default already closes it.
+**Action taken:** added a code comment at the call site recording this (so a future reader doesn't rediscover
+and "fix" the same non-bug), added a regression test `claim_due_waits_for_a_concurrent_writer_instead_of_failing_busy`
+that exercises the real, still-worth-protecting invariant directly (a concurrent writer holding the lock
+doesn't cause `claim_due` to fail busy) since it's a genuinely important behavior for a live, concurrently-called
+API regardless of which mechanism guarantees it — but did **not** change `claim_due` to call `self.connect()`,
+since there was no bug to fix and swapping it in would have been change for its own sake. Full `event-ledger`
+crate suite (88 tests, up from 87) and `cargo build --workspace --tests` pass. This is the session's own
+established practice applied to a rare case where it was needed: verify every finding, including ones a
+background agent already framed with citations and a plausible mechanism, before writing a fix — this one
+looked exactly like the session's other confirmed "sibling method skips a check" bugs until direct measurement
+disproved the mechanism.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

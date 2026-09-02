@@ -309,6 +309,13 @@ impl CronStore {
     /// with `last_claim_ms = now_ms`, so two concurrent pollers can never
     /// claim the same row. Returns the claimed rows in fire order.
     pub fn claim_due(&self, now_ms: i64, limit: usize) -> Result<Vec<CronJob>, CronStoreError> {
+        // `Connection::open` sets rusqlite's own 5000ms `sqlite3_busy_timeout`
+        // default unconditionally (see `InnerConnection::open_with_flags`),
+        // matching `connect()`'s explicit `busy_timeout(BUSY_TIMEOUT)` call
+        // exactly — so a concurrent poller waits for this transaction rather
+        // than failing immediately with `SQLITE_BUSY` either way. Confirmed
+        // directly against this workspace's pinned rusqlite version before
+        // assuming otherwise.
         let conn = Connection::open(&self.path)?;
         let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         let due: Vec<CronJob> = {
@@ -547,6 +554,37 @@ mod tests {
         // Second claim at the same instant gets nothing: the lease holds.
         let again = store.claim_due(2_000, 10).expect("claim again");
         assert!(again.is_empty());
+    }
+
+    #[test]
+    fn claim_due_waits_for_a_concurrent_writer_instead_of_failing_busy() {
+        // `claim_due`'s own doc comment says two concurrent pollers can
+        // safely race for the same rows — that only holds if a busy
+        // connection actually waits for the lock instead of erroring
+        // immediately with SQLITE_BUSY, which requires `busy_timeout` to be
+        // configured on `claim_due`'s own connection like it is on every
+        // other method's.
+        let (store, db) = TempDb::open_store();
+        add_job(&store, 1_500);
+
+        let blocker_path = db.path.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let conn = Connection::open(&blocker_path).expect("blocker connection");
+            conn.execute_batch("BEGIN IMMEDIATE;")
+                .expect("begin immediate");
+            ready_tx.send(()).expect("signal ready");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            conn.execute_batch("COMMIT;").expect("commit");
+        });
+        ready_rx.recv().expect("blocker ready");
+
+        let claimed = store
+            .claim_due(2_000, 10)
+            .expect("claim_due must wait out the concurrent writer, not fail busy");
+        assert_eq!(claimed.len(), 1);
+
+        handle.join().expect("blocker thread");
     }
 
     #[test]
