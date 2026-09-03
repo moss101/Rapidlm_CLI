@@ -1209,6 +1209,43 @@ public API around private fields and fallible constructors only (a breaking chan
 yet-wired-in public type) — a real API design tradeoff, not attempted this pass. Both latent, same reachability
 as the other desktop findings above.
 
+**Fresh review pass, 2026-09-02, `crates/agent-pool/src/lib.rs::ResourcePool::acquire` — a provisioner that
+returns a duplicate id let one caller's release silently steal or free another caller's active lease.** The
+module doc's own framing: the pool "tracks each environment's phase (warm / in-use / quarantined)," implying
+each id maps to exactly one live lease at a time. `acquire`'s miss-fallback path called `provisioner.provision
+(backend)` and inserted the result straight into `in_use` with no check against the ids already tracked in
+`warm`/`in_use`/`quarantined` — a second provision returning an id already held elsewhere silently overwrote
+that entry via `BTreeMap::insert`. Reproduced (and, before applying any fix, empirically confirmed against the
+real crate in a standalone throwaway binary by a background review agent) with a `Provisioner` that derives its
+id from the backend alone with no per-call uniqueness — exactly the shape `apps/rapid/src/host_runtime.rs`'s
+own `FakeProvisioner` already uses: alice acquires `Container` (misses, provisions `"env-container"`), bob
+acquires `Container` before alice releases (misses again, provisioner returns the *same* id, silently
+overwriting alice's `in_use` entry — `in_use_count()` stays `1` even though two acquires were granted), bob
+releases cleanly, carol acquires the now-warm `"env-container"`, and alice's eventual release removes *carol's*
+still-active entry instead of her own. Verified via the standard temporary-revert cycle: the new test failed
+with bob's acquire succeeding (returning `owner: Some("bob")` for what should have been a rejected duplicate)
+against the reverted code. **Fixed:** added `ResourcePool::is_tracked` (checks all three sets) and reject the
+freshly-provisioned id with a new `PoolError::DuplicateId` if it's already tracked anywhere, calling `provisioner
+.destroy(&id)` first so the just-created backing resource isn't itself leaked. New test `duplicate_provisioner_
+id_fails_closed_instead_of_stealing_a_lease`. **Same pass, second finding and fix — `quarantine()`'s
+`QuarantineLimit` failure path dropped the lease from every tracked set, unlike its sibling `sanitize()`'s
+identical failure shape**, which explicitly re-inserts the lease with the comment "a failed sanitize does not
+lose the environment" (`lib.rs:302`). `quarantine()`'s equivalent branch had no such restoration, silently
+decrementing the pool's real resource count with no `destroy()` call — the classic "cleanup/restoration present
+on one error path, missing on the analogous sibling" shape this document has fixed repeatedly. Confirmed
+reachable in isolation only via a total()-desyncing bug (this pass's own Finding 1, now fixed, was exactly such
+a mechanism) or a future relaxation of the `MAX_ENVIRONMENTS` gate — a latent defensive-code bug, not a live
+one, but worth having correct regardless. **Fixed:** `quarantine()` now re-inserts the lease into `in_use` on
+the limit failure, mirroring `sanitize()`'s contract exactly. New test `quarantine_failure_returns_the_lease_
+to_in_use_not_lost` (constructs the boundary directly via 256 filler entries rather than exercising 256 real
+quarantine cycles). Full `agent-pool` crate suite (17 tests, up from 15) and `cargo build --workspace --tests`
+pass. **Latent, not yet actively firing:** confirmed via `grep -rln "HostRuntime\b" apps/rapid/src` (only the
+module declaration, no real call site) that `apps/rapid`'s `HostRuntime` wrapper around this pool has no
+production caller, and no real (non-test) `Provisioner` implementation exists anywhere in the workspace yet —
+but this is a genuine, demonstrable defect in the pool's own logic, not a caller-misuse issue: the pool's own
+doc-claimed exclusivity guarantee should hold regardless of what ids a `Provisioner` implementation happens to
+return, and the one example implementation already in the tree is exactly the naive shape that triggers it.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

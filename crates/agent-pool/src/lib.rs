@@ -114,6 +114,7 @@ pub enum PoolError {
     InvalidId,
     SanitizeFailed,
     ProvisionFailed,
+    DuplicateId,
 }
 
 impl PoolError {
@@ -124,6 +125,7 @@ impl PoolError {
             Self::InvalidId => "resource pool id is invalid",
             Self::SanitizeFailed => "resource pool sanitation failed",
             Self::ProvisionFailed => "resource pool provisioning failed",
+            Self::DuplicateId => "resource pool provisioner returned an id already tracked",
         }
     }
 }
@@ -172,6 +174,13 @@ impl ResourcePool {
         self.warm.len() + self.in_use.len() + self.quarantined.len()
     }
 
+    /// Whether `id` already names a lease in any of the three tracked sets.
+    fn is_tracked(&self, id: &str) -> bool {
+        self.in_use.contains_key(id)
+            || self.quarantined.contains_key(id)
+            || self.warm.iter().any(|lease| lease.id == id)
+    }
+
     /// Warm-acquire, or provision on a miss (P7-025 + P7-028 fallback).
     pub fn acquire<P: Provisioner>(
         &mut self,
@@ -205,6 +214,17 @@ impl ResourcePool {
         let id = provisioner.provision(backend)?;
         if !valid_id(&id, MAX_ENV_ID_BYTES) {
             return Err(PoolError::InvalidId);
+        }
+        // A provisioner that returns an id already tracked elsewhere in the
+        // pool (warm, another caller's in_use, or quarantined) must not be
+        // accepted silently: inserting it into `in_use` here would overwrite
+        // that existing entry, so a later release/quarantine keyed on the
+        // same id would act on whichever lease happens to occupy the slot at
+        // that moment — a different caller's still-active environment, not
+        // this one's.
+        if self.is_tracked(&id) {
+            let _ = provisioner.destroy(&id);
+            return Err(PoolError::DuplicateId);
         }
         self.stats.provisions += 1;
         self.stats.acquires += 1;
@@ -255,11 +275,15 @@ impl ResourcePool {
     }
 
     /// Quarantine a specific in-use environment (failure isolation).
+    /// On a quarantine-limit failure the environment stays in use rather
+    /// than being lost (mirrors `sanitize`'s "a failure does not lose the
+    /// environment" contract).
     pub fn quarantine(&mut self, id: &str) -> Result<(), PoolError> {
         let Some(mut lease) = self.in_use.remove(id) else {
             return Ok(());
         };
         if self.quarantined.len() >= MAX_ENVIRONMENTS {
+            self.in_use.insert(id.to_owned(), lease);
             return Err(PoolError::QuarantineLimit);
         }
         self.stats.quarantines += 1;
@@ -386,6 +410,89 @@ mod tests {
         pool.release(a.id(), true, 4, &mut p).expect("release a");
         assert_eq!(pool.warm_count(), 1, "warm was full so a is disposed");
         assert_eq!(pool.stats().releases, 2);
+    }
+
+    /// Returns the same id for every call — the exact shape of
+    /// `apps/rapid/src/host_runtime.rs`'s own `FakeProvisioner`, which
+    /// derives an id from the backend alone with no per-call uniqueness.
+    struct SameIdProvisioner;
+    impl Provisioner for SameIdProvisioner {
+        fn provision(&mut self, backend: PoolBackend) -> Result<String, PoolError> {
+            Ok(format!("env-{}", backend.as_str()))
+        }
+        fn sanitize(&mut self, _id: &str) -> Result<(), PoolError> {
+            Ok(())
+        }
+        fn destroy(&mut self, _id: &str) -> Result<(), PoolError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn duplicate_provisioner_id_fails_closed_instead_of_stealing_a_lease() {
+        let mut pool = ResourcePool::new(4);
+        let mut p = SameIdProvisioner;
+        let alice = pool
+            .acquire(PoolBackend::Container, "alice", 1, &mut p)
+            .expect("alice acquire");
+        // bob's acquire misses warm (alice hasn't released yet) and the
+        // provisioner hands back the exact id alice already holds. Without
+        // the fix this silently overwrote alice's `in_use` entry instead of
+        // failing, letting a later release of either id act on whichever
+        // lease happened to occupy that key.
+        let err = pool
+            .acquire(PoolBackend::Container, "bob", 2, &mut p)
+            .expect_err("duplicate id must be rejected, not silently accepted");
+        assert_eq!(err, PoolError::DuplicateId);
+        assert_eq!(
+            pool.in_use_count(),
+            1,
+            "alice's lease must be untouched by bob's rejected acquire"
+        );
+        assert_eq!(
+            pool.stats().acquires,
+            1,
+            "a rejected acquire must not count as a real one"
+        );
+        pool.release(alice.id(), true, 3, &mut p).expect("release");
+        assert_eq!(pool.warm_count(), 1);
+        assert_eq!(pool.in_use_count(), 0);
+    }
+
+    #[test]
+    fn quarantine_failure_returns_the_lease_to_in_use_not_lost() {
+        // Mirrors `sanitize`'s own "a failure does not lose the environment"
+        // contract — `quarantine`'s equivalent failure path dropped the
+        // lease from every tracked set instead.
+        let mut pool = ResourcePool::new(4);
+        let mut p = prov();
+        let a = pool
+            .acquire(PoolBackend::Container, "o", 1, &mut p)
+            .expect("acquire");
+        // Force the quarantine-limit branch directly rather than filling
+        // MAX_ENVIRONMENTS (256) quarantine slots for real.
+        for i in 0..MAX_ENVIRONMENTS {
+            pool.quarantined.insert(
+                format!("filler-{i}"),
+                EnvironmentLease {
+                    id: format!("filler-{i}"),
+                    backend: PoolBackend::Container,
+                    state: EnvironmentState::Quarantined,
+                    owner: None,
+                    acquired_at: 0,
+                    released_at: None,
+                },
+            );
+        }
+        let err = pool
+            .quarantine(a.id())
+            .expect_err("quarantine limit must be enforced");
+        assert_eq!(err, PoolError::QuarantineLimit);
+        assert_eq!(
+            pool.in_use_count(),
+            1,
+            "the environment must remain in use, not vanish"
+        );
     }
 
     #[test]
