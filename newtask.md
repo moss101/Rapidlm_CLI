@@ -1079,6 +1079,45 @@ direct, minimal-diff structural match to the two already-tested sibling cleanup 
 verified by inspection and by the full crate suite's continued pass (72 tests, no regressions) plus
 `cargo build --workspace --tests`.
 
+**Fresh review pass, 2026-09-02, `crates/llm-router/src/providers/openai_compatible.rs::http_get` — the
+single most severe, most clearly *live* finding of this whole session: the live `web_fetch` tool's HTTP
+response reader silently truncated response bodies to whatever bytes happened to arrive in the same low-level
+socket read as the header terminator, often to nothing at all, for essentially any real remote server.**
+`http_get`'s own doc comment: "the same SSRF guards, TLS root set, and **response caps** as the provider
+transport." The real provider transport's reader, `read_http_response` (used identically by both the
+OpenAI-compatible and Anthropic adapters), correctly continues reading after the initial header-focused read —
+looping on `Content-Length` until satisfied, decoding `Transfer-Encoding: chunked`, or reading to EOF/deadline
+when neither is present. `http_get`'s own reader, `read_http_response_opts`, did **none of this**: it read
+until it found `\r\n\r\n` anywhere in the accumulated buffer and returned immediately, treating whatever bytes
+happened to be in that same buffer as "the body" — no Content-Length continuation, no chunked decoding, full
+stop. Any real server that delivers headers and body across separate TCP reads or TLS records (essentially
+every server on a real network, as opposed to a `Cursor`-backed unit-test fixture) would have its body
+silently cut down to a few hundred/thousand bytes or to nothing — returned as `Ok(...)`, not an error, and
+`apps/rapid/src/web_fetch.rs::fetch_page`'s own truncation-marker logic (`if body.len() >= max_bytes { ...
+FETCH_TRUNCATION_MARKER }`) never fires either, since the returned length is almost always far below
+`max_bytes` — so the model receives a tiny or empty snippet of a page with **no indication it was cut off at
+all**. Verified via the standard temporary-revert cycle with a real TCP fixture: a server that flushes headers,
+sleeps briefly, then dribbles a 5,000-byte body across ten separate 500-byte writes (deliberately forcing
+headers and body across separate low-level reads, the exact shape that defeats the header-focused-only reader)
+made the new test fail with an **empty body** against the reverted code; restoring the fix returned the full,
+correct 5,000 bytes. **Fixed:** unified `read_http_response`/`read_http_response_opts` into one
+`read_http_response_impl(..., truncate: bool)` sharing the same Content-Length/chunked/EOF continuation logic
+— `truncate=false` (provider path) keeps its existing fail-closed-past-`max_body` behavior unchanged (verified
+by diffing the new code against the original line-for-line: identical when `truncate=false`), `truncate=true`
+(tool-fetch path) now genuinely reads the real body up to `max_bytes` before returning, capping rather than
+abandoning it early. `decode_chunked` gained the same `truncate` parameter for the chunked-body case (a
+capped-but-incomplete final chunk is read up to the cap and returned as success rather than erroring). Also
+removed `read_until_limit`, a now-dead thin wrapper the refactor obsoleted. New test `http_get_reads_the_full_
+body_when_it_arrives_after_the_headers`; the six existing `decode_chunked` unit tests updated to pass their
+prior, unchanged `truncate=false` expectation explicitly. Full `llm-router` crate suite (140 tests, up from
+139, confirmed stable across 15 repeated runs — this crate's real-TCP-fixture tests carry some inherent
+timing-based flakiness unrelated to this change, confirmed identical on the pre-fix code before concluding
+so), `apps/rapid`'s 10 real `web_fetch` tests, and `cargo build --workspace --tests` all pass. **Live and
+reachable, not latent:** confirmed via `grep -rln "llm_router::" apps/` that `apps/rapid/src/web_fetch.rs`
+imports `http_get` directly and `apps/rapid/src/exec_tools.rs:2229` wires it into the real, model-callable
+`web_fetch` tool — this bug has been silently degrading (in most real-world cases, silently *breaking*) one of
+the product's core tools for arbitrary internet fetches.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

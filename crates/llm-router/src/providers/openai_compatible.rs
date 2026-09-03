@@ -1692,29 +1692,6 @@ pub fn http_get(
     Ok(body)
 }
 
-fn read_http_response_opts<S: Read + Write>(
-    stream: &mut S,
-    max_body: usize,
-    cancel: &CancellationToken,
-    deadline: Instant,
-    truncate: bool,
-) -> Result<ProviderHttpResponse, ProviderError> {
-    let raw =
-        read_until_limit_opts(stream, max_body + 16 * 1024, cancel, deadline, truncate)?;
-    let split = find_header_body_split(&raw).ok_or(ProviderError::Permanent)?;
-    let header_bytes = &raw[..split];
-    let header_text = std::str::from_utf8(header_bytes).map_err(|_| ProviderError::Permanent)?;
-    let status_line = header_text.split("\r\n").next().ok_or(ProviderError::Permanent)?;
-    let status = parse_status_line(status_line)?;
-    // Truncated responses carry whatever body bytes arrived.
-    let body = raw[split + 4..].to_vec();
-    Ok(ProviderHttpResponse {
-        status,
-        headers: Vec::new(),
-        body,
-    })
-}
-
 fn write_http_request<S: Read + Write>(
     stream: &mut S,
     url: &ParsedUrl,
@@ -1769,7 +1746,36 @@ fn read_http_response<S: Read + Write>(
     cancel: &CancellationToken,
     deadline: Instant,
 ) -> Result<ProviderHttpResponse, ProviderError> {
-    let raw = read_until_limit(stream, max_body + 16 * 1024, cancel, deadline)?;
+    read_http_response_impl(stream, max_body, cancel, deadline, false)
+}
+
+/// `truncate=false` (provider path): a body past `max_body` fails closed with
+/// `BoundExceeded`. `truncate=true` (tool-fetch path): reading stops at
+/// `max_body` and the capped prefix is returned as success — the same split
+/// `read_until_limit_opts` already draws for the initial header read. Both
+/// modes share one Content-Length/chunked/EOF continuation loop: the header
+/// read alone (the previous shape of this split) only returns whatever bytes
+/// happened to arrive in the same low-level reads as the header terminator,
+/// which is nowhere near the actual body for almost any real server that
+/// delivers headers and body across separate reads.
+fn read_http_response_opts<S: Read + Write>(
+    stream: &mut S,
+    max_body: usize,
+    cancel: &CancellationToken,
+    deadline: Instant,
+    truncate: bool,
+) -> Result<ProviderHttpResponse, ProviderError> {
+    read_http_response_impl(stream, max_body, cancel, deadline, truncate)
+}
+
+fn read_http_response_impl<S: Read + Write>(
+    stream: &mut S,
+    max_body: usize,
+    cancel: &CancellationToken,
+    deadline: Instant,
+    truncate: bool,
+) -> Result<ProviderHttpResponse, ProviderError> {
+    let raw = read_until_limit_opts(stream, max_body + 16 * 1024, cancel, deadline, truncate)?;
     let split = find_header_body_split(&raw).ok_or(ProviderError::Permanent)?;
     let header_bytes = &raw[..split];
     let body_prefix = &raw[split + 4..];
@@ -1815,29 +1821,36 @@ fn read_http_response<S: Read + Write>(
             max_body,
             cancel,
             deadline,
+            truncate,
         )?
     } else {
         body_prefix.to_vec()
     };
     if let Some(length) = content_length {
-        if length > max_body {
+        if !truncate && length > max_body {
             return Err(ProviderError::BoundExceeded);
         }
-        while body.len() < length {
+        let target = length.min(max_body);
+        while body.len() < target {
             let mut buf = [0u8; 2048];
-            let want = (length - body.len()).min(buf.len());
+            let want = (target - body.len()).min(buf.len());
             let read = read_some(stream, &mut buf[..want], cancel, deadline)?;
             if read == 0 {
+                if truncate {
+                    // A capped prefix is still success in this mode.
+                    break;
+                }
                 // Peer closed short of Content-Length: fail closed.
                 return Err(ProviderError::Permanent);
             }
             body.extend_from_slice(&buf[..read]);
         }
-        if body.len() > length {
-            body.truncate(length);
+        if body.len() > target {
+            body.truncate(target);
         }
     } else if !chunked {
-        // No Content-Length: read until EOF, deadline, or max. A prefix is not success.
+        // No Content-Length: read until EOF, deadline, or max. A prefix is
+        // not success unless `truncate` says otherwise.
         loop {
             if body.len() > max_body {
                 return Err(ProviderError::BoundExceeded);
@@ -1845,6 +1858,9 @@ fn read_http_response<S: Read + Write>(
             let mut buf = [0u8; 2048];
             let room = max_body.saturating_sub(body.len());
             if room == 0 {
+                if truncate {
+                    break;
+                }
                 let mut probe = [0u8; 1];
                 let extra = read_some(stream, &mut probe, cancel, deadline)?;
                 if extra > 0 {
@@ -1858,13 +1874,22 @@ fn read_http_response<S: Read + Write>(
                 break;
             }
             if body.len() + read > max_body {
+                if truncate {
+                    let take = max_body - body.len();
+                    body.extend_from_slice(&buf[..take]);
+                    break;
+                }
                 return Err(ProviderError::BoundExceeded);
             }
             body.extend_from_slice(&buf[..read]);
         }
     }
     if body.len() > max_body {
-        return Err(ProviderError::BoundExceeded);
+        if truncate {
+            body.truncate(max_body);
+        } else {
+            return Err(ProviderError::BoundExceeded);
+        }
     }
     ProviderHttpResponse::new(status, headers, body)
 }
@@ -1889,13 +1914,18 @@ impl<S: Read> Read for PrefixedStream<'_, S> {
     }
 }
 
-/// Decode a chunked transfer body to its plain content. Success requires the
-/// terminating zero chunk; a truncated stream fails closed.
+/// Decode a chunked transfer body to its plain content.
+///
+/// `truncate=false` (provider path): success requires the terminating zero
+/// chunk, and a body past `max_body` fails closed. `truncate=true`
+/// (tool-fetch path): stops and returns the capped prefix as success once
+/// `max_body` is reached, without requiring the terminating chunk.
 fn decode_chunked(
     input: &mut dyn Read,
     max_body: usize,
     cancel: &CancellationToken,
     deadline: Instant,
+    truncate: bool,
 ) -> Result<Vec<u8>, ProviderError> {
     let mut body = Vec::new();
     loop {
@@ -1925,6 +1955,13 @@ fn decode_chunked(
             .checked_add(len)
             .ok_or(ProviderError::BoundExceeded)?;
         if new_len > max_body {
+            if truncate {
+                let room = max_body.saturating_sub(body.len());
+                let start = body.len();
+                body.resize(start + room, 0);
+                read_exact_some(input, &mut body[start..], cancel, deadline)?;
+                break;
+            }
             return Err(ProviderError::BoundExceeded);
         }
         let start = body.len();
@@ -1994,15 +2031,6 @@ fn parse_status_line(line: &str) -> Result<u16, ProviderError> {
 
 fn find_header_body_split(raw: &[u8]) -> Option<usize> {
     raw.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn read_until_limit<S: Read + Write>(
-    stream: &mut S,
-    limit: usize,
-    cancel: &CancellationToken,
-    deadline: Instant,
-) -> Result<Vec<u8>, ProviderError> {
-    read_until_limit_opts(stream, limit, cancel, deadline, false)
 }
 
 /// `truncate` stops reading at the limit instead of failing: the tool-fetch
@@ -3114,7 +3142,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut wire: &[u8] = b"4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\n\r\n";
-        let body = decode_chunked(&mut wire, 1024, &cancel, deadline).expect("decode");
+        let body = decode_chunked(&mut wire, 1024, &cancel, deadline, false).expect("decode");
         assert_eq!(body, b"Wikipedia");
 
         // Buffered prefix bytes (arrived with the headers) participate.
@@ -3124,7 +3152,7 @@ mod tests {
             pos: 0,
             stream: &mut sink,
         };
-        let body = decode_chunked(&mut prefixed, 1024, &cancel, deadline).expect("prefixed");
+        let body = decode_chunked(&mut prefixed, 1024, &cancel, deadline, false).expect("prefixed");
         assert_eq!(body, b"ok");
     }
 
@@ -3135,19 +3163,19 @@ mod tests {
         // Truncated stream (no terminating zero chunk) is a failure.
         let mut truncated: &[u8] = b"4\r\nWiki\r\n";
         assert_eq!(
-            decode_chunked(&mut truncated, 1024, &cancel, deadline),
+            decode_chunked(&mut truncated, 1024, &cancel, deadline, false),
             Err(ProviderError::Permanent)
         );
         // Non-hex size line is a failure.
         let mut garbage: &[u8] = b"zz\r\n";
         assert_eq!(
-            decode_chunked(&mut garbage, 1024, &cancel, deadline),
+            decode_chunked(&mut garbage, 1024, &cancel, deadline, false),
             Err(ProviderError::Permanent)
         );
         // Declared size beyond the bound never completes.
         let huge = format!("{:x}\r\n", 4096).into_bytes();
         assert_eq!(
-            decode_chunked(&mut huge.as_slice(), 1024, &cancel, deadline),
+            decode_chunked(&mut huge.as_slice(), 1024, &cancel, deadline, false),
             Err(ProviderError::BoundExceeded)
         );
     }
@@ -3168,8 +3196,52 @@ mod tests {
         wire.extend_from_slice(b"a\r\n0123456789\r\n");
         wire.extend_from_slice(format!("{:x}\r\n", usize::MAX - 9).as_bytes());
         assert_eq!(
-            decode_chunked(&mut wire.as_slice(), 1024, &cancel, deadline),
+            decode_chunked(&mut wire.as_slice(), 1024, &cancel, deadline, false),
             Err(ProviderError::BoundExceeded)
         );
+    }
+
+    #[test]
+    fn http_get_reads_the_full_body_when_it_arrives_after_the_headers() {
+        // `http_get`'s own doc comment promises "the same... response caps
+        // as the provider transport" — the provider transport keeps reading
+        // past the header terminator until Content-Length is satisfied.
+        // Writing headers and body as two separate, flushed `write_all`
+        // calls (with a real gap between them) forces the client's initial
+        // buffered read to see the header terminator before the body has
+        // arrived at all, exactly the shape that silently truncated the old
+        // implementation to whatever bytes happened to already be queued.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let body = "y".repeat(5_000);
+        let body_for_server = body.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).expect("read request");
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body_for_server.len()
+            );
+            stream.write_all(header.as_bytes()).expect("write headers");
+            stream.flush().expect("flush headers");
+            thread::sleep(Duration::from_millis(50));
+            for chunk in body_for_server.as_bytes().chunks(500) {
+                stream.write_all(chunk).expect("write chunk");
+                stream.flush().expect("flush chunk");
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let url = format!("http://127.0.0.1:{}/x", addr.port());
+        let result = http_get(
+            &url,
+            true,
+            body.len(),
+            Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .expect("http_get");
+        assert_eq!(result, body.as_bytes());
+        server.join().expect("server thread");
     }
 }
