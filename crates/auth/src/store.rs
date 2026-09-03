@@ -1028,20 +1028,7 @@ fn delete_from_keychain<K: PlatformKeychain>(
 }
 
 fn refs_match(stored: &SecretRef, query: &SecretRef) -> bool {
-    if stored == query {
-        return true;
-    }
-    if let (Some(stored_id), Some(query_id)) = (stored.id(), query.id())
-        && stored_id == query_id
-    {
-        return true;
-    }
-    if let (Some(stored_alias), Some(query_alias)) = (stored.alias(), query.alias())
-        && stored_alias == query_alias
-    {
-        return true;
-    }
-    false
+    stored.matches(query)
 }
 
 fn matches_query(meta: &CredentialMetadata, query: &MetadataQuery) -> bool {

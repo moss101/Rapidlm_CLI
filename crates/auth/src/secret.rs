@@ -124,6 +124,29 @@ impl SecretRef {
     pub fn alias(&self) -> Option<&str> {
         self.alias.as_deref()
     }
+
+    /// Whether `self` and `other` name the same handle: exact equality, or
+    /// a shared id, or a shared alias. A store may hold a fuller ref
+    /// (id+alias) than the one a caller originally queried or was issued a
+    /// token for (id-only or alias-only) — this is the single definition of
+    /// "same handle" both the store's own lookup and [`SecretValue::expose`]
+    /// must agree on, so the two can never diverge again.
+    pub(crate) fn matches(&self, other: &SecretRef) -> bool {
+        if self == other {
+            return true;
+        }
+        if let (Some(a), Some(b)) = (self.id(), other.id())
+            && a == b
+        {
+            return true;
+        }
+        if let (Some(a), Some(b)) = (self.alias(), other.alias())
+            && a == b
+        {
+            return true;
+        }
+        false
+    }
 }
 
 impl SecretValue {
@@ -175,7 +198,7 @@ impl SecretValue {
         if token.spent {
             return Err(SecretError::ExposeUnauthorized);
         }
-        if token.secret_ref != self.refer {
+        if !token.secret_ref.matches(&self.refer) {
             return Err(SecretError::ExposeUnauthorized);
         }
         if token.target != *target {

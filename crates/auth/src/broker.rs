@@ -230,4 +230,37 @@ mod tests {
         assert!(broker.open(&mut scoped, &CancellationToken::new()).is_err());
         let _ = CredentialKind::Generic;
     }
+
+    #[test]
+    fn expose_succeeds_when_the_issued_ref_is_narrower_than_the_stored_one() {
+        // The store deliberately does loose id-or-alias matching (see
+        // `SecretRef::matches`) — a secret stored under id+alias must still
+        // resolve for a token issued against alias-only, since `open()`
+        // already proved the store holds that exact handle. `expose()` must
+        // agree with that same definition of "same handle" or a caller can
+        // see `open()` succeed and then be denied by `expose()` for a
+        // handle the store just confirmed it holds.
+        let store = InMemoryCredentialStore::new();
+        let stored_ref = SecretRef::from_id_and_alias(
+            "018f3c8a-7e2b-7a10-8c4d-0123456789ab",
+            "env:ANTHROPIC_API_KEY",
+        )
+        .expect("stored ref");
+        let put = CredentialPut::persist(
+            SecretValue::from_bytes(stored_ref, b"sk-secret".to_vec()).expect("value"),
+            CredentialKind::Generic,
+        );
+        store.put(put, &CancellationToken::new()).expect("put");
+
+        let broker = SecretBroker::new(&store, env(1000));
+        let alias_only = SecretRef::from_alias("env:ANTHROPIC_API_KEY").expect("alias ref");
+        let mut scoped = broker.issue(alias_only, target("sandbox"));
+        let mut bound = broker
+            .open(&mut scoped, &CancellationToken::new())
+            .expect("open");
+        assert_eq!(
+            bound.expose(&target("sandbox")).expect("expose").as_bytes(),
+            b"sk-secret"
+        );
+    }
 }

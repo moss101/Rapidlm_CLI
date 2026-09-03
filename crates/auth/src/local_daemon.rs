@@ -817,8 +817,11 @@ fn persist_token(
     let encoded = encode_token_file(binding, token);
     {
         let mut file = create_private_file(&tmp)?;
-        file.write_all(&encoded).map_err(|_| DaemonAuthError::Io)?;
-        file.sync_all().map_err(|_| DaemonAuthError::Io)?;
+        if let Err(err) = file.write_all(&encoded).and_then(|()| file.sync_all()) {
+            let _ = err;
+            let _ = fs::remove_file(&tmp);
+            return Err(DaemonAuthError::Io);
+        }
     }
     if let Err(err) = set_unix_mode(&tmp, TOKEN_FILE_MODE) {
         let _ = fs::remove_file(&tmp);

@@ -1032,6 +1032,53 @@ anywhere in `apps/rapid` yet (confirmed, not assumed: no call site in `apps/rapi
 "needs a design decision this pass can't responsibly guess at" category, not a small wiring gap — flagging it
 precisely rather than either rushing a partial/wrong integration or silently leaving it unrecorded.
 
+**Fresh review pass, 2026-09-02, `crates/auth/src/secret.rs::SecretValue::expose` — two independent
+implementations of "does this ref name the same secret" had silently diverged, so `open()` succeeding could
+still be followed by `expose()` wrongly denying it.** `crates/auth/src/store.rs`'s `MemoryTable::get` (and the
+in-memory/ephemeral legs of the keychain adapters that route through it) deliberately does *loose* matching —
+`refs_match` treats a shared `id` **or** a shared `alias` as "the same handle" even if the two refs otherwise
+differ, and `get` returns the *stored* ref, not the caller's query ref. But `SecretValue::expose` compared
+`token.secret_ref != self.refer` with plain `PartialEq` — *strict* structural equality. `SecretBroker::open`'s
+own doc comment: "Fails closed if `scoped` was issued for a different environment, and fails if the store no
+longer holds the handle." A secret stored under `SecretRef::from_id_and_alias(id, alias)` but issued as a
+`ScopedSecret` from `SecretRef::from_alias(alias)` alone made `open()` succeed (correctly proving the store
+holds it) and then `expose()` fail with `ExposeUnauthorized` anyway, because `{id: None, alias}` != `{id:
+Some(_), alias}` — contradicting `open()`'s own doc-promised guarantee that success there means the caller can
+proceed. Verified via the standard temporary-revert cycle: the new test failed with exactly `expose:
+ExposeUnauthorized` against the reverted strict-equality check, confirming the gap, before the fix was
+restored. **Fixed:** added `SecretRef::matches` — the single canonical definition of "same handle" (exact
+equality, or shared id, or shared alias) — and made both `store.rs::refs_match` and `SecretValue::expose` call
+it, so the two can never independently diverge again. New test
+`expose_succeeds_when_the_issued_ref_is_narrower_than_the_stored_one`. Full `auth` crate suite (72 tests, up
+from 71) and `cargo build --workspace --tests` pass. **Latent, not yet actively firing:** confirmed via
+`grep -rln "SecretBroker"` (outside `crates/auth`) that this broker has zero callers anywhere in the
+workspace — its own `#[allow(dead_code)]` comment on `SecretBrokerToken::issue` says it's "minted by
+SecretBroker / store paths in later auth tasks" — but a real, demonstrable contract violation in the public
+API worth having fixed before any caller mints a `ScopedSecret` from a ref shape narrower than how the secret
+happens to be stored.
+
+**Same review pass, `crates/auth/src/local_daemon.rs::persist_token` — a write/sync failure while issuing a
+daemon token left an un-wiped, owner-only secret file on disk indefinitely.** Every other failure path in this
+function (mode-setting, rename) cleans up the temp file with `let _ = fs::remove_file(&tmp);` before
+returning, but the `file.write_all(&encoded)`/`file.sync_all()` calls used a bare `.map_err(..)?` with no
+cleanup — sibling-path asymmetry, the same shape this session has fixed repeatedly elsewhere. Concretely: if
+`write_all`/`sync_all` fails (e.g. `ENOSPC` from a full disk, or any transient I/O error) while `DaemonAuth::
+issue()` persists a freshly-generated token, the `0600`-mode temp file at `<runtime_dir>/daemon.token.tmp`
+survives on disk, containing whatever partial/complete token bytes were flushed before the failure, until
+`issue()` happens to be called again (the only existing cleanup is defensive, at the *next* call's own
+`if tmp.exists() { remove_file }` guard at the top of the function) — inconsistent with the rest of this
+crate's otherwise scrupulous secret-hygiene discipline (`wipe_array`/`wipe_vec` zero every in-memory secret
+buffer on every drop/error path). Reachability: live — `DaemonAuth::issue()` is exercised directly by
+`crates/kernel`'s IPC server auth handshake (the same subsystem this session already fixed a real bug in:
+the per-request re-authorization gap, commit `72149ea`). **Fixed:**
+the write-then-sync sequence now shares the same catch-and-clean-up pattern the mode-set and rename paths
+already use. **Verification note:** not exercised by a new test — forcing a genuine, portable `write_all`/
+`sync_all` failure (a full disk, a closed fd) without a platform-specific device (`/dev/full` isn't available
+on macOS, where this pass ran) or an unsafe fd-manipulation trick isn't achievable safely here; the fix is a
+direct, minimal-diff structural match to the two already-tested sibling cleanup blocks in the same function,
+verified by inspection and by the full crate suite's continued pass (72 tests, no regressions) plus
+`cargo build --workspace --tests`.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
