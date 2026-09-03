@@ -1246,6 +1246,43 @@ but this is a genuine, demonstrable defect in the pool's own logic, not a caller
 doc-claimed exclusivity guarantee should hold regardless of what ids a `Provisioner` implementation happens to
 return, and the one example implementation already in the tree is exactly the naive shape that triggers it.
 
+**Fresh review pass, 2026-09-02, `crates/knowledge/src/lib.rs::PreferenceStore::merge` — two compounding bugs:
+the wrong entry was returned when the merge target wasn't the vec's last element, and a rejection was replayed
+as a confirmation.** The module's own framing: "Preference store with contradiction handling across
+candidates," and `merge`'s own doc comment: "same proposition confirms/contradicts in place." **Bug 1:** the
+function mutated `existing` (found via `iter_mut().find(...)`, which can be any index) but always *returned*
+`self.candidates.last().unwrap()` — correct only when the merge target happened to be the vec's last entry.
+The crate's own pre-existing test never caught this because it only ever exercised a single-entry store, where
+`last()` trivially equals the merged entry. **Bug 2:** the function *always* called `existing.confirm()` before
+additionally replaying `candidate.contradictions` contradictions — so merging a Reject-sourced candidate
+(built via `PreferenceCandidate::from_feedback`, which carries `observations: 0, contradictions: 1` for a
+rejection) still called `confirm()` once, spuriously incrementing `observations` and partially offsetting the
+contradiction's confidence drop — the store ends up *more* confident in a preference than it should be right
+after being told the user rejected it, the opposite of `contradict`'s own doc comment ("Contradiction reduces
+confidence"). Verified via the standard temporary-revert cycle for both: the new tests failed with the exact
+predicted wrong values (`"prop-b"` returned instead of `"prop-a"`; `observations` incremented to 2 instead of
+staying at 1) against the reverted code. **Fixed:** replaced the `iter_mut().find()`/`last()` pattern with an
+index-based lookup (`iter().position()` then index into `self.candidates[index]`) so the function can return a
+reference to the actual merged entry regardless of position, and replays `candidate.observations` confirms
+before `candidate.contradictions` contradicts — generalizing correctly to both Accept/Edit-sourced (1
+observation, 0 contradictions) and Reject-sourced (0 observations, 1 contradiction) candidates alike, instead
+of hardcoding one confirm every time. New tests `merge_returns_the_actual_merged_entry_even_when_not_last` and
+`merge_replays_a_rejection_as_a_contradiction_not_a_confirmation`. **Same pass, third and lowest-severity
+finding — `PreferenceCandidate::decay`'s `days_idle as i32` cast wraps negative past `i32::MAX`, flipping
+`0.98f64.powi(...)` from decaying toward the 0.05 floor to diverging toward infinity** — directly contradicting
+the function's own doc comment ("recency keeps preferences honest"). Requires an unrealistic `days_idle` (~5.9
+million years) to trigger directly via the public `u32` parameter, but is exactly the kind of footgun a
+timestamp-subtraction-derived `days_idle` could hit on an underflow before the cast; fixed with a `.min(i32::
+MAX as u32)` clamp before casting, verified via the same temporary-revert cycle (`confidence.is_finite()`
+failed against the reverted code). New test `decay_never_blows_up_past_i32_max_days_idle`. Full `knowledge`
+crate suite (7 tests, up from 4) and `cargo build --workspace --tests` pass. **Latent, not yet actively
+firing:** confirmed via `grep -rn "PreferenceStore|PreferenceCandidate|FeedbackEvent|ExperimentRegistry"
+--include="*.rs" .` that the only matches outside this crate's own file are its `Cargo.toml` dependency
+declaration in `apps/rapid` — no file under `apps/rapid/src` actually imports or calls into `knowledge::*` yet.
+The crate is fully dead code from the rest of the workspace's perspective today, but these bugs would be live
+the moment the feedback/preference-learning pipeline its own module doc references (P11-020..027) gets wired
+in — worth having correct before that happens.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
