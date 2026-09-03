@@ -36,14 +36,32 @@ pub fn analyze(records: &[crate::EventSummary]) -> Vec<Insight> {
             detail: "at least one goal completed".into(),
         });
     }
-    let secrets = records
+    // Approval-lifecycle activity: the request/resolve/expire family, plus
+    // the tool-side gate that triggers it (crates/event-ledger's real
+    // Approval-family kinds — this doc comment's own "approvals" promise
+    // was previously unimplemented).
+    let approvals = records
         .iter()
-        .filter(|r| r.kind.contains("secret"))
+        .filter(|r| r.kind.starts_with("approval.") || r.kind == "tool.approval_required")
         .count();
-    if secrets > 0 {
+    if approvals > 0 {
         out.push(Insight {
-            kind: "secret_touches",
-            detail: format!("{secrets} secret-classified events"),
+            kind: "approvals",
+            detail: format!("{approvals} approval-lifecycle events"),
+        });
+    }
+    // Error pressure: turn/model/tool failures (this doc comment's own
+    // "error pressure" promise was previously unimplemented — the crate
+    // only ever looked at the narrower `tool.denied` kind, so 50
+    // `tool.failed` events produced no failure-pressure signal at all).
+    let errors = records
+        .iter()
+        .filter(|r| r.kind == "turn.failed" || r.kind == "model.failed" || r.kind == "tool.failed")
+        .count();
+    if errors > 0 {
+        out.push(Insight {
+            kind: "error_pressure",
+            detail: format!("{errors} turn/model/tool failures"),
         });
     }
     out
@@ -136,20 +154,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn analyzer_surfaces_tools_denials_completion_and_secrets() {
+    fn analyzer_surfaces_tools_denials_completion_approvals_and_errors() {
         let records = vec![
             EventSummary::new("tool.completed"),
             EventSummary::new("tool.completed"),
             EventSummary::new("tool.denied"),
             EventSummary::new("goal.completed"),
-            EventSummary::new("secret.used"),
+            EventSummary::new("approval.requested"),
+            EventSummary::new("approval.resolved"),
+            EventSummary::new("tool.approval_required"),
+            EventSummary::new("tool.failed"),
+            EventSummary::new("turn.failed"),
+            EventSummary::new("model.failed"),
         ];
         let insights = analyze(&records);
         let kinds: Vec<&str> = insights.iter().map(|i| i.kind).collect();
         assert!(kinds.contains(&"tool_usage"));
         assert!(kinds.contains(&"denials"));
         assert!(kinds.contains(&"goal_completion"));
-        assert!(kinds.contains(&"secret_touches"));
+        assert!(kinds.contains(&"approvals"));
+        assert!(kinds.contains(&"error_pressure"));
+        let approvals = insights.iter().find(|i| i.kind == "approvals").expect("approvals");
+        assert_eq!(approvals.detail, "3 approval-lifecycle events");
+        let errors = insights
+            .iter()
+            .find(|i| i.kind == "error_pressure")
+            .expect("error_pressure");
+        assert_eq!(errors.detail, "3 turn/model/tool failures");
+    }
+
+    #[test]
+    fn analyzer_emits_no_approvals_or_error_pressure_when_absent() {
+        let records = vec![EventSummary::new("tool.completed")];
+        let insights = analyze(&records);
+        let kinds: Vec<&str> = insights.iter().map(|i| i.kind).collect();
+        assert!(!kinds.contains(&"approvals"));
+        assert!(!kinds.contains(&"error_pressure"));
     }
 
     #[test]

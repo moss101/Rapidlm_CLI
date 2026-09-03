@@ -1354,6 +1354,36 @@ FILES` and add a distinct tombstone bound?) rather than a one-line change; `grep
 the crate confirms zero external callers, and the crate's own internal caller creates a fresh overlay per
 transaction, so it isn't triggered by current wiring either. Both flagged precisely rather than guessed at.
 
+**Fresh review pass, 2026-09-02, `crates/insights/src/lib.rs::analyze` — the last crate in the workspace to get
+a dedicated review this session, and a live one: two of the four signal families `analyze`'s own doc comment
+promises were never implemented.** Doc comment: "Session insights over exported ledger records: tool usage,
+approvals, goal completion, error pressure." The implementation only ever produced `tool_usage`, `denials`
+(narrowly `kind == "tool.denied"`, not the broader "error pressure" the doc promises), `goal_completion`, and
+an undocumented fifth `secret_touches`. Concretely: a session with real `ApprovalRequested`/`ApprovalResolved`/
+`ApprovalExpired` events (`crates/event-ledger`'s actual Approval-family kinds — confirmed present in its
+closed `define_event_kinds!` registry) or `ToolFailed`/`TurnFailed`/`ModelFailed` events produced no `approvals`
+or `error_pressure` insight at all — `rapid insights <session-id>` silently omitted exactly the two signal
+categories its own doc comment says it surfaces. Separately, `secret_touches` (`kind.contains("secret")`) was
+confirmed genuinely dead code for any real session: `crates/event-ledger/src/event.rs`'s wire-string registry
+is closed and fully enumerated (~90 literal kind strings), and none contains the substring `"secret"` — the
+crate's own test only exercised this branch with a synthetic `"secret.used"` string production code can never
+construct (`EventSummary` is built exclusively from real `ExportedEvent.kind` values). Verified via the
+standard temporary-revert cycle: the new test failed on `kinds.contains(&"approvals")` against the reverted
+code. **Fixed:** implemented `approvals` (matches the real `approval.*` kinds plus the tool-side `tool.
+approval_required` gate that triggers them) and `error_pressure` (matches `turn.failed`/`model.failed`/`tool.
+failed`) using the exact same filter-and-count pattern the three existing insights already establish in this
+same function — not a new mechanism, just extending an established local pattern with kinds that already exist
+in the ledger's own registry. Removed the confirmed-dead `secret_touches` branch (and its test coverage, which
+only ever exercised the synthetic string) rather than leave demonstrably unreachable production logic that
+looks like it does something. New tests `analyzer_surfaces_tools_denials_completion_approvals_and_errors` and
+`analyzer_emits_no_approvals_or_error_pressure_when_absent`. Full `insights` crate suite (5 tests, was 4 before
+removing the old combined test and adding two) and `cargo build --workspace --tests` pass. **Live and
+reachable:** confirmed via `grep -rn "secret_touches"` (zero hits anywhere, safe to remove) and via `apps/
+rapid/src/interactive.rs:349`/`p9_commands.rs:1817-1847` that `rapid insights <session-id>` is a real, wired CLI
+subcommand exercising exactly this function against real exported ledger events today — `apps/rapid`'s own
+`insights_command_analyzes_real_exported_ledger_events` integration test still passes. This closes out the
+session's crate-by-crate sweep: every crate in the workspace has now had at least one dedicated review pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
