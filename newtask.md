@@ -1283,6 +1283,77 @@ The crate is fully dead code from the rest of the workspace's perspective today,
 the moment the feedback/preference-learning pipeline its own module doc references (P11-020..027) gets wired
 in — worth having correct before that happens.
 
+**Fresh review pass, 2026-09-02, `crates/workspace/src/backends/git_worktree.rs::GitWorktreeStore::
+rollback_create` — the live, reachable finding of this pass: a failed `create_view` could permanently orphan a
+worktree directory with no record left pointing at it.** The module's own doc comment: "Cleanup never uses
+`--force`; a dirty worktree is left intact and reported as `GitWorktreeError::CleanupFailed`." `remove_view`
+honors this precisely (checks the removal result and the directory's continued existence; on either failure,
+marks the persisted record `CleanupFailed` and returns an error *without* deleting the ref or metadata).
+`rollback_create` — invoked from `create_view`'s error branch when `finish_create` fails after the worktree may
+already be partially created — did the opposite: it discarded `git worktree remove`'s result and unconditionally
+deleted both the ref and the metadata record regardless of whether the directory removal actually succeeded.
+Concretely: `finish_create` runs `git worktree add` then checks the user's HEAD hasn't moved, failing with
+`GitFailed` if it has (or on a timeout/cancellation mid-checkout, already a real, tested failure mode via `git_
+timeout_is_enforced`) — a real worktree directory exists on disk by that point. A non-forced `git worktree
+remove` can legitimately fail against a dirty/partial checkout; `rollback_create` swallowed that failure and
+deleted the metadata anyway, leaving the directory (and git's own `.git/worktrees/<id>` registration)
+permanently unreachable — `list_views`/`metadata_ids` only enumerate `views/*.json`, so nothing could ever find
+or clean it up again. Verified via the standard temporary-revert cycle: the new test failed on `assert!(ref_
+exists(...))` against the reverted code. **Fixed:** `rollback_create` now mirrors `remove_view`'s exact
+contract — on a removal failure or the directory still existing afterward, it re-reads the still-persisted
+record, marks it `CleanupFailed`, and persists that instead of deleting anything further. New helper `mark_
+cleanup_failed`, new test `rollback_create_preserves_the_record_when_cleanup_cannot_remove_the_worktree`. Full
+`workspace` crate suite (173 tests, up from 171) and `cargo build --workspace --tests` pass. **Live and
+reachable, not latent:** confirmed via `grep -rn "create_view"` that `apps/rapid/src/shadow_diagnostics.rs` and
+`crates/agent-runtime/src/agent/spawn.rs` (which explicitly maps `GitWorktreeError::Timeout` to `SpawnError::
+Timeout` — timeout-during-create is an anticipated, already-handled outcome on the real subagent-spawn path)
+both call `create_view` directly, and `apps/rapid` depends on both crates.
+
+**Same review pass, `crates/workspace/src/backends/{overlay,remote}.rs` — a lost-update race in both `Overlay
+Backend`/`RemoteSnapshotBackend`'s `write`/`delete`: two separate lock acquisitions (one to read the current
+state via `visible()`, a second to mutate) let a concurrent writer's release-then-remutate silently overwrite
+another writer's just-completed change with no error, defeating the `expected`/`PreimageMismatch` optimistic-
+concurrency contract those parameters exist to enforce.** The sibling `DirectBackend::write` already gets this
+right — one lock held across the whole read-decide-mutate sequence — making this an asymmetry between
+implementations of the same `WorkspaceBackend` contract, not a design choice. Concretely: two threads both call
+`write(path, bytes, expected: None)` for a not-yet-existing path; both see `visible() == None` under their own,
+separately-acquired-and-released lock, both pass the `(None, None) => {}` arm, and both then acquire a second,
+fresh lock to `slots.insert(...)` — the second insert silently replaces the first, and both calls return `Ok
+(())` even though only one write should have won. Verified via a genuine multi-threaded reproduction (not
+simulated): an unsynchronized 2-thread version of this test needed hundreds of tries to land inside the actual
+race window (a few in-memory operations) and mostly didn't, so the real test uses 16 threads synchronized to a
+`Barrier` all racing to create the same path — against the reverted two-lock code this reliably produced
+multiple `Ok(())` results (2 successes out of 16 in the run that confirmed it) for what should be exactly one
+winner; restoring the fix reduced it to exactly 1 every time across repeated runs. **Fixed:** both backends now
+acquire the lock once and hold it across the whole decide-then-mutate sequence, via a new `visible_locked` that
+takes an already-held `&Inner` instead of re-locking (the now-fully-redundant `OverlayBackend::visible`
+convenience wrapper was removed as genuinely dead code once both its only two callers were switched). New test
+`concurrent_writes_to_a_new_path_never_both_report_success` in `overlay.rs`. Full `workspace` crate suite and
+`cargo build --workspace --tests` pass. **Latent, not yet actively firing:** confirmed via `grep -rln
+"OverlayBackend::\|RemoteSnapshotBackend::"` that neither type is constructed anywhere outside the crate's own
+tests — real, demonstrable defects in dormant public API, worth having correct before either backend is wired
+into `apps/rapid`.
+
+**Same pass, two further findings documented but not fixed — both real, both currently dormant, both larger
+than a scoped bug fix given the time already spent on this pass's two live/higher-confidence fixes above:**
+(1) `crates/workspace/src/checkpoint.rs::CheckpointManager::rewind` bypasses the manager's own `max_files`/
+`max_bytes` caps that `checkpoint()` enforces — `plan_rewind`'s signature takes neither parameter at all, so a
+manager configured with tight caps (e.g. `max_files=1`) still processes every journal entry since the checkpoint
+(up to `MAX_JOURNAL_ENTRIES` = 4096, each up to the crate-wide 8 MiB ceiling) with zero enforcement from its own
+configured limits during `rewind`. Closing this means deciding what `plan_rewind` should actually do when a
+rewind's natural scope exceeds the manager's caps (truncate the rewind set? fail closed? a different cap
+entirely from checkpoint's?) — a real design question, not a mechanical fix, and `grep -rln "CheckpointManager"`
+confirms zero instantiations outside the crate's own tests today. (2) `crates/workspace/src/patch/apply.rs::
+MAX_OVERLAY_FILES`'s own doc comment says "Maximum **present** files retained in one overlay," but `check_
+overlay_bounds` counts `slots.len()` — present entries *and* delete tombstones, which are never pruned — so a
+`StagingOverlay` reused across many sequential patches (an explicitly supported, tested usage pattern) can hit
+the 4096 cap from accumulated deletes alone and reject a legitimate `CreateFile` for a brand-new file even with
+zero present-file bytes held. Fixing this needs a decision on the actual intended tombstone lifetime (prune on
+some schedule? cap tombstones separately from present files? count only `Present` slots against `MAX_OVERLAY_
+FILES` and add a distinct tombstone bound?) rather than a one-line change; `grep -rln StagingOverlay` outside
+the crate confirms zero external callers, and the crate's own internal caller creates a fresh overlay per
+transaction, so it isn't triggered by current wiring either. Both flagged precisely rather than guessed at.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

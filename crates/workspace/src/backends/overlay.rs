@@ -168,7 +168,13 @@ impl OverlayBackend {
             return Err(OverlayError::BoundExceeded);
         }
         let new_hash = ArtifactId::from_bytes(bytes);
-        let visible = self.visible(path, cancel)?;
+        // Held for the whole decide-then-mutate sequence: releasing it
+        // between the preimage check and the insert let two concurrent
+        // writers both pass the check against the same stale snapshot, the
+        // second silently overwriting the first with no error — exactly
+        // the lost-update `expected`/`PreimageMismatch` exists to prevent.
+        let mut inner = self.lock()?;
+        let visible = self.visible_locked(&inner, path, cancel)?;
         match (visible.as_ref(), expected) {
             (Some(current), _) if current.hash == new_hash => return Ok(()),
             (Some(_current), None) => return Err(OverlayError::PreexistingChange),
@@ -178,7 +184,6 @@ impl OverlayBackend {
             (None, Some(_)) => return Err(OverlayError::PreimageMismatch),
             (None, None) | (Some(_), Some(_)) => {}
         }
-        let mut inner = self.lock()?;
         if !inner.slots.contains_key(path.as_str()) && inner.slots.len() >= self.max_slots {
             return Err(OverlayError::SlotLimit);
         }
@@ -202,13 +207,15 @@ impl OverlayBackend {
         self.ensure_writable()?;
         self.ensure_in_scope(path)?;
         reject_git(path)?;
-        let visible = self.visible(path, cancel)?.ok_or(OverlayError::NotFound)?;
+        let mut inner = self.lock()?;
+        let visible = self
+            .visible_locked(&inner, path, cancel)?
+            .ok_or(OverlayError::NotFound)?;
         match expected {
             None => return Err(OverlayError::PreexistingChange),
             Some(exp) if visible.hash != *exp => return Err(OverlayError::PreimageMismatch),
             Some(_) => {}
         }
-        let mut inner = self.lock()?;
         if !inner.slots.contains_key(path.as_str()) && inner.slots.len() >= self.max_slots {
             return Err(OverlayError::SlotLimit);
         }
@@ -218,12 +225,15 @@ impl OverlayBackend {
         Ok(())
     }
 
-    fn visible(
+    /// Looks up a path's visible blob against an already-held guard so a
+    /// caller can decide-then-mutate under one continuous lock instead of a
+    /// stale snapshot from a separately acquired-and-released lock.
+    fn visible_locked(
         &self,
+        inner: &Inner,
         path: &RepoPath,
         cancel: &CancellationToken,
     ) -> Result<Option<VisibleBlob>, OverlayError> {
-        let inner = self.lock()?;
         match inner.slots.get(path.as_str()) {
             Some(OverlaySlot::Present { hash, .. }) => Ok(Some(VisibleBlob { hash: *hash })),
             Some(OverlaySlot::Deleted) => Ok(None),
@@ -404,6 +414,46 @@ mod tests {
             fs::read(fx.dir.join("src/lib.rs")).expect("base"),
             b"fn main() {}\n"
         );
+    }
+
+    #[test]
+    fn concurrent_writes_to_a_new_path_never_both_report_success() {
+        // Writers racing to create the same not-yet-existing path with
+        // `expected: None` must not both succeed: exactly one wins, and
+        // every loser must see `PreexistingChange` once it observes the
+        // winner's write — never silently overwrite it while still
+        // reporting `Ok`. A synchronized start with many contenders (rather
+        // than two threads left to real scheduling) is needed to reliably
+        // land inside the race window, which spans only a few in-memory
+        // operations.
+        const CONTENDERS: usize = 16;
+        for _ in 0..50 {
+            let fx = fixture();
+            let path = repo("src/new.rs");
+            let barrier = std::sync::Barrier::new(CONTENDERS);
+            let results: Vec<Result<(), OverlayError>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..CONTENDERS)
+                    .map(|i| {
+                        let barrier = &barrier;
+                        let backend = &fx.backend;
+                        let path = &path;
+                        scope.spawn(move || {
+                            let bytes = format!("from-{i}");
+                            barrier.wait();
+                            backend.write(path, bytes.as_bytes(), None, &cancel())
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().expect("thread")).collect()
+            });
+            let successes = results.iter().filter(|r| r.is_ok()).count();
+            assert_eq!(
+                successes, 1,
+                "exactly one concurrent write to a brand-new path must win \
+                 (got {results:?}) — more than one silently overwriting the \
+                 winner instead of seeing PreexistingChange is the bug"
+            );
+        }
     }
 
     #[test]

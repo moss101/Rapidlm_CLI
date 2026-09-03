@@ -448,6 +448,18 @@ impl GitWorktreeStore {
         Ok(active)
     }
 
+    /// Undo a failed `create_view`. Mirrors `remove_view`'s own contract
+    /// ("a dirty worktree is left intact and reported as `CleanupFailed`"):
+    /// if the worktree can't actually be removed, the ref and metadata
+    /// record must survive too, marked `CleanupFailed`, so the directory
+    /// stays discoverable via `list_views` instead of becoming a permanently
+    /// orphaned worktree with no record pointing at it.
+    /// Undo a failed `create_view`. Mirrors `remove_view`'s own contract
+    /// ("a dirty worktree is left intact and reported as `CleanupFailed`"):
+    /// if the worktree can't actually be removed, the ref and metadata
+    /// record must survive too, marked `CleanupFailed`, so the directory
+    /// stays discoverable via `list_views` instead of becoming a permanently
+    /// orphaned worktree with no record pointing at it.
     fn rollback_create(
         &self,
         view_id: WorkspaceViewId,
@@ -455,14 +467,30 @@ impl GitWorktreeStore {
         worktree_path: &Path,
         cancel: &CancellationToken,
     ) {
+        let relpath = view_relpath(view_id);
         if worktree_path.exists() {
-            let path = path_arg(worktree_path).ok();
-            if let Some(path) = path {
-                let _ = self.git(&["worktree", "remove", "--", path], cancel);
+            let removed = path_arg(worktree_path)
+                .ok()
+                .and_then(|path| self.git(&["worktree", "remove", "--", path], cancel).ok());
+            if removed.is_none() || worktree_path.exists() {
+                self.mark_cleanup_failed(view_id, &relpath);
+                return;
             }
         }
-        let _ = self.delete_ref(git_ref, cancel);
+        if self.delete_ref(git_ref, cancel).is_err() {
+            self.mark_cleanup_failed(view_id, &relpath);
+            return;
+        }
         let _ = remove_metadata(&self.metadata_path(view_id));
+    }
+
+    /// Best-effort: mark the still-persisted record `CleanupFailed` instead
+    /// of leaving cleanup's caller to silently drop it.
+    fn mark_cleanup_failed(&self, view_id: WorkspaceViewId, relpath: &str) {
+        if let Ok(mut record) = self.read_metadata(view_id) {
+            record.record_state = GitWorktreeRecordState::CleanupFailed;
+            let _ = self.write_metadata(&record, relpath);
+        }
     }
 
     fn resolve_commit(
@@ -1367,6 +1395,42 @@ mod tests {
             store(&fx).load_view(record.view_id(), &cancel()),
             Err(GitWorktreeError::ViewNotFound)
         );
+    }
+
+    #[test]
+    fn rollback_create_preserves_the_record_when_cleanup_cannot_remove_the_worktree() {
+        // Simulates `create_view`'s error branch calling `rollback_create`
+        // after `finish_create` fails post-`git worktree add` (e.g. a
+        // concurrent HEAD move) — by that point a real worktree directory
+        // exists on disk. Dirtying it here reproduces the same non-forced
+        // `git worktree remove` refusal `cleanup_failure_is_reported_and_
+        // not_destructive` already exercises for `remove_view`, but through
+        // `rollback_create`'s own path instead.
+        let fx = fixture();
+        let st = store(&fx);
+        let record = st
+            .create_view(&view(ViewAccess::ReadWrite, &fx.head_sha), &cancel())
+            .expect("create");
+        let extra = record.worktree_path().join("dirty.txt");
+        fs::write(&extra, b"uncommitted\n").expect("dirty worktree");
+
+        st.rollback_create(
+            record.view_id(),
+            record.git_ref(),
+            record.worktree_path(),
+            &cancel(),
+        );
+
+        // The worktree, ref, and metadata must all survive cleanup failure,
+        // marked `CleanupFailed` — not silently deleted out from under a
+        // directory that still exists on disk with no record left pointing
+        // at it.
+        assert!(record.worktree_path().exists());
+        assert!(ref_exists(&fx.dir, record.git_ref()));
+        let loaded = st
+            .load_view(record.view_id(), &cancel())
+            .expect("metadata remains");
+        assert_eq!(loaded.record_state(), GitWorktreeRecordState::CleanupFailed);
     }
 
     #[test]

@@ -198,7 +198,13 @@ impl RemoteSnapshotBackend {
             return Err(RemoteSnapshotError::BoundExceeded);
         }
         let new_hash = ArtifactId::from_bytes(bytes);
-        let visible = self.visible(path, cancel)?;
+        // Held for the whole decide-then-mutate sequence: releasing it
+        // between the preimage check and the insert let two concurrent
+        // writers both pass the check against the same stale snapshot, the
+        // second silently overwriting the first with no error — exactly
+        // the lost-update `expected`/`PreimageMismatch` exists to prevent.
+        let mut inner = self.lock()?;
+        let visible = self.visible_locked(&inner, path, cancel)?;
         match (visible, expected) {
             (Some(current), _) if current == new_hash => return Ok(()),
             (Some(_), None) => return Err(RemoteSnapshotError::PreexistingChange),
@@ -208,7 +214,6 @@ impl RemoteSnapshotBackend {
             (None, Some(_)) => return Err(RemoteSnapshotError::PreimageMismatch),
             (None, None) | (Some(_), Some(_)) => {}
         }
-        let mut inner = self.lock()?;
         if !inner.slots.contains_key(path.as_str()) && inner.slots.len() >= self.max_slots {
             return Err(RemoteSnapshotError::SlotLimit);
         }
@@ -232,15 +237,15 @@ impl RemoteSnapshotBackend {
         self.ensure_writable()?;
         self.ensure_in_scope(path)?;
         reject_git(path)?;
+        let mut inner = self.lock()?;
         let visible = self
-            .visible(path, cancel)?
+            .visible_locked(&inner, path, cancel)?
             .ok_or(RemoteSnapshotError::NotFound)?;
         match expected {
             None => return Err(RemoteSnapshotError::PreexistingChange),
             Some(exp) if visible != *exp => return Err(RemoteSnapshotError::PreimageMismatch),
             Some(_) => {}
         }
-        let mut inner = self.lock()?;
         if !inner.slots.contains_key(path.as_str()) && inner.slots.len() >= self.max_slots {
             return Err(RemoteSnapshotError::SlotLimit);
         }
@@ -250,12 +255,15 @@ impl RemoteSnapshotBackend {
         Ok(())
     }
 
-    fn visible(
+    /// Looks up a path's visible hash against an already-held guard so a
+    /// caller can decide-then-mutate under one continuous lock instead of a
+    /// stale snapshot from a separately acquired-and-released lock.
+    fn visible_locked(
         &self,
+        inner: &Inner,
         path: &RepoPath,
         cancel: &CancellationToken,
     ) -> Result<Option<ArtifactId>, RemoteSnapshotError> {
-        let inner = self.lock()?;
         match inner.slots.get(path.as_str()) {
             Some(OverlaySlot::Present { hash, .. }) => Ok(Some(*hash)),
             Some(OverlaySlot::Deleted) => Ok(None),
