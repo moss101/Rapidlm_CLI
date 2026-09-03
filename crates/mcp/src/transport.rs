@@ -9,7 +9,10 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::{self, Debug};
 use std::io::{self, Read, Write};
-use std::time::Duration;
+use std::marker::PhantomData;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use auth::{SecretRef, SecretTarget};
 use capability_broker::{
@@ -60,6 +63,11 @@ const JSONRPC_VERSION: &str = "2.0";
 const INITIALIZE_METHOD: &str = "initialize";
 const INITIALIZED_METHOD: &str = "notifications/initialized";
 const CANCEL_STRIDE: usize = 64;
+
+/// Poll stride while [`StdioTransport::recv_frame`] waits on its background
+/// reader thread — bounds how quickly a cancellation or deadline is noticed
+/// without busy-spinning.
+const RECV_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Which wire the session is speaking.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -195,12 +203,19 @@ pub trait StreamableHttpIo {
 }
 
 /// Newline-delimited JSON-RPC over already-opened supervised pipes.
+///
+/// Receiving runs on a dedicated background thread: a blocked `Read::read`
+/// on a real pipe cannot be interrupted by a cancellation flag or a
+/// deadline, only waited on, so `recv_frame` bounds its *wait* on the
+/// resulting channel instead of the read itself. A hung peer leaves the
+/// reader thread blocked until the pipe eventually closes or errors, but
+/// `recv_frame` still returns promptly on cancellation or `IoBounds::timeout`.
 pub struct StdioTransport<R, W> {
-    reader: R,
+    frames: mpsc::Receiver<Result<Vec<u8>, TransportError>>,
+    _reader: PhantomData<R>,
     writer: W,
     job_id: Option<JobId>,
     bounds: IoBounds,
-    leftover: Vec<u8>,
     closed: bool,
 }
 
@@ -542,15 +557,17 @@ impl HttpResponse {
     }
 }
 
-impl<R: Read, W: Write> StdioTransport<R, W> {
-    /// Attach to pipes from a supervised child. This type does not spawn.
+impl<R: Read + Send + 'static, W: Write> StdioTransport<R, W> {
+    /// Attach to pipes from a supervised child. This type does not spawn the
+    /// child process itself, but it does spawn the background frame reader
+    /// described on the type's own doc comment.
     pub fn from_pipes(reader: R, writer: W, job_id: Option<JobId>, bounds: IoBounds) -> Self {
         Self {
-            reader,
+            frames: spawn_frame_reader(reader, bounds.max_frame_bytes),
+            _reader: PhantomData,
             writer,
             job_id,
             bounds,
-            leftover: Vec::new(),
             closed: false,
         }
     }
@@ -558,6 +575,29 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
     pub fn job_id(&self) -> Option<JobId> {
         self.job_id
     }
+}
+
+/// Runs [`read_newline_frame`] in a loop on a dedicated thread, sending each
+/// parsed frame (or the terminal error) over the returned channel. Never
+/// cancelled internally — cancellation and the I/O deadline are enforced by
+/// `recv_frame`'s wait on the channel, not by this loop.
+fn spawn_frame_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    max_frame_bytes: usize,
+) -> mpsc::Receiver<Result<Vec<u8>, TransportError>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let never_cancelled = CancellationToken::new();
+        let mut leftover = Vec::new();
+        loop {
+            let frame = read_newline_frame(&mut reader, &mut leftover, max_frame_bytes, &never_cancelled);
+            let terminal = frame.is_err();
+            if tx.send(frame).is_err() || terminal {
+                return;
+            }
+        }
+    });
+    rx
 }
 
 impl<R: Read, W: Write> McpTransport for StdioTransport<R, W> {
@@ -579,12 +619,19 @@ impl<R: Read, W: Write> McpTransport for StdioTransport<R, W> {
 
     fn recv_frame(&mut self, cancel: &CancellationToken) -> Result<Vec<u8>, TransportError> {
         check_open(self.closed, cancel)?;
-        read_newline_frame(
-            &mut self.reader,
-            &mut self.leftover,
-            self.bounds.max_frame_bytes,
-            cancel,
-        )
+        let deadline = Instant::now() + self.bounds.timeout;
+        loop {
+            cancel_check(cancel)?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(TransportError::Timeout);
+            }
+            match self.frames.recv_timeout(remaining.min(RECV_POLL_INTERVAL)) {
+                Ok(frame) => return frame,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(TransportError::Closed),
+            }
+        }
     }
 
     fn close(&mut self, cancel: &CancellationToken) -> Result<(), TransportError> {
@@ -1961,6 +2008,52 @@ mod tests {
             transport.send_frame(b"{}", &cancel),
             Err(TransportError::Cancelled)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_recv_frame_times_out_when_the_peer_never_writes() {
+        // A real pipe whose write end stays open but silent — `read()` on
+        // the receive end genuinely blocks in the kernel, exactly like a
+        // hung MCP stdio server. Without a background reader thread this
+        // would hang the test itself; recv_frame must still return promptly.
+        let (reader, _writer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut transport = StdioTransport::from_pipes(
+            reader,
+            Cursor::new(Vec::new()),
+            None,
+            IoBounds::new(4096, Duration::from_millis(200)).expect("bounds"),
+        );
+        let started = Instant::now();
+        assert_eq!(
+            transport.recv_frame(&CancellationToken::new()),
+            Err(TransportError::Timeout)
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_recv_frame_is_interrupted_by_cancellation_when_the_peer_never_writes() {
+        let (reader, _writer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut transport = StdioTransport::from_pipes(
+            reader,
+            Cursor::new(Vec::new()),
+            None,
+            IoBounds::standard(),
+        );
+        let cancel = CancellationToken::new();
+        let watchdog = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            watchdog.cancel();
+        });
+        let started = Instant::now();
+        assert_eq!(
+            transport.recv_frame(&cancel),
+            Err(TransportError::Cancelled)
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

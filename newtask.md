@@ -964,6 +964,74 @@ background agent already framed with citations and a plausible mechanism, before
 looked exactly like the session's other confirmed "sibling method skips a check" bugs until direct measurement
 disproved the mechanism.
 
+**Fresh review pass, 2026-09-02 — `crates/capability-broker` got a direct internal-correctness review (its
+lease/policy/approval API had only been read piecemeal via caller-side bugs found earlier this session); it
+came back clean.** Every stated invariant was traced against the code and the crate's own 137-plus-adversarial
+test suite (all passing): the MAC comparison (`ct_eq`) is genuinely non-short-circuiting, `LeaseValidator::
+validate_use` performs its check-decrement-write entirely inside one lock acquisition (no TOCTOU), policy-
+revision re-checking happens at use time, not just issuance, and `ActionFingerprint`'s binding bytes are
+injective (no delimiter-collision path lets two different principal/session/action bindings hash the same).
+One candidate — `ApprovalRequest::resolve` having no consumed-flag, so a shared `&ApprovalRequest` could in
+principle be resolved more than once — was correctly *not* reported as a bug: no doc comment claims single-
+resolve, the enforced guarantee is the resulting lease's `max_uses` (which genuinely is atomic), and no real
+call site anywhere in the workspace keeps a pending `ApprovalRequest` around across concurrent calls. Recorded
+here only because "reviewed, found nothing" is itself useful signal against re-litigating this crate.
+
+**Fresh review pass, 2026-09-02, `crates/mcp/src/transport.rs::StdioTransport` — a live, reachable hang: the
+transport's blocking pipe read ignored both `CancellationToken` and its own configured `IoBounds::timeout`.**
+The trait doc (`transport.rs:156`, then): "Byte-level MCP transport. Implementations must honor cancel and
+frame caps." `read_newline_frame` only checked `cancel.is_cancelled()` *between* `Read::read` calls
+(`CANCEL_STRIDE`-gated); once inside a real blocked `read()` syscall on an actual pipe, nothing could interrupt
+it, and `IoBounds.timeout` was never consulted for stdio at all — confirmed via `grep -n "bounds.timeout"
+transport.rs` showing exactly one hit, inside the *HTTP* transport's `exchange()`, not stdio's. **Concrete,
+live consequence:** `apps/rapid/src/exec_tools.rs::execute_mcp_tool` calls `session.tools_call(...)` directly
+on a real `StdioTransport<ChildStdout, ChildStdin>` and spawns its own 30s watchdog thread specifically to
+bound that call via `cancel.cancel()` — a watchdog that turns out to be a no-op against a genuinely hung MCP
+stdio server, since the cancellation flag it sets is never actually checked while the read is blocked.
+Reproduced directly: a test using a real `UnixStream::pair()` (write end held open but silent, exactly
+mirroring a hung server's pipe) hung the test process itself past a 20s bound when run against the unfixed
+code — confirmed via the standard temporary-revert cycle (stash the fix, re-add just the new tests to the
+original code, observe the genuine hang, restore the fix) rather than only reasoning about it. **Fixed:**
+`StdioTransport` now spawns a dedicated background thread at construction (`spawn_frame_reader`) that owns the
+reader and runs the framing loop internally, pushing each parsed frame (or terminal error) onto an
+`mpsc::Receiver`; `recv_frame` polls that channel with `recv_timeout` in short (`RECV_POLL_INTERVAL` = 50ms)
+slices bounded by `IoBounds::timeout`, checking cancellation every slice, so it now returns promptly on either
+signal instead of blocking on the syscall itself. This is safe against the higher-layer `exchange_skipping_
+notifications` loop (`transport.rs:946`), which already discards any frame whose JSON-RPC `id` doesn't match
+the expected request — confirmed by reading it before starting the redesign, specifically to rule out a
+"stale response from an abandoned request gets delivered to a later, unrelated call" correctness risk before
+implementing this. New tests `stdio_recv_frame_times_out_when_the_peer_never_writes` and `stdio_recv_frame_
+is_interrupted_by_cancellation_when_the_peer_never_writes`. Full `mcp` crate suite (80 tests, up from 78),
+`apps/rapid`'s three real MCP integration tests (`mcp_stdio_servers_register_and_dispatch_through_the_session`
+included — a real spawned-child end-to-end path), and `cargo build --workspace --tests` all pass. **Known,
+deliberately out-of-scope sibling gap:** `send_frame`'s blocking write (`write_all_cancellable`) has the exact
+same structural limitation (cancellation only checked between syscalls) but was not fixed this pass — the
+confirmed reproduction and the live watchdog-bypass consequence were specifically on the *receive* side;
+fixing the write side too would be a natural follow-up but wasn't independently demonstrated here, so it's
+named rather than assumed-and-fixed by extension.
+
+**Same review pass — `crates/mcp/src/gateway.rs`'s `McpGateway`/`McpTrustStore`/`McpCatalogCache` are
+unreachable: the real caller bypasses the entire trust/policy/lease gate this crate exists to provide.** This
+is a restatement, not a new discovery: §0a above already established that "no production code path in the
+whole repo mints a real lease today" (the `crates/capability-broker` note). `McpGateway::invoke` requires
+exactly that missing prerequisite as an input (`ExternalCallRequest.lease: &CapabilityLease`), so this is that
+same already-documented, deliberately-not-attempted structural gap surfacing again at a new call site, not an
+independent problem needing its own remediation decision. Concretely: `gateway.rs`'s own doc comment ("Catalog
+revision, trust, policy, and the capability lease are checked before any server I/O") and `trust.rs`'s
+("Project-configured servers start disabled. Trust is an explicit grant.") are both true of the *gateway* type
+in isolation — its own tests confirm every check fires correctly — but `apps/rapid/src/exec_tools.rs` never
+constructs or calls through `McpGateway` at all; `register_mcp_servers` spawns every configured server
+directly off `.rapidlm/settings.json`'s `mcpServers` table once the coarser, unrelated workspace-trust check
+passes, and `execute_mcp_tool` calls `McpSession::tools_call` directly — no `McpTrustStore::authorize_connect`/
+`authorize_tool`, no policy evaluation, no lease consumption, for any MCP tool call in production today.
+**Deliberately not attempted:** wiring `McpGateway::invoke` in at that call site needs the same missing
+prerequisite every other "wire crate X into `apps/rapid`" item in this document is blocked on — a real
+approval/policy-stack/lease-issuance flow reachable from the live tool-dispatch loop, which doesn't exist
+anywhere in `apps/rapid` yet (confirmed, not assumed: no call site in `apps/rapid` constructs a `PolicyStack`
++ `LeaseValidator` + issues a `CapabilityLease` for any tool category, MCP or otherwise). This is exactly the
+"needs a design decision this pass can't responsibly guess at" category, not a small wiring gap — flagging it
+precisely rather than either rushing a partial/wrong integration or silently leaving it unrecorded.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
