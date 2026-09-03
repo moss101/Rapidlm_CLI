@@ -1459,6 +1459,69 @@ above. **Live and reachable, not latent:** `SHELL_EXEC_TOOL`, `WORKSPACE_READ_TO
 directly from `execute_call_traced`'s match table — this is the primary tool surface a model actually drives on
 every turn, not a dormant or unwired mechanism like most of this session's other findings.
 
+**Fresh review pass, 2026-09-03, `apps/rapid/src/host.rs::load_memory_index`/`load_todos_index` — the same
+unbounded-read pattern just fixed in `exec_tools.rs`, recurring one file over.** `load_memory_index`'s own doc
+comment: "a bounded, always-loaded pointer file... oversized content is truncated to the line and byte bounds
+rather than dropped entirely." Both loaders called raw `fs::read_to_string`/`fs::read` — bounding only the
+*output* after the whole file was already buffered, not the read itself. `.rapidlm/MEMORY.md` is explicitly
+documented elsewhere in this binary as "git-committed and team-shared," i.e. it arrives via `git clone`, not a
+write this binary controls or bounds; a bloated or malicious repo's `MEMORY.md`/`todos.json` forces a full-file
+allocation on every single turn, not once at startup. Verified via the standard temporary-revert cycle, with a
+specifically-designed reproduction for each: `load_memory_index`'s new test constructs valid multi-line content
+whose truncated OUTPUT would be identical whether or not the read itself was capped, so it was extracted into a
+directly-testable `read_memory_index_bounded` helper and asserted on the raw pre-truncation length (100KB
+buffered on the reverted code vs. the intended 25.6KB cap); `load_todos_index`'s new test uses genuinely valid,
+complete JSON padded past the cap with a large trailing field — an unbounded read parses the whole thing
+successfully, while a read capped short of the file's real size truncates mid-value, making the bytes actually
+read invalid JSON. Both distinguishing mechanisms were necessary because a merely "oversized-and-garbage" or
+"oversized programmatically-truncated" fixture would return the same result regardless of whether the read was
+bounded, which wouldn't actually prove the fix. **Fixed:** widened `exec_tools::read_file_bounded`/
+`BoundedReadError` to `pub(crate)` and reused it for `load_todos_index` (oversized → treated as corrupt,
+matching its own documented fail-open contract); `load_memory_index` needed its own bounded-read helper instead,
+since unlike `read_file_bounded` it must still yield truncated content on an oversized file, not `None`. New
+tests `read_memory_index_bounded_never_buffers_past_the_cap`, `load_memory_index_truncates_an_oversized_
+multiline_file_instead_of_dropping_it`, `load_todos_index_treats_a_file_past_the_bound_as_corrupt_even_if_it_
+is_valid_json`. Full `host` test module (50 tests, up from 44) and `cargo build --workspace --tests` pass.
+**Live and reachable:** both loaders are called from `apps/rapid/src/interactive.rs`'s `exec_turn`, the real
+entry point for every `rapidlm exec` invocation and every `rapid cron poll` cycle — an attacker-controlled cron
+prompt combined with a bloated `MEMORY.md` in the target repo re-triggers this on every unattended poll.
+(Same review pass, background agent's Finding 2 — `host.rs::diag_host_from_base_url` truncates by `.chars()`
+count instead of the `MAX_DIAG_HOST_BYTES` its own doc comment promises, so an internationalized hostname could
+yield a diagnostic label up to ~4x the documented byte cap — noted but not fixed this pass: it's a `--verbose`-
+only diagnostic line, not a memory/security boundary, and the fix is genuinely trivial should anyone hit it.)
+
+**Same review sweep, `apps/rapid/src/permissions.rs::ToolPattern::matches` — a real security bypass: domain
+`deny`/`ask` rules, and even the admin `denied_tools` ceiling documented as un-overridable by any setting, were
+case-sensitive, so a case change in the request URL's host slipped past them entirely.** `glob_match` is a
+plain per-`char` comparator with no case folding, and `rule_subject` (`exec_tools.rs`) builds the `web_fetch`
+match subject as `format!("domain:{host}")` from the raw, un-lowercased URL host. The *sibling* mechanism for
+the identical conceptual question — "is this host on my list?" — is explicitly documented and implemented as
+case-insensitive one file over: `web_fetch::classify_fetch`'s own doc comment says "exact, case-insensitive
+match," via `eq_ignore_ascii_case`. Concretely: a settings rule `{"deny": ["web_fetch(domain:evil.example.com)"]}`
+(or an admin policy `denied_tools` entry, which per its own doc "no setting can re-enable") never matches a
+call to `https://EVIL.EXAMPLE.COM/...` — `glob_match` returns `false` on the first case mismatch, no ask/allow
+rule matches either, `web_fetch` classifies as `ToolClass::ReadOnly`, and the call auto-allows and actually
+executes. Verified via the standard temporary-revert cycle: the new test failed against the reverted matcher —
+not with the naively-predicted "the fetch actually executes" (the fictional test domain doesn't resolve
+regardless of case, so the reverted code's *attempted* fetch itself fails on an unrelated DNS error), but the
+security-relevant fact it proves is unaffected either way — the deny rule did not fire and the call was not
+`Denied`, exactly the bypass this fix closes; for a real, resolvable malicious domain the attempted fetch would
+have gone through. **Fixed:** `ToolPattern::matches` now compares `"domain:"`-prefixed subjects/patterns
+case-insensitively (both sides lowercased before `glob_match`), leaving every other subject shape (paths, shell
+argv) exact-case as before, matching real filesystem/shell semantics — this is scoped precisely to the one
+subject shape that's unambiguously case-insensitive by spec, not a blanket case-insensitive glob change. New
+test `web_fetch_deny_rule_matches_the_urls_domain_regardless_of_letter_case`. Full `permissions` (21 tests) and
+`web_fetch`-related `exec_tools` (11 tests) suites, plus `cargo build --workspace --tests`, all pass. **Live
+and reachable, security-relevant:** `permission_for`/`ToolPattern::matches` gate every real tool call via
+`execute_call_traced`, the actual dispatch path a model drives on every turn — this is the one bug this
+session's `apps/rapid` sweep found that directly defeats a security control on the live tool surface, rather
+than a latent mechanism or a memory/correctness issue. (Same pass, Finding 2 from the same background agent —
+`parse_grants`'s per-project cap checks *after* pushing, allowing 129 entries into a 128-entry `Vec` before
+breaking — confirmed genuinely inert: the sole reader, `PermissionLattice::with_grants`, re-caps via
+`.take(MAX_GRANTS - self.grants.len())` before consulting any grant, and nothing ever persists `PermissionGrants`
+back to disk, so the extra element never has an observable effect. Not fixed this pass since there is nothing
+to demonstrably fix a bug in, but noted for completeness rather than silently dropped.)
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

@@ -57,6 +57,12 @@ pub const MAX_SYSTEM_PROMPT_BLOCK_BYTES: usize = 32 * 1024;
 /// 25 KB).
 pub const MAX_MEMORY_INDEX_LINES: usize = 200;
 pub const MAX_MEMORY_INDEX_BYTES: usize = 25 * 1024;
+/// Read cap for `.rapidlm/todos.json`, well above the legitimate maximum
+/// (`MAX_TODOS` entries at `MAX_TODO_CONTENT_BYTES` each plus JSON
+/// overhead) so any realistically-written file always parses; an oversized
+/// file is treated as corrupt (`None`), matching `load_todos_index`'s own
+/// documented fail-open contract for malformed content.
+pub const MAX_TODOS_INDEX_BYTES: usize = 256 * 1024;
 /// Byte cap for composed selected-skills text.
 pub const MAX_SKILLS_BYTES: usize = 16 * 1024;
 /// Maximum retained evidence ids.
@@ -1236,13 +1242,36 @@ where
     })
 }
 
+/// Reads `.rapidlm/MEMORY.md` through a `MAX_MEMORY_INDEX_BYTES` cap on the
+/// read itself, rather than trusting the file's size on disk — the same
+/// stat-then-read gap `read_file_bounded` closes elsewhere in this binary.
+/// `.rapidlm/MEMORY.md` is git-committed and team-shared, so it arrives via
+/// `git clone`, not a bounded write this binary controls. Unlike
+/// `read_file_bounded`, an oversized file must still yield the truncated
+/// content `load_memory_index`'s own doc comment promises, not `None` — so
+/// this caps the read directly rather than treating "too large" as a
+/// rejection. `from_utf8_lossy` tolerates a multi-byte character split by
+/// the cap; this is advisory display content, not something that must
+/// round-trip exactly. Split out from `load_memory_index` so the raw,
+/// pre-line-truncation byte cap is directly unit-testable.
+fn read_memory_index_bounded(root: &Path) -> Option<String> {
+    use std::io::Read as _;
+    let path = root.join(".rapidlm").join("MEMORY.md");
+    let mut buf = Vec::new();
+    fs::File::open(&path)
+        .ok()?
+        .take(MAX_MEMORY_INDEX_BYTES as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// Load the project memory index (`.rapidlm/MEMORY.md`): a bounded,
 /// always-loaded pointer file the model can rely on (Claude MEMORY.md
 /// parity). Missing file → None; oversized content is truncated to the line
 /// and byte bounds rather than dropped entirely.
 pub fn load_memory_index(root: &Path) -> Option<String> {
-    let path = root.join(".rapidlm").join("MEMORY.md");
-    let text = fs::read_to_string(path).ok()?;
+    let text = read_memory_index_bounded(root)?;
     let mut bounded: Vec<&str> = text.lines().take(MAX_MEMORY_INDEX_LINES).collect();
     let mut size = bounded.iter().map(|line| line.len() + 1).sum::<usize>();
     while size > MAX_MEMORY_INDEX_BYTES && !bounded.is_empty() {
@@ -1266,7 +1295,15 @@ pub fn load_memory_index(root: &Path) -> Option<String> {
 /// fail to start over. Malformed individual entries are skipped, not fatal
 /// to the whole projection.
 pub fn load_todos_index(root: &Path) -> Option<String> {
-    let bytes = fs::read(root.join(crate::exec_tools::TODOS_PATH)).ok()?;
+    // Bound the read rather than trusting the file's size on disk (same
+    // rationale as `load_memory_index` above) — an oversized file is
+    // treated the same as any other unparseable content by the `?` chain
+    // below, matching this function's own "corrupt file → None" contract.
+    let bytes = crate::exec_tools::read_file_bounded(
+        &root.join(crate::exec_tools::TODOS_PATH),
+        MAX_TODOS_INDEX_BYTES,
+    )
+    .ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let entries = value.get("todos")?.as_array()?;
     let lines: Vec<String> = entries
@@ -1839,6 +1876,73 @@ mod tests {
     }
 
     #[test]
+    fn read_memory_index_bounded_never_buffers_past_the_cap() {
+        // `.rapidlm/MEMORY.md` is git-committed and team-shared, so it
+        // arrives via `git clone`, not a bounded write this binary
+        // controls. Directly asserting on the raw, pre-line-truncation
+        // read size (rather than `load_memory_index`'s final output,
+        // which a post-hoc truncate-after-full-read would also satisfy)
+        // is what actually distinguishes "the read itself is capped" from
+        // "the whole file is read, then the output is trimmed" — the two
+        // are behaviorally identical from the caller's side for any file
+        // under a few MB, which is exactly why this needs its own test on
+        // the extracted helper instead of only on `load_memory_index`.
+        let root = std::env::temp_dir().join(format!(
+            "rapidlm-host-memory-bound-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".rapidlm")).expect("dir");
+        let oversized = vec![b'x'; MAX_MEMORY_INDEX_BYTES * 4];
+        std::fs::write(root.join(".rapidlm").join("MEMORY.md"), &oversized).expect("write");
+
+        let text = read_memory_index_bounded(&root).expect("file exists");
+        assert_eq!(
+            text.len(),
+            MAX_MEMORY_INDEX_BYTES,
+            "the read must stop at the cap regardless of the file's real size on disk"
+        );
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[test]
+    fn load_memory_index_truncates_an_oversized_multiline_file_instead_of_dropping_it() {
+        // This function's own doc comment promises "oversized content is
+        // truncated to the line and byte bounds rather than dropped
+        // entirely". Many short lines whose cumulative size, not any
+        // single line, is what exceeds the cap — a single line bigger
+        // than the whole budget is dropped outright by the existing
+        // line-level trimming (unrelated to and unchanged by the read-
+        // bounding fix above), so that shape wouldn't exercise this
+        // specific promise the way a realistic oversized team memory doc
+        // does.
+        let root = std::env::temp_dir().join(format!(
+            "rapidlm-host-memory-truncate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".rapidlm")).expect("dir");
+        let oversized: String = "0123456789012345678901234567890123456789\n".repeat(30_000);
+        std::fs::write(root.join(".rapidlm").join("MEMORY.md"), &oversized).expect("write");
+
+        let text = load_memory_index(&root)
+            .expect("oversized multi-line content must be truncated, not dropped");
+        assert!(
+            text.len() <= MAX_MEMORY_INDEX_BYTES,
+            "output must still respect the byte bound: {} bytes",
+            text.len()
+        );
+        assert!(text.lines().count() <= MAX_MEMORY_INDEX_LINES);
+        drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[test]
     fn load_todos_index_renders_persisted_entries_and_fails_open() {
         let root = std::env::temp_dir().join(format!(
             "rapidlm-host-todos-{}-{}",
@@ -1880,6 +1984,46 @@ mod tests {
         assert_eq!(rendered, "- [in_progress] wire the thing\n- [pending] test it");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_todos_index_treats_a_file_past_the_bound_as_corrupt_even_if_it_is_valid_json() {
+        // A file merely oversized-and-garbage would return `None` either
+        // way (garbage never parses, bounded or not), which wouldn't
+        // actually distinguish "the read is capped" from "the whole file
+        // is read, then rejected". Using genuinely valid, complete JSON
+        // that only exceeds the cap because of a large trailing field
+        // does distinguish them: an unbounded read gets the whole
+        // document and parses it successfully, while a read capped short
+        // of the file's real size truncates mid-value, making the bytes
+        // actually read invalid JSON — the observable proof that the read
+        // itself, not just the outcome, is now bounded.
+        let root = std::env::temp_dir().join(format!(
+            "rapidlm-host-todos-bound-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".rapidlm")).expect("dir");
+        let padding = "a".repeat(MAX_TODOS_INDEX_BYTES * 2);
+        let content = format!(
+            r#"{{"schema":1,"todos":[{{"id":"1","content":"keep this","status":"pending"}}],"padding":"{padding}"}}"#
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&content).is_ok(),
+            "the fixture itself must be valid JSON when read in full"
+        );
+        std::fs::write(root.join(crate::exec_tools::TODOS_PATH), &content).expect("write");
+
+        assert!(
+            load_todos_index(&root).is_none(),
+            "a file whose real size exceeds the bound must be treated as \
+             corrupt (truncated mid-value), not parsed in full"
+        );
+
+        drop(std::fs::remove_dir_all(&root));
     }
 
     #[test]

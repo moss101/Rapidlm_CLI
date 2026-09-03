@@ -164,7 +164,22 @@ impl ToolPattern {
         }
         match &self.arg_glob {
             None => true,
-            Some(glob) => glob_match(glob, subject),
+            // Domain names are case-insensitive by spec (DNS) — the same
+            // normalization `web_fetch::classify_fetch`'s own allowlist
+            // already applies via `eq_ignore_ascii_case`. Without it here,
+            // a plain case change in the request URL's host (attacker- or
+            // redirect-controlled) silently bypasses a `deny`/`ask` rule,
+            // or even an admin `denied_tools` ceiling documented as
+            // un-overridable by any setting. Every other subject shape
+            // (paths, shell argv) stays exact-case, matching real
+            // filesystem/shell semantics.
+            Some(glob) => match (glob.strip_prefix("domain:"), subject.strip_prefix("domain:")) {
+                (Some(pattern_domain), Some(subject_domain)) => glob_match(
+                    &pattern_domain.to_ascii_lowercase(),
+                    &subject_domain.to_ascii_lowercase(),
+                ),
+                _ => glob_match(glob, subject),
+            },
         }
     }
 }

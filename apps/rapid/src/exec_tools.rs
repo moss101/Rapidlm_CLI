@@ -2464,19 +2464,20 @@ fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 }
 
 /// A file read that either failed at the OS level or exceeded `max_bytes`.
-enum BoundedReadError {
+pub(crate) enum BoundedReadError {
     Io(std::io::Error),
     TooLarge,
 }
 
 /// Bounded file read shared by `workspace_read`/`repo_read`/`workspace_patch`/
-/// `repo_search`. Reads through a `max_bytes + 1` cap rather than trusting a
-/// preceding `fs::metadata` size check, closing the same stat-then-read gap
-/// `p9_commands::read_bounded_file` already guards against elsewhere in this
-/// binary: a file can grow between a size check and the read that follows
-/// it. Capping the read itself means at most `max_bytes + 1` bytes are ever
-/// buffered, regardless of how large the file actually is.
-fn read_file_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, BoundedReadError> {
+/// `repo_search`/`host::load_todos_index`. Reads through a `max_bytes + 1`
+/// cap rather than trusting a preceding `fs::metadata` size check, closing
+/// the same stat-then-read gap `p9_commands::read_bounded_file` already
+/// guards against elsewhere in this binary: a file can grow between a size
+/// check and the read that follows it. Capping the read itself means at
+/// most `max_bytes + 1` bytes are ever buffered, regardless of how large the
+/// file actually is.
+pub(crate) fn read_file_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, BoundedReadError> {
     use std::io::Read;
     let file = fs::File::open(path).map_err(BoundedReadError::Io)?;
     let mut buf = Vec::new();
@@ -6765,6 +6766,38 @@ use std::sync::{Arc, Mutex};
                     if detail.as_deref().unwrap_or("").contains("deny rule")
             ),
             "the deny rule must not match an unrelated domain, got {:?}",
+            results[0]
+        );
+    }
+
+    #[test]
+    fn web_fetch_deny_rule_matches_the_urls_domain_regardless_of_letter_case() {
+        // Domain names are case-insensitive by spec (DNS); a deny rule (or,
+        // more severely, an admin `denied_tools` ceiling documented as
+        // un-overridable by any setting) must not be bypassable just by
+        // changing the URL's case, whether attacker/prompt-injection
+        // controlled or arising naturally from a redirect.
+        let root = TempRoot::new("web-fetch-deny-case");
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::BypassPermissions)
+            .with_rules(vec![ToolRule {
+                effect: RuleEffect::Deny,
+                pattern: ToolPattern::parse("web_fetch(domain:evil.example.com)").expect("rule"),
+            }]);
+        let mut tools = ExecTools::workspace_with_permissions(&root.0, lattice).expect("tools");
+        let calls = vec![make_call(
+            "c1",
+            WEB_FETCH_TOOL,
+            r#"{"url":"https://EVIL.EXAMPLE.COM/exfiltrate"}"#,
+        )];
+        let results = run_batch(&mut tools, &calls);
+        assert!(
+            matches!(
+                &results[0],
+                Ok(ToolStepResult::Denied { detail, .. })
+                    if detail.as_deref().unwrap_or("").contains("deny rule")
+            ),
+            "expected the domain deny rule to block a same-domain, \
+             different-case URL, got {:?}",
             results[0]
         );
     }
