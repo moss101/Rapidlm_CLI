@@ -298,6 +298,15 @@ fn spawn_timeout_watcher(cancel: CancellationToken, timeout: Duration) -> Timeou
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        // The loop above only checks the stop flag *inside* each iteration;
+        // a `stop()` that lands after the last check but before the loop's
+        // own timeout condition trips falls through here unobserved. One
+        // more check right before firing closes that gap — `stop()` calls
+        // are meant to reliably prevent cancellation, not just usually win
+        // a race against the poll interval.
+        if watcher_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         cancel.cancel();
     });
     TimeoutWatcher { stop }

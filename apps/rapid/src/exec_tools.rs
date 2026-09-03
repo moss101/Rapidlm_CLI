@@ -125,6 +125,16 @@ pub const MAX_TOTAL_WRITE_BYTES_PER_TURN: u64 = 64 * 1024 * 1024;
 pub const MAX_TOTAL_FETCH_BYTES_PER_TURN: u64 = 16 * 1024 * 1024;
 /// Hard byte cap on one file read returned to the model.
 pub const MAX_READ_BYTES: usize = 4 * 1024;
+/// Hard byte cap on one file this crate will read into memory at all, for
+/// `workspace_read`/`repo_read`/`workspace_patch`/`repo_search`. Far above
+/// `MAX_READ_BYTES` (display output is still truncated to that afterward)
+/// so any real source file reads exactly as before; it exists only to bound
+/// worst-case memory for a pathologically large file (a data file, media
+/// asset, or build artifact under the workspace root) instead of buffering
+/// it in full. Matches `crates/workspace`'s own `MAX_DIRECT_FILE_BYTES` and
+/// `crates/llm-router`'s `MAX_HTTP_RESPONSE_BYTES` — the same "how big is
+/// too big for one file" ceiling already established elsewhere.
+pub const MAX_FILE_READ_BYTES: usize = 8 * 1024 * 1024;
 /// Default 1-indexed start line for `repo_read`.
 pub const DEFAULT_READ_OFFSET: usize = 1;
 /// Default line window for `repo_read`.
@@ -1317,7 +1327,7 @@ impl WorkspaceTools {
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_path_argument(call.arguments()).ok_or(ToolStepError::Invalid)?;
         let target = self.resolve_in_root(&args)?;
-        match fs::read(&target) {
+        match read_file_bounded(&target, MAX_FILE_READ_BYTES) {
             Ok(bytes) => {
                 // Rich reads: images become vision data URLs; PDFs are
                 // text-extracted. Everything else stays bounded UTF-8 text.
@@ -1360,7 +1370,7 @@ impl WorkspaceTools {
                     summary: bounded_text(&bytes, MAX_READ_BYTES),
                 })
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(BoundedReadError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
                 // Model-visible, handled failure: the turn continues
                 // and the model can correct the path.
                 Ok(ToolStepResult::Failed {
@@ -1369,7 +1379,14 @@ impl WorkspaceTools {
                     detail: Some(bounded_detail(&format!("{args}: file not found"))),
                 })
             }
-            Err(_) => Err(ToolStepError::Failed),
+            Err(BoundedReadError::TooLarge) => Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "{args}: file exceeds the {MAX_FILE_READ_BYTES}-byte limit"
+                ))),
+            }),
+            Err(BoundedReadError::Io(_)) => Err(ToolStepError::Failed),
         }
     }
 
@@ -1382,16 +1399,26 @@ impl WorkspaceTools {
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_repo_read_args(call.arguments())?;
         let target = self.resolve_in_root(&args.path)?;
-        let bytes = match fs::read(&target) {
+        let bytes = match read_file_bounded(&target, MAX_FILE_READ_BYTES) {
             Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(BoundedReadError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(ToolStepResult::Failed {
                     call_id: call.call_id().to_owned(),
                     handled: true,
                     detail: Some(bounded_detail(&format!("{}: file not found", args.path))),
                 })
             }
-            Err(_) => return Err(ToolStepError::Failed),
+            Err(BoundedReadError::TooLarge) => {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&format!(
+                        "{}: file exceeds the {MAX_FILE_READ_BYTES}-byte limit",
+                        args.path
+                    ))),
+                });
+            }
+            Err(BoundedReadError::Io(_)) => return Err(ToolStepError::Failed),
         };
         let text = String::from_utf8_lossy(&bytes);
         let line_count = text.lines().count();
@@ -1511,16 +1538,26 @@ impl WorkspaceTools {
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_patch_args(call.arguments())?;
         let target = self.resolve_in_root(&args.path)?;
-        let bytes = match fs::read(&target) {
+        let bytes = match read_file_bounded(&target, MAX_FILE_READ_BYTES) {
             Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(BoundedReadError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(ToolStepResult::Failed {
                     call_id: call.call_id().to_owned(),
                     handled: true,
                     detail: Some(bounded_detail(&format!("{}: file not found", args.path))),
                 })
             }
-            Err(_) => return Err(ToolStepError::Failed),
+            Err(BoundedReadError::TooLarge) => {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&format!(
+                        "{}: file exceeds the {MAX_FILE_READ_BYTES}-byte limit",
+                        args.path
+                    ))),
+                });
+            }
+            Err(BoundedReadError::Io(_)) => return Err(ToolStepError::Failed),
         };
         let contents = String::from_utf8(bytes).map_err(|_| ToolStepError::Invalid)?;
         let exact_occurrences = contents.matches(&args.old).count();
@@ -1759,6 +1796,45 @@ impl WorkspaceTools {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         let mut child = command.spawn().map_err(|_| ToolStepError::Failed)?;
+        // Drain stdout/stderr on background threads concurrently with the
+        // wait loop below, mirroring `JobRegistry::start`'s own pattern —
+        // polling `try_wait()` without ever reading the pipes deadlocks the
+        // instant the child writes more than one OS pipe buffer's worth of
+        // combined output before exiting, since nothing is draining it and
+        // `try_wait()` can then never observe the exit.
+        let output_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let pipes: Vec<Box<dyn std::io::Read + Send>> = [
+            child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+            child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let readers: Vec<_> = pipes
+            .into_iter()
+            .map(|mut pipe| {
+                let buf = Arc::clone(&output_buf);
+                std::thread::spawn(move || {
+                    let mut chunk = [0u8; 2048];
+                    loop {
+                        match pipe.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                let Ok(mut spool) = buf.lock() else {
+                                    return;
+                                };
+                                let room = MAX_SHELL_OUTPUT_BYTES.saturating_sub(spool.len());
+                                let take = n.min(room);
+                                spool.extend_from_slice(&chunk[..take]);
+                                // Keep draining even past the cap, discarding
+                                // the excess, so the child is never blocked
+                                // on a full pipe regardless of output size.
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
         let deadline = Instant::now() + args.timeout;
         let status = loop {
             if let Ok(Some(status)) = child.try_wait() {
@@ -1776,15 +1852,12 @@ impl WorkspaceTools {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        let output_text = match child.wait_with_output() {
-            Ok(output) => {
-                let mut combined =
-                    Vec::with_capacity(output.stdout.len() + output.stderr.len());
-                combined.extend_from_slice(&output.stdout);
-                combined.extend_from_slice(&output.stderr);
-                bounded_text(&combined, MAX_SHELL_OUTPUT_BYTES)
-            }
-            Err(_) => String::new(),
+        for reader in readers {
+            let _ = reader.join();
+        }
+        let output_text = {
+            let combined = output_buf.lock().map(|guard| guard.clone()).unwrap_or_default();
+            bounded_text(&combined, MAX_SHELL_OUTPUT_BYTES)
         };
         match status {
             Ok(status) => {
@@ -2390,13 +2463,43 @@ fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
+/// A file read that either failed at the OS level or exceeded `max_bytes`.
+enum BoundedReadError {
+    Io(std::io::Error),
+    TooLarge,
+}
+
+/// Bounded file read shared by `workspace_read`/`repo_read`/`workspace_patch`/
+/// `repo_search`. Reads through a `max_bytes + 1` cap rather than trusting a
+/// preceding `fs::metadata` size check, closing the same stat-then-read gap
+/// `p9_commands::read_bounded_file` already guards against elsewhere in this
+/// binary: a file can grow between a size check and the read that follows
+/// it. Capping the read itself means at most `max_bytes + 1` bytes are ever
+/// buffered, regardless of how large the file actually is.
+fn read_file_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, BoundedReadError> {
+    use std::io::Read;
+    let file = fs::File::open(path).map_err(BoundedReadError::Io)?;
+    let mut buf = Vec::new();
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(BoundedReadError::Io)?;
+    if buf.len() > max_bytes {
+        return Err(BoundedReadError::TooLarge);
+    }
+    Ok(buf)
+}
+
 /// Count `/Type /Page` objects (not /Pages) as a page estimate.
 fn pdf_page_count(bytes: &[u8]) -> usize {
     let mut count = 0;
     let mut cursor = 0;
     while let Some(rel) = find_bytes(&bytes[cursor..], b"/Type") {
         let at = cursor + rel;
-        let rest = &bytes[at + 6..];
+        // `find_bytes` only guarantees `at + 5 <= bytes.len()` (the length
+        // of "/Type" itself); when a match ends exactly at the buffer's
+        // end, `at + 6` overruns it. `.get(..)` treats that as "nothing
+        // left to inspect" instead of panicking on a crafted short input.
+        let rest = bytes.get(at + 6..).unwrap_or(&[]);
         let skip = rest.iter().take(4).count();
         let _ = skip;
         let trimmed = leading_spaces(rest);
@@ -2405,7 +2508,7 @@ fn pdf_page_count(bytes: &[u8]) -> usize {
         {
             count += 1;
         }
-        cursor = at + 6;
+        cursor = (at + 6).min(bytes.len());
     }
     count.max(1)
 }
@@ -2459,7 +2562,7 @@ fn walk_text_files(
         if file_type.is_symlink() || name.starts_with('.') {
             continue;
         }
-        let Ok(bytes) = fs::read(entry.path()) else {
+        let Ok(bytes) = read_file_bounded(&entry.path(), MAX_FILE_READ_BYTES) else {
             continue;
         };
         *walked += 1;
@@ -5909,6 +6012,34 @@ use std::sync::{Arc, Mutex};
     }
 
     #[test]
+    fn workspace_read_rejects_a_file_past_the_read_bound_instead_of_buffering_it() {
+        // `workspace_read` used to call plain `fs::read`, which allocates
+        // and copies the *entire* file before any truncation happens — a
+        // file well past a sane "one file" ceiling made the call allocate
+        // proportional to that size regardless of how little of it the
+        // model ever sees. It must now be refused as a bounded, handled
+        // failure instead, without ever buffering past the cap.
+        let root = TempRoot::new("workspace-read-oversized");
+        fs::write(
+            root.0.join("huge.bin"),
+            vec![b'A'; MAX_FILE_READ_BYTES + 1],
+        )
+        .expect("seed");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let call = make_call("c1", WORKSPACE_READ_TOOL, r#"{"path":"huge.bin"}"#);
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                let detail = detail.unwrap();
+                assert!(detail.contains("exceeds"), "{detail}");
+            }
+            other => panic!("expected an oversized-file refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn repo_search_honors_head_limit_and_offset() {
         let root = TempRoot::new("repo-search");
         for index in 0..5 {
@@ -6472,6 +6603,37 @@ use std::sync::{Arc, Mutex};
         assert!(
             started.elapsed() < Duration::from_secs(15),
             "the timeout must kill the child promptly"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_exec_drains_output_concurrently_and_does_not_deadlock() {
+        // `dd`'s output comfortably exceeds every common OS pipe buffer size
+        // (typically 16-64 KiB), so a reader that only reads after the child
+        // exits blocks the child in write(2) well before it can exit on its
+        // own — exactly the deadlock this test guards against.
+        let root = TempRoot::new("shell-big-output");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["dd","if=/dev/zero","bs=1024","count=300"],"timeout_ms":5000}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        let started = Instant::now();
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.starts_with("exit 0"), "{summary}");
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a child producing output past the pipe buffer must not deadlock \
+             the wait loop until the timeout: took {:?}",
+            started.elapsed()
         );
     }
 
@@ -7668,6 +7830,24 @@ use std::sync::{Arc, Mutex};
                 other => panic!("{name}: expected extracted text, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn workspace_read_pdf_with_type_at_buffer_end_does_not_panic() {
+        // `pdf_page_count` scans for "/Type" and then looks at the bytes
+        // right after it; when a match ends exactly at the file's end,
+        // there is no "right after" to slice — a crafted short file whose
+        // last 5 bytes are literally "/Type" must fail cleanly, not panic
+        // the worker thread.
+        let root = TempRoot::new("pdf-type-at-end");
+        fs::write(root.0.join("short.pdf"), b"%PDF-/Type").expect("seed");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let call = make_call("c1", WORKSPACE_READ_TOOL, r#"{"path":"short.pdf"}"#);
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        // Must return *some* typed outcome (success or a handled failure)
+        // rather than unwinding a panic out of `execute`.
+        let _ = tools.execute(&validated, &cancel).expect("execute must not panic");
     }
 
     #[test]

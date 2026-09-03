@@ -1384,6 +1384,81 @@ subcommand exercising exactly this function against real exported ledger events 
 `insights_command_analyzes_real_exported_ledger_events` integration test still passes. This closes out the
 session's crate-by-crate sweep: every crate in the workspace has now had at least one dedicated review pass.
 
+**Fresh review pass, 2026-09-02, `apps/rapid/src/exec_tools.rs` — the shipped binary's own tool-dispatch code
+finally got a dedicated pass (previously only touched indirectly via `crates/*` fixes), and found the exact
+same live "child-output deadlock" bug family already fixed three times elsewhere this session, plus a real
+panic and a real unbounded-memory gap, all in the primary model-facing tool surface.**
+
+**Fix 1 — `execute_shell`'s foreground `shell_exec` path deadlocks on ordinary-sized output.** It polled
+`child.try_wait()` in a loop without ever reading the child's piped stdout/stderr until `wait_with_output()`
+*after* the loop — a child writing more than one OS pipe buffer's worth of combined output before exiting
+blocks in `write(2)`, `try_wait()` never observes the exit, and the call spins for the full timeout (default
+60s) before being force-killed. The sibling background-job path (`JobRegistry::start`) already gets this right
+— it spawns reader threads that drain each pipe concurrently with its own poll loop — making this the same
+"one path has the fix, the sibling reimplements the deadlock" asymmetry this session's own `git log` shows
+already fixed three times (commit `e0236b5`, "fix: drain child stdout/stderr concurrently with wait, not
+after, across 3 call sites" — `external_agents.rs`, `goal_claim.rs`, `crates/plugin-host/src/hooks.rs`); this
+fourth call site was simply missed. Verified via the standard temporary-revert cycle with a real child (`dd
+if=/dev/zero bs=1024 count=300`, ~300 KiB — comfortably past any common pipe buffer): the reverted code took
+the full 5000ms test timeout and had to be force-killed; the fix completes in under 50ms. **Fixed:** ported
+the same concurrent-reader-thread pattern `JobRegistry::start` already uses, into a shared, capped buffer (this
+also fixes stdout/stderr's *relative* ordering going from "grouped" to real chronological interleaving — a
+minor, arguably-improved behavior change the existing test only asserts `contains(...)` against, not exact
+ordering). New test `shell_exec_drains_output_concurrently_and_does_not_deadlock`.
+
+**Fix 2 — `pdf_page_count` panics on a crafted file as small as 10 bytes.** `&bytes[at + 6..]` assumed 6 bytes
+always follow a `"/Type"` match, but `find_bytes` only guarantees the 5-byte match itself fits — a match
+ending exactly at the buffer's end panics with an out-of-range slice. Reachable in two model tool calls:
+`workspace_write` a file containing `"%PDF-/Type"`, then `workspace_read` it. `batch_dispatch`'s own panic
+containment (each call runs in a `thread::scope` worker, joined and converted to a typed failure) keeps this
+from crashing the whole process, but it still means a bare, noisy internal panic instead of the clean, typed,
+model-correctable failure every other malformed-input branch in this file produces. Verified via the standard
+temporary-revert cycle. **Fixed:** `bytes.get(at + 6..).unwrap_or(&[])` instead of a direct slice, treating "no
+bytes follow" as "nothing left to inspect" rather than panicking; `cursor` is likewise clamped to `bytes.len()`
+so the next loop iteration's slice can't overrun either. New test
+`workspace_read_pdf_with_type_at_buffer_end_does_not_panic`.
+
+**Fix 3 — `workspace_read`, `repo_read`, `workspace_patch`, and `repo_search` all read files fully into memory
+with no bound, unlike `workspace_write`'s input, which is genuinely capped before any I/O happens.** All four
+called plain `fs::read`/equivalent, allocating and copying a file's *entire* size regardless of how much of it
+ever reaches the model — `workspace_read`/`repo_read` only truncate the *output* afterward; `repo_search`'s
+`walk_text_files` does this for every one of up to 2000 walked files, and even reads a file fully before its
+own binary/NUL-byte heuristic (which only inspects the first 8 KiB) gets a chance to skip it. This repo already
+has the exact right fix pattern twice over — `crates/workspace::backends::external_mutation::read_confined`
+and, in this very file's own sibling module, `p9_commands::read_bounded_file`, whose doc comment states the
+rationale almost verbatim: "Reads through a `max_bytes + 1` cap rather than trusting a preceding `fs::metadata`
+size check... Capping the read itself means at most `max_bytes + 1` bytes are ever buffered, regardless of how
+large the file actually is." Concretely: a model calling `repo_search` (or `workspace_read`) on a workspace
+containing a large checked-in file (a dataset, media asset, log, or database dump) allocates memory
+proportional to that file's full size to serve what should be a cheap, bounded response. Verified via the
+standard temporary-revert cycle: an 8 MiB+1 file made `workspace_read` succeed (fully buffering it) against the
+reverted code; the fix rejects it as a handled, typed failure instead. **Fixed:** new shared helper
+`read_file_bounded` (mirrors `read_bounded_file`'s exact technique) and a new `MAX_FILE_READ_BYTES` (8 MiB,
+matching the same "one file" ceiling already established by `crates/workspace`'s `MAX_DIRECT_FILE_BYTES` and
+`crates/llm-router`'s `MAX_HTTP_RESPONSE_BYTES`) wired into all four call sites — `workspace_patch` in
+particular needs the file's *real* content to patch correctly, so it fails closed above the cap rather than
+silently truncating, unlike the read-preview tools, which already truncate their *output* separately and
+unaffected by this change for any realistically-sized file. New test
+`workspace_read_rejects_a_file_past_the_read_bound_instead_of_buffering_it`.
+
+**Bonus fix found during verification, `apps/rapid/src/context_retrieval.rs::TimeoutWatcher`** — while
+confirming the three fixes above didn't destabilize the full `apps/rapid` suite, one unrelated test
+(`timeout_watcher_is_stopped_even_when_retrieve_inner_errors_early`) failed intermittently; confirmed via
+`git stash` that it already failed ~75% of the time on the *original*, untouched code, ruling out a regression
+from this pass's own changes and pointing at a real, pre-existing race. The watcher's poll loop only checks its
+stop flag *inside* the `while started.elapsed() < timeout` loop body — if `stop()` is called after the loop's
+last flag-check but before its next `elapsed() < timeout` re-evaluation trips false, the loop falls straight
+through to `cancel.cancel()` with no further chance to observe the stop request at all, exactly the "the check
+exists on the way in, not on the way out" shape this document has found repeatedly elsewhere. **Fixed:** added
+one more stop-flag check immediately before the fall-through `cancel.cancel()`. Confirmed via repeated runs:
+15/15 clean afterward, versus roughly 1-in-4 passing before.
+
+Full `rapid` crate suite (335 tests, up from 332) and `cargo build --workspace --tests` pass for all of the
+above. **Live and reachable, not latent:** `SHELL_EXEC_TOOL`, `WORKSPACE_READ_TOOL`, `REPO_READ_TOOL`,
+`WORKSPACE_PATCH_TOOL`, and `REPO_SEARCH_TOOL` are all registered, real, model-callable tools dispatched
+directly from `execute_call_traced`'s match table — this is the primary tool surface a model actually drives on
+every turn, not a dormant or unwired mechanism like most of this session's other findings.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
