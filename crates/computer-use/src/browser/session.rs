@@ -292,10 +292,47 @@ struct FakeContext {
     closed: bool,
 }
 
+#[derive(Clone)]
 struct SessionDirs {
     profile_dir: PathBuf,
     downloads_dir: PathBuf,
     temp_dir: PathBuf,
+}
+
+/// Removes freshly `allocate_dirs`-created directories on drop, unless
+/// [`Self::defuse`] is called first. `create()` has several early-return
+/// points after allocation (cancel, slot reservation, browser launch,
+/// context creation, session-record commit) — RAII means a future one can't
+/// silently reintroduce the leak this guard exists to close. A persistent
+/// profile directory is a long-lived, possibly-reused-across-sessions
+/// directory, never one freshly created for this attempt (mirrors
+/// `ManagerInner::cleanup`'s identical `persist` exemption).
+struct SessionDirsCleanupGuard {
+    dirs: SessionDirs,
+    persist: bool,
+    defused: bool,
+}
+
+impl SessionDirsCleanupGuard {
+    fn defuse(&mut self) {
+        self.defused = true;
+    }
+}
+
+impl Drop for SessionDirsCleanupGuard {
+    fn drop(&mut self) {
+        if self.defused {
+            return;
+        }
+        if !self.persist {
+            let _ = remove_dir_if_exists(&self.dirs.profile_dir);
+        }
+        let _ = remove_dir_if_exists(&self.dirs.downloads_dir);
+        let _ = remove_dir_if_exists(&self.dirs.temp_dir);
+        if let Some(session_root) = self.dirs.downloads_dir.parent() {
+            let _ = fs::remove_dir(session_root);
+        }
+    }
 }
 
 impl BrowserEngine {
@@ -552,6 +589,11 @@ impl BrowserManager {
 
         let id = BrowserSessionId::new();
         let dirs = self.allocate_dirs(id, &spec.profile)?;
+        let mut dirs_guard = SessionDirsCleanupGuard {
+            dirs: dirs.clone(),
+            persist: matches!(spec.profile, BrowserProfile::Persistent { .. }),
+            defused: false,
+        };
         check_cancel(&spec.cancel)?;
         self.reserve_slot(&spec.profile)?;
 
@@ -592,6 +634,10 @@ impl BrowserManager {
                 .close_context(context, persist, &spec.cancel);
             return Err(err);
         }
+        // The session record now owns these directories; ordinary
+        // `cleanup()` on close removes them (or leaves a persistent profile
+        // alone), so the create-time guard must stand down here.
+        dirs_guard.defuse();
 
         Ok(BrowserSession {
             id,
@@ -1903,6 +1949,40 @@ mod tests {
         assert_eq!(
             live_session.close(&cancel).unwrap_err(),
             BrowserSessionError::Cancelled
+        );
+    }
+
+    #[test]
+    fn create_failure_after_dir_allocation_does_not_leak_session_directories() {
+        // `allocate_dirs` runs before `reserve_slot`'s `TooManySessions`
+        // check, so hitting the live-session cap is a real, reachable way
+        // to fail *after* directories exist on disk — exactly the shape
+        // that leaked them before the create-time cleanup guard existed.
+        let env = TempEnv::create();
+        let manager = env.manager();
+        let mut live = Vec::new();
+        for _ in 0..MAX_LIVE_SESSIONS {
+            live.push(
+                manager
+                    .create(BrowserSpec::ephemeral(BrowserEngine::Chromium))
+                    .expect("create under the cap"),
+            );
+        }
+        let sessions_dir = env.root.join("sessions");
+        let before = fs::read_dir(&sessions_dir).expect("sessions dir").count();
+        assert_eq!(before, MAX_LIVE_SESSIONS);
+
+        assert_eq!(
+            manager
+                .create(BrowserSpec::ephemeral(BrowserEngine::Chromium))
+                .unwrap_err(),
+            BrowserSessionError::TooManySessions
+        );
+
+        let after = fs::read_dir(&sessions_dir).expect("sessions dir").count();
+        assert_eq!(
+            after, before,
+            "the rejected session's directory must not remain on disk"
         );
     }
 

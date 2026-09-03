@@ -1118,6 +1118,97 @@ imports `http_get` directly and `apps/rapid/src/exec_tools.rs:2229` wires it int
 `web_fetch` tool — this bug has been silently degrading (in most real-world cases, silently *breaking*) one of
 the product's core tools for arbitrary internet fetches.
 
+**Fresh review pass, 2026-09-02, `crates/computer-use` — a dedicated review of desktop automation and, on
+follow-up, browser automation, found five findings: two fixed, one lower-confidence code-smell noted only,
+and two genuinely large gaps documented and deliberately not rushed.**
+
+**Fixed — `crates/computer-use/src/desktop/backend.rs::DesktopActor::act` computed a sensitive-target flag and
+never enforced it.** The threat model's T-CU-01 control ("UI content is untrusted... sensitive UI classifier
+plus deterministic policy") is implemented on the observe/redaction side — `ResolvedDesktopTarget::is_sensitive
+()` correctly flags macOS secure text fields and system-permission apps, Windows password elements and secure-
+desktop apps, and Linux password roles and auth apps — but `act()` only ever checked `resolved.interactive`,
+never `resolved.is_sensitive()`; the flag was computed and then never consulted for gating. A `Click` or
+`TypeText` against a flagged target (a password field, a login-window control) reached the OS-level `perform()`
+call unmodified. Verified via the standard temporary-revert cycle. **Fixed with one deliberate refinement over
+the naive "deny everything sensitive" version**, discovered by the fix's own first attempt breaking two
+existing, deliberately-designed tests (`secret_handle_stays_opaque` on macOS and Windows): T-CU-03's own stated
+design lets an agent type an *opaque* `SecretHandle` into a secure field without ever seeing the plaintext —
+that's the intended credential-injection path, not an attack, and remains allowed. What's denied is any
+`Click` on a sensitive target, and any `TypeText` carrying a model-visible `SecretAwareString::Literal` value.
+Two pre-existing tests (`linux.rs`, `windows.rs`) that typed literal text into the password field purely to
+verify `type_text`'s action-kind mapping (not testing security semantics) were updated to use a secret handle
+instead, preserving their original intent. New `DesktopError::TargetSensitive` variant (mirrors `TargetNot
+Interactive`'s `ErrorCode::ToolInvalidArguments` mapping) and new test `sensitive_target_rejects_click_and_
+literal_text_but_not_a_secret_handle`. Full `computer-use` crate suite (181 tests, up from 179 net after the
+two test updates) and `cargo build --workspace --tests` pass. **Latent:** confirmed via `grep -rln "DesktopActor
+|MacosDesktopBackend|WindowsDesktopBackend|LinuxDesktopBackend" apps/` (zero matches) that desktop automation
+has no caller in `apps/rapid` at all today — `computer_runtime.rs` only imports `computer_use::browser::*`.
+
+**Fixed — `crates/computer-use/src/browser/session.rs::BrowserManager::create` leaked freshly-allocated
+session directories on every error path after allocation.** `allocate_dirs` creates `downloads`/`tmp` (and, for
+an Ephemeral profile, `profile`) directories under `sessions/<id>/` before `reserve_slot`'s `TooManySessions`/
+`SessionConflict` check, the backend launch, context creation, or `commit_session` can fail — none of those
+five early-return paths removed the just-created directories, unlike the normal-close path (`ManagerInner::
+cleanup`), which correctly does. Verified via the standard temporary-revert cycle with a real, non-synthetic
+reproduction: filling `MAX_LIVE_SESSIONS` (32) live sessions, then one more `create()` call that fails with
+`TooManySessions` — 33 directories remained on disk against the reverted code, confirmed by directly counting
+`sessions/`'s entries, before the fix reduced it back to 32. **Fixed** with an RAII guard (`SessionDirsCleanup
+Guard`) armed right after `allocate_dirs` and defused only once `commit_session` succeeds, rather than adding
+cleanup at each of the five separate early-return sites by hand — the same shape of oversight ("forgot one of
+several early-return paths") that caused the bug in the first place. The guard mirrors `cleanup()`'s own
+`persist` exemption exactly: a `Persistent` profile's directory is a long-lived, possibly-reused-across-
+sessions directory and is never deleted, even on this failure path — confirmed by re-reading `cleanup()`'s
+identical `if snapshot.persist { false } else { remove_dir_if_exists(...) }` pattern before writing the guard,
+since deleting a shared persistent profile on a transient failure would be strictly worse than the leak being
+fixed. New test `create_failure_after_dir_allocation_does_not_leak_session_directories`. Full `computer-use`
+crate suite and `cargo build --workspace --tests` pass. **Latent:** same reachability note as above —
+`apps/rapid`'s `computer_runtime.rs` doesn't call `BrowserManager::create` yet.
+
+**Documented, deliberately not rushed — `crates/computer-use/src/browser/action.rs::BrowserActor::act_with`
+never calls the crate's own sensitive-action classifier, so a single `browser.navigate` lease can execute
+actions the security module's own doc comments say must always be denied.** `security.rs`'s own doc comment:
+"FileUpload, AuthSecurityAccount, Destructive, and Clipboard are Exclusive (deny-by-default). A `browser.
+navigate` lease cannot authorize them." But `act_with`'s non-`Navigate` arm authorizes solely via `authorize_
+page_action` → `require_browser_lease`, which checks only lease expiry/remaining-uses/capability-match/origin
+— it never calls `classify_browser_action`/`authorize_browser_action`/`authorize_intents` from `security.rs`
+at all. This is not speculative: the crate's own existing, unmodified, currently-passing test suite contains
+two tests that directly contradict each other on the identical `(click "Sign in", BrowserNavigate lease)`
+pair — `action.rs`'s `click_type_key_scroll_use_semantic_targets` asserts this click succeeds via `act()`,
+while `security.rs`'s `navigate_lease_cannot_authorize_upload_auth_or_destructive` asserts the same click with
+the same lease type is `SecurityError::PolicyDenied` via `authorize_browser_action` directly — both pass today
+because they exercise two different, disconnected code paths for the same real decision. **Why this pass
+didn't attempt a fix:** `act`/`act_with`'s public signature takes a single `observation_id: ObservationId`
+(used only for staleness re-validation) and never receives the actual `Observation` value `classify_browser_
+action`/`authorize_browser_action` require as an argument — `BrowserObserver` deliberately exposes no method to
+re-fetch a previously-issued `Observation` by ID (only `require_current`, which validates staleness and returns
+nothing). Wiring the classifier in correctly needs a real design decision: either widen `act`/`act_with`'s
+public API to accept an `Observation` parameter (a breaking change touching every existing call site in this
+crate's own tests, `fixtures.rs`, and any future `apps/rapid` integration), or add new internal machinery to
+safely retrieve/reconstruct one from the observer's ledger without risking exactly the kind of stale-observation
+bug this crate's own T-CU-02 threat class is about. Guessing at either under time pressure risks introducing a
+new, subtly wrong security boundary rather than closing the one that exists — this is the "needs a design
+decision this pass can't responsibly guess at" category, same as this document's other declined items, not a
+small wiring gap. **Latent, matching the reachability pattern above:** confirmed via `grep -rln "computer_use::"`
+that `apps/rapid/src/computer_runtime.rs` is the only consumer, and it does not call `act`/`BrowserActor::act`/
+`authorize_browser_action` today — but this is exactly the mechanism that will fire the moment anything wires
+real action dispatch through the obvious, already-public entry point.
+
+**Documented, deliberately not rushed — two more desktop-module gaps, both requiring a design decision this
+pass didn't attempt to guess at, found by the same sub-review:** (1) `DesktopActor::act` has no `CapabilityLease`
+parameter or concept at all — compare `BrowserActor::act`, which requires one and checks it — so there is
+currently no way to scope which desktop actions an agent may perform even in principle; designing that scoping
+scheme from scratch (what capability/resource shape maps to Click vs. TypeText vs. LaunchApp, etc.) is a real
+design task, not a bug fix, especially with zero real callers yet to validate the design against. (2)
+`DesktopAction`'s bound checks (`MAX_CLICK_COUNT`, scroll magnitude, chord key count, `DisplayGeometry`'s
+width/height) are enforced only inside the enum's own smart-constructor functions, not re-checked in `act()`
+or any backend's `perform()` — because `DesktopAction` is a `pub` enum, Rust cannot restrict its variant fields
+to be narrower than the enum itself, so `DesktopAction::ResizeWindow { width: 50_000, height: 50_000, .. }` can
+be constructed directly, bypassing the bound entirely. Closing this properly means either re-validating bounds
+defensively inside every backend's `perform()` (duplicated logic, easy to miss a variant) or restructuring the
+public API around private fields and fallible constructors only (a breaking change to a still-unstable, not-
+yet-wired-in public type) — a real API design tradeoff, not attempted this pass. Both latent, same reachability
+as the other desktop findings above.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

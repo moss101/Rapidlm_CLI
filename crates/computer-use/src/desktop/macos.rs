@@ -1309,6 +1309,51 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_target_rejects_click_and_literal_text_but_not_a_secret_handle() {
+        // T-CU-01: a secure field's own content is untrusted and must not
+        // itself grant capability to act on it. Clicking a password field,
+        // or typing model-visible literal text into one, must be denied;
+        // typing an opaque secret handle (the intended credential-injection
+        // path, exercised by `secret_handle_stays_opaque` above) must not be.
+        let (session, actor) = setup();
+        let obs = observe(&actor, session);
+        let password = obs
+            .targets()
+            .iter()
+            .find(|target| target.node().stable_ref() == "ax:secure:password")
+            .expect("password");
+        assert!(password.is_interactive());
+
+        assert_eq!(
+            actor
+                .act(
+                    session,
+                    DesktopActionRequest::new(
+                        obs.id(),
+                        DesktopAction::click(password.as_target()).expect("click"),
+                    ),
+                )
+                .expect_err("click on sensitive target must be denied"),
+            DesktopError::TargetSensitive
+        );
+        assert_eq!(
+            actor
+                .act(
+                    session,
+                    DesktopActionRequest::new(
+                        obs.id(),
+                        DesktopAction::type_text(
+                            password.as_target(),
+                            SecretAwareString::literal("hunter2").expect("lit"),
+                        ),
+                    ),
+                )
+                .expect_err("literal text into a sensitive target must be denied"),
+            DesktopError::TargetSensitive
+        );
+    }
+
+    #[test]
     fn non_interactive_ax_target_is_rejected() {
         let (session, actor) = setup();
         let obs = observe(&actor, session);

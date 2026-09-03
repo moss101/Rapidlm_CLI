@@ -1580,6 +1580,12 @@ mod tests {
             .iter()
             .find(|target| target.node().stable_ref() == "uia:edit:password")
             .expect("password");
+        // A password field is sensitive (T-CU-01): typing model-visible
+        // literal text into it is denied. Typing an opaque secret handle
+        // is the intended credential-injection path and stays allowed —
+        // use that here since this test is only verifying the type_text ->
+        // value-pattern mapping, not the security boundary itself.
+        let handle = SecretHandle::parse("secret.test.password").expect("handle");
         actor
             .act(
                 session,
@@ -1587,7 +1593,7 @@ mod tests {
                     obs.id(),
                     DesktopAction::type_text(
                         password.as_target(),
-                        SecretAwareString::literal("x").expect("lit"),
+                        SecretAwareString::secret_handle(handle),
                     ),
                 ),
             )

@@ -415,6 +415,7 @@ pub enum DesktopError {
     TargetBound,
     TargetNotFound,
     TargetNotInteractive,
+    TargetSensitive,
     KeyInvalid,
     TypeBound,
     ScrollBound,
@@ -1528,6 +1529,7 @@ impl DesktopError {
             Self::TargetBound => "target_bound",
             Self::TargetNotFound => "target_not_found",
             Self::TargetNotInteractive => "target_not_interactive",
+            Self::TargetSensitive => "target_sensitive",
             Self::KeyInvalid => "key_invalid",
             Self::TypeBound => "type_bound",
             Self::ScrollBound => "scroll_bound",
@@ -1551,6 +1553,7 @@ impl DesktopError {
             | Self::TargetBound
             | Self::TargetNotFound
             | Self::TargetNotInteractive
+            | Self::TargetSensitive
             | Self::KeyInvalid
             | Self::TypeBound
             | Self::ScrollBound
@@ -1665,9 +1668,34 @@ impl<B: DesktopBackend> DesktopActor<B> {
         if matches!(
             request.action(),
             DesktopAction::Click { .. } | DesktopAction::TypeText { .. }
-        ) && !resolved.interactive
-        {
-            return Err(DesktopError::TargetNotInteractive);
+        ) {
+            if !resolved.interactive {
+                return Err(DesktopError::TargetNotInteractive);
+            }
+            // T-CU-01: window/node content is untrusted and must not itself
+            // grant capability. `is_sensitive()` already flags secure text
+            // fields and system-permission/login-window targets for display
+            // redaction — the same flag must also deny acting on them here,
+            // or computing it is theater. The one deliberate exception is
+            // typing an opaque `SecretHandle` into a sensitive field: that's
+            // the intended, secure credential-injection path (T-CU-03 — the
+            // model never sees the plaintext), not a content-driven action,
+            // so it stays allowed. Everything else against a sensitive
+            // target — any click, or typing model-visible literal text — is
+            // denied. This is a fail-safe default, not a capability-lease
+            // system: it denies unconditionally rather than gating on a
+            // grant, since no lease-based scoping exists yet for desktop
+            // actions (unlike `browser::action`'s `require_browser_lease`).
+            let is_secret_handle_type = matches!(
+                request.action(),
+                DesktopAction::TypeText {
+                    value: SecretAwareString::SecretHandle(_),
+                    ..
+                }
+            );
+            if resolved.is_sensitive() && !is_secret_handle_type {
+                return Err(DesktopError::TargetSensitive);
+            }
         }
         check_cancel(request.cancel())?;
         self.backend.perform(
