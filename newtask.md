@@ -3337,6 +3337,41 @@ No adversarial angle applies since there's no reachable input to drive through i
 tests (6, covering decay overflow, proposition merging, rejection-replay, ranking order, hard-gate ordering)
 look internally sound for what they exercise, for whoever eventually wires this in.
 
+**Same sweep, next applied to `ask_user` — the model-callable tool meant to surface a question with options
+to a real human. Not a bug in a live code path this time: `ask_user` itself has no live code path at all,
+and its own documentation understates that fact.** `WorkspaceTools::ask_stdin` (the closure a real answer
+source would populate) has exactly one caller of its setter (`set_ask_source`) in the entire workspace — the
+tool's own unit test. `exec_turn` (`interactive.rs`, the real `rapid exec` entry point) wires up every other
+`WorkspaceTools` setter (`set_trace_calls`, `set_fetch_allowlist`, `set_hooks`, `set_shadow_diagnostics`,
+`register_mcp_servers`, the `narrow_*`/`share_*` ceiling methods) but never `set_ask_source` — and `ExecTools`
+doesn't even expose a passthrough method for it the way it does for every other setter, so there's no way to
+reach it from the composition root even by adding one call. `LiveSubagentRunner::run` propagates `turn_
+budgets`/`write_locks`/`job_budget`/`hooks`/`shadow_diagnostics`/`trace_calls`/`turn_ceilings` to every
+subagent child but has no `share_ask_source` either — consistent with there being nothing to share, since the
+parent's own `ask_stdin` is always `None`. Net effect: `execute_ask_user` takes the `None` branch and returns
+its typed refusal on *every* real invocation of `rapid`, not just headless ones — the tool's own doc comment
+("Headless runs (no source) return a typed refusal") and its tool-surface description ("In headless runs this
+returns a typed refusal") both imply an interactive run would get a real answer, which has never been true;
+`ASK_USER_TIMEOUT` (300s) and the closure's own `Duration` parameter are both dead data with no reader that
+could ever honor or ignore them. **Not a fix**, since there's no live path to fix a bug in — corrected the
+misleading "headless-specific" framing here instead, and flagged that whoever eventually wires up a real
+answer source (interactive stdin, or a TUI-side prompt) should also add the missing `ExecTools`/
+`LiveSubagentRunner` passthrough this review confirmed doesn't exist yet. Verified via exhaustive static
+tracing (every setter call site, every `ExecTools` passthrough method, `LiveSubagentRunner`'s full propagation
+list, and git history back to the commit that introduced `ask_user` — the wiring was simply never done, not
+broken since).
+
+That same review surfaced a much larger, separate architectural question worth resolving on its own: `apps/
+rapid/src/interactive.rs::run_interactive`/`run_started_session` (the entry points for `rapid`'s interactive
+TUI mode, as opposed to headless `rapid exec`) appear to route through `crates/kernel`'s `ServiceGraph<
+KernelRuntime>`/`InProcessKernelClient` rather than `ExecTools`/`WorkspaceTools` at all — meaning every fix
+this sweep has made to `exec_tools.rs` this session (task_spawn cancellation and write-race, background-job
+reader/budget/pagination, web_fetch SSRF and cancellation, the git-commit gate, the `.git`-write guard, and
+everything before it) may only actually protect the headless `rapid exec` path, with the interactive TUI
+running a parallel, unaudited tool-execution implementation — or, alternatively, the TUI may not execute
+tools via `ExecTools` because it doesn't yet drive an agentic tool-calling loop at all. A dedicated
+investigation is running to resolve this precisely before deciding whether it needs its own sweep.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
