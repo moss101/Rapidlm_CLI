@@ -157,7 +157,7 @@ impl PageActor for FixturePageActor {
         cancel: &CancellationToken,
     ) -> Result<(), ActionError> {
         let _ = self.snapshot(session, context, cancel)?;
-        if let SecretAwareString::Literal(text) = value {
+        if let Some(text) = value.as_literal() {
             let mut state = self.state.lock().map_err(|_| ActionError::Unavailable)?;
             state
                 .entry(session)
@@ -165,7 +165,7 @@ impl PageActor for FixturePageActor {
                     typed: HashMap::new(),
                 })
                 .typed
-                .insert(target.stable_ref().to_owned(), text.clone());
+                .insert(target.stable_ref().to_owned(), text.to_owned());
         }
         Ok(())
     }

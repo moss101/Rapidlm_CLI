@@ -276,15 +276,28 @@ pub struct DesktopObserveRequest {
 }
 
 /// Text payload. Secret handles stay opaque; plaintext is never logged.
+///
+/// `Literal` is `#[non_exhaustive]`: outside this crate it can only be
+/// built via [`SecretAwareString::literal`], which enforces
+/// `MAX_TYPE_BYTES`. A bare tuple-variant construction would skip that
+/// bound entirely.
 #[derive(Clone, Eq, PartialEq)]
 pub enum SecretAwareString {
+    #[non_exhaustive]
     Literal(String),
     SecretHandle(SecretHandle),
 }
 
 /// Side-effecting desktop action. Coordinates are an explicit fallback variant.
+///
+/// `Click` and `Scroll` are `#[non_exhaustive]`: their bounds
+/// (`MAX_CLICK_COUNT`, `MAX_SCROLL_ABS`) are enforced only in the
+/// [`DesktopAction::click_button`]/[`DesktopAction::scroll`] smart
+/// constructors, so a caller outside this crate that built either variant
+/// via a struct literal would bypass them entirely.
 #[derive(Clone, Eq, PartialEq)]
 pub enum DesktopAction {
+    #[non_exhaustive]
     Click {
         target: DesktopTargetRef,
         button: MouseButton,
@@ -301,6 +314,7 @@ pub enum DesktopAction {
     Chord {
         keys: Vec<KeyCode>,
     },
+    #[non_exhaustive]
     Scroll {
         target: Option<DesktopTargetRef>,
         dx: i32,
@@ -309,6 +323,7 @@ pub enum DesktopAction {
     FocusWindow {
         window: WindowRef,
     },
+    #[non_exhaustive]
     ResizeWindow {
         window: WindowRef,
         width: u32,
@@ -321,6 +336,7 @@ pub enum DesktopAction {
         window: WindowRef,
     },
     /// Observation-bound coordinate injection. Not a semantic target.
+    #[non_exhaustive]
     CoordinateFallback {
         point: Point,
         button: MouseButton,

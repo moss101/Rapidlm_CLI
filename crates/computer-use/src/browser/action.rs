@@ -68,15 +68,28 @@ pub enum MouseButton {
 pub struct KeyCode(String);
 
 /// Text payload. Secret handles stay opaque; plaintext is never logged.
+///
+/// `Literal` is `#[non_exhaustive]`: outside this crate it can only be
+/// built via [`SecretAwareString::literal`], which enforces
+/// `MAX_TYPE_BYTES`. A bare tuple-variant construction would skip that
+/// bound entirely.
 #[derive(Clone, Eq, PartialEq)]
 pub enum SecretAwareString {
+    #[non_exhaustive]
     Literal(String),
     SecretHandle(SecretHandle),
 }
 
 /// Side-effecting browser action. Coordinate fallback is not accepted here.
+///
+/// `Click` and `Scroll` are `#[non_exhaustive]`: their bounds
+/// (`MAX_CLICK_COUNT`, `MAX_SCROLL_ABS`) are enforced only in the
+/// [`UiAction::click_button`]/[`UiAction::scroll`] smart constructors, so a
+/// caller outside this crate that built either variant via a struct
+/// literal would bypass them entirely.
 #[derive(Clone, Eq, PartialEq)]
 pub enum UiAction {
+    #[non_exhaustive]
     Click {
         target: TargetSelector,
         button: MouseButton,
@@ -90,6 +103,7 @@ pub enum UiAction {
         target: Option<TargetSelector>,
         key: KeyCode,
     },
+    #[non_exhaustive]
     Scroll {
         target: Option<TargetSelector>,
         dx: i32,
@@ -339,6 +353,17 @@ impl SecretAwareString {
 
     pub fn secret_handle(handle: SecretHandle) -> Self {
         Self::SecretHandle(handle)
+    }
+
+    /// The literal text, if this isn't an opaque secret handle. `Literal`
+    /// is `#[non_exhaustive]` (only [`SecretAwareString::literal`] can
+    /// build one), so this accessor is how a backend reads the bound text
+    /// it needs to type without being able to construct an unbounded one.
+    pub fn as_literal(&self) -> Option<&str> {
+        match self {
+            Self::Literal(text) => Some(text),
+            Self::SecretHandle(_) => None,
+        }
     }
 }
 

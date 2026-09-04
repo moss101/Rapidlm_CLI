@@ -154,11 +154,12 @@ mod tests {
     use computer_use::browser::action::{MouseButton, TargetSelector};
 
     fn click_action() -> UiAction {
-        UiAction::Click {
-            target: TargetSelector::parse("btn-1").expect("sel"),
-            button: MouseButton::Left,
-            count: 1,
-        }
+        UiAction::click_button(
+            TargetSelector::parse("btn-1").expect("sel"),
+            MouseButton::Left,
+            1,
+        )
+        .expect("click")
     }
 
     #[test]

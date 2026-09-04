@@ -2714,6 +2714,66 @@ env-leak fix above.
 Full `hooks` test module (10 tests, up from 9), full `-p rapid --lib` suite (360 tests, up from 359), and
 `cargo build --workspace --tests` all pass.
 
+**Same second-pass adversarial sweep, next applied to `crates/computer-use` — the third crate in a row
+matching the "well-designed layer, disconnected from any real caller" pattern, and this time the
+disconnection is total: no shipped code path can perform a single real OS-level or browser action through
+this crate today.** `ComputerUseRuntime` (`apps/rapid/src/computer_runtime.rs`, the crate's one real
+consumer) is never instantiated outside its own tests; `apps/rapid` has no GUI-automation tool dispatch at
+all (`RapidLmTool::BrowserAct` is declared in `crates/mcp`/`crates/tool-gateway` schemas but neither depends
+on `computer-use`); the crate is `#![forbid(unsafe_code)]`, so every "Live" desktop backend (macOS AX/Windows
+UIA/Linux AT-SPI) is a permanently-failing stub, and the browser side has no live Playwright backend, only a
+test fake. Given that, the two findings below are not reachable from any shipped path — but they're real
+defects in the crate's own internal contract, of the exact shape already found and fixed twice this session
+(`crates/sandbox`'s lease replay, `crates/auth`'s `EnvIdentity` collision), so worth closing before a real
+caller is ever wired up.
+
+**Fixed: `DesktopAction`/`UiAction`'s bounds-checked variants (`Click`, `Scroll`, `CoordinateFallback`,
+`ResizeWindow`) and `SecretAwareString::Literal` were `pub` enum variants with public fields, so their bounds
+(`MAX_CLICK_COUNT=2`, `MAX_SCROLL_ABS=100_000`, `MAX_TYPE_BYTES=4096`, `DisplayGeometry`'s resize bound) were
+enforced only inside smart constructors (`click_button`, `scroll`, `coordinate_fallback`, `resize_window`,
+`SecretAwareString::literal`) and trivially bypassed by any external caller building the variant directly via
+a struct/tuple literal.** (`crates/computer-use/src/desktop/backend.rs` and `crates/computer-use/src/browser/
+action.rs`, both `DesktopAction`/`UiAction` enum definitions and their matching `SecretAwareString`.) The
+review's own probe confirmed this: `DesktopAction::Scroll{dx:i32::MAX,dy:i32::MIN,..}`,
+`UiAction::Click{count:255,..}`, and `SecretAwareString::Literal("a".repeat(10_000_000))` all constructed and
+compiled with no error via direct struct/tuple-literal construction. Fixed by marking each bounds-protected
+variant `#[non_exhaustive]` — the standard Rust idiom for "construct only via the smart constructor, still
+freely matchable" — which for a struct-like variant blocks external struct-literal construction while still
+letting external code read its named `pub` fields, and for the tuple variant `SecretAwareString::Literal`
+blocks external construction *and* reads (tuple-variant fields have no separate visibility), so a new
+`SecretAwareString::as_literal(&self) -> Option<&str>` accessor was added for the one legitimate external
+reader (`crates/computer-use/tests/fixtures.rs`'s fake backend, updated to use it instead of destructuring).
+Verified by recreating the review's exact three-line reproduction as a throwaway integration test
+(`crates/computer-use/tests/nonexhaustive_probe.rs`, written, run, then deleted — confirmed via `git status`
+that no stray file remains): it now fails to compile with `error[E0639]: cannot create non-exhaustive variant
+using struct expression` (the two struct-like variants) and `error[E0603]: tuple variant 'Literal' is private`
+(the tuple variant) — the strongest form of verification available for a compile-time-enforced invariant.
+Fixing this also surfaced a real, pre-existing instance of exactly this bypass already in the tree: `apps/
+rapid/src/computer_runtime.rs`'s own test helper `click_action()` built `UiAction::Click{..}` via a raw struct
+literal from outside the crate; switched to `UiAction::click_button(...)`. Full `computer-use` crate suite
+(181 lib tests + 8 integration tests, unchanged — this is a compile-time hardening, not new runtime
+behavior), full `-p rapid --lib` suite (360 tests), and `cargo build --workspace --tests` all pass.
+
+**Found, verified, and deliberately left unfixed: no lease consumption anywhere in this crate — a
+`CapabilityLease` for a browser/desktop action can be replayed without limit, the same defect class as the
+already-fixed `crates/sandbox` lease-replay bug.** `require_browser_lease` (`browser/action.rs:1201-1209`)
+and `authorize_intents`/`lease_covers_class` (`browser/security.rs:394-448`) only read `lease.is_expired(now)`
+/`lease.remaining_uses() > 0` — both frozen at `issue()` time — and never call `capability_broker::
+LeaseValidator::validate_use`, which `capability-broker/src/lease.rs:109-111` explicitly documents as
+required for real use-consumption. Desktop actions have no lease gate at all (openly noted in a code comment
+at `backend.rs:1675-1688`). Verified by the reviewer: the crate's own existing, passing test
+`browser::action::tests::click_type_key_scroll_use_semantic_targets` issues one `ApprovalScopeId::Once` lease
+(`max_uses()==1`) and performs 4 separate `act()` calls with it; a temporary probe looping 5 calls on the same
+lease got 5 successes with `remaining_uses()` staying `1` throughout (reverted via `git checkout --`,
+confirmed clean). **Not fixed this pass**, unlike the `#[non_exhaustive]` fix above: this is the exact fix
+already done once this session for `crates/sandbox` (add a `validator: &LeaseValidator` parameter, call
+`validate_use`, consume the guard), so the *pattern* is well understood, but wiring it through `computer-use`
+touches `act()`/`act_with()` across both the browser and desktop actors and their call sites in a ~20K-line
+crate with zero real callers — a larger, more speculative change than the `crates/sandbox` case, which had
+one concrete, real, shipped caller motivating the exact shape of the fix. Given nothing in this codebase can
+currently reach this path at all, doing that wiring work now would be guessing at an interface a real caller
+hasn't been designed yet, matching this document's standing rule for findings of this shape.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
