@@ -1649,6 +1649,60 @@ entries" exactly as predicted, confirming the fixture discriminates before confi
 has zero callers anywhere in the binary (confirmed via grep across `apps/rapid/src`), so left undocumented here
 pending it actually being wired up.
 
+**Fresh review pass, 2026-09-04, `apps/rapid/src/hooks.rs::run_hook_once` — two independent bugs in the same
+function, both contradicting the module's own stated timeout contract.** Module doc: "Hook commands... are
+bounded by a timeout — a hung hook denies rather than hangs the turn." Both `pre_tool_use` and `post_tool_use`
+hooks run through `run_hook_once` on every real tool call whenever a project configures either
+(`exec_tools.rs:1119`/`:1212`), and `session_start`/`session_end`/`subagent_start`/`subagent_stop` hooks
+(`interactive.rs:1247`/`:1716`, `exec_tools.rs:2349`/`:2362`) share the same function.
+
+1. **The stdin write blocked the parent thread with no timeout, before the timeout clock even started.**
+`run_hook_once` wrote the hook's stdin JSON via a plain, synchronous `stdin.write_all()` prior to capturing
+`started = Instant::now()`. `write_all` on a piped child stdin blocks once the OS pipe buffer fills, until the
+child either reads or dies — and the overwhelming majority of hooks (a linter, a notifier, a one-line format
+check) never touch stdin at all. `run_pre_tool_hooks`'s `arguments` is the raw tool-call arguments value
+(`exec_tools.rs:1122`, e.g. a `workspace_write`'s full file content) and `run_post_tool_hooks`'s `summary` can
+carry up to `MAX_SHELL_OUTPUT_BYTES` (16 KiB) of raw shell output, which `serde_json`'s per-control-byte
+`\u00XX` escaping can inflate several-fold — either is large enough to fill a typical OS pipe buffer outright.
+Verified via the revert cycle with a hook that never reads stdin (`sleep 30`) and a 4 MB stdin payload: the
+reverted code's write blocked for the full 30 s until the child exited on its own, at which point
+`try_wait()` immediately saw a successful exit and returned `PreHookOutcome::Allowed` — a hung/ignorant hook
+being silently **allowed** rather than denied, the opposite of the doc's own contract, not just a slow denial.
+**Fixed:** the stdin write now happens on a detached thread, started before the timeout clock; if the hook is
+later killed on timeout, its stdin fd closes and unblocks the writer thread with a broken-pipe error, which is
+ignored (matching the pre-existing "output to a temp file, never a pipe" rationale already used for the read
+side of this same function). New test
+`a_large_stdin_payload_does_not_block_past_the_hook_timeout`.
+
+2. **`std::fs::read_to_string` on the captured output silently discarded the entire output when any single byte
+anywhere in it was invalid UTF-8** — not just an unbounded-read concern (shape already fixed 8+ times this
+session — see `read_capped_bytes` below), but a correctness bug independent of size: `read_to_string` requires
+the *whole* buffer to validate as UTF-8, so one stray non-UTF-8 byte from a hook's raw stdout/stderr (common
+for any tool emitting binary-ish diagnostic output) zeroed out `output` entirely via
+`.unwrap_or_default()`, before the `truncate()` helper that already correctly trims to the last valid UTF-8
+boundary ever got a chance to run on the real bytes. **Fixed, alongside the unbounded-read problem in one
+motion:** new `apps/rapid/src/exec_tools.rs::read_capped_bytes` (distinct from `read_file_bounded` — this one
+never errors on an oversized file, since captured hook/diagnostics output is always going to be truncated to a
+hard byte cap regardless; it exists purely to avoid ever buffering more than that cap). `run_hook_once` now
+reads through it and passes raw bytes straight to `truncate()`, both bounding the read and preserving valid
+output that happens to be followed by a stray invalid byte. New test
+`hook_output_survives_a_trailing_invalid_utf8_byte`, using a hook that `printf`s a valid prefix immediately
+followed by a raw `\xFF` byte — verified via the revert cycle that reverting just this part (independent of
+fix 1) reproduces exactly the predicted failure (`got ""` instead of the valid prefix).
+
+**Same review pass, `apps/rapid/src/shadow_diagnostics.rs::run_diagnostics_once` — the identical
+`read_to_string`-discards-valid-output-on-any-invalid-byte bug** (this file already redirects stdio to a temp
+file rather than a pipe with no stdin write at all, so bug 1 above doesn't apply here). Same fix
+(`read_capped_bytes` + passing raw bytes to the existing `from_utf8_lossy`-based `truncate`), same verification
+approach: new test `diagnostics_tail_survives_a_trailing_invalid_utf8_byte` (a `printf`-based diagnostics
+command whose output is a valid prefix plus a trailing `\xFF`), confirmed via the revert cycle to fail with an
+empty tail against the original `read_to_string` code before confirming it passes against the fix. Live and
+reachable: `run_diagnostics_once` backs `verify_candidate`, which runs on every `workspace_write` call when
+`shadow_diagnostics` is configured (`exec_tools.rs:1267`).
+
+Full `hooks` (9 tests, up from 7) and `shadow_diagnostics` (8 tests, up from 7) modules — 17 total across both,
+up from 14 — and `cargo build --workspace --tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

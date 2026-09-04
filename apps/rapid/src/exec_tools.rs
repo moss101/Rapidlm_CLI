@@ -2490,6 +2490,21 @@ pub(crate) fn read_file_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>
     Ok(buf)
 }
 
+/// Best-effort capped read, for "capture then truncate" output collection
+/// (`hooks::run_hook_once`, `shadow_diagnostics::run_diagnostics_once`),
+/// where a captured subprocess's stdout+stderr is always truncated to a hard
+/// byte cap regardless — so there's no reason to ever buffer more than that
+/// cap, and no reason to treat an oversized file as an error the way
+/// `read_file_bounded` does. A missing/unreadable file returns an empty
+/// buffer, matching callers' prior `unwrap_or_default()` fallback.
+pub(crate) fn read_capped_bytes(path: &Path, cap: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if let Ok(file) = fs::File::open(path) {
+        let _ = file.take(cap as u64).read_to_end(&mut buf);
+    }
+    buf
+}
+
 /// Count `/Type /Page` objects (not /Pages) as a page estimate.
 fn pdf_page_count(bytes: &[u8]) -> usize {
     let mut count = 0;

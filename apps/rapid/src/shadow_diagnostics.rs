@@ -272,17 +272,21 @@ fn run_diagnostics_once(argv: &[String], cwd: &Path, timeout: Duration) -> (bool
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let output = std::fs::read_to_string(&output_path).unwrap_or_default();
+                let output =
+                    crate::exec_tools::read_capped_bytes(&output_path, MAX_DIAGNOSTICS_OUTPUT_BYTES);
                 let _ = std::fs::remove_file(&output_path);
-                return (status.success(), truncate(output.as_bytes(), MAX_DIAGNOSTICS_OUTPUT_BYTES));
+                return (status.success(), truncate(&output, MAX_DIAGNOSTICS_OUTPUT_BYTES));
             }
             Ok(None) => {
                 if started.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let output = std::fs::read_to_string(&output_path).unwrap_or_default();
+                    let output = crate::exec_tools::read_capped_bytes(
+                        &output_path,
+                        MAX_DIAGNOSTICS_OUTPUT_BYTES,
+                    );
                     let _ = std::fs::remove_file(&output_path);
-                    let mut text = truncate(output.as_bytes(), MAX_DIAGNOSTICS_OUTPUT_BYTES);
+                    let mut text = truncate(&output, MAX_DIAGNOSTICS_OUTPUT_BYTES);
                     text.push_str("\n(diagnostics command timed out)");
                     return (false, text);
                 }
@@ -443,5 +447,31 @@ mod tests {
         let outcome = verify_candidate(&dir, "a.txt", b"x", &config);
         assert!(matches!(outcome, ShadowVerifyOutcome::Skipped { .. }), "{outcome:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnostics_tail_survives_a_trailing_invalid_utf8_byte() {
+        // A `read_to_string`-based collection fails validity for the *whole*
+        // captured file the instant any byte anywhere is invalid UTF-8,
+        // discarding an otherwise perfectly good tail rather than just the
+        // offending byte. `read_capped_bytes` + this module's `truncate`
+        // (already `from_utf8_lossy`-based) must instead preserve the valid
+        // prefix.
+        let root = seeded_repo("badutf8");
+        let config = ShadowDiagnosticsConfig::parse(&serde_json::json!({
+            "shadow_diagnostics": { "command": ["printf", "ok-output\\377"] }
+        }))
+        .expect("parsed");
+        let outcome = verify_candidate(&root, "new.txt", b"hello\n", &config);
+        match outcome {
+            ShadowVerifyOutcome::Passed { diagnostics_tail } => {
+                assert!(
+                    diagnostics_tail.contains("ok-output"),
+                    "expected the valid prefix to survive a trailing invalid UTF-8 byte, got {diagnostics_tail:?}"
+                );
+            }
+            other => panic!("expected Passed (printf always exits 0), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

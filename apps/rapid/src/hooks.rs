@@ -123,18 +123,31 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> (bool, S
             return (false, format!("hook spawn failed: {err}"));
         }
     };
-    // Write stdin and drop the pipe so the hook sees EOF.
+    // Write stdin on its own thread rather than blocking here: `write_all`
+    // on a piped child stdin has no timeout of its own, so a payload larger
+    // than the OS pipe buffer combined with a hook that never reads stdin
+    // (the overwhelmingly common case — most hooks only care about argv/the
+    // command's own output) would otherwise block synchronously, before the
+    // timeout clock below even starts, hanging the turn despite this
+    // module's own "bounded by a timeout" contract (see the module doc).
+    // The child's stdin handle is moved into the thread, so dropping it
+    // there still gives the hook EOF; if the child is killed on timeout
+    // while the write is still blocked, closing its stdin fd unblocks the
+    // writer thread with a broken-pipe error, which is ignored below.
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(input_json.as_bytes());
-        let _ = stdin.flush();
+        let input_json = input_json.to_owned();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(input_json.as_bytes());
+            let _ = stdin.flush();
+        });
     }
     let started = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let output = std::fs::read_to_string(&output_path).unwrap_or_default();
+                let output = crate::exec_tools::read_capped_bytes(&output_path, MAX_HOOK_STDERR_BYTES);
                 let _ = std::fs::remove_file(&output_path);
-                let text = truncate(output.as_bytes(), MAX_HOOK_STDERR_BYTES);
+                let text = truncate(&output, MAX_HOOK_STDERR_BYTES);
                 return (status.success(), text);
             }
             Ok(None) => {
@@ -151,9 +164,9 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> (bool, S
             }
         }
     }
-    let output = std::fs::read_to_string(&output_path).unwrap_or_default();
+    let output = crate::exec_tools::read_capped_bytes(&output_path, MAX_HOOK_STDERR_BYTES);
     let _ = std::fs::remove_file(&output_path);
-    let text = truncate(output.as_bytes(), MAX_HOOK_STDERR_BYTES);
+    let text = truncate(&output, MAX_HOOK_STDERR_BYTES);
     if !text.is_empty() {
         (false, text)
     } else {
@@ -366,12 +379,60 @@ exit 0"#,
     }
 
     #[test]
+    fn a_large_stdin_payload_does_not_block_past_the_hook_timeout() {
+        // `hang.sh` never touches stdin. If `run_hook_once` writes stdin
+        // synchronously before starting its timeout clock, a payload larger
+        // than the OS pipe buffer blocks the write until the child exits on
+        // its own (here, after its full 30s sleep) rather than being bounded
+        // by `timeout` — directly contradicting this module's doc comment
+        // ("bounded by a timeout — a hung hook denies rather than hangs the
+        // turn"). A small payload wouldn't reach the pipe buffer's capacity
+        // and would pass either way, so this needs a payload comfortably
+        // past any realistic OS pipe buffer size.
+        let dir = std::env::temp_dir().join(format!("hook-bigstdin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let hang = script(&dir, "hang.sh", "sleep 30");
+        let big_argument = format!("\"{}\"", "x".repeat(4_000_000));
+        let started = std::time::Instant::now();
+        match run_pre_tool_hooks(&[hang], "shell_exec", &big_argument, Duration::from_millis(250)) {
+            PreHookOutcome::Denied { reason } => {
+                assert!(reason.contains("timed out"), "{reason}");
+            }
+            PreHookOutcome::Allowed => panic!("hung hook must deny"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a large stdin payload must not block past the hook timeout, took {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn post_hooks_record_their_output() {
         let dir = std::env::temp_dir().join(format!("hook-post-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let note = script(&dir, "note.sh", "echo post-ran-ok");
         let output = run_post_tool_hooks(&[note], "repo_read", "the summary", HOOK_TIMEOUT);
         assert!(output.contains("post-ran-ok"), "{output}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hook_output_survives_a_trailing_invalid_utf8_byte() {
+        // A `read_to_string`-based collection fails validity for the *whole*
+        // captured file the instant any byte anywhere is invalid UTF-8,
+        // discarding an otherwise perfectly good output rather than just the
+        // offending tail. `read_capped_bytes` + the manual boundary-trimming
+        // `truncate` above must instead preserve the valid prefix.
+        let dir = std::env::temp_dir().join(format!("hook-badutf8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let hook = script(&dir, "badutf8.sh", "printf 'ok-output'; printf '\\377'");
+        let output = run_post_tool_hooks(&[hook], "repo_read", "the summary", HOOK_TIMEOUT);
+        assert!(
+            output.contains("ok-output"),
+            "expected the valid prefix to survive a trailing invalid UTF-8 byte, got {output:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
