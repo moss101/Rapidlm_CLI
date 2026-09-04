@@ -3526,6 +3526,51 @@ does show this codebase's usual careful patterns (bounded frame reads, cooperati
 errors, no panics) on a quick read, but a full adversarial pass wasn't warranted given zero production
 reachability.
 
+**Same sweep, next turning to the core `crates/agent-runtime/src/turn.rs` turn-execution loop itself — the
+single most consequential file in this crate, since every real turn (headless `rapid exec`, interactive, and
+every `task_spawn` subagent) runs through it. Fixed: `MAX_TURN_EVENTS` was an independently-chosen fixed
+number, inconsistent with the crate's own other two hard budgets, and reachable within the envelope those
+budgets themselves declare legal.**
+
+**Fixed: `MAX_TURN_EVENTS = 512` could be exceeded by a turn that never exceeded `MAX_MODEL_STEPS = 32` or
+`MAX_TOOL_CALLS_PER_STEP = 16` — the two constants that are supposed to bound how much a turn can legally do
+— and hitting it mid-batch silently dropped already-executed tool results and skipped the turn's own
+documented "exactly one terminal event" contract.** `turn.rs`'s module doc (turn.rs:1-6) promises *"Emits
+`turn.started`, then model/tool events, then exactly one of `turn.completed`, `turn.failed`, or
+`turn.interrupted`."* Every model step that proposes tool calls emits exactly 2 events
+(`ModelRequested`+`ModelCompleted`, confirmed by reading every branch of `run_model_step`), and every
+dispatched tool call emits exactly 3 (`ToolRequested` in the phase-1 validation loop, `ToolStarted` +
+one-of-four terminal tool events in `dispatch_prepared`'s phase-2 dispatch, confirmed by reading both loops
+directly) — so a turn using its full, budget-legal envelope (32 steps × 16 calls/step = 512 tool calls, with
+`TurnBudget`'s own `max_tool_calls: Option<u32>` left `None`, which is a real, reachable configuration since
+`tool_budget_exhausted` returns `false` unconditionally in that case) produces `1 (Started) + 32×2 (model) +
+512×3 (tool) + 1 (terminal) = 1602` events — crossed well before the old fixed `512` cap, at roughly 150 total
+tool calls. `dispatch_prepared` (turn.rs, phase 2/3) executes every accepted call's real side effect via one
+synchronous `tools.execute_batch(...)` call up front, then loops over the outcomes to record each into
+`results`/`state.usage` and `emit_tool_result(...)?` — the `?` on that emit means a sink rejection
+(`impl TurnEventSink for Vec<TurnEvent>` rejects once `self.len() >= MAX_TURN_EVENTS`) unwinds the whole
+`run_turn` call immediately with `Err(TurnError::EventSink)`, discarding the local `results` Vec built so far:
+every call whose accounting hadn't yet completed had already mutated real state (files written, shell
+commands run, model/token spend recorded by the provider) but its result is never recorded anywhere and no
+terminal event is ever emitted. This is reachable from both real production call sites that construct the
+sole real sink (`apps/rapid/src/interactive.rs`'s headless `exec_turn`/`rapid exec` path and
+`LiveSubagentRunner::run`, the real `task_spawn` backing) — an ordinary heavy-tool-use turn could trigger it,
+not just an adversarial one.
+
+Fixed by making `MAX_TURN_EVENTS` a value computed directly from the other two budgets instead of an
+independently-chosen number: `2 + MAX_MODEL_STEPS as usize * (2 + MAX_TOOL_CALLS_PER_STEP * 3) + 8` (the `+8`
+is defensive slack, not load-bearing) — this is provably ≥ the exact worst-case count derivable from those
+same two constants (1610 ≥ 1602), so no turn this crate's own budgets already allow can ever cross it again,
+and if either constant changes in the future the cap moves with it instead of silently drifting back out of
+sync. New test `a_fully_loaded_turn_within_the_advertised_envelope_never_overruns_the_event_cap`: drives a
+scripted 32-step, 16-call-per-step turn (all budget-legal, `max_tool_calls: None`) to completion, asserts the
+turn ends in exactly one terminal event (`turn.failed`/`BudgetExhausted`, once the 33rd step's
+`model_budget_exhausted` check trips), and asserts the exact event count (1602) matches the derived formula
+precisely rather than merely fitting under some cap. Verified via the revert cycle: reverting just the
+constant back to the literal `512` makes this exact test fail with `EventSink`, exactly as the finding
+predicted; restoring the fix passes it again. Full `-p agent-runtime` suite (276 tests, up from 275) and
+`cargo build --workspace --tests` both pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

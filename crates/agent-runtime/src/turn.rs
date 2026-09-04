@@ -19,8 +19,24 @@ pub const MAX_MODEL_STEPS: u32 = 32;
 /// Hard ceiling on tool calls accepted from one model step.
 pub const MAX_TOOL_CALLS_PER_STEP: usize = 16;
 
-/// Maximum events one turn may emit.
-pub const MAX_TURN_EVENTS: usize = 512;
+/// Maximum events one turn may emit. Computed from the turn's own other
+/// hard ceilings, not a fixed guess: `Started` + one terminal event, plus
+/// every step using its full allowance (`ModelRequested`/`ModelCompleted`
+/// per step; `ToolRequested`/`ToolStarted`/one terminal tool event per
+/// call). A cap sized independently of `MAX_MODEL_STEPS`/
+/// `MAX_TOOL_CALLS_PER_STEP` — as a flat `512` previously was — can be hit
+/// well inside the turn's own advertised budget (crossed at roughly 150
+/// total tool calls, against a nominal ceiling of `32 * 16 = 512`), and
+/// hitting it mid-batch silently discards already-executed tool side
+/// effects (their results are never recorded) and ends the turn with no
+/// terminal event at all — an ordinary heavy-tool-use turn, not just an
+/// adversarial one, could trigger this. Deriving the cap from the same
+/// constants that bound steps/calls makes it provably impossible to hit
+/// under any turn this crate's own budget already allows, rather than
+/// hoping a fixed number stays ahead of them as those change. `+ 8` is
+/// slack for defensive margin, not load-bearing.
+pub const MAX_TURN_EVENTS: usize =
+    2 + (MAX_MODEL_STEPS as usize) * (2 + MAX_TOOL_CALLS_PER_STEP * 3) + 8;
 
 /// Maximum UTF-8 bytes accepted in a model `request_id` or tool `call_id`.
 pub const MAX_CALL_ID_BYTES: usize = 128;
@@ -3120,5 +3136,50 @@ mod tests {
         assert!(!TurnEventKind::ModelCompleted.is_terminal());
         assert_eq!(model_request_id(1), "m1");
         assert_eq!(model_request_id(12), "m12");
+    }
+
+    /// A turn legal under `MAX_MODEL_STEPS`/`MAX_TOOL_CALLS_PER_STEP` alone
+    /// (no `max_tool_calls` cap) can drive every one of the 32 steps to its
+    /// full 16-call allowance — 512 tool calls total. That is well inside
+    /// what those two constants advertise as fine, yet the event count it
+    /// produces (`Started` + 2/step + 3/call + one terminal = 1602) used to
+    /// exceed the old, independently-chosen `MAX_TURN_EVENTS = 512`. Once
+    /// crossed mid-batch, `dispatch_prepared` unwound via `emit`'s `?` with
+    /// already-executed results never recorded and no terminal event ever
+    /// emitted — this test proves that no longer happens and pins the exact
+    /// event count the fully-loaded envelope produces.
+    #[test]
+    fn a_fully_loaded_turn_within_the_advertised_envelope_never_overruns_the_event_cap() {
+        let steps: Vec<Result<ModelStepOutput, ModelStepError>> = (0..MAX_MODEL_STEPS)
+            .map(|step| {
+                let calls = (0..MAX_TOOL_CALLS_PER_STEP)
+                    .map(|i| {
+                        ProposedToolCall::new(
+                            format!("c{step}_{i}"),
+                            "test.tool",
+                            format!("{{\"step\":{step},\"i\":{i}}}"),
+                        )
+                        .expect("call")
+                    })
+                    .collect();
+                tools_out(calls, 1)
+            })
+            .collect();
+        let mut model = ScriptedModel::new(steps);
+        let mut tools = ScriptedTools::new(Vec::new());
+        let mut events = Vec::new();
+        let budget = TurnBudget::new(MAX_MODEL_STEPS, None, None).expect("budget");
+        let result = run(budget, &mut model, &mut tools, &mut events, &live())
+            .expect("a fully-loaded but budget-legal turn must not overrun the event cap");
+
+        assert_eq!(result.status(), TurnStatus::Failed);
+        assert_eq!(result.reason(), Some(TurnStopReason::BudgetExhausted));
+        assert_eq!(kinds(&events).last(), Some(&"turn.failed"));
+        let expected_events = 1 // turn.started
+            + MAX_MODEL_STEPS as usize * 2 // model.requested + model.completed
+            + MAX_MODEL_STEPS as usize * MAX_TOOL_CALLS_PER_STEP * 3 // tool.requested + tool.started + tool.completed
+            + 1; // the one terminal event
+        assert_eq!(events.len(), expected_events);
+        assert!(expected_events <= MAX_TURN_EVENTS);
     }
 }
