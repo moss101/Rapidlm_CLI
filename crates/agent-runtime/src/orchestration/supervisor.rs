@@ -205,7 +205,17 @@ impl Supervisor {
         contract
             .validate()
             .map_err(SupervisorError::InvalidContract)?;
-        if drivers.verifiers.is_empty() && contract.verification_policy.skeptic_count > 0 {
+        // `VerifierPanel::for_policy` sizes its panel to `skeptic_count.max(1)`
+        // independent assignments (e.g. `Unanimous` aggregation for
+        // `TaskComplexity::Critical` requires 2 agreeing skeptics) — but
+        // `verify()` only ever iterates the drivers actually injected here,
+        // never the panel's own assignment count. Checking for merely
+        // "zero verifiers supplied" let a caller under-provision (e.g. one
+        // verifier for a `skeptic_count: 2` policy) and still start
+        // successfully, silently satisfying a multi-skeptic requirement
+        // with a single verdict once `aggregate()`'s `Unanimous` branch saw
+        // no disagreement in a one-element list.
+        if drivers.verifiers.len() < contract.verification_policy.skeptic_count as usize {
             return Err(SupervisorError::VerifierUnavailable);
         }
         let panel = VerifierPanel::for_policy(&contract.verification_policy);
@@ -1378,6 +1388,33 @@ mod tests {
             RapidConfig::default().orchestration.mode,
             OrchestrationMode::Off
         );
+    }
+
+    #[test]
+    fn start_rejects_fewer_verifiers_than_skeptic_count_requires() {
+        // `Critical` complexity requires 2 independent skeptics
+        // (`Unanimous` aggregation, `skeptic_count: 2`), but
+        // `SupervisorDrivers::fakes` always supplies exactly one verifier.
+        // `start()` must reject this under-provisioned combination rather
+        // than silently accepting it and letting a single verdict satisfy
+        // what the policy calls for two-must-agree.
+        let id = GoalId::new();
+        let mut c = contract(id);
+        c.verification_policy = VerificationPolicy::for_complexity(TaskComplexity::Critical);
+        let drivers = SupervisorDrivers::fakes(FakeScript {
+            task_id: id,
+            evidence: vec![],
+            include_evidence: false,
+            refute_n: 0,
+            fail_checks: false,
+        });
+        match Supervisor::start(c, identity(), drivers) {
+            Err(SupervisorError::VerifierUnavailable) => {}
+            other => panic!(
+                "expected Err(VerifierUnavailable) for an under-provisioned panel, got is_ok={}",
+                other.is_ok()
+            ),
+        }
     }
 
     #[test]

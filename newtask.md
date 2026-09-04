@@ -2143,6 +2143,50 @@ id-stability across recompiles (`GraphService::diff`) has zero callers outside i
 entirely dormant scaffolding (confirmed via repo-wide grep for their public types) with no verified live bug
 in any of the three.
 
+**Fresh review pass, 2026-09-04, `crates/agent-runtime/src/orchestration/supervisor.rs::Supervisor::start` —
+a verifier-panel under-provisioning gap that could silently satisfy a multi-skeptic policy with a single
+verdict.** `VerifierPanel::for_policy` (`policy.rs:218-229`) sizes its panel to `skeptic_count.max(1)`
+independent assignments — `TaskComplexity::Critical`'s `Unanimous` aggregation policy specifically means "2
+skeptics must independently agree" — but `verify()` (`supervisor.rs:492-502`) only ever iterates the
+`SupervisorDrivers.verifiers` actually injected at construction, never reading `panel.assignments`/
+`quorum_policy` at all (confirmed via grep: read nowhere outside one test assertion). `start()`'s only guard
+was `drivers.verifiers.is_empty() && skeptic_count > 0` — checking for *zero* supplied verifiers, not for
+*fewer than required*. **Concrete failure:** construct a `Critical`-complexity contract (`skeptic_count: 2`)
+but supply only one `Verifier` driver — `start()` accepted it, `verify()` ran the single verifier, and
+`aggregate()`'s `Unanimous` branch sees a one-element list with no disagreement and returns it as-is,
+satisfying what the policy intended as "two independent skeptics must agree" with only one. Live-caller
+reachability caveat, stated plainly: the one confirmed end-to-end caller
+(`apps/rapid/src/goal_claim.rs::run_claim`) always uses `skeptic_count: 0` and never hits this; this is a
+validation gap in the public `Supervisor` API itself, verified via direct code reading, not yet exploited by
+any code shipping today. **Fixed:** changed the guard to `drivers.verifiers.len() < skeptic_count as usize`,
+which subsumes the old zero-verifiers case and additionally rejects the under-provisioned case. New test
+`start_rejects_fewer_verifiers_than_skeptic_count_requires` (a `Critical`-complexity contract via the crate's
+own `SupervisorDrivers::fakes`, which always supplies exactly one verifier) — verified via the revert cycle to
+return `Ok` (accepting the under-provisioned panel) against the original guard before confirming the fix
+rejects it with `VerifierUnavailable`. Full `orchestration` module (17 tests) and full `agent-runtime` crate
+(275 tests) pass, plus `cargo build --workspace --tests`.
+
+**Same review pass, investigated but declined: `AcceptancePolicy::AllowInconclusive`/`allow_inconclusive_
+acceptance` is completely non-functional and permanently strands the orchestration state machine the moment
+it's actually exercised.** Doc comment (`policy.rs:21`): "Inconclusive never accepts under Strict" (implying
+non-Strict *should* allow forward progress on an inconclusive verdict) — but `verify()`
+(`supervisor.rs:546-556`) simply skips applying any transition at all when a verdict is `Inconclusive`/
+`Blocked` and `allow_inconclusive_acceptance` is true, leaving state at `Verifying`/`Reverifying`
+indefinitely; separately, `accept()`'s guard (`supervisor.rs:661-667`) has a dead second clause (subsumed by
+the first) that makes it unconditionally require `Verdict::Verified` regardless of policy, so even a caller
+that wanted to accept an inconclusive result couldn't. With no public `Supervisor` method able to force a
+transition out of `Verifying`/`Reverifying` (`repair()`/`strategize()` both require `Refuted`; `advance()`'s
+match has no arm for this state), the **only** way out is `cancel()` — a real, permanent stuck state.
+**Confirmed not reachable today:** the one live caller (`goal_claim.rs`) hardcodes `allow_inconclusive_
+acceptance: false` and never wires a real `Verifier` (empty `verifiers` vec, `skeptic_count: 0`), so
+`Inconclusive`/`Blocked` verdicts can never arise on the live path — `host_verdict`/`host_gate` only ever
+produce `Verified` or `Refuted`. **Declining to fix:** unlike the verifier-count gap above (a pure input-
+validation tightening), correctly wiring this policy knob requires deciding what state the FSM *should*
+transition to on an accepted-inconclusive verdict — a new terminal-ish state, or relaxing `accept()`'s guard to
+admit `Inconclusive` directly — which is a real state-machine design choice with no existing test or caller to
+validate against, not a mechanical fix. Flagging in full so whichever future caller wants non-Strict
+acceptance semantics doesn't discover this by getting stuck.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
