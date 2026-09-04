@@ -416,10 +416,30 @@ capability = "proc.exec"
     PolicyStack::new([doc]).expect("stack")
 }
 
+/// A random key generated once per process, reused by every lease issuer and
+/// validator this process constructs. A fixed constant here would be an
+/// unexplained deviation from `LeaseIssuer::ephemeral()`'s own documented
+/// practice ("fresh in-process key... not a credential-store secret") with
+/// no real gain: the lease token itself never leaves process memory (no
+/// `Serialize` impl, `token_for_tool_output` always errors), so a fixed key
+/// buys nothing, and its only cost is a value an attacker with any read
+/// access to this binary's memory or source could predict in advance. Not
+/// `LeaseIssuer::ephemeral()` itself: it generates a fresh key on every call
+/// with no accessor to recover the bytes, but the issuer and validator built
+/// from this key below must share the identical bytes to MAC-verify against
+/// each other.
 fn agent_cli_key() -> [u8; 32] {
-    let mut key = [0u8; 32];
-    key[0] = 0xa9;
-    key
+    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    *KEY.get_or_init(|| loop {
+        let mut seed = Vec::with_capacity(64);
+        for _ in 0..4 {
+            seed.extend_from_slice(protocol::SessionId::new().as_uuid().as_bytes());
+        }
+        let key = *protocol::ArtifactId::from_bytes(&seed).as_digest();
+        if key.iter().any(|byte| *byte != 0) {
+            return key;
+        }
+    })
 }
 
 #[cfg(test)]
@@ -434,6 +454,21 @@ mod tests {
             "rapidlm-p9-{name}-{}-{seq}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn agent_cli_key_is_process_stable_and_no_longer_the_old_fixed_constant() {
+        // The issuer and the validator built from this key (run_agent_cli,
+        // around line 316) must see byte-identical keys within one process
+        // or every lease would fail to MAC-verify — so this must be stable
+        // across repeated calls, not a fresh value each time.
+        let a = agent_cli_key();
+        let b = agent_cli_key();
+        assert_eq!(a, b, "repeated calls in one process must agree");
+        let mut old_hardcoded = [0u8; 32];
+        old_hardcoded[0] = 0xa9;
+        assert_ne!(a, old_hardcoded, "must no longer be the old fixed constant");
+        assert!(a.iter().any(|byte| *byte != 0), "must not be all-zero");
     }
 
     #[test]

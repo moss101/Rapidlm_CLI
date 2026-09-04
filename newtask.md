@@ -3610,6 +3610,79 @@ second, both `call_id: "dup-id"`); reverting `turn.rs`'s check let both duplicat
 (`tool_calls() == 2`) instead of neither. Full `-p agent-runtime` suite (277 tests, up from 276), full `-p
 rapid --lib` suite (375 tests, up from 374), and `cargo build --workspace --tests` all pass.
 
+**Same sweep, next applied to `crates/capability-broker` — the ninth (and, unlike the prior eight, genuinely
+live) crate this pass, confirmed backing real command/path normalization and lease-scoped approval behind
+`apps/rapid`'s `run_agent_cli` (the `rapid agent-cli` subcommand). One finding fixed, one larger architectural
+gap found and declined with a tracked follow-up, plus several confirmed-clean checks.**
+
+**Fixed: `run_agent_cli`'s lease-signing key was a fixed, hardcoded constant (`agent_cli_key()` returning
+`[0xa9, 0, 0, ..., 0]`) instead of a per-process random value, an unexplained deviation from the crate's own
+documented practice for exactly this purpose (`LeaseIssuer::ephemeral()`: "fresh in-process key... not a
+credential-store secret").** `apps/rapid/src/p9_commands.rs:316-320` constructs both a `LeaseIssuer` (to
+mint the lease) and a `LeaseValidator` (wrapping a second `LeaseIssuer`, to check it) from two separate calls
+to `agent_cli_key()` — both need byte-identical keys to MAC-verify against each other, which is exactly why
+the function returned a fixed constant rather than fresh randomness each call. Real-world impact is low today:
+`CapabilityLease`/`LeaseToken` never leave process memory (no `Serialize` impl anywhere on either type, and
+`token_for_tool_output()` unconditionally returns `Err(TokenNotExportable)`, `crates/capability-broker/src/
+lease.rs:222-225`), so knowing the key in advance doesn't let an external actor forge a lease by itself — but
+it's a real, avoidable weakening with no corresponding benefit. Not simply switched to `LeaseIssuer::
+ephemeral()` directly: that generates a fresh random key on *every* call with no accessor to recover the
+bytes, and the two call sites need the *same* bytes. Fixed by generating one random key per process (same
+entropy construction `ephemeral()` itself uses — four `SessionId` UUIDs hashed via `ArtifactId::from_bytes`
+— cached in a `std::sync::OnceLock` local to `p9_commands.rs`) so repeated calls within one process agree
+while a fresh process gets a fresh key. New test
+`agent_cli_key_is_process_stable_and_no_longer_the_old_fixed_constant`: asserts two calls agree, the value is
+no longer the old hardcoded constant, and it isn't all-zero (`LeaseIssuer::from_key`'s own fail-closed check).
+Full `p9_commands::` test module and `-p rapid --lib` suite pass; `cargo build --workspace --tests` passes.
+
+**Found, verified via reading `crates/capability-broker/src/normalize/{command,fs}.rs` and every production
+`Resolver` implementation in the workspace, and left unfixed given the scope: every production command-exec
+`Resolver` (`apps/rapid/src/p9_commands.rs`'s `FrozenPathResolver`, `apps/rapid/src/exec_tools.rs`'s
+`AlreadyResolvedPathResolver`, `crates/process-supervisor/src/spawn.rs`'s own `FrozenPathResolver` used by
+production `spawn()`'s pre-exec re-check) is a pure lexical `..`/`.`-folding pass-through with zero
+filesystem syscalls — structurally unable to detect a symlink retarget or binary swap between lease approval
+and the real `execve`, unlike the crate's own `normalize::fs::FsResolver`, whose trait shape forces real
+`exists`/`is_dir`/`read_link` calls and correctly catches exactly this class of attack in the crate's own
+`tests/lease_toctou.rs`.** The crate's whole anti-TOCTOU design (demonstrated correctly for filesystem
+writes) is: re-derive the canonical identity fresh, immediately before the side effect, and compare its
+fingerprint to the one bound into the lease. `process_supervisor::spawn::verify_lease_bound` does call this
+re-derivation in the right place (right before `Command::spawn()`) for exactly the right reason — but because
+every command-side `Resolver` only touches path *strings*, that re-check can only ever prove "the argv/cwd
+strings didn't change," never "the file the approved path still points at hasn't been swapped." Blast radius
+today is narrowed by an incidental factor, not a designed one: the one live command-exec gate
+(`run_agent_cli`) resolves its "ask" approval synchronously and unconditionally in-process
+(`ApprovalChoice::Approve(ApprovalScopeId::Once)`, p9_commands.rs:347-360, matching its own doc comment that
+the operator's CLI invocation itself is the consent) with no real interactive wait, so the window between
+`normalize_exec()` and the eventual `execve` is only a handful of function calls, not zero — but the
+architecture would become straightforwardly exploitable (attacker has as long as a human takes to approve)
+the moment this same lease/approval machinery is ever wired to a genuinely interactive prompt anywhere in the
+codebase, which the crate's own TTL/expiry scaffolding is clearly built assuming will eventually happen.
+Properly closing this means giving `command.rs` (or its callers) a real filesystem-truth re-check mirroring
+`fs.rs`'s already-correct, already-tested pattern — likely opening the resolved executable via a file
+descriptor at approval time and re-verifying identity (device+inode, or an fd-relative exec) rather than a
+second lexical string compare at spawn time — a genuine design decision spanning three production call sites
+across two crates (`apps/rapid`, `process-supervisor`), not a same-shaped mechanical patch. Flagged via
+`spawn_task` for dedicated follow-up rather than attempted inline.
+
+Also noted, not a bug: `crates/capability-broker/src/audit.rs`'s complete, tested audit-ledger integration
+(`AuditEmitter`, `audit_decision`, `audit_lease_issued`, `audit_lease_used`) has zero callers from
+`apps/rapid` — `run_agent_cli` produces no audit trail of its own allow/ask/deny/lease decisions despite the
+crate providing one. Lower priority than the TOCTOU gap (an observability gap, not a safety one) but worth
+picking up alongside it. `crates/capability-broker/src/projection.rs` (`CapabilityProjection` and friends) and
+`normalize::fs`/`FsResolver`/`normalize_fs` itself are dead code with zero production callers anywhere in the
+workspace — confirmed reachability, no fix needed.
+
+Confirmed clean: `LeaseUseGuard`/`validate_use`'s one-shot accounting is atomic under concurrency and
+correctly process-scoped (each `rapid agent-cli` invocation mints its own random `LeaseId`/nonce, so there is
+no path for one lease to reach two validator instances); `request_approval`/`ApprovedAction` resolution fails
+closed on expiry/mutation/cancellation; `PolicyStack` layer composition ("higher-trust deny is final, lower
+layers may only narrow") holds with no bypass found, though both production `PolicyStack` builders in
+`apps/rapid` currently build only single-document stacks, so this composition logic is exercised today only
+by the crate's own tests; glob/rename matching correctly requires an Allow to cover both source and
+destination of a rename; the advisory-scanner `.ok()`-discarding pattern in `exec_tools.rs` is working as
+documented (never gates execution, by design) rather than a fail-open bug; `Capability`/`ResourceDescriptor`
+deserialization fails closed on any unrecognized variant.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
