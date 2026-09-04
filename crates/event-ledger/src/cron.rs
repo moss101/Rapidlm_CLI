@@ -27,6 +27,13 @@ pub const MAX_SCHEDULE_TEXT_BYTES: usize = 512;
 pub const MAX_SESSION_ID_BYTES: usize = 128;
 /// Maximum UTF-8 bytes accepted in a quarantine reason.
 pub const MAX_QUARANTINE_REASON_BYTES: usize = 256;
+/// Maximum total rows (any status) one store holds. Unlike prompt/schedule/
+/// session-id sizes, nothing else bounds how many jobs accumulate: there is
+/// no expiry, and quarantined rows are kept indefinitely for operator
+/// review. Without this, `rapid cron add` in a loop grows the sqlite file
+/// without bound and can crowd legitimate jobs out of `poll`'s bounded
+/// per-tick batch.
+pub const MAX_CRON_JOBS: usize = 512;
 
 /// Row lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -100,6 +107,11 @@ pub enum CronStoreError {
         limit: usize,
         observed: usize,
     },
+    /// The store already holds `MAX_CRON_JOBS` rows; refusing to grow
+    /// further rather than accepting unbounded storage.
+    TooManyJobs {
+        limit: usize,
+    },
     /// Stored row violates its own invariants; the database was edited
     /// outside this crate.
     Corrupt(&'static str),
@@ -131,6 +143,10 @@ impl fmt::Display for CronStoreError {
             Self::ReasonTooLarge { limit, observed } => write!(
                 f,
                 "quarantine reason is {observed} bytes; limit is {limit} bytes"
+            ),
+            Self::TooManyJobs { limit } => write!(
+                f,
+                "cron store already holds the maximum of {limit} jobs"
             ),
             Self::Corrupt(why) => write!(f, "cron store row is corrupt: {why}"),
             Self::Migration(err) => write!(f, "cron store migration failed: {err}"),
@@ -247,6 +263,12 @@ impl CronStore {
         }
         let id = generate_id();
         let conn = self.connect()?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM cron_jobs", [], |row| row.get(0))?;
+        if count as usize >= MAX_CRON_JOBS {
+            return Err(CronStoreError::TooManyJobs {
+                limit: MAX_CRON_JOBS,
+            });
+        }
         conn.execute(
             "INSERT INTO cron_jobs
                (id, prompt, session_id, schedule, status, next_fire_at_ms,
@@ -537,6 +559,23 @@ mod tests {
         match err {
             CronStoreError::JobNotFound { id } => assert_eq!(id, "cron-missing"),
             other => panic!("expected JobNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_refuses_once_the_store_holds_max_cron_jobs() {
+        let (store, _db) = TempDb::open_store();
+        for i in 0..MAX_CRON_JOBS {
+            store
+                .add("run checks", None, "*/5 * * * *", 1_000 + i as i64, 1_000)
+                .unwrap_or_else(|err| panic!("job {i} should fit under the cap: {err}"));
+        }
+        let err = store
+            .add("one too many", None, "*/5 * * * *", 999_999, 1_000)
+            .expect_err("the store is at capacity");
+        match err {
+            CronStoreError::TooManyJobs { limit } => assert_eq!(limit, MAX_CRON_JOBS),
+            other => panic!("expected TooManyJobs, got {other:?}"),
         }
     }
 

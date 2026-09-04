@@ -2813,6 +2813,66 @@ several well-engineered, independently-tested capability-gated execution layers,
 product uses none of them for its real tool dispatch — whoever next does this wiring work should treat it as
 one decision (which layer becomes canonical) rather than four separate integration tasks.
 
+**Same second-pass adversarial sweep, next applied to `crates/scheduler` — a genuine change of pattern from
+the last four crates: this one has a real, wired, executing production path (`rapid cron`), and the design
+turned out to be sound where it mattered most.**
+
+**Reachability, precisely:** `cron.rs`'s `PromptCron` (backed by `crates/event-ledger::cron::CronStore`) is
+real and wired — `apps/rapid/src/interactive.rs:343` dispatches `rapid cron` to `p9_commands.rs::run_cron`,
+whose `poll` path runs each fired prompt through the real interactive turn machinery
+(`crate::interactive::exec_turn`). The rest of the crate (`graph.rs`/`service.rs`/`orch.rs`'s `GraphService`/
+`GraphBackedRun` state-machine orchestrator — over half the crate's ~2,825 lines) matches the same
+disconnected-layer pattern as the four crates above: `rapid playbook-compile` only builds and prints a graph,
+never executes it, and `GraphService`/`GraphBackedRun` have zero production callers. Not re-documented in
+full here since it's the same shape already established four times over — noting only that it's not
+reachable, for completeness. **Correction to this review's own dispatch premise**: RapidLM has no
+`scheduler_create`/`list`/`delete` *model-callable tool* — that description in this document's Phase-1
+competitor tables is Grok Build's tool set, not RapidLM's. `rapid cron` is a human/operator-only CLI
+subcommand; grepping the full model-callable tool surface in `exec_tools.rs` confirms no cron/scheduler tool
+is exposed to the agent loop, so prompt injection has no path to this crate at all — this meaningfully
+narrows everything below to a CLI-operator-only threat model.
+
+**Verified sound, not a bug: deferred/unattended execution gets *more* scrutiny than interactive, not less.**
+This was the central question this review was dispatched to answer (a scheduler is exactly the kind of
+mechanism that could let a one-time interactive approval get silently replayed later, unattended). Traced end
+to end: `interactive.rs:1144` forces `PermissionMode::Plan` unconditionally for every cron-fired turn,
+overriding project settings, `RAPIDLM_PERMISSION_MODE`, and any persisted grant; `permissions.rs:555-556`'s
+Plan-mode check is an absolute pre-rule ceiling checked before deny/ask/allow rules and before persisted
+grants (`class != ToolClass::ReadOnly` denies outright); `managed_config.rs`'s policy gate can only narrow a
+mode, never widen it, and Plan mode is already the strictest of all six modes, making that gate a structural
+no-op against it; and `exec_workspace` re-derives project trust fresh from disk on every call rather than
+replaying trust state cached from job-creation time. Net effect: a cron-fired turn can read but never write,
+patch, or shell-exec, regardless of what was granted when the job was created — the unattended path is
+strictly more restrictive than an interactive session, which merely *asks* for a write. No fix needed; this
+is exactly the property you'd want, already correctly implemented.
+
+**Fixed: `CronStore::add` (`crates/event-ledger/src/cron.rs:217`) bounded every individual field's size
+(`MAX_PROMPT_BYTES`, `MAX_SCHEDULE_TEXT_BYTES`, `MAX_SESSION_ID_BYTES`) but had no cap on the total number of
+stored jobs.** No expiry exists either (quarantined rows are kept indefinitely for operator review), so
+`rapid cron add` in a loop grows `.rapidlm/sessions.sqlite`'s `cron_jobs` table without bound, and a burst of
+same-instant jobs can crowd genuinely due jobs out of `poll`'s `MAX_POLL_BATCH = 64`-row-per-tick window
+(ordered by `(next_fire_at_ms, id)`). Notably, this document's own Phase-1 tables cite Grok Build's scheduler
+as having exactly this kind of cap (50 entries) and a 7-day expiry as a positive design point — RapidLM's
+cron facade had neither, despite otherwise carefully bounding every other input to this store. Low severity
+given the narrowed threat model above (CLI-operator-only, not model-reachable — anyone with local shell
+access to run `rapid cron add` in a loop already has strictly more direct ways to cause harm), but a clean,
+mechanical fix worth making anyway, matching this codebase's own bound-everything convention. Fixed with a
+new `MAX_CRON_JOBS = 512` constant and a `COUNT(*)` check before insert, returning a new
+`CronStoreError::TooManyJobs` (propagated automatically through `scheduler::CronError`'s existing `From`
+conversion — no exhaustive match anywhere needed updating). New test
+`add_refuses_once_the_store_holds_max_cron_jobs`: fills the store to the cap, confirms the next insert is
+rejected with the right limit. Verified via the revert cycle: without the count check, all 513 inserts
+succeeded (test failed exactly as predicted) before restoring the fix.
+
+Minor, undocumented-as-a-separate-fix note from the same review: fired cron jobs don't record which workspace
+they were created in, so a poll's read-only tool calls run against the poller's current working directory
+rather than necessarily the job's original project — a scoping/correctness gap, not an authorization bypass
+(the Plan-mode ceiling above already blocks every write regardless), so left as-is rather than bundled into
+this pass.
+
+Full `event-ledger` cron test module (11 tests, up from 10), full `event-ledger` crate suite (5 integration
+tests unaffected), full `scheduler` crate suite (24 tests), and `cargo build --workspace --tests` all pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
