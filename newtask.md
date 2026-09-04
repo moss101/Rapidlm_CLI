@@ -3944,6 +3944,73 @@ temporarily reverting `submit_turn` to its old "append `turn.started`, drain, st
   *within* one drain tick (needs 4096+ prior entries in one session), which could very rarely mis-render a
   few lines. A real, narrow, acknowledged edge case, not fixed given how rarely it can actually trigger.
 
+**2026-09-05, same day, self-review: an adversarial review of the turn-execution commit above (dispatched
+against its own diff, not assumed clean) found three real gaps in its own core promise — "the lease is always
+released, however execution finishes" — each surviving in a different corner of the new concurrent code. All
+three fixed.**
+
+**Fixed (critical): a panic anywhere in a turn's own execution chain (model construction, `run_live_exec`,
+`agent_runtime::run_turn`) unwound straight past both `finish_turn` and the `turn_in_flight` reset, stranding
+the lease *and* leaving the whole interactive session silently, permanently unresponsive to every later
+message for the rest of the process — no error shown, since nothing calls `submit_turn`'s kernel API again
+once `turn_in_flight` is stuck `true`.** Worse than the crash this feature exists to fix, precisely because
+it's silent. No `catch_unwind` existed anywhere in the chain (confirmed by grep). Fixed by wrapping the call
+to `run_interactive_turn` in a new `catching_panics` helper (`std::panic::catch_unwind` +
+`AssertUnwindSafe`, converting a panic into `TurnOutcome::Failed` instead of letting it propagate) inside
+`spawn_interactive_turn`, so `finish_turn` and the `turn_in_flight` reset run regardless. New test
+`a_panic_during_turn_execution_is_caught_and_reported_as_failed`: calls `catching_panics` (the exact function
+`spawn_interactive_turn` uses, not a duplicate of its logic — the real call chain isn't mockable enough to
+inject a real panic deep inside it) with a deliberately panicking closure, asserts the result is `Failed`
+rather than an unwind. Verified via the revert cycle: reverting `catching_panics` to call `f()` directly
+makes the panic propagate and fail the test exactly as predicted.
+
+**Fixed (high): `submit_turn`'s original code order called `self.drain()?` (refresh the UI from the ledger)
+*before* completing the turn (`finish_turn` for an empty-text submission, or `spawn_interactive_turn` for a
+real one) — a `drain()` failure (a lagged event stream, a cancelled token, a kernel `get_session` error, all
+real reachable `Err` arms) returned early via `?` with the turn's lease already acquired and nothing left to
+ever release it, stranding it exactly like the original bug.** Fixed by reordering: the lease-completing step
+now always runs first, and `self.drain()` (still propagating its own error, just afterward) runs last. This
+is a pure reordering of existing logic, not a new code path — the existing turn-execution regression test
+(`a_second_plain_text_message_does_not_crash_the_session_and_a_turn_actually_runs`) still passes unchanged,
+confirming the happy path is unaffected; no separate regression test added for the `drain()`-failure case
+itself, since forcing a real `Lagged`/`ApiError` deterministically in a test would need fault-injection
+infrastructure this fix's correctness doesn't otherwise depend on (the fix is a straightforward, directly-
+readable reordering, not new conditional logic).
+
+**Fixed (high, and genuinely reproduced as a real, non-deterministic race, not just reasoned about):
+`interrupt_sync`'s read-then-append is optimistic concurrency (`expected_seq`), and a concurrent writer to
+the same session can win the race between the read and the append — routinely, now, for the first time,
+since a live turn's own `append_turn_progress` calls (one per model step / tool-call transition) write to
+the same session continuously. The original code gave up after exactly one retry, silently leaving a
+still-active turn's interrupt unrecorded and its lease stuck.** Fixed by turning the single retry into a
+bounded loop (`MAX_INTERRUPT_APPEND_ATTEMPTS = 20`, re-reading the snapshot fresh each attempt) — each
+attempt is a local, fast SQLite read+append, not a network call, so a generous bound costs little in the rare
+case it's needed. Also stopped silently swallowing an ultimate failure at the one real caller
+(`run_started_session`'s teardown `interrupt_session` call): now logged via `exec_diag::stderr_line` instead
+of a bare `let _ =`, since nothing else will ever release that turn's lease once the process exits. New test
+`interrupt_survives_a_concurrent_writer_racing_the_same_session`: a background thread hammers
+`append_turn_progress` on a session with an active turn while the main thread calls `interrupt`, asserting it
+still succeeds. This is a genuine race, not a deterministic repro — run 5 times with the fix (5/5 pass) and 3
+times reverted to the original single-attempt behavior (2/3 *fail* with the exact `SessionConflict` this fix
+closes, 1/3 gets lucky) — a real, reproduced, substantially-improved-not-just-theoretical fix, not merely
+argued from reading the code.
+
+Full `-p kernel` (168 tests, up from 167) and `-p rapid --lib` (381 tests, up from 379) suites and
+`cargo build --workspace --tests` all pass.
+
+**Confirmed clean by the same review** (see its own report for the reasoning, not just the verdict):
+`turn_in_flight`'s set/clear ordering has no window where it's falsely `false` while a real turn runs;
+`finish_turn`'s take-live-turn-first design makes a double-invocation (both `Interrupt` and the background
+thread racing to finish the same turn) a genuine no-op, not a double-append; `InteractiveTurnSink::emit`
+failing mid-turn still always reaches `finish_turn` (unlike the earlier `MAX_TURN_EVENTS` bug this session
+already fixed in `agent-runtime`, which this new code does *not* reproduce); the ledger-then-lease ordering
+inside `finish_turn` has a theoretical window against a hypothetical third concurrent caller, but nothing in
+this codebase's current architecture ever produces one; `RedactionClass::Project` on the new `text` fields is
+consistent with every other field in this file (though the review flagged, correctly, that user message text
+is now durably written to the ledger for interactive sessions at all for the first time — a real, deliberate
+posture change worth the team knowing about, not a bug); `MAX_TRANSCRIPT_ENTRIES` eviction has no off-by-one
+and no bypassed call site.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

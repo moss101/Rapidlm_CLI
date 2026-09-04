@@ -2292,7 +2292,17 @@ fn run_started_session(
 
     close_stream(&mut stream);
     let restore_ok = terminal.restore().is_ok() && terminal.is_restored();
-    let _ = interrupt_session(&client, session_id, &actor, &options.cancel);
+    // Best-effort: `interrupt_sync`'s own bounded retry (see its doc
+    // comment in `crates/kernel/src/client.rs`) already closes almost all
+    // of the race against a still-running turn's own progress-event
+    // writes; surfacing a residual failure here (rather than a bare `let _
+    // =`) at least makes it observable when it does happen, since nothing
+    // else will ever release that turn's lease once this process exits.
+    if let Err(err) = interrupt_session(&client, session_id, &actor, &options.cancel) {
+        crate::exec_diag::stderr_line(&format!(
+            "warning: could not confirm the session's active turn was interrupted before exit ({err})"
+        ));
+    }
     let quiesce = quiesce_graph(graph, &options.cancel);
     drop(client);
 
@@ -2516,7 +2526,16 @@ impl SessionLoop<'_> {
             )),
             self.cancel,
         )?;
-        self.drain()?;
+        // From here on the kernel holds this turn's exclusive lease: every
+        // path below must reach `finish_turn` (empty text) or
+        // `spawn_interactive_turn` (real text) before this function
+        // returns, *before* the UI-refreshing `drain()` call at the end —
+        // an adversarial self-review of this feature found that draining
+        // first (the original order) let a `drain()` failure (a lagged
+        // event stream, a cancelled token, a kernel `get_session` error)
+        // return early via `?` with the lease still held and nothing left
+        // to ever release it, stranding it exactly like the bug this
+        // feature exists to fix.
         if text.trim().is_empty() {
             // A `SubmitTurn` with no real message (today, only the
             // `KernelApi::SubmitTurn` slash-command path, e.g. `/goal
@@ -2531,30 +2550,27 @@ impl SessionLoop<'_> {
                 TraceId::new(),
                 kernel::TurnOutcome::Completed { text: None },
             ));
-            return self.drain();
+        } else if let Some(turn_cancel) = self.client.turn_cancel_token(self.session_id) {
+            // `submit_turn_sync` stores this turn's cancel token before
+            // returning, so it is always present immediately after a
+            // successful submit — `None` here would mean it was already
+            // finished and released before this line ran, which cannot
+            // happen on this thread's own just-issued handle.
+            self.turn_in_flight
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            spawn_interactive_turn(
+                self.client.clone(),
+                self.session_id,
+                handle.turn_id(),
+                self.actor.clone(),
+                self.root.to_path_buf(),
+                self.trusted,
+                text.to_owned(),
+                turn_cancel,
+                std::sync::Arc::clone(&self.turn_in_flight),
+            );
         }
-        // `submit_turn_sync` stores this turn's cancel token before
-        // returning, so it is always present immediately after a successful
-        // submit — `None` here would mean it was already finished and
-        // released before this line ran, which cannot happen on this
-        // thread's own just-issued handle.
-        let Some(turn_cancel) = self.client.turn_cancel_token(self.session_id) else {
-            return Ok(());
-        };
-        self.turn_in_flight
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        spawn_interactive_turn(
-            self.client.clone(),
-            self.session_id,
-            handle.turn_id(),
-            self.actor.clone(),
-            self.root.to_path_buf(),
-            self.trusted,
-            text.to_owned(),
-            turn_cancel,
-            std::sync::Arc::clone(&self.turn_in_flight),
-        );
-        Ok(())
+        self.drain()
     }
 
     fn interrupt(&mut self) -> Result<(), InteractiveError> {
@@ -2672,6 +2688,19 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
     }
 }
 
+/// Run `f`, converting a panic into a `Failed` outcome instead of letting it
+/// unwind past whatever the caller does afterward — `spawn_interactive_
+/// turn`'s cleanup (releasing the turn's lease, clearing `turn_in_flight`)
+/// must run regardless of how execution ends, panic included, or a panic
+/// deep in `run_live_exec` would strand the lease *and* leave the session
+/// silently unresponsive to every later message for the rest of the
+/// process (found in an adversarial self-review of this feature).
+fn catching_panics(f: impl FnOnce() -> kernel::TurnOutcome + std::panic::UnwindSafe) -> kernel::TurnOutcome {
+    std::panic::catch_unwind(f).unwrap_or_else(|_| kernel::TurnOutcome::Failed {
+        reason: "interactive turn execution panicked".to_owned(),
+    })
+}
+
 /// Spawn a thread that runs one interactive turn to completion and reports
 /// the outcome back to the kernel so its lease is always released — even if
 /// execution fails in some unexpected way — closing the crash this feature
@@ -2689,8 +2718,21 @@ fn spawn_interactive_turn(
     turn_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     std::thread::spawn(move || {
-        let outcome =
-            run_interactive_turn(&client, session_id, &actor, &root, trusted, &text, &kernel_cancel);
+        // A panic anywhere in `run_interactive_turn`'s own call chain (model
+        // construction, `run_live_exec`, `agent_runtime::run_turn`) would
+        // otherwise unwind straight past both `finish_turn` and the
+        // `turn_in_flight` reset below — an adversarial self-review of this
+        // feature found that this stranded the lease *and* left the whole
+        // session silently unresponsive to every future message for the
+        // rest of the process (no error shown, since nothing calls
+        // `submit_turn`'s kernel API again once `turn_in_flight` is stuck
+        // `true`) — a worse failure mode than the crash this feature exists
+        // to fix. `catch_unwind` (`AssertUnwindSafe`: this closure only
+        // reports the panic as a normal `Failed` outcome, it doesn't rely on
+        // any invariant broken by unwinding) keeps that guarantee even here.
+        let outcome = catching_panics(std::panic::AssertUnwindSafe(|| {
+            run_interactive_turn(&client, session_id, &actor, &root, trusted, &text, &kernel_cancel)
+        }));
         let _ = client.finish_turn(kernel::FinishTurn::new(
             session_id,
             turn_id,
@@ -3966,6 +4008,29 @@ base_url = "http://127.0.0.1:11434/v1"
         assert!(
             seq_after > 1,
             "expected real turn events beyond session creation, got seq {seq_after}"
+        );
+    }
+
+    #[test]
+    fn a_panic_during_turn_execution_is_caught_and_reported_as_failed() {
+        // `spawn_interactive_turn` relies on `catching_panics` to guarantee
+        // its cleanup (releasing the turn's lease, clearing
+        // `turn_in_flight`) still runs even if `run_interactive_turn`
+        // itself panics — an adversarial self-review of the turn-execution
+        // feature found that, before this fix, a panic anywhere in that
+        // call chain unwound straight past both, stranding the lease and
+        // leaving the session permanently, silently unresponsive to every
+        // later message for the rest of the process. Exercises the exact
+        // function `spawn_interactive_turn` calls, not a duplicate of its
+        // logic, since the real call chain (`run_live_exec` /
+        // `agent_runtime::run_turn`) isn't mockable enough to inject a real
+        // panic deep inside it directly.
+        let outcome = catching_panics(std::panic::AssertUnwindSafe(|| -> kernel::TurnOutcome {
+            panic!("simulated turn-execution panic");
+        }));
+        assert!(
+            matches!(outcome, kernel::TurnOutcome::Failed { .. }),
+            "a panic must be caught and reported as Failed, not left to unwind: {outcome:?}"
         );
     }
 

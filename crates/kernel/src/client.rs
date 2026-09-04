@@ -84,6 +84,13 @@ pub struct SubmitTurn {
 /// parallel constant rather than a shared one.
 pub const MAX_TURN_TEXT_BYTES: usize = 32 * 1024;
 
+/// Bound on `interrupt_sync`'s read-then-append retry loop against a
+/// concurrent writer to the same session (see its own doc comment). Each
+/// attempt is a local, fast (sub-millisecond to low-millisecond) SQLite
+/// read+append, not a network call, so a generous bound costs little in the
+/// rare case it's actually needed.
+const MAX_INTERRUPT_APPEND_ATTEMPTS: u32 = 20;
+
 /// Truncate `text` to `MAX_TURN_TEXT_BYTES`, backing off to the nearest
 /// UTF-8 char boundary so a multibyte character is never split.
 fn bounded_turn_text(text: &str) -> String {
@@ -692,56 +699,61 @@ impl InProcessKernelClient {
 
     fn interrupt_sync(&self, req: Interrupt) -> Result<(), ApiError> {
         let trace = req.trace_id;
-        let snapshot = self
-            .sessions
-            .get_session(req.session_id, &live())
-            .map_err(|err| session_api(err, trace))?;
-
         self.cancel_live_turn(req.session_id);
 
-        let Some(turn_id) = snapshot.active_turn() else {
-            self.take_live_turn(req.session_id);
-            return Ok(());
-        };
-
-        let options = AppendOptions {
-            redaction: RedactionClass::Project,
-            trace_id: req.trace_id,
-            expected_seq: Some(snapshot.seq()),
-        };
-        match self.ledger.append(
-            req.session_id,
-            req.actor,
-            EventKind::TurnInterrupted,
-            TurnInterruptedPayload {
-                turn_id,
-                reason: req.reason,
-            },
-            &options,
-            &ledger_live(),
-        ) {
-            Ok(_) => {
+        // Read-then-append against `expected_seq` is optimistic concurrency:
+        // a concurrent writer to the same session can win the race between
+        // the read and this append, producing `SequenceConflict`. That
+        // writer is routinely a live turn's own `append_turn_progress`
+        // calls (one per model step / tool-call transition) — a tool-heavy
+        // turn now appends continuously, so a single-attempt retry (the
+        // original shape here) leaves a real, not-just-theoretical window
+        // where this call gives up while the turn is still genuinely being
+        // interrupted, stranding its lease with no terminal event ever
+        // recorded — an adversarial review of the interactive turn-
+        // execution feature traced this precisely. Retried in a bounded
+        // loop, re-reading the snapshot fresh each attempt, instead.
+        for attempt in 0..MAX_INTERRUPT_APPEND_ATTEMPTS {
+            let snapshot = self
+                .sessions
+                .get_session(req.session_id, &live())
+                .map_err(|err| session_api(err, trace))?;
+            let Some(turn_id) = snapshot.active_turn() else {
                 self.take_live_turn(req.session_id);
-                Ok(())
-            }
-            Err(LedgerError::SequenceConflict { .. }) => {
-                let again = self
-                    .sessions
-                    .get_session(req.session_id, &live())
-                    .map_err(|err| session_api(err, trace))?;
-                if again.active_turn().is_none() {
+                return Ok(());
+            };
+            let options = AppendOptions {
+                redaction: RedactionClass::Project,
+                trace_id: req.trace_id,
+                expected_seq: Some(snapshot.seq()),
+            };
+            match self.ledger.append(
+                req.session_id,
+                req.actor.clone(),
+                EventKind::TurnInterrupted,
+                TurnInterruptedPayload {
+                    turn_id,
+                    reason: req.reason,
+                },
+                &options,
+                &ledger_live(),
+            ) {
+                Ok(_) => {
                     self.take_live_turn(req.session_id);
-                    Ok(())
-                } else {
-                    Err(api_error(
-                        ErrorCode::SessionConflict,
-                        "Session conflict",
-                        trace,
-                    ))
+                    return Ok(());
                 }
+                Err(LedgerError::SequenceConflict { .. }) => {
+                    let _ = attempt;
+                    continue;
+                }
+                Err(err) => return Err(ledger_api(err, trace)),
             }
-            Err(err) => Err(ledger_api(err, trace)),
         }
+        Err(api_error(
+            ErrorCode::SessionConflict,
+            "Session conflict",
+            trace,
+        ))
     }
 
     /// P10-022: cross-session listing for the sessions inspector/CLI.
@@ -1356,6 +1368,60 @@ mod tests {
         assert!(ready.active_turn().is_none());
         assert_eq!(ready.status(), crate::SessionStatus::Ready);
         assert_eq!(ready.seq(), 3);
+    }
+
+    #[test]
+    fn interrupt_survives_a_concurrent_writer_racing_the_same_session() {
+        // `interrupt_sync`'s read-then-append is optimistic concurrency: a
+        // concurrent writer to the same session (in production, a busy
+        // turn's own `append_turn_progress` calls — one per model step /
+        // tool-call transition) can win the race between the read and this
+        // append. An adversarial review of the interactive turn-execution
+        // feature found the original single-attempt shape gave up on the
+        // very first conflict, stranding the turn's lease with no terminal
+        // event ever recorded. This drives a real concurrent writer hard
+        // enough that `interrupt` almost certainly collides with it at
+        // least once, and asserts it still succeeds via the bounded retry.
+        let tmp = TempClient::create();
+        let created = block_on(tmp.client.create_session(create_req())).expect("create");
+        let handle = block_on(tmp.client.submit_turn(SubmitTurn::new(
+            created.id(),
+            created.seq(),
+            actor(),
+            TraceId::new(),
+            "hello",
+        )))
+        .expect("submit");
+
+        let writer_client = tmp.client.clone();
+        let session_id = created.id();
+        let turn_id = handle.turn_id();
+        let writer = std::thread::spawn(move || {
+            for i in 0..15 {
+                let _ = writer_client.append_turn_progress(
+                    session_id,
+                    &actor(),
+                    TraceId::new(),
+                    EventKind::ModelRequested,
+                    serde_json::json!({"turn_id": turn_id, "i": i}),
+                );
+            }
+        });
+
+        let result = block_on(tmp.client.interrupt(Interrupt::new(
+            session_id,
+            InterruptReason::ClientRequested,
+            actor(),
+            TraceId::new(),
+        )));
+        writer.join().expect("writer thread");
+
+        assert!(
+            result.is_ok(),
+            "interrupt must survive a concurrent writer to the same session: {result:?}"
+        );
+        let after = block_on(tmp.client.get_session(session_id)).expect("session");
+        assert!(after.active_turn().is_none(), "turn must be interrupted");
     }
 
     #[test]
