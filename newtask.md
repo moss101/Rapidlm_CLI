@@ -1562,6 +1562,33 @@ consistency fix rather than a live exploit path — flagged by the same backgrou
 confidence for exactly this reason, and fixed anyway since the established bounded-read helper was a direct,
 low-risk drop-in.
 
+**Fresh review pass, 2026-09-03, `apps/rapid/src/model.rs::fold_stream` — parallel tool-call proposals were
+silently reordered into lexical call-id order, contradicting `agent-runtime::turn`'s own documented dispatch
+contract.** `fold_stream`'s own doc comment: "tool-call deltas form proposed calls (the tool driver decides
+validity downstream)" — implying the calls it hands back are the ones the model actually proposed, in that
+order. It collected them into a `BTreeMap<String, (String, String)>` keyed on the provider's opaque `call_id`
+(OpenAI's `call_XXXXXXXXXXXX`, Anthropic's `toolu_XXXXXXXXXXXX` — confirmed via direct citation of both
+provider adapters, not assumed), then handed back `.into_iter()`'s **lexicographic byte order of the key**,
+not the order `ToolCallStart` events actually arrived in. `crates/agent-runtime/src/turn.rs`'s own doc comment
+is explicit: "Phase 1: per-call gates and validation, in **proposal order**. The first refusal is recorded;
+calls accepted ahead of it still dispatch" — the per-call budget gate and the loop detector both act on
+whatever sequence `fold_stream` hands them. Concretely: a model proposes `workspace_write` (save a file) then
+`shell_exec` (run tests) in that order; if their call ids happen to sort the other way (entirely a function of
+each provider's opaque id generation, unrelated to proposal order), the turn loop sees `shell_exec` first — if
+the turn's remaining tool-call budget only allows one more call, the *test run* could be accepted while the
+*file save it's supposed to check* is refused as over-budget, the inverse of what the model asked for. Parallel
+tool calls are a normal feature of both provider APIs, not an edge case; the existing test suite never
+exercised more than one concurrent `ToolCallStart`, which is exactly why this went uncaught. Verified via the
+standard temporary-revert cycle: the new test (deliberately using call ids that sort opposite of proposal
+order) failed with the calls reversed against the reverted `BTreeMap` code. **Fixed:** replaced the map with an
+insertion-order-preserving `Vec<(String, String, String)>`, using a short linear scan (real per-turn tool-call
+counts are small, typically single digits) to find the in-progress call an arguments-delta belongs to instead
+of a keyed lookup. New test `fold_stream_preserves_the_providers_proposal_order_for_parallel_tool_calls`. Full
+`model` test module (19 tests, up from 18) and `cargo build --workspace --tests` pass. **Live and reachable,
+not latent:** `fold_stream` runs inside `ConfiguredModel::step`, the sole `LiveModelCall` implementation wired
+to both the primary model and every `FallbackChainModel` backend (`interactive.rs`) — this fires on every real
+request that returns more than one tool call in a step, not a hypothetical or an unwired mechanism.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

@@ -18,7 +18,6 @@
 //! (https provider origins, verified against the static Mozilla root set;
 //! there is no custom-CA or dynamic trust surface).
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -630,21 +629,29 @@ fn fold_stream(
     request_bytes: usize,
 ) -> Result<ModelStepOutput, ModelStepError> {
     let mut text = String::new();
-    // call_id -> (tool name, accumulated arguments)
-    let mut tools: BTreeMap<String, (String, String)> = BTreeMap::new();
+    // (call_id, tool name, accumulated arguments), in the order the
+    // provider actually proposed them. Order matters downstream:
+    // `agent-runtime::turn`'s own doc comment ("Phase 1: per-call gates and
+    // validation, in proposal order") means the per-call budget gate and
+    // the loop detector both act on this sequence — a `BTreeMap` keyed on
+    // the opaque, provider-issued `call_id` used to sort calls into
+    // lexical id order here instead, silently reordering any turn with
+    // more than one parallel tool call (a normal feature of both provider
+    // APIs, not an edge case).
+    let mut tools: Vec<(String, String, String)> = Vec::new();
     let mut usage: Option<&NormalizedUsage> = None;
     for event in stream.events() {
         match event {
             ModelStreamEvent::TextDelta { text: delta } => text.push_str(delta),
             ModelStreamEvent::ToolCallStart { call_id, name } => {
-                tools.insert(call_id.as_str().to_owned(), (name.as_str().to_owned(), String::new()));
+                tools.push((call_id.as_str().to_owned(), name.as_str().to_owned(), String::new()));
             }
             ModelStreamEvent::ToolCallArgumentsDelta {
                 call_id,
                 arguments_delta,
             } => {
-                if let Some(entry) = tools.get_mut(call_id.as_str()) {
-                    entry.1.push_str(arguments_delta);
+                if let Some(entry) = tools.iter_mut().find(|(id, ..)| id == call_id.as_str()) {
+                    entry.2.push_str(arguments_delta);
                 }
             }
             ModelStreamEvent::Usage(normalized) => usage = Some(normalized),
@@ -654,8 +661,8 @@ fn fold_stream(
     }
     let response_bytes: usize = text.len()
         + tools
-            .values()
-            .map(|(name, arguments)| name.len() + arguments.len())
+            .iter()
+            .map(|(_, name, arguments)| name.len() + arguments.len())
             .sum::<usize>();
     // Some OpenAI-compatible endpoints ignore `stream_options.include_usage`
     // entirely (no usage event at all); others send a `usage` object whose
@@ -690,7 +697,7 @@ fn fold_stream(
     }
     let calls = tools
         .into_iter()
-        .map(|(call_id, (tool, arguments))| {
+        .map(|(call_id, tool, arguments)| {
             ProposedToolCall::new(call_id, tool, arguments).map_err(|_| ModelStepError::Failed)
         })
         .collect::<Result<Vec<_>, ModelStepError>>()?;
@@ -1038,6 +1045,63 @@ mod tests {
                 // as no usage event at all — so this falls back to the
                 // byte estimate rather than reading back as a literal 0.
                 assert!(tokens > 0, "got {tokens}");
+            }
+            other => panic!("expected tool calls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fold_stream_preserves_the_providers_proposal_order_for_parallel_tool_calls() {
+        // `call_id`s are opaque, provider-issued strings (OpenAI's
+        // `call_XXXXXXXXXXXX`, Anthropic's `toolu_XXXXXXXXXXXX`) with no
+        // relationship to proposal order. Picking ids that sort in the
+        // *reverse* of proposal order pins down that `fold_stream` returns
+        // calls in the order the provider actually proposed them — not
+        // lexical call-id order — matching `agent-runtime::turn`'s own
+        // "Phase 1: per-call gates and validation, in proposal order"
+        // contract, which the per-call budget gate and loop detector both
+        // depend on.
+        let first_id = llm_router::provider::ToolCallId::parse("call-9-first").expect("id");
+        let second_id = llm_router::provider::ToolCallId::parse("call-2-second").expect("id");
+        assert!(
+            second_id.as_str() < first_id.as_str(),
+            "fixture must sort opposite of proposal order to be a real test"
+        );
+        let write_name = llm_router::provider::ToolName::parse("workspace-write").expect("name");
+        let shell_name = llm_router::provider::ToolName::parse("shell-exec").expect("name");
+        let usage = NormalizedUsage::new(None, None, None, None, None, None, UsageCost::Unknown);
+        let stream = stream(vec![
+            ModelStreamEvent::ToolCallStart {
+                call_id: first_id.clone(),
+                name: write_name,
+            },
+            ModelStreamEvent::ToolCallArgumentsDelta {
+                call_id: first_id.clone(),
+                arguments_delta: "{\"path\":\"a.rs\"}".to_owned(),
+            },
+            ModelStreamEvent::ToolCallStart {
+                call_id: second_id.clone(),
+                name: shell_name,
+            },
+            ModelStreamEvent::ToolCallArgumentsDelta {
+                call_id: second_id.clone(),
+                arguments_delta: "{\"argv\":[\"true\"]}".to_owned(),
+            },
+            ModelStreamEvent::Completed {
+                finish: FinishReason::ToolCalls,
+                usage,
+            },
+        ]);
+        let output = fold_stream(&stream, 0).expect("fold");
+        match output {
+            ModelStepOutput::ToolCalls { calls, .. } => {
+                assert_eq!(calls.len(), 2);
+                assert_eq!(
+                    calls[0].call_id(),
+                    first_id.as_str(),
+                    "the first-proposed call must come first, got {calls:?}"
+                );
+                assert_eq!(calls[1].call_id(), second_id.as_str());
             }
             other => panic!("expected tool calls, got {other:?}"),
         }
