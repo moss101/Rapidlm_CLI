@@ -19,6 +19,12 @@ use std::path::Path;
 pub const FINDINGS_STORE_PATH: &str = ".rapidlm/findings.json";
 const FINDINGS_SCHEMA: u32 = 1;
 
+/// Read cap for `findings.json`, matching `host.rs::MAX_TODOS_INDEX_BYTES` —
+/// this store lives in the same "project-local advisory state" bucket (see
+/// module doc above) and a handful of dismissed-fingerprint entries never
+/// legitimately approaches this size.
+pub const MAX_FINDINGS_STORE_BYTES: usize = 256 * 1024;
+
 /// One dismissed/resolved finding, keyed by its `FindingFingerprint` hex.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DismissedFinding {
@@ -34,7 +40,15 @@ pub struct FindingsStore {
 impl FindingsStore {
     /// Load from `root/.rapidlm/findings.json`. Missing or corrupt: empty.
     pub fn load(root: &Path) -> Self {
-        let Ok(bytes) = std::fs::read(root.join(FINDINGS_STORE_PATH)) else {
+        // Bound the read rather than trusting the file's size on disk (same
+        // rationale as `host.rs::load_todos_index`) — an oversized file is
+        // treated the same as any other unparseable content by the
+        // `unwrap_or_default` below, matching this function's own
+        // "corrupt file -> empty" contract.
+        let Ok(bytes) = crate::exec_tools::read_file_bounded(
+            &root.join(FINDINGS_STORE_PATH),
+            MAX_FINDINGS_STORE_BYTES,
+        ) else {
             return Self::default();
         };
         Self::parse(&bytes).unwrap_or_default()
@@ -147,6 +161,34 @@ mod tests {
         let (fingerprint, entry) = reloaded.entries().next().expect("one entry");
         assert_eq!(fingerprint, "abc123");
         assert_eq!(entry.reason, "test fixture, not a real secret");
+    }
+
+    #[test]
+    fn load_bounds_the_read_instead_of_buffering_an_oversized_file() {
+        let root = temp_root("oversized");
+        std::fs::create_dir_all(root.join(".rapidlm")).expect("dir");
+        // Valid, fully-parseable JSON whose `reason` field is padded well
+        // past `MAX_FINDINGS_STORE_BYTES`: an unbounded read parses it in
+        // full and yields one dismissed entry, while a bounded read rejects
+        // it as too large before parsing is ever attempted and yields an
+        // empty store — two different outcomes, not "some error either way".
+        let padding = "a".repeat(MAX_FINDINGS_STORE_BYTES * 2);
+        let document = serde_json::json!({
+            "schema": FINDINGS_SCHEMA,
+            "dismissed": { "abc123": { "reason": padding } },
+        });
+        std::fs::write(
+            root.join(FINDINGS_STORE_PATH),
+            serde_json::to_vec(&document).expect("serialize"),
+        )
+        .expect("write");
+
+        let store = FindingsStore::load(&root);
+        assert!(
+            store.is_empty(),
+            "expected an oversized file to be rejected before parsing, got {} entries",
+            store.len()
+        );
     }
 
     #[test]

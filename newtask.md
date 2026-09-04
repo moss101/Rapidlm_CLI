@@ -1619,6 +1619,36 @@ the fix. `GoalPersistError` gained `Eq, PartialEq` to support the match-based as
 would have required `GoalHost: Debug`, which it isn't). Full `goal_host` test module (9 tests, up from 8) and
 `cargo build --workspace --tests` pass.
 
+**Fresh review pass, 2026-09-04, `apps/rapid/src/findings_store.rs::FindingsStore::load` (line 42, at the time
+of the fix) — the last outlier of this session's unbounded-read sweep, and the most directly attacker-reachable
+one.** `load` called plain `std::fs::read(root.join(FINDINGS_STORE_PATH))`, buffering `.rapidlm/findings.json`
+in full before any size check or parsing, the same shape already fixed 7+ times this session. What makes this
+one notably more exposed than the others: `FindingsStore::load` isn't just invoked from the explicit `rapid
+findings list|dismiss` subcommand (`run_findings`, `p9_commands.rs:780`) — it's called from
+`exec_tools.rs::scan_for_secrets_advisory`/`scan_command_advisory`/`scan_patch_advisory` (`exec_tools.rs:3024`,
+`:3089`, `:3134`), which run automatically on the ordinary `workspace_write`/`shell_exec`/`workspace_patch` tool
+paths (`exec_tools.rs:2649`, `:1721`, `:1751`, `:1774`, `:1783`, `:2883`, `:2886`). Concretely: simply operating
+on a cloned/untrusted workspace whose `.rapidlm/findings.json` is oversized (corrupted, appended-to over time,
+or planted in a malicious repo) triggers a full unbounded allocation on the agent's very first file write or
+shell command in that session — no explicit `rapid findings` invocation needed. The module's own doc comment
+already commits to a fail-open contract ("a missing or corrupt store is treated as empty... matching
+`exec_tools.rs::load_todos`'s established fail-open convention"), so an oversized file should already have been
+in scope for that same bounded-read treatment. **Fixed:** `load` now goes through `read_file_bounded` with a new
+`MAX_FINDINGS_STORE_BYTES` (256 KiB, matching `host.rs::MAX_TODOS_INDEX_BYTES` — the module doc already names
+that function as this store's convention-sibling). New test
+`load_bounds_the_read_instead_of_buffering_an_oversized_file`: since `load`'s contract fails open on *any* error
+(missing, corrupt, or too-large all collapse to `Self::default()`), a garbage-oversized fixture would pass
+against both old and new code alike and prove nothing — so the fixture instead is **valid, fully-parseable
+JSON** with one `reason` field padded past the cap. An unbounded read parses it whole and yields one dismissed
+entry; a bounded read rejects it before parsing and yields an empty store — two genuinely different outcomes.
+Verified via the standard temporary-revert cycle: reverted to plain `fs::read`, the test failed with "got 1
+entries" exactly as predicted, confirming the fixture discriminates before confirming the fix closes it. Full
+`findings_store` test module (5 tests, up from 4) and `cargo build --workspace --tests` pass. This closes the
+`read_file_bounded` sweep across every currently-reachable `apps/rapid` file-loader found this session;
+`preview.rs`'s equivalent gaps were also surfaced by the same review pass but are not live — `PreviewSupervisor`
+has zero callers anywhere in the binary (confirmed via grep across `apps/rapid/src`), so left undocumented here
+pending it actually being wired up.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
