@@ -5,10 +5,11 @@
 
 use std::error::Error;
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use capability_broker::{
-    CancellationToken, CanonicalHostPath, Capability, CapabilityLease, SecretHandle,
+    CancellationToken, CanonicalAction, Capability, CapabilityLease, CanonicalHostPath,
+    LeaseValidator, SecretHandle,
 };
 use protocol::{ErrorCode, LeaseId, RepoPath, RuntimeId, SandboxTier};
 
@@ -1136,12 +1137,26 @@ impl SandboxManager {
         backend.prepare(spec, lease, cancel)
     }
 
+    /// `validator` is the mandatory pre-effect guard (`capability_broker::
+    /// LeaseValidator::validate_use`'s own doc comment): it independently
+    /// re-checks the lease's MAC, expiry, bound action, and policy revision
+    /// against its own atomically-decremented use table, then issues a
+    /// one-time guard consumed immediately before the real process runs.
+    /// Without this, `require_proc_lease`'s checks below only ever compare
+    /// against `lease.remaining_uses()` — a frozen snapshot captured once at
+    /// `issue()` time that nothing in this crate ever decrements — so a
+    /// nominally single-use lease could otherwise be replayed against this
+    /// method without bound. `prepare()` deliberately does not also consume
+    /// a use: one prepare+exec pair is one logical use of the `proc.exec`
+    /// capability, and `exec()` is where the actual side effect (the
+    /// process this lease authorizes) happens.
     pub fn exec(
         &self,
         spec: &SandboxSpec,
         handle: &SandboxHandle,
         request: &SandboxExecRequest,
         lease: &CapabilityLease,
+        validator: &LeaseValidator,
         cancel: &CancellationToken,
     ) -> Result<SandboxExecResult, SandboxError> {
         check_cancel(cancel)?;
@@ -1153,6 +1168,17 @@ impl SandboxManager {
             return Err(SandboxError::TierUnavailable);
         }
         request.within_spec(spec)?;
+        let actual = CanonicalAction::Resource {
+            capability: lease.capability(),
+            resource: lease.resource().clone(),
+        };
+        let guard = validator
+            .validate_use(lease, &actual, Instant::now(), cancel)
+            .map_err(|_| SandboxError::LeaseInvalid)?;
+        // Consumed strictly before the backend actually runs anything —
+        // matches `LeaseUseGuard`'s own doc comment ("consume on the
+        // executor path immediately before the side effect").
+        let _consumed = guard.consume();
         let backend = self.backend_for(handle.tier)?;
         backend.exec(handle, request, lease, cancel)
     }
@@ -1329,8 +1355,9 @@ mod tests {
 
     use capability_broker::{
         evaluate, issue, request_approval, ActionRequest, ApprovalChoice, ApprovalResolution,
-        ApprovalScopeId, CanonicalAction, Capability, FilesystemScope, LeaseIssuer, PolicyDocument,
-        PolicySource, PolicyStack, PrincipalRef, ProcessScope, ResourceDescriptor,
+        ApprovalScopeId, CanonicalAction, Capability, FilesystemScope, LeaseIssuer, LeaseValidator,
+        PolicyDocument, PolicyRevision, PolicySource, PolicyStack, PrincipalRef, ProcessScope,
+        ResourceDescriptor,
     };
     use protocol::SessionId;
 
@@ -1616,6 +1643,13 @@ capability = "fs.read"
         )
     }
 
+    /// Matches `proc_lease()`'s own issuer/policy stack exactly, so
+    /// `validate_use` sees the same MAC key and policy revision the lease
+    /// was actually minted under.
+    fn proc_validator() -> LeaseValidator {
+        LeaseValidator::new(issuer(), PolicyRevision::of_stack(&proc_stack()))
+    }
+
     #[test]
     fn every_known_tier_has_derived_isolation() {
         for tier in SandboxTier::ALL {
@@ -1783,7 +1817,7 @@ capability = "fs.read"
         let request =
             SandboxExecRequest::new(["/bin/true"], Duration::from_secs(1), 1024).expect("request");
         assert_eq!(
-            mgr.exec(&spec, &handle, &request, &lease, &cancel)
+            mgr.exec(&spec, &handle, &request, &lease, &proc_validator(), &cancel)
                 .expect_err("exec"),
             SandboxError::Cancelled
         );
@@ -1816,15 +1850,48 @@ capability = "fs.read"
             .expect("request");
         let other = proc_lease();
         assert_eq!(
-            mgr.exec(&spec, &handle, &request, &other, &live)
+            mgr.exec(&spec, &handle, &request, &other, &proc_validator(), &live)
                 .expect_err("retarget"),
             SandboxError::LeaseInvalid
         );
         let result = mgr
-            .exec(&spec, &handle, &request, &lease, &live)
+            .exec(&spec, &handle, &request, &lease, &proc_validator(), &live)
             .expect("exec");
         assert_eq!(result.exit().reason(), SandboxExitReason::Exited);
         mgr.destroy(&handle, &live).expect("destroy");
+    }
+
+    #[test]
+    fn a_single_use_lease_cannot_be_replayed_across_multiple_exec_calls() {
+        // `proc_lease()` is minted single-use (`ApprovalScopeId::Once`).
+        // `exec`'s own `validate_use` call must genuinely decrement the
+        // real, atomically-tracked use count -- not just re-read the
+        // frozen `lease.remaining_uses()` snapshot every backend's own
+        // `require_proc_lease` already checks, which never changes after
+        // `issue()` and so can never by itself catch a replay.
+        let mgr = manager([FakeBackend::new(SandboxTier::Container)]);
+        let spec = spec(SandboxTier::Container);
+        let live = CancellationToken::new();
+        let lease = proc_lease();
+        let validator = proc_validator();
+        let handle = mgr.prepare(&spec, &lease, &live).expect("prepare");
+        let request = SandboxExecRequest::new(["/bin/true"], Duration::from_millis(50), 512)
+            .expect("request");
+
+        let result = mgr
+            .exec(&spec, &handle, &request, &lease, &validator, &live)
+            .expect("first exec must succeed");
+        assert_eq!(result.exit().reason(), SandboxExitReason::Exited);
+
+        // Same lease, same validator (so the real use-count carries over,
+        // as it would across two calls in one real process): replaying it
+        // must now be rejected rather than silently running a second
+        // command under a lease that was only ever approved for one.
+        assert_eq!(
+            mgr.exec(&spec, &handle, &request, &lease, &validator, &live)
+                .expect_err("replayed lease must be rejected"),
+            SandboxError::LeaseInvalid
+        );
     }
 
     #[test]
@@ -1842,14 +1909,14 @@ capability = "fs.read"
         let wide =
             SandboxExecRequest::new(["/bin/true"], Duration::from_secs(5), 1024).expect("wide");
         assert_eq!(
-            mgr.exec(&spec, &handle, &wide, &lease, &live)
+            mgr.exec(&spec, &handle, &wide, &lease, &proc_validator(), &live)
                 .expect_err("widen timeout"),
             SandboxError::TimeoutInvalid
         );
         let wide_out =
             SandboxExecRequest::new(["/bin/true"], Duration::from_secs(1), 4096).expect("wide out");
         assert_eq!(
-            mgr.exec(&spec, &handle, &wide_out, &lease, &live)
+            mgr.exec(&spec, &handle, &wide_out, &lease, &proc_validator(), &live)
                 .expect_err("widen output"),
             SandboxError::OutputLimitInvalid
         );

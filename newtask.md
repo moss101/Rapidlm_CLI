@@ -2416,6 +2416,40 @@ genuinely multi-step-restricted or policy-revision-sensitive lease (unlike today
 approved, throwaway one) — that caller would get none of the "single-use"/"current policy" enforcement its
 own lease's constraints promise.
 
+**Fixed after all, 2026-09-04, on explicit request — the design decision above turned out to have a clean
+answer once actually worked through, not a reason to defer indefinitely.** `SandboxManager::exec` (the one
+method every real caller and all five backends' tests actually go through) now takes an additional
+`validator: &LeaseValidator` parameter and calls `validator.validate_use(lease, &actual, Instant::now(),
+cancel)` — reconstructing `actual` as `CanonicalAction::Resource { capability: lease.capability(), resource:
+lease.resource().clone() }`, i.e. exactly the same generic `Resource` shape `sandbox_exec.rs::
+mint_proc_exec_lease` already binds every self-approved lease to, so this closes the replay gap without also
+attempting the separate, harder "verify against the truly resolved executable" property the reverted
+capability-broker fix went for (deliberately out of scope here, matching that earlier decision). Consumption
+deliberately sits in `exec()`, not `prepare()`: `SandboxManager::prepare`/`exec` already re-validate the same
+lease against the same handle (`lease.lease_id() == handle.lease_id`), so one `prepare()`+`exec()` pair is one
+logical use of the `proc.exec` capability, and `exec()` is where the real side effect (the process this lease
+authorizes) actually happens — consuming at `prepare()` too would double-decrement a `max_uses = 1` lease
+before its own `exec()` call ever ran. `SandboxBackend`'s own per-backend trait methods and all five backends'
+individual `require_proc_lease` copies are untouched — their frozen-snapshot checks become harmless redundant
+checks now that `SandboxManager::exec` rejects an exhausted/invalid lease before ever reaching them.
+
+`apps/rapid/src/sandbox_exec.rs::run_sandboxed` — the one real caller — now builds a `LeaseValidator::new
+(issuer, revision)` from the *exact* issuer and `PolicyRevision` the lease was minted under (`mint_proc_exec_
+lease` was changed to return `(CapabilityLease, PolicyRevision)` instead of just the lease, since `Lease
+Validator::new`'s own revision check fails closed on any mismatch — recomputing the policy document a second
+time and hoping it stays byte-for-byte identical would have been fragile). New test in `crates/sandbox`
+(`a_single_use_lease_cannot_be_replayed_across_multiple_exec_calls`): the same lease and validator drive two
+`exec()` calls against one handle — the first succeeds, the second is rejected with `LeaseInvalid` — verified
+via the revert cycle (temporarily no-op'd the `validate_use` call, keeping the new parameter so the six call
+sites didn't need reverting too) that the replay was silently accepted (a real `SandboxExecResult`, exit code
+0) against the original logic before confirming the fix rejects it. `run_sandboxed`'s own 6 existing tests
+still pass unmodified, confirming the one real, single-shot production path is unaffected. Full `sandbox`
+crate suite (101 tests, up from 100), full `-p rapid` suite (356 tests), and `cargo build --workspace --tests`
+all pass. The capability-broker `proc.exec` finding two entries above remains correctly unfixed — it's a
+different problem (declared-resource-vs-real-action verification, which needs a policy convention this
+codebase doesn't have) from this one (real use-count consumption, which just needed the existing `Lease
+Validator` machinery actually wired in).
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

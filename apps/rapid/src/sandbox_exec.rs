@@ -24,9 +24,9 @@ use std::time::{Duration, Instant};
 
 use capability_broker::{
     ActionRequest, ApprovalChoice, ApprovalResolution, ApprovalScopeId, CancellationToken,
-    CanonicalAction, Capability, CapabilityLease, CanonicalHostPath, LeaseIssuer, PolicyDocument,
-    PolicySource, PolicyStack, PrincipalRef, ProcessScope, ResourceDescriptor, evaluate, issue,
-    request_approval,
+    CanonicalAction, Capability, CapabilityLease, CanonicalHostPath, LeaseIssuer, LeaseValidator,
+    PolicyDocument, PolicyRevision, PolicySource, PolicyStack, PrincipalRef, ProcessScope,
+    ResourceDescriptor, evaluate, issue, request_approval,
 };
 use protocol::{RepoPath, SandboxTier, SessionId};
 use sandbox::{
@@ -184,10 +184,17 @@ fn resolve_program_on_path(program: &str) -> Result<String, SandboxRunError> {
 /// policy here is deliberately trivial (a fixed always-`ask` rule, resolved
 /// by immediately self-approving) — see `SandboxRunError::Capability`'s doc
 /// comment for why that's the correct shape, not a shortcut.
+///
+/// Returns the `PolicyRevision` of the policy stack the lease was minted
+/// against alongside the lease itself: the caller needs it to construct a
+/// `LeaseValidator` that actually agrees with what's baked into the lease
+/// (`LeaseValidator::new`'s own revision check fails closed on a mismatch),
+/// rather than recomputing the policy document a second time and hoping it
+/// stays byte-for-byte identical.
 fn mint_proc_exec_lease(
     issuer: &LeaseIssuer,
     command_name: &str,
-) -> Result<CapabilityLease, SandboxRunError> {
+) -> Result<(CapabilityLease, PolicyRevision), SandboxRunError> {
     let cancel = CancellationToken::new();
 
     let policy_src = format!(
@@ -237,7 +244,9 @@ fn mint_proc_exec_lease(
             ));
         }
     };
-    issue(issuer, &approved, &policies, now, &cancel).map_err(cap_err)
+    let revision = PolicyRevision::of_stack(&policies);
+    let lease = issue(issuer, &approved, &policies, now, &cancel).map_err(cap_err)?;
+    Ok((lease, revision))
 }
 
 /// Run `argv` inside the host-restricted sandbox tier, synchronously.
@@ -253,7 +262,14 @@ pub fn run_sandboxed(
     let spec = build_spec(root, timeout, output_limit)?;
     let issuer = LeaseIssuer::ephemeral();
     let command_name = argv.first().map(String::as_str).unwrap_or("shell");
-    let lease = mint_proc_exec_lease(&issuer, command_name)?;
+    let (lease, revision) = mint_proc_exec_lease(&issuer, command_name)?;
+    // `validate_use` is the mandatory pre-effect guard `SandboxManager::exec`
+    // now requires — real, atomic use-count decrementing, not just a re-read
+    // of the frozen snapshot `lease.remaining_uses()` was minted with. Built
+    // from the exact same issuer/revision the lease above was minted under,
+    // so its MAC and policy-revision checks agree with what's actually baked
+    // into the lease.
+    let validator = LeaseValidator::new(issuer, revision);
     let cancel = CancellationToken::new();
 
     let handle = manager
@@ -263,7 +279,7 @@ pub fn run_sandboxed(
     let resolved_argv = std::iter::once(program).chain(argv.iter().skip(1).cloned());
     let request = SandboxExecRequest::new(resolved_argv, timeout, output_limit)
         .map_err(SandboxRunError::Sandbox)?;
-    let result = manager.exec(&spec, &handle, &request, &lease, &cancel);
+    let result = manager.exec(&spec, &handle, &request, &lease, &validator, &cancel);
     // Best-effort cleanup: a destroy failure after a successful/failed exec
     // is a resource-leak concern for the backend's own bookkeeping, not
     // something the caller can act on — never mask the exec outcome with it.
