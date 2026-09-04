@@ -5154,18 +5154,20 @@ their results become evidence, not just a console warning).
   explicit `rapid scan` entry point, not a hook on every tool call). This is new user-facing feature and
   config-surface work, not a wiring task the way `CommandFinding`/`PatchFinding` were — correctly left
   alone this whole section rather than a gap anyone missed.
-- **Cross-reference, 2026-09-04: a new gap in the already-built `PatchPolicyGate` itself, found this pass
-  and documented in full in §0a (search this document for "silently discarded every `ScanError`... into a
-  silent `None`").** `scan_for_secrets_advisory`/`scan_patch_advisory` — reused verbatim inside
-  `collect_content_findings`, the function backing both `scan_git_commit_gate` and `scan_git_merge_gate`
-  above — collapse every scan error via `.ok()?`, including `BoundExceeded` for a staged file over the
-  scanner's 8 MiB cap. Unlike this section's own `-C`/`-c` global-flag gap (a precisely documented,
-  deliberately-accepted boundary), this one wasn't previously known: a single oversized staged file
-  (a bundled binary or data dump committed alongside legitimate secrets-bearing text — not exotic) silently
-  drops that file from the *mandatory* gate's scan, with no repo-access problem involved at all. Not fixed
-  this pass — deciding the right response (block the commit outright, degrade to a surfaced "could not
-  fully scan" warning, or raise the cap) is a policy call for a mandatory security gate, not a mechanical
-  error-handling fix.
+- ~~Cross-reference, 2026-09-04: a new gap in the already-built `PatchPolicyGate` itself... `scan_for_
+  secrets_advisory`/`scan_patch_advisory`... collapse every scan error via `.ok()?`... Not fixed this
+  pass~~ **Fixed, 2026-09-04, same day as this note (during the `crates/security` review pass — see §0a's
+  entry for "the tenth crate"): `collect_content_findings` no longer calls the two advisory wrappers at
+  all.** It now calls their `Result`-returning cores (`secrets_scan`/`patch_scan`) directly and turns *any*
+  `Err` — `BoundExceeded` included, alongside every other scan failure — into a blocking finding of its own,
+  closing exactly the gap this paragraph originally flagged as an open policy call. No separate "block vs.
+  degrade vs. raise the cap" decision was actually needed: the pre-existing size-cap check just above this
+  loop already turns the *specific* oversized-content case into its own clearer, dedicated message before
+  either scanner ever runs, and this fix's `Err`-as-finding handling is the safe, non-negotiable default for
+  every *other* scan failure a mandatory gate can hit — content it cannot scan is content it must not commit
+  unscanned, full stop. New test `collect_content_findings_blocks_a_file_the_scanners_cannot_parse_rather_
+  than_passing_it_silently`; verified via the revert cycle; `-p rapid --lib` and `cargo build --workspace
+  --tests` pass.
 
 ### 2.10 Scoped Credential Broker + Resource Governor
 
