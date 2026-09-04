@@ -1360,6 +1360,12 @@ struct LiveSubagentRunner {
     /// per_turn`/`max_fetch_bytes_per_turn` bounds a subagent's own writes
     /// too, not just the parent's.
     turn_ceilings: (u64, u64),
+    /// The parent's redaction snapshot (known secret values to scrub from
+    /// captured `shell_exec` output), cloned into every child so a
+    /// subagent's own commands are scrubbed for the same known secrets as
+    /// the parent's instead of leaking them unscrubbed by default. See
+    /// `ExecTools::share_redaction`'s own doc comment.
+    redaction: Option<security::RedactionSnapshot>,
 }
 
 impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
@@ -1409,6 +1415,9 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // Same reasoning for the per-turn background-job budget — see
         // `job_budget`'s own doc comment.
         tools.share_job_budget(self.job_budget.clone());
+        // Scrub the same known secrets from this child's own shell_exec
+        // output as the parent's — see `redaction`'s own doc comment.
+        tools.share_redaction(self.redaction.clone());
         // Policy hooks (pre_tool_use/post_tool_use/subagent_start/
         // subagent_stop) must apply to a subagent's own tool calls too, or
         // delegation becomes a way to route around them entirely.
@@ -1954,6 +1963,27 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             }
         }
     };
+    // Scrub the active model's own resolved credential from captured
+    // shell_exec output: a command that reads back a config file
+    // containing it (a real, plausible thing to run, not a contrived
+    // scenario — `~/.rapidlm/config.toml` stores it in plaintext) must not
+    // hand it back to the model verbatim. Best-effort: a registration
+    // failure (e.g. the credential is empty or oversized) just means
+    // nothing gets scrubbed, not a turn failure.
+    if let (Some(active), Some((_, TrustStatus::Trusted))) =
+        (child_model_config.as_ref(), workspace.as_ref())
+        && let Some(plaintext) = active.credential.plaintext.as_deref()
+        && let Ok(refer) = auth::SecretRef::from_alias("active-model-credential")
+    {
+        let mut registry = security::SecretRedactionRegistry::new();
+        let cancel = security::RedactionCancellation::new();
+        if registry
+            .register_canary(&refer, plaintext.as_bytes(), &cancel)
+            .is_ok()
+        {
+            tools.set_redaction(registry.snapshot());
+        }
+    }
     // Subagents: with a configured model, task_spawn runs child agents with
     // the same provider config and a depth-restricted read-only-capable tool
     // surface. Memory index: .rapidlm/MEMORY.md is always loaded (bounded).
@@ -1983,6 +2013,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                 shadow_diagnostics,
                 trace_calls,
                 turn_ceilings,
+                redaction: tools.redaction_handle(),
             }));
         }
     }
@@ -2834,6 +2865,23 @@ fn run_interactive_turn_inner(
         Ok(ModelSelection::Configured { active, warnings }) => {
             for warning in warnings {
                 crate::exec_diag::stderr_line(&format!("warning: {warning}"));
+            }
+            // Scrub the active model's own resolved credential from
+            // captured shell_exec output — see exec_turn's own identical
+            // seeding for why this is a real, plausible leak vector, not a
+            // contrived one. Best-effort: a registration failure just means
+            // nothing gets scrubbed, not a turn failure.
+            if let Some(plaintext) = active.credential.plaintext.as_deref()
+                && let Ok(refer) = auth::SecretRef::from_alias("active-model-credential")
+            {
+                let mut registry = security::SecretRedactionRegistry::new();
+                let cancel = security::RedactionCancellation::new();
+                if registry
+                    .register_canary(&refer, plaintext.as_bytes(), &cancel)
+                    .is_ok()
+                {
+                    tools.set_redaction(registry.snapshot());
+                }
             }
             match ConfiguredModel::build(&active, &credential_store) {
                 Ok(model) => SelectedModel::Configured(Box::new(model)),

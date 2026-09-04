@@ -705,6 +705,9 @@ pub struct WorkspaceTools {
     max_subagent_spawns: u64,
     /// Cross-instance per-path write serialization — see [`WriteLocks`].
     write_locks: WriteLocks,
+    /// Known secret values to scrub from captured `shell_exec` output before
+    /// it becomes a tool result — see `set_redaction`'s own doc comment.
+    redaction: Option<security::RedactionSnapshot>,
 }
 
 impl WorkspaceTools {
@@ -745,6 +748,7 @@ impl WorkspaceTools {
             max_fetch_bytes: MAX_TOTAL_FETCH_BYTES_PER_TURN,
             max_subagent_spawns: MAX_SUBAGENT_SPAWNS_PER_TURN,
             write_locks: WriteLocks::default(),
+            redaction: None,
         })
     }
 
@@ -849,6 +853,62 @@ impl WorkspaceTools {
     /// Hosts web_fetch may fetch despite resolving private (local fixtures).
     pub fn set_fetch_allowlist(&mut self, allowlist: Vec<String>) {
         self.fetch_allowlist = allowlist;
+    }
+
+    /// Scrub known secret values from captured `shell_exec` output before it
+    /// becomes a tool result — `crates/security::redaction`'s registry,
+    /// seeded by the caller (the active model's resolved API key, today —
+    /// see `exec_turn`/`run_interactive_turn_inner`) with values already
+    /// known to be sensitive. This is a narrower job than the secrets
+    /// *scanner* (`scan_for_secrets_advisory`/the git-commit gate), which
+    /// pattern-matches for *unknown* secret shapes in written content; this
+    /// scrubs *known* values wherever they appear in a command's own
+    /// output — e.g. a command that reads a config file containing the
+    /// active provider key back out. `None` (the default) means nothing is
+    /// registered and output passes through unchanged.
+    pub fn set_redaction(&mut self, redaction: security::RedactionSnapshot) {
+        self.redaction = Some(redaction);
+    }
+
+    /// Clone the configured redaction snapshot, if any, for a caller
+    /// propagating it to a subagent child (`share_redaction`) — cheap (an
+    /// `Arc` clone), unlike `fetch_allowlist`/`hooks`/`shadow_diagnostics`,
+    /// which aren't propagated to subagents today. Redaction is a leak-
+    /// prevention mechanism, not a capability grant, so it follows the same
+    /// "shared safety limit" precedent as `share_write_locks`/
+    /// `share_job_budget` rather than staying parent-only.
+    pub(crate) fn redaction_handle(&self) -> Option<security::RedactionSnapshot> {
+        self.redaction.clone()
+    }
+
+    /// Replace this instance's own redaction snapshot with the parent's —
+    /// called on every subagent child's own tools (`LiveSubagentRunner::
+    /// run`), same call site as `share_write_locks`/`share_job_budget`, so a
+    /// child's `shell_exec` output is scrubbed for the same known secrets as
+    /// its parent's rather than left unscrubbed by default.
+    pub(crate) fn share_redaction(&mut self, redaction: Option<security::RedactionSnapshot>) {
+        self.redaction = redaction;
+    }
+
+    /// Scrub known secret values from already-bounded `shell_exec` output
+    /// text, if a redaction snapshot is configured. A no-op (returns `text`
+    /// unchanged) when none is — the common case for an untrusted project
+    /// or an unconfigured model, where nothing was ever registered. A
+    /// redaction failure (e.g. non-UTF-8 output after a lossy join — should
+    /// not happen given `bounded_text`'s own UTF-8-safe truncation, but
+    /// fails safe if it somehow did) returns the original text unscrubbed
+    /// rather than dropping the tool's real output entirely: this is a
+    /// best-effort leak-reduction pass, not a security boundary the way the
+    /// git-commit `PatchPolicyGate` is.
+    fn redact_output(&self, text: String) -> String {
+        let Some(redaction) = &self.redaction else {
+            return text;
+        };
+        let cancel = security::RedactionCancellation::new();
+        match redaction.redact_text(security::TextSink::Tool, &text, &cancel) {
+            Ok(redacted) => redacted.as_text().map(str::to_owned).unwrap_or(text),
+            Err(_) => text,
+        }
     }
 
     /// Attach the shadow-diagnostics command: `workspace_write` calls whose
@@ -1891,7 +1951,8 @@ impl WorkspaceTools {
                 MAX_SHELL_OUTPUT_BYTES as u64,
             ) {
                 Ok(outcome) => {
-                    let output = bounded_text(&outcome.output, MAX_SHELL_OUTPUT_BYTES);
+                    let output =
+                        self.redact_output(bounded_text(&outcome.output, MAX_SHELL_OUTPUT_BYTES));
                     let status = sandboxed_status_line(
                         outcome.exit_code,
                         outcome.timed_out,
@@ -2009,7 +2070,7 @@ impl WorkspaceTools {
         }
         let output_text = {
             let combined = output_buf.lock().map(|guard| guard.clone()).unwrap_or_default();
-            bounded_text(&combined, MAX_SHELL_OUTPUT_BYTES)
+            self.redact_output(bounded_text(&combined, MAX_SHELL_OUTPUT_BYTES))
         };
         match status {
             Ok(status) => {
@@ -2302,7 +2363,7 @@ impl WorkspaceTools {
                 ))),
             });
         };
-        let mut summary = text;
+        let mut summary = self.redact_output(text);
         if done {
             summary.push_str(&format!("\n[job finished: {state}]"));
         } else {
@@ -4287,6 +4348,14 @@ impl ExecTools {
         }
     }
 
+    /// Scrub known secret values from captured `shell_exec` output (no-op
+    /// on the no-op surface). See `WorkspaceTools::set_redaction`.
+    pub fn set_redaction(&mut self, redaction: security::RedactionSnapshot) {
+        if let Self::Workspace(tools) = self {
+            tools.set_redaction(redaction);
+        }
+    }
+
     /// Attach project hook commands (pre/post tool stages).
     pub fn set_hooks(&mut self, hooks: crate::hooks::HooksConfig) {
         if let Self::Workspace(tools) = self {
@@ -4374,6 +4443,23 @@ impl ExecTools {
     pub(crate) fn share_write_locks(&mut self, locks: WriteLocks) {
         if let Self::Workspace(tools) = self {
             tools.share_write_locks(locks);
+        }
+    }
+
+    /// Clone this turn's redaction snapshot, if any (`None` on the no-op
+    /// surface). See `WorkspaceTools::redaction_handle`.
+    pub(crate) fn redaction_handle(&self) -> Option<security::RedactionSnapshot> {
+        match self {
+            Self::Workspace(tools) => tools.redaction_handle(),
+            Self::Noop(_) => None,
+        }
+    }
+
+    /// Adopt the parent's redaction snapshot (no-op on the no-op surface).
+    /// See `WorkspaceTools::share_redaction`.
+    pub(crate) fn share_redaction(&mut self, redaction: Option<security::RedactionSnapshot>) {
+        if let Self::Workspace(tools) = self {
+            tools.share_redaction(redaction);
         }
     }
 
@@ -7132,6 +7218,45 @@ use std::sync::{Arc, Mutex};
                 assert!(summary.starts_with("exit 3"), "{summary}");
             }
             other => panic!("expected exit-code outcome, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_exec_scrubs_a_registered_secret_from_captured_output() {
+        use std::os::unix::fs::PermissionsExt;
+        // A real, plausible leak vector: a command reads back a file that
+        // happens to contain a value the caller has already registered as
+        // sensitive (e.g. exec_turn/run_interactive_turn_inner registering
+        // the active model's own resolved credential) — the tool result
+        // must not hand that value back to the model verbatim.
+        let root = TempRoot::new("shell-redaction");
+        let secret = "sk-not-a-real-secret-0123456789abcdef";
+        fs::write(root.0.join("cat_secret.sh"), format!("#!/bin/sh\necho {secret}\n"))
+            .expect("seed");
+        fs::set_permissions(
+            root.0.join("cat_secret.sh"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+        let mut tools = permissive_workspace(&root.0);
+        let mut registry = security::SecretRedactionRegistry::new();
+        let refer = auth::SecretRef::from_alias("test-secret").expect("alias");
+        let cancel_redact = security::RedactionCancellation::new();
+        registry
+            .register_canary(&refer, secret.as_bytes(), &cancel_redact)
+            .expect("register");
+        tools.set_redaction(registry.snapshot());
+
+        let cancel = CancellationToken::new();
+        let call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["./cat_secret.sh"]}"#);
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(!summary.contains(secret), "{summary}");
+                assert!(summary.contains("[REDACTED:secret:"), "{summary}");
+            }
+            other => panic!("expected shell success, got {other:?}"),
         }
     }
 

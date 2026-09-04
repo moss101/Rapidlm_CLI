@@ -4011,6 +4011,44 @@ is now durably written to the ledger for interactive sessions at all for the fir
 posture change worth the team knowing about, not a bug); `MAX_TRANSCRIPT_ENTRIES` eviction has no off-by-one
 and no bypassed call site.
 
+**2026-09-05: picked up one of this session's own earlier follow-up tasks — wiring `crates/security::
+redaction` into `shell_exec`'s captured output, closing the gap the "tenth crate" `crates/security` review
+flagged (search this document for "nothing in `apps/rapid` routes subprocess output through
+`SecretRedactionRegistry`"). Scoped to the concrete, verified leak vector that motivated the finding, not the
+full space of what the module could theoretically protect.**
+
+**Fixed: `shell_exec` (plain, sandboxed, and background-job-polled output alike) never scrubbed known secret
+values from captured command output — a command that reads back a file containing the active model's own
+resolved API key (not hypothetical: `~/.rapidlm/config.toml` stores it in plaintext, and `cat ~/.rapidlm/
+config.toml` is a completely ordinary thing for a model debugging a config issue to run) handed it back
+verbatim.** `exec_turn` and `run_interactive_turn_inner` now register the active model's resolved credential
+(`active.credential.plaintext`, when present — a keyless local provider has none, and nothing is registered
+for it) into a `security::SecretRedactionRegistry` right after model resolution succeeds, and pass its
+`.snapshot()` to `tools.set_redaction(...)`. `WorkspaceTools` gained a `redact_output` method (`redaction:
+Option<security::RedactionSnapshot>`, `None` by default — the common case for an untrusted project or an
+unconfigured model, where nothing was ever registered) applied to all three of `shell_exec`'s output-return
+points (the plain synchronous path, the sandboxed path, and `job_output`'s background-job polling) right
+after `bounded_text` bounds the captured bytes. A redaction failure (shouldn't happen given `bounded_text`'s
+own UTF-8-safe truncation, but fails safe if it somehow did) returns the original text unscrubbed rather than
+dropping real tool output — this is a best-effort leak-reduction pass, not a security boundary the way the
+`PatchPolicyGate` is, and doesn't claim to be. Propagated to subagent children the same way `WriteLocks`/the
+job-budget counter already are (`share_redaction`, called from `LiveSubagentRunner::run`) rather than left
+parent-only, since a subagent's own `shell_exec` calls are just as real a leak vector as the parent's.
+
+Deliberately not attempted, matching the follow-up task's own framing: this only registers the *one* concrete,
+already-known-sensitive value in play (the active model credential) — it does not attempt automatic secret
+*detection* in output (that's the separate, already-existing secrets *scanner*'s job, a fundamentally
+different, pattern-matching-for-unknown-shapes problem) and does not wire `output_safety.rs` (terminal-hijack
+neutralization for `rapid jobs logs`-style rendering) at all, since that protects a different surface (a
+rendered terminal view) that doesn't yet exist for `shell_exec`'s tool-result text, which the model consumes
+as plain data, not as terminal escape sequences.
+
+New test `shell_exec_scrubs_a_registered_secret_from_captured_output`: registers a fake secret, runs a script
+that echoes it back, asserts the tool result contains the `[REDACTED:secret:<fingerprint>]` marker instead of
+the raw value. Verified via the revert cycle: a no-op `redact_output` reproduces the exact leak (the raw
+secret string appears verbatim in the panicking assertion's own output). Full `-p rapid --lib` suite and
+`cargo build --workspace --tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
