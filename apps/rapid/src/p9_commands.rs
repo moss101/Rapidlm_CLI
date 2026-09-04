@@ -457,6 +457,22 @@ mod tests {
     }
 
     #[test]
+    fn doctor_exit_code_is_nonzero_for_every_non_pass_status() {
+        // A CI script gating on `rapid doctor`'s exit code must be able to
+        // see any check that isn't a clean pass — the old code returned 0
+        // unconditionally regardless of status.
+        assert_eq!(doctor_exit_code(security::DoctorStatus::Pass), 0);
+        for status in [
+            security::DoctorStatus::Warn,
+            security::DoctorStatus::Unavailable,
+            security::DoctorStatus::Fail,
+            security::DoctorStatus::Error,
+        ] {
+            assert_eq!(doctor_exit_code(status), 1, "{status:?} must not exit 0");
+        }
+    }
+
+    #[test]
     fn agent_cli_key_is_process_stable_and_no_longer_the_old_fixed_constant() {
         // The issuer and the validator built from this key (run_agent_cli,
         // around line 316) must see byte-identical keys within one process
@@ -600,7 +616,15 @@ pub fn run_doctor(args: &[String]) -> Result<i32, P9CommandError> {
     for check in report.checks() {
         println!("{} {:?}", check.id(), check.status());
     }
-    Ok(0)
+    Ok(doctor_exit_code(report.status()))
+}
+
+// A CI/pre-flight script gating on `rapid doctor`'s exit code needs to see a
+// failing check as non-zero; the caller previously printed each row and
+// returned 0 unconditionally, so nothing scripted against it could ever
+// observe a `Fail`/`Error`/`Unavailable` check.
+fn doctor_exit_code(status: security::DoctorStatus) -> i32 {
+    if status.is_pass() { 0 } else { 1 }
 }
 
 /// `rapid sessions list|search <text> [--db <path>]` over the kernel

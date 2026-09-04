@@ -3102,8 +3102,11 @@ fn collect_content_findings(root: &Path, files: impl Iterator<Item = (String, Ve
     // legitimate write). It is the *wrong* trade-off here: this function's
     // whole purpose is a blocking gate, so a file this pass genuinely
     // could not scan must block the commit/merge, not silently commit it
-    // unscanned. Check the shared size cap up front so a too-large file
-    // becomes its own finding instead of an invisible scanner error.
+    // unscanned — so this calls `secrets_scan`/`patch_scan` (the `Result`-
+    // returning core behind those two advisory functions) directly instead,
+    // and turns any `Err` into a finding of its own. Checking the shared
+    // size cap up front still means a too-large file gets a clearer,
+    // dedicated message rather than the scanner's own generic bound error.
     let scan_cap = security::MAX_TARGET_BYTES.min(security::MAX_PATCH_TARGET_BYTES);
     for (path, content) in files {
         if content.len() > scan_cap {
@@ -3114,11 +3117,21 @@ fn collect_content_findings(root: &Path, files: impl Iterator<Item = (String, Ve
             ));
             continue;
         }
-        if let Some(note) = scan_for_secrets_advisory(root, &path, &content) {
-            findings.push(note);
+        match secrets_scan(root, &path, &content) {
+            Ok(Some(note)) => findings.push(note),
+            Ok(None) => {}
+            Err(reason) => findings.push(format!(
+                "{path}: secret scan could not run ({reason}); blocking rather than committing \
+                 content that could not be scanned"
+            )),
         }
-        if let Some(note) = scan_patch_advisory(root, &path, &content) {
-            findings.push(note);
+        match patch_scan(root, &path, &content) {
+            Ok(Some(note)) => findings.push(note),
+            Ok(None) => {}
+            Err(reason) => findings.push(format!(
+                "{path}: patch scan could not run ({reason}); blocking rather than committing \
+                 content that could not be scanned"
+            )),
         }
     }
     findings
@@ -3343,13 +3356,24 @@ fn append_write_advisories(summary: &mut String, root: &Path, path: &str, conten
 /// fingerprint) never resurface on a rerun — but a *changed* finding at the
 /// same location gets a different fingerprint and is never silently hidden.
 fn scan_for_secrets_advisory(root: &Path, path: &str, content: &[u8]) -> Option<String> {
-    let repo_path = protocol::RepoPath::parse(path).ok()?;
-    let target = security::ScanTarget::staged_diff(repo_path, content.to_vec()).ok()?;
+    secrets_scan(root, path, content).ok().flatten()
+}
+
+/// Shared core behind `scan_for_secrets_advisory`: `Ok(None)` is "scanned,
+/// nothing (undismissed) to report," `Ok(Some(note))` is a real finding, and
+/// `Err` is "the scan itself could not run." Split out so a blocking caller
+/// (`collect_content_findings`) can treat `Err` as a finding of its own,
+/// while the advisory wrapper above keeps collapsing it to `None` exactly as
+/// before — without duplicating the scan pipeline itself.
+fn secrets_scan(root: &Path, path: &str, content: &[u8]) -> Result<Option<String>, String> {
+    let repo_path = protocol::RepoPath::parse(path).map_err(|err| err.to_string())?;
+    let target =
+        security::ScanTarget::staged_diff(repo_path, content.to_vec()).map_err(|err| err.to_string())?;
     let mut request = security::ScanRequest::new();
-    request.push_target(target).ok()?;
+    request.push_target(target).map_err(|err| err.to_string())?;
     let scanner = security::SecretScanner::new();
     let cancel = security::ScanCancellation::new();
-    let report = scanner.scan(&request, &cancel).ok()?;
+    let report = scanner.scan(&request, &cancel).map_err(|err| err.to_string())?;
     let store = crate::findings_store::FindingsStore::load(root);
     let findings: Vec<&security::Finding> = report
         .findings()
@@ -3357,17 +3381,17 @@ fn scan_for_secrets_advisory(root: &Path, path: &str, content: &[u8]) -> Option<
         .filter(|finding| !store.is_dismissed(finding.fingerprint().as_hex()))
         .collect();
     if findings.is_empty() {
-        return None;
+        return Ok(None);
     }
     let details: Vec<String> = findings
         .iter()
         .map(|finding| format!("{} ({})", finding.rule_id(), finding.fingerprint().as_hex()))
         .collect();
-    Some(format!(
+    Ok(Some(format!(
         "advisory: possible secrets detected: {} — verify before committing, or dismiss a \
          false positive with `rapid findings dismiss <fingerprint>`",
         details.join(", ")
-    ))
+    )))
 }
 
 /// `capability_broker::Resolver` for a path already made absolute by the
@@ -3453,13 +3477,22 @@ fn scan_command_advisory(root: &Path, argv: &[String]) -> Option<String> {
 /// `Delete`/`Move`, which this path never produces. Same dismiss/never-
 /// block shape as every other scanner in this file.
 fn scan_patch_advisory(root: &Path, path: &str, content: &[u8]) -> Option<String> {
-    let repo_path = protocol::RepoPath::parse(path).ok()?;
-    let target = security::PatchScanTarget::create(repo_path, content.to_vec(), false).ok()?;
+    patch_scan(root, path, content).ok().flatten()
+}
+
+/// Shared core behind `scan_patch_advisory` — same split as `secrets_scan`
+/// above, for the same reason: `collect_content_findings` needs `Err` (the
+/// scan itself failing) to mean "block," while the advisory wrapper needs it
+/// to mean "nothing to report."
+fn patch_scan(root: &Path, path: &str, content: &[u8]) -> Result<Option<String>, String> {
+    let repo_path = protocol::RepoPath::parse(path).map_err(|err| err.to_string())?;
+    let target = security::PatchScanTarget::create(repo_path, content.to_vec(), false)
+        .map_err(|err| err.to_string())?;
     let mut request = security::PatchScanRequest::new();
-    request.push_target(target).ok()?;
+    request.push_target(target).map_err(|err| err.to_string())?;
     let scanner = security::PatchScanner::new();
     let cancel = security::PatchScanCancellation::new();
-    let report = scanner.scan(&request, &cancel).ok()?;
+    let report = scanner.scan(&request, &cancel).map_err(|err| err.to_string())?;
     let store = crate::findings_store::FindingsStore::load(root);
     let findings: Vec<&security::PatchFinding> = report
         .findings()
@@ -3467,17 +3500,17 @@ fn scan_patch_advisory(root: &Path, path: &str, content: &[u8]) -> Option<String
         .filter(|finding| !store.is_dismissed(finding.fingerprint().as_hex()))
         .collect();
     if findings.is_empty() {
-        return None;
+        return Ok(None);
     }
     let details: Vec<String> = findings
         .iter()
         .map(|finding| format!("{} ({})", finding.rule_id(), finding.fingerprint().as_hex()))
         .collect();
-    Some(format!(
+    Ok(Some(format!(
         "advisory: possible patch-policy issue detected: {} — verify before committing, or \
          dismiss a false positive with `rapid findings dismiss <fingerprint>`",
         details.join(", ")
-    ))
+    )))
 }
 
 /// Parse bounded `{"path": ..., "content": ...}` arguments; unknown keys,
@@ -6043,6 +6076,30 @@ use std::sync::{Arc, Mutex};
             other => panic!("expected an unscannable file to block the commit, got {other:?}"),
         }
         assert_commit_count(&root.0, 1, "content too large to scan must never be committed unscanned");
+    }
+
+    #[test]
+    fn collect_content_findings_blocks_a_file_the_scanners_cannot_parse_rather_than_passing_it_silently() {
+        // A path containing `..` fails `protocol::RepoPath::parse` before
+        // either scanner ever runs — well under the size cap, so this is a
+        // distinct failure mode from `commit_gate_blocks_rather_than_
+        // commits_content_over_the_scan_size_cap` above: a real "the scan
+        // itself could not run" case, not an oversized-content one. Both
+        // `secrets_scan` and `patch_scan` hit the same parse failure
+        // independently, so this must block with one finding per scanner,
+        // not silently produce zero findings the way the pre-fix `.ok()?`
+        // chains in `scan_for_secrets_advisory`/`scan_patch_advisory` would
+        // have (correctly, for those advisory-only callers — but wrongly
+        // for this blocking one).
+        let root = TempRoot::new("collect-findings-scan-failure");
+        let files = vec![(
+            "../escape.txt".to_owned(),
+            b"clean content, nowhere near the size cap".to_vec(),
+        )];
+        let findings = collect_content_findings(&root.0, files.into_iter());
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert!(findings.iter().any(|f| f.contains("secret scan could not run")), "{findings:?}");
+        assert!(findings.iter().any(|f| f.contains("patch scan could not run")), "{findings:?}");
     }
 
     #[test]

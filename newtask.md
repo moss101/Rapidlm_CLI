@@ -3683,6 +3683,89 @@ destination of a rename; the advisory-scanner `.ok()`-discarding pattern in `exe
 documented (never gates execution, by design) rather than a fail-open bug; `Capability`/`ResourceDescriptor`
 deserialization fails closed on any unrecognized variant.
 
+**Same sweep, next applied to `crates/security` itself — the tenth crate, and the largest (~23,000 lines
+across `doctor.rs`, `gate.rs`, `hardening.rs`, `network_policy.rs`, `output_safety.rs`, `redaction.rs`, and
+`scanners/{command,external,patch,secrets}.rs`). Two small, mechanical findings fixed; a much bigger
+integration gap found and documented (not fixed, given its scope); several modules confirmed dead or
+already-correctly-advisory.**
+
+**Fixed: `collect_content_findings` (the git commit/merge blocking gate's per-file scan loop,
+`apps/rapid/src/exec_tools.rs`) closed the *oversized-content* silent-pass gap earlier this session, but
+still silently passed a file on any *other* scanner failure — a malformed path, a scanner-internal error —
+because it called `scan_for_secrets_advisory`/`scan_patch_advisory`, whose whole contract (correctly, for
+their real advisory-only callers) is "collapse any failure to `None`."** A file whose path fails
+`protocol::RepoPath::parse` (e.g. containing `..`) reaches this function from `scan_git_commit_gate`/
+`scan_git_merge_gate`'s own git-reported file lists and would previously commit/merge completely unscanned,
+with the gate believing it saw zero findings rather than a scan it couldn't run. Not fixed by editing the two
+advisory functions themselves (that would break their own correct, documented "never break a legitimate
+write on a scanner hiccup" contract for `workspace_write`/`workspace_patch`). Fixed by splitting each into a
+thin `Option`-collapsing wrapper (unchanged behavior, still advisory) over a new `Result`-returning core
+(`secrets_scan`, `patch_scan`) that `collect_content_findings` now calls directly, turning any `Err` into a
+blocking finding of its own rather than silence. New test
+`collect_content_findings_blocks_a_file_the_scanners_cannot_parse_rather_than_passing_it_silently`: a path
+containing `..`, well under the size cap, produces one finding from each scanner ("secret scan could not
+run"/"patch scan could not run") instead of zero. Verified via the revert cycle. Full `-p rapid --lib` suite
+and `cargo build --workspace --tests` pass.
+
+**Fixed: `rapid doctor` (`apps/rapid/src/p9_commands.rs::run_doctor`) printed every check's status but always
+returned exit code `0`, regardless of whether any check came back `Fail`/`Error`/`Unavailable` — so nothing
+scripting it for CI/pre-flight gating could ever detect a failure via the process exit code, the
+only interface a script actually reads.** `security::DoctorReport::status()` already computes exactly the
+right value (the most severe status across all checks, fail-closed to `Error` on a missing row) — it was
+computed nowhere; `run_doctor` never called it at all. Fixed by mapping it through a small, directly-unit-
+tested `doctor_exit_code` helper (`Pass` → 0, everything else → 1, mirroring the existing `Ok(if matches!(...)
+{0} else {1})` pattern already used for `run_agent_cli`'s own outcome in the same file). New test
+`doctor_exit_code_is_nonzero_for_every_non_pass_status`: asserts all five `DoctorStatus` variants map
+correctly without needing to force a real host-level doctor failure. Verified via the revert cycle. Full
+`-p rapid --lib` suite and `cargo build --workspace --tests` pass.
+
+**Found, verified by grepping every one of the crate's exported gate/engine symbols against the entire
+workspace, and left unfixed given the scope: four of the crate's eight modules — `gate.rs`, `redaction.rs`,
+`output_safety.rs`, and `scanners/external.rs` — are complete, carefully engineered, and adversarially tested
+(`crates/security/tests/adversarial.rs`) but have zero callers anywhere outside their own tests.** This is the
+"disconnected capability layer" pattern found repeatedly elsewhere this session (mcp's gateway, plugin-host's
+hook engine, computer-use, tool-gateway, agent-pool, knowledge, acp), but here the stakes read higher, because
+of what these four modules are *for*:
+- `redaction.rs`'s own module doc says it exists so process/tool/event/trace text sinks "must not emit
+  protected values" — but nothing in `apps/rapid` registers a canary or routes subprocess output through
+  `SecretRedactionRegistry`/`StreamingRedactor` before it reaches the model or terminal. `shell_exec`'s
+  "byte-captured combined output" (its own doc comment) goes back unfiltered. A spawned command that echoes an
+  injected credential (`echo $API_KEY`) is not caught by anything in this workspace today.
+- `output_safety.rs`'s own module doc names a concrete consumer ("`rapid jobs logs` and artifact metadata
+  cannot trigger terminal side effects" — OSC 8/52/title hijack, CSI, C0/C1 neutralization) that doesn't exist
+  as a subcommand; the closest analogue, the real `job_output` tool (`apps/rapid/src/exec_tools.rs`), returns
+  raw spooled bytes to the model, not through this filter.
+- `gate.rs`'s `evaluate_scan_gate`/`ScanGatePolicy` is a well-designed scanner-result aggregator (fails closed
+  on unavailable/error/conflicting results, requires a typed `PolicyException`+`GateAuditId` to waive a
+  finding) whose `GatePhase::PreAction/Verification/Apply` model looks purpose-built for exactly the boundary
+  `scan_git_commit_gate`/`scan_git_merge_gate` reimplement by hand with none of its waiver/audit-trail
+  machinery — but is never called.
+- `scanners/external.rs` (SARIF/subprocess external-scanner supervised exec, ~2000 lines) has the same
+  zero-caller profile.
+
+None of this is a small patch — wiring any of the four in is a real design decision about where in
+`apps/rapid`/`crates/mcp` each belongs, not a mechanical change, so it's documented here rather than attempted
+inline. `crates/security::network_policy` (IPv4-mapped-IPv6 canonicalization, DNS-rebind re-resolution and
+subset-checking, one-use egress leases — read in full, no bypass found) is real, correct, and well-tested but
+its only real caller, `crates/mcp::transport::StreamableHttpTransport`, is itself never constructed by the
+shipped CLI (`apps/rapid` only ever uses `StdioTransport` for MCP) — so this module also currently protects no
+live path, though unlike the four above it at least has one production-shaped caller already written, only
+unused. `network_policy.rs`'s own `ConsumedConnect::dial_ips()` — the field that exists specifically so a real
+socket connect can be pinned to the validated IP instead of a third DNS lookup that could reintroduce a rebind
+window — has zero readers anywhere, including in its own module's non-test code; flagged as a design trap for
+whoever eventually writes the first production `StreamableHttpIo`, not a live bug today.
+
+Confirmed clean / working as designed, not bugs: the exec_tools.rs advisory scanner call sites
+(`scan_command_advisory`, and the pre-fix `scan_for_secrets_advisory`/`scan_patch_advisory`) genuinely never
+gate anything, exactly as their own doc comments say; `SecretScanner::scan` only ever constructs
+`ScanStatus::Clean`/`Findings` (never a "looks-clean" `Partial`/`Error`), so a real failure surfaces as
+`Result::Err`, not a silently-clean report; `hardening.rs` is an ACP frame-decoder fuzz-test helper only, not
+a security gate, and its own tests are its only caller; `doctor.rs`'s per-check status ordering (`Pass < Warn
+< Unavailable < Fail < Error`) is internally consistent with its own doc comment; `NetworkClient::{Sandbox,
+Browser,Tool}` attribution is genuinely "attribution only, never grants privilege" — the "shared function,
+different caller strictness" pattern found elsewhere this session (`web_fetch` vs. `llm-router`'s IP checks)
+does not recur here.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
