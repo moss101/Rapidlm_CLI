@@ -1007,7 +1007,20 @@ impl StreamCoalescer {
                 // Queue full: leave text intact and signal pressure.
                 return Err(TranscriptError::BackPressure);
             }
-            let rest = self.current.split_off(self.max_chunk_bytes);
+            // `max_chunk_bytes` is an arbitrary byte count, not necessarily a
+            // char boundary in `self.current` (arbitrary streamed model
+            // output routinely has multi-byte UTF-8 straddling it) —
+            // `String::split_off` panics on a non-boundary index. Round up
+            // to the next boundary rather than down: this is a batching
+            // threshold, not a hard cap, so a sealed chunk landing a few
+            // bytes over is harmless, and rounding up (instead of down)
+            // guarantees forward progress even if a single character is
+            // wider than `max_chunk_bytes` itself.
+            let mut split_at = self.max_chunk_bytes;
+            while split_at < self.current.len() && !self.current.is_char_boundary(split_at) {
+                split_at += 1;
+            }
+            let rest = self.current.split_off(split_at);
             let sealed = std::mem::take(&mut self.current);
             self.current = rest;
             self.sealed.push(sealed);
@@ -1385,6 +1398,19 @@ mod coalescer_tests {
         assert_eq!(c.pending_chunks(), 0);
         c.push("ok").expect("push after drain");
         assert_eq!(c.drain(), vec!["ok".to_owned()]);
+    }
+
+    #[test]
+    fn seal_boundary_landing_inside_a_multibyte_char_does_not_panic() {
+        // max_chunk_bytes=3 lands inside '€'s 3-byte UTF-8 encoding (bytes
+        // 1..4 of "a€") — the exact shape that made a naive
+        // `split_off(max_chunk_bytes)` panic on a non-char-boundary index.
+        // Real streamed model deltas routinely contain multi-byte UTF-8
+        // (non-English text, emoji, box-drawing characters), so this must
+        // never panic regardless of where max_chunk_bytes happens to fall.
+        let mut c = StreamCoalescer::new(3, 10);
+        c.push("a€").expect("push must not panic on a straddling multi-byte char");
+        assert_eq!(c.drain().join(""), "a€", "no text may be dropped");
     }
 
     #[test]

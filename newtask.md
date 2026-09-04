@@ -2094,6 +2094,55 @@ concretely-severe, easily-reproduced symptom of the "interactive session loop do
 found so far — worth prioritizing whenever that larger wiring work happens, since today it means the shipped
 interactive CLI cannot sustain a real back-and-forth conversation at all past the first message.
 
+**Same review sweep, `crates/tui` — confirmed no submission gate exists anywhere in this crate either** (a
+direct follow-up question after the finding above): `AppState::actions_blocked()` is set only by
+`try_reduce`/`apply_kernel` on a malformed kernel event or a projection-invariant violation, and is unrelated
+to turn lifecycle; `ComposerModel`/`ComposerCommand::Submit` has no disabled/read-only concept at all. So the
+absence isn't a broken doc-comment invariant — nothing in this crate claims a turn-in-flight gate exists — it's
+confirmed to be missing end-to-end, both at the kernel layer and the UI layer.
+
+**Two additional, real, verified panics found in the same `crates/tui` sweep — both fixed, though both are
+currently unreachable since `apps/rapid/src/interactive.rs` only imports a thin slice of this crate
+(`AppState`/`reduce`, `commands::{parse_command, dispatch}`, `terminal::TerminalGuard` — no `ComposerModel`,
+no panel view-models, no `ratatui` dependency at all in `apps/rapid`) and will fire the moment the fuller
+TUI surface gets wired in.**
+
+1. `crates/tui/src/transcript.rs::StreamCoalescer::push` (line ~1005) called `self.current.split_off(self.
+max_chunk_bytes)` to seal a chunk once it hit the configured threshold — `String::split_off` panics unless
+the index is a UTF-8 char boundary, and `max_chunk_bytes` (real value `MAX_COALESCED_CHUNK_BYTES` = 8192) is
+an arbitrary byte count with no boundary check. The module doc frames this coalescer as merging "consecutive
+model deltas" for "high-frequency streams" — i.e. built for arbitrary LLM output, which routinely contains
+multi-byte UTF-8. **Fixed:** round up to the next char boundary before splitting (a batching threshold, not a
+hard cap, so a chunk landing a few bytes over the configured size is harmless — and rounding up rather than
+down guarantees forward progress even if a single character is wider than `max_chunk_bytes` itself, avoiding
+a zero-progress infinite loop in that edge case). New test
+`seal_boundary_landing_inside_a_multibyte_char_does_not_panic` (`StreamCoalescer::new(3, 10)`, pushing `"a€"`
+so `€`'s 3-byte encoding straddles the byte-3 split point) — verified via the revert cycle to panic with
+`assertion failed: self.is_char_boundary(at)` against the original code before confirming the fix closes it.
+
+2. `crates/tui/src/session_actions.rs::preview_text` (line 1287) called `out.truncate(MAX_GOAL_PREVIEW_BYTES)`
+*before* its own char-boundary-fixup loop — `String::truncate` itself panics immediately on a non-boundary
+index, so the loop written to handle exactly that case could never run. `MAX_GOAL_PREVIEW_CHARS` (48)
+multi-byte characters can reach up to 192 bytes, comfortably over `MAX_GOAL_PREVIEW_BYTES` (128), and 128
+lands strictly between two CJK character boundaries in the reproduction. Reached from `project_goal`
+(rendering a goal's free-text `statement()`, i.e. arbitrary text from `/goal start <text>`) via `plan_resume`/
+`plan_fork`/`plan_rewind`, none of which `apps/rapid` currently calls into (confirmed via grep: no hits for
+`SessionLifecycleIntent`/`session_actions::` outside the module itself). **Fixed:** find the char boundary
+*before* truncating instead of after, matching the already-correct sibling idiom used elsewhere in this same
+crate (`status.rs::truncate_bytes`). New test `preview_text_truncates_multibyte_chars_without_panicking` (48
+CJK characters, 3 bytes each) — verified via the revert cycle to panic with `assertion failed: self.
+is_char_boundary(new_len)` against the original ordering before confirming the fix closes it.
+
+Full `tui` crate suite (214 tests) and `cargo build --workspace --tests` pass. Also from this same review pass
+(read-only, no fix needed): `crates/scheduler/src/playbook.rs::compile()`'s doc comment claims "deterministic
+node ids from traversal order," but node ids are actually `NodeId::new()` (fresh UUIDv7 per call) and the
+computed topological order is discarded unused — inert today since the one live caller
+(`p9_commands::run_playbook_compile`) compiles once and prints, and the only consumer that would care about
+id-stability across recompiles (`GraphService::diff`) has zero callers outside its own tests. `crates/acp`,
+`crates/harness`, and `crates/tool-gateway` were also reviewed this pass and found to be substantially or
+entirely dormant scaffolding (confirmed via repo-wide grep for their public types) with no verified live bug
+in any of the three.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

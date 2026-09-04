@@ -1287,10 +1287,17 @@ fn format_goal_line(preview: &SessionLifecyclePreview) -> String {
 fn preview_text(text: &str) -> String {
     let mut out: String = text.chars().take(MAX_GOAL_PREVIEW_CHARS).collect();
     if out.len() > MAX_GOAL_PREVIEW_BYTES {
-        out.truncate(MAX_GOAL_PREVIEW_BYTES);
-        while !out.is_char_boundary(out.len()) {
-            out.pop();
+        // Find the last valid char boundary at or before the cap *before*
+        // truncating: `String::truncate` itself panics on a non-boundary
+        // index, so fixing the boundary after calling it (the previous
+        // shape here) never actually ran — `MAX_GOAL_PREVIEW_CHARS` (48)
+        // multi-byte characters can reach up to 192 bytes, comfortably over
+        // `MAX_GOAL_PREVIEW_BYTES` (128).
+        let mut end = MAX_GOAL_PREVIEW_BYTES;
+        while end > 0 && !out.is_char_boundary(end) {
+            end -= 1;
         }
+        out.truncate(end);
     }
     out.retain(|c| c != '\n' && c != '\t');
     out
@@ -1323,6 +1330,18 @@ fn check_cancel(cancel: &CancellationToken) -> Result<(), SessionActionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_text_truncates_multibyte_chars_without_panicking() {
+        // 48 (MAX_GOAL_PREVIEW_CHARS) CJK characters at 3 bytes each is 144
+        // bytes, comfortably over MAX_GOAL_PREVIEW_BYTES (128) -- and 128
+        // falls strictly between two of those characters' byte boundaries
+        // (126 and 129), so a naive `truncate(128)` panics.
+        let text: String = std::iter::repeat_n('字', 48).collect();
+        let preview = preview_text(&text);
+        assert!(preview.len() <= MAX_GOAL_PREVIEW_BYTES, "{}", preview.len());
+        assert!(!preview.is_empty());
+    }
     use crate::commands::{dispatch, parse_command};
     use event_ledger::event::{ActorKind, ActorRef, EventEnvelope, EventKind, RecordedAt};
     use kernel::{apply, replay};
