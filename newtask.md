@@ -3372,6 +3372,19 @@ running a parallel, unaudited tool-execution implementation — or, alternativel
 tools via `ExecTools` because it doesn't yet drive an agentic tool-calling loop at all. A dedicated
 investigation is running to resolve this precisely before deciding whether it needs its own sweep.
 
+**Resolved: the second alternative.** `run_started_session`'s `SessionLoop` bottoms out in
+`InProcessKernelClient::submit_turn_sync`, whose entire effect is appending one `TurnStarted` ledger event and
+holding a turn lease — no model call, no tool proposal, no dispatch of any kind; `crates/kernel` doesn't even
+list `agent-runtime` as a dependency. `ExecTools`/`WorkspaceTools`/`ToolDriver` are reachable only from
+`exec_turn`, confirmed to be the sole functioning tool-execution surface in this codebase today — not one of
+two parallel implementations. This isn't a new discovery: it's independently corroborated, file:line for
+file:line, by this same document's own pre-existing §0a entry ("There is no live agent-turn/tool-dispatch
+loop in that path at all," 2026-08-29) and the "Severe finding, 2026-09-04" entry a few thousand lines below
+documenting the concrete, reproducible consequence (a second chat message crashes the session with
+`SessionConflict` since nothing ever releases a submitted turn's lease except an explicit interrupt). No
+action needed from this cross-check beyond the confirmation itself: every fix this sweep made to
+`exec_tools.rs` this session protects the one real tool-execution path that exists.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
