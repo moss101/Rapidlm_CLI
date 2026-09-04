@@ -2774,6 +2774,45 @@ one concrete, real, shipped caller motivating the exact shape of the fix. Given 
 currently reach this path at all, doing that wiring work now would be guessing at an interface a real caller
 hasn't been designed yet, matching this document's standing rule for findings of this shape.
 
+**Same second-pass adversarial sweep, next applied to `crates/tool-gateway` — believed, per a side remark in
+the `crates/auth` review earlier in this sweep, to be "properly wired" into real dispatch. That claim did not
+hold up, and this crate turns out to be even more disconnected than the previous three.** No code fix came
+out of this pass — the crate's own logic is sound — but the reachability question needed a rigorous, direct
+answer rather than inherited assumption, so it's recorded here in full.
+
+**Verdict: `crates/tool-gateway` has zero reverse dependencies in the entire workspace — not linked into the
+`rapid` binary at all, let alone bypassed by a shorter path.** `cargo metadata --no-deps`, checked against
+every package's dependency list: no crate, `apps/rapid` included, depends on `tool-gateway`. `grep -rn
+"tool_gateway::"` outside the crate itself: zero hits. No production `impl CapabilityBroker for`/`impl
+ToolExecutor for`/`impl ArtifactSink for` exists anywhere — `dispatch()`'s only implementations of the traits
+it requires are `ScriptedBroker`/`RecordingExecutor` inside its own `#[cfg(test)]` module. The real, shipped
+tool-execution path (`apps/rapid/src/exec_tools.rs`'s `WorkspaceTools`/`ExecTools`, `impl ToolDriver for ...`)
+is an entirely independent implementation with its own tool catalog (names don't even overlap with
+`tool-gateway`'s 12-tool v1 catalog) and never calls `capability_broker::evaluate`/`issue`/`validate_use`/
+`PolicyStack` — it's gated purely by `apps/rapid/src/permissions.rs`'s `PermissionLattice`, already reviewed
+earlier in this sweep (3 bugs found and fixed). This is not a new discovery: [gaps.md:155-159](gaps.md) — a
+pre-existing, already-tracked project document, not something this sweep introduced — independently states
+*"tool-gateway already defines a 12-tool v1 catalog … with per-tool JSON Schema, capability scoping, deny
+lists, and repair logic. The capability broker, sandbox, and process supervisor exist. None are reachable by
+the model,"* with its own recommendation (build a `GatewayTool` → `ToolDriver` adapter). This sweep's
+contribution is independent, code-level confirmation of exactly that claim via dependency-graph and call-site
+evidence, plus a full internal soundness check the planning document didn't attempt: `dispatch()`'s own
+ordering (authorize → re-validate lease → invoke executor), output-bounding (`MAX_INLINE_RESULT_BYTES` 16
+KiB, artifact spill capped at 8 MiB), and privilege-leak scrubbing (`reject_privilege_leak`/
+`reject_denied_output`) all check out correctly against the same TOCTOU/lease-replay bug classes already
+found elsewhere this session — `capability_broker::validate_use` decrements its use counter atomically
+*inside itself*, before returning the guard, so even a caller that never calls `.consume()` (as no real caller
+does today) cannot replay a lease. **Not spawning a separate follow-up task for this**, unlike the `crates/
+mcp`/`crates/plugin-host` findings above: `gaps.md` already tracks the exact recommendation, and a fourth
+"wire this up" chip pointing at the same underlying decision (which single capability-gated tool layer this
+codebase should actually standardize on — `tool-gateway`, or the per-app-shaped alternatives already found in
+`crates/mcp`/`crates/plugin-host`) would fragment one architectural decision into four uncoordinated ones.
+The pattern across all four crates reviewed this pass (`crates/mcp`, `crates/plugin-host`, `crates/
+computer-use`, `crates/tool-gateway`) is now well enough established to state plainly: this codebase has built
+several well-engineered, independently-tested capability-gated execution layers, and the currently shipped
+product uses none of them for its real tool dispatch — whoever next does this wiring work should treat it as
+one decision (which layer becomes canonical) rather than four separate integration tasks.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
