@@ -2652,6 +2652,68 @@ cancellation was genuinely ignored, not just slow.
 Full `exec_tools` test module (88 tests), full `-p rapid --lib` suite (359 tests, up from 356), and `cargo
 build --workspace --tests` all pass.
 
+**Same second-pass adversarial sweep, next applied to `crates/plugin-host` — the third crate in a row where
+this exact question ("does the well-designed sandboxed layer this crate ships actually sit in the real
+request path?") turned up the same shape of gap as `crates/mcp` just did.**
+
+**Central finding, documented but deliberately not attempted this pass, same shape as the `crates/mcp`
+finding above: `crates/plugin-host`'s entire capability-gated hook engine (manifest/trust/hooks/wasm/skills/
+install) is dead code — the real, shipped hook runner is a completely separate, unrelated implementation
+with none of its protections.** `crates/plugin-host/src/hooks.rs`'s module doc claims hooks "receive a
+redacted event DTO on stdin, inherit no parent environment, and cannot grant capabilities," and its
+`HookSandboxProfile::new` fails closed unless network is isolated. `grep -rln "plugin_host" apps` finds only
+one reference in the whole app (`apps/rapid/src/p9_commands.rs`), and that reference is exclusively the
+`rapid plugins hook-test` dry-run subcommand, which explicitly never executes anything (ends with
+`"dry-run complete; the hook command was not executed"`). `run_command_hook`/`HookExecContext`/`hooks::
+dispatch`, `ExtensionTrustStore::authorize_executable`/`authorize_capability`, `wasm::instantiate`/
+`WasmPluginHost`, `skills::activate`/`discover`, and `install::PluginInstaller` all have zero callers
+anywhere in `apps/` outside the crate's own tests. The real hook runner that actually gates every tool call
+is `apps/rapid/src/hooks.rs` — an unrelated 480-line module (same name, no other connection), wired in for
+real at `exec_tools.rs:1129` (pre-tool, can deny), `:1222` (post-tool, output spliced into the model-visible
+summary), and `:2373`/`:2386`/`interactive.rs:1300`/`:1769` (session/subagent notify hooks), populated from
+`hooks` in `.rapidlm/settings.json`/`.claude/settings.json` and gated only by the same single, coarse
+project-trust flag as every other workspace tool (`interactive.rs:1756`) — not a hook-specific consent step,
+not the sandboxed engine `crates/plugin-host` actually built. **Not attempted this pass** for the same reason
+as the `crates/mcp` finding: routing `apps/rapid/src/hooks.rs` through `crates/plugin-host`'s existing
+sandbox is a real architectural decision spanning two crates, not a mechanical patch.
+
+**Fixed (the one concrete, local bug inside the real, reachable path): `apps/rapid/src/hooks.rs::
+run_hook_once` spawned every project-configured hook with the full ambient process environment — the one
+subprocess-spawning path in this app that skipped the `env_clear()` + allowlist pattern used everywhere
+else.** (`apps/rapid/src/hooks.rs:95-134`, the `#[cfg(unix)]` `Command::new("sh").arg("-c").arg(command)`
+spawn, before this fix — `grep -n "env_clear"` returned zero hits in this file, in direct contrast to the
+same pattern already fixed this session in `apps/rapid/src/exec_tools.rs`'s MCP stdio spawn, two entries
+above, and already established in that file's bash-tool/`shell_exec` spawns.) Because this app resolves model
+provider credentials via `std::env::vars()` (`user_config.rs:767,805,836`), those credentials routinely live
+in `rapid`'s own process environment — and because a hook fires on every successful tool call with the output
+spliced into the model-visible summary, a project shipping `.claude/settings.json` with a `post_tool_use`
+hook that simply runs `curl ... -d "$(env)"` would exfiltrate them the moment a trusted user ran a single
+tool call, with unrestricted network access (plain `sh -c`, no isolation). Fixed by applying the exact same
+`.env_clear()` + `PATH`/`HOME`/`LANG`/`TMPDIR` allowlist already used by `exec_tools.rs`'s spawns. New test
+`hook_subprocess_does_not_inherit_ambient_environment`: runs `env > <file>` as the hook command and asserts
+every captured key is in an allowlist of the four intentionally-forwarded names plus what `sh -c` itself
+injects under a fully cleared environment (`PWD`, `SHLVL`, `_` — confirmed independently via `env -i
+PATH=/usr/bin:/bin sh -c 'env'`). Verified via the revert cycle: without `.env_clear()`, the test failed by
+dumping this session's own `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_MESSAGING_SOCKET`, and other ambient
+identifiers straight into the hook's environment — a concrete demonstration, not a hypothetical. The
+`#[cfg(not(unix))]` `cmd.exe` branch got the same mechanical fix (`env_clear()` plus `PATH`/`USERPROFILE`/
+`TEMP`/`TMP`/`SystemRoot`) for consistency, but **that branch is not compiler-verified**: this session runs
+on macOS, where `#[cfg(not(unix))]` is never compiled, and (as already noted for the `crates/auth` Windows
+finding above) cross-target `cargo check` fails on this host due to a Homebrew-vs-rustup toolchain mismatch
+unrelated to this change. Flagging honestly rather than claiming full verification for that one branch.
+
+Secondary, lower-severity finding from the same review, not fixed this pass: none of `run_hook_once`/
+`run_pre_tool_hooks`/`run_post_tool_hooks`/`run_notify_hooks` take a `CancellationToken` — a hook's wait loop
+only checks its own timeout (`HOOK_TIMEOUT`, 5s default), so Ctrl-C/turn cancellation doesn't shorten a
+running hook, and up to `MAX_HOOKS_PER_STAGE` (8) hooks run sequentially per stage, bounding the worst-case
+extra delay at roughly 8×5s. Bounded, not a hang, and inconsistent with this session's `crates/mcp`
+cancellation-bridge fix two entries above only in spirit, not in severity — left as a documented gap rather
+than bundled into this fix, since it's a distinct change (four function signatures, all call sites) from the
+env-leak fix above.
+
+Full `hooks` test module (10 tests, up from 9), full `-p rapid --lib` suite (360 tests, up from 359), and
+`cargo build --workspace --tests` all pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

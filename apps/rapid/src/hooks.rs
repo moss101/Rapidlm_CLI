@@ -107,15 +107,31 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> (bool, S
         Err(err) => return (false, format!("hook output file failed: {err}")),
     };
     #[cfg(unix)]
-    let spawn = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::from(output_file.try_clone().expect("clone")))
-        .stderr(Stdio::from(output_file))
-        .spawn();
+    let spawn = {
+        let mut command_builder = Command::new("sh");
+        command_builder.arg("-c").arg(command).env_clear();
+        for key in ["PATH", "HOME", "LANG", "TMPDIR"] {
+            if let Ok(value) = std::env::var(key) {
+                let _ = command_builder.env(key, value);
+            }
+        }
+        command_builder
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(output_file.try_clone().expect("clone")))
+            .stderr(Stdio::from(output_file))
+            .spawn()
+    };
     #[cfg(not(unix))]
-    let spawn = Command::new("cmd").arg("/C").arg(command).spawn();
+    let spawn = {
+        let mut command_builder = Command::new("cmd");
+        command_builder.arg("/C").arg(command).env_clear();
+        for key in ["PATH", "USERPROFILE", "TEMP", "TMP", "SystemRoot"] {
+            if let Ok(value) = std::env::var(key) {
+                let _ = command_builder.env(key, value);
+            }
+        }
+        command_builder.spawn()
+    };
     let mut child = match spawn {
         Ok(child) => child,
         Err(err) => {
@@ -375,6 +391,35 @@ exit 0"#,
             started.elapsed() < Duration::from_secs(5),
             "the hook budget must bound the wait"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hook_subprocess_does_not_inherit_ambient_environment() {
+        let dir = std::env::temp_dir().join(format!("hook-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let capture = dir.join("env.txt");
+        let hook = format!("env > {}", capture.display());
+        assert_eq!(
+            run_pre_tool_hooks(&[hook], "repo_read", "{}", HOOK_TIMEOUT),
+            PreHookOutcome::Allowed
+        );
+        let captured = std::fs::read_to_string(&capture).expect("captured env");
+        // The four we deliberately forward, plus what `sh` itself injects
+        // even under `env -i` (confirmed via `env -i PATH=/usr/bin:/bin sh
+        // -c 'env'`: PWD, SHLVL, and `_`) — not something our own spawn
+        // code passes through. Anything outside this set had to come from
+        // the real process environment, which env_clear() must stop.
+        const ALLOWED: &[&str] = &["PATH", "HOME", "LANG", "TMPDIR", "PWD", "SHLVL", "_"];
+        for line in captured.lines() {
+            let Some((key, _)) = line.split_once('=') else {
+                continue;
+            };
+            assert!(
+                ALLOWED.contains(&key),
+                "hook subprocess must not inherit ambient env var {key:?}: {captured}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
