@@ -3055,6 +3055,68 @@ than a mechanical patch matching an existing in-file pattern.
 Full `exec_tools` test module (93 tests, up from 90), full `-p rapid --lib` suite (365 tests, up from 362),
 full `-p rapid --tests` integration suites, and `cargo build --workspace --tests` all pass.
 
+**Same sweep, next applied to the project-trust and permission-grant *persistence* layer
+(`crates/kernel/src/project/trust.rs::ProjectTrustStore`, `apps/rapid/src/permissions.rs::parse_grants`) —
+the disk-backed mechanism behind "is this workspace trusted" and "did a human already approve this specific
+ask rule." Two real findings, neither fixed this pass, for the same underlying reason: both are latent in
+code with no reachable production writer today, and closing either one for real means designing that missing
+writer first, not patching the persistence code in isolation.**
+
+**The load-bearing finding: nothing in the shipped binary ever calls `ProjectTrustStore::set` (or triggers
+`get`'s self-heal write) — trust can only ever become `Trusted` on disk via manual file editing, not through
+any `rapid` command.** `grep -rn "\.set(&"` across the whole workspace: the only call sites are `trust.rs`'s
+own tests and `interactive.rs`'s own test module, which opens the store and calls `.set()` directly to
+*fabricate* a trusted state before exercising the interactive loop — even the test that exercises "trust is
+active" has no real grant flow to drive instead. Every real production caller of the *read* side
+(`exec_workspace`, `resolve_project` in `interactive.rs`) constructs `ProjectIdentity::new(root, None)` — no
+VCS fingerprint, no device hint, no manifest hash — confirmed via a repo-wide grep of every `ProjectIdentity::
+new(` call site. `apps/rapid/tests/exec_diagnosability.rs`'s own `trusted_project` test helper writes
+`project-trust.json` directly via `std::fs::write`, with a doc comment that says so explicitly: *"mirroring
+the interactive trust grant"* — because there is no interactive trust grant to call instead. The same holds
+for permission grants: `permissions.rs::parse_grants` is a pure reader with one real caller
+(`exec_permission_lattice`), and a repo-wide grep for `project-trust.json`/`project-permissions.json` across
+every file type finds only test fixtures as writers. This is not a new discovery — it corroborates, via
+independent code-level re-derivation (grep/read from scratch, not taken on faith), a gap already noted in
+this repo's own pre-existing `gap_analysis.md` (§3.2, "Project trust is un-grantable") — a different session's
+document, not something this sweep produced. Consequence: this fails *too* closed today (workspace tools stay
+a permanent no-op surface in the shipped build, since `TrustStatus::Trusted` can never be produced through
+the app), not too open — so there's no live over-grant to fix, only a missing feature. Building the actual
+grant UI/flow is a large, separate piece of work belonging with whoever picks up that gap, not this sweep.
+
+**Found, verified computationally, and left unfixed given the finding above: `ProjectTrustStore::persist`/
+`load` have no locking at all, so a lost-update race can silently revert an already-committed, fsync'd grant
+or revoke — but the only two callers that could ever trigger it (`set`, and `get`'s self-heal branch) are
+both effectively dead in production.** (`crates/kernel/src/project/trust.rs:290-388`.) `set()`'s
+read-modify-write has no file lock, no compare-and-swap, and doesn't even re-read before its final
+`fs::rename`; two concurrent writers starting from the same snapshot silently drop one committed write with no
+error to either caller — worst case, a revoke racing a grant loses, meaning a project a human just told the
+tool *not* to trust could end up `Trusted` again purely from timing. `get()`'s own self-heal write (rewriting
+a record to `Untrusted` when `material_eq` fails) shares the exact same unlocked path — but per the finding
+above, every real caller passes `identity` with every optional fingerprint field `None`, so `material_eq`
+compares `None == None` (always equal) and that branch can never actually fire for a real caller either,
+confirming this is genuinely latent today, not just theoretically rare. A secondary aggravation in the same
+function: `part_path()`'s temp filename is fixed (`<catalog>.part`), shared by every writer to that catalog
+rather than randomized per attempt, so two true concurrent writers could in principle interleave writes into
+the same temp file before either renames it — `decode_catalog`'s own strict schema validation fails closed on
+the resulting corruption rather than silently accepting a spliced file, so this mostly manifests as the lost
+update above or a hard, typed error, not a silent over-grant. Verified by the reviewing agent with a
+throwaway test calling the module's own private `load`/`persist` directly to force the exact interleaving
+(committed grant for one project reverted by a second writer's stale-snapshot commit), confirmed passing,
+then reverted via `git checkout --` with a clean `git status` afterward. **Not fixed this pass**: real
+locking (a file lock via a crate like `fs2`/`fslock`, or a compare-and-swap/version scheme) is a genuine
+design decision, and doing it now — against an interface with zero real callers to validate the right shape
+against — would be solving a concurrency problem for a writer that doesn't exist yet, the same reasoning this
+document has already applied to `crates/agent-pool`'s unowned-release gap and `crates/computer-use`'s
+lease-replay gap.
+
+Also noted, purely as a consequence of the first finding rather than an independent bug:
+`ProjectIdentity::material_eq`'s protection against a *different* project later reusing the same directory
+path (verified via VCS remote fingerprint / device hint / manifest hash) can never fire for any real caller
+today, since production code never populates those fields — so if a future trust-grant UI is wired up by
+copying the existing `ProjectIdentity::new(root, None)` call pattern already used everywhere else in this
+codebase, it would silently inherit this same gap rather than getting the protection the module's own doc
+comment advertises. Worth a note for whoever builds that UI, not something to patch in isolation now.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
