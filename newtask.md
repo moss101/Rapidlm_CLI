@@ -2497,6 +2497,79 @@ created, proving the smudge command ran) — before restoring the fix and re-con
 that checked-out content is still correct (`tracked.txt` reads back as `base\n`, not the filter's stdout).
 Full `workspace` crate suite (174 tests, up from 173) and `cargo build --workspace --tests` both pass.
 
+**Same second-pass adversarial sweep, next applied to `crates/auth` — background review dispatched
+specifically to hunt for authorization bypasses (TOCTOU races, stale caches, silently-downgraded
+comparisons, revocation-not-enforced-at-use, fail-open-where-fail-closed-was-intended), not just general
+code quality. Two real, computationally-verified findings; one fixed, one documented and deliberately not
+attempted.**
+
+**Fixed: `EnvIdentity::from_parts`'s environment fingerprint was not injective — a NUL byte inside a value
+could forge a collision with a different, multi-variable environment.** (`crates/auth/src/
+env_identity.rs:33-47`.) The module's own doc states the invariant plainly: *"a cache value fetched under
+one process environment or OS identity is never served to a different one."* The fingerprint buffer was
+built as `uid_be || Σ(name || 0x00 || value || 0x00)` over the sorted bindings — no length-prefixing, no
+escaping of `0x00` inside `name`/`value`. Since Rust `String`s can legally contain a NUL byte, two distinct
+logical environments could serialize to the identical byte buffer: `{"a":"1","b":"2"}` and
+`{"a":"1\0b\x002"}` both produce `61 00 31 00 62 00 32 00`, and `ArtifactId::from_bytes` is plain unkeyed
+SHA-256, so identical buffers guarantee an identical `EnvIdentity` — the sole gate `SecretBroker::open()`
+checks. Fixed by switching to length-prefixed encoding (`(name.len() as u64).to_be_bytes() || name ||
+(value.len() as u64).to_be_bytes() || value`), the same length-prefix convention already used elsewhere in
+this codebase for hash/fingerprint inputs (`crates/workspace/src/merge.rs:921`, `crates/workspace/src/
+patch/model.rs:456`, `crates/event-ledger/src/journal.rs:805`) — this makes the encoding unambiguously
+injective regardless of byte content. New test `embedded_nul_bytes_cannot_forge_a_different_bindings_
+identity`, verified via the standard revert cycle: reverted to the unprefixed encoding, re-ran the test,
+confirmed both `EnvIdentity` values were byte-identical (`assert_ne!` failed with matching `fingerprint`
+values in the panic output) before restoring the fix and re-confirming all tests pass. **Not reachable from
+any real, shipped call site today** — `EnvIdentity`/`SecretBroker`/`CredentialCacheKey` have zero callers
+outside `crates/auth`'s own doc comments and tests — but `from_parts` takes an arbitrary `impl IntoIterator
+<Item = (String, String)>`, not just `std::env::vars()` (which can't contain NUL), so any future non-OS-env
+caller (config-derived, network-derived) would have inherited the ambiguity; worth closing before that
+wiring happens rather than after. Full `auth` crate suite (73 tests, up from 72) and `cargo build --workspace
+--tests` both pass.
+
+**Found, verified, and deliberately left unfixed: PowerShell command injection in
+`WindowsCredentialManager::put`.** (`crates/auth/src/os_keychain_other.rs:33-46`, specifically the `format!`
+building the PowerShell script at line 40.) The secret is spliced directly into a single-quoted PowerShell
+string literal — `PasswordCredential('RapidLM','{acct}','{pass}')` — with `pass` built from the raw secret
+bytes and never escaped. `{acct}` is safe (constrained by `parse_alias`/`parse_uuid_id`'s allowlisted
+charset, which excludes `'`), but the secret itself is only bounded by `MAX_SECRET_BYTES`
+(`crates/auth/src/secret.rs:157-168`) with no charset restriction. Any credential containing a single quote
+— an entirely realistic human-typed password or pasted API key — breaks out of the string literal: a secret
+of `abc'); Start-Process calc.exe; ('` produces a script that runs `Start-Process calc.exe` as an injected
+statement, with the RapidLM process's own privileges. **Confirmed by direct inspection of the full call
+chain (no escaping exists anywhere between `SecretValue` and this `format!`)**, not just a suspicion.
+
+**Reachable from zero real, shipped call sites today** — `WindowsCredentialManager`/`PlatformKeychainAdapter
+::new` have no callers outside `crates/auth` itself and a cosmetic string mapping in `crates/security/src/
+doctor.rs`; `apps/rapid` currently only wires up `InMemoryCredentialStore`. This is, however, the actual
+"P4-032 production backend" the crate's own comments describe as meant to be wired up, so it needs fixing
+(most likely the same way the Linux `secret-tool` backend already avoids this class of bug two modules down
+in the same file: pass the secret via stdin instead of interpolating it into an executed command string,
+rather than just escaping embedded quotes) before any real caller adopts it.
+
+**Deliberately not fixed this pass, for a reason distinct from every other decline in this document:** every
+prior "found but not fixed" entry here was declined because the *design* needed a decision (a trait-signature
+change, an API-shape choice) too large for a mechanical patch. This one is different — the fix itself is
+well-understood and low-risk — but the whole file is `#![cfg(any(target_os = "windows", target_os =
+"linux"))]`-gated (`os_keychain_other.rs:4`), so **it does not compile at all on this development machine**
+(macOS/aarch64). Confirmed this is a hard platform limitation, not a config oversight: `rustup target list
+--installed` reports `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu` present, `rustup target add
+x86_64-pc-windows-msvc` reports the target already up to date, yet `cargo check --target x86_64-pc-windows-
+msvc -p auth --tests` fails with `error[E0463]: can't find crate for core` — the active `rustc` resolves to a
+Homebrew install (`rustc 1.97.1 (8bab26f4f 2026-07-14) (Homebrew)`) that doesn't see the rustup-managed
+target's std, ahead of the rustup-managed toolchain `rustup show` claims is active; the Linux cross-target
+check fails the same way, plus a missing `x86_64-linux-gnu-gcc` linker for one dependency's build script.
+Reconfiguring the host's Rust toolchain/PATH precedence to unblock this is a system-configuration change
+outside this session's scope, not a one-line code fix, so — matching this document's own standing rule of
+never forcing through a change this session cannot actually verify — the finding is fully documented here
+for whoever next touches this file (ideally on an actual Windows or Linux host, or CI) rather than committed
+unverified. *Secondary, much lower-severity note found in the same review:* both the macOS and Windows
+backends pass the secret as a literal CLI argument (`security add-generic-password -w <secret>` /
+the PowerShell `-Command` script), which isn't shell injection (no shell is invoked — `Command::args` execs
+directly) but does put secret plaintext into the local process argument list, visible to co-resident
+processes that can read `ps` output on the same host; inherent to those OS CLIs, flagged for completeness
+only.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

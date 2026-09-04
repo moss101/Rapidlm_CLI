@@ -35,10 +35,10 @@ impl EnvIdentity {
         let mut buf = Vec::new();
         buf.extend_from_slice(&uid.to_be_bytes());
         for (name, value) in &sorted {
+            buf.extend_from_slice(&(name.len() as u64).to_be_bytes());
             buf.extend_from_slice(name.as_bytes());
-            buf.push(0);
+            buf.extend_from_slice(&(value.len() as u64).to_be_bytes());
             buf.extend_from_slice(value.as_bytes());
-            buf.push(0);
         }
         Self {
             uid,
@@ -91,6 +91,18 @@ mod tests {
         let refer = SecretRef::from_id("018f3c8a-7e2b-7a10-8c4d-0123456789ab").expect("refer");
         assert_eq!(a, b);
         assert_eq!(a.cache_key(refer.clone()), b.cache_key(refer));
+    }
+
+    #[test]
+    fn embedded_nul_bytes_cannot_forge_a_different_bindings_identity() {
+        // Without length-prefixing, {"a":"1","b":"2"} and {"a":"1\0b\x002"}
+        // serialize to the identical delimiter-joined byte string, so a
+        // single crafted binding could collide with a genuinely different
+        // multi-variable environment's fingerprint.
+        let two_bindings = EnvIdentity::from_parts(1000, env(&[("a", "1"), ("b", "2")]));
+        let one_crafted_binding =
+            EnvIdentity::from_parts(1000, env(&[("a", "1\0b\x002")]));
+        assert_ne!(two_bindings, one_crafted_binding);
     }
 
     #[test]
