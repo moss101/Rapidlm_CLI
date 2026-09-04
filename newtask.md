@@ -1879,6 +1879,70 @@ noted, lower-severity: `JsonlDiagnostics`/`write_line`'s own single-line/size-ca
 (jsonl.rs:370-410) are never actually applied to any diagnostic text the shipped CLI produces (real stderr goes
 through plain `eprintln!`/`exec_diag::stderr_line` instead) — dead-code-in-practice rather than a live bug.
 
+**New crates reviewed for the first time this session, 2026-09-04: `crates/agent-runtime/src/goal/{driver,recovery,budget}.rs` and
+`crates/context-engine/src/retrieval/{candidates,rank,grep,filter,links}.rs`.** Both crates are heavily used by
+`apps/rapid` overall (goal_host.rs, context_retrieval.rs), but these specific files turned out to be a mix of
+"live and sound" and "real bugs in code with zero current callers" — another instance of this session's
+recurring §0a pattern (mature, tested code sitting unwired), this time *within* an otherwise-live crate rather
+than a whole dormant crate. Verified via repo-wide grep: **`GoalDriver`/`GoalRecovery`/`GoalBudgetGuard`
+(driver.rs, recovery.rs, budget.rs) have zero callers outside their own tests** — `apps/rapid/src/goal_host.rs`
+(the real `rapid goal` backend) uses only `state.rs`'s `GoalStateMachine`/`GoalSnapshot`/`GoalBudget` directly
+and re-implements the evidence-gated completion check itself, confirmed byte-for-byte equivalent to
+`driver.rs`'s `apply_lifecycle`. Similarly, **`grep.rs` and `links.rs` in context-engine have zero callers**
+anywhere outside their own tests (not even internally within context-engine), and `filter.rs`'s
+`ScopeSet`-based path filtering is only ever exercised with `ScopeSet::empty()` in the one live caller
+(`context_retrieval.rs:117-129`), so its filtering logic is never meaningfully invoked today either.
+
+**Verified, real bug in the dormant `driver.rs`/`budget.rs` pair — usage silently dropped for any turn that
+doesn't stay `Active` for its full duration.** `GoalDriver::next` calls `pause_if_active` (a fallback
+"pause if the turn didn't cleanly complete" transition) *before* `accrue_after_turn` records that turn's
+tokens — and separately, a mid-turn lifecycle tool (`goal.pause`/`.block`/`.cancel`/`.complete`, run via
+`GoalLifecycleTools::execute` from inside `run_turn` itself) can flip the state away from `Active` before
+`next()` ever regains control. Either way, by the time `accrue_after_turn` runs, `GoalBudgetGuard::accrue`'s
+own internal gate (`budget.rs:252-255`, `if self.state != GoalState::Active { return; }`) sees a non-`Active`
+state and silently no-ops — discarding the *entire* turn's usage (tokens, turn count, active_ms), even though
+`next()`'s own precondition (`driver.rs:253-261`) guarantees every turn it runs starts from `Active`, so the
+usage was genuinely incurred while active. Empirically confirmed (not just read-derived) by a background
+reviewer who built a standalone harness against the crate's real public API: a turn reporting
+`Completed`/3000 tokens after a mid-turn `goal.pause` tool call, and a turn reporting `Failed`/900 tokens after
+an ordinary tool-call step, both left `driver.snapshot().usage()` at all-zero. Once wired up, this would let a
+`max_tokens`-bounded goal spend tokens across a pause/resume cycle with the ceiling never actually decrementing
+for the turns that triggered the pause. **Not fixed this pass:** the accrual gate exists deliberately for a
+real, different scenario (`budget.rs`'s own doc: "`active_ms` is ignored while paused or blocked so parked
+time cannot consume the wall-clock ceiling") — the correct fix needs the guard to accrue against the state the
+goal was in *during* the turn (already captured, unused for this purpose, in `next()`'s own pre-turn `snapshot`
+local at line 253) rather than the state after any mid-turn or fallback transition, without breaking that
+parked-time-shouldn't-count property for the genuinely-already-parked case. That requires tracing exactly how
+`apply_lifecycle`'s state-machine transitions interact with the snapshot's `usage` field across all four
+lifecycle commands, which is more state-machine-invariant work than a mechanical reorder — flagging in detail
+so whoever wires `driver.rs` into the live product doesn't have to rediscover it from scratch, but declining to
+guess at a fix for code with zero current callers and no test coverage of this exact interaction.
+
+**Two smaller, lower-severity findings in the same dormant files, also not fixed:** (1) `budget.rs`'s `cost`
+dimension can never advance through the normal turn loop — `driver.rs:401`'s only call to
+`GoalBudgetGuard::after_model` hardcodes `cost: 0`, and `ModelStepOutput`'s real `cost_usd_micros` field
+never even reaches `TurnUsage` (which has no `cost` field at all) to be threaded through; harmless today only
+because nothing in the live CLI can set a goal's `max_cost` ceiling in the first place (`interactive.rs:444`
+always passes `None`). (2) `recovery.rs::GoalRecovery::into_driver` (line 96) always reconstructs a driver
+with a brand-new, empty `EvidenceService`, discarding any evidence already satisfied before a crash — asymmetric
+with `GoalHost`'s own real recovery path (`goal_host.rs`'s `load`/`load_evidence`), which correctly restores
+both. Inert today since nothing calls `recover_goal`/`into_driver` at all.
+
+**Verified, real (but also currently unreachable) bug in context-engine's `filter.rs` — the identical
+raw-vs-normalized-path shape as today's already-fixed `ripple_advisory_inner` bug, one layer over.**
+`allows_path`/`path_matches_prefix` (`filter.rs:86-97`, `:187-193`) compare a normalized `RepoPath::as_str()`
+candidate path against a `ScopeSet` prefix string that is validated (length, NUL bytes) but never normalized —
+so a scope prefix supplied as `"./src"` or `"src\\utils"` (Windows-style) would never match any real candidate
+path, silently dropping in-scope files. `grep.rs`'s equivalent `prefix_matches` gets this right by parsing both
+sides as `RepoPath` first. **Confirmed not reachable today:** the one live caller
+(`context_retrieval.rs:117-129`) always constructs `ScopeSet::empty()`, under which `allows_path` short-
+circuits true before `path_matches_prefix` is ever meaningfully exercised — this only bites the moment a future
+`--scope`-style flag or another `context-engine` caller constructs a non-empty `ScopeSet` from a
+not-already-canonical path string. Noted for whoever adds that caller; not fixed now since there is no live
+reachability to verify a fix against, and normalizing via `RepoPath::parse` inside `path_matches_prefix` needs
+a decision about how to handle a prefix that fails to parse at all (silently drop the scope restriction?
+reject the `InformationNeed` at construction?) — a small design choice, not a pure mechanical change.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
