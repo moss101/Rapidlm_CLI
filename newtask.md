@@ -3117,6 +3117,77 @@ copying the existing `ProjectIdentity::new(root, None)` call pattern already use
 codebase, it would silently inherit this same gap rather than getting the protection the module's own doc
 comment advertises. Worth a note for whoever builds that UI, not something to patch in isolation now.
 
+**Same sweep, next applied to `apps/rapid/src/web_fetch.rs` — the real, live, model-callable `web_fetch`
+tool. Two real, directly reachable, severe findings; both fixed.**
+
+**Fixed: a DNS-rebinding SSRF bypass reaching loopback and RFC 1918/ULA-private targets, defeating
+`web_fetch`'s own defense-in-depth design.** `classify_fetch` (`web_fetch.rs::is_private_ip`, already hardened
+earlier this session for the IPv4-mapped-IPv6 bypass) resolves the URL's host and strictly classifies every
+address — but that's the *first* of two independent DNS resolutions. `fetch_page` then calls
+`llm_router::http_get`, which does its *own*, separate resolution immediately before connecting and checks it
+with `crates/llm-router/src/providers/openai_compatible.rs::ip_is_blocked` — a *much* weaker check (only
+unspecified/broadcast/multicast/`169.254.0.0/16`; no loopback, no RFC 1918, no ULA, no IPv4-mapped unwrap). An
+attacker's authoritative DNS with a short TTL can legally answer the two queries differently: a public IP for
+`classify_fetch`'s check, then `127.0.0.1`/`10.x.x.x`/`::1`/`::ffff:127.0.0.1`/etc. for `http_get`'s own
+resolution moments later — and since `TcpStream::connect_timeout` connects to whatever that second resolution
+returned, the model's `web_fetch` call reaches the operator's own loopback services or internal network. The
+existing code's own comment at the `http_get` call site had already (correctly) identified that two
+resolutions exist and could disagree, but drew the wrong conclusion from it — treating `classify_fetch` as
+the "strict" layer and `http_get`'s weaker check as an acceptable "second opinion... additionally catching
+some classes," when DNS rebinding means the *second*, weaker check is actually the one deciding what gets
+connected to.
+
+**The exact same fix this document's own §0a already flags as a live landmine (search "same lesson as this
+session's earlier llm-router::ip_is_blocked revert") applied here too, and was caught the same way: tightening
+`ip_is_blocked` directly broke 20 unrelated tests** (`cargo test -p llm-router` failures across
+`providers::openai_compatible::tests`/`providers::anthropic::tests`, all `endpoint: InvalidRequest`) —
+`OpenAiCompatibleEndpoint::new` calls the *same* function (via `host_is_blocked`'s literal-IP-address
+decoding) to validate an **operator-configured provider base URL**, where `http://127.0.0.1:11434`-style
+local providers (e.g. Ollama) are a real, legitimate, intended target, and `Http1Transport::execute` (the real
+provider request transport) calls `ip_is_blocked` completely unconditionally for the same reason. Tightening
+`ip_is_blocked` itself would have broken local-provider support exactly the way the earlier, already-reverted
+attempt did. Root-caused this precisely before writing a fix: `ip_is_blocked` has three call sites total, and
+only *one* (`http_get`'s own `!allow_private` connect-time re-check, reached only by `web_fetch`'s one real
+caller) should ever get the strict treatment. Fixed with a new, separate `resolved_ip_is_blocked_for_web_fetch`
+function — matching `is_private_ip`'s exact strictness (loopback/private/link-local/unspecified/broadcast,
+IPv6 loopback/ULA, IPv4-mapped unwrap) — used *only* at that one call site; `ip_is_blocked`,
+`host_is_blocked`, and every other caller are byte-for-byte unchanged. New test
+`http_get_with_allow_private_false_refuses_a_real_loopback_server`: a real local `TcpListener` that would
+answer with a real HTTP response if reached; `http_get(url, allow_private=false, ...)` must refuse before
+ever connecting. Verified via the revert cycle: reverting just the one call site made the test fail with
+`Ok([104, 105])` (the fixture's literal `"hi"` response bytes) — a live, exploitable direct proof, not a
+hypothetical. Full `llm-router` suite (141 tests, up from 140) confirms zero regressions to the
+provider-transport/endpoint-construction callers this fix deliberately left untouched.
+
+Fixing this also surfaced and closed a real functional regression risk in the same code path: `fetch_page`
+hardcoded `allow_private: false` unconditionally, ignoring its own `allowlist` parameter — meaning an
+explicitly allowlisted host (a local test fixture, or an operator-approved internal service) would pass
+`classify_fetch`'s allowlist check only to be refused a moment later by `http_get`'s independent check
+regardless. Extracted the shared `host_is_allowlisted` predicate `classify_fetch` already used internally, and
+`fetch_page` now derives `allow_private` from the same allowlist decision before calling `http_get` — closing
+the gap the *new*, stricter check would otherwise have reopened for every legitimately allowlisted host (this
+surfaced immediately as two real, previously-passing test failures during development, `web_fetch_caps_
+oversized_responses` and `web_fetch_refuses_loopback_by_default_and_fetches_when_allowlisted`, both now
+passing again).
+
+**Fixed: `web_fetch` dropped the turn's real cancellation token and substituted a fresh, never-cancelled
+one — the same bug class already fixed twice this session (`task_spawn`, the MCP stdio path).**
+`execute_web_fetch`'s `cancel` parameter was named `_cancel` (unused); `fetch_page`'s public signature had no
+cancellation parameter at all; the `http_get` call passed `&llm_router::provider::CancellationToken::new()`
+inline. `--max-wall-time`/Ctrl-C had zero effect on an in-flight fetch, which ran to its own fixed 30-second
+internal timeout regardless. Fixed the same way as the MCP fix: `fetch_page` now takes the real `agent_
+runtime::CancellationToken` and bridges it onto `llm_router::provider::CancellationToken` (a different type
+from a different crate, so no direct pass-through) via a poller thread, canceling the bridge as soon as the
+real token fires or the same 30s ceiling elapses either way. New test `web_fetch_honors_the_callers_real_
+cancellation_token`: a real TCP listener that accepts a connection and never responds; cancels the turn's
+token 200ms after the call starts; asserts the call returns in well under 10s. Verified via the revert cycle:
+without the bridge, the same test took exactly `30.084322417s` — confirming cancellation was genuinely
+ignored, not merely slow, matching the identical verification shape used for the two earlier cancellation
+fixes this session.
+
+Full `web_fetch`/`exec_tools` web_fetch test coverage (13 tests, up from 10), full `-p rapid --lib` suite (366
+tests, up from 365), full `llm-router` suite (141 tests), and `cargo build --workspace --tests` all pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

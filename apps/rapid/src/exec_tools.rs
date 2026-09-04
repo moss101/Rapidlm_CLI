@@ -2435,7 +2435,7 @@ impl WorkspaceTools {
     fn execute_web_fetch(
         &self,
         call: &ValidatedToolCall,
-        _cancel: &CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         let (url, max_bytes) = parse_web_fetch_args(call.arguments())?;
         if let Some(detail) = self.reserve_fetch_budget(max_bytes) {
@@ -2445,7 +2445,7 @@ impl WorkspaceTools {
                 detail: Some(bounded_detail(&detail)),
             });
         }
-        match crate::web_fetch::fetch_page(&url, &self.fetch_allowlist, max_bytes) {
+        match crate::web_fetch::fetch_page(&url, &self.fetch_allowlist, max_bytes, cancel) {
             Ok(text) if text.is_empty() => Ok(ToolStepResult::Succeeded {
                 call_id: call.call_id().to_owned(),
                 summary: format!("fetched {url}: empty page"),
@@ -8942,6 +8942,45 @@ for line in sys.stdin:
             }
             other => panic!("expected capped fetch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn web_fetch_honors_the_callers_real_cancellation_token() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            // Accept but never respond, holding the connection open — a
+            // stalled peer that only the caller's real cancellation, not a
+            // fixed internal timeout, should end quickly.
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(60));
+                drop(stream);
+            }
+        });
+        let root = TempRoot::new("fetch-cancel");
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_fetch_allowlist(vec!["127.0.0.1".to_owned()]);
+        let cancel = CancellationToken::new();
+        let call = make_call(
+            "c1",
+            WEB_FETCH_TOOL,
+            &format!(r#"{{"url":"http://127.0.0.1:{}/x"}}"#, addr.port()),
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        let trigger = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            trigger.cancel();
+        });
+        let started = Instant::now();
+        let _ = tools.execute(&validated, &cancel);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the caller's real cancellation must abort a stalled fetch promptly, \
+             not wait out web_fetch's fixed internal timeout: took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

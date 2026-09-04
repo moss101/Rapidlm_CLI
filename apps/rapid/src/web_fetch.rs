@@ -125,10 +125,7 @@ pub fn classify_fetch(url: &str, allowlist: &[String]) -> Result<(), FetchRefusa
     if split.scheme != "http" && split.scheme != "https" {
         return Err(FetchRefusal::UnsupportedScheme(split.scheme.clone()));
     }
-    let allowlisted = allowlist
-        .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(split.host));
-    if allowlisted {
+    if host_is_allowlisted(split.host, allowlist) {
         return Ok(());
     }
     let addrs = (split.host, split.port)
@@ -147,6 +144,17 @@ pub fn classify_fetch(url: &str, allowlist: &[String]) -> Result<(), FetchRefusa
         return Err(FetchRefusal::InvalidUrl(url.to_owned()));
     }
     Ok(())
+}
+
+/// Exact, case-insensitive host match against the settings allowlist —
+/// shared by `classify_fetch`'s own check and by `fetch_page`, which needs
+/// to know the same answer to decide whether `http_get`'s independent,
+/// connect-time re-check should also admit the host (otherwise an
+/// explicitly allowlisted host, e.g. a local test fixture or an operator-
+/// approved internal service, would pass `classify_fetch` only to be
+/// refused a moment later by the second, unrelated check).
+fn host_is_allowlisted(host: &str, allowlist: &[String]) -> bool {
+    allowlist.iter().any(|allowed| allowed.eq_ignore_ascii_case(host))
 }
 
 fn strip_block(source: &str, block: &str) -> String {
@@ -242,12 +250,48 @@ pub fn html_to_text(html: &str) -> String {
 
 /// Fetch `url` and return bounded readable text. `allowlist` admits
 /// private/loopback hosts that the SSRF guard would otherwise refuse.
+/// `cancel` is the caller's real turn cancellation token (Ctrl-C /
+/// `--max-wall-time`); an in-flight fetch must observe it, not run to its
+/// own internal timeout regardless.
 pub fn fetch_page(
     url: &str,
     allowlist: &[String],
     max_bytes: usize,
+    cancel: &agent_runtime::CancellationToken,
 ) -> Result<String, FetchRefusal> {
     classify_fetch(url, allowlist)?;
+    // `classify_fetch` above already let this host through either because
+    // it resolved to only public addresses, or because it's explicitly
+    // allowlisted — in the latter case, `http_get`'s own independent
+    // connect-time re-check must admit it too, or an allowlisted host
+    // (a local test fixture, an operator-approved internal service) would
+    // pass the first check only to be refused by the second.
+    let allow_private = split_url(url)
+        .map(|split| host_is_allowlisted(split.host, allowlist))
+        .unwrap_or(false);
+    const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    // `http_get` takes `llm_router::provider::CancellationToken` — a
+    // different type than the caller's real `agent_runtime::
+    // CancellationToken` — so the two can't be passed through directly.
+    // Bridge them with a poller instead of substituting a fresh, never-
+    // cancelled token: without this, Ctrl-C/--max-wall-time had no effect
+    // on an in-flight fetch, which could then run the full FETCH_TIMEOUT
+    // regardless of the turn already having been cancelled.
+    let bridge = llm_router::provider::CancellationToken::new();
+    let watchdog = {
+        let bridge = bridge.clone();
+        let real_cancel = cancel.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + FETCH_TIMEOUT;
+            while std::time::Instant::now() < deadline {
+                if real_cancel.is_cancelled() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            bridge.cancel();
+        })
+    };
     let body = http_get(
         url,
         // `classify_fetch` above only bounds the *first* DNS resolution: a
@@ -255,18 +299,22 @@ pub fn fetch_page(
         // private/metadata IP on `http_get`'s own (independent) resolution
         // at connect time, which would slip straight through if that second
         // lookup's guards were disabled. Keep `http_get`'s guards active
-        // (`allow_private: false`) so the resolution that actually matters —
-        // the one immediately before connecting — is checked too. This
-        // makes `classify_fetch` a fast-path/early-error optimization plus a
-        // second, independent guard (it also catches address classes, like
-        // RFC1918 private ranges and loopback, that `http_get`'s narrower
-        // guard does not), rather than the sole line of defense.
-        false,
+        // (`allow_private`, mirroring the same allowlist decision
+        // `classify_fetch` already made) so the resolution that actually
+        // matters — the one immediately before connecting — is checked too.
+        // Both resolutions now enforce the same strict address
+        // classification (loopback/RFC1918/link-local/IPv4-mapped, not just
+        // the narrower metadata-focused set `http_get` used to apply on its
+        // own), so this is a genuine second, independent guard against DNS
+        // rebinding between the two lookups, not just a fast-path
+        // optimization.
+        allow_private,
         max_bytes,
-        std::time::Duration::from_secs(30),
-        &llm_router::provider::CancellationToken::new(),
-    )
-    .map_err(|_| FetchRefusal::InvalidUrl(url.to_owned()))?;
+        FETCH_TIMEOUT,
+        &bridge,
+    );
+    drop(watchdog);
+    let body = body.map_err(|_| FetchRefusal::InvalidUrl(url.to_owned()))?;
     let text = String::from_utf8_lossy(&body);
     let mut readable = if text.trim_start().starts_with('<') {
         html_to_text(&text)

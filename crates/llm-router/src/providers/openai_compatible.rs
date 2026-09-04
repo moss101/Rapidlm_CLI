@@ -1615,6 +1615,49 @@ fn slice_timeout(total: Duration) -> Duration {
     if total < slice { total } else { slice }
 }
 
+/// Strict address classification for `http_get`'s post-resolution,
+/// connect-time re-check only — never for `host_is_blocked`/`ip_is_blocked`,
+/// which the real provider transport (`Http1Transport::execute`) and
+/// `OpenAiCompatibleEndpoint::new` also rely on, unconditionally, to reach a
+/// legitimately operator-configured local provider (e.g. Ollama on
+/// `127.0.0.1`) — tightening those directly breaks that real, intended use.
+///
+/// `http_get`'s one real caller (`apps/rapid`'s `web_fetch` tool) resolves
+/// the same host TWICE: once in its own pre-flight `classify_fetch`, and
+/// again here, independently, right before connecting. An attacker's
+/// authoritative DNS can legally answer those two queries differently
+/// (DNS rebinding) — so this second resolution, not the first, is the one
+/// that actually decides what `TcpStream::connect_timeout` reaches, and it
+/// must therefore be at least as strict as `classify_fetch`'s own check
+/// (loopback, RFC 1918/4193 private ranges, link-local, unspecified,
+/// broadcast/multicast, and the IPv4-mapped-IPv6 unwrap for all of the
+/// above) — plain `ip_is_blocked` only blocks unspecified/broadcast/
+/// multicast/169.254.0.0/16, so `127.0.0.1`, `10.0.0.0/8`, `172.16.0.0/12`,
+/// `192.168.0.0/16`, IPv6 loopback, and `fc00::/7` all sailed through it.
+fn resolved_ip_is_blocked_for_web_fetch(ip: IpAddr) -> bool {
+    fn v4(v4: Ipv4Addr) -> bool {
+        v4.is_unspecified()
+            || v4.is_broadcast()
+            || v4.is_multicast()
+            || v4.is_loopback()
+            || v4.is_private()
+            || v4.is_link_local()
+    }
+    match ip {
+        IpAddr::V4(addr) => v4(addr),
+        IpAddr::V6(addr) => {
+            if let Some(mapped) = addr.to_ipv4_mapped() {
+                return v4(mapped);
+            }
+            addr.is_unspecified()
+                || addr.is_multicast()
+                || addr.is_loopback()
+                || addr.is_unicast_link_local()
+                || (addr.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
 /// Tool-facing bounded HTTP GET: the same SSRF guards, TLS root set, and
 /// response caps as the provider transport, without provider auth plumbing.
 /// `allow_private` opts loopback/private targets back in (callers must have
@@ -1640,7 +1683,7 @@ pub fn http_get(
     let mut selected = None;
     for addr in addrs {
         cancel.check()?;
-        if !allow_private && ip_is_blocked(addr.ip()) {
+        if !allow_private && resolved_ip_is_blocked_for_web_fetch(addr.ip()) {
             return Err(ProviderError::InvalidRequest);
         }
         if selected.is_none() {
@@ -3243,5 +3286,33 @@ mod tests {
         .expect("http_get");
         assert_eq!(result, body.as_bytes());
         server.join().expect("server thread");
+    }
+
+    #[test]
+    fn http_get_with_allow_private_false_refuses_a_real_loopback_server() {
+        // A DNS-rebinding attacker controls what the *second* (connect-time)
+        // resolution answers, independent of whatever apps/rapid's own
+        // pre-flight classify_fetch already approved — so this is the check
+        // that actually decides what gets connected to, and it must refuse
+        // loopback on its own, not rely on the caller's first check having
+        // already caught it. A real listening server (not just a bound-
+        // then-dropped port) proves the refusal happens before any
+        // connection attempt, not merely that nothing answered.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        thread::spawn(move || {
+            // If the guard fails, this accepts and answers; if it holds
+            // (the expected outcome), this blocks harmlessly for the rest
+            // of the test binary's run rather than affecting the test.
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+            }
+        });
+        let url = format!("http://127.0.0.1:{}/x", addr.port());
+        let result = http_get(&url, false, 1024, Duration::from_secs(2), &CancellationToken::new());
+        assert!(
+            matches!(result, Err(ProviderError::InvalidRequest)),
+            "loopback must be refused even via the connect-time resolution, got {result:?}"
+        );
     }
 }
