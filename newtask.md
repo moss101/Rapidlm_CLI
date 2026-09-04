@@ -1732,6 +1732,104 @@ confirming the fix closes it. Full `context_retrieval` test module (7 tests, up 
 confusing/wrong message rather than data loss — but easily triggered given how common both `./`-prefixed
 tool-call paths and same-file helper→target patterns are.
 
+**Fresh review pass, 2026-09-04, `apps/rapid/src/web_fetch.rs::is_private_ip` (line 90) — the SSRF guard's
+IPv6 arm never unmapped IPv4-mapped IPv6 addresses, a well-known SSRF-filter bypass.** Module doc: "every
+resolved address for the URL's host must be public unless the host is on the settings allowlist." An address
+in `::ffff:0:0/96` encodes an IPv4 address and is routed by any dual-stack network stack to that embedded
+IPv4 destination — but `is_private_ip`'s `IpAddr::V6` arm only checked `is_loopback`/`is_unspecified`/
+`is_unicast_link_local`/the ULA range, never calling `to_ipv4_mapped()` first. **Concrete failure:** an
+attacker-controlled domain publishing an `AAAA` record for `::ffff:127.0.0.1` (or `::ffff:169.254.169.254`
+for cloud instance metadata, or any RFC1918 address) sailed straight through `classify_fetch`, which is
+called on every real `web_fetch` tool invocation (`exec_tools.rs:2302`) with an attacker/model-choosable URL.
+**Fixed:** both `is_private_ip`'s V4 and V6 arms now share a `is_private_ipv4` helper, and the V6 arm calls
+`v6.to_ipv4_mapped()` first, judging a mapped address by its embedded IPv4 rules before falling through to
+the existing IPv6-specific checks. New test `classify_refuses_ipv4_mapped_ipv6_addresses` (three IPv4-mapped
+literals: loopback, link-local metadata, and RFC1918) — verified via the revert cycle that the original code
+returned `Ok(())` for `[::ffff:127.0.0.1]` exactly as predicted, before confirming the fix rejects it. Full
+`web_fetch` test module (7 tests, up from 6) and `cargo build --workspace --tests` pass.
+
+**Same review pass, investigated but declined: `crates/llm-router`'s `ip_is_blocked`/`host_is_blocked` have
+the identical IPv4-mapped gap, and `http_get`'s IPv4 arm never checks `is_loopback()`/`is_private()` at all —
+directly contradicting `allow_private`'s own doc comment ("opts loopback/private targets back in," implying
+`false` blocks them).** `web_fetch.rs::fetch_page` always calls `http_get(url, ..., false, ...)`, with its own
+comment explaining this second, independent resolution exists specifically to close a DNS-rebind TOCTOU
+window (a short-TTL attacker domain answering with a public IP on `classify_fetch`'s lookup and a
+private/loopback IP on `http_get`'s lookup immediately before connecting) — a window that in fact stays open
+today for every class `ip_is_blocked` doesn't check. Attempted the equivalent fix (broadening `ip_is_blocked`'s
+IPv4 arm to `is_loopback`/`is_private`/`is_link_local`, unmapping IPv4-mapped IPv6 first) and it **failed 20
+existing tests** across `providers::anthropic` and `providers::openai_compatible` — `cancellation_is_not_
+swallowed`, `auth_failure_is_not_remapped_to_transient`, several streaming/normalization tests, all of which
+bind a real `TcpListener` on `127.0.0.1` to exercise the actual provider transport. `ip_is_blocked`/
+`host_is_blocked` are shared by both `http_get` (the one tool-facing caller with a genuine untrusted-URL SSRF
+concern) *and* the main provider connection path, which by design must be able to reach a self-hosted/local
+OpenAI-compatible endpoint (LM Studio, Ollama, an on-prem gateway) — for that path, blocking loopback/RFC1918
+outright would be a regression, not a fix, since a configured `base_url` pointing at a local server is the
+intended use, not an attacker-controlled URL. Reverted the `llm-router` change entirely (`git diff` confirms
+zero delta) and kept only the self-contained `web_fetch.rs` fix above, which fully closes the *first*-resolution
+gap `classify_fetch` owns. **Flagging for a future pass, not fixing now:** closing the residual DNS-rebind
+window on the `http_get` side needs either a second, stricter blocklist function used only by `http_get`'s
+`allow_private: false` path (distinct from the shared provider-transport one), or some other way to give
+`fetch_page`'s specific untrusted-URL threat model a check that doesn't also constrain legitimate self-hosted
+provider endpoints — a real design decision, not a mechanical one-line fix, so declining to rush it.
+
+**Same review pass, `apps/rapid/src/pdf_text.rs::extract_pdf_text` (line 39) — a single corrupted or
+chain-filtered stream discarded every page of text already extracted from earlier streams in the same PDF.**
+Doc comment: "Returns `None` when the input is not a PDF or contains no harvestable text operators." The loop
+scans every `stream...endstream` object in the file, pushing each one's harvested text into `collected` — but
+`inflate(&bytes[data_start..data_end])?` propagated a `None` from a single failed `FlateDecode` (truncated
+data, bit-flip corruption, or a chained filter like `[/ASCII85Decode /FlateDecode]` that the substring-based
+`is_flate` detection doesn't account for) straight out of the *whole* function via `?`, discarding every
+page already pushed into `collected` and never scanning any later object either. **Concrete failure:** a
+3-stream PDF where streams 1 and 3 are valid FlateDecode with real text and stream 2 is corrupted returns
+`None` for the entire file — reported to the model as "no extractable text (scanned or encoded content)" for
+a document that is in fact mostly text-extractable. Live and reachable: `extract_pdf_text` runs on every
+`.pdf` read through `workspace_read`/`repo_read` (`exec_tools.rs:1352`). Checked this file for the same
+unchecked-byte-offset panic shape already fixed once this session in `pdf_page_count` — traced every slice
+operation by hand and found none recur here (all offsets are `find()`-derived or bounds-checked), so this is
+an isolated finding, not a sibling of that one. **Fixed:** `inflate(...).unwrap_or_default()` instead of `?`
+— a failed stream contributes empty content (skipped by the existing `page_text.trim().is_empty()` check)
+rather than aborting the file. New test
+`a_corrupted_stream_does_not_discard_text_already_extracted_from_earlier_streams` (3-stream PDF, middle one
+garbage) — verified via the revert cycle to fail (whole-file `None`) against the original `?`-based code
+before confirming the fix preserves both surrounding pages' text. Full `pdf_text` test module (6 tests, up
+from 5) and `cargo build --workspace --tests` pass.
+
+**Same review pass, `apps/rapid/src/external_agents.rs::MAX_AGENT_PROMPT_BYTES` (256 KiB) silently exceeded
+the transport's real, hard-enforced limit (`process_supervisor::MAX_STDIN_BYTES`, 64 KiB), so any prompt in
+between constructed successfully only to fail deterministically later.** `ExternalAgentTask::new` validates
+`prompt.len() > MAX_AGENT_PROMPT_BYTES`, but `SupervisedCliRunner::prepare` sends the prompt as the child's
+stdin via `StdinSpec::Bytes`, and `ExecSpec::build`'s own validation (`crates/process-supervisor/src/
+spawn.rs:336`) hard-rejects anything over `MAX_STDIN_BYTES` with `SpawnError::StdinTooLarge` — which
+`prepare()` then collapses into the generic `ExternalAgentError::Supervised("spec".into())`, losing the real
+cause entirely. **Concrete failure:** any `rapid agent-cli <prompt> -- <argv>` invocation (real command,
+`p9_commands.rs:286`, wired in `interactive.rs:339`) with a prompt between 64 KiB and 256 KiB — an entirely
+ordinary size, e.g. pasting a sizeable code excerpt — passes construction (`ExternalAgentTask::new` says it's
+fine) and then always fails at `prepare()` with a generic, unhelpful error that gives no hint the real limit
+is 4x smaller than advertised. **Fixed:** `MAX_AGENT_PROMPT_BYTES` now aliases `process_supervisor::
+MAX_STDIN_BYTES` directly instead of a separately-chosen, larger number — nothing in the 64–256 KiB range
+ever succeeded before this fix either, so this is a pure improvement (an immediate, specific
+`PromptTooLarge` at construction instead of a deferred, generic failure), not a capability regression. New
+test `new_rejects_a_prompt_too_large_for_the_stdin_transport` (a `MAX_STDIN_BYTES + 1`-byte prompt) — verified
+via the revert cycle that it passed construction under the old 256 KiB cap exactly as predicted, before
+confirming the fix rejects it. Full `external_agents` test module (9 tests, up from 8), including the real
+`supervised_cli_runner_drives_real_child_through_broker_lease` integration test, and
+`cargo build --workspace --tests` pass.
+
+**Same review pass, investigated but declined: `crates/process-supervisor::spawn()` writes a spawned child's
+stdin synchronously (`write_stdin`, blocking `pipe.write_all`) before returning, with no timeout and nothing
+yet draining the child's stdout/stderr concurrently — a mirror-image of the exact stdin-write-deadlock shape
+just fixed in `apps/rapid/src/hooks.rs::run_hook_once` this session, but here in a shared crate underlying
+every `process_supervisor::spawn()` caller, not a single self-contained file.** A child that emits any
+startup output before fully draining stdin (banners, verbose logging — common) combined with a stdin payload
+near or over the OS pipe buffer size can deadlock both sides before `await_exit_draining`'s timeout/grace
+logic ever begins, since that logic only starts after `spawn()` returns. `external_agents.rs`'s
+`DEFAULT_AGENT_TIMEOUT` (600s) would never actually bound such a hang. Declining to fix this pass: unlike the
+`hooks.rs` fix (one self-contained function in one file), `process_supervisor::spawn()` is a shared primitive
+used by `external_agents.rs` and `plugin-host::hooks.rs` alike, and the llm-router revert above already showed
+this session's own risk-assessment intuition for "should be safe" changes to shared crates isn't reliable
+without the full test suite — the right fix here likely mirrors `hooks.rs`'s detached-writer-thread pattern,
+but should be scoped and reviewed as its own pass across every real caller rather than folded into this batch.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

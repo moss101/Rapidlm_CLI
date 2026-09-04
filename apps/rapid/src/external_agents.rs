@@ -14,12 +14,19 @@ use acp::stdio::{JsonRpcId, JsonRpcMessage, StdioError};
 use acp::v1::StopReason;
 use capability_broker::{CancellationToken, CanonicalHostPath, LeaseUseGuard, PrincipalRef};
 use process_supervisor::{
-    ExecBinding, ExecSpec, SecretOrValue, StdinSpec, await_exit_draining, spawn, DEFAULT_GRACE,
+    ExecBinding, ExecSpec, MAX_STDIN_BYTES, SecretOrValue, StdinSpec, await_exit_draining, spawn,
+    DEFAULT_GRACE,
 };
 use protocol::SessionId;
 
-/// Maximum prompt bytes forwarded to an external agent.
-pub const MAX_AGENT_PROMPT_BYTES: usize = 256 * 1024;
+/// Maximum prompt bytes forwarded to an external agent. Pinned to
+/// `process_supervisor::MAX_STDIN_BYTES` rather than a separate, larger
+/// number: `prepare()` below sends the prompt as the child's stdin via
+/// `StdinSpec::Bytes`, which `ExecSpec::build`'s own validation hard-rejects
+/// past that bound (`SpawnError::StdinTooLarge`) — a task accepted here with
+/// a bigger cap would construct successfully only to fail deterministically,
+/// and unhelpfully, once `prepare()` runs.
+pub const MAX_AGENT_PROMPT_BYTES: usize = MAX_STDIN_BYTES;
 /// Maximum raw stdout bytes accepted back from an external CLI agent.
 pub const MAX_AGENT_RESULT_BYTES: usize = 256 * 1024;
 /// Capability-broker family used when supervising external agent processes.
@@ -687,6 +694,25 @@ mod tests {
         assert!(ExternalAgentCapabilities::new(false, 4, vec![long_tool]).is_err());
         assert!(ExternalAgentTask::new(SessionId::new(), "").is_err());
         assert!(ExternalAgentTask::new(SessionId::new(), "y".repeat(MAX_AGENT_PROMPT_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn new_rejects_a_prompt_too_large_for_the_stdin_transport() {
+        // `prepare()` sends the prompt as the child's stdin via
+        // `StdinSpec::Bytes`, and `ExecSpec::build`'s own validation hard-
+        // rejects anything over `process_supervisor::MAX_STDIN_BYTES` — so
+        // the constructor's own cap must never accept more than that, or an
+        // otherwise-valid task fails deterministically (and, before this
+        // fix, unhelpfully) later inside `prepare()` instead of at
+        // construction time.
+        let oversized = "y".repeat(MAX_STDIN_BYTES + 1);
+        assert!(
+            matches!(
+                ExternalAgentTask::new(SessionId::new(), oversized),
+                Err(ExternalAgentError::PromptTooLarge)
+            ),
+            "a prompt over MAX_STDIN_BYTES must be rejected at construction, not left to fail in prepare()"
+        );
     }
 
     #[test]

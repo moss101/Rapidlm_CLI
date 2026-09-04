@@ -6,7 +6,7 @@
 //! allowlist (loopback/private/link-local are refused by default, matching the
 //! reference CLIs' local-fetch protections).
 
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 
 use llm_router::http_get;
 
@@ -87,16 +87,28 @@ fn split_url(url: &str) -> Option<SplitUrl<'_>> {
     })
 }
 
+fn is_private_ipv4(v4: Ipv4Addr) -> bool {
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+}
+
 fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-        }
+        IpAddr::V4(v4) => is_private_ipv4(v4),
         IpAddr::V6(v6) => {
+            // An IPv4-mapped IPv6 address (::ffff:0:0/96) is routed by a
+            // dual-stack network stack to its embedded IPv4 destination, so
+            // it must be classified by the same rules as that IPv4 address —
+            // otherwise an attacker-controlled AAAA record encoding e.g.
+            // ::ffff:127.0.0.1 or ::ffff:169.254.169.254 (cloud metadata)
+            // sails past every IPv6-specific check below, a well-known
+            // SSRF-filter bypass technique.
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_private_ipv4(mapped);
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_unicast_link_local()
@@ -302,6 +314,21 @@ mod tests {
         // this pins down the IPv6 sibling doing the same.
         let refusal = classify_fetch("http://[fe80::1]/x", &[]).unwrap_err();
         assert!(matches!(refusal, FetchRefusal::PrivateTargetBlocked { .. }));
+    }
+
+    #[test]
+    fn classify_refuses_ipv4_mapped_ipv6_addresses() {
+        // ::ffff:0:0/96 encodes an IPv4 address; a dual-stack network stack
+        // routes it to that embedded IPv4 destination, so skipping the
+        // unmapping check lets an attacker-controlled AAAA record smuggle a
+        // private/loopback/link-local IPv4 target past the IPv6 arm's
+        // checks — a well-known SSRF-filter bypass technique.
+        let refusal = classify_fetch("http://[::ffff:127.0.0.1]/x", &[]).unwrap_err();
+        assert!(matches!(refusal, FetchRefusal::PrivateTargetBlocked { .. }), "{refusal:?}");
+        let refusal = classify_fetch("http://[::ffff:169.254.169.254]/x", &[]).unwrap_err();
+        assert!(matches!(refusal, FetchRefusal::PrivateTargetBlocked { .. }), "{refusal:?}");
+        let refusal = classify_fetch("http://[::ffff:10.0.0.5]/x", &[]).unwrap_err();
+        assert!(matches!(refusal, FetchRefusal::PrivateTargetBlocked { .. }), "{refusal:?}");
     }
 
     #[test]

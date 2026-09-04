@@ -35,8 +35,14 @@ pub fn extract_pdf_text(bytes: &[u8]) -> Option<String> {
         let dict_start = cursor;
         let dict = &bytes[dict_start..stream_start];
         let is_flate = find(dict, b"FlateDecode").is_some();
+        // A single corrupted/unsupported-filter stream must not discard
+        // text already harvested from earlier streams in the same file —
+        // matching the loop's own "one object failing must not abort the
+        // rest" shape (see the harvest/push logic below). `unwrap_or_default`
+        // yields an empty content, so this stream contributes no text but
+        // every other object is still scanned normally.
         let content: Vec<u8> = if is_flate {
-            inflate(&bytes[data_start..data_end])?
+            inflate(&bytes[data_start..data_end]).unwrap_or_default()
         } else {
             bytes[data_start..data_end].to_vec()
         };
@@ -213,5 +219,48 @@ mod tests {
     fn pdf_without_text_operators_yields_none() {
         let pdf = wrap_stream("", b"/Annots []");
         assert!(extract_pdf_text(&pdf).is_none());
+    }
+
+    #[test]
+    fn a_corrupted_stream_does_not_discard_text_already_extracted_from_earlier_streams() {
+        // Three stream objects, the middle one declared FlateDecode but
+        // filled with garbage that fails to inflate. The doc comment
+        // promises `None` only when the file "is not a PDF or contains no
+        // harvestable text operators" -- a corrupted middle object among
+        // otherwise-good ones does not meet that bar, so both surrounding
+        // pages' text must still come through.
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"BT /F1 12 Tf (page one text) Tj ET").expect("deflate");
+        let compressed1 = encoder.finish().expect("finish");
+        pdf.extend_from_slice(
+            format!("1 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n", compressed1.len())
+                .as_bytes(),
+        );
+        pdf.extend_from_slice(&compressed1);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let garbage = b"not valid zlib data at all, deliberately broken".to_vec();
+        pdf.extend_from_slice(
+            format!("2 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n", garbage.len())
+                .as_bytes(),
+        );
+        pdf.extend_from_slice(&garbage);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"BT /F1 12 Tf (page three text) Tj ET").expect("deflate");
+        let compressed3 = encoder.finish().expect("finish");
+        pdf.extend_from_slice(
+            format!("3 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n", compressed3.len())
+                .as_bytes(),
+        );
+        pdf.extend_from_slice(&compressed3);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n%%EOF");
+
+        let text = extract_pdf_text(&pdf).expect("text should survive a corrupted middle stream");
+        assert!(text.contains("page one text"), "{text}");
+        assert!(text.contains("page three text"), "{text}");
     }
 }
