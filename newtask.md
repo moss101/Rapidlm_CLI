@@ -1830,6 +1830,55 @@ this session's own risk-assessment intuition for "should be safe" changes to sha
 without the full test suite — the right fix here likely mirrors `hooks.rs`'s detached-writer-thread pattern,
 but should be scoped and reviewed as its own pass across every real caller rather than folded into this batch.
 
+**New file discovered mid-sweep, 2026-09-04: `apps/rapid/src/headless/jsonl.rs` (1000 lines) had received zero
+review this session** — every earlier crate-by-crate/file-by-file pass of `apps/rapid/src` used a flat listing
+of `*.rs` files, which silently skipped this one file because it lives under `headless/` (`headless/mod.rs` +
+`headless/jsonl.rs`), the only subdirectory module in the whole crate. Worth remembering for any future sweep:
+`find apps/rapid/src -name '*.rs'`, not a flat glob, is the only way to be sure nothing in a subdirectory gets
+missed the same way. A dedicated review of it found two related, real gaps in the `rapid exec --jsonl`
+protocol's failure handling — reported here rather than fixed, for reasons below.
+
+**`apps/rapid/src/headless/jsonl.rs`'s `JsonlWriter::write` correctly enforces `MAX_JSONL_LINE_BYTES` (1 MiB)
+and correctly returns `Result<(), JsonlError>` — but every one of its four call sites in
+`interactive.rs::exec_turn` discards that result with `let _ =`** (`interactive.rs:1969`, `:1991-2003`
+`router.decision`, `:2072-2079` `assistant.message`, `:2081-2088` `session.finished`), and the process exit
+code (`code.as_i32()`, computed earlier from the turn's own outcome, entirely independent of whether any JSONL
+write actually succeeded) is returned regardless. **Concrete failure scenario:** a turn whose final answer text
+exceeds 1 MiB (a large code dump, a long completion — not exotic) makes the `assistant.message` write return
+`Err(LineTooLarge)`; that error is swallowed, so a consuming script sees `rapid.schema` → (optional
+`router.decision`) → `session.finished{"exit_code":0}` with the entire result payload silently absent, exit
+code 0. (A second way to hit the same swallowed-write path — a downstream reader closing early, e.g.
+`rapid exec --jsonl "..." | head -1` — is not itself a bug: Rust sets `SIGPIPE` to `SIG_IGN` for `fn main()`
+binaries, so a `BrokenPipe` write error here is the *expected*, correct way for a CLI to handle an early-closing
+consumer, and should stay silent. The two scenarios currently share one code path and one `let _ =`, which is
+part of what makes a clean fix non-trivial — see below.)
+
+**Compounding gap: `JsonlRecord::error` — the protocol's own documented, golden-tested mechanism for reporting
+a structured failure ("Diagnostics still go to stderr, not here") — is never constructed by any production code
+path.** Every real failure in `exec_turn` (both the non-`Succeeded` `Ok(outcome)` arm and the `Err(err)` arm) is
+reported only as an `eprintln!`/`stderr_line` human-readable string plus a bare integer inside
+`session.finished`'s `exit_code` — so even if the write-swallowing above were fixed, there is today no code path
+that would ever populate the `error` record a `--jsonl` consumer's protocol parser might reasonably be built to
+expect.
+
+**Declining to fix this pass, and documenting why in detail:** a fully correct fix couples several real design
+choices that shouldn't be made mechanically under this pass's time budget: (1) whether an oversized
+`assistant.message` should truncate-with-marker (matching this codebase's own established convention —
+`bounded_text`, `FETCH_TRUNCATION_MARKER` — elsewhere) rather than drop the record outright, which requires
+either a bounded retry-and-shrink loop or a size estimate that accounts for JSON string-escaping's worst-case
+~2x expansion, not a one-line change; (2) whether a write failure should change the process's exit code at all
+— a real, externally-visible CLI-contract decision for anyone already scripting against `rapid exec --jsonl`,
+not something to flip silently; and (3) actually wiring `JsonlRecord::error` into the two real failure arms
+needs a real `ApiError`/typed-code mapping from `AgentExecutionError`, which doesn't exist today (confirmed:
+`AgentExecutionError` itself, `crates/agent-runtime/src/agent_executor.rs:219-245`, isn't an `ApiError` — this
+isn't a case of already-built structured data being thrown away, it's a path that never gets built). Each of
+these is a legitimate design call, not a mechanical bug fix, and — per this session's own llm-router lesson a
+few entries above — a change to a shared, externally-consumed protocol surface deserves its own deliberate pass
+with the user's input on the intended contract, not a rushed fix folded into an unrelated review batch. Also
+noted, lower-severity: `JsonlDiagnostics`/`write_line`'s own single-line/size-cap/cancellation guarantees
+(jsonl.rs:370-410) are never actually applied to any diagnostic text the shipped CLI produces (real stderr goes
+through plain `eprintln!`/`exec_diag::stderr_line` instead) — dead-code-in-practice rather than a live bug.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
