@@ -2038,6 +2038,62 @@ addition that panics on overflow) — confirmed not currently reachable, since b
 safe timeouts (`external_agents::DEFAULT_AGENT_TIMEOUT` 600s, `hooks::HARD_MAX_HOOK_TIMEOUT` 30s) well before
 any `ExecSpec` is built; flagged as defense-in-depth only.
 
+**Severe finding, 2026-09-04, independently re-verified line-by-line before writing this up (given how
+surprising it is): the default interactive `rapid` session terminates with an error the moment a second
+plain-text message is submitted without an intervening Ctrl+C.** This is a concrete, easily-triggered symptom
+sitting inside the area this document's own §0a meta-finding already named ("the live chat session doesn't
+actually run turns yet") — but that meta-finding described an *absence* (no tool dispatch); this is a specific,
+user-facing *crash* within that same absence, not previously called out on its own.
+
+Trace, each link independently re-confirmed by direct code reading rather than trusting the background
+reviewer's report alone: `rapid` with no subcommand hits `LaunchMode::Interactive` (`interactive.rs:271`) →
+`run_interactive` → `run_started_session` → `SessionLoop::run`. Every plain-text Enter goes through
+`InteractiveInput::Enter => self.submit_composer()` (`interactive.rs:2301`) → `submit_turn()`
+(`interactive.rs:2328`) → `self.client.submit_turn(...)` → `crates/kernel/src/client.rs:420`'s
+`submit_turn_sync`, which calls `self.turns.begin_turn(...)` — the real `TurnSubmissionGuard`
+(`crates/kernel/src/turn/guard.rs`). `begin_turn`'s own module doc: *"admits at most one in-process lease per
+session... Completing, failing, cancelling, or dropping the lease releases occupancy."* `TurnLease` does have a
+`Drop` impl that releases occupancy (`guard.rs:176-180`) — so the lease WOULD be safely released if simply
+dropped. But `submit_turn_sync` does not drop it: on success it stores the lease inside a `LiveTurn` held in
+`InProcessKernelClient`'s own `live_turn` state (`client.rs:461-467`, `store_live_turn`), keeping occupancy
+held indefinitely. The **only** code in the entire repo that ever calls `take_live_turn`/`cancel_live_turn` (the
+only path back to releasing that stored lease) is `interrupt_sync` (`client.rs:475-527`), which fires only on
+an explicit `KernelApi::Interrupt` — Ctrl+C, or the internal `/interrupt`-equivalent action. Nothing else
+completes, fails, or drops a live turn: confirmed via repo-wide grep that `TurnLease::complete()`/`.fail()` are
+called nowhere outside `guard.rs`'s own unit tests, `EventKind::TurnCompleted`/`TurnFailed` are appended by no
+production code, and `KernelRuntime` (`interactive.rs:2818-2871`, the `LifecycleService` wrapping this whole
+kernel client) is confirmed to be nothing more than "open a client against the ledger file" — no background
+worker, no async turn-execution loop exists to ever call back and complete a turn once real agent work would
+finish. This directly matches, and gives a second independent confirmation of, the crate-dependency check
+already on record (`crates/kernel/Cargo.toml` has no `agent-runtime` dependency at all).
+
+**Concrete, minimal reproduction:** launch `rapid` with no arguments, type any message and press Enter, then
+type a second ordinary message and press Enter again (no Ctrl+C in between — the single most natural thing a
+person does in a chat interface). The second `submit_turn()` finds the session already in `live_turn`
+(`try_occupy`, `guard.rs:100-110`, returns `Conflict` before even checking `expected_seq`), which becomes
+`ApiError(SessionConflict, "Session conflict")`, propagated by `?` through `submit_turn` →
+`submit_composer` → `handle_input` → `SessionLoop::run` → `run_started_session`, which does correctly restore
+the terminal (`terminal.restore()` runs unconditionally right after the loop, regardless of its `Result`,
+confirmed by direct reading of `run_started_session`) before propagating the error up through `run_interactive`
+→ `run()` → `main()`'s `eprintln!("{err}"); std::process::exit(...)`. So the failure mode is a clean,
+non-panicking early exit — the terminal is left in a sane state, not corrupted — but the entire interactive
+session still ends abruptly on the user's second message, every single time, with no workaround short of
+pressing Ctrl+C between every message.
+
+**Not fixed this pass, deliberately:** the module doc's own stated intent — a lease is meant to be released
+once the real turn work (completing/failing/cancelling) finishes — presupposes a real turn-execution loop that
+does not exist yet anywhere in this codebase. The two candidate mechanical fixes both carry real risk of
+conflicting with whatever that not-yet-built execution wiring is eventually meant to look like: (a) have
+`submit_turn_sync` drop/complete the lease immediately after appending `TurnStarted` instead of storing it,
+which would silently discard the exclusivity guarantee `begin_turn`'s doc comment describes the moment a real
+turn loop *is* wired in and needs that protection to actually mean something; or (b) add automatic
+interrupt-then-resubmit logic to `submit_composer`, which guesses at UX behavior (should an in-flight "turn"
+be silently cancelled by typing a new message, or should the UI block input until some future turn-completion
+signal arrives?) that isn't this repo's call to make speculatively. Flagging this as the single most
+concretely-severe, easily-reproduced symptom of the "interactive session loop doesn't run real turns yet" gap
+found so far — worth prioritizing whenever that larger wiring work happens, since today it means the shipped
+interactive CLI cannot sustain a real back-and-forth conversation at all past the first message.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
