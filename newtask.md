@@ -2372,6 +2372,50 @@ pressure is exactly what produced the reverted, broken attempt), or accepting th
 genuinely cannot be enforced generically at this layer and belongs, if anywhere, in a future caller's own
 construction logic instead. Flagging in full rather than guessing at either.
 
+**Same second-pass adversarial sweep, next applied to `crates/sandbox` — the process-isolation layer that
+actually runs a command once a lease has approved it, the last line of defense in this whole stack. One real,
+computationally-proven finding, correctly left unfixed for the same reason as the capability-broker item
+above: fixing it means changing a public trait signature five backends share, not a mechanical patch.**
+
+**Finding: a nominally single-use `CapabilityLease` is fully replayable against `SandboxManager` and every
+backend — none of them ever call `LeaseValidator::validate_use`, the actual use-decrementing mechanism.**
+Every backend's `require_proc_lease` (`crates/sandbox/src/backend.rs:1260-1265`, and identical copies in
+`host_restricted.rs`, `container.rs`, `seatbelt.rs`, `gvisor.rs`, `remote.rs`) only checks
+`lease.is_expired(...)` and `lease.remaining_uses() == 0` — both read from a **frozen snapshot** captured once
+at `issue()` time (`crates/capability-broker/src/lease.rs:283`). Real use-decrementing lives entirely inside
+`LeaseValidator`'s own internal `HashMap<LeaseId, u32>` (`validator.rs:31`), which `crates/sandbox` never
+touches — `crates/sandbox/Cargo.toml:12`'s own doc claims "`CapabilityLease` is re-checked at prepare/exec,"
+but "re-checked" here means only re-reading the same static snapshot, not `validate_use`'s actual MAC/expiry/
+bound-action/policy-revision re-verification and atomic decrement. A background reviewer proved this
+computationally (a throwaway test, run once, then deleted — confirmed via `git status` that nothing was left
+in the repo): one lease minted under the crate's own default single-use policy (`max_uses = 1`) was used to
+`prepare()` + `exec()` **three separate `/bin/echo` invocations**, all succeeding, `remaining_uses()`
+reporting `1` after every call.
+
+**Confirmed, independently, not currently reachable via the one real, live caller.** `apps/rapid/src/
+sandbox_exec.rs::run_sandboxed` — the sole production caller of `SandboxManager` — mints a brand-new,
+function-local `LeaseIssuer::ephemeral()` lease on *every single call* (`sandbox_exec.rs:254`), used for
+exactly one `prepare()`+`exec()` pair before the function returns and the lease is dropped; nothing in the
+shipped code ever holds a lease across multiple calls to attempt a replay. `SandboxRunError::Capability`'s own
+doc comment (`sandbox_exec.rs:63-68`) already states the intended design plainly: *"This is plumbing, not a
+second independent gate — the real authorization already happened via the calling tool's `PermissionLattice`
+decision before this path is ever reached."* So today's one real caller is safe not because the crate enforces
+single-use, but because it never needs to.
+
+**Not fixed, and not attempted, for the same reason the capability-broker item above was reverted rather than
+forced through:** `SandboxBackend`/`SandboxManager` is public API, used identically by five backend
+implementations and at least one other real caller (`crates/security/src/doctor.rs`), and the codebase's own
+established convention elsewhere (`tool-gateway::dispatch.rs`, `mcp::gateway.rs`, `plugin-host::hooks.rs`,
+`process-supervisor::spawn.rs`) is that an executor calls `validate_use` and consumes a `LeaseUseGuard` before
+its side effect — `crates/sandbox` is the one executor that instead accepts a bare `&CapabilityLease` and
+never converts it into a consumed guard at all. Fixing this properly means deciding whether `SandboxManager`'s
+public methods should take a `LeaseUseGuard`/`ConsumedLeaseUse` instead of `&CapabilityLease`, or take a
+`&LeaseValidator` internally — a real API-shape decision affecting five backends' call sites, not a
+same-file, mechanical guard addition. Flagging for whoever next builds a caller that hands `SandboxManager` a
+genuinely multi-step-restricted or policy-revision-sensitive lease (unlike today's one, single-shot, self-
+approved, throwaway one) — that caller would get none of the "single-use"/"current policy" enforcement its
+own lease's constraints promise.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
