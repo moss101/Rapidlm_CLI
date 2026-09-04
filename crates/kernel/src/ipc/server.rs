@@ -205,6 +205,8 @@ struct SubmitTurnParams {
     expected_seq: u64,
     actor: ActorRef,
     trace_id: TraceId,
+    #[serde(default)]
+    text: String,
 }
 
 #[derive(Deserialize)]
@@ -977,6 +979,7 @@ where
                 params.expected_seq,
                 params.actor,
                 params.trace_id,
+                params.text,
             );
             match call_client(client.submit_turn(call)) {
                 Ok(handle) => write_ok(

@@ -224,6 +224,7 @@ impl DaemonClient {
             "expected_seq": req.expected_seq(),
             "actor": req.actor(),
             "trace_id": req.trace_id(),
+            "text": req.text(),
         });
         self.rpc_non_idempotent("submit_turn", params)
     }
@@ -1455,6 +1456,7 @@ mod tests {
                 1,
                 actor(),
                 TraceId::new(),
+                "hello",
             ))
             .unwrap_err();
         match err {

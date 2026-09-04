@@ -33,9 +33,9 @@ pub use cancel::{
     MAX_CANCEL_DEPTH,
 };
 pub use client::{
-    ApprovalDecision, EventStream, EventStreamError, InProcessKernelClient, Interrupt,
+    ApprovalDecision, EventStream, EventStreamError, FinishTurn, InProcessKernelClient, Interrupt,
     InterruptReason, KernelClient, ResolveApproval, RewindResult, RewindSession, SubmitTurn,
-    SubscribeEvents, TurnHandle,
+    SubscribeEvents, TurnHandle, TurnOutcome,
 };
 pub use config::loader::{
     CancellationToken, ConfigLoadError, ConfigLoadResult, ConfigOrigin, ConfigOverride,

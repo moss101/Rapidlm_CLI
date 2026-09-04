@@ -44,6 +44,11 @@ pub const MAX_PROJECTED_APPROVALS: usize = 256;
 /// Maximum approval/protocol modals on the stack.
 pub const MAX_MODALS: usize = 16;
 
+/// Maximum transcript entries retained; the oldest is dropped once exceeded
+/// (a live conversation view, not a durable history — the kernel ledger is
+/// the durable record).
+pub const MAX_TRANSCRIPT_ENTRIES: usize = 4096;
+
 /// Maximum UTF-8 bytes accepted in composer text (local chrome only).
 pub const MAX_COMPOSER_BYTES: usize = 32 * 1024;
 
@@ -135,6 +140,7 @@ pub struct AppState {
     control_holder: ControlHolder,
     protocol_error: Option<String>,
     actions_blocked: bool,
+    transcript: Vec<TranscriptEntry>,
 }
 
 /// Default interactive route.
@@ -267,6 +273,35 @@ pub enum GoalLifecycle {
     Blocked,
     Completed,
     Cancelled,
+}
+
+/// One rendered unit of the live conversation view. A projection of the
+/// turn-lifecycle/model/tool kernel events, not the durable record itself
+/// (the ledger is) — bounded and droppable, per [`MAX_TRANSCRIPT_ENTRIES`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TranscriptEntry {
+    User { text: String },
+    Assistant { text: String },
+    ToolActivity {
+        tool: String,
+        status: ToolActivityStatus,
+    },
+    TurnFailed { reason: String },
+    TurnInterrupted,
+}
+
+/// One tool call's lifecycle, as reflected into the transcript. Not the
+/// tool's own result content (`agent_runtime::TurnEvent` doesn't carry
+/// that) — just what stage it reached.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolActivityStatus {
+    Started,
+    Completed,
+    Failed,
+    Denied,
+    ApprovalRequired,
 }
 
 /// Job row keyed by [`JobId`].
@@ -455,9 +490,22 @@ fn apply_kernel(
         EventKind::JobOrphanReconciled => {
             upsert_job(&mut state, event, JobLifecycle::OrphanReconciled)?;
         }
-        EventKind::ApprovalRequested | EventKind::ToolApprovalRequired => {
+        EventKind::ApprovalRequested => {
             let id = upsert_approval(&mut state, event, ApprovalLifecycle::Requested)?;
             push_approval_modal(&mut state, id)?;
+        }
+        EventKind::ToolApprovalRequired => {
+            let id = upsert_approval(&mut state, event, ApprovalLifecycle::Requested)?;
+            push_approval_modal(&mut state, id)?;
+            if let Some(tool) = optional_display(event, event.payload(), "tool")? {
+                push_transcript(
+                    &mut state,
+                    TranscriptEntry::ToolActivity {
+                        tool,
+                        status: ToolActivityStatus::ApprovalRequired,
+                    },
+                );
+            }
         }
         EventKind::ApprovalResolved => {
             let id = upsert_approval(&mut state, event, ApprovalLifecycle::Resolved)?;
@@ -473,9 +521,62 @@ fn apply_kernel(
         EventKind::ControlTransferredToAgent => {
             state.control_holder = ControlHolder::Agent;
         }
+        EventKind::TurnStarted => {
+            if let Some(text) = optional_display(event, event.payload(), "text")?
+                && !text.is_empty()
+            {
+                push_transcript(&mut state, TranscriptEntry::User { text });
+            }
+        }
+        EventKind::ToolStarted => {
+            push_tool_activity(&mut state, event, ToolActivityStatus::Started)?;
+        }
+        EventKind::ToolCompleted => {
+            push_tool_activity(&mut state, event, ToolActivityStatus::Completed)?;
+        }
+        EventKind::ToolFailed => {
+            push_tool_activity(&mut state, event, ToolActivityStatus::Failed)?;
+        }
+        EventKind::ToolDenied => {
+            push_tool_activity(&mut state, event, ToolActivityStatus::Denied)?;
+        }
+        EventKind::TurnCompleted => {
+            if let Some(text) = optional_display(event, event.payload(), "text")? {
+                push_transcript(&mut state, TranscriptEntry::Assistant { text });
+            }
+        }
+        EventKind::TurnFailed => {
+            if let Some(reason) = optional_display(event, event.payload(), "reason")? {
+                push_transcript(&mut state, TranscriptEntry::TurnFailed { reason });
+            }
+        }
+        EventKind::TurnInterrupted => {
+            push_transcript(&mut state, TranscriptEntry::TurnInterrupted);
+        }
         _ => {}
     }
     Ok(state)
+}
+
+/// Push a bounded transcript entry, dropping the oldest once
+/// [`MAX_TRANSCRIPT_ENTRIES`] is exceeded — a live view, not the durable
+/// record (the kernel ledger is that).
+fn push_transcript(state: &mut AppState, entry: TranscriptEntry) {
+    state.transcript.push(entry);
+    if state.transcript.len() > MAX_TRANSCRIPT_ENTRIES {
+        state.transcript.remove(0);
+    }
+}
+
+fn push_tool_activity(
+    state: &mut AppState,
+    event: &ErasedEventEnvelope,
+    status: ToolActivityStatus,
+) -> Result<(), UiStateError> {
+    if let Some(tool) = optional_display(event, event.payload(), "tool")? {
+        push_transcript(state, TranscriptEntry::ToolActivity { tool, status });
+    }
+    Ok(())
 }
 
 fn apply_local(mut state: AppState, event: &LocalUiEvent) -> Result<AppState, UiStateError> {
@@ -925,6 +1026,7 @@ impl AppState {
             control_holder: ControlHolder::Agent,
             protocol_error: None,
             actions_blocked: false,
+            transcript: Vec::new(),
         }
     }
 
@@ -980,6 +1082,10 @@ impl AppState {
 
     pub fn approvals(&self) -> &BTreeMap<ApprovalKey, ApprovalProjection> {
         &self.approvals
+    }
+
+    pub fn transcript(&self) -> &[TranscriptEntry] {
+        &self.transcript
     }
 
     pub fn selected_agent(&self) -> Option<AgentId> {

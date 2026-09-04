@@ -147,6 +147,7 @@ struct ResolvedProject {
     executable_config_active: bool,
     config: ConfigLoadResult,
     ledger_path: PathBuf,
+    root: PathBuf,
 }
 
 struct KernelRuntime {
@@ -2273,6 +2274,7 @@ fn run_started_session(
         None => InputSource::Crossterm,
     };
 
+    let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let loop_result = SessionLoop {
         client: &client,
         stream: &mut stream,
@@ -2282,6 +2284,9 @@ fn run_started_session(
         cancel: &options.cancel,
         interrupt_count: &mut interrupt_count,
         saw_ctrl_c: &mut saw_ctrl_c,
+        root: &resolved.root,
+        trusted: resolved.trust.is_trusted(),
+        turn_in_flight: turn_in_flight.clone(),
     }
     .run(&mut inputs);
 
@@ -2315,6 +2320,13 @@ struct SessionLoop<'a> {
     cancel: &'a CancellationToken,
     interrupt_count: &'a mut u32,
     saw_ctrl_c: &'a mut bool,
+    root: &'a Path,
+    trusted: bool,
+    /// Set while a turn spawned by `submit_turn` is executing on its own
+    /// thread; a new plain-text submission is a no-op while this is set,
+    /// rather than reaching `kernel::SubmitTurn` and hitting the exact
+    /// `SessionConflict` this whole feature exists to stop crashing on.
+    turn_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SessionLoop<'_> {
@@ -2404,7 +2416,8 @@ impl SessionLoop<'_> {
         if trimmed.starts_with('/') {
             return self.dispatch_slash(trimmed);
         }
-        self.submit_turn()?;
+        let text = trimmed.to_owned();
+        self.submit_turn(&text)?;
         Ok(LoopControl::Continue)
     }
 
@@ -2441,7 +2454,7 @@ impl SessionLoop<'_> {
                 self.interrupt()?;
             }
             KernelApi::SubmitTurn => {
-                self.submit_turn()?;
+                self.submit_turn("")?;
             }
             KernelApi::ForkSession => {
                 let seq = self.ui.snapshot().map(|s| s.seq()).unwrap_or(0);
@@ -2479,21 +2492,69 @@ impl SessionLoop<'_> {
         self.drain()
     }
 
-    fn submit_turn(&mut self) -> Result<(), InteractiveError> {
+    fn submit_turn(&mut self, text: &str) -> Result<(), InteractiveError> {
         if self.ui.actions_blocked() {
             return Ok(());
         }
+        // A turn already running on its own thread (see below) holds the
+        // kernel's own exclusive lease; reaching `SubmitTurn` again here
+        // would only bounce off `SessionConflict`. Silently ignoring a
+        // submission while one is in flight (rather than queuing it) is the
+        // deliberately simple choice for a first working version of real
+        // turn execution.
+        if self.turn_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
         let expected_seq = self.ui.snapshot().map(|s| s.seq()).unwrap_or(0);
-        block_on(
+        let handle = block_on(
             self.client.submit_turn(SubmitTurn::new(
                 self.session_id,
                 expected_seq,
                 self.actor.clone(),
                 TraceId::new(),
+                text,
             )),
             self.cancel,
         )?;
-        self.drain()
+        self.drain()?;
+        if text.trim().is_empty() {
+            // A `SubmitTurn` with no real message (today, only the
+            // `KernelApi::SubmitTurn` slash-command path, e.g. `/goal
+            // start`, reaches this) has nothing to actually run — an
+            // `AgentSpec`'s task text must be non-empty, and there is no
+            // real chat content to execute against. Finish it immediately
+            // rather than spawning execution machinery with nothing to do.
+            let _ = self.client.finish_turn(kernel::FinishTurn::new(
+                self.session_id,
+                handle.turn_id(),
+                self.actor.clone(),
+                TraceId::new(),
+                kernel::TurnOutcome::Completed { text: None },
+            ));
+            return self.drain();
+        }
+        // `submit_turn_sync` stores this turn's cancel token before
+        // returning, so it is always present immediately after a successful
+        // submit — `None` here would mean it was already finished and
+        // released before this line ran, which cannot happen on this
+        // thread's own just-issued handle.
+        let Some(turn_cancel) = self.client.turn_cancel_token(self.session_id) else {
+            return Ok(());
+        };
+        self.turn_in_flight
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        spawn_interactive_turn(
+            self.client.clone(),
+            self.session_id,
+            handle.turn_id(),
+            self.actor.clone(),
+            self.root.to_path_buf(),
+            self.trusted,
+            text.to_owned(),
+            turn_cancel,
+            std::sync::Arc::clone(&self.turn_in_flight),
+        );
+        Ok(())
     }
 
     fn interrupt(&mut self) -> Result<(), InteractiveError> {
@@ -2510,6 +2571,297 @@ impl SessionLoop<'_> {
             self.session_id,
             self.cancel,
         )
+    }
+}
+
+/// Streams one turn's progress events into the session's own kernel ledger
+/// as `agent_runtime::run_turn` (reached via `run_live_exec`) produces them,
+/// so `drain_kernel_events`'s existing replay/reduce mechanism renders them
+/// live rather than only after the whole turn finishes. The turn's own
+/// `Started`/`Completed`/`Failed`/`Interrupted` events are handled outside
+/// this sink (`Started` was already recorded by `submit_turn`; the other
+/// three need the real `ExecOutcome`/error this sink doesn't have access to,
+/// so `run_interactive_turn_inner` appends those itself via `finish_turn`
+/// after `run_live_exec` returns) — this only carries the events in between.
+struct InteractiveTurnSink<'a> {
+    client: &'a InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &'a ActorRef,
+}
+
+impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
+    fn emit(&mut self, event: agent_runtime::TurnEvent) -> Result<(), agent_runtime::TurnError> {
+        use agent_runtime::TurnEvent;
+        use event_ledger::event::EventKind;
+        let (kind, turn_id, call_id, tool, request_id, step, tokens) = match event {
+            TurnEvent::Started { .. }
+            | TurnEvent::Completed { .. }
+            | TurnEvent::Failed { .. }
+            | TurnEvent::Interrupted { .. } => return Ok(()),
+            TurnEvent::ModelRequested {
+                turn_id,
+                request_id,
+                step,
+            } => (
+                EventKind::ModelRequested,
+                turn_id,
+                None,
+                None,
+                Some(request_id),
+                Some(step),
+                None,
+            ),
+            TurnEvent::ModelCompleted {
+                turn_id,
+                request_id,
+                tokens,
+            } => (
+                EventKind::ModelCompleted,
+                turn_id,
+                None,
+                None,
+                Some(request_id),
+                None,
+                Some(tokens),
+            ),
+            TurnEvent::ModelFailed { turn_id, request_id } => (
+                EventKind::ModelFailed,
+                turn_id,
+                None,
+                None,
+                Some(request_id),
+                None,
+                None,
+            ),
+            TurnEvent::ToolRequested { turn_id, call_id, tool } => {
+                (EventKind::ToolRequested, turn_id, Some(call_id), Some(tool), None, None, None)
+            }
+            TurnEvent::ToolStarted { turn_id, call_id, tool } => {
+                (EventKind::ToolStarted, turn_id, Some(call_id), Some(tool), None, None, None)
+            }
+            TurnEvent::ToolCompleted { turn_id, call_id, tool } => {
+                (EventKind::ToolCompleted, turn_id, Some(call_id), Some(tool), None, None, None)
+            }
+            TurnEvent::ToolFailed { turn_id, call_id, tool } => {
+                (EventKind::ToolFailed, turn_id, Some(call_id), Some(tool), None, None, None)
+            }
+            TurnEvent::ToolDenied { turn_id, call_id, tool } => {
+                (EventKind::ToolDenied, turn_id, Some(call_id), Some(tool), None, None, None)
+            }
+            TurnEvent::ToolApprovalRequired { turn_id, call_id, tool } => (
+                EventKind::ToolApprovalRequired,
+                turn_id,
+                Some(call_id),
+                Some(tool),
+                None,
+                None,
+                None,
+            ),
+        };
+        let payload = serde_json::json!({
+            "turn_id": turn_id,
+            "call_id": call_id,
+            "tool": tool,
+            "request_id": request_id,
+            "step": step,
+            "tokens": tokens,
+        });
+        self.client
+            .append_turn_progress(self.session_id, self.actor, TraceId::new(), kind, payload)
+            .map_err(|_| agent_runtime::TurnError::EventSink)
+    }
+}
+
+/// Spawn a thread that runs one interactive turn to completion and reports
+/// the outcome back to the kernel so its lease is always released — even if
+/// execution fails in some unexpected way — closing the crash this feature
+/// exists to fix.
+#[allow(clippy::too_many_arguments)]
+fn spawn_interactive_turn(
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    turn_id: protocol::TurnId,
+    actor: ActorRef,
+    root: PathBuf,
+    trusted: bool,
+    text: String,
+    kernel_cancel: kernel::CancelToken,
+    turn_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let outcome =
+            run_interactive_turn(&client, session_id, &actor, &root, trusted, &text, &kernel_cancel);
+        let _ = client.finish_turn(kernel::FinishTurn::new(
+            session_id,
+            turn_id,
+            actor,
+            TraceId::new(),
+            outcome,
+        ));
+        turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+fn run_interactive_turn(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    text: &str,
+    kernel_cancel: &kernel::CancelToken,
+) -> kernel::TurnOutcome {
+    // `kernel::CancelToken` (set by `Interrupt`/Ctrl-C) and `agent_runtime::
+    // CancellationToken` (what `run_live_exec` actually checks) are
+    // different types from different crates with no dependency between
+    // them — bridged with a poller, the same pattern already used for
+    // `execute_mcp_tool`/`fetch_page`'s cross-crate cancellation, rather
+    // than substituting a fresh, never-cancelled token that would make
+    // Ctrl-C during a real in-flight turn silently do nothing.
+    let bridge = agent_runtime::CancellationToken::new();
+    let stop_watchdog = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog = {
+        let bridge = bridge.clone();
+        let kernel_cancel = kernel_cancel.clone();
+        let stop = std::sync::Arc::clone(&stop_watchdog);
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if kernel_cancel.is_cancelled() {
+                    bridge.cancel();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        })
+    };
+
+    let outcome =
+        run_interactive_turn_inner(client, session_id, actor, root, trusted, text, &bridge);
+
+    stop_watchdog.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = watchdog.join();
+    outcome
+}
+
+/// Actually resolve a model, build workspace tools, and run one turn through
+/// the same `run_live_exec` entry the headless `rapid exec` path uses.
+///
+/// Deliberately simpler than `exec_turn`'s full setup for a first working
+/// version of interactive execution: a single configured model (no fallback
+/// chain, no managed-policy ceilings) and no proactive context retrieval,
+/// memory index, reminders, hooks, or MCP servers. All of that is real and
+/// worth adding — omitted here to land working end-to-end turn execution
+/// first, not silently dropped as an oversight.
+fn run_interactive_turn_inner(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    text: &str,
+    cancel: &agent_runtime::CancellationToken,
+) -> kernel::TurnOutcome {
+    let preserved =
+        match build_live_context(Some(root), Some(root), text.to_owned(), trusted, 8192, 256) {
+            Ok(preserved) => preserved,
+            Err(err) => {
+                return kernel::TurnOutcome::Failed {
+                    reason: format!("context error: {err}"),
+                };
+            }
+        };
+    let permission_lattice = match exec_permission_lattice(Some(root), None) {
+        Ok(lattice) => lattice,
+        Err(err) => {
+            return kernel::TurnOutcome::Failed {
+                reason: format!("permission configuration error: {err}"),
+            };
+        }
+    };
+    let mut tools = if trusted {
+        ExecTools::workspace_with_permissions(root, permission_lattice)
+            .unwrap_or_else(|_| ExecTools::noop())
+    } else {
+        ExecTools::noop()
+    };
+
+    // One store, fully built before `ConfiguredModel` borrows from it — the
+    // borrow must not outlive it, matching `exec_turn`'s own ordering.
+    let credential_store = auth::InMemoryCredentialStore::new();
+    let backing = match crate::user_config::select_from_process_env_gated() {
+        Ok(ModelSelection::Configured { active, warnings }) => {
+            for warning in warnings {
+                crate::exec_diag::stderr_line(&format!("warning: {warning}"));
+            }
+            match ConfiguredModel::build(&active, &credential_store) {
+                Ok(model) => SelectedModel::Configured(Box::new(model)),
+                Err(err) => {
+                    return kernel::TurnOutcome::Failed {
+                        reason: format!("model configuration error: {err}"),
+                    };
+                }
+            }
+        }
+        Ok(ModelSelection::Unconfigured { .. }) => SelectedModel::Unconfigured(UnconfiguredModel),
+        Err(err) => {
+            return kernel::TurnOutcome::Failed {
+                reason: format!("model configuration error: {err}"),
+            };
+        }
+    };
+
+    let spec = match AgentSpec::builder(
+        protocol::AgentId::new(),
+        AgentRole::Coder,
+        text.to_owned(),
+        protocol::WorkspaceViewId::new(),
+    )
+    .permissions_profile("work")
+    .build()
+    {
+        Ok(spec) => spec,
+        Err(err) => {
+            return kernel::TurnOutcome::Failed {
+                reason: format!("invalid turn request: {err}"),
+            };
+        }
+    };
+    let request = AgentExecutionRequest::new(spec, session_id);
+    let mut sink = InteractiveTurnSink {
+        client,
+        session_id,
+        actor,
+    };
+
+    match crate::host::run_live_exec(
+        preserved,
+        backing,
+        &request,
+        &mut tools,
+        &mut sink,
+        cancel,
+        ContextRetryPolicy::default(),
+        None,
+    ) {
+        Ok(outcome) => match outcome.result.status() {
+            AgentTerminalStatus::Succeeded => kernel::TurnOutcome::Completed {
+                text: Some(outcome.result.summary().to_owned()),
+            },
+            AgentTerminalStatus::Cancelled => kernel::TurnOutcome::Interrupted,
+            AgentTerminalStatus::Failed => kernel::TurnOutcome::Failed {
+                reason: outcome.result.summary().to_owned(),
+            },
+            // `#[non_exhaustive]`: a future variant this match hasn't been
+            // taught yet. The summary text is still real and safe to show;
+            // treating it as failed rather than silently succeeding is the
+            // conservative direction for an unrecognized status.
+            _ => kernel::TurnOutcome::Failed {
+                reason: outcome.result.summary().to_owned(),
+            },
+        },
+        Err(err) => kernel::TurnOutcome::Failed {
+            reason: err.to_string(),
+        },
     }
 }
 
@@ -2538,6 +2890,7 @@ fn drain_kernel_events(
     session_id: protocol::SessionId,
     cancel: &CancellationToken,
 ) -> Result<(), InteractiveError> {
+    let rendered = ui.transcript().len();
     for i in 0..MAX_EVENTS_PER_TICK {
         cancel.check().map_err(|_| InteractiveError::Cancelled)?;
         match stream.try_recv() {
@@ -2553,7 +2906,44 @@ fn drain_kernel_events(
     }
     let snapshot = block_on(client.get_session(session_id), cancel)?;
     *ui = reduce(ui.clone(), &UiEvent::Snapshot(snapshot));
+    render_new_transcript_entries(&ui.transcript()[rendered.min(ui.transcript().len())..]);
     Ok(())
+}
+
+/// Print transcript entries this tick's drain just produced. Raw mode (held
+/// for the whole interactive session, see `TerminalGuard`) disables the
+/// terminal's own `\n` -> `\r\n` translation, so every line is written with
+/// an explicit `\r\n` — a bare `println!` here would stair-step down the
+/// screen instead of returning to column 0. This is deliberately plain text,
+/// not a rendered transcript panel (`crates/tui`'s fuller panel/view-model
+/// surface isn't wired into `apps/rapid` — see this module's own doc
+/// comment) — a real next step, not an oversight.
+fn render_new_transcript_entries(entries: &[tui::state::TranscriptEntry]) {
+    use std::io::Write as _;
+    use tui::state::{ToolActivityStatus, TranscriptEntry};
+    let mut out = io::stdout();
+    for entry in entries {
+        let line = match entry {
+            TranscriptEntry::User { text } => format!("> {text}"),
+            TranscriptEntry::Assistant { text } => text.clone(),
+            TranscriptEntry::ToolActivity { tool, status } => {
+                let marker = match status {
+                    ToolActivityStatus::Started => "→",
+                    ToolActivityStatus::Completed => "✓",
+                    ToolActivityStatus::Failed => "✗",
+                    ToolActivityStatus::Denied => "⛔",
+                    ToolActivityStatus::ApprovalRequired => "⏸",
+                };
+                format!("{marker} {tool}")
+            }
+            TranscriptEntry::TurnFailed { reason } => format!("(turn failed: {reason})"),
+            TranscriptEntry::TurnInterrupted => "(interrupted)".to_owned(),
+        };
+        for physical_line in line.split('\n') {
+            let _ = write!(out, "{physical_line}\r\n");
+        }
+    }
+    let _ = out.flush();
 }
 
 fn next_input(
@@ -2619,6 +3009,7 @@ fn resolve_project(options: &InteractiveOptions) -> Result<ResolvedProject, Inte
         executable_config_active: trust.is_trusted(),
         config,
         ledger_path: project_root.join(PROJECT_MARKER).join(LEDGER_NAME),
+        root: project_root,
     })
 }
 
@@ -3513,6 +3904,69 @@ base_url = "http://127.0.0.1:11434/v1"
         assert_eq!(report.trust, TrustStatus::Untrusted);
         assert!(!report.executable_config_active);
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
+    }
+
+    #[test]
+    fn a_second_plain_text_message_does_not_crash_the_session_and_a_turn_actually_runs() {
+        // Reproduces, then proves fixed, the exact bug this feature exists
+        // for: the interactive session used to terminate with an error the
+        // moment a second plain-text message was submitted without an
+        // intervening interrupt, because nothing ever released the first
+        // turn's exclusive kernel lease. `submit_turn` now spawns real
+        // execution and reports its outcome back, so the lease is released
+        // regardless of how the turn actually finishes.
+        //
+        // Scripted inputs process with no real delay between them, so by
+        // the time this reaches `/quit`, the first turn has typically only
+        // gotten as far as `model.requested` (confirmed by inspecting the
+        // ledger directly while writing this test) before the session's own
+        // teardown interrupts it — this is deliberately not forced to wait
+        // for a real model response: doing so would mean either mocking the
+        // model or making a real network call keyed to whatever provider
+        // happens to be configured on the machine running the test, neither
+        // of which this test needs to prove what it's actually testing (the
+        // lease releases and the process doesn't crash, regardless of how
+        // the turn ends). The second plain-text submission lands while the
+        // first is still in flight and is silently dropped by design (see
+        // `submit_turn`'s own comment on `turn_in_flight`) — this test's
+        // point is that dropping it, rather than reaching `SubmitTurn` and
+        // hitting `SessionConflict`, is what happens.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options(vec![
+            InteractiveInput::Submit("hello".to_owned()),
+            InteractiveInput::Submit("are you still there?".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("a second plain-text message must not crash the session");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        assert!(report.terminal_restored);
+
+        let session_id = report.session_id.expect("session id");
+        // Turn execution is deliberately fire-and-forget from the input
+        // loop's perspective (see `spawn_interactive_turn`'s own doc
+        // comment) so Ctrl-C stays responsive during a real in-flight
+        // turn — poll briefly for the background thread(s) to finish
+        // releasing their lease rather than asserting immediately.
+        let ledger_path = env.project.join(PROJECT_MARKER).join(LEDGER_NAME);
+        let mut seq_after = 0;
+        let mut turn_still_active = true;
+        for _ in 0..80 {
+            let client = InProcessKernelClient::open(&ledger_path).expect("open ledger");
+            let snapshot = block_on(client.get_session(session_id), &CancellationToken::new())
+                .expect("session");
+            seq_after = snapshot.seq();
+            turn_still_active = snapshot.active_turn().is_some();
+            if !turn_still_active && seq_after > 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!turn_still_active, "a turn's lease was never released");
+        assert!(
+            seq_after > 1,
+            "expected real turn events beyond session creation, got seq {seq_after}"
+        );
     }
 
     #[test]

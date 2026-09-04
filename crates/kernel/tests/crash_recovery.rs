@@ -198,9 +198,14 @@ fn run_mid_turn_fixture() {
         EventKind::GoalCreated,
         json!({"goal_id": goal_id, "statement": "finish the interrupted turn"}),
     );
-    let handle =
-        block_on(client.submit_turn(SubmitTurn::new(created.id(), 2, actor(), TraceId::new())))
-            .expect("submit turn");
+    let handle = block_on(client.submit_turn(SubmitTurn::new(
+        created.id(),
+        2,
+        actor(),
+        TraceId::new(),
+        "hello",
+    )))
+    .expect("submit turn");
     append(
         &ledger,
         created.id(),

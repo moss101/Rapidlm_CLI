@@ -538,6 +538,7 @@ impl<C: KernelClient> V1Adapter<C> {
                 snapshot.seq(),
                 self.actor.clone(),
                 TraceId::new(),
+                prompt_text(&parsed.prompt),
             ))
             .await
             .map_err(map_kernel_err)?;
@@ -969,6 +970,20 @@ fn validate_implementation(info: &ImplementationInfo) -> Result<(), V1Error> {
         return Err(V1Error::InvalidParams);
     }
     Ok(())
+}
+
+/// Flatten a prompt's text blocks for `SubmitTurn`'s display text. Non-text
+/// blocks (image/resource) contribute nothing here — this is transcript
+/// display text, not the model-facing content the turn actually runs on.
+fn prompt_text(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn validate_prompt(blocks: &[ContentBlock]) -> Result<(), V1Error> {

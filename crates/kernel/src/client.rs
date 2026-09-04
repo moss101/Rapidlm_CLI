@@ -66,13 +66,35 @@ pub struct InProcessKernelClient {
     runtime: Arc<Runtime>,
 }
 
-/// Submit a foreground turn at `expected_seq`.
+/// Submit a foreground turn at `expected_seq`. `text` is the user's own
+/// composed message that starts the turn; bounded to [`MAX_TURN_TEXT_BYTES`]
+/// (truncated at a UTF-8 boundary, never rejected — this is display text,
+/// not a security boundary).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubmitTurn {
     session_id: SessionId,
     expected_seq: u64,
     actor: ActorRef,
     trace_id: TraceId,
+    text: String,
+}
+
+/// Cap on `SubmitTurn::text`, matching `crates/tui`'s own composer bound
+/// (`MAX_COMPOSER_BYTES`) — kernel does not depend on tui, so this is a
+/// parallel constant rather than a shared one.
+pub const MAX_TURN_TEXT_BYTES: usize = 32 * 1024;
+
+/// Truncate `text` to `MAX_TURN_TEXT_BYTES`, backing off to the nearest
+/// UTF-8 char boundary so a multibyte character is never split.
+fn bounded_turn_text(text: &str) -> String {
+    if text.len() <= MAX_TURN_TEXT_BYTES {
+        return text.to_owned();
+    }
+    let mut end = MAX_TURN_TEXT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
 }
 
 /// Accepted foreground turn after `turn.started` is durably committed.
@@ -179,12 +201,73 @@ struct LiveTurn {
 #[derive(Serialize)]
 struct TurnStartedPayload {
     turn_id: TurnId,
+    text: String,
 }
 
 #[derive(Serialize)]
 struct TurnInterruptedPayload {
     turn_id: TurnId,
     reason: InterruptReason,
+}
+
+#[derive(Serialize)]
+struct TurnCompletedPayload {
+    turn_id: TurnId,
+    /// The assistant's final text, when the turn produced one. Absent for a
+    /// turn that ended some other way `TurnCompleted` still legitimately
+    /// covers (kernel does not itself interpret this — it is display text
+    /// for the frontend's transcript).
+    text: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TurnFailedPayload {
+    turn_id: TurnId,
+    /// Human-readable failure reason. Kernel does not interpret this; the
+    /// caller (the actual turn executor) supplies whatever text it has.
+    reason: String,
+}
+
+/// How a turn actually executed by the caller (e.g. via
+/// `agent_runtime::run_turn`, which `crates/kernel` does not depend on)
+/// finished, so [`InProcessKernelClient::finish_turn`] can append the right
+/// terminal ledger event and release the turn's lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TurnOutcome {
+    Completed { text: Option<String> },
+    Failed { reason: String },
+    Interrupted,
+}
+
+/// Report how a turn finished. A no-op if this turn's lease was already
+/// released by something else (e.g. `interrupt` racing ahead of the caller
+/// noticing its own cancellation token) — whichever side observes the live
+/// turn first does the real work; the other sees nothing left to finish.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FinishTurn {
+    session_id: SessionId,
+    turn_id: TurnId,
+    actor: ActorRef,
+    trace_id: TraceId,
+    outcome: TurnOutcome,
+}
+
+impl FinishTurn {
+    pub fn new(
+        session_id: SessionId,
+        turn_id: TurnId,
+        actor: ActorRef,
+        trace_id: TraceId,
+        outcome: TurnOutcome,
+    ) -> Self {
+        Self {
+            session_id,
+            turn_id,
+            actor,
+            trace_id,
+            outcome,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -198,12 +281,14 @@ impl SubmitTurn {
         expected_seq: u64,
         actor: ActorRef,
         trace_id: TraceId,
+        text: impl Into<String>,
     ) -> Self {
         Self {
             session_id,
             expected_seq,
             actor,
             trace_id,
+            text: bounded_turn_text(&text.into()),
         }
     }
 
@@ -221,6 +306,10 @@ impl SubmitTurn {
 
     pub fn trace_id(&self) -> TraceId {
         self.trace_id
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
     }
 }
 
@@ -447,7 +536,10 @@ impl InProcessKernelClient {
             req.session_id,
             req.actor,
             EventKind::TurnStarted,
-            TurnStartedPayload { turn_id },
+            TurnStartedPayload {
+                turn_id,
+                text: req.text,
+            },
             &options,
             &ledger_live(),
         ) {
@@ -470,6 +562,132 @@ impl InProcessKernelClient {
             turn_id,
             seq: envelope.seq(),
         })
+    }
+
+    /// The cancellation token for the turn currently live on `session_id`,
+    /// if any. `crates/kernel` has no dependency on any execution engine
+    /// (e.g. `agent-runtime`), so a caller that actually runs the turn on
+    /// another thread reads this to bridge kernel's own cancellation into
+    /// whatever token type that engine expects — mirroring how `Interrupt`
+    /// (Ctrl-C) already cancels it today.
+    pub fn turn_cancel_token(&self, session_id: SessionId) -> Option<CancelToken> {
+        let sessions = lock_sessions(&self.runtime.sessions);
+        sessions
+            .get(&session_id)
+            .and_then(|runtime| runtime.live_turn.as_ref())
+            .map(|turn| turn.cancel.clone())
+    }
+
+    /// Append one non-terminal progress event for a turn's own execution
+    /// (e.g. a model step or tool call starting/finishing). Does not touch
+    /// occupancy/lease state — only [`finish_turn`](Self::finish_turn) does.
+    /// Appended at the session's current tip (`expected_seq: None`): this can
+    /// run concurrently with other writers to the same session (an
+    /// `Interrupt` racing in, another progress event from the same turn),
+    /// and each append is its own atomic, serialized ledger transaction, so
+    /// there is no lost update to guard against with an optimistic check
+    /// here the way session-authority writes (`submit_turn`/`interrupt`)
+    /// need one.
+    pub fn append_turn_progress<P: Serialize>(
+        &self,
+        session_id: SessionId,
+        actor: &ActorRef,
+        trace_id: TraceId,
+        kind: EventKind,
+        payload: P,
+    ) -> Result<(), ApiError> {
+        let options = AppendOptions {
+            redaction: RedactionClass::Project,
+            trace_id,
+            expected_seq: None,
+        };
+        self.ledger
+            .append(
+                session_id,
+                actor.clone(),
+                kind,
+                payload,
+                &options,
+                &ledger_live(),
+            )
+            .map(|_| ())
+            .map_err(|err| ledger_api(err, trace_id))
+    }
+
+    /// Record how a turn finished and release its lease. A no-op — `Ok(())`,
+    /// nothing appended — if the lease was already released by something
+    /// else (the `Interrupt`/Ctrl-C path already appends `turn.interrupted`
+    /// and releases the lease itself, and may well win this race, since it
+    /// runs on the frontend's own input-handling thread rather than waiting
+    /// on the turn's execution to actually notice cancellation).
+    pub fn finish_turn(&self, req: FinishTurn) -> Result<(), ApiError> {
+        let Some(live) = self.take_live_turn(req.session_id) else {
+            return Ok(());
+        };
+        if live.lease.turn_id() != req.turn_id {
+            // Should not be reachable in this single-live-turn-per-session
+            // design (a new turn cannot start while this one's lease is
+            // still held), but never release a lease this call did not
+            // actually finish.
+            self.store_live_turn(req.session_id, live);
+            return Ok(());
+        }
+        let options = AppendOptions {
+            redaction: RedactionClass::Project,
+            trace_id: req.trace_id,
+            expected_seq: None,
+        };
+        let append_result: Result<(), LedgerError> = match req.outcome {
+            TurnOutcome::Completed { text } => self
+                .ledger
+                .append(
+                    req.session_id,
+                    req.actor,
+                    EventKind::TurnCompleted,
+                    TurnCompletedPayload {
+                        turn_id: req.turn_id,
+                        text,
+                    },
+                    &options,
+                    &ledger_live(),
+                )
+                .map(|_| ()),
+            TurnOutcome::Failed { reason } => self
+                .ledger
+                .append(
+                    req.session_id,
+                    req.actor,
+                    EventKind::TurnFailed,
+                    TurnFailedPayload {
+                        turn_id: req.turn_id,
+                        reason,
+                    },
+                    &options,
+                    &ledger_live(),
+                )
+                .map(|_| ()),
+            TurnOutcome::Interrupted => self
+                .ledger
+                .append(
+                    req.session_id,
+                    req.actor,
+                    EventKind::TurnInterrupted,
+                    TurnInterruptedPayload {
+                        turn_id: req.turn_id,
+                        reason: InterruptReason::ClientRequested,
+                    },
+                    &options,
+                    &ledger_live(),
+                )
+                .map(|_| ()),
+        };
+        // The lease is released regardless of whether the ledger append
+        // above succeeded: a stuck lease (the original bug this exists to
+        // fix) is worse than a turn whose terminal ledger event is missing
+        // because of a real storage error — occupancy must not survive a
+        // finished turn.
+        live.lease.complete();
+        append_result.map_err(|err| ledger_api(err, req.trace_id))
     }
 
     fn interrupt_sync(&self, req: Interrupt) -> Result<(), ApiError> {
@@ -1083,6 +1301,7 @@ mod tests {
             created.seq(),
             actor(),
             TraceId::new(),
+            "hello",
         )))
         .expect("submit");
         let started = stream.recv().expect("turn.started");
@@ -1117,6 +1336,7 @@ mod tests {
             created.seq(),
             actor(),
             TraceId::new(),
+            "hello",
         )))
         .expect("submit");
         let busy = block_on(tmp.client.get_session(created.id())).expect("busy");
@@ -1147,6 +1367,7 @@ mod tests {
             0,
             actor(),
             TraceId::new(),
+            "hello",
         )))
         .expect_err("stale");
         assert_eq!(err.code(), ErrorCode::SessionConflict);

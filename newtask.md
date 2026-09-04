@@ -3830,6 +3830,120 @@ whether an outer layer already bounds concurrent `shell_exec` calls.
 `cargo build -p sandbox --lib` and the full `-p sandbox --lib` test suite pass (doc-only change, no behavior
 affected, so no new regression test — nothing to revert-cycle).
 
+**2026-09-04, user-directed (not part of the autonomous security sweep above): wired a real turn-execution
+loop into the interactive `rapid` session, closing the "Severe finding" documented earlier in this section
+(search for "the default interactive `rapid` session terminates with an error") — the interactive CLI used to
+never call the model at all, and crashed outright on a second plain-text message. Both are fixed. Deliberately
+scoped down from headless `exec_turn`'s full sophistication for a first working version — see below for
+exactly what's still missing.**
+
+**The root cause, exactly as previously documented and re-confirmed by direct reading before touching
+anything: `apps/rapid/src/interactive.rs::SessionLoop::submit_turn` called `kernel::InProcessKernelClient::
+submit_turn` (which only appends `turn.started` and stores an exclusive in-process lease) and then just
+drained already-committed ledger events — nothing anywhere called `agent_runtime::run_turn`, and nothing ever
+released the lease except an explicit `Interrupt` (Ctrl-C).** Fixed by making `submit_turn` actually run the
+turn to completion and report the outcome back to the kernel, closing the lease regardless of how execution
+finishes — matching the `TurnLease` module doc's own stated intent ("Completing, failing, cancelling, or
+dropping the lease releases occupancy") for the first time.
+
+**New `crates/kernel` surface** (`crates/kernel/src/client.rs`), since `crates/kernel` deliberately has no
+dependency on `agent-runtime` or any other execution engine — the bridge has to live at the boundary, not
+inside kernel itself:
+- `SubmitTurn::new` gained a `text: String` parameter (bounded to `MAX_TURN_TEXT_BYTES` = 32 KiB, truncated at
+  a UTF-8 boundary, matching `crates/tui`'s own composer bound) — the user's actual message, threaded into
+  `TurnStartedPayload` so it's part of the durable record instead of being discarded at the door. Every real
+  call site updated: `apps/rapid/src/interactive.rs`, `crates/acp/src/v1.rs` (dead code, confirmed earlier
+  this sweep, but a real caller if `rapid acp` ever gets wired up — flattens the ACP prompt's text blocks),
+  `crates/kernel/src/ipc/{client,server}.rs` (the daemon IPC transport, wire params gained a `text` field),
+  plus every test constructing a `SubmitTurn` directly.
+- `InProcessKernelClient::turn_cancel_token(session_id) -> Option<CancelToken>`: lets a caller that runs the
+  turn on its own thread read the same cancellation token `Interrupt`/Ctrl-C already sets, so cancellation
+  actually reaches execution instead of only ever cancelling a lease nothing was using.
+- `InProcessKernelClient::append_turn_progress(...)`: appends one event at the session's current tip
+  (`expected_seq: None` — safe under concurrent writers, since each append is its own atomic, serialized
+  ledger transaction) for a turn's own in-progress model/tool events.
+- `InProcessKernelClient::finish_turn(FinishTurn) -> Result<(), ApiError>`: appends the real terminal event
+  (`turn.completed`/`turn.failed`/`turn.interrupted`, now carrying real content — see `TurnOutcome` below —
+  not just a bare `turn_id`) and releases the lease. A no-op if the lease was already released by something
+  else (`Interrupt` racing ahead of the caller noticing its own cancellation token, which — since `Interrupt`
+  runs on the frontend's own input thread rather than waiting on execution — will often win that race) so
+  there is no double-release or duplicate terminal event regardless of timing. The lease is released even if
+  the ledger append itself fails: a stuck lease (the original bug) is worse than a turn whose terminal ledger
+  event is missing because of a real storage error.
+- `TurnOutcome::{Completed{text}, Failed{reason}, Interrupted}`: what actually happened, supplied by the
+  caller (the real turn executor, in `apps/rapid`) since kernel itself has no way to know.
+
+**`apps/rapid/src/interactive.rs` execution glue**: `submit_turn` now spawns a thread (`spawn_interactive_
+turn`) that builds the same model/tools/context construction the headless `rapid exec` path uses and calls
+`crate::host::run_live_exec` (the same production entry `exec_turn` calls — retries, cost/token tracking,
+context-overflow recovery all included, not reimplemented), streaming its `agent_runtime::TurnEvent`s into the
+session's own kernel ledger as they happen via a new `InteractiveTurnSink` (`ModelRequested`/`ModelCompleted`/
+`ModelFailed`/`ToolRequested`/`ToolStarted`/`ToolCompleted`/`ToolFailed`/`ToolDenied`/`ToolApprovalRequired`
+map directly to the matching, already-existing `EventKind`s — the ledger schema was already shaped for exactly
+this, just never fed). `Started`/`Completed`/`Failed`/`Interrupted` are handled outside the sink: `Started` was
+already recorded by `submit_turn` itself; the other three need the real `ExecOutcome`/error the sink doesn't
+have, so the glue calls `finish_turn` with real content once `run_live_exec` returns. Execution runs on its own
+thread — not blocking the input loop — specifically so Ctrl-C stays responsive during a real in-flight turn;
+kernel's own cancellation token (bridged into `agent_runtime::CancellationToken` via the same poll-and-mirror
+pattern already used for `execute_mcp_tool`/`fetch_page`'s cross-crate cancellation) is what actually reaches
+`run_live_exec`. A `turn_in_flight: Arc<AtomicBool>` on `SessionLoop` makes a second plain-text submission
+while one is already running a silent no-op (queuing was considered and deliberately not built — see below)
+rather than reaching `SubmitTurn` and hitting the exact `SessionConflict` this whole feature exists to stop
+crashing on.
+
+**`crates/tui/src/state.rs`**: `AppState` gained a bounded `transcript: Vec<TranscriptEntry>`
+(`MAX_TRANSCRIPT_ENTRIES` = 4096, oldest dropped once exceeded — a live view, not the durable record) and
+`reduce` now populates it from the same events — `turn.started`'s `text` becomes a `User` entry, `turn.
+completed`'s `text` becomes an `Assistant` entry, tool events become `ToolActivity` entries with a status,
+`turn.failed`/`turn.interrupted` become their own entries. This is the first thing to ever populate the
+`UiRoute::Transcript`/`PanelId::Transcript` route that already existed as a named concept with nothing behind
+it. `apps/rapid/src/interactive.rs::drain_kernel_events` prints newly-added entries after each drain — plain
+text with explicit `\r\n` line endings (raw mode, held for the whole session, disables the terminal's own `\n`
+→ `\r\n` translation; a bare `println!` here would stair-step down the screen), not a rendered panel.
+
+**New test** `a_second_plain_text_message_does_not_crash_the_session_and_a_turn_actually_runs`
+(`apps/rapid/src/interactive.rs`): submits two plain-text messages then `/quit` through the existing scripted-
+input `TempEnv`/`run_interactive` test harness, asserts the run completes without error, then polls the ledger
+directly (a fresh `InProcessKernelClient::open` against the same path) for the lease to release and the
+sequence to advance past session creation. Confirmed by inspecting the ledger directly while writing this test
+(this dev machine has a real configured model, so `select_from_process_env_gated()` — which reads the real
+process environment, same as headless `exec_turn` — does resolve one): scripted inputs process with no real
+delay between them, so the first turn typically reaches only `model.requested` before `run_started_session`'s
+own unconditional teardown `Interrupt` cancels it — no real network call happens, which is what keeps this
+test fast and deterministic rather than depending on whatever provider is configured on the machine running
+it. The second submission lands while the first is still in flight and is silently dropped by `submit_turn`'s
+own `turn_in_flight` guard, by design — never reaching `SubmitTurn` at all. Verified via the revert cycle:
+temporarily reverting `submit_turn` to its old "append `turn.started`, drain, stop" shape reproduces the
+*exact* original error verbatim — `Kernel(ApiError { code: SessionConflict, message: "Session conflict",
+... })` — on the second submission, confirming the test would have caught the original bug precisely. Full
+`-p kernel` (167 tests), `-p tui` (214 tests), and `-p rapid --lib` (379 tests, up from 378) suites and
+`cargo build --workspace --tests` all pass.
+
+**Deliberately not attempted, scoped down for a first working version — real gaps, not oversights:**
+- **Config sophistication**: `run_interactive_turn_inner` builds a single configured model (no fallback
+  chain) and skips managed-policy ceilings, proactive context retrieval, the memory index, todos, reminders,
+  hooks, and MCP servers — all real, all valuable, all things `exec_turn`'s ~600-line setup already does for
+  the headless path. A natural refactor (extract `exec_turn`'s setup into a function both paths share) rather
+  than a duplicate implementation to maintain in parallel — not attempted here given the size of everything
+  else in this change.
+- **No response streaming**: `agent_runtime::TurnEvent` doesn't carry model text deltas or tool result content
+  (it's structural telemetry — which step, how many tokens, which tool, pass/fail), only the final `TurnResult`
+  does. The transcript shows tool call *activity* (name + stage) live as it happens, but the assistant's actual
+  reply only appears once the whole turn finishes — real per-token streaming would need a deeper change to how
+  `ModelDriver`/`run_turn` itself works, out of scope here.
+- **No queuing**: a plain-text message submitted while one is already executing is silently dropped rather
+  than queued or shown as "busy" in any way — a real UX gap, and a case where the simplest correct behavior
+  (never reach the kernel conflict) was chosen over guessing at queuing semantics nobody has specified.
+- **No explicit join on session exit**: `run_started_session`'s existing `Interrupt` call on every exit path
+  cancels a live turn, but nothing waits for that turn's background thread to actually finish before the
+  process tears down (`drop(client)` etc.) — safe (the client is `Arc`-shared, cloned into the thread, so this
+  isn't a dangling-reference issue) but not a clean join; acceptable given every other in-flight operation in
+  this codebase already has the same property on an abrupt exit.
+- **Transcript rendering under sustained load**: `drain_kernel_events` captures `transcript.len()` before
+  draining and prints everything after that index — correct unless `MAX_TRANSCRIPT_ENTRIES` eviction happens
+  *within* one drain tick (needs 4096+ prior entries in one session), which could very rarely mis-render a
+  few lines. A real, narrow, acknowledged edge case, not fixed given how rarely it can actually trigger.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
