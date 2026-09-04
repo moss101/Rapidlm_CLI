@@ -3067,6 +3067,26 @@ rejects a stale writer. Named explicitly to "prevent desktop/CLI/cloud dual-resu
   confused with two other things named "recovery" in this codebase, checked directly: `host.rs`'s
   `LiveRecoveryController` is unrelated context-overflow/compaction recovery (§2.7), and `GoalCommand::
   Pause`'s `process_recovered` is an in-memory goal-pause flag, not this ledger-level pipeline.
+- **Cross-reference, 2026-09-04: the "no current observable path to a user" conclusion two bullets above
+  does not hold for a distinct, strictly more basic manifestation of the same root shape, found this pass
+  and documented in full in §0a (search this document for "the default interactive `rapid` session
+  terminates").** That finding needs no crash, no process restart, and no `ResumeSession` at all — it is
+  the single most ordinary case: one continuous, still-running `rapid` process, one session, a first
+  plain-text message, then a second one. `TurnSubmissionGuard`'s *in-process* layer (this section's own
+  "genuine but secondary optimization... not the actual safety boundary," per the audit above) stores the
+  first message's `TurnLease` in `InProcessKernelClient`'s `live_turn` state (`client.rs:461-467`) and
+  never releases it except via an explicit interrupt (`interrupt_sync`, Ctrl+C) — there is no
+  process-restart, no durable-ledger-replay, and no `RecoveryManager` involved anywhere in this path, so
+  the "wiring it in wouldn't fix anything observable because resume is a no-op" reasoning above is correct
+  for the *crash* case but doesn't apply here. This is the layer this section calls "secondary" precisely
+  because the durable, cross-process fencing (the ledger's own `seq` check) is the real safety boundary —
+  but that in-process layer still gates ordinary, same-process, non-concurrent turn submission, and nothing
+  ever releases its lease under normal (non-interrupted) operation. Net effect: today's interactive `rapid`
+  cannot sustain a second message in one sitting without an intervening Ctrl+C, a user-facing severity this
+  section's crash-focused analysis didn't capture. See §0a for the full trace and why a fix wasn't attempted
+  this pass (it needs a real design decision about what should complete/drop the lease under normal
+  operation, since no real turn-execution loop exists yet to call it — the same root gap the rest of this
+  document already tracks under "the live chat session doesn't actually run turns yet").
 
 **Correction to the correction (2026-08-29):** the "verified genuinely absent" note directly below was
 itself wrong — a methodology bug, not a re-check of source: the grep only covered
