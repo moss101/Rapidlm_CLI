@@ -2187,6 +2187,35 @@ admit `Inconclusive` directly — which is a real state-machine design choice wi
 validate against, not a mechanical fix. Flagging in full so whichever future caller wants non-Strict
 acceptance semantics doesn't discover this by getting stuck.
 
+**Fresh review pass, 2026-09-04, `crates/mobile-sim` and `crates/protocol` — the last two crates in the
+workspace not yet reviewed this session, completing full file-level coverage of the codebase.**
+`crates/mobile-sim` is confirmed fully dormant (zero callers anywhere outside its own tests — corroborated
+independently by the separate `gap_analysis.md`'s own finding); `crates/protocol`, the foundational shared-
+types crate almost everything else depends on, was reviewed in full (`repo_path.rs`, `id.rs`, `artifact.rs`,
+`error.rs`, `config.rs`, `remote_worker.rs`, `trace.rs`) and found exceptionally well-defended — every
+hand-written parser bounds-checks before indexing, and validation (e.g. `validate_guest_path`,
+`validate_artifact`) is applied symmetrically across every construction path checked, including custom
+`Deserialize` impls. No bug found in `protocol`.
+
+**One real, verified panic found and fixed in the dormant `mobile-sim`:
+`crates/mobile-sim/src/ios/simctl.rs::find_udid` (line 1204) slides a fixed 36-byte window across every byte
+offset of a `simctl list` output line with no char-boundary check, panicking the instant that window lands on
+a non-ASCII byte.** `xcrun simctl rename <udid> "<name>"` accepts arbitrary Unicode device names — an accented,
+CJK, or emoji simulator name (not exotic; any developer can set one) produces a line where the sliding window
+lands mid-character before ever reaching the (always-ASCII) UDID substring itself, panicking with "byte index
+N is not a char boundary." Every other string-scanning helper in this crate (`attr_value`, `redact_key`,
+`token_len`) anchors its slice endpoints on ASCII-literal `.find()` results instead, which is provably
+boundary-safe — `find_udid` is the one place that manually walks every byte offset. **Fixed:** skip a probed
+position whenever either endpoint of the window isn't a char boundary, before attempting the slice — a
+one-line guard, since a genuine UDID match is always pure ASCII and therefore always has both endpoints
+already on a boundary, so this changes no correct-match behavior. New test `parse_simctl_list_does_not_
+panic_on_a_non_ascii_device_name` ("Café Test" and an emoji-prefixed device name) — verified via the revert
+cycle to panic with exactly the predicted message ("byte index 4 is not a char boundary; it is inside 'é'")
+against the original code before confirming the fix closes it. Full `mobile-sim` crate suite (106 tests) and
+`cargo build --workspace --tests` pass. Fixed despite the crate's dormancy for the same reason as the two
+`crates/tui` panics earlier in this document: cheap, low-risk, and would otherwise be waiting to surprise
+whoever wires simulator discovery into a real command.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

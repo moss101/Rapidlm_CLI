@@ -1206,7 +1206,17 @@ fn find_udid(line: &str) -> Option<(usize, DeviceUdid)> {
         return None;
     }
     for start in 0..=line.len() - UDID_LEN {
-        let candidate = &line[start..start + UDID_LEN];
+        let end = start + UDID_LEN;
+        // A real UDID is pure ASCII (hex digits and dashes), so a genuine
+        // match always has both endpoints on a char boundary — but this
+        // loop probes every byte offset, including ones inside a non-ASCII
+        // device name (`simctl rename` accepts arbitrary Unicode), where
+        // slicing would panic before `looks_like_uuid` ever gets a chance
+        // to reject the candidate.
+        if !line.is_char_boundary(start) || !line.is_char_boundary(end) {
+            continue;
+        }
+        let candidate = &line[start..end];
         if looks_like_uuid(candidate) && DeviceUdid::parse(candidate).is_ok() {
             return Some((start, DeviceUdid(candidate.to_ascii_uppercase())));
         }
@@ -1637,6 +1647,25 @@ mod tests {
         assert_eq!(devices[1].state(), SimulatorState::Booted);
         assert_eq!(devices[2].runtime().as_str(), "watchOS 10.2");
         assert_eq!(devices[2].state(), SimulatorState::Creating);
+    }
+
+    #[test]
+    fn parse_simctl_list_does_not_panic_on_a_non_ascii_device_name() {
+        // `xcrun simctl rename <udid> "<name>"` accepts arbitrary Unicode,
+        // so a real device list line can contain multi-byte UTF-8 well
+        // before the UDID itself (which is always pure ASCII). find_udid's
+        // sliding byte-window must skip candidate positions that would
+        // straddle a character boundary rather than panicking.
+        let body = "\
+== Devices ==
+-- iOS 17.2 --
+    Café Test (A1B2C3D4-E5F6-7890-ABCD-EF1234567890) (Shutdown)
+    \u{1F4F1} Emoji Phone (11111111-2222-3333-4444-555555555555) (Booted)
+";
+        let devices = parse_simctl_list(body).expect("parse must not panic");
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].name().as_str(), "Café Test");
+        assert_eq!(devices[1].name().as_str(), "\u{1F4F1} Emoji Phone");
     }
 
     #[test]
