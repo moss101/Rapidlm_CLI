@@ -807,6 +807,37 @@ fn load_active_reminders(
         .map(|block| (block, active.effort_floor())))
 }
 
+/// Load the managed policy once and gate every `[models] fallback` candidate
+/// against it, in one pass — never a second, independent `load_policy` call
+/// per candidate. `load_policy`'s own doc comment: "set-but-unreadable is an
+/// error (a configured-but-absent control document must not silently become
+/// 'no policy')" — propagated here via `?` rather than folded into `None`,
+/// so a transient failure on this read (a live policy-file rewrite mid-turn,
+/// an I/O hiccup) refuses the fallback chain the same way the primary
+/// model's own gating already refuses the whole turn on the identical
+/// failure, instead of silently letting every fallback candidate through
+/// ungated. A dropped candidate (blocked by the managed provider allowlist)
+/// is a warning, not an error — the turn still runs on the primary/other
+/// candidates.
+fn gate_fallback_candidates(
+    process_env: &[(String, String)],
+    candidates: Vec<crate::user_config::ActiveModel>,
+) -> Result<(Vec<crate::user_config::ActiveModel>, Vec<String>), crate::managed_config::ManagedConfigError>
+{
+    let policy = crate::managed_config::load_policy(process_env)?;
+    let mut gated = Vec::new();
+    let mut warnings = Vec::new();
+    for candidate in candidates {
+        match crate::managed_config::apply_to_fallback_candidate(candidate, policy.as_ref()) {
+            Ok(candidate) => gated.push(candidate),
+            Err(profile_id) => warnings.push(format!(
+                "models.fallback entry '{profile_id}' is not on the managed provider allowlist; skipped"
+            )),
+        }
+    }
+    Ok((gated, warnings))
+}
+
 /// Raise the configured reasoning effort to the reminders' floor. The roster
 /// stores the semantics; the composition root maps them onto the router's
 /// effort ladder. A configured effort already at or above the floor wins.
@@ -1790,16 +1821,16 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                 for warning in warnings {
                     eprintln!("warning: {warning}");
                 }
-                let policy = crate::managed_config::load_policy(&process_env).unwrap_or(None);
-                for candidate in candidates {
-                    match crate::managed_config::apply_to_fallback_candidate(
-                        candidate,
-                        policy.as_ref(),
-                    ) {
-                        Ok(candidate) => models.push(candidate),
-                        Err(profile_id) => eprintln!(
-                            "warning: models.fallback entry '{profile_id}' is not on the managed provider allowlist; skipped"
-                        ),
+                match gate_fallback_candidates(&process_env, candidates) {
+                    Ok((gated, warnings)) => {
+                        for warning in warnings {
+                            eprintln!("warning: {warning}");
+                        }
+                        models.extend(gated);
+                    }
+                    Err(err) => {
+                        eprintln!("managed policy error: {err}");
+                        return Ok(JsonlExitCode::Usage.as_i32());
                     }
                 }
             }
@@ -2967,6 +2998,65 @@ mod tests {
             "the second file's deny rule must survive the merge, got {} total rules",
             merged.len()
         );
+    }
+
+    #[test]
+    fn gate_fallback_candidates_fails_closed_on_a_policy_read_error_instead_of_no_policy() {
+        // `load_policy`'s own doc comment: "set-but-unreadable is an error
+        // ... must not silently become 'no policy'". A candidate that a real
+        // policy would block (wrong provider) must stay blocked even when
+        // the read of that same policy document then fails -- the function
+        // must propagate the error (refusing the whole fallback chain).
+        let doc = r#"
+[models]
+default = "local"
+
+[model.local]
+provider = "openai-compatible"
+model = "llama3.2"
+base_url = "http://127.0.0.1:11434/v1"
+"#;
+        let config = crate::user_config::parse_config_document(doc, "user.toml").expect("parse");
+        let candidate = crate::user_config::resolve_active(&[], &config).expect("active");
+
+        let policy_path = std::env::temp_dir().join(format!(
+            "rapidlm-fallback-gate-{}-{}.toml",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(
+            &policy_path,
+            format!(
+                "schema = \"{}\"\n[policy]\nallowed_providers = [\"anthropic\"]\n",
+                crate::managed_config::MANAGED_SCHEMA
+            ),
+        )
+        .expect("write policy");
+        let env = vec![(
+            crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+            policy_path.display().to_string(),
+        )];
+
+        // Valid, readable policy: the openai-compatible candidate is
+        // correctly blocked by the allowlist (a warning, not an error).
+        let (gated, warnings) =
+            gate_fallback_candidates(&env, vec![candidate.clone()]).expect("first read succeeds");
+        assert!(gated.is_empty(), "candidate must be blocked by the allowlist");
+        assert_eq!(warnings.len(), 1);
+
+        // The same path, now unreadable (garbage/corrupt on a re-read):
+        // must propagate the error, never fall back to treating this as "no
+        // policy" (which would let the candidate through ungated).
+        std::fs::write(&policy_path, "not valid toml at all {{{").expect("corrupt policy");
+        match gate_fallback_candidates(&env, vec![candidate]) {
+            Err(_) => {}
+            Ok((gated, _)) => panic!(
+                "a policy read failure must not silently become \"no policy\", got {} \
+                 candidate(s) let through ungated",
+                gated.len()
+            ),
+        }
+        let _ = std::fs::remove_file(&policy_path);
     }
 
     #[test]

@@ -2279,6 +2279,40 @@ positive or a wrong fix would be in this specific file. Full `permissions`/`inte
 45 tests, both zero regressions), full `-p rapid` suite (355 tests), and `cargo build --workspace --tests`
 all pass.
 
+**Same second-pass adversarial approach, next applied to the sibling file `apps/rapid/src/managed_config.rs`
+(the admin-policy-ceiling logic these `permissions.rs` bugs enforce) — one real, narrower-severity fail-open
+found and fixed, everything else confirmed sound.** Most of this file's gates held up under the same six bug
+shapes that produced the three `permissions.rs` bugs above: `gate_permission_mode` uses the identical
+`PermissionMode::permissiveness_rank()` `permissions.rs::evaluate()` now correctly enforces; `denied_tools`/
+`confine_writes_to` are wired additively and inherited correctly into subagent lattices; the turn-ceiling
+byte/count limits narrow via `.min()` so call ordering can't widen them; `min_reasoning_effort`/
+`allowed_providers` apply identically to the primary model and `[models] fallback` candidates (the gap this
+session's earlier `c31e77f` fix already closed); and a malformed/absent-but-configured policy document fails
+the whole run closed everywhere checked.
+
+**The one real gap: `interactive.rs::exec_turn`'s fallback-candidate gating performed an independent, second
+`managed_config::load_policy` call and silently folded any error from it into "no policy" via `.unwrap_or
+(None)`, while the primary model's gating a few lines above already fails the whole turn closed on the
+identical failure.** `load_policy`'s own doc comment: *"set-but-unreadable is an error (a configured-but-
+absent control document must not silently become 'no policy')"* — and the local comment on this exact block
+already states the intended contract: *"a fallback entry is never let through a restriction... the primary
+itself has to honor."* If this second, independent read of the same `RAPIDLM_MANAGED_CONFIG` path fails after
+the first read (during primary gating) already succeeded — a live policy-file rewrite mid-turn, a transient
+I/O hiccup — every `[models] fallback` candidate silently skipped both the provider allowlist and the effort
+floor for that turn, exactly the outcome the local comment says must never happen. Exploitability caveat,
+stated plainly: unlike the three `permissions.rs` bugs (each a single crafted static input), this requires the
+admin-controlled policy file itself to change or become transiently unreadable within one process's two reads
+of it during a single `exec_turn` — real and reachable, but narrower than the findings above. **Fixed:**
+extracted the "load once, gate every candidate" logic into a new, directly-testable `gate_fallback_candidates`
+helper that loads the policy exactly once and propagates a `load_policy` failure via `?` instead of folding it
+into `None`; `exec_turn`'s call site now fails the turn closed on that error (`eprintln!` + `JsonlExitCode::
+Usage`), mirroring the primary model's own existing failure behavior exactly. New test `gate_fallback_
+candidates_fails_closed_on_a_policy_read_error_instead_of_no_policy` (a real policy file, read successfully
+once — correctly blocking a wrong-provider candidate — then corrupted and read again) — verified via the
+revert cycle to report "got 1 candidate(s) let through ungated" against the original `.unwrap_or(None)` before
+confirming the fix closes it. Full `interactive`/`managed_config` test modules (38 tests), full `-p rapid`
+suite (356 tests), and `cargo build --workspace --tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
