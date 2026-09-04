@@ -16,7 +16,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -527,11 +527,17 @@ impl Drop for JobRegistry {
 pub trait SubagentRunner: Send + Sync {
     /// `write_scope`: confine the child's writes to this workspace-relative
     /// path or its descendants (Modbit `CAP-008`); `None` is unscoped.
+    /// `cancel`: the parent turn's own cancellation token (Ctrl-C /
+    /// `--max-wall-time`) — an implementation must actually observe it
+    /// during the child's run, not substitute a fresh, disconnected token,
+    /// or cancelling the parent turn silently fails to stop an in-flight
+    /// subagent.
     fn run(
         &self,
         prompt: &str,
         agent_type: &str,
         write_scope: Option<&str>,
+        cancel: &CancellationToken,
     ) -> Result<SubagentReport, String>;
 }
 
@@ -575,6 +581,30 @@ pub struct SubagentReport {
     pub artifacts: Vec<String>,
 }
 
+/// Turn-wide per-path write locks. `batch_dispatch`'s own `write_group_key`
+/// grouping already serializes same-path writes made through one
+/// `WorkspaceTools` instance's own batch, but a spawned subagent gets its
+/// *own*, independent `WorkspaceTools` instance (Modbit `AGT-010`/`WRK-017`),
+/// and `task_spawn` calls within one batch run concurrently on separate
+/// threads (see `batch_dispatch`'s `solo:{index}` grouping) — so two
+/// sibling subagents, or a subagent and its parent, writing the same
+/// resolved path race directly against each other with no shared gate at
+/// all. `execute_write`/`execute_patch` hold the per-path lock this returns
+/// for their whole read-modify-write, and every subagent child shares the
+/// *same* registry as its parent (`share_write_locks`) instead of getting a
+/// fresh, useless one of its own.
+#[derive(Clone, Default)]
+pub(crate) struct WriteLocks(Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>);
+
+impl WriteLocks {
+    fn lock_for(&self, path: &Path) -> Arc<Mutex<()>> {
+        let mut map = self.0.lock().expect("write locks");
+        map.entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+}
+
 /// Bounded tools rooted at one canonical workspace directory, with the
 /// permission lattice that gates every call.
 pub struct WorkspaceTools {
@@ -593,10 +623,15 @@ pub struct WorkspaceTools {
     ask_stdin: Option<Arc<dyn Fn(&str, &[String], Duration) -> Result<String, String> + Send + Sync>>,
     mcp: Arc<Mutex<Vec<McpConnection>>>,
     mcp_surface: Arc<Mutex<Vec<(String, String, mcp::transport::McpToolDescriptor)>>>,
-    /// Resource ceiling (Modbit `WRK-017`'s concurrency axis, narrowed to
-    /// this codebase's actual shape: `task_spawn` runs synchronously, one
-    /// subagent at a time, never several in parallel — so the real runaway
-    /// risk is an unbounded *total* per turn, not concurrent execution).
+    /// Resource ceiling (Modbit `WRK-017`'s concurrency axis) bounding the
+    /// *total* number of subagents one turn may spawn. This does **not**
+    /// mean subagents only ever run one at a time: `batch_dispatch`'s
+    /// `solo:{index}` grouping gives every `task_spawn` call in one batch
+    /// its own thread, so several sibling subagents' entire child turns
+    /// genuinely execute concurrently (an earlier version of this comment
+    /// claimed otherwise — corrected 2026-09-04 after an adversarial review
+    /// found real sibling subagents writing the same path could silently
+    /// lose each other's edits; see `WriteLocks`, which closes that gap).
     /// See `newtask.md` §2.10.
     subagent_spawns: Arc<AtomicU64>,
     /// Resource ceiling (Modbit `WRK-017`'s disk axis): cumulative bytes
@@ -629,6 +664,8 @@ pub struct WorkspaceTools {
     /// unreachable from a child entirely, so a child's own copy of this
     /// field is dead data, not a gap.
     max_subagent_spawns: u64,
+    /// Cross-instance per-path write serialization — see [`WriteLocks`].
+    write_locks: WriteLocks,
 }
 
 impl WorkspaceTools {
@@ -668,6 +705,7 @@ impl WorkspaceTools {
             max_write_bytes: MAX_TOTAL_WRITE_BYTES_PER_TURN,
             max_fetch_bytes: MAX_TOTAL_FETCH_BYTES_PER_TURN,
             max_subagent_spawns: MAX_SUBAGENT_SPAWNS_PER_TURN,
+            write_locks: WriteLocks::default(),
         })
     }
 
@@ -869,6 +907,24 @@ impl WorkspaceTools {
     pub(crate) fn share_turn_budgets(&mut self, bytes_written: Arc<AtomicU64>, fetch_bytes: Arc<AtomicU64>) {
         self.bytes_written = bytes_written;
         self.fetch_bytes = fetch_bytes;
+    }
+
+    /// Clone the shared per-path write-lock registry (see [`WriteLocks`])
+    /// for a caller propagating it to a subagent child alongside the shared
+    /// byte counters.
+    pub(crate) fn write_lock_handle(&self) -> WriteLocks {
+        self.write_locks.clone()
+    }
+
+    /// Replace this instance's own write-lock registry with the parent's:
+    /// without this, every subagent child gets a *fresh*, empty registry of
+    /// its own, which serializes nothing against the parent or its
+    /// siblings — see [`WriteLocks`]'s own doc comment for why that leaves
+    /// same-path writes racing across instances. Called on every subagent
+    /// child's own tools (`LiveSubagentRunner::run`), same call site as
+    /// `share_turn_budgets`.
+    pub(crate) fn share_write_locks(&mut self, locks: WriteLocks) {
+        self.write_locks = locks;
     }
 
     /// Current disk/network per-turn ceilings (Modbit `CAP-001`), for a
@@ -1245,6 +1301,12 @@ impl WorkspaceTools {
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_write_args(call.arguments())?;
         let target = self.resolve_in_root(&args.path)?;
+        // Serialize against any other WorkspaceTools instance (this turn's
+        // parent, or a sibling subagent) writing the same resolved path —
+        // see `WriteLocks`'s own doc comment for why `batch_dispatch`'s
+        // per-batch grouping alone cannot close this gap.
+        let path_lock = self.write_locks.lock_for(&target);
+        let _write_guard = path_lock.lock().expect("write lock");
         if let Some(detail) = self.reserve_write_budget(args.content.len()) {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
@@ -1548,6 +1610,14 @@ impl WorkspaceTools {
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_patch_args(call.arguments())?;
         let target = self.resolve_in_root(&args.path)?;
+        // Serialize against any other WorkspaceTools instance (this turn's
+        // parent, or a sibling subagent) writing the same resolved path —
+        // otherwise this function's own read-then-write is a lost-update
+        // race the moment two instances patch the same file concurrently.
+        // See `WriteLocks`'s own doc comment for why `batch_dispatch`'s
+        // per-batch grouping alone cannot close this gap.
+        let path_lock = self.write_locks.lock_for(&target);
+        let _write_guard = path_lock.lock().expect("write lock");
         let bytes = match read_file_bounded(&target, MAX_FILE_READ_BYTES) {
             Ok(bytes) => bytes,
             Err(BoundedReadError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1940,6 +2010,16 @@ impl WorkspaceTools {
         _cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_todo_args(call.arguments())?;
+        let target = self.resolve_in_root(TODOS_PATH)?;
+        // Serialize against any other WorkspaceTools instance (this turn's
+        // parent, or a sibling subagent) reading/writing the shared todo
+        // list — held across the read (`load_todos`) through the write
+        // below, or two concurrent updates can silently discard each
+        // other's changes the same way `execute_patch` can. See
+        // `WriteLocks`'s own doc comment for why `batch_dispatch`'s
+        // per-batch grouping alone cannot close this gap.
+        let path_lock = self.write_locks.lock_for(&target);
+        let _write_guard = path_lock.lock().expect("write lock");
         let existing = self.load_todos();
         let mut todos = existing.clone();
         for entry in &args.todos {
@@ -1983,7 +2063,6 @@ impl WorkspaceTools {
                 ))),
             });
         }
-        let target = self.resolve_in_root(TODOS_PATH)?;
         let document = serde_json::json!({
             "schema": 1,
             "todos": todos.iter().map(|todo| serde_json::json!({
@@ -2347,7 +2426,7 @@ impl WorkspaceTools {
     fn execute_task_spawn(
         &self,
         call: &ValidatedToolCall,
-        _cancel: &CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_task_args(call.arguments())?;
         let Some(runner) = self.subagents.as_ref() else {
@@ -2377,7 +2456,7 @@ impl WorkspaceTools {
                 crate::hooks::HOOK_TIMEOUT,
             );
         }
-        let outcome = runner.run(&args.prompt, &args.agent_type, args.write_scope.as_deref());
+        let outcome = runner.run(&args.prompt, &args.agent_type, args.write_scope.as_deref(), cancel);
         if !self.hooks.subagent_stop.is_empty() {
             let (status, ok) = match &outcome {
                 Ok(report) => (report.status.clone(), true),
@@ -4044,6 +4123,24 @@ impl ExecTools {
         }
     }
 
+    /// Clone this turn's per-path write-lock registry (`None` on the no-op
+    /// surface, which never writes at all). See
+    /// `WorkspaceTools::write_lock_handle`.
+    pub(crate) fn write_lock_handle(&self) -> Option<WriteLocks> {
+        match self {
+            Self::Workspace(tools) => Some(tools.write_lock_handle()),
+            Self::Noop(_) => None,
+        }
+    }
+
+    /// Adopt the parent's per-path write-lock registry (no-op on the no-op
+    /// surface). See `WorkspaceTools::share_write_locks`.
+    pub(crate) fn share_write_locks(&mut self, locks: WriteLocks) {
+        if let Self::Workspace(tools) = self {
+            tools.share_write_locks(locks);
+        }
+    }
+
     /// Current disk/network per-turn ceilings, `None` on the no-op surface.
     /// See `WorkspaceTools::turn_ceilings`.
     pub(crate) fn turn_ceilings(&self) -> Option<(u64, u64)> {
@@ -4775,7 +4872,7 @@ use std::sync::{Arc, Mutex};
             calls: Arc<StdMutex<Vec<()>>>,
         }
         impl crate::exec_tools::SubagentRunner for FakeRunner {
-            fn run(&self, _prompt: &str, _agent_type: &str, _write_scope: Option<&str>) -> Result<SubagentReport, String> {
+            fn run(&self, _prompt: &str, _agent_type: &str, _write_scope: Option<&str>, _cancel: &CancellationToken) -> Result<SubagentReport, String> {
                 self.calls.lock().expect("lock").push(());
                 Ok(SubagentReport {
                     summary: "done".to_owned(),
@@ -7471,7 +7568,7 @@ use std::sync::{Arc, Mutex};
             calls: Arc<StdMutex<Vec<(String, String)>>>,
         }
         impl crate::exec_tools::SubagentRunner for FakeRunner {
-            fn run(&self, prompt: &str, agent_type: &str, _write_scope: Option<&str>) -> Result<SubagentReport, String> {
+            fn run(&self, prompt: &str, agent_type: &str, _write_scope: Option<&str>, _cancel: &CancellationToken) -> Result<SubagentReport, String> {
                 self.calls
                     .lock()
                     .expect("lock")
@@ -7610,6 +7707,7 @@ use std::sync::{Arc, Mutex};
                 _prompt: &str,
                 _agent_type: &str,
                 write_scope: Option<&str>,
+                _cancel: &CancellationToken,
             ) -> Result<SubagentReport, String> {
                 self.seen.lock().expect("lock").push(write_scope.map(str::to_owned));
                 Ok(SubagentReport {
@@ -7672,7 +7770,7 @@ use std::sync::{Arc, Mutex};
     fn task_spawn_refuses_once_the_per_turn_budget_is_exhausted() {
         struct CountingRunner(Arc<AtomicU64>);
         impl crate::exec_tools::SubagentRunner for CountingRunner {
-            fn run(&self, _prompt: &str, _agent_type: &str, _write_scope: Option<&str>) -> Result<SubagentReport, String> {
+            fn run(&self, _prompt: &str, _agent_type: &str, _write_scope: Option<&str>, _cancel: &CancellationToken) -> Result<SubagentReport, String> {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(SubagentReport {
                     summary: "done".to_owned(),
@@ -7724,10 +7822,126 @@ use std::sync::{Arc, Mutex};
     }
 
     #[test]
+    fn task_spawn_forwards_the_callers_real_cancellation_token_to_the_runner() {
+        use std::sync::Mutex as StdMutex;
+        struct CapturingRunner {
+            captured: StdMutex<Option<CancellationToken>>,
+        }
+        impl crate::exec_tools::SubagentRunner for CapturingRunner {
+            fn run(
+                &self,
+                _prompt: &str,
+                _agent_type: &str,
+                _write_scope: Option<&str>,
+                cancel: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                *self.captured.lock().expect("lock") = Some(cancel.clone());
+                Ok(SubagentReport {
+                    summary: "done".to_owned(),
+                    status: "succeeded".to_owned(),
+                    tool_calls: 0,
+                    tokens: 1,
+                    cost_usd_micros: None,
+                    stop_reason: None,
+                    claims: Vec::new(),
+                    blockers: Vec::new(),
+                    open_questions: Vec::new(),
+                    patch_summary: None,
+                    artifacts: Vec::new(),
+                })
+            }
+        }
+
+        let root = TempRoot::new("spawn-cancel");
+        let mut tools = permissive_workspace(&root.0);
+        let runner = Arc::new(CapturingRunner {
+            captured: StdMutex::new(None),
+        });
+        tools.subagents = Some(Arc::clone(&runner) as Arc<dyn SubagentRunner>);
+        let cancel = CancellationToken::new();
+        let call = make_call("c1", TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
+        let validated = tools.validate(&call, &cancel).expect("v");
+        tools.execute(&validated, &cancel).expect("e");
+
+        let captured = runner
+            .captured
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("the runner must receive a cancellation token");
+        assert!(!captured.is_cancelled(), "sanity: not cancelled yet");
+        // Cancel the caller's own token *after* the call returns, then check
+        // whether the runner's captured token reflects it: a shared
+        // Arc<AtomicBool> under Clone means this only passes if the runner
+        // was actually handed the caller's real token, not a fresh,
+        // disconnected one it can never observe.
+        cancel.cancel();
+        assert!(
+            captured.is_cancelled(),
+            "the token the runner received must be the caller's real token, not a fresh disconnected one"
+        );
+    }
+
+    #[test]
+    fn sibling_subagent_style_patches_sharing_write_locks_never_lose_a_write() {
+        const N: usize = 32;
+        let root = TempRoot::new("concurrent-patch");
+        let seed: String = (0..N).map(|i| format!("SLOT_{i}\n")).collect();
+        fs::write(root.0.join("shared.txt"), seed).expect("seed");
+        let shared_locks = WriteLocks::default();
+        let root_path = root.0.clone();
+        let barrier = std::sync::Barrier::new(N);
+        let outcomes: Vec<Result<ToolStepResult, ToolStepError>> = std::thread::scope(|scope| {
+            let barrier = &barrier;
+            let handles: Vec<_> = (0..N)
+                .map(|i| {
+                    let root_path = root_path.clone();
+                    let shared_locks = shared_locks.clone();
+                    scope.spawn(move || {
+                        let mut tools = permissive_workspace(&root_path);
+                        tools.share_write_locks(shared_locks);
+                        let call = make_call(
+                            &format!("c{i}"),
+                            WORKSPACE_PATCH_TOOL,
+                            // Trailing `\n` keeps single-digit slots (e.g.
+                            // "SLOT_1") from matching as an ambiguous
+                            // substring of "SLOT_10".."SLOT_19".
+                            &format!(r#"{{"path":"shared.txt","old":"SLOT_{i}\n","new":"DONE_{i}\n"}}"#),
+                        );
+                        let cancel = CancellationToken::new();
+                        let validated = tools.validate(&call, &cancel).expect("v");
+                        // Release every thread's patch at once so their
+                        // reads and writes genuinely interleave, matching
+                        // what concurrent sibling subagents actually do.
+                        barrier.wait();
+                        tools.execute(&validated, &cancel)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("thread")).collect()
+        });
+
+        let succeeded = outcomes
+            .iter()
+            .filter(|o| matches!(o, Ok(ToolStepResult::Succeeded { .. })))
+            .count();
+        assert_eq!(succeeded, N, "every patch call should report success");
+
+        let final_content = fs::read_to_string(root.0.join("shared.txt")).expect("read final");
+        for i in 0..N {
+            assert!(
+                final_content.contains(&format!("DONE_{i}")),
+                "edit {i} reported success but was silently lost under concurrent sibling \
+                 writes: {final_content}"
+            );
+        }
+    }
+
+    #[test]
     fn task_spawn_report_renders_cost_only_when_reported() {
         struct CostRunner(Option<u64>);
         impl crate::exec_tools::SubagentRunner for CostRunner {
-            fn run(&self, _prompt: &str, _agent_type: &str, _write_scope: Option<&str>) -> Result<SubagentReport, String> {
+            fn run(&self, _prompt: &str, _agent_type: &str, _write_scope: Option<&str>, _cancel: &CancellationToken) -> Result<SubagentReport, String> {
                 Ok(SubagentReport {
                     summary: "done".to_owned(),
                     status: "succeeded".to_owned(),
@@ -7776,7 +7990,7 @@ use std::sync::{Arc, Mutex};
     fn task_spawn_report_surfaces_claims_blockers_questions_and_patch_summary() {
         struct RichRunner;
         impl crate::exec_tools::SubagentRunner for RichRunner {
-            fn run(&self, _prompt: &str, _agent_type: &str, _write_scope: Option<&str>) -> Result<SubagentReport, String> {
+            fn run(&self, _prompt: &str, _agent_type: &str, _write_scope: Option<&str>, _cancel: &CancellationToken) -> Result<SubagentReport, String> {
                 Ok(SubagentReport {
                     summary: "done".to_owned(),
                     status: "succeeded".to_owned(),

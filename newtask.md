@@ -2908,6 +2908,69 @@ that degrades to today's behavior?) — a real design decision belonging with wh
 first real `Provisioner` backend and wires `task_spawn` to this pool, not a mechanical patch to make now
 against an interface with no real caller to validate the shape against.
 
+**After five crates in a row (`crates/mcp`, `crates/plugin-host`, `crates/computer-use`, `crates/tool-gateway`,
+`crates/agent-pool`) showed the same disconnected-capability-layer pattern with limited fixable output, this
+pass pivoted the sweep to the mechanism those crates were checked *against*: the real, live, shipped
+subagent-spawning path (`task_spawn`, `apps/rapid/src/exec_tools.rs::execute_task_spawn` and
+`interactive.rs`'s `LiveSubagentRunner`). Two real, directly reachable, computationally-verified bugs came
+out of it — the highest-value findings since the `crates/mcp` subprocess fixes.**
+
+A prior reviewer's claims about this path (atomic per-turn spawn cap, depth-1 nesting cap enforced both on
+`tool_surface()` and at execution, narrowing-only permission inheritance, no widening path in `TaskSpawnArgs`)
+were independently re-verified and hold up. Two gaps didn't:
+
+**Fixed: cancelling a turn (`--max-wall-time`, or Ctrl-C) had no effect on an in-flight subagent.**
+`SubagentRunner::run` (`exec_tools.rs:527-536`, before this fix) took no cancellation token at all;
+`execute_task_spawn`'s own `cancel` parameter was named `_cancel` (unused); and `LiveSubagentRunner::run`
+(`interactive.rs:1433-1443`) drove the child's entire nested turn with a **brand-new**
+`agent_runtime::CancellationToken::new()`, never linked to the parent's real token. This directly
+contradicts `EXEC_USAGE`'s own documented promise (`interactive.rs:239-240`): *"Cancel the turn if it runs
+longer than this many seconds (cooperative: the same signal Ctrl-C sends)."* Concretely: `rapid exec "..."
+--max-wall-time 60` with a delegating prompt — the watchdog cancels the shared token at 60s, but the thread
+blocked inside `runner.run()` never observes it and keeps running, bounded only by the child's own
+`MAX_MODEL_STEPS=32`, continuing to spend tokens/cost and mutate the workspace after the user believes the
+turn was stopped. Fixed by adding `cancel: &CancellationToken` to `SubagentRunner::run`'s signature,
+forwarding the caller's real token from `execute_task_spawn` instead of discarding it, and passing that same
+token into `run_live_exec` from `LiveSubagentRunner::run` instead of a fresh one — no type bridging needed,
+since both are the same `agent_runtime::CancellationToken`. New test
+`task_spawn_forwards_the_callers_real_cancellation_token_to_the_runner`: a fake runner captures a clone of
+the token it receives, the test cancels the *original* token after the call returns, and asserts the captured
+clone reflects it — provable only if the same underlying `Arc<AtomicBool>` reached the runner, not a fresh
+one. Verified via the revert cycle: reintroducing a fresh `&CancellationToken::new()` at the
+`execute_task_spawn` call site reproduced the exact failure predicted.
+
+**Fixed: sibling subagents (and a subagent and its parent) writing the same resolved file path had no shared
+serialization, and could silently destroy each other's successful writes.** `batch_dispatch`'s own
+`write_group_key` grouping (`exec_tools.rs:2453-2463`) already serializes same-path writes made through
+*one* `WorkspaceTools` instance's own batch — but a spawned subagent gets its own, entirely independent
+`WorkspaceTools` instance, and multiple `task_spawn` calls within one batch run concurrently on separate
+threads (the `solo:{index}` fallback in the same grouping function, originally meant for calls with no shared
+target, silently applies to `task_spawn` too). `execute_patch`/`execute_write`/`execute_todo_write` are all
+plain read-then-`fs::write` with no cross-instance gate at all. The reviewing agent's own reproduction: 32
+independent `WorkspaceTools` instances rooted at one shared directory, each patching the same anchor with a
+unique marker, released concurrently — 20/32 calls reported `Succeeded`, but only 1 of the 20 markers
+survived in the final file; 19 successful, reported edits silently destroyed with no error anywhere. Also
+corrected a directly-contradicted doc comment on `subagent_spawns` (`exec_tools.rs:626-630`) that claimed
+*"`task_spawn` runs synchronously, one subagent at a time, never several in parallel"* — false, per the same
+evidence.
+
+Fixed with a new `WriteLocks` registry (`exec_tools.rs`): a `Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>`
+handing out one lock per resolved path, shared from a turn's top-level `WorkspaceTools` into every subagent
+child via `share_write_locks` — the exact same "fresh-by-default, shared-on-purpose" pattern this file
+already uses for `bytes_written`/`fetch_bytes` (`share_turn_budgets`). `execute_write`, `execute_patch`, and
+`execute_todo_write` each acquire the lock for their resolved target immediately after computing it and hold
+it for their entire read-modify-write, closing the race for all three of this file's read-then-write
+handlers, not just the one the reproduction targeted. New test
+`sibling_subagent_style_patches_sharing_write_locks_never_lose_a_write`: 32 threads, each its own
+`WorkspaceTools` sharing one `WriteLocks`, released via a `Barrier` to force real interleaving, each patching
+a distinct marker in one shared file — asserts all 32 report success *and* all 32 markers survive. Verified
+via the revert cycle: with `share_write_locks` skipped (each instance keeping its own fresh, useless
+registry — exactly the original bug), the same test reliably failed with markers missing, reproducing the
+reviewer's finding directly rather than by inspection alone.
+
+Full `exec_tools` test module (90 tests, up from 88), full `-p rapid --lib` suite (362 tests, up from 360),
+full `-p rapid --tests` integration suites, and `cargo build --workspace --tests` all pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

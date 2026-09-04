@@ -1327,6 +1327,11 @@ struct LiveSubagentRunner {
     /// share_turn_budgets`'s own doc comment for why a fresh-per-child
     /// counter under-enforces a "per-turn" ceiling.
     turn_budgets: (std::sync::Arc<std::sync::atomic::AtomicU64>, std::sync::Arc<std::sync::atomic::AtomicU64>),
+    /// The parent's shared per-path write-lock registry (Modbit `WRK-017`),
+    /// so a subagent writing the same resolved path as its parent or a
+    /// sibling subagent serializes against them instead of racing on the
+    /// underlying file. See `exec_tools::WriteLocks`'s own doc comment.
+    write_locks: crate::exec_tools::WriteLocks,
     /// The parent's configured project hooks, cloned into every child so a
     /// `pre_tool_use`/`post_tool_use` policy hook that gates the parent's
     /// own tool calls also gates its subagents' — without this, delegating
@@ -1355,6 +1360,7 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         prompt: &str,
         agent_type: &str,
         write_scope: Option<&str>,
+        cancel: &agent_runtime::CancellationToken,
     ) -> Result<crate::exec_tools::SubagentReport, String> {
         use crate::exec_tools::ExecTools;
         let store = auth::InMemoryCredentialStore::new();
@@ -1388,6 +1394,10 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // doc comment.
         let (bytes_written, fetch_bytes) = self.turn_budgets.clone();
         tools.share_turn_budgets(bytes_written, fetch_bytes);
+        // Share the parent's per-path write-lock registry (Modbit
+        // WRK-017) rather than let this child start a fresh, useless one
+        // of its own — see `write_locks`'s own doc comment.
+        tools.share_write_locks(self.write_locks.clone());
         // Policy hooks (pre_tool_use/post_tool_use/subagent_start/
         // subagent_stop) must apply to a subagent's own tool calls too, or
         // delegation becomes a way to route around them entirely.
@@ -1436,7 +1446,7 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             &request,
             &mut tools,
             &mut events,
-            &agent_runtime::CancellationToken::new(),
+            cancel,
             ContextRetryPolicy::default(),
             None,
         )
@@ -1947,11 +1957,13 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                 crate::exec_tools::MAX_TOTAL_WRITE_BYTES_PER_TURN,
                 crate::exec_tools::MAX_TOTAL_FETCH_BYTES_PER_TURN,
             ));
+            let write_locks = tools.write_lock_handle().unwrap_or_default();
             tools.set_subagent_runner(std::sync::Arc::new(LiveSubagentRunner {
                 active: active.clone(),
                 root: root.clone(),
                 permissions: permission_lattice.clone(),
                 turn_budgets,
+                write_locks,
                 hooks,
                 shadow_diagnostics,
                 trace_calls,
