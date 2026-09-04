@@ -3766,6 +3766,70 @@ Browser,Tool}` attribution is genuinely "attribution only, never grants privileg
 different caller strictness" pattern found elsewhere this session (`web_fetch` vs. `llm-router`'s IP checks)
 does not recur here.
 
+**Same sweep, next applied to `crates/sandbox` — the eleventh crate, and the actual process-isolation backend
+behind `shell_exec`'s `"sandbox": true` execution. The most severe finding of the entire sweep: the only
+sandbox backend the shipped CLI ever actually uses provides zero real network isolation, contradicting its
+own internal documentation, and the finding was confirmed by live reproduction (a sandboxed process
+exfiltrating data to a loopback listener), not static reading alone. One misleading doc comment fixed inline;
+the real enforcement gap declined and tracked as a follow-up, since implementing it is genuine platform-
+specific work, not a mechanical patch.**
+
+**Confirmed, via a real executable reproduction (a standalone harness reusing the actual crate, run against a
+loopback listener) that `HostRestrictedBackend` — the only sandbox backend `apps/rapid` ever registers; its
+`SeatbeltBackend`/`ContainerBackend`/`GvisorBackend`/`RemoteBackend` siblings are wired up nowhere in the
+shipped CLI at all — computes and stores a `HostNetworkHelper` (`Isolated` vs. `Allowlist`) for every prepared
+sandbox but never reads it back at spawn time.** `crates/sandbox/src/backends/host_restricted.rs`'s
+`run_supervised`/`spawn_command` install a real `RLIMIT_CPU` before exec (a genuine kernel-enforced ceiling)
+but never touch network at all — no `unshare`, no firewall/pf rule, no seccomp, no socket restriction of any
+kind, confirmed by grepping the whole file. `HostNetworkHelper::Isolated`'s own doc comment claimed "no host
+network grant" as if that were an enforced guarantee; in reality a sandboxed command with `sandbox: true` and
+no other flags (the *strictest*, default-requested mode — `apps/rapid/src/sandbox_exec.rs` never requests
+anything else) has full, unrestricted network egress on Linux, Windows, or macOS whenever `sandbox-exec` is
+unavailable (the only condition under which `apps/rapid` falls back to this backend on macOS — see below for
+the normal macOS path). Fixed the misleading doc comment on `HostNetworkHelper` (both variants, plus a note on
+the enum itself) to accurately describe that neither is currently enforced, so a future reader isn't misled
+into trusting a guarantee that isn't real the way this review very nearly was before it decided to verify
+empirically. This is a doc-only change; the real fix (network namespace isolation on Linux, or an equivalent
+platform mechanism, wired into `run_supervised` before exec) is genuine platform-specific implementation work
+that can't be verified end-to-end from this macOS host, so it's declined here and tracked as a follow-up task
+rather than attempted inline.
+
+Separately, and lower severity than initially it appeared: `apps/rapid/src/exec_tools.rs`'s own macOS Seatbelt
+path (the one actually exercised on this and most developer machines, since `find_sandbox_exec` finds a real
+`sandbox-exec` binary here) was also found by the same review to only enforce `(deny file-write*)` +
+`(allow default)` — reads, network, and everything else are permitted. This is **not** a doc/implementation
+mismatch on the `apps/rapid` side, though: `execute_shell`'s own existing comment already correctly scopes
+this as "Seatbelt confinement (macOS): workspace writes allowed, other writes denied," and the model-facing
+tool schema only ever promised "optional sandbox confinement" — genuinely vague, not a specific network/read-
+isolation claim. So macOS's write-only scope is a real, narrow protection (and a real limitation worth being
+aware of if `sandbox: true` is ever relied on as a boundary against untrusted/adversarial command content) but
+not a broken promise the way `HostNetworkHelper`'s doc comment was.
+
+Useful existing mitigation this connects back to: `crates/security::doctor.rs`'s `SandboxAvailability` check
+already emits `DoctorStatus::Warn` with `"host-restricted is not a strong malicious-code boundary; prefer
+container, gvisor, or remote-worker"` whenever no *strong* isolation tier is available (true on this and most
+hosts, since only `HostRestrictedBackend` is ever wired up) — a real, honest, existing warning. It doesn't
+name the network gap specifically, but the fix earlier in this same pass (`rapid doctor` now returning a
+non-zero exit code on any non-`Pass` status, instead of always `0`) is what makes this warning actually
+actionable in a CI/pre-flight context for the first time, rather than a message nobody's tooling could ever
+notice.
+
+Also found, lower priority, left unfixed and briefly documented rather than spawned as a separate task
+(bundled into the same follow-up): `env_allowlist` is threaded through `SandboxSpec`/`HostRestrictedPlan` and
+validated, but `run_supervised` only ever calls `command.env_clear()` and never re-populates any allowlisted
+variable — currently invisible in production because `apps/rapid/src/sandbox_exec.rs` never actually requests
+a non-empty allowlist (so "allow nothing, get nothing" coincidentally matches), but it's dead, unimplemented
+machinery behind a doc comment that implies otherwise; and `MAX_LIVE_HOST_SANDBOXES` (a cap on live sessions
+per `HostRestrictedBackend` instance) provides no real cross-call protection today since
+`sandbox_exec.rs::run_sandboxed` constructs a brand-new manager+backend and drops it on every single call —
+the same "per-instance ceiling standing in for what should be shared/durable state" shape already found and
+fixed elsewhere this session (`JobRegistry`, `WriteLocks`), but here needs a real architectural decision
+(a long-lived, thread-safe, shared backend instance) rather than a small patch, since nothing today confirms
+whether an outer layer already bounds concurrent `shell_exec` calls.
+
+`cargo build -p sandbox --lib` and the full `-p sandbox --lib` test suite pass (doc-only change, no behavior
+affected, so no new regression test — nothing to revert-cycle).
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

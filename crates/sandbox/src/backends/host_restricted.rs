@@ -73,11 +73,23 @@ shift
 exec "$@""#;
 
 /// Network helper attached to a prepared host-restricted sandbox.
+///
+/// Neither variant is actually enforced today: `plan_spec` computes and
+/// stores this on `HostRestrictedPlan`, but `run_supervised`/`spawn_command`
+/// never read it back — no `unshare`, firewall rule, or socket restriction
+/// of any kind is installed before the child execs, on any platform this
+/// backend runs on. A `SandboxNetwork::None` request (this backend's
+/// default, and the only one `apps/rapid` ever requests) is silently *not*
+/// isolated; a real network egress is possible for any sandboxed command.
+/// Distinguishing the two variants here only gates *acceptance* of a spec
+/// via `supports_spec`/`from_network` below, not what actually happens at
+/// exec time.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum HostNetworkHelper {
-    /// Default isolated mode: no host network grant and no proxy env.
+    /// Requested/accepted as the strictest mode; not currently enforced.
     Isolated,
-    /// Brokered allowlist helper. Not a kernel/netns boundary.
+    /// Requested/accepted as a brokered allowlist; not currently enforced,
+    /// and was never meant to be a kernel/netns boundary even if it were.
     Allowlist,
 }
 
