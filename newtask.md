@@ -3512,6 +3512,20 @@ full `-p rapid --lib` suite (374 tests, up from 373), full `-p rapid --tests` in
 the live-provider `real_s5_web_fetch_through_the_live_provider` bench), and `cargo build --workspace --tests`
 all pass.
 
+**Same sweep, briefly, on `crates/acp` — an eighth crate confirmed unreachable in this sweep.** Implements
+the Agent Client Protocol (JSON-RPC 2.0 over stdio, two adapter versions) for RapidLM to act as either an ACP
+*server* (an external editor/IDE drives `rapid` over stdio, analogous to how editors talk to other CLI
+agents) or an ACP *client* (`apps/rapid/src/external_agents.rs` spawning some other ACP-speaking tool).
+Neither side is wired up: `rapid acp` is documented in `CLI_USAGE`'s help text and appears in this document's
+own "Target V3 command surface" list, but `run_subcommand`'s actual dispatcher has no `"acp"` match arm at
+all (falls through to a usage error); the one live external-agent path, `rapid agent-cli`, only ever uses the
+sibling CLI flavor (`AgentFlavor::Acp`/`run_acp_agent`/`AgentChannel` have zero non-test implementations or
+callers anywhere in the workspace). `crates/security`'s own `fuzz_acp_frame_decoder` exercises the transport
+layer, but only as a test-only fuzzing helper, not a runtime path. The transport/decoder itself (`stdio.rs`)
+does show this codebase's usual careful patterns (bounded frame reads, cooperative cancellation, typed
+errors, no panics) on a quick read, but a full adversarial pass wasn't warranted given zero production
+reachability.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
