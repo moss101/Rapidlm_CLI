@@ -3040,7 +3040,26 @@ fn run_git(root: &Path, args: &[&str]) -> Option<std::process::Output> {
 /// is *which* files and content count as "about to become permanent."
 fn collect_content_findings(root: &Path, files: impl Iterator<Item = (String, Vec<u8>)>) -> Vec<String> {
     let mut findings = Vec::new();
+    // `scan_for_secrets_advisory`/`scan_patch_advisory` collapse a scanner
+    // error (oversized content, unreadable path) to `None` — the same
+    // shape as "found nothing," which is the right, documented trade-off
+    // for their own advisory-only callers (`workspace_write`/
+    // `workspace_patch`, where a scan failure must never break a
+    // legitimate write). It is the *wrong* trade-off here: this function's
+    // whole purpose is a blocking gate, so a file this pass genuinely
+    // could not scan must block the commit/merge, not silently commit it
+    // unscanned. Check the shared size cap up front so a too-large file
+    // becomes its own finding instead of an invisible scanner error.
+    let scan_cap = security::MAX_TARGET_BYTES.min(security::MAX_PATCH_TARGET_BYTES);
     for (path, content) in files {
+        if content.len() > scan_cap {
+            findings.push(format!(
+                "{path}: {} bytes exceeds the {scan_cap}-byte scan limit; blocking rather than \
+                 committing content that could not be scanned",
+                content.len()
+            ));
+            continue;
+        }
         if let Some(note) = scan_for_secrets_advisory(root, &path, &content) {
             findings.push(note);
         }
@@ -3051,6 +3070,77 @@ fn collect_content_findings(root: &Path, files: impl Iterator<Item = (String, Ve
     findings
 }
 
+/// Whether `argv[0]` resolves to the real `git` binary — a literal `"git"`,
+/// or any absolute/relative/`$PATH`-resolved path whose canonical target is
+/// named `git`/`git.exe` — so `["/usr/bin/git", "commit", ...]` is treated
+/// identically to `["git", "commit", ...]` by the gates below.
+fn argv0_is_git(root: &Path, program: &str) -> bool {
+    if program == "git" {
+        return true;
+    }
+    crate::sandbox_exec::resolve_program(root, program)
+        .ok()
+        .and_then(|resolved| {
+            Path::new(&resolved)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name == "git" || name == "git.exe")
+        })
+        .unwrap_or(false)
+}
+
+/// The index into `argv` of the token that actually invokes git subcommand
+/// `verb` ("commit" or "merge"), or `None` if this call doesn't. Robust to
+/// three ways the literal token can move or disappear: a resolvable but
+/// non-literal `argv[0]` (`/usr/bin/git commit`, see `argv0_is_git`); git's
+/// own global options shifting the subcommand out of `argv[1]` (`git -c
+/// x=y commit`) — handled by searching every token after `argv[0]` rather
+/// than only `argv[1]`, which only risks over-matching (an extra, harmless
+/// scan of whatever happens to be staged) since `verb` never appears as a
+/// stray token in a real, unrelated command by coincidence; and a local
+/// git alias whose value names the verb (`git config alias.c commit` then
+/// `git c`) — resolved with one extra, read-only `git config
+/// --get-regexp` query, one alias level deep (an alias chain nested
+/// further than that is treated the same as the already-documented,
+/// accepted "wrapped in a shell string" scope limit below).
+fn find_git_verb_index(root: &Path, argv: &[String], verb: &str) -> Option<usize> {
+    if argv.len() < 2 || !argv0_is_git(root, &argv[0]) {
+        return None;
+    }
+    if let Some(index) = argv[1..].iter().position(|token| token == verb) {
+        return Some(index + 1);
+    }
+    let output = run_git(root, &["config", "--get-regexp", r"^alias\."])?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let aliases: Vec<(&str, &str)> = text
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(' ')?;
+            Some((key.strip_prefix("alias.")?, value))
+        })
+        .collect();
+    argv[1..]
+        .iter()
+        .position(|token| {
+            aliases
+                .iter()
+                .any(|(name, value)| *name == token && value.split_whitespace().any(|word| word == verb))
+        })
+        .map(|index| index + 1)
+}
+
+/// Whether `flags` (every argv token after the matched verb) includes
+/// git's `-a`/`--all`/a short-flag cluster containing `a` (`-am`), which
+/// auto-stages already-tracked modified/deleted files as part of the same
+/// commit — content `scan_git_commit_gate`'s normal `git diff --cached`
+/// read would never see, since it was never staged at all before the
+/// commit that includes it.
+fn commit_flags_include_all(flags: &[String]) -> bool {
+    flags
+        .iter()
+        .any(|token| token == "--all" || (token.starts_with('-') && !token.starts_with("--") && token.contains('a')))
+}
+
 /// Blocking pre-commit gate (Modbit `VER-009` `PatchPolicyGate`): when
 /// `shell_exec`'s plain path is about to run `git commit`, every staged
 /// file is scanned exactly the way `workspace_write`/`workspace_patch`
@@ -3059,25 +3149,40 @@ fn collect_content_findings(root: &Path, files: impl Iterator<Item = (String, Ve
 /// dismiss mechanism and message text) — but here a finding blocks the
 /// commit outright instead of only appending an advisory note, since
 /// "gate before commit" is this item's whole point, unlike every other
-/// scanner call site in this file. Only matches a plain `argv[0] ==
-/// "git"`/`argv[1] == "commit"` call; a `git commit` wrapped in a shell
-/// string (`["sh", "-c", "git commit ..."]`) is not detected — a real,
-/// known scope limit, not an oversight. Fails open (returns `None`, never
+/// scanner call site in this file. Detection goes through
+/// `find_git_verb_index` (robust to a resolvable-but-not-literal `argv[0]`,
+/// git global options shifting the subcommand's position, and a local
+/// alias naming the verb) rather than a fixed `argv[0]`/`argv[1]` pair. A
+/// `git commit` wrapped in a shell string (`["sh", "-c", "git commit
+/// ..."]`) is still not detected — a real, known scope limit, not an
+/// oversight: that would need parsing an arbitrary shell command line, not
+/// just git's own argv grammar. A `-a`/`--all`/`-am`-style flag is
+/// special-cased (`commit_flags_include_all`) to scan the working tree
+/// against `HEAD` instead of the index against `HEAD` — otherwise a file
+/// modified but never explicitly staged, which `-a` still commits, would
+/// never be read by this gate at all. Fails open (returns `None`, never
 /// blocks) on anything that isn't a real, readable git repo with staged
 /// changes: this can only ever narrow which commits succeed, never widen
 /// what's allowed, so a repo this can't introspect must not be blocked by
 /// a check that can't run.
 fn scan_git_commit_gate(root: &Path, argv: &[String]) -> Option<String> {
-    if argv.len() < 2 || argv[0] != "git" || argv[1] != "commit" {
-        return None;
-    }
-    let staged = run_git(root, &["diff", "--cached", "--name-only", "--diff-filter=ACMR"])?;
+    let verb_index = find_git_verb_index(root, argv, "commit")?;
+    let include_all = commit_flags_include_all(&argv[verb_index + 1..]);
+    let staged = if include_all {
+        run_git(root, &["diff", "HEAD", "--name-only", "--diff-filter=ACMR"])?
+    } else {
+        run_git(root, &["diff", "--cached", "--name-only", "--diff-filter=ACMR"])?
+    };
     let files = String::from_utf8_lossy(&staged.stdout)
         .lines()
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .filter_map(|path| {
-            let content = run_git(root, &["show", &format!(":{path}")])?.stdout;
+            let content = if include_all {
+                fs::read(root.join(path)).ok()?
+            } else {
+                run_git(root, &["show", &format!(":{path}")])?.stdout
+            };
             Some((path.to_owned(), content))
         })
         .collect::<Vec<_>>();
@@ -3099,19 +3204,20 @@ fn scan_git_commit_gate(root: &Path, argv: &[String]) -> Option<String> {
 /// about to run `git merge <ref>...`, every file the merge would actually
 /// bring in is scanned the same way. Unlike a commit, there is no single
 /// "staged" set to read — a merge's target refs are computed from `argv`
-/// itself (every trailing token that doesn't start with `-`; a merge with
-/// no such token, e.g. `git merge --continue`, is not this gate's concern
-/// and is left alone), then each ref's incoming content is compared against
-/// `HEAD` (`git diff --name-only HEAD <ref>`) and read via `git show
-/// <ref>:<path>` — never the working tree, which the merge hasn't touched
-/// yet. Fails open the same way the commit gate does: an unreadable repo,
-/// an unresolvable ref, or a deleted-by-incoming-branch path are all
-/// silently skipped rather than treated as a reason to block.
+/// itself (every trailing token, after the matched verb, that doesn't
+/// start with `-`; a merge with no such token, e.g. `git merge
+/// --continue`, is not this gate's concern and is left alone), then each
+/// ref's incoming content is compared against `HEAD` (`git diff
+/// --name-only HEAD <ref>`) and read via `git show <ref>:<path>` — never
+/// the working tree, which the merge hasn't touched yet. Detection goes
+/// through `find_git_verb_index`, same robustness (and same accepted
+/// shell-string-wrapping scope limit) as `scan_git_commit_gate`. Fails
+/// open the same way the commit gate does: an unreadable repo, an
+/// unresolvable ref, or a deleted-by-incoming-branch path are all silently
+/// skipped rather than treated as a reason to block.
 fn scan_git_merge_gate(root: &Path, argv: &[String]) -> Option<String> {
-    if argv.len() < 2 || argv[0] != "git" || argv[1] != "merge" {
-        return None;
-    }
-    let targets: Vec<&str> = argv[2..]
+    let verb_index = find_git_verb_index(root, argv, "merge")?;
+    let targets: Vec<&str> = argv[verb_index + 1..]
         .iter()
         .map(String::as_str)
         .filter(|arg| !arg.starts_with('-'))
@@ -5682,6 +5788,207 @@ use std::sync::{Arc, Mutex};
             1,
             "only the seed commit — the gated commit must never have run, even as a background job"
         );
+    }
+
+    /// Shared setup for the argv-shape-bypass regression tests below: a
+    /// repo with a secret staged and configured for a real commit — the
+    /// only thing each test varies is the exact `argv` sequence used to
+    /// try to commit it, mirroring an evasive model probing for a shape
+    /// the gate's detection doesn't recognize.
+    fn commit_gate_bypass_fixture() -> (TempRoot, String) {
+        let root = TempRoot::new("commit-gate-bypass");
+        git_init(&root.0);
+        let configure = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root.0)
+                .args(args)
+                .output()
+                .expect("git config");
+            assert!(out.status.success());
+        };
+        configure(&["config", "user.name", "t"]);
+        configure(&["config", "user.email", "t@t.invalid"]);
+        let token = format!("ghp_{}", "e".repeat(36));
+        fs::write(root.0.join("config.rs"), format!("const TOKEN: &str = \"{token}\";\n"))
+            .expect("write secret file");
+        let stage = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["add", "config.rs"])
+            .output()
+            .expect("git add");
+        assert!(stage.status.success());
+        (root, token)
+    }
+
+    fn assert_commit_count(root: &Path, expected: usize, context: &str) {
+        let log = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["log", "--oneline"])
+            .output()
+            .expect("git log");
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).lines().count(),
+            expected,
+            "{context}"
+        );
+    }
+
+    #[test]
+    fn commit_gate_still_blocks_when_a_git_global_option_shifts_the_verbs_position() {
+        let (root, _token) = commit_gate_bypass_fixture();
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["git","-c","advice.detachedHead=false","commit","-m","add config"]}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.expect("detail").contains("commit blocked"));
+            }
+            other => panic!("expected `git -c k=v commit` to still be gated, got {other:?}"),
+        }
+        assert_commit_count(&root.0, 1, "a -c-prefixed commit must still be blocked");
+    }
+
+    #[test]
+    fn commit_gate_still_blocks_when_argv0_is_a_resolved_path_to_git() {
+        let (root, _token) = commit_gate_bypass_fixture();
+        let git_path = std::process::Command::new("which")
+            .arg("git")
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned());
+        let Some(git_path) = git_path else {
+            // No resolvable `git` on this host's PATH to test against;
+            // skip rather than fail on an environment this fix doesn't
+            // control.
+            return;
+        };
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let args = serde_json::json!({"argv": [git_path, "commit", "-m", "add config"]});
+        let call = make_call("c1", SHELL_EXEC_TOOL, &args.to_string());
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.expect("detail").contains("commit blocked"));
+            }
+            other => panic!("expected a path-resolved git commit to still be gated, got {other:?}"),
+        }
+        assert_commit_count(&root.0, 1, "a path-to-git commit must still be blocked");
+    }
+
+    #[test]
+    fn commit_gate_still_blocks_when_a_local_alias_names_commit() {
+        let (root, _token) = commit_gate_bypass_fixture();
+        let alias = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["config", "alias.c", "commit"])
+            .output()
+            .expect("git config alias");
+        assert!(alias.status.success());
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","c","-m","add config"]}"#);
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.expect("detail").contains("commit blocked"));
+            }
+            other => panic!("expected an aliased `git c` to still be gated, got {other:?}"),
+        }
+        assert_commit_count(&root.0, 1, "an aliased commit must still be blocked");
+    }
+
+    #[test]
+    fn commit_gate_scans_working_tree_content_under_the_all_flag() {
+        // Unlike the other bypass fixtures, this secret must be an
+        // *unstaged* modification to an already-tracked file — exactly
+        // what `-a` sweeps in that a plain `git diff --cached` read would
+        // never see.
+        let root = TempRoot::new("commit-gate-all-flag");
+        git_init(&root.0);
+        let configure = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root.0)
+                .args(args)
+                .output()
+                .expect("git config");
+            assert!(out.status.success());
+        };
+        configure(&["config", "user.name", "t"]);
+        configure(&["config", "user.email", "t@t.invalid"]);
+        let token = format!("ghp_{}", "g".repeat(36));
+        // `seed.txt` is already tracked (committed by `git_init`); modify
+        // it on disk without ever staging it.
+        fs::write(root.0.join("seed.txt"), format!("const TOKEN: &str = \"{token}\";\n"))
+            .expect("modify tracked file");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-am","update seed"]}"#);
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                let detail = detail.expect("detail");
+                assert!(detail.contains("commit blocked"), "{detail}");
+            }
+            other => panic!("expected `-am` to scan the unstaged modification, got {other:?}"),
+        }
+        assert_commit_count(&root.0, 1, "an -am commit sweeping in a secret must still be blocked");
+    }
+
+    #[test]
+    fn commit_gate_blocks_rather_than_commits_content_over_the_scan_size_cap() {
+        let root = TempRoot::new("commit-gate-oversized");
+        git_init(&root.0);
+        let configure = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root.0)
+                .args(args)
+                .output()
+                .expect("git config");
+            assert!(out.status.success());
+        };
+        configure(&["config", "user.name", "t"]);
+        configure(&["config", "user.email", "t@t.invalid"]);
+        let cap = security::MAX_TARGET_BYTES.min(security::MAX_PATCH_TARGET_BYTES);
+        let oversized = vec![b'a'; cap + 1];
+        fs::write(root.0.join("huge.bin"), &oversized).expect("write oversized file");
+        let stage = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["add", "huge.bin"])
+            .output()
+            .expect("git add");
+        assert!(stage.status.success());
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","add huge file"]}"#);
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                let detail = detail.expect("detail");
+                assert!(detail.contains("commit blocked"), "{detail}");
+                assert!(detail.contains("scan limit"), "{detail}");
+            }
+            other => panic!("expected an unscannable file to block the commit, got {other:?}"),
+        }
+        assert_commit_count(&root.0, 1, "content too large to scan must never be committed unscanned");
     }
 
     #[test]

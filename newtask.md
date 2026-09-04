@@ -3188,6 +3188,93 @@ fixes this session.
 Full `web_fetch`/`exec_tools` web_fetch test coverage (13 tests, up from 10), full `-p rapid --lib` suite (366
 tests, up from 365), full `llm-router` suite (141 tests), and `cargo build --workspace --tests` all pass.
 
+**Same sweep, next applied to the `git commit`/`git merge` PatchPolicyGate (`apps/rapid/src/
+exec_tools.rs::scan_git_commit_gate`/`scan_git_merge_gate`) — the blocking gate that scans staged/incoming
+content for unresolved secrets before letting `shell_exec` actually run a commit or merge. Five real,
+directly reachable findings; all five fixed. One further scope gap documented, not fixed.**
+
+The gate's own wiring was already sound going in — a single, unconditional check point ahead of all three
+`shell_exec` modes (plain/background/sandboxed), confirmed by the existing `background_and_sandbox_shell_
+exec_cannot_bypass_the_git_commit_gate` test — so every finding below is about the *detection* itself being
+narrower than the git CLI grammar it's trying to recognize, not about the gate being skippable once matched.
+
+**Fixed: three ways to make git run `commit`/`merge` without the literal argv shape `["git", "commit", ...]`
+the gate's own `argv[0]`/`argv[1]` check required.** (1) `git -c <k>=<v> commit ...` — `-c` is a documented
+git *global* option that precedes the subcommand, shifting `"commit"` to `argv[2]`; the positional check
+simply never saw it. (2) `/usr/bin/git commit ...` (or any other resolvable path/`$PATH` lookup instead of
+the literal string `"git"`) — a raw string comparison, not canonicalization; this codebase already has the
+fix for exactly this shape elsewhere (`scan_command_advisory`'s own `crate::sandbox_exec::resolve_program`
+call for its advisory dangerous-command scan) but never applied it here. (3) `git config alias.c commit`
+(itself unblocked — `argv[1] == "config"`, and shell_exec only restricts the process `cwd`, not what paths a
+git subprocess can write to) then `git c -m "..."` — aliases are a first-class git feature the real `git`
+binary resolves internally, invisible to a literal `argv[1]` string check. All three close to a real,
+committed secret with zero errors from the gate. Fixed with a new `find_git_verb_index` that: resolves
+`argv[0]` via the same `resolve_program` helper `scan_command_advisory` already used (closing (2)); searches
+every token after `argv[0]` for the literal verb rather than only `argv[1]` (closing (1) — this only risks
+*over*-matching, an extra harmless scan, since `"commit"`/`"merge"` don't appear as stray tokens in real,
+unrelated commands by coincidence); and, failing that, resolves one level of local git alias via a read-only
+`git config --get-regexp '^alias\.'` query (closing (3) — an alias chain nested deeper than one level is
+left as the same already-accepted "wrapped in a shell string" scope limit the gate's own doc comment already
+carves out, not a new gap). New tests `commit_gate_still_blocks_when_a_git_global_option_shifts_the_verbs_
+position`, `commit_gate_still_blocks_when_argv0_is_a_resolved_path_to_git`,
+`commit_gate_still_blocks_when_a_local_alias_names_commit` — each stages a real secret and drives the exact
+bypass argv/sequence, asserting the commit is blocked and the repo's commit count never moves. Verified via
+the revert cycle: all three (plus the two findings below) failed identically against the original positional
+check, each one actually committing the secret (`git log` showing a real new commit) rather than merely
+returning a wrong-shaped result.
+
+**Fixed: `git commit -a`/`--all`/`-am` scanned the wrong content — a same-call content-scope gap, not an
+argv-detection bypass.** The gate only ever read `git diff --cached` (the index). Per `git-commit`'s own
+documented semantics, `-a`/`--all` auto-stages already-tracked modified/deleted files *as part of the same
+commit invocation* — content that was never staged when the gate ran its `--cached` read, so it was never
+scanned at all. Concretely: modify an already-tracked file in place (e.g. via the ordinary, permitted
+`workspace_write` tool, whose own secret scan is advisory-only and never blocks) without staging it, then
+`git commit -am "..."` — the secret ships, gate untouched. Fixed by detecting `-a`/`--all`/a short-flag
+cluster containing `a` (`commit_flags_include_all`, deliberately broad — a message argument that happens to
+start with `-` and contain `a` would only cost an unnecessary extra scan, never a missed one) among the
+tokens after the matched verb, and when present, scanning `git diff HEAD --name-only` (working tree vs.
+`HEAD`, exactly what `-a` folds into the commit for already-tracked files, verified against `git-commit`'s
+own documented "modified and deleted, but new files you have not told git about are not affected") with each
+file's *working-tree* content (read straight off disk) rather than `git show :path` (the index blob, which
+for an unstaged file doesn't reflect the change at all). New test `commit_gate_scans_working_tree_content_
+under_the_all_flag`. Verified via the revert cycle: the unfixed gate let the `-am` commit through cleanly
+every time, confirmed by a real second commit appearing in `git log`.
+
+**Fixed: the scanner's own 8 MiB per-file size cap was a silent fail-*open* for the gate, though it's a
+correct, deliberate fail-*closed* default for every other caller of the same scanner.** `scan_for_secrets_
+advisory`/`scan_patch_advisory`'s `.ok()?` chains collapse a scan error (their own doc comment: "bad path,
+oversized content") to `None` — indistinguishable from "scanned, found nothing" — which is the *right*
+trade-off for their real callers (`workspace_write`/`workspace_patch`'s advisory-only notes, where a scanner
+hiccup must never block a legitimate write) but the *wrong* one for `collect_content_findings`, the shared
+helper both gates use, whose entire purpose is blocking. Concretely: stage one file over
+`security::MAX_TARGET_BYTES`/`MAX_PATCH_TARGET_BYTES` (8 MiB) with a live secret anywhere in it, commit — the
+per-file scan fails closed-shaped (`BoundExceeded`) but the `.ok()?` conversion makes it look like "nothing
+found," `record_gate_decision` durably logs `blocked:false` to `.rapidlm/gate_log.jsonl` (an audit trail
+that now reads as "checked, clean" for a file that was never actually checked), and the secret commits.
+Fixed by checking the shared size cap in `collect_content_findings` itself, before calling either scanner,
+and turning "too large to scan" into its own blocking finding rather than letting it fall through to the
+scanners' own silent-`None` path. New test `commit_gate_blocks_rather_than_commits_content_over_the_scan_
+size_cap`. Verified via the revert cycle: the unfixed gate committed the oversized secret-bearing file
+cleanly, no warning, no log entry hinting anything was skipped.
+
+**Documented, not fixed: `scan_git_commit_gate`/`scan_git_merge_gate` only ever recognize the literal verbs
+`"commit"`/`"merge"` — every other git operation that durably creates commit content
+(`pull` — literally fetch-then-merge, the exact machinery `scan_git_merge_gate` exists to guard, just reached
+by a different verb; `rebase`, `cherry-pick`, `revert`; the plumbing pair `commit-tree`/`update-ref`) is
+outside both gates entirely, and unlike the shell-string-wrapping limit, this gap isn't called out anywhere
+in the code.** `git pull` in particular needs no adversarial intent to reach — it's an entirely ordinary
+workflow step. **Not fixed this pass**: `pull`'s incoming content isn't locally available to scan the same
+way (it needs to be fetched first, and scanning after the merge step has already run is too late); `rebase`/
+`cherry-pick`/`revert` replay *existing* commits rather than committing currently-staged/working-tree
+content, a genuinely different scan shape (diff the replayed range against its base, not `--cached`/`HEAD`)
+that doesn't reduce to either existing gate's logic. Closing this properly means designing a third, distinct
+gate shape per operation family, not extending the argv-detection this pass already hardened — a larger,
+separate piece of work belonging with whoever next reviews this gate's coverage, flagged here so it isn't
+mistaken for full coverage.
+
+Full `exec_tools`/commit-gate test coverage (7 tests, up from 5), full `-p rapid --lib` suite (371 tests, up
+from 366), and `cargo build --workspace --tests` all pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
