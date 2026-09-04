@@ -619,14 +619,28 @@ pub struct SubagentReport {
 /// *same* registry as its parent (`share_write_locks`) instead of getting a
 /// fresh, useless one of its own.
 #[derive(Clone, Default)]
-pub(crate) struct WriteLocks(Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>);
+pub(crate) struct WriteLocks(Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>);
 
 impl WriteLocks {
     fn lock_for(&self, path: &Path) -> Arc<Mutex<()>> {
+        // Keyed on a lowercased string, not the `PathBuf` itself:
+        // `resolve_in_root` preserves whatever casing the caller's `path`
+        // argument used rather than the filesystem's real, already-
+        // established casing, so on any case-insensitive-but-case-
+        // preserving filesystem (the macOS/Windows default) two spellings
+        // of the very file this lock exists to protect — `Notes.txt` and
+        // `notes.txt` — would otherwise land on two different `Arc<Mutex<
+        // ()>>` instances and race with no real mutual exclusion at all,
+        // defeating this registry's whole purpose. Folding the key erases
+        // that distinction unconditionally, even on a genuinely
+        // case-sensitive filesystem where the two spellings are really
+        // different files — the cost there is an occasional unnecessary
+        // serialization between two unrelated writes, never a lost update,
+        // so it's the safe direction to err in without needing to probe
+        // the filesystem's actual case sensitivity.
+        let key = path.to_string_lossy().to_ascii_lowercase();
         let mut map = self.0.lock().expect("write locks");
-        map.entry(path.to_path_buf())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+        map.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
     }
 }
 
@@ -8615,6 +8629,30 @@ use std::sync::{Arc, Mutex};
                  writes: {final_content}"
             );
         }
+    }
+
+    #[test]
+    fn write_locks_key_case_insensitively_regardless_of_path_casing() {
+        // `resolve_in_root` preserves the caller's casing rather than the
+        // filesystem's real, already-established one, so on any case-
+        // insensitive-but-case-preserving filesystem (the macOS/Windows
+        // default) two spellings of the very file `WriteLocks` exists to
+        // protect must still land on the same lock, not two independent
+        // ones that provide no real mutual exclusion at all.
+        let locks = WriteLocks::default();
+        let a = locks.lock_for(Path::new("/root/Notes.txt"));
+        let b = locks.lock_for(Path::new("/root/notes.txt"));
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "two case-variant spellings of the same path must share one lock"
+        );
+        // A genuinely different path must still get its own, independent
+        // lock — this isn't a fix that collapses everything into one.
+        let c = locks.lock_for(Path::new("/root/other.txt"));
+        assert!(
+            !Arc::ptr_eq(&a, &c),
+            "an unrelated path must not share a lock with Notes.txt"
+        );
     }
 
     #[test]

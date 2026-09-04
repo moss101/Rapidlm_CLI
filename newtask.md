@@ -3385,6 +3385,74 @@ documenting the concrete, reproducible consequence (a second chat message crashe
 action needed from this cross-check beyond the confirmation itself: every fix this sweep made to
 `exec_tools.rs` this session protects the one real tool-execution path that exists.
 
+**Self-check, next applied to `batch_dispatch`/`write_group_key`/`WriteLocks` — this session's own new
+per-batch-thread concurrency engine, and the `WriteLocks` mechanism this sweep added earlier today. Two
+findings confirmed clean (reassuring, since one of them is exactly the risk a hand-rolled locking addition
+could have introduced), one real bug fixed that directly undermined `WriteLocks`'s own guarantee, two more
+real findings documented and left for later given their complexity.**
+
+**Confirmed clean: no deadlock risk from `WriteLocks`, and thread count is hard-capped, so a crafted batch
+can't exhaust threads.** Every call site (`execute_write`, `execute_patch`, `execute_todo_write`) acquires
+exactly one path's lock and holds it only for its own function body; nothing reachable while holding it
+(secret/patch-policy scanning, shadow-diagnostics verification, hook lookups) ever tries to acquire a second
+lock, and `post_tool_use` hook execution runs strictly after the write guard is already dropped — so the
+classic two-lock AB/BA deadlock has no code path to occur through. Separately, `batch_dispatch`'s thread count
+is bounded by `crates/agent-runtime`'s own `MAX_TOOL_CALLS_PER_STEP = 16`, enforced *before* any call
+dispatches — a hostile batch spreading calls across many distinct paths/`solo:{index}` keys still can't spawn
+more than 16 threads in one `std::thread::scope`. Both verified via direct tracing of every reachable
+function and the existing `proposal_above_the_per_step_cap_is_refused_before_any_execution` test.
+
+**Fixed: `WriteLocks` keyed on the exact `PathBuf` `resolve_in_root` returns — which preserves the caller's
+own casing rather than the filesystem's real, already-established one — so two case-variant spellings of the
+identical real file got two different locks and no real mutual exclusion at all, on any case-insensitive-but-
+case-preserving filesystem (the macOS/Windows default this repo and most contributors' machines run on).**
+`resolve_in_root` computes a canonicalized path purely to run its containment check, then discards it and
+returns the original, caller-cased `target` — confirmed empirically that `std::fs::canonicalize`/`realpath`
+does not itself correct case on APFS (`realpath("Notes.txt")` and `realpath("notes.txt")` both return their
+own input casing verbatim, not the file's one true stored name), so simply adopting the canonicalized result
+wouldn't have closed this. Concretely: `workspace_write{path:"Notes.txt"}` and `workspace_patch{path:"notes.
+txt"}` in one batch (or across a parent and a subagent sharing the same `WriteLocks` registry) target the
+identical on-disk file but land on two independent `Arc<Mutex<()>>` instances, racing with zero serialization
+— defeating the exact guarantee `WriteLocks` was added earlier today to provide. Properly deriving the
+filesystem's *true* stored casing would need a `read_dir`-based case-insensitive lookup per path component,
+genuinely platform/filesystem-dependent (a case-sensitive volume can be mounted on macOS too) — instead fixed
+`WriteLocks::lock_for` to key on a lowercased string unconditionally, on every platform, regardless of the
+real filesystem's actual case sensitivity: on a case-insensitive filesystem this correctly serializes what
+needs it; on a genuinely case-sensitive one it costs only an occasional unneeded serialization between two
+truly-independent files, never a lost update — the safe direction to err in without probing filesystem
+semantics at all. New test `write_locks_key_case_insensitively_regardless_of_path_casing`: asserts `Notes.txt`
+and `notes.txt` share one lock (via `Arc::ptr_eq`) while an unrelated path gets its own — verified via the
+revert cycle that the un-folded key produces two different lock objects.
+
+**Found, verified via static tracing, and left unfixed given the complexity: `std::sync::Mutex` poisoning has
+no recovery anywhere `WriteLocks`/`write_locks.lock().expect(...)` is used, so a panic while holding one
+path's write lock permanently turns every future call to that exact path — for the rest of the turn, across
+every subagent sharing the registry — into a caught panic (`ToolStepError::Failed`) with no self-healing,
+since the map entry is never replaced.** No live trigger was demonstrated (would need a real, reproducible
+panic inside the secret/patch-policy scanners or shadow-diagnostics verification while the lock is held,
+which wasn't attempted — auditing `crates/security`'s scanner internals for a live panic is a separate,
+larger investigation). This is real per documented Rust `Mutex` semantics, narrow in blast radius (one path,
+one turn, no process crash), and not fixed this pass: recovering from a poisoned lock (clearing/replacing the
+map entry, or switching to a non-poisoning lock primitive) is a real design decision about this registry's
+failure semantics, not a same-shaped mechanical patch.
+
+**Found, verified via static tracing, and left unfixed: `write_group_key` keys `workspace_write`/
+`workspace_patch` calls on the raw, unresolved JSON path string, not the canonicalized target — so two
+cosmetic spellings of the same file (`"foo.txt"` vs `"./foo.txt"`) land in different `batch_dispatch` groups
+and run on independent threads, breaking the function's own documented "same key ⇒ serialized in proposal
+order" contract.** Distinct from the case-folding bug just fixed: `Path`'s own component-wise `Eq`/`Hash`
+already normalizes a non-leading `.`/repeated separators away, so `WriteLocks` (keyed on `resolve_in_root`'s
+*canonicalized-for-containment* return value, now case-folded too) still resolves to the same lock for these
+two spellings — nothing is lost, only the *ordering* guarantee `write_group_key` itself promises is broken
+(the model's second-issued call could execute first). Not fixed this pass: closing it properly means
+`write_group_key` resolving each call's path the same way `execute_write`/`execute_patch` do *before*
+grouping, which today only happens per-call, inside those functions themselves — a real refactor of the
+grouping/execution split, not a small patch, and lower priority than the case-folding fix given data safety
+already holds here.
+
+Full `exec_tools` test module (101 tests, up from 100), full `-p rapid --lib` suite (373 tests, up from 372),
+and `cargo build --workspace --tests` all pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
