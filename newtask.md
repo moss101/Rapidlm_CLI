@@ -3324,6 +3324,19 @@ unfixed code accepted the write, silently replaced the hook's content, and confi
 Full `exec_tools` test module (100 tests, up from 99), full `-p rapid --lib` suite (372 tests, up from 371),
 and `cargo build --workspace --tests` all pass.
 
+**Same sweep, briefly, on `crates/knowledge` — a sixth crate confirmed unreachable, and not even the
+crate the plausible-sounding name suggests.** Declared as an `apps/rapid` dependency but never imported or
+referenced anywhere in the workspace outside its own tests (`grep -rn "knowledge::"` returns nothing).
+Despite the name, it isn't a memory/content-search implementation at all — reading the full crate confirms
+it's a self-contained operator-feedback/preference-ranking module (`FeedbackEvent` → `PreferenceCandidate` →
+`rank` → an `ExperimentRegistry` promotion gate), unrelated to `.rapidlm/MEMORY.md`/`team_memory_gate` (a
+different, unrelated secret-scanning gate in `exec_tools.rs`) or to the `memory_search`/`memory_get` tools
+this document's own Phase-1 competitor tables reference — those are Grok Build's tools, not RapidLM's;
+`gaps.md`'s own comparison table already records "no productized surface" for memory/knowledge in this repo.
+No adversarial angle applies since there's no reachable input to drive through it; the crate's own internal
+tests (6, covering decay overflow, proposition merging, rejection-replay, ranking order, hard-gate ordering)
+look internally sound for what they exercise, for whoever eventually wires this in.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
