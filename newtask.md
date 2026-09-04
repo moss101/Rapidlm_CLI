@@ -3571,6 +3571,45 @@ constant back to the literal `512` makes this exact test fail with `EventSink`, 
 predicted; restoring the fix passes it again. Full `-p agent-runtime` suite (276 tests, up from 275) and
 `cargo build --workspace --tests` both pass.
 
+**Same review, second finding: `agent-runtime::turn`'s own `ProposedToolCall` validation never rejected two
+sibling calls in one step sharing a `call_id`, and the one real `ModelDriver` that turns provider-stream
+traffic into `ProposedToolCall`s (`apps/rapid/src/model.rs::fold_stream`) could actually produce that shape
+from ordinary provider output — silently misattributing one call's arguments onto another's entry while both
+still reported the same id. Fixed at both layers.**
+
+`fold_stream` folds a provider's `ToolCallStart`/`ToolCallArgumentsDelta` stream events into `(call_id, tool,
+arguments)` tuples: every `ToolCallStart` unconditionally pushed a new tuple (no check for an existing entry
+under the same id), and every `ToolCallArgumentsDelta` routed to `tools.iter_mut().find(|(id,..)| id ==
+call_id.as_str())` — the *first* tuple matching that id. So a provider stream that ever emitted two
+`ToolCallStart` events sharing one `call_id` (the raw id is taken verbatim from provider-controlled JSON,
+`crates/llm-router/src/providers/anthropic.rs` and `.../openai_compatible.rs`, with no stream-scoped
+uniqueness check on either provider path) produced two `ProposedToolCall`s under the identical id: the first
+absorbing *both* calls' argument deltas concatenated together, the second left with empty arguments — both
+still identically labeled, so nothing downstream could tell them apart by id. `turn.rs::validate_proposed`
+only checked one call's own shape (identifier chars, byte length, no control characters) and never checked
+for a repeat across the step's sibling calls, so this reached dispatch unblocked — real side effects would
+run for both calls, one built from doubled/wrong arguments and one from none.
+
+Fixed at the point that actually manufactures the collision — `fold_stream` now rejects a step outright
+(`Err(ModelStepError::Failed)`, the same fail-closed outcome this function already uses for a
+`ProposedToolCall::new` structural rejection a few lines below) the moment two collected tuples share a
+`call_id`, before either ever reaches a `ProposedToolCall` — and at the trait-contract boundary in `turn.rs`,
+which now also refuses any step whose proposed `calls` contain a duplicate `call_id`, exactly like the
+existing `calls.len() > MAX_TOOL_CALLS_PER_STEP` rejection just above it in `run_model_step`. The `turn.rs`
+check matters independently of `fold_stream`'s: it is the actual API contract every `ModelDriver`
+implementation must satisfy, not a guarantee that happens to hold for the one real implementation today.
+
+New tests: `fold_stream_fails_closed_when_two_tool_call_starts_share_one_call_id`
+(`apps/rapid/src/model.rs`) feeds a stream with two `ToolCallStart`s under one id and asserts
+`ModelStepError::Failed`; `a_step_proposing_two_calls_sharing_one_call_id_is_refused_before_any_execution`
+(`crates/agent-runtime/src/turn.rs`) constructs a step with two structurally-valid `ProposedToolCall`s sharing
+an id directly (bypassing `fold_stream` entirely) and asserts the turn stops `ModelFailed` with zero tool
+calls executed. Both verified via the revert cycle: reverting `fold_stream`'s check reproduced the exact
+predicted corruption (`arguments: "{\"path\":\"a.rs\"}{\"path\":\"b.rs\"}"` on the first call, `""` on the
+second, both `call_id: "dup-id"`); reverting `turn.rs`'s check let both duplicate-id calls execute
+(`tool_calls() == 2`) instead of neither. Full `-p agent-runtime` suite (277 tests, up from 276), full `-p
+rapid --lib` suite (375 tests, up from 374), and `cargo build --workspace --tests` all pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

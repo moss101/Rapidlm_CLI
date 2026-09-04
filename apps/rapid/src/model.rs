@@ -712,6 +712,18 @@ fn fold_stream(
     // estimating one. `None` means "unknown," never "free" or "zero" — see
     // `ModelStepOutput`'s own doc comment.
     let cost_usd_micros = usage.and_then(usage_cost_micros);
+    // A provider stream that emits two `ToolCallStart` events sharing one
+    // `call_id` would otherwise have every `ToolCallArgumentsDelta` for
+    // both calls merged into whichever entry `tools.iter_mut().find(...)`
+    // above matches first (the first-pushed entry with that id), leaving
+    // the other with permanently empty or truncated arguments while both
+    // still carry the identical id downstream — silently dispatching a
+    // real tool call built from the wrong arguments. Treated the same as
+    // any other structurally invalid provider proposal on this path.
+    let mut seen_call_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    if !tools.iter().all(|(id, ..)| seen_call_ids.insert(id.as_str())) {
+        return Err(ModelStepError::Failed);
+    }
     if tools.is_empty() {
         return Ok(ModelStepOutput::Terminal {
             text,
@@ -1073,6 +1085,41 @@ mod tests {
             }
             other => panic!("expected tool calls, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fold_stream_fails_closed_when_two_tool_call_starts_share_one_call_id() {
+        // A provider stream that reuses a `call_id` across two distinct
+        // `ToolCallStart` events (a stream-protocol quirk, not something the
+        // provider's own id-uniqueness guarantee — if any — is assumed to
+        // rule out) must never silently merge both calls' argument deltas
+        // into one entry while returning two entries under the same id.
+        let dup_id = llm_router::provider::ToolCallId::parse("dup-id").expect("id");
+        let name_a = llm_router::provider::ToolName::parse("read-file").expect("name");
+        let name_b = llm_router::provider::ToolName::parse("write-file").expect("name");
+        let stream = stream(vec![
+            ModelStreamEvent::ToolCallStart {
+                call_id: dup_id.clone(),
+                name: name_a,
+            },
+            ModelStreamEvent::ToolCallArgumentsDelta {
+                call_id: dup_id.clone(),
+                arguments_delta: "{\"path\":\"a.rs\"}".to_owned(),
+            },
+            ModelStreamEvent::ToolCallStart {
+                call_id: dup_id.clone(),
+                name: name_b,
+            },
+            ModelStreamEvent::ToolCallArgumentsDelta {
+                call_id: dup_id,
+                arguments_delta: "{\"path\":\"b.rs\"}".to_owned(),
+            },
+        ]);
+        let result = fold_stream(&stream, 0);
+        assert!(
+            matches!(result, Err(ModelStepError::Failed)),
+            "got {result:?}"
+        );
     }
 
     #[test]

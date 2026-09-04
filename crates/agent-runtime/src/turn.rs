@@ -1162,7 +1162,23 @@ where
             *tokens
         }
         ModelStepOutput::ToolCalls { calls, tokens, .. } => {
-            if calls.len() > MAX_TOOL_CALLS_PER_STEP {
+            // A `call_id` repeated across two calls in one step breaks the
+            // one-to-one id-to-call assumption every downstream consumer
+            // makes (`apps/rapid/src/exec_tools.rs::batch_dispatch` restores
+            // results by index rather than id, so it survives this, but a
+            // `ModelDriver` that folds a provider stream keyed on `call_id` —
+            // the real one does, in `apps/rapid/src/model.rs::fold_stream` —
+            // can silently misattribute one call's argument deltas onto
+            // another's entry, dispatching a real tool call built from the
+            // wrong arguments while both entries still report the same id).
+            // Rejected here, at the trait-contract boundary, so no
+            // `ModelDriver` implementation can smuggle this past the turn
+            // loop regardless of how it assembles a step's proposed calls.
+            let has_duplicate_call_id = {
+                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                !calls.iter().all(|call| seen.insert(call.call_id()))
+            };
+            if calls.len() > MAX_TOOL_CALLS_PER_STEP || has_duplicate_call_id {
                 emit(
                     events,
                     TurnEvent::ModelFailed {
@@ -2645,6 +2661,39 @@ mod tests {
         let calls: Vec<ProposedToolCall> = (0..=MAX_TOOL_CALLS_PER_STEP)
             .map(|index| call(&format!("c{index}"), "repo.read"))
             .collect();
+        let mut model = ScriptedModel::new(vec![tools_out(calls, 1)]);
+        let mut tools = BatchOnlyTools;
+        let mut events = Vec::new();
+        let result = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(result.status(), TurnStatus::Failed);
+        assert_eq!(result.reason(), Some(TurnStopReason::ModelFailed));
+        assert_eq!(result.usage().tool_calls(), 0, "no call may execute");
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind() == TurnEventKind::ToolStarted),
+            "refused calls never reach dispatch"
+        );
+    }
+
+    #[test]
+    fn a_step_proposing_two_calls_sharing_one_call_id_is_refused_before_any_execution() {
+        // Two structurally valid calls that happen to share a `call_id` (the
+        // shape a provider stream reusing an id across two `ToolCallStart`
+        // events would produce, per `apps/rapid/src/model.rs::fold_stream`)
+        // must never reach the driver — neither can be told apart from the
+        // other by id alone downstream.
+        let calls = vec![
+            ProposedToolCall::new("dup", "repo.read", "{}").expect("call"),
+            ProposedToolCall::new("dup", "workspace.write", "{}").expect("call"),
+        ];
         let mut model = ScriptedModel::new(vec![tools_out(calls, 1)]);
         let mut tools = BatchOnlyTools;
         let mut events = Vec::new();
