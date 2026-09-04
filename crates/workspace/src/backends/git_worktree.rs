@@ -46,6 +46,7 @@ const RAPIDLM_DIR: &str = "rapidlm";
 const VIEWS_DIR: &str = "views";
 const WORKTREES_DIR: &str = "worktrees";
 const HOOKS_DIR: &str = "disabled-hooks";
+const MAX_FILTER_OVERRIDES: usize = 256;
 
 static OPEN_REPOS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
@@ -900,6 +901,58 @@ fn discover_git(
     })
 }
 
+/// Lists every `filter.<name>.<subkey>` entry set in `cwd`'s own local
+/// `.git/config` (never `--global`/`--system` — those belong to the
+/// operator, not to whatever repository is being opened here). A tracked
+/// `.gitattributes` can name an arbitrary filter driver (`path filter=x`);
+/// the actual smudge/clean/process *command* for that name comes only from
+/// git config, so a local config carrying `filter.x.smudge = <shell
+/// command>` runs that command on any checkout touching a matching path —
+/// including `git worktree add`. Unlike hooks, filter driver names are
+/// attacker-chosen, so there is no single config key that disables them
+/// all; the caller must instead override every key this reports to an
+/// empty value.
+///
+/// Never fails: any error at any step (git not found, non-zero exit,
+/// non-UTF-8 output) is treated the same as "no keys configured", since a
+/// failed lookup here must fail toward finding nothing to override, not
+/// toward blocking the caller or panicking. The real safety net is that
+/// `run_git`'s explicit `-c` overrides always take precedence over
+/// whatever this enumeration does or doesn't find.
+fn local_filter_config_keys(git_program: &Path, cwd: &Path) -> Vec<String> {
+    let output = Command::new(git_program)
+        .arg("-C")
+        .arg(cwd)
+        .args([
+            "config",
+            "--local",
+            "--name-only",
+            "--get-regexp",
+            r"^filter\.",
+        ])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let Ok(text) = String::from_utf8(output.stdout) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(MAX_FILTER_OVERRIDES)
+        .map(str::to_owned)
+        .collect()
+}
+
 fn run_git(
     git_program: &Path,
     cwd: &Path,
@@ -912,6 +965,10 @@ fn run_git(
     cancel.check().map_err(|_| GitWorktreeError::Cancelled)?;
     let hooks = path_arg(hooks_dir)?;
     let hooks_cfg = format!("core.hooksPath={hooks}");
+    let filter_overrides: Vec<String> = local_filter_config_keys(git_program, cwd)
+        .into_iter()
+        .map(|key| format!("{key}="))
+        .collect();
     let mut command = Command::new(git_program);
     command
         .arg("-C")
@@ -921,7 +978,11 @@ fn run_git(
         .arg("-c")
         .arg("advice.detachedHead=false")
         .arg("-c")
-        .arg("core.fsmonitor=false")
+        .arg("core.fsmonitor=false");
+    for override_arg in &filter_overrides {
+        command.arg("-c").arg(override_arg);
+    }
+    command
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -1726,5 +1787,49 @@ mod tests {
         );
         assert_eq!(user_branch(&fx.dir), fx.branch);
         assert_eq!(user_sha(&fx.dir), fx.head_sha);
+    }
+
+    #[test]
+    fn worktree_create_does_not_run_a_local_filter_drivers_smudge_command() {
+        let fx = fixture();
+        let marker = fx.dir.join("filter-fired");
+        git_ok(
+            &fx.dir,
+            &[
+                "config",
+                "filter.x.smudge",
+                &format!("sh -c 'printf fired > \"{}\"; cat'", marker.display()),
+            ],
+        );
+        fs::write(fx.dir.join(".gitattributes"), b"tracked.txt filter=x\n").expect("attrs");
+        git_ok(&fx.dir, &["add", ".gitattributes"]);
+        git_ok(
+            &fx.dir,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t.invalid",
+                "commit",
+                "-m",
+                "attrs",
+            ],
+        );
+        let sha = user_sha(&fx.dir);
+        assert!(!marker.exists(), "filter must not fire before worktree add");
+
+        let created = store(&fx)
+            .create_view(&view(ViewAccess::ReadWrite, &sha), &cancel())
+            .expect("create");
+
+        assert!(
+            !marker.exists(),
+            "a local filter.x.smudge command must not run during worktree add"
+        );
+        assert_eq!(
+            fs::read(created.worktree_path().join("tracked.txt")).expect("read checkout"),
+            b"base\n",
+            "content must still check out correctly once the filter is neutralized"
+        );
     }
 }

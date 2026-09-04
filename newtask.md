@@ -2450,6 +2450,53 @@ different problem (declared-resource-vs-real-action verification, which needs a 
 codebase doesn't have) from this one (real use-count consumption, which just needed the existing `Lease
 Validator` machinery actually wired in).
 
+**Same second-pass adversarial sweep, next applied to `crates/workspace/src/backends/git_worktree.rs::
+run_git` — the single choke point every git subprocess in this backend goes through.** `run_git`
+(`git_worktree.rs:903`, before this fix) already neutralized two other repo-config-driven code-execution
+vectors before ever running a real command: `-c core.hooksPath=<disabled-hooks-dir>` (defeats
+`.git/hooks/*`) and `-c core.fsmonitor=false`. It missed a third vector of the same shape.
+
+**Finding (fixed): a malicious local `.git/config` can define an arbitrary-named filter driver that runs
+attacker-chosen shell commands during `git worktree add`, and `run_git` never neutralized it.** A tracked,
+legitimate `.gitattributes` entry (e.g. `tracked.txt filter=x`) only *names* a filter driver — the actual
+`smudge`/`clean`/`process` **command** for that name comes exclusively from git config
+(`filter.<name>.smudge` etc.), read from local/global/system scope. If the *local* `.git/config` carries
+`filter.x.smudge = <shell command>`, git runs that command on every checkout touching a matching path —
+including the checkout `git worktree add` performs. Unlike hooks, filter driver names are attacker-chosen
+and unbounded, so there is no single `-c filter.X.smudge=` override that works generically the way `-c
+core.hooksPath=` does for hooks; empirically confirmed (via `git help config`/`man git-config` against git
+2.50.1) that no blanket `convert.disable`-style flag exists either.
+
+**Threat model:** requires the *local* `.git/config` itself to already carry attacker-chosen content — not
+triggered by a plain `git clone <untrusted-url>` (`filter.*` keys are config, never cloned), but real for an
+extracted archive/tarball/backup that bundles a full `.git` directory, or a copy of an already-compromised
+local clone. Reachable from two real, shipped callers of `GitWorktreeStore::create_view`: every
+write-isolated subagent spawn (`crates/agent-runtime/src/agent/spawn.rs:541`, via the `IsolatedWorktree`
+impl) and `apps/rapid/src/shadow_diagnostics.rs:148`.
+
+**Fix:** new `local_filter_config_keys(git_program, cwd)` (`git_worktree.rs`, just above `run_git`) runs
+`git -C <cwd> config --local --name-only --get-regexp '^filter\.'` — scoped to `--local` only, deliberately
+leaving the operator's own `--global`/`--system` config (e.g. a legitimate `git lfs install`) untouched,
+matching the precise threat model. This lookup only *reads* config; it never executes a filter command.
+Empirically confirmed it returns exit code 1 (not 0) with empty output when no `filter.*` keys exist, so the
+helper treats any non-success exit, spawn failure, or non-UTF-8 output the same as "no keys" rather than as
+an error — a failed lookup must fail toward finding nothing to override, never toward blocking the caller,
+since the actual safety net is `run_git`'s own `-c` overrides always taking precedence over whatever this
+enumeration does or doesn't find. `run_git` now builds `-c <key>=` (empty-value override) for every key this
+returns (capped at `MAX_FILTER_OVERRIDES = 256`, defense-in-depth against a maliciously bloated local
+config) and adds them alongside the existing `core.hooksPath`/`advice.detachedHead`/`core.fsmonitor`
+overrides on every invocation — including `discover_git`'s pre-setup calls, so the very first `git
+rev-parse` against a newly-opened repo is covered too.
+
+Verified end-to-end with a real, executable reproduction, not just code-reading: new test
+`worktree_create_does_not_run_a_local_filter_drivers_smudge_command` configures a local `filter.x.smudge`
+that writes a marker file, commits a `.gitattributes` binding `tracked.txt` to it, then calls the real
+`create_view`. Confirmed via the standard revert cycle — temporarily replaced the computed `filter_overrides`
+with an empty `Vec::new()`, re-ran the test, watched it fail exactly as predicted (the marker file *did* get
+created, proving the smudge command ran) — before restoring the fix and re-confirming the test passes, and
+that checked-out content is still correct (`tracked.txt` reads back as `base\n`, not the filter's stdout).
+Full `workspace` crate suite (174 tests, up from 173) and `cargo build --workspace --tests` both pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
