@@ -2570,6 +2570,88 @@ directly) but does put secret plaintext into the local process argument list, vi
 processes that can read `ps` output on the same host; inherent to those OS CLIs, flagged for completeness
 only.
 
+**Same second-pass adversarial sweep, next applied to `crates/mcp` — the MCP client/gateway that talks to
+external, potentially untrusted MCP servers. Review dispatched to assume the server on the other end is
+actively hostile, not just buggy.** Four real findings; three are local, mechanical, and fixed; one is a
+genuinely large architectural gap, documented rather than force-fixed this pass.
+
+**Central finding, documented but deliberately not attempted this pass: `crates/mcp`'s entire trust/gateway
+mediation layer is dead code — production talks to MCP servers through a completely different, much thinner
+path that has none of its protections.** `crates/mcp/src/gateway.rs`'s own module doc states *"Catalog
+revision, trust, policy, and the capability lease are checked before any server I/O. The MCP payload is
+untrusted context (T-007)"* — per-server trust grants (`crates/mcp/src/trust.rs`: *"Project-configured
+servers start disabled. Trust is an explicit grant"*), `allowed_tools`/`allowed_capabilities` narrowing,
+a `PRIVILEGE_RESULT_KEYS` scrub of tool results for smuggled secrets/capability grants, and
+`ResultTrustLabel::UntrustedContext` labeling on every result. `grep -rn "McpTrustStore\|mcp::trust\|
+mcp::gateway\|mcp::catalog"` across `apps/` and `crates/` (outside `crates/mcp` itself) returns **zero
+hits**. The real, shipped path (`apps/rapid/src/exec_tools.rs::register_mcp_servers`/`execute_mcp_tool`,
+reached from `exec_turn` for both interactive `rapid` and headless `rapid exec`) only uses the raw
+`mcp::transport` JSON-RPC layer directly, gated solely by one coarse *project*-level trust flag
+(`crates/kernel/src/project/trust.rs::TrustStatus`) — not a per-server MCP trust grant, no capability-broker
+lease, no tool/capability allowlisting, no secret-scrubbing of results, no untrusted-context labeling. Once a
+project is trusted once, every tool every configured MCP server advertises is registered with no further
+review, and every tool result feeds straight back into the agent's context unscrubbed. **Not attempted this
+pass**: unlike the three findings below, closing this gap means deciding how `gateway.rs`'s
+lease/trust/scrub layer should actually integrate with `exec_tools.rs`'s dispatch (a real architectural
+wiring decision spanning two crates, not a same-file mechanical patch) — matching this document's standing
+rule for findings of this shape. Flagging in full given the severity: this is the same class of gap as an
+authorization layer that was built and tested but never actually wired to the code path it was meant to
+guard.
+
+**Fixed: MCP stdio server child processes were never killed — every registered server leaked as an orphaned
+process for the lifetime of the host machine.** `McpConnection`'s own doc comment claims it holds *"the
+supervised child,"* but the struct had no `child` field at all, and `register_mcp_servers`'s local `child:
+Child` (`apps/rapid/src/exec_tools.rs:700`, before this fix) was dropped at the end of each loop iteration
+without `.kill()`/`.wait()` — Rust's `Child` has no `Drop` impl that terminates the process, so a server that
+never voluntarily exits (or that a hostile server deliberately doesn't) runs forever, un-trackable by
+anything in the process, unlike every other subprocess this same file spawns (the bash-tool and `shell_exec`
+paths both explicit `child.kill(); child.wait();` on timeout/cancel/shutdown). Fixed by adding
+`child: Option<std::process::Child>` to `McpConnection` and `impl Drop for McpConnection` that kills and
+reaps it — so cleanup fires whenever the connection is actually dropped (session end, `Arc` refcount
+reaching zero), regardless of how many places hold a reference to the surrounding `Arc<Mutex<Vec<
+McpConnection>>>`, rather than needing an explicit call at every possible teardown path. New test
+`dropping_the_tool_surface_kills_an_mcp_server_process_that_ignores_stdin_eof`: a real Python subprocess
+that sleeps instead of exiting writes its own pid to a file, the test drops the tool surface and polls `kill
+-0 <pid>` until the process is gone. Verified via the revert cycle — a no-op `Drop` impl reproduced the leak
+exactly (test failed: process still alive) before restoring the real one.
+
+**Fixed: MCP stdio server subprocesses inherited the full parent process environment, unlike every other
+subprocess this file spawns.** `register_mcp_servers`'s `Command::new(&server.command)` (`exec_tools.rs:700`,
+before this fix) had no `.env_clear()`, so a configured server's child process received every environment
+variable of the `rapid` process verbatim — in direct contrast to the bash-tool and `shell_exec` spawns two
+call sites away in the same file, which both `.env_clear()` then explicitly forward only `PATH, HOME, LANG,
+TMPDIR`. Fixed by applying the exact same pattern. New test
+`mcp_server_process_does_not_inherit_ambient_environment`: a real Python MCP server reports `sorted(os.
+environ.keys())` back through a tool call; the test asserts every key is in an allowlist of the four
+intentionally-forwarded names plus the handful macOS's own `/usr/bin/python3` (an xcrun-routed stub) injects
+on its own even under a fully empty parent env (confirmed independently via `env -i PATH=/usr/bin:/bin
+/usr/bin/python3 -c "import os; print(sorted(os.environ.keys()))"`, which reproduces `CPATH, LC_CTYPE,
+LIBRARY_PATH, MANPATH, SDKROOT, __CF_USER_TEXT_ENCODING` from nothing — a platform artifact unrelated to this
+fix). Verified via the revert cycle: without `.env_clear()`, the test failed by showing this session's own
+`ALIBABA_CODING_PLAN_API_KEY` and `ANTHROPIC_BASE_URL` leaking straight into the child's environment — a
+concrete demonstration of exactly the secret-exposure risk this fix closes, not a hypothetical.
+
+**Fixed: an MCP tool call ignored the caller's real cancellation token, using a fixed 30-second sleep
+instead.** `execute_mcp_tool` (`exec_tools.rs:2196`, before this fix) took `_cancel: &CancellationToken`
+(discarded) and instead built a disconnected `capability_broker::CancellationToken`, canceled unconditionally
+by a watchdog thread after a flat 30-second sleep — every sibling handler in the same dispatch `match`
+(`execute_write`, `execute_shell`, etc.) honors the one real, shared token wired to Ctrl-C and the turn's
+`--max-wall-time` budget; `execute_mcp_tool` alone was deaf to it. Root cause: `agent_runtime::
+CancellationToken` (the app-level token every tool handler receives) and `capability_broker::
+CancellationToken` (what `mcp::transport::McpSession` methods actually take) are two independently-defined
+types in different crates with no conversion between them — not merely an oversight of forgetting to pass a
+token through. Fixed by keeping the local bridge token (still needed, since the types don't unify) but
+spawning a poller that watches the real token's `is_cancelled()` every 50ms and cancels the bridge as soon as
+it fires, keeping the 30s sleep only as a worst-case ceiling for a server that never responds and is never
+explicitly canceled either. New test `mcp_tool_call_honors_the_callers_real_cancellation_token`: a real
+Python server that never answers `tools/call`, canceled from another thread 200ms after the call starts;
+asserts the call returns in well under 10s. Verified via the revert cycle: removing just the polling loop
+(keeping the flat 30s sleep) reproduced the bug exactly — the call took `30.002313667s`, confirming
+cancellation was genuinely ignored, not just slow.
+
+Full `exec_tools` test module (88 tests), full `-p rapid --lib` suite (359 tests, up from 356), and `cargo
+build --workspace --tests` all pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

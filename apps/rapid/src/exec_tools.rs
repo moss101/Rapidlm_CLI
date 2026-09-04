@@ -697,8 +697,16 @@ impl WorkspaceTools {
         let bounds = IoBounds::new(64 * 1024, Duration::from_secs(30))
             .expect("standard io bounds");
         for server in servers {
-            let spawn = std::process::Command::new(&server.command)
+            let mut command = std::process::Command::new(&server.command);
+            command
                 .args(&server.args)
+                .env_clear();
+            for key in ["PATH", "HOME", "LANG", "TMPDIR"] {
+                if let Ok(value) = std::env::var(key) {
+                    let _ = command.env(key, value);
+                }
+            }
+            let spawn = command
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
@@ -722,6 +730,7 @@ impl WorkspaceTools {
                         server: server.name.clone(),
                         online: false,
                         session: None,
+                        child: None,
                     });
                     continue;
                 }
@@ -755,6 +764,7 @@ impl WorkspaceTools {
                 server: server.name.clone(),
                 online: true,
                 session: Some(Mutex::new(session)),
+                child: Some(child),
             });
         }
     }
@@ -2196,7 +2206,7 @@ impl WorkspaceTools {
     fn execute_mcp_tool(
         &self,
         call: &ValidatedToolCall,
-        _cancel: &CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         const MCP_RESULT_CAP: usize = 20 * 1024;
         let wire = call.tool();
@@ -2249,15 +2259,29 @@ impl WorkspaceTools {
             Ok(session) => session,
             Err(_) => return Err(ToolStepError::Failed),
         };
-        let cancel = capability_broker::CancellationToken::new();
+        // `cancel` (agent_runtime::CancellationToken, the turn's real kill
+        // switch) and mcp::transport's capability_broker::CancellationToken
+        // are distinct types from different crates, so a hostile/slow
+        // server's call is bridged onto a fresh token that a poller cancels
+        // as soon as the caller's real token fires — with a fixed 30s
+        // ceiling so a server that never responds still can't hang forever
+        // even without an explicit cancel.
+        let bridge = capability_broker::CancellationToken::new();
         let watchdog = {
-            let cancel = cancel.clone();
+            let bridge = bridge.clone();
+            let real_cancel = cancel.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(30));
-                cancel.cancel();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while Instant::now() < deadline {
+                    if real_cancel.is_cancelled() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                bridge.cancel();
             })
         };
-        let outcome = session.tools_call(tool_name, &arguments, &cancel);
+        let outcome = session.tools_call(tool_name, &arguments, &bridge);
         drop(watchdog);
         match outcome {
             Ok(output) if !output.is_error => Ok(ToolStepResult::Succeeded {
@@ -3509,6 +3533,19 @@ struct McpConnection {
     server: String,
     online: bool,
     session: Option<Mutex<mcp_session_box::SessionBox>>,
+    child: Option<std::process::Child>,
+}
+
+impl Drop for McpConnection {
+    /// A server that ignores stdin EOF must not outlive this connection:
+    /// kill and reap it rather than leaving an orphaned process running
+    /// after the session that spawned it is gone.
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 mod mcp_session_box {
@@ -8027,6 +8064,234 @@ for line in sys.stdin:
             }
             other => panic!("expected MCP success, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mcp_server_process_does_not_inherit_ambient_environment() {
+        const SERVER_SCRIPT: &str = r#"#!/usr/bin/env python3
+import sys, json, os
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "envcheck", "version": "1.0"}}})
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": "keys", "description": "lists env var names",
+             "inputSchema": {"type": "object"}}]}})
+    elif method == "tools/call":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"content": [
+            {"type": "text", "text": ",".join(sorted(os.environ.keys()))}]}})
+"#;
+        let root = TempRoot::new("mcp-env");
+        let script_path = root.0.join("mcp-envcheck-server.py");
+        fs::write(&script_path, SERVER_SCRIPT).expect("write server");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let servers = vec![McpServerConfig {
+            name: "envcheck".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script_path.display().to_string()],
+        }];
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(&servers);
+
+        let call = make_call("e1", "mcp__envcheck__keys", "{}");
+        let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
+        match tools.execute(&validated, &CancellationToken::new()).expect("dispatch") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                let keys_line = summary.lines().last().unwrap_or("");
+                // The four we deliberately forward, plus vars macOS's own
+                // /usr/bin/python3 (an xcrun-routed stub) injects on its
+                // own even under a fully empty parent env — confirmed via
+                // `env -i PATH=/usr/bin:/bin /usr/bin/python3 -c
+                // "import os; print(sorted(os.environ.keys()))"`. Anything
+                // outside this set had to come from the real parent
+                // environment, which is exactly what env_clear() must stop.
+                const ALLOWED: &[&str] = &[
+                    "PATH",
+                    "HOME",
+                    "LANG",
+                    "TMPDIR",
+                    "CPATH",
+                    "LC_CTYPE",
+                    "LIBRARY_PATH",
+                    "MANPATH",
+                    "SDKROOT",
+                    "__CF_USER_TEXT_ENCODING",
+                ];
+                for key in keys_line.split(',').filter(|k| !k.is_empty()) {
+                    assert!(
+                        ALLOWED.contains(&key),
+                        "MCP server process must not inherit ambient env var {key:?}: {summary}"
+                    );
+                }
+            }
+            other => panic!("expected env listing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dropping_the_tool_surface_kills_an_mcp_server_process_that_ignores_stdin_eof() {
+        const SERVER_SCRIPT: &str = r#"#!/usr/bin/env python3
+import sys, json, os, time
+with open(sys.argv[1], "w") as f:
+    f.write(str(os.getpid()))
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "sticky", "version": "1.0"}}})
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": []}})
+# A hostile/non-conforming server does not exit on stdin EOF.
+time.sleep(30)
+"#;
+        let root = TempRoot::new("mcp-lifecycle");
+        let script_path = root.0.join("mcp-sticky-server.py");
+        fs::write(&script_path, SERVER_SCRIPT).expect("write server");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let pid_path = root.0.join("server.pid");
+        let servers = vec![McpServerConfig {
+            name: "sticky".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![
+                script_path.display().to_string(),
+                pid_path.display().to_string(),
+            ],
+        }];
+
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(&servers);
+
+        fn alive(pid: i32) -> bool {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        }
+
+        let mut pid = None;
+        for _ in 0..100 {
+            if let Ok(contents) = fs::read_to_string(&pid_path) {
+                if let Ok(parsed) = contents.trim().parse::<i32>() {
+                    pid = Some(parsed);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = pid.expect("server wrote its pid");
+        assert!(alive(pid), "server process must be running before drop");
+
+        drop(tools);
+
+        let mut still_alive = true;
+        for _ in 0..100 {
+            if !alive(pid) {
+                still_alive = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !still_alive,
+            "an MCP server that ignores stdin EOF must not outlive the tool surface"
+        );
+    }
+
+    #[test]
+    fn mcp_tool_call_honors_the_callers_real_cancellation_token() {
+        const SERVER_SCRIPT: &str = r#"#!/usr/bin/env python3
+import sys, json, time
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "hang", "version": "1.0"}}})
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": "stall", "description": "never responds",
+             "inputSchema": {"type": "object"}}]}})
+    elif method == "tools/call":
+        time.sleep(60)
+"#;
+        let root = TempRoot::new("mcp-cancel");
+        let script_path = root.0.join("mcp-hang-server.py");
+        fs::write(&script_path, SERVER_SCRIPT).expect("write server");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let servers = vec![McpServerConfig {
+            name: "hang".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script_path.display().to_string()],
+        }];
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(&servers);
+
+        let cancel = CancellationToken::new();
+        let call = make_call("c1", "mcp__hang__stall", "{}");
+        let validated = tools.validate(&call, &cancel).expect("v");
+        let trigger = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            trigger.cancel();
+        });
+        let started = Instant::now();
+        let _ = tools.execute(&validated, &cancel);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the caller's real cancellation must abort a stalled MCP call promptly, \
+             not wait out the fixed 30s watchdog ceiling: took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
