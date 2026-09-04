@@ -1005,8 +1005,16 @@ const PERMISSION_MODE_ENV: &str = "RAPIDLM_PERMISSION_MODE";
 const PROJECT_SETTINGS_FILES: [&str; 2] = [".rapidlm/settings.json", ".claude/settings.json"];
 /// Persisted per-project allow grants consulted before any ask.
 const PERMISSIONS_STORE_NAME: &str = "project-permissions.json";
-/// Maximum rule entries admitted across all settings documents.
-const MAX_WIRED_RULES: usize = crate::permissions::MAX_RULES;
+/// Maximum rule entries admitted across all settings documents. Each file is
+/// already individually capped at `MAX_RULES` by `parse_settings` (an
+/// over-limit file fails the whole load with `TooManyRules`, never silently
+/// truncates) — sizing this to `MAX_RULES * PROJECT_SETTINGS_FILES.len()`
+/// means every successfully-loaded file's rules always fit in the merge
+/// below. A per-file cap here (the previous `MAX_RULES` alone) let a single
+/// maxed-out file silently crowd out every later file's rules, deny rules
+/// included, contradicting this function's own "deny rules always apply"
+/// contract.
+const MAX_WIRED_RULES: usize = crate::permissions::MAX_RULES * PROJECT_SETTINGS_FILES.len();
 
 /// Resolve the permission lattice for one exec run: mode precedence is env >
 /// project settings > Claude-compat `defaultMode` > `default`; rules merge
@@ -1042,6 +1050,28 @@ fn exec_permission_mode() -> Result<crate::permissions::PermissionMode, String> 
     Ok(PermissionMode::Default)
 }
 
+/// Merge every loaded settings document's rules, in file-precedence order,
+/// bounded by `MAX_WIRED_RULES`. Each document's own rules are already
+/// individually capped at `crate::permissions::MAX_RULES` by `parse_settings`
+/// (an over-limit file fails the whole load, never silently truncates), and
+/// `MAX_WIRED_RULES` is sized to fit every known settings file's full quota —
+/// so this only ever truncates if a future settings source is added without
+/// updating that sizing, not under today's fixed two-file set.
+fn merge_settings_rules(
+    loaded_settings: &[crate::permissions::ProjectSettings],
+) -> Vec<crate::permissions::ToolRule> {
+    let mut rules: Vec<crate::permissions::ToolRule> = Vec::new();
+    for settings in loaded_settings {
+        for rule in settings.rules.clone() {
+            if rules.len() >= MAX_WIRED_RULES {
+                break;
+            }
+            rules.push(rule);
+        }
+    }
+    rules
+}
+
 fn exec_permission_lattice(
     canonical_root: Option<&Path>,
     forced_mode: Option<crate::permissions::PermissionMode>,
@@ -1057,7 +1087,6 @@ fn exec_permission_lattice(
             None
         }
     };
-    let mut rules: Vec<crate::permissions::ToolRule> = Vec::new();
     let mut loaded_settings: Vec<ProjectSettings> = Vec::new();
     for file_name in PROJECT_SETTINGS_FILES {
         let Ok(text) = fs::read_to_string(file_name) else {
@@ -1071,14 +1100,7 @@ fn exec_permission_lattice(
         }
         loaded_settings.push(settings);
     }
-    for settings in &loaded_settings {
-        for rule in settings.rules.clone() {
-            if rules.len() >= MAX_WIRED_RULES {
-                break;
-            }
-            rules.push(rule);
-        }
-    }
+    let rules = merge_settings_rules(&loaded_settings);
     let mode = mode.unwrap_or(PermissionMode::Default);
     // A caller-forced mode (e.g. `rapid cron`'s propose-only execution,
     // Modbit `AGT-008`/§3.2) overrides every other source unconditionally —
@@ -2920,6 +2942,32 @@ mod tests {
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
     static TERMINAL_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn merge_settings_rules_never_truncates_a_second_files_deny_rule() {
+        // A first settings document maxed out at `permissions::MAX_RULES`
+        // filler allow rules must not crowd out a second document's rules,
+        // deny rules included, once merged -- MAX_WIRED_RULES must be sized
+        // to hold every known settings file's own full quota, not just one.
+        use crate::permissions::{RuleEffect, parse_settings};
+        let filler: Vec<String> = (0..crate::permissions::MAX_RULES)
+            .map(|i| format!("\"workspace_read(filler-{i}/*)\""))
+            .collect();
+        let first_json = format!(r#"{{"permissions":{{"allow":[{}]}}}}"#, filler.join(","));
+        let first = parse_settings(&first_json).expect("first settings");
+        assert_eq!(first.rules.len(), crate::permissions::MAX_RULES);
+
+        let second_json = r#"{"permissions":{"deny":["shell_exec(rm *)"]}}"#;
+        let second = parse_settings(second_json).expect("second settings");
+        assert_eq!(second.rules.len(), 1);
+
+        let merged = merge_settings_rules(&[first, second]);
+        assert!(
+            merged.iter().any(|rule| rule.effect == RuleEffect::Deny),
+            "the second file's deny rule must survive the merge, got {} total rules",
+            merged.len()
+        );
+    }
 
     #[test]
     fn max_wall_time_parses_and_rejects_bad_values() {

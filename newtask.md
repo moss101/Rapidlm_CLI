@@ -2216,6 +2216,69 @@ against the original code before confirming the fix closes it. Full `mobile-sim`
 `crates/tui` panics earlier in this document: cheap, low-risk, and would otherwise be waiting to surprise
 whoever wires simulator discovery into a real command.
 
+**Second-pass adversarial security review, 2026-09-04, `apps/rapid/src/permissions.rs` — three real,
+computationally-verified authorization bypasses in the tool-permission gate itself, the actual boundary
+between an LLM-driven agent and the real filesystem/shell/network.** Prompted by today's earlier domain
+case-sensitivity fix (`5a0e5e8`) in this exact file; each finding below was independently confirmed by
+tracing the real matching/evaluation code, not just accepted from the review, before any fix was applied.
+
+1. **Path-subject rule matching was case-sensitive, but the two most common desktop filesystems this tool
+actually runs on (macOS's default APFS, Windows' default NTFS) are both case-insensitive.** The exact same
+bug shape as the already-fixed domain case-sensitivity issue, one subject type over: `ToolPattern::matches`
+(`permissions.rs:161`) fell through to plain `glob_match(glob, subject)` for path-shaped subjects
+(`workspace_write`/`workspace_read`/`repo_read`/`workspace_patch`/`repo_glob`), and its own comment claimed
+this "match[es] real filesystem/shell semantics" — true for shell argv, false for paths on the two most
+common desktop OSes. A deny rule (or an admin `denied_tools` ceiling, documented as un-overridable) written
+for `secrets/*` never matched a model-supplied `Secrets/x` or `SECRETS/x`, even though that's the identical
+file on disk. **Fixed:** path-shaped tool subjects now match case-insensitively too (lowercased both sides,
+same technique as the domain fix), gated on a new `PATH_SUBJECT_TOOLS` list so `shell_exec`'s argv subject
+correctly stays exact-case (Unix program-name lookup really is case-sensitive — confirmed this distinction
+holds before applying a blanket fix). New test `path_subject_deny_rules_are_case_insensitive` (three case
+permutations of a denied path, plus a shell-argv case asserting no behavior change there) — verified via the
+revert cycle to return `Allow(BypassAllow)` instead of `Deny(DenyRule)` for `Secrets/config.json` against the
+original code before confirming the fix closes it.
+
+2. **Cross-file settings merge could silently drop an entire settings file's rules, including deny rules, if
+an earlier file alone reached the per-file rule cap.** `apps/rapid/src/interactive.rs::exec_permission_
+lattice`'s own doc comment states "rules merge from every settings document that exists (deny rules always
+apply)" — but the merge loop just concatenated `.rapidlm/settings.json`'s rules then `.claude/settings.json`'s
+in file order and hard-stopped at `MAX_WIRED_RULES`, which was set equal to `permissions::MAX_RULES` (128) —
+exactly one file's own individual cap, not a cap sized for multiple files. `parse_settings` itself already
+guarantees no single successfully-loaded file exceeds 128 rules (an over-limit file fails the whole load with
+`TooManyRules`, never silently truncates) — so a first file with exactly 128 rules (plausible from a
+generated/templated file, or an untrusted contributor's PR in an already-trusted shared repo) silently
+discarded every rule in the second file once merged, deny rules included. **Fixed:** extracted the merge loop
+into a directly-testable `merge_settings_rules` helper and resized `MAX_WIRED_RULES` to
+`MAX_RULES * PROJECT_SETTINGS_FILES.len()` (256), so both known settings files' full quotas always fit.  New
+test `merge_settings_rules_never_truncates_a_second_files_deny_rule` (128 filler rules in one document, one
+deny rule in a second) — verified via the revert cycle to report "got 128 total rules" (the deny rule
+dropped) against the original `MAX_RULES`-sized constant before confirming the fix closes it.
+
+3. **Most severe: Plan mode's documented "denies every write outright" guarantee — and by extension the
+admin `max_permission_mode` ceiling built directly on that guarantee — was defeated by an ordinary `allow`
+rule.** `PermissionMode::permissiveness_rank`'s doc comment states Plan "denies every write-classified call
+outright... stricter than `Default`'s 'ask'," and `managed_config.rs`'s admin ceiling doc explicitly builds
+on this: a project's own settings "can request `bypassPermissions`, but never actually get more than an
+admin allows." Both assumed Plan mode was an unconditional floor. It wasn't: `evaluate()` checked rules
+(deny → ask → allow) *before* the mode table, so a plain `allow` rule for a write tool — the kind of rule an
+ordinary, lower-trust `.rapidlm/settings.json`/`.claude/settings.json` could carry — matched and returned
+`Decision::Allow` several lines before Plan's own `Decision::Deny(PlanModeDeny)` was ever reached. Confirmed
+this isn't compensated elsewhere: `ExecTools`'s own `plan_mode: AtomicBool` (the interactive `/plan` toggle)
+is a completely separate, unrelated flag from the lattice's own `mode` field. **Concretely:** whenever an
+admin's `max_permission_mode = "plan"` policy forces the lattice into `Plan` (via `managed_config::gate_
+permission_mode`), any ordinary write-allow rule in a lower-trust settings file defeats that ceiling entirely
+— exactly the scenario the ceiling exists to make impossible. **Fixed:** added an absolute Plan-mode check
+before the rule-matching loop, denying every non-`ReadOnly`-classified call unconditionally regardless of any
+matching rule (reads still auto-allow in Plan mode, since the model still needs to read files to plan). New
+test `plan_mode_denies_writes_even_when_an_allow_rule_matches` — verified via the revert cycle to return
+`Allow(AllowRule)` instead of `Deny(PlanModeDeny)` against the original ordering before confirming the fix
+closes it, plus an assertion that reads are unaffected (no over-denial).
+
+All three findings and fixes independently verified line-by-line before applying, given how severe a false
+positive or a wrong fix would be in this specific file. Full `permissions`/`interactive` test modules (23 +
+45 tests, both zero regressions), full `-p rapid` suite (355 tests), and `cargo build --workspace --tests`
+all pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

@@ -170,19 +170,46 @@ impl ToolPattern {
             // a plain case change in the request URL's host (attacker- or
             // redirect-controlled) silently bypasses a `deny`/`ask` rule,
             // or even an admin `denied_tools` ceiling documented as
-            // un-overridable by any setting. Every other subject shape
-            // (paths, shell argv) stays exact-case, matching real
-            // filesystem/shell semantics.
+            // un-overridable by any setting.
             Some(glob) => match (glob.strip_prefix("domain:"), subject.strip_prefix("domain:")) {
                 (Some(pattern_domain), Some(subject_domain)) => glob_match(
                     &pattern_domain.to_ascii_lowercase(),
                     &subject_domain.to_ascii_lowercase(),
                 ),
+                // Path-shaped subjects (`workspace_write`/`workspace_read`/
+                // `repo_read`/`workspace_patch`/`repo_glob`) also need
+                // case-insensitive matching: the two most common desktop
+                // filesystems this tool actually runs against — macOS's
+                // default APFS and Windows' default NTFS — are both
+                // case-insensitive (case-preserving, but insensitive for
+                // lookups), so `Secrets/x` and `secrets/x` are the same file
+                // on disk even though a plain-string glob comparison sees
+                // them as different subjects. Without this, a deny rule (or
+                // an admin `denied_tools` ceiling) written for `secrets/*`
+                // never matches a model-supplied `Secrets/x`, even though
+                // the write lands in the identical protected file. Shell
+                // argv (`shell_exec`) is deliberately excluded — Unix
+                // program-name lookup really is case-sensitive.
+                _ if PATH_SUBJECT_TOOLS.contains(&tool) => {
+                    glob_match(&glob.to_ascii_lowercase(), &subject.to_ascii_lowercase())
+                }
                 _ => glob_match(glob, subject),
             },
         }
     }
 }
+
+/// Tool names whose rule subject is a workspace-relative path, mirroring
+/// `exec_tools.rs::rule_subject`'s own classification exactly (kept as
+/// literal strings here, not a shared import, per this module's own "pure
+/// decision logic" doc comment — it has no dependency on `exec_tools`).
+const PATH_SUBJECT_TOOLS: &[&str] = &[
+    "workspace_write",
+    "workspace_read",
+    "repo_read",
+    "workspace_patch",
+    "repo_glob",
+];
 
 /// `true` when `value` matches `pattern` with `*` (any run) and `?` (one
 /// char). Iterative single-pass matcher, no regex dependency.
@@ -513,6 +540,21 @@ impl PermissionLattice {
         {
             return Decision::Deny(DecisionReason::WriteScopeViolation);
         }
+        // 0.75. Plan mode's absolute write floor, checked before any rule:
+        // `permissiveness_rank`'s own doc comment describes Plan as denying
+        // "every write-classified call outright... stricter than Default's
+        // 'ask'" — a ceiling, not a default that a lower-trust project
+        // settings file's ordinary `allow` rule should be able to widen past
+        // (the same property the admin ceilings above already enforce for
+        // denied tools/write scope). Without this check, an `allow` rule
+        // matched at step 1 below would return `Decision::Allow` before the
+        // mode table ever saw the call, silently defeating both a plain
+        // `"plan"` mode and an admin `max_permission_mode` ceiling that
+        // forced it. Scoped to non-`ReadOnly` calls only: the model still
+        // needs to read files to produce a plan.
+        if self.mode == PermissionMode::Plan && class != ToolClass::ReadOnly {
+            return Decision::Deny(DecisionReason::PlanModeDeny);
+        }
         // 1. Rules, by precedence not insertion order: deny wins, then ask,
         // then allow.
         for rule in &self.rules {
@@ -744,6 +786,68 @@ mod tests {
         assert_eq!(
             lattice.evaluate("shell_exec", "git status", ToolClass::Other),
             Decision::Ask(DecisionReason::ModeAsk)
+        );
+    }
+
+    #[test]
+    fn plan_mode_denies_writes_even_when_an_allow_rule_matches() {
+        // Plan's own doc comment (`permissiveness_rank`): denies every
+        // write-classified call outright, a ceiling a lower-trust project
+        // settings file's ordinary `allow` rule must not be able to widen
+        // past -- the same property an admin `max_permission_mode` ceiling
+        // relies on when it forces the lattice into Plan mode.
+        let allow_everything = ToolRule {
+            effect: RuleEffect::Allow,
+            pattern: ToolPattern::parse("workspace_write(*)").expect("pattern"),
+        };
+        let lattice =
+            PermissionLattice::new(PermissionMode::Plan).with_rules(vec![allow_everything]);
+        assert_eq!(
+            lattice.evaluate("workspace_write", "src/lib.rs", ToolClass::FileEdit),
+            Decision::Deny(DecisionReason::PlanModeDeny),
+            "an allow rule must never bypass Plan mode's absolute write floor"
+        );
+        // Reads still work in Plan mode -- the model needs to read files to
+        // produce a plan -- confirming this doesn't over-deny.
+        assert_eq!(
+            lattice.evaluate("workspace_read", "src/lib.rs", ToolClass::ReadOnly),
+            Decision::Allow(DecisionReason::ReadOnlyAutoAllow)
+        );
+    }
+
+    #[test]
+    fn path_subject_deny_rules_are_case_insensitive() {
+        // The two most common desktop filesystems this tool runs against
+        // (macOS's default APFS, Windows' default NTFS) are both
+        // case-insensitive, so `Secrets/x` and `secrets/x` are the same
+        // file on disk -- a deny rule (or an admin `denied_tools` ceiling)
+        // written for one case must still catch the other.
+        let deny_secrets = ToolRule {
+            effect: RuleEffect::Deny,
+            pattern: ToolPattern::parse("workspace_write(secrets/*)").expect("pattern"),
+        };
+        let lattice =
+            PermissionLattice::new(PermissionMode::BypassPermissions).with_rules(vec![deny_secrets]);
+        for path in ["secrets/config.json", "Secrets/config.json", "SECRETS/config.json"] {
+            assert_eq!(
+                lattice.evaluate("workspace_write", path, ToolClass::FileEdit),
+                Decision::Deny(DecisionReason::DenyRule),
+                "{path} must be denied regardless of case"
+            );
+        }
+        // shell_exec's argv subject deliberately stays case-sensitive (Unix
+        // program-name lookup really is case-sensitive) -- confirming the
+        // fix is scoped to path-shaped tools, not a blanket change.
+        let deny_rm = ToolRule {
+            effect: RuleEffect::Deny,
+            pattern: ToolPattern::parse("shell_exec(rm *)").expect("pattern"),
+        };
+        let shell_lattice =
+            PermissionLattice::new(PermissionMode::BypassPermissions).with_rules(vec![deny_rm]);
+        assert_eq!(
+            shell_lattice.evaluate("shell_exec", "RM -rf /tmp/x", ToolClass::Other),
+            Decision::Allow(DecisionReason::BypassAllow),
+            "shell argv case-sensitivity must be unchanged"
         );
     }
 
