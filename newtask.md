@@ -1703,6 +1703,35 @@ reachable: `run_diagnostics_once` backs `verify_candidate`, which runs on every 
 Full `hooks` (9 tests, up from 7) and `shadow_diagnostics` (8 tests, up from 7) modules — 17 total across both,
 up from 14 — and `cargo build --workspace --tests` pass.
 
+**Fresh review pass, 2026-09-04, `apps/rapid/src/context_retrieval.rs::ripple_advisory_inner` (line 218) —
+the Next-Edit-Ripple advisory's self-exclusion filter compared the graph's normalized path against the raw,
+unnormalized caller-supplied path, so an edited file could wrongly advise about referencing itself.**
+`ripple_advisory_inner` correctly normalizes its input up front (`let target = RepoPath::parse(path).ok()?`,
+line 192) and uses `target` for the walk match and `symbols_at_path` lookup — but the loop that builds the
+"impacted files" set filtered with `impacted_path.as_str() != path` (the *original*, unnormalized string),
+not `target.as_str()`. `impacted_path` always comes from the graph's own `symbol_label`, which is always in
+canonical `RepoPath` form (no `./`, no redundant separators) — so the comparison only worked by coincidence,
+when the caller happened to already pass a canonical path. `RepoPath::parse` drops `.` components
+(`crates/protocol/src/repo_path.rs:60-63`), and `checked_relative` (`exec_tools.rs:2672`) explicitly permits
+`Component::CurDir`, so a `./`-prefixed path — a common form for LLM-issued tool calls — reaches this function
+unnormalized via `args.path` (never itself rewritten, only resolved into a separate `PathBuf`) and
+`append_write_advisories` (`exec_tools.rs:1288/1306/1316/1594/1658`) into `ripple_advisory`
+(`exec_tools.rs:3019`). **Concrete failure scenario:** a file with a same-file helper→target call
+(`fn helper() { target(); } fn target() {}`) edited via a `./`-prefixed path produces a nonsensical advisory —
+`"advisory: editing ./same_file.rs may affect code that references it in: same_file.rs — verify they still
+work"` — the file naming itself; worse, near the 8-path `MAX_RIPPLE_PATHS_LISTED` truncation boundary, the
+spurious self-entry can silently displace a real impacted file from the reported (alphabetically-sorted)
+list. Live and reachable: `ripple_advisory` runs on every successful `workspace_write`/`workspace_patch` call
+via `append_write_advisories`, not a hypothetical or dormant path. **Fixed:** one-line change, comparing
+against `target.as_str()` instead of the raw `path`. New test
+`ripple_advisory_excludes_the_edited_file_itself_even_with_a_dot_slash_path` (a same-file caller edited via a
+`./`-prefixed path, asserting `None` since there's no other real caller) — verified via the revert cycle to
+fail with exactly the predicted self-referential advisory text against the original comparison before
+confirming the fix closes it. Full `context_retrieval` test module (7 tests, up from 6) and
+`cargo build --workspace --tests` pass. Advisory-only (never blocks a write), so the blast radius is a
+confusing/wrong message rather than data loss — but easily triggered given how common both `./`-prefixed
+tool-call paths and same-file helper→target patterns are.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

@@ -215,7 +215,7 @@ fn ripple_advisory_inner(root: &Path, path: &str, cancel: &CancellationToken) ->
         };
         for edge in &edges {
             if let Some((_, impacted_path)) = pipeline.graph().symbol_label(edge.from())
-                && impacted_path.as_str() != path
+                && impacted_path.as_str() != target.as_str()
             {
                 impacted.insert(impacted_path.as_str().to_owned());
             }
@@ -363,6 +363,31 @@ mod tests {
         // An unknown/nonexistent path fails open rather than panicking.
         assert!(ripple_advisory(&root, "does-not-exist.rs").is_none());
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ripple_advisory_excludes_the_edited_file_itself_even_with_a_dot_slash_path() {
+        // Same-file caller: `helper` calls `target` in the same file. The
+        // self-exclusion filter must compare against the *normalized* path
+        // (what the graph's `symbol_label` always returns), not the raw
+        // caller-supplied one — a "./"-prefixed path is a common form for
+        // LLM-issued tool calls and is explicitly permitted by
+        // `checked_relative` in exec_tools.rs, so it reaches this function
+        // unnormalized.
+        let root = temp_dir("selfref");
+        std::fs::write(
+            root.join("same_file.rs"),
+            "fn helper() { target(); }\nfn target() {}\n",
+        )
+        .expect("seed");
+        let _ = retrieve(&root, "target", 4096);
+
+        let advisory = ripple_advisory(&root, "./same_file.rs");
+        assert!(
+            advisory.is_none(),
+            "a same-file caller must not make the edited file advise about itself: {advisory:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
