@@ -3540,6 +3540,18 @@ their results become evidence, not just a console warning).
   explicit `rapid scan` entry point, not a hook on every tool call). This is new user-facing feature and
   config-surface work, not a wiring task the way `CommandFinding`/`PatchFinding` were — correctly left
   alone this whole section rather than a gap anyone missed.
+- **Cross-reference, 2026-09-04: a new gap in the already-built `PatchPolicyGate` itself, found this pass
+  and documented in full in §0a (search this document for "silently discarded every `ScanError`... into a
+  silent `None`").** `scan_for_secrets_advisory`/`scan_patch_advisory` — reused verbatim inside
+  `collect_content_findings`, the function backing both `scan_git_commit_gate` and `scan_git_merge_gate`
+  above — collapse every scan error via `.ok()?`, including `BoundExceeded` for a staged file over the
+  scanner's 8 MiB cap. Unlike this section's own `-C`/`-c` global-flag gap (a precisely documented,
+  deliberately-accepted boundary), this one wasn't previously known: a single oversized staged file
+  (a bundled binary or data dump committed alongside legitimate secrets-bearing text — not exotic) silently
+  drops that file from the *mandatory* gate's scan, with no repo-access problem involved at all. Not fixed
+  this pass — deciding the right response (block the commit outright, degrade to a surfaced "could not
+  fully scan" warning, or raise the cap) is a policy call for a mandatory security gate, not a mechanical
+  error-handling fix.
 
 ### 2.10 Scoped Credential Broker + Resource Governor
 
