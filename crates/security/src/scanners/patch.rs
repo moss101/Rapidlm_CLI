@@ -1118,14 +1118,24 @@ fn collect_credential_material(
     cancel.check()?;
     const BEGIN: &[u8] = b"-----BEGIN ";
     const PRIVATE: &[u8] = b"PRIVATE KEY";
-    if let Some(start) = find_bytes(hay, BEGIN) {
+    // Loop over every `-----BEGIN ` marker (matching
+    // `secrets.rs::collect_private_keys`'s structure exactly) rather than
+    // inspecting only the first: a combined certificate+key PEM bundle (a
+    // common real-world TLS artifact) puts a non-key BEGIN block first, and
+    // stopping there after one miss would skip a real private key later in
+    // the same file. `end` also uses the inner match's own relative offset
+    // (`priv_rel`), not just `after + PRIVATE.len()` — a key-type label
+    // between BEGIN and PRIVATE KEY (`RSA `, `EC `, `OPENSSH `, ...) means
+    // the match rarely starts right at `after`.
+    let mut pos = 0;
+    let mut found_key = false;
+    while let Some(rel) = find_bytes(&hay[pos..], BEGIN) {
+        cancel.check()?;
+        let start = pos + rel;
         let after = start + BEGIN.len();
         let window_end = hay.len().min(after.saturating_add(48));
-        if find_bytes(&hay[after..window_end], PRIVATE).is_some() {
-            let end = after
-                .min(hay.len())
-                .saturating_add(PRIVATE.len())
-                .min(hay.len());
+        if let Some(priv_rel) = find_bytes(&hay[after..window_end], PRIVATE) {
+            let end = after + priv_rel + PRIVATE.len();
             hits.push(RawHit {
                 rule_id: "patch.credential_material",
                 category: PatchFindingCategory::Credential,
@@ -1136,8 +1146,14 @@ fn collect_credential_material(
                 message: "Staged text includes private-key material",
                 remediation: REMEDIATE_CREDENTIAL,
             });
-            return Ok(());
+            found_key = true;
+            pos = end;
+        } else {
+            pos = after;
         }
+    }
+    if found_key {
+        return Ok(());
     }
     for needle in [
         &b"aws_secret_access_key="[..],
@@ -1597,6 +1613,53 @@ mod tests {
             assert_no_payload("message", finding.message(), "MIIEowIBAAKCAQEAFAKE");
             assert_no_payload("display", &finding.to_string(), "BEGIN RSA");
         }
+    }
+
+    #[test]
+    fn credential_material_range_covers_the_full_pem_header_including_key_type_label() {
+        // PRIVATE_KEY's header is "-----BEGIN RSA PRIVATE KEY-----" -- the
+        // "RSA " key-type label sits between BEGIN and PRIVATE KEY, exactly
+        // the shape that exposed a wrong `end` offset: computing
+        // `after + PRIVATE.len()` instead of `after + priv_rel +
+        // PRIVATE.len()` landed the range short, inside "PRIVATE" itself,
+        // for any non-empty label (RSA/EC/DSA/OPENSSH/ENCRYPTED/...).
+        let report = scan_one(
+            PatchScanTarget::create(path(".ssh/id_rsa"), PRIVATE_KEY.as_bytes().to_vec(), false)
+                .expect("target"),
+        );
+        let finding = report
+            .findings()
+            .iter()
+            .find(|finding| finding.rule_id() == "patch.credential_material")
+            .expect("credential_material finding");
+        let expected_end = PRIVATE_KEY.find("PRIVATE KEY").expect("marker") + "PRIVATE KEY".len();
+        assert_eq!(
+            finding.range().end(),
+            expected_end as u64,
+            "range end should cover through the end of \"PRIVATE KEY\", not stop short inside \"RSA PRIVATE\""
+        );
+    }
+
+    #[test]
+    fn credential_material_finds_a_private_key_after_an_earlier_non_key_begin_block() {
+        // A combined certificate+key PEM bundle is a completely ordinary
+        // real-world TLS artifact: a non-key "-----BEGIN " block (the
+        // certificate, well over the 48-byte lookahead window) comes first,
+        // and the real private key follows later in the same file. Stopping
+        // after the first BEGIN marker misses it entirely.
+        let bundle = format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n{PRIVATE_KEY}",
+            "M".repeat(200)
+        );
+        let report = scan_one(
+            PatchScanTarget::create(path("bundle.pem"), bundle.as_bytes().to_vec(), false)
+                .expect("target"),
+        );
+        assert!(
+            rules(&report).contains(&"patch.credential_material"),
+            "a private key later in the file must still be detected: {:?}",
+            rules(&report)
+        );
     }
 
     #[test]

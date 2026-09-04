@@ -1943,6 +1943,55 @@ reachability to verify a fix against, and normalizing via `RepoPath::parse` insi
 a decision about how to handle a prefix that fails to parse at all (silently drop the scope restriction?
 reject the `InformationNeed` at construction?) — a small design choice, not a pure mechanical change.
 
+**Fresh review pass, 2026-09-04, `crates/security/src/scanners/patch.rs::collect_credential_material` — two
+real detection bugs, both fixed by mirroring the already-correct sibling implementation in the same crate.**
+Live and reachable: this function runs on every `workspace_write`/`workspace_patch` via `scan_patch_advisory`
+(`exec_tools.rs:3149`) and on every staged `git commit`/`git merge` via the blocking `PatchPolicyGate`'s
+`collect_content_findings` (`exec_tools.rs:2895-2906`). (1) **Wrong byte-range `end` for private-key hits:**
+the inner `find_bytes(&hay[after..window_end], PRIVATE)` call's own relative offset was discarded
+(`.is_some()` only) and `end` was computed as `after + PRIVATE.len()`, ignoring how far into the window the
+match actually started — so any non-empty key-type label between `-----BEGIN ` and `PRIVATE KEY`
+(`RSA `/`EC `/`DSA `/`OPENSSH `/`ENCRYPTED `, i.e. virtually every real PEM private-key header) produced a
+range landing short, inside the word "PRIVATE" itself, several bytes before the header actually ends — and
+that wrong range feeds directly into `PatchFindingFingerprint::compute`, so the fingerprint used for dismissal
+was computed from the wrong bytes too. `secrets.rs::collect_private_keys`'s identical-in-purpose function
+already gets this right (`let end = after + priv_rel + PRIVATE.len();`), confirming this was a genuine
+regression, not a design choice. (2) **Only the first `-----BEGIN ` marker in the whole file was ever
+inspected** — no loop, unlike `secrets.rs`'s version. A combined certificate+key PEM bundle (a completely
+ordinary real-world TLS artifact: certificate block first, private key block later) puts a non-key BEGIN
+block first; since it's longer than the hard-coded 48-byte lookahead window and contains no match, the
+function gave up on private-key detection for the *entire file*, never reaching the real key later on. If the
+file's path doesn't independently trip `is_credential_path` (e.g. a `.pem`/generic bundle rather than
+`.ssh/id_rsa`), this alone would produce zero patch-scanner findings for a file that literally contains a
+private key — mitigated in practice today only because `scan_for_secrets_advisory` always runs alongside
+`scan_patch_advisory` at every current call site, and `secrets.rs`'s own loop still catches it, but a real,
+independent bug in this scanner's own contract regardless. **Fixed:** rewrote `collect_credential_material`'s
+private-key half to loop over every `-----BEGIN ` occurrence exactly like `collect_private_keys` does,
+computing `end` from the inner match's real relative offset. New tests
+`credential_material_range_covers_the_full_pem_header_including_key_type_label` (asserts the exact byte
+offset, computed from the fixture string itself rather than hardcoded) and
+`credential_material_finds_a_private_key_after_an_earlier_non_key_begin_block` (a synthetic cert+key bundle) —
+verified via the revert cycle that both fail exactly as predicted (`22` vs `26`, and only
+`patch.credential_path` firing with the real key entirely missed) against the original code before confirming
+the fix closes both. Full `security` crate suite (171 tests) and `cargo build --workspace --tests` pass.
+
+**Same review pass, investigated but declined: `exec_tools.rs`'s advisory scan functions (`scan_for_secrets_
+advisory`/`scan_patch_advisory`) collapse every `ScanError`/`PatchScanError` — including `BoundExceeded` for a
+file over the scanner's 8 MiB cap — into a silent `None` via `.ok()?`, and those exact functions are reused
+verbatim inside `collect_content_findings`, which backs the supposedly-mandatory `scan_git_commit_gate`/
+`scan_git_merge_gate`.** Their own doc comments frame the fail-open behavior as being about repo-access
+problems only ("fails open... on anything that isn't a real, readable git repo with staged changes") — but in
+practice, any single staged file over 8 MiB (a bundled binary, data dump, or checkpoint committed alongside
+legitimate secrets-bearing text) silently drops that file from the *blocking* gate's scan too, with no
+repo-access problem involved at all. A smaller sibling gap: `scan_command_advisory` collapses
+`CommandScanError::UnparseableShell` (a case `command.rs`'s own module doc says is deliberately "never Clean")
+into the same silent `None`, though this one is advisory-only today (no blocking command gate exists), so
+lower severity. Declining to fix this pass: turning `BoundExceeded` into an actual gate failure changes the
+commit/merge gate's real behavior for legitimate large-file commits (a bundled binary alongside code is not
+unusual), and deciding the right response — block the commit outright, degrade to a "could not fully scan"
+warning surfaced to the user, or raise the cap — is a policy call for the mandatory security gate specifically,
+not a mechanical error-handling fix; flagging in detail rather than guessing at the intended trade-off.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
