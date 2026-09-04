@@ -2313,6 +2313,65 @@ revert cycle to report "got 1 candidate(s) let through ungated" against the orig
 confirming the fix closes it. Full `interactive`/`managed_config` test modules (38 tests), full `-p rapid`
 suite (356 tests), and `cargo build --workspace --tests` pass.
 
+**Same second-pass adversarial approach, next applied to `crates/capability-broker/src/policy/evaluator.rs`
+(the crate that actually mints/validates capability leases for real process exec/filesystem/network) —
+one asymmetry found, a fix attempted and then reverted after empirically disproving its own premise via the
+full test suite, and documented here as a genuine design-decision item rather than forced through.** Verified
+finding: `resource_matches`'s `ResourcePattern::Process` arm (`evaluator.rs:605-611`) never consults its own
+`action: &CanonicalAction` parameter — it matches a `proc.exec` rule's `command_family` pattern purely
+against the caller-declared `ResourceDescriptor::Process` label. Its two siblings in the *same function* both
+do this correctly: `ResourcePattern::Filesystem`'s `fs_action_matches` and `ResourcePattern::Network`'s
+`net_action_matches` each require the rule to match **both** the declared resource **and** the real
+normalized action (`CanonicalFsAction`/`CanonicalNetworkTarget`) for an `Allow`, and match on **either** for
+`Deny`/`Ask` — the same "declared label, independently re-verified against the real action" shape already
+missing, and now present, in `permissions.rs`'s own domain/path fixes above. A background reviewer
+constructed a computational proof: an `ActionRequest` with `resource = Process("git")` but
+`normalized_action = Command(/bin/rm -rf /)` (a genuinely resolved `CanonicalCommand` via the crate's own
+`normalize_exec`) — `evaluate()` returns `Allow` against a `git`-only allow rule, and a separate `deny {
+command_family = "rm" }` at a higher-trust layer never fires either, since `resource_matches` never looks at
+the real command at all.
+
+**A fix was attempted (cross-check the rule against the real executable's basename, mirroring the FS/Network
+pattern) and then reverted after the full test suite proved its own premise wrong — worth recording in detail
+so the next attempt doesn't repeat it.** The fix assumed `command_family` is meant to equal `basename(real
+executable)` — true for the one place that convention is documented (`tool-gateway::dispatch::
+describe_proc_from_argv`, which derives a `ResourceDescriptor::Process`'s label from `argv[0]`'s own
+basename) — but running the full workspace test suite (not just this crate's own) immediately falsified it:
+18 `process-supervisor` tests failed with `approval: Denied`, including its own fixture at
+`spawn.rs:1069` (`resource = { command_family = "test" }`, an arbitrary opaque label with zero relationship to
+any real executable's name), and — more importantly — the one confirmed **real, shipped** production caller,
+`apps/rapid/src/external_agents.rs:487`, binds every external-agent invocation (`claude`, `codex`,
+`cursor-agent`, whichever CLI a project configures) under the single fixed constant
+`AGENT_COMMAND_FAMILY = "agent.external"` — a *category* label, never the literal executable's basename. Under
+the "family == basename" fix, that real, live code path would have failed every single external-agent
+invocation, since no real CLI binary is ever literally named `"agent.external"`. This is the same shape as
+this session's earlier `llm-router::ip_is_blocked` lesson: a fix that looks locally correct from one call
+site's convention breaks a different, equally-real caller's actual, intended semantics — caught only by
+running the *entire* workspace suite, not just the crate under change, before committing.
+
+**Re-scoped conclusion after this deeper dive, more nuanced than the initial finding:** `command_family` is,
+by this codebase's actual design (confirmed against both `apps/rapid`'s one real caller and every crate's own
+test fixtures), a caller-asserted *classification tag*, not a literal-executable-identity claim the evaluator
+can independently verify — there is no crate-level definition of "which real executables belong to which
+family" for `resource_matches` to check against, unlike domains (DNS case-insensitivity is a universal fact)
+or paths (filesystem case-(in)sensitivity is a real, checkable OS fact). Whether `external_agents.rs`'s own
+`resource`/`normalized_action` pair can ever *honestly* diverge was checked directly: today it can't — the
+`resource`'s family and the `normalized_action`'s real command both describe the same single, genuine agent
+invocation, just at different abstraction levels, never independently caller-controlled in a way that could
+lie. The only place a genuinely dishonest pair *could* arise — `tool-gateway::dispatch::describe_capability`
+deriving `resource` and `action` from different sources — is itself fully dormant (zero callers anywhere in
+this repo outside its own tests, confirmed independently by two separate background reviews this session), and
+even there, its current `ShellExec` handling constructs `action` as a tautological clone of `resource`, so it
+cannot construct a mismatch either, today. **Net effect: this is a genuine internal-robustness gap in the
+evaluator relative to its own FS/Network design (worth closing eventually, matching that symmetric shape), but
+not a currently live, directly-exploitable bypass reachable from any real, shipped code path** — unlike the
+four bugs fixed earlier in this document today, all of which were reachable from real dispatch with a single
+crafted static input. The right fix needs either a real, crate-level policy convention connecting a declared
+command family to what real executables may satisfy it (not invented here, since inventing one under time
+pressure is exactly what produced the reverted, broken attempt), or accepting that this specific cross-check
+genuinely cannot be enforced generically at this layer and belongs, if anywhere, in a future caller's own
+construction logic instead. Flagging in full rather than guessing at either.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
