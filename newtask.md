@@ -3453,6 +3453,25 @@ already holds here.
 Full `exec_tools` test module (101 tests, up from 100), full `-p rapid --lib` suite (373 tests, up from 372),
 and `cargo build --workspace --tests` all pass.
 
+**Same sweep, next applied to `crates/insights` — the crate this session already fixed once
+(`817d01b`, `analyze` silently implementing only two of its four promised signals). A clean result on
+everything actually reachable, plus confirmation the earlier fix's own class of bug ("doc promises N,
+implementation delivers a subset") has no sibling elsewhere in this crate.** Precise reachability: only
+`insights::analyze`/`EventSummary` are real, dispatched via the live `rapid insights <session-id>` CLI
+subcommand (`p9_commands.rs`); `EnduranceTier`/`run_endurance`/`run_release_scenario`/
+`verified_success_per_token` are real code with zero callers anywhere outside the crate's own tests — dead
+scaffolding co-located inside an otherwise-live crate, matching the pattern found in the fully-dead crates
+this sweep, just not itself a vulnerability since it's unreachable. On the live path: `analyze`'s input
+(`EventSummary.kind`) comes from a closed, compile-time enum of fixed event-kind literals, never raw file
+content or free text, so there's no injection surface into the analyzer; its output is purely
+`println!`-displayed by the one real caller with nothing downstream reading it, confirmed via a workspace-wide
+grep for the `Insight` type finding no other consumer; the event-count bound (`MAX_EXPORT_EVENTS = 10_000`) is
+correctly re-derived from durable storage (`SELECT MAX(seq) ...`) on every call rather than tracked as
+resettable local state, so it isn't the recurring per-instance-vs-shared-ceiling defect found elsewhere this
+session; every doc comment in the crate was checked against its implementation and all four (`analyze`,
+`run_endurance`, `run_release_scenario`, `verified_success_per_token`) match exactly, so the specific bug
+class already fixed once here doesn't recur. No fix needed.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
