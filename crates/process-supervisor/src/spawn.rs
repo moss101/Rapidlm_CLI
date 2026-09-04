@@ -469,6 +469,15 @@ pub fn spawn(spec: ExecSpec, lease: LeaseUseGuard) -> Result<JobHandle, SpawnErr
     let mut child = command.spawn().map_err(|_| SpawnError::Io)?;
     let pid = child.id();
     if let Err(err) = write_stdin(&mut child, &spec.stdin) {
+        // `child.kill()` only signals the leader PID. `isolate_process_group`
+        // put this child in its own process group (pgid == pid), so any
+        // grandchild it already forked before this failure — an ordinary
+        // shell command that backgrounds work, or one that exits without
+        // draining all of stdin — would otherwise survive as an orphan with
+        // no `JobHandle` ever handed back to find or kill it later. Signal
+        // the whole group too, best-effort, matching `terminate_tree`'s own
+        // group-based termination model.
+        let _ = crate::cancel::signal_group(ProcessGroupId(pid), crate::cancel::SignalKind::Kill);
         let _ = child.kill();
         let _ = child.wait();
         return Err(err);
@@ -1362,6 +1371,104 @@ capability = "fs.read"
             .wait_with_output()
             .expect("wait");
         assert_eq!(output.stdout, b"hello-stdin");
+    }
+
+    #[cfg(unix)]
+    fn pid_alive(pid: u32) -> bool {
+        Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    // `spawn()`'s stdin-write-failure cleanup (below) now signals the whole
+    // process group via `crate::cancel::signal_group`, not just the leader
+    // PID, so a grandchild the leader already forked doesn't survive as an
+    // orphan. The natural trigger for that cleanup path — a broken-pipe
+    // write failure — turned out to be unwinnable as a black-box test on
+    // this platform: writing up to `MAX_STDIN_BYTES` (65536, empirically
+    // exactly this system's pipe capacity) into a freshly-created pipe
+    // always completes in one non-blocking syscall regardless of whether
+    // the child ever reads it, and even a child that closes its own stdin
+    // as the very first thing it does never gets scheduled before the
+    // parent's write already returned (verified empirically: 0/30 forced
+    // failures across two independent race constructions). So this test
+    // instead verifies the mechanism the fix relies on directly: that
+    // `signal_group` — now `pub(crate)` so `spawn()` can call it — actually
+    // reaches a grandchild inside the target process group, using a real
+    // group obtained through the crate's own normal `spawn()` path.
+    #[cfg(unix)]
+    #[test]
+    fn signal_group_kill_reaches_a_grandchild_not_just_the_leader() {
+        let sh = require_bin("/bin/sh");
+        let pidfile = std::env::temp_dir().join(format!(
+            "psup-spawn-signalgroup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&pidfile);
+        // Background a grandchild inside the leader's own process group
+        // (isolate_process_group puts every spawned child in its own new
+        // group), record its pid, then the leader itself stays alive too so
+        // this exercises killing a live group with more than one member.
+        let script = format!("sleep 30 & echo $! > {} ; sleep 30", pidfile.display());
+        let spec = ExecSpec::shell(
+            sh,
+            script,
+            temp_cwd(),
+            None::<(String, SecretOrValue)>,
+            StdinSpec::Empty,
+            None,
+            4096,
+            CancellationToken::new(),
+        )
+        .expect("spec")
+        .bind(shell_binding())
+        .expect("bind");
+        let mut job = spawn(spec.clone(), lease_guard(&spec)).expect("spawn");
+        let leader_pid = job.pid();
+        let process_group_id = job.process_group_id();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let grandchild_pid: u32 = loop {
+            if let Ok(text) = std::fs::read_to_string(&pidfile) {
+                if let Ok(pid) = text.trim().parse() {
+                    break pid;
+                }
+            }
+            assert!(Instant::now() < deadline, "grandchild pid file was never written");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(pid_alive(leader_pid), "leader should still be running");
+        assert!(pid_alive(grandchild_pid), "grandchild should still be running");
+
+        crate::cancel::signal_group(process_group_id, crate::cancel::SignalKind::Kill)
+            .expect("signal group");
+        // Reap the leader ourselves (we're its direct parent — Rust's
+        // `Child` never waits on drop, and an unreaped killed process stays
+        // a zombie that `kill -0` still reports as "alive"). The grandchild
+        // has no such issue: once orphaned by the killed leader it's
+        // reparented to init, which reaps it on its own.
+        job.child_mut().wait().expect("reap leader");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pid_alive(grandchild_pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_file(&pidfile);
+        assert!(!pid_alive(leader_pid), "leader survived a group kill");
+        assert!(
+            !pid_alive(grandchild_pid),
+            "grandchild pid {grandchild_pid} survived a group kill — this is exactly what \
+             `child.kill()` alone (single-PID, the pre-fix cleanup) would have missed"
+        );
     }
 
     #[cfg(unix)]

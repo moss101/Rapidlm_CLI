@@ -395,7 +395,12 @@ fn validate_pgid_raw(pgid: u32) -> Result<(), CancelError> {
     }
 }
 
-fn signal_group(pgid: ProcessGroupId, kind: SignalKind) -> Result<(), CancelError> {
+/// Send one group signal directly, bypassing `terminate_tree`'s
+/// wait/escalate ceremony — for a caller that already knows it wants an
+/// immediate, best-effort kill (e.g. `spawn`'s own stdin-write-failure
+/// cleanup, which needs to reap a process that will never be handed back
+/// as a usable `JobHandle`).
+pub(crate) fn signal_group(pgid: ProcessGroupId, kind: SignalKind) -> Result<(), CancelError> {
     validate_pgid_raw(pgid.as_u32())?;
     platform_signal_group(pgid, kind)
 }

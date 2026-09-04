@@ -1992,6 +1992,52 @@ unusual), and deciding the right response — block the commit outright, degrade
 warning surfaced to the user, or raise the cap — is a policy call for the mandatory security gate specifically,
 not a mechanical error-handling fix; flagging in detail rather than guessing at the intended trade-off.
 
+**Fresh review pass, 2026-09-04, `crates/process-supervisor/src/spawn.rs::spawn` — the stdin-write-failure
+cleanup killed only the leader PID, not the whole process group, orphaning any grandchild the leader had
+already forked.** Live and reachable: both real callers of `spawn()` (`apps/rapid/src/external_agents.rs`'s
+`SupervisedCliRunner`, and `crates/plugin-host/src/hooks.rs`) always pass a non-empty `StdinSpec::Bytes`
+payload, so this cleanup branch is reachable whenever the write fails. `isolate_process_group` puts every
+spawned leader in its own new process group specifically so descendants can be reaped together — the crate's
+whole termination model (`cancel::terminate_tree`, tested via `grandchild_fixture_is_terminated_with_group_
+semantics`) signals `-pgid`, never a lone PID. But the inline cleanup on a failed `write_stdin` used plain
+`child.kill()` (Rust stdlib: single-PID only, never a process group) instead of the crate's own group-kill
+machinery — even though the process group id (`pid`, since `isolate_process_group` sets pgid = the leader's
+own pid) was sitting right there in scope. Concretely: a hook/agent command that forks a subprocess and exits
+without draining all of stdin (an entirely ordinary shell pattern) causes the broken-pipe write failure;
+`child.kill()` then signals only the already-exiting leader, and the grandchild — already in the same process
+group — is never touched. `SpawnError` carries no PID/group data, so the caller has no way to ever find or
+kill that orphan once `spawn()` returns. **Fixed:** added a `signal_group(pgid, Kill)` call (widened from
+private to `pub(crate)`, matching this session's established `read_file_bounded`-style visibility-widening
+pattern for cross-module reuse) alongside the existing `child.kill()` — purely additive, so even if the group
+signal fails for any reason, the pre-existing single-PID kill still runs exactly as before, meaning this
+carries no regression risk. **Verification note, stated plainly:** the natural trigger for this cleanup path
+(a genuine broken-pipe write failure) turned out to be unwinnable as a black-box test on this platform —
+empirically verified with two independent experiments (a Python harness closing a child's stdin as its first
+action before any parent write, 0/30 forced failures; and a direct pipe-capacity probe showing a single write
+up to exactly `MAX_STDIN_BYTES` — 65536 bytes — always completes in one non-blocking syscall on this system's
+kernel, regardless of whether anything reads it). The parent's write reliably completes before a freshly-forked
+child is ever scheduled, on this OS, every time, within the crate's own legitimate size bound — not a flaky
+test, a structural inability to force this specific race from user space without `unsafe` raw fd control,
+which this crate forbids (`#![forbid(unsafe_code)]`). New test `signal_group_kill_reaches_a_grandchild_not_
+just_the_leader` therefore verifies the *mechanism* the fix depends on directly — using the crate's own
+`spawn()` to create a real process group containing a live grandchild, then calling `signal_group` on it and
+confirming both leader and grandchild die (the grandchild via automatic reaping once orphaned onto init; the
+leader reaped explicitly via `child_mut().wait()`, since an unreaped killed process stays a zombie that
+`kill -0` still reports as alive) — rather than exercising `spawn()`'s own cleanup branch end-to-end, which
+this platform will not allow a test to reach. Full `process-supervisor` crate suite (106 tests) and
+`cargo build --workspace --tests` pass.
+
+**Same review pass, two lower-confidence/lower-severity notes from `process-supervisor`, not fixed:** (1)
+`cancel::await_exit_draining`'s stdout/stderr reader threads are spawned before `await_exit` runs; if
+`await_exit` returns `Err` (e.g. `TreeStillAlive`, a process surviving the TERM→KILL escalation), those reader
+threads are never joined and the `Child`'s last reference is dropped with no `JobRegistry` reconciliation path
+in either real caller — a real gap, but the triggering condition (SIGKILL failing to actually terminate a
+process within `KILL_WAIT`) is inherently rare. (2) `spawn.rs::validate()` only rejects a zero `ExecSpec::
+timeout`, no upper bound, and `cancel::await_exit` computes `started_at + limit` (an `Instant + Duration`
+addition that panics on overflow) — confirmed not currently reachable, since both real callers hardcode small,
+safe timeouts (`external_agents::DEFAULT_AGENT_TIMEOUT` 600s, `hooks::HARD_MAX_HOOK_TIMEOUT` 30s) well before
+any `ExecSpec` is built; flagged as defense-in-depth only.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
