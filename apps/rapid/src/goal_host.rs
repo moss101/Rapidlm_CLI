@@ -28,6 +28,20 @@ pub const EVIDENCE_FILE: &str = "goal-evidence.json";
 /// Canonical session ledger db name; evidence citations resolve against it.
 pub const SESSIONS_DB_FILE: &str = "sessions.sqlite";
 
+/// Read cap for `goal.json` — a single goal snapshot. The schema's own
+/// limits (`MAX_CRITERIA` × `MAX_CRITERION_TEXT_BYTES` plus
+/// `MAX_GOAL_STATEMENT_BYTES`, `crates/agent-runtime/src/goal/state.rs`)
+/// put a legitimate snapshot's ceiling around 272 KiB before JSON
+/// structural overhead; this stays comfortably above that so no real goal
+/// is ever rejected as oversized.
+pub const MAX_GOAL_FILE_BYTES: usize = 1024 * 1024;
+/// Read cap for `goal-evidence.json`. Each record can carry several
+/// `MAX_CRITERION_TEXT_BYTES`-capped (4 KiB) string fields (assertion,
+/// subject, command, criterion id — `crates/agent-runtime/src/evidence.rs`),
+/// so `MAX_EVIDENCE_RECORDS` (256) records tops out around 6 MiB before
+/// JSON overhead; this stays comfortably above that.
+pub const MAX_EVIDENCE_FILE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Closed host schema for the persisted evidence doc.
 const EVIDENCE_DOC_SCHEMA: &str = "rapidlm.goal_host_evidence";
 
@@ -69,7 +83,7 @@ impl BackingResolver for LedgerEventBacking {
 }
 
 /// Typed host persistence failure. Display never echoes goal text.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum GoalPersistError {
     Io,
     Json,
@@ -234,13 +248,25 @@ impl GoalHost {
 
     /// Load a persisted goal. `Ok(None)` when no file exists yet.
     pub fn load(path: &Path) -> Result<Option<Self>, GoalPersistError> {
-        match fs::read(path) {
+        // Bound the read itself rather than trusting the file's size on
+        // disk — the same stat-then-read gap `read_file_bounded` closes
+        // elsewhere in this binary (`.rapidlm/MEMORY.md`, the managed
+        // policy doc, the user config). `goal.json` is normally
+        // self-written by this host, but corruption, a bad merge, or a
+        // file arriving via a cloned repo can still make it arbitrarily
+        // large, and this is read unconditionally on every TUI startup and
+        // every `rapid goal` subcommand.
+        match crate::exec_tools::read_file_bounded(path, MAX_GOAL_FILE_BYTES) {
             Ok(bytes) => {
                 let snapshot: GoalSnapshot =
                     serde_json::from_slice(&bytes).map_err(|_| GoalPersistError::Json)?;
                 Ok(Some(Self::from_snapshot(snapshot)))
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(crate::exec_tools::BoundedReadError::Io(err))
+                if err.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
             Err(_) => Err(GoalPersistError::Io),
         }
     }
@@ -289,7 +315,8 @@ impl GoalHost {
             schema_version: u16,
             records: Vec<EvidenceRecord>,
         }
-        match fs::read(path) {
+        // Bound the read itself, same rationale as `GoalHost::load` above.
+        match crate::exec_tools::read_file_bounded(path, MAX_EVIDENCE_FILE_BYTES) {
             Ok(bytes) => {
                 let raw: Raw =
                     serde_json::from_slice(&bytes).map_err(|_| GoalPersistError::Json)?;
@@ -306,7 +333,11 @@ impl GoalHost {
                 }
                 Ok(count)
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(crate::exec_tools::BoundedReadError::Io(err))
+                if err.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(0)
+            }
             Err(_) => Err(GoalPersistError::Io),
         }
     }
@@ -393,6 +424,27 @@ mod tests {
         let path = scratch("missing");
         let _ = fs::remove_file(&path);
         assert!(GoalHost::load(&path).expect("load").is_none());
+    }
+
+    #[test]
+    fn load_bounds_the_read_instead_of_buffering_an_oversized_file() {
+        // `goal.json` is normally self-written by this host, but corruption,
+        // a bad merge, or a file arriving via a cloned repo can still make
+        // it arbitrarily large. A garbage file past `MAX_GOAL_FILE_BYTES`
+        // gives a genuinely distinguishing signal: an unbounded `fs::read`
+        // reads the whole thing and then fails to parse it as JSON
+        // (`GoalPersistError::Json`), while the bounded read rejects it as
+        // too large before parsing is even attempted
+        // (`GoalPersistError::Io`) — the two are different error variants,
+        // not just "some error either way".
+        let path = scratch("oversized");
+        let _ = fs::remove_file(&path);
+        fs::write(&path, vec![b'x'; MAX_GOAL_FILE_BYTES + 1]).expect("write");
+        match GoalHost::load(&path) {
+            Err(GoalPersistError::Io) => {}
+            other => panic!("expected Err(Io) for an oversized file, got {}", other.is_ok()),
+        }
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

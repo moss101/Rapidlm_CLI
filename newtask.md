@@ -1589,6 +1589,36 @@ not latent:** `fold_stream` runs inside `ConfiguredModel::step`, the sole `LiveM
 to both the primary model and every `FallbackChainModel` backend (`interactive.rs`) — this fires on every real
 request that returns more than one tool call in a step, not a hypothetical or an unwired mechanism.
 
+**Fresh review pass, 2026-09-04, `apps/rapid/src/goal_host.rs::GoalHost::load` (line 250) and `::load_evidence`
+(line 310) — both buffered the entire file into memory via plain `std::fs::read` before any JSON parsing,
+the same unbounded-read-before-size-check anti-pattern already fixed 6+ times this session** (`exec_tools.rs`'s
+`workspace_read`/`repo_read`/`workspace_patch`/`repo_search`, `host.rs`'s `load_memory_index`/`load_todos_index`,
+`managed_config.rs`'s `load_policy`, `user_config.rs`'s `read_config_file`). `goal.json` and `goal-evidence.json`
+are normally self-written by this same host, but corruption, a bad merge, or a file arriving via a cloned repo
+can still make either arbitrarily large, and both functions are unconditionally live: `GoalHost::load` runs on
+every TUI startup via `sync_persisted_goal` (`interactive.rs:287`, called from `interactive.rs:2172`) and on
+every real `rapid goal create|show|pause|resume|cancel|complete` invocation via `run_goal_command`
+(`interactive.rs:365`); `load_evidence` runs from the same command handler (`interactive.rs:388`). **Fixed:**
+both now go through the crate's existing `read_file_bounded` primitive (`exec_tools.rs`, widened from private to
+`pub(crate)` earlier this session for exactly this kind of reuse), with two new caps: `MAX_GOAL_FILE_BYTES`
+(1 MiB) and `MAX_EVIDENCE_FILE_BYTES` (8 MiB). Both caps were deliberately set well above the schema's own
+legitimate ceiling rather than picked arbitrarily — checked directly against `crates/agent-runtime/src/goal/
+state.rs` (`MAX_GOAL_STATEMENT_BYTES` 16 KiB + `MAX_CRITERIA` 64 × `MAX_CRITERION_TEXT_BYTES` 4 KiB, a legitimate
+`goal.json` ceiling around 272 KiB before JSON overhead) and `crates/agent-runtime/src/evidence.rs`
+(`MAX_EVIDENCE_RECORDS` 256 records, each with several 4 KiB-capped string fields, a legitimate evidence-file
+ceiling around 6 MiB) — the first-chosen caps (256 KiB / 4 MiB) were actually *below* those legitimate ceilings
+and would have rejected real, schema-compliant files as "too large," caught and corrected before committing.
+`BoundedReadError::Io`'s `NotFound` case still maps to the existing `Ok(None)`/`Ok(0)` "no file yet" behavior;
+any other bounded-read error (including `TooLarge`) maps to the existing `GoalPersistError::Io` variant. New
+test `load_bounds_the_read_instead_of_buffering_an_oversized_file`, using a garbage fixture one byte over
+`MAX_GOAL_FILE_BYTES` and asserting the specific `Err(GoalPersistError::Io)` variant — verified via the standard
+temporary-revert cycle that this genuinely discriminates: reverted to plain `fs::read`, the same fixture no
+longer produces `Err(Io)` (the old code buffers the whole garbage file and only then fails to parse it as JSON,
+a different error path), confirming the test fails against the original bug before confirming it passes against
+the fix. `GoalPersistError` gained `Eq, PartialEq` to support the match-based assertion (`Result::expect_err`
+would have required `GoalHost: Debug`, which it isn't). Full `goal_host` test module (9 tests, up from 8) and
+`cargo build --workspace --tests` pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
