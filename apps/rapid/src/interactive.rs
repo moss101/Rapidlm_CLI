@@ -1332,6 +1332,13 @@ struct LiveSubagentRunner {
     /// sibling subagent serializes against them instead of racing on the
     /// underlying file. See `exec_tools::WriteLocks`'s own doc comment.
     write_locks: crate::exec_tools::WriteLocks,
+    /// The parent's shared per-turn background-job budget counter (Modbit
+    /// `WRK-017`), so a subagent's own `shell_exec(background: true)` calls
+    /// count against the same turn-wide ceiling as the parent's and every
+    /// sibling's instead of each starting a fresh `MAX_BACKGROUND_JOBS`
+    /// budget of its own. See `JobRegistry::started_this_turn`'s own doc
+    /// comment.
+    job_budget: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The parent's configured project hooks, cloned into every child so a
     /// `pre_tool_use`/`post_tool_use` policy hook that gates the parent's
     /// own tool calls also gates its subagents' — without this, delegating
@@ -1398,6 +1405,9 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // WRK-017) rather than let this child start a fresh, useless one
         // of its own — see `write_locks`'s own doc comment.
         tools.share_write_locks(self.write_locks.clone());
+        // Same reasoning for the per-turn background-job budget — see
+        // `job_budget`'s own doc comment.
+        tools.share_job_budget(self.job_budget.clone());
         // Policy hooks (pre_tool_use/post_tool_use/subagent_start/
         // subagent_stop) must apply to a subagent's own tool calls too, or
         // delegation becomes a way to route around them entirely.
@@ -1958,12 +1968,16 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                 crate::exec_tools::MAX_TOTAL_FETCH_BYTES_PER_TURN,
             ));
             let write_locks = tools.write_lock_handle().unwrap_or_default();
+            let job_budget = tools
+                .job_budget_handle()
+                .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
             tools.set_subagent_runner(std::sync::Arc::new(LiveSubagentRunner {
                 active: active.clone(),
                 root: root.clone(),
                 permissions: permission_lattice.clone(),
                 turn_budgets,
                 write_locks,
+                job_budget,
                 hooks,
                 shadow_diagnostics,
                 trace_calls,

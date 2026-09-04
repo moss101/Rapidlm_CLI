@@ -225,9 +225,31 @@ impl JobState {
 pub struct JobRegistry {
     jobs: Arc<Mutex<BTreeMap<String, JobShared>>>,
     seq: Arc<AtomicU64>,
+    /// Total jobs started this turn, shared across the parent and every
+    /// subagent's own `JobRegistry` (see `share_job_budget`) — `start`'s own
+    /// bound otherwise only ever counted *this* registry's own live jobs,
+    /// so a turn spawning up to `MAX_SUBAGENT_SPAWNS_PER_TURN` subagents
+    /// could start `MAX_BACKGROUND_JOBS` each, aggregating to far more than
+    /// the constant's own "per run" doc comment implies — the exact same
+    /// per-instance-instead-of-per-turn shape `WriteLocks` already closed
+    /// for file writes.
+    started_this_turn: Arc<AtomicU64>,
 }
 
 impl JobRegistry {
+    /// Clone the shared per-turn job-start counter, for a caller propagating
+    /// it to a subagent child alongside `WriteLocks`/the turn budgets.
+    pub(crate) fn job_budget_handle(&self) -> Arc<AtomicU64> {
+        self.started_this_turn.clone()
+    }
+
+    /// Replace this instance's own counter with the parent's: without this,
+    /// every subagent child starts counting from zero again. See
+    /// `started_this_turn`'s own doc comment.
+    pub(crate) fn share_job_budget(&mut self, handle: Arc<AtomicU64>) {
+        self.started_this_turn = handle;
+    }
+
     /// Start `argv` in `cwd` as a detached supervised job; returns its id.
     /// The supervisor thread enforces the timeout, honors cancellation, spools
     /// combined output up to [`MAX_JOB_OUTPUT_BYTES`], and records the exit.
@@ -237,20 +259,8 @@ impl JobRegistry {
         cwd: &Path,
         timeout: Duration,
     ) -> Result<String, ToolStepError> {
-        {
-            let jobs = self.jobs.lock().map_err(|_| ToolStepError::Failed)?;
-            let live = jobs
-                .values()
-                .filter(|job| {
-                    job.state
-                        .lock()
-                        .map(|state| matches!(*state, JobState::Running))
-                        .unwrap_or(false)
-                })
-                .count();
-            if live >= MAX_BACKGROUND_JOBS {
-                return Err(ToolStepError::Failed);
-            }
+        if self.started_this_turn.fetch_add(1, Ordering::SeqCst) >= MAX_BACKGROUND_JOBS as u64 {
+            return Err(ToolStepError::Failed);
         }
         let id = format!("job-{}", self.seq.fetch_add(1, Ordering::SeqCst) + 1);
         let shared = JobShared {
@@ -335,16 +345,22 @@ impl JobRegistry {
                                     let Ok(mut spool) = output.lock() else {
                                         return;
                                     };
-                                    if spool.len() >= MAX_JOB_OUTPUT_BYTES {
-                                        overflow.store(true, Ordering::SeqCst);
-                                        return;
-                                    }
-                                    let take = n.min(MAX_JOB_OUTPUT_BYTES - spool.len());
+                                    let room = MAX_JOB_OUTPUT_BYTES.saturating_sub(spool.len());
+                                    let take = n.min(room);
                                     spool.extend_from_slice(&chunk[..take]);
                                     if take < n {
                                         overflow.store(true, Ordering::SeqCst);
-                                        return;
                                     }
+                                    // Keep draining even past the cap,
+                                    // discarding the excess, so the child is
+                                    // never blocked on a full pipe regardless
+                                    // of output size — returning here instead
+                                    // (as this loop used to) leaves the OS
+                                    // pipe undrained, which blocks the next
+                                    // write the still-running child makes,
+                                    // hanging it until the job's own timeout
+                                    // force-kills it and misreports a normal
+                                    // command as "timed out".
                                 }
                             }
                         }
@@ -414,19 +430,28 @@ impl JobRegistry {
             .flatten()
     }
 
-    /// Bounded slice of spooled output starting at `offset`; returns the text,
-    /// whether the job is finished, and the next offset to read from.
-    fn output(&self, id: &str, offset: usize) -> Option<(String, bool, usize, String)> {
+    /// Bounded slice of spooled output starting at `offset`; returns the
+    /// text, whether the job is finished, the next offset to read from, the
+    /// state text, and whether the job's *total* captured output was cut
+    /// off at [`MAX_JOB_OUTPUT_BYTES`] (independent of which page this is —
+    /// the real process may have emitted more than was ever spooled).
+    fn output(&self, id: &str, offset: usize) -> Option<(String, bool, usize, String, bool)> {
         let jobs = self.jobs.lock().ok()?;
         let job = jobs.get(id)?;
         let buffer = job.output.lock().ok()?;
         let start = offset.min(buffer.len());
-        let end = (start + MAX_SHELL_OUTPUT_BYTES).min(buffer.len());
+        let mut end = (start + MAX_SHELL_OUTPUT_BYTES).min(buffer.len());
+        // Back off to the nearest UTF-8 character boundary so a multi-byte
+        // character straddling the page cap isn't split into two mangled
+        // (U+FFFD) fragments across this page and the next one.
+        while end > start && end < buffer.len() && (buffer[end] & 0xC0) == 0x80 {
+            end -= 1;
+        }
         let text = String::from_utf8_lossy(&buffer[start..end]).into_owned();
-        let next = start + (end - start);
         let state = job.state.lock().ok()?;
         let done = !matches!(*state, JobState::Running);
-        Some((text, done, next, state.as_text()))
+        let overflow = job.overflow.load(Ordering::SeqCst);
+        Some((text, done, end, state.as_text(), overflow))
     }
 
     /// Take every completed-but-unreported job as a model notification
@@ -925,6 +950,19 @@ impl WorkspaceTools {
     /// `share_turn_budgets`.
     pub(crate) fn share_write_locks(&mut self, locks: WriteLocks) {
         self.write_locks = locks;
+    }
+
+    /// Clone the shared per-turn background-job budget counter, for a
+    /// caller propagating it to a subagent child. See
+    /// `JobRegistry::job_budget_handle`.
+    pub(crate) fn job_budget_handle(&self) -> Arc<AtomicU64> {
+        self.jobs.job_budget_handle()
+    }
+
+    /// Replace this instance's job registry's own counter with the
+    /// parent's. See `JobRegistry::share_job_budget`.
+    pub(crate) fn share_job_budget(&mut self, handle: Arc<AtomicU64>) {
+        self.jobs.share_job_budget(handle);
     }
 
     /// Current disk/network per-turn ceilings (Modbit `CAP-001`), for a
@@ -2220,7 +2258,7 @@ impl WorkspaceTools {
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_job_id_args(call.arguments(), true)?;
         let offset = args.offset.unwrap_or(0);
-        let Some((text, done, next, state)) = self.jobs.output(&args.job_id, offset) else {
+        let Some((text, done, next, state, overflow)) = self.jobs.output(&args.job_id, offset) else {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
@@ -2235,6 +2273,11 @@ impl WorkspaceTools {
             summary.push_str(&format!("\n[job finished: {state}]"));
         } else {
             summary.push_str(&format!("\n[job {state}; continue at offset {next}]"));
+        }
+        if overflow {
+            summary.push_str(&format!(
+                "{TRUNCATION_MARKER} (job emitted more than the {MAX_JOB_OUTPUT_BYTES}-byte capture limit; earlier output is complete, but the process may have written more than was captured)"
+            ));
         }
         Ok(ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
@@ -4138,6 +4181,24 @@ impl ExecTools {
     pub(crate) fn share_write_locks(&mut self, locks: WriteLocks) {
         if let Self::Workspace(tools) = self {
             tools.share_write_locks(locks);
+        }
+    }
+
+    /// Clone this turn's background-job budget counter (`None` on the no-op
+    /// surface, which never starts a job at all). See
+    /// `WorkspaceTools::job_budget_handle`.
+    pub(crate) fn job_budget_handle(&self) -> Option<Arc<AtomicU64>> {
+        match self {
+            Self::Workspace(tools) => Some(tools.job_budget_handle()),
+            Self::Noop(_) => None,
+        }
+    }
+
+    /// Adopt the parent's background-job budget counter (no-op on the no-op
+    /// surface). See `WorkspaceTools::share_job_budget`.
+    pub(crate) fn share_job_budget(&mut self, handle: Arc<AtomicU64>) {
+        if let Self::Workspace(tools) = self {
+            tools.share_job_budget(handle);
         }
     }
 
@@ -7433,11 +7494,16 @@ use std::sync::{Arc, Mutex};
             other => panic!("expected output, got {other:?}"),
         }
 
-        // A long job is observable as running, then cancelled at shutdown.
+        // A long job is observable as running, then actually killed when
+        // the real registry holding it drops (not a decoy instance).
+        let pid_path = root.0.join("long.pid");
         let call = make_call(
             "c2",
             SHELL_EXEC_TOOL,
-            r#"{"argv":["sleep","30"],"background":true}"#,
+            &format!(
+                r#"{{"argv":["sh","-c","echo $$ > {} && sleep 30"],"background":true}}"#,
+                pid_path.display()
+            ),
         );
         let validated = tools.validate(&call, &cancel).expect("validate");
         let long_id = match tools.execute(&validated, &cancel).expect("execute") {
@@ -7461,14 +7527,232 @@ use std::sync::{Arc, Mutex};
                 other => panic!("expected running, got {other:?}"),
             }
         }
-        // Shutdown path: drop the registry clone to cancel + kill the child.
-        drop(JobRegistry::default());
         let unknown = make_call("s3", JOB_STATUS_TOOL, r#"{"job_id":"job-missing"}"#);
         let validated = tools.validate(&unknown, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("handled") {
             ToolStepResult::Failed { handled, .. } => assert!(handled),
             other => panic!("expected unknown-job failure, got {other:?}"),
         }
+
+        fn alive(pid: i32) -> bool {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        }
+        let mut pid = None;
+        for _ in 0..100 {
+            if let Ok(contents) = fs::read_to_string(&pid_path) {
+                if let Ok(parsed) = contents.trim().parse::<i32>() {
+                    pid = Some(parsed);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = pid.expect("long job wrote its pid");
+        assert!(alive(pid), "long job must still be running before drop");
+
+        // Shutdown path: dropping the real WorkspaceTools (and the
+        // JobRegistry it owns) must kill the still-running child, not just
+        // a same-shaped decoy registry that never held it.
+        drop(tools);
+
+        let mut still_alive = true;
+        for _ in 0..100 {
+            if !alive(pid) {
+                still_alive = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !still_alive,
+            "a background job must not outlive the WorkspaceTools/JobRegistry that started it"
+        );
+    }
+
+    #[test]
+    fn background_job_output_past_the_cap_does_not_block_the_child() {
+        let root = TempRoot::new("bg-overflow");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        // Emit well past MAX_JOB_OUTPUT_BYTES (64 KiB) fast, then exit
+        // normally. A reader that stops draining once the spool cap is hit
+        // leaves the child blocked on a full OS pipe forever.
+        let call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["sh","-c","yes | head -c 200000"],"background":true}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        let job_id = match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                let word = summary
+                    .split_whitespace()
+                    .find(|word| word.starts_with("job-"))
+                    .expect("job id in summary");
+                word.trim_end_matches(':').to_owned()
+            }
+            other => panic!("expected background start, got {other:?}"),
+        };
+
+        let mut final_state = None;
+        for _ in 0..100 {
+            let status_call =
+                make_call("s1", JOB_STATUS_TOOL, &format!(r#"{{"job_id":"{job_id}"}}"#));
+            let validated = tools.validate(&status_call, &cancel).expect("validate");
+            if let ToolStepResult::Succeeded { summary, .. } =
+                tools.execute(&validated, &cancel).expect("execute")
+            {
+                if !summary.contains("running") {
+                    final_state = Some(summary);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let final_state = final_state.expect("job must reach a terminal state, not hang");
+        assert!(
+            final_state.contains("completed exit 0"),
+            "a normal command emitting more than the capture cap must still exit \
+             cleanly, not be force-killed as \"timed out\": {final_state}"
+        );
+
+        let output_call = make_call(
+            "o1",
+            JOB_OUTPUT_TOOL,
+            &format!(r#"{{"job_id":"{job_id}","offset":0}}"#),
+        );
+        let validated = tools.validate(&output_call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(
+                    summary.contains(TRUNCATION_MARKER),
+                    "output past the capture cap must be flagged as truncated: {summary}"
+                );
+            }
+            other => panic!("expected output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn background_job_budget_is_shared_across_subagent_children_of_one_turn() {
+        let root = TempRoot::new("bg-budget");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        // A child WorkspaceTools built the way LiveSubagentRunner builds one
+        // — sharing the parent's job-budget handle, not a fresh one.
+        let mut child = permissive_workspace(&root.0);
+        child.share_job_budget(tools.job_budget_handle());
+
+        for i in 0..MAX_BACKGROUND_JOBS {
+            let call = make_call(
+                &format!("p{i}"),
+                SHELL_EXEC_TOOL,
+                r#"{"argv":["true"],"background":true}"#,
+            );
+            let validated = tools.validate(&call, &cancel).expect("v");
+            match tools.execute(&validated, &cancel).expect("e") {
+                ToolStepResult::Succeeded { .. } => {}
+                other => panic!("expected success under budget, got {other:?}"),
+            }
+        }
+
+        // The parent alone already exhausted the turn-wide budget, so the
+        // child sharing it must be refused even on its very first attempt —
+        // proving the two instances count against one ceiling, not two
+        // independent `MAX_BACKGROUND_JOBS` allowances.
+        let call = make_call(
+            "c0",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["true"],"background":true}"#,
+        );
+        let validated = child.validate(&call, &cancel).expect("v");
+        assert!(
+            child.execute(&validated, &cancel).is_err(),
+            "expected the shared per-turn job budget to already be exhausted"
+        );
+    }
+
+    #[test]
+    fn job_output_pagination_does_not_split_a_multibyte_char_at_the_page_boundary() {
+        let root = TempRoot::new("bg-utf8-page");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        // 16383 ASCII bytes, then a 2-byte UTF-8 character ('é') straddling
+        // MAX_SHELL_OUTPUT_BYTES (16384): its first byte lands at the last
+        // byte of page one, its second byte at the first byte of page two.
+        let script = format!(
+            "python3 -c 'import sys; sys.stdout.buffer.write(b\"a\"*{} + chr(233).encode(\"utf-8\") + b\"END\")'",
+            MAX_SHELL_OUTPUT_BYTES - 1
+        );
+        let args = serde_json::json!({
+            "argv": ["sh", "-c", script],
+            "background": true,
+        });
+        let call = make_call("c1", SHELL_EXEC_TOOL, &args.to_string());
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        let job_id = match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                let word = summary
+                    .split_whitespace()
+                    .find(|word| word.starts_with("job-"))
+                    .expect("job id in summary");
+                word.trim_end_matches(':').to_owned()
+            }
+            other => panic!("expected background start, got {other:?}"),
+        };
+        let mut completed = false;
+        for _ in 0..50 {
+            let status_call =
+                make_call("s1", JOB_STATUS_TOOL, &format!(r#"{{"job_id":"{job_id}"}}"#));
+            let validated = tools.validate(&status_call, &cancel).expect("validate");
+            if let ToolStepResult::Succeeded { summary, .. } =
+                tools.execute(&validated, &cancel).expect("execute")
+            {
+                if summary.contains("completed exit 0") {
+                    completed = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(completed, "background job must complete");
+
+        // `execute_job_output`'s "[job finished: ...]" suffix (used once
+        // the job is done, as it is here) carries no next-offset hint —
+        // unlike the "continue at offset N" suffix used for a still-running
+        // job — so page 2's offset is derived from page 1's own returned
+        // byte length instead of parsed out of the summary text.
+        let page = |offset: usize, tools: &mut WorkspaceTools| -> String {
+            let output_call = make_call(
+                "o1",
+                JOB_OUTPUT_TOOL,
+                &format!(r#"{{"job_id":"{job_id}","offset":{offset}}}"#),
+            );
+            let validated = tools.validate(&output_call, &cancel).expect("validate");
+            match tools.execute(&validated, &cancel).expect("execute") {
+                ToolStepResult::Succeeded { summary, .. } => summary
+                    .split("\n[job")
+                    .next()
+                    .unwrap_or(&summary)
+                    .to_owned(),
+                other => panic!("expected output, got {other:?}"),
+            }
+        };
+        let page1 = page(0, &mut tools);
+        let page2 = page(page1.len(), &mut tools);
+        let combined = page1 + &page2;
+        assert!(
+            !combined.contains('\u{FFFD}'),
+            "a character straddling the page boundary must not be mangled: {combined:?}"
+        );
+        assert!(combined.contains("éEND"), "full content must survive pagination: {combined:?}");
     }
 
     #[test]

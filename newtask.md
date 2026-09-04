@@ -2971,6 +2971,90 @@ reviewer's finding directly rather than by inspection alone.
 Full `exec_tools` test module (90 tests, up from 88), full `-p rapid --lib` suite (362 tests, up from 360),
 full `-p rapid --tests` integration suites, and `cargo build --workspace --tests` all pass.
 
+**Same pivot to the real, live path, next applied to the background-job system (`JobRegistry`, `shell_exec`
+`background:true`, `job_status`, `job_output`) — the other major real subprocess mechanism in this file,
+directly analogous in shape to the `task_spawn` bugs above. Four real, directly reachable findings; three
+fixed, one (signal handling) documented and deliberately not attempted.**
+
+**Fixed: a background job's stdout/stderr reader thread stopped draining once the 64 KiB capture cap was
+hit, instead of continuing to drain and discard like every other bounded-output reader in this file.**
+(`exec_tools.rs`'s `JobRegistry::start`, before this fix — the two `return` statements inside the per-pipe
+reader closure once `spool.len() >= MAX_JOB_OUTPUT_BYTES`.) A reader thread that `return`s drops its
+`Box<dyn Read>`, which closes that end of the OS pipe — so once the cap is hit, the pipe's read end is gone,
+and the *still-running* child's next `write()` to that fd blocks on a full, undrained kernel buffer.
+Contrast the foreground `shell_exec` reader loop two hundred lines away in the same file, whose own comment
+states the fix directly: *"Keep draining even past the cap, discarding the excess, so the child is never
+blocked on a full pipe regardless of output size."* A background job hitting this simply hangs until its own
+timeout force-kills it, misreporting a normal, fast command as `"failed: timed out"`. Fixed by mirroring the
+foreground reader's exact pattern. Also surfaced the job's own `overflow` flag (already tracked, but written
+and never read anywhere) as a `TRUNCATION_MARKER` note on `job_output`, matching every other bounded-output
+surface in this file. New test `background_job_output_past_the_cap_does_not_block_the_child`: a job that
+emits `yes | head -c 200000` (well past the cap) must still report `"completed exit 0"`, not a corrupted or
+timed-out state, and `job_output` must flag the result as truncated. Verified via the revert cycle: without
+the fix, the same command's `sh` process itself got `SIGPIPE`'d (`"completed exit 141"`) once its stdout pipe
+closed under it — a different concrete symptom than a flat hang, but the same root cause, and the test caught
+it either way.
+
+**Fixed: `MAX_BACKGROUND_JOBS` (16) was enforced per-`JobRegistry` instance, not per turn — the exact same
+per-instance-instead-of-shared shape the `WriteLocks` fix above just closed for file writes, just for
+background jobs instead.** Every subagent gets its own fresh `WorkspaceTools`/`JobRegistry`
+(`jobs: JobRegistry::default()`), and `LiveSubagentRunner::run` shared `turn_budgets`/`write_locks` into every
+child but never an equivalent for jobs — so a turn spawning up to `MAX_SUBAGENT_SPAWNS_PER_TURN` (32)
+`task_spawn` calls of a write-capable agent type, each independently filling its own 16-job budget, could
+reach roughly 16 + 32×16 = 528 concurrently live child processes in one turn against a constant whose own doc
+comment says "per run." Fixed with a `started_this_turn: Arc<AtomicU64>` field on `JobRegistry` (same
+fresh-by-default, shared-via-explicit-propagation pattern as `WriteLocks`/`turn_budgets`), checked and
+incremented atomically in `start()`, shared into every subagent via a new `job_budget`
+field/`share_job_budget` call alongside `write_locks`. This changes the cap's semantics slightly (total
+started this turn, not concurrently-live at any instant — matching how `subagent_spawns` already works in
+this same file) — a strictly more conservative behavior, which is the right direction for a resource-ceiling
+fix. New test `background_job_budget_is_shared_across_subagent_children_of_one_turn`: a parent fills the
+budget to 16, then a second `WorkspaceTools` sharing the same handle is refused on its very first attempt.
+Verified via the revert cycle against the original per-instance live-count scan.
+
+**Fixed, lower severity: `job_output`'s pagination sliced the spooled buffer at a raw byte offset, not a
+UTF-8 character boundary, so a multi-byte character straddling a page boundary was rendered as a mangled
+`U+FFFD` split across two pages** — the same bug shape already fixed elsewhere this session
+(`StreamCoalescer::push`, `preview_text`), just not yet in this file's own `JobRegistry::output`. Its sibling
+method `drain_notifications` already does this correctly a few lines away (`text.is_char_boundary`-based
+backoff on the lossily-decoded string). Fixed by backing `end` off while the byte at that offset is a UTF-8
+continuation byte (`(b & 0xC0) == 0x80`), applied to the raw buffer rather than a decoded string since the
+buffer's later bytes aren't decoded yet at the point the slice boundary is chosen. New test
+`job_output_pagination_does_not_split_a_multibyte_char_at_the_page_boundary`: seeds 16383 ASCII bytes then a
+2-byte UTF-8 character exactly straddling `MAX_SHELL_OUTPUT_BYTES` (16384); reading both pages must not
+contain `U+FFFD`. Verified via the revert cycle: without the boundary backoff, the output visibly contained a
+mangled `�ND` in place of `éEND` at the seam. Cosmetic corruption only, not data loss — flagged low severity,
+fixed anyway since it directly mirrored an already-established fix pattern in this same file.
+
+Fixing the drain-past-cap bug above also surfaced that the existing test
+`background_jobs_run_report_and_cancel`'s own "shutdown path" section didn't test what its comment claimed:
+`drop(JobRegistry::default())` dropped a brand-new, unrelated decoy registry, never the real one holding the
+test's own still-running `sleep 30` job. Rewrote that section to have the long-running job write its own pid
+to a file, then drop the *real* `WorkspaceTools` and poll `kill -0 <pid>` — confirming `JobRegistry`'s `Drop`
+impl genuinely kills a live child, which (per the finding below) turns out to matter precisely because it's
+the *only* path that does.
+
+**Found, verified, and deliberately left unfixed: no signal handler exists anywhere in this codebase, so a
+plain `SIGTERM`/`SIGINT` sent directly to the `rapid` process (CI cancellation, `docker stop`, `systemd
+stop`, a plain `kill`) orphans every live background job — `JobRegistry`'s own `Drop`-based cleanup (verified
+above to work correctly) only runs on a normal Rust unwind, which a raw OS signal's default disposition never
+triggers.** The only Ctrl-C interception anywhere in this codebase is crossterm raw-mode key detection inside
+the interactive TUI's own event loop (`interactive.rs`'s `TerminalGuard`/`map_crossterm`) — never exercised
+by `exec_turn`, the actual reachable path for `shell_exec`/`JobRegistry` (headless `rapid exec` and
+`task_spawn` subagents). No child is placed in its own process group either, so a real terminal's Ctrl-C may
+incidentally also reach the child via process-group signal delivery, but a targeted signal to just `rapid`'s
+own PID does not. **Not fixed this pass**: `signal-hook` is already present as a *transitive* dependency
+(pulled in by something else), but adding it as a direct dependency and wiring a real signal handler is a
+categorically different kind of change from this pass's other three fixes — new direct dependency, genuine
+async-signal-safety design constraints (a handler can't safely acquire the same mutexes `JobRegistry::kill_all`
+does), platform differences (SIGTERM/SIGINT don't mean the same thing on Windows), and no reliable way to
+exercise it in a deterministic `cargo test`. This is exactly the shape of finding this document declines
+rather than forces through: real, severe, directly reachable, but requiring a genuine design decision rather
+than a mechanical patch matching an existing in-file pattern.
+
+Full `exec_tools` test module (93 tests, up from 90), full `-p rapid --lib` suite (365 tests, up from 362),
+full `-p rapid --tests` integration suites, and `cargo build --workspace --tests` all pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
