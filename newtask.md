@@ -3275,6 +3275,55 @@ mistaken for full coverage.
 Full `exec_tools`/commit-gate test coverage (7 tests, up from 5), full `-p rapid --lib` suite (371 tests, up
 from 366), and `cargo build --workspace --tests` all pass.
 
+**Same sweep, next applied to `resolve_in_root` — the foundational path-containment check every
+model-callable file tool (`workspace_write`, `workspace_patch`, `workspace_read`, `repo_read`, `repo_search`,
+`repo_glob`, `todo_write`) routes through to stay confined inside the trusted workspace root. A genuinely
+clean result on the core question this pass exists to ask, plus one real, narrower finding — fixed — that's a
+different class of gap than a containment escape.**
+
+**Confirmed sound, not a bug: path traversal, symlink escapes (both intermediate-directory and leaf), and
+absolute paths are all correctly refused, with the code's own doc comments showing it was already built with
+exactly these failure modes in mind.** `checked_relative` rejects any path with an absolute-path component or
+*any* `ParentDir` component anywhere (not just a leading `../`), so a buried traversal like `a/../../out.txt`
+is caught the same as an obvious one. `resolve_in_root` walks path components one at a time,
+canonicalizing-and-containment-checking each level *before* `create_dir_all` ever materializes it and before
+the leaf is opened — precisely to prevent the "create outside root before the check runs" and "leaf itself is
+a symlink out" bugs its own comments name explicitly. Absolute paths are rejected before any `.join()` call,
+so Rust's well-known `PathBuf::join`-with-an-absolute-path footgun (silently replacing the base instead of
+concatenating) never has a path to trigger through. All seven tool call sites funnel through the identical
+function or (for `repo_search`/`repo_glob`, which take a search pattern rather than a single path) an
+equivalent walker that explicitly skips every symlink rather than following any — no forked/diverging logic
+at any call site. Re-verified computationally by running this codebase's own existing tests for these exact
+properties (`symlinked_leaf_escape_is_refused_on_read_and_write`, `symlinked_intermediate_directory_creates_
+nothing_outside_the_root`, `traversal_absolute_and_oversize_arguments_are_refused`), not merely re-reading the
+code and taking its own tests on faith. One theoretical TOCTOU (no `O_NOFOLLOW` re-check between
+`resolve_in_root`'s leaf check and the actual `fs::write`/`File::open`) is real but not exploitable through
+these seven tools alone — none of them can create a symlink, and the only tool that can (`shell_exec`) already
+has unmediated OS filesystem access on its plain path, so winning that race gains a model nothing it couldn't
+already do directly.
+
+**Fixed: `resolve_in_root` enforces "inside the workspace root," never "not a git-internal control file" —
+`workspace_write`/`workspace_patch` could silently overwrite an existing, already-executable git hook's
+content.** Not a containment escape (nothing leaves the root) but a real, reachable, previously-unhandled
+risk: `{"path":".git/hooks/pre-commit","content":"..."}` was accepted and executed like any ordinary in-root
+write. `fs::write` never touches file mode bits, so if a cloned repo already ships an executable hook (common
+with husky/pre-commit/lefthook-style setups), a confused or manipulated model could replace its content with
+a payload that runs automatically on the next real `git commit`/`checkout` — no `shell_exec` needed at all.
+Confirmed via the revert cycle that this codebase's own `scan_patch_advisory` scanner already has a rule
+watching for exactly this shape (`patch.hook_path`) — but only as an *advisory* note on a successful write,
+never a block, so the write still succeeded either way. Fixed with a new `is_git_internal_path` check
+(anything whose first path component is `.git`) at the top of both `execute_write` and `execute_patch`,
+refusing the call outright before any content is touched — mirroring `team_memory_gate`'s existing scoped-path
+pattern, but unconditional rather than secret-scan-gated, since there's no legitimate reason for a
+model-driven write/patch to target git's own control directory at all (real git operations go through the
+actual `git` CLI via `shell_exec`). New test `writes_and_patches_inside_dot_git_are_refused`: seeds a real
+executable hook, confirms both a `workspace_write` and a `workspace_patch` targeting paths under `.git/` are
+refused, and that the hook's content is byte-for-byte unchanged afterward. Verified via the revert cycle: the
+unfixed code accepted the write, silently replaced the hook's content, and confirmed it via `fs::read`.
+
+Full `exec_tools` test module (100 tests, up from 99), full `-p rapid --lib` suite (372 tests, up from 371),
+and `cargo build --workspace --tests` all pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
