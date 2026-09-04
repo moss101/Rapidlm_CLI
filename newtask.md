@@ -2873,6 +2873,41 @@ this pass.
 Full `event-ledger` cron test module (11 tests, up from 10), full `event-ledger` crate suite (5 integration
 tests unaffected), full `scheduler` crate suite (24 tests), and `cargo build --workspace --tests` all pass.
 
+**Same second-pass adversarial sweep, next applied to `crates/agent-pool` — a fifth crate matching the
+disconnected-capability-layer pattern, this time for real subagent spawning (`task_spawn`).** No code fix
+came out of this pass: the one real design gap found is unreachable by a wide margin (not just "no caller
+wires it up" but "no real backend implementation of its core trait exists anywhere"), and the crate's pure
+pool-management logic already received one adversarial fix earlier this session (`0402a1c`, the
+duplicate-provisioner-id fix visible in this repo's git log) — this pass re-confirmed the rest holds up.
+
+**Reachability:** `apps/rapid/src/host_runtime.rs` is the crate's only consumer anywhere outside its own
+tests, wrapping `agent_pool::ResourcePool` as `HostRuntime`. `grep -rn "HostRuntime::new"` finds it constructed
+only inside `host_runtime.rs`'s own `#[cfg(test)]` module — `apps/rapid/src/main.rs` never builds one. The
+real, shipped `task_spawn` handler (`exec_tools.rs::execute_task_spawn`) has zero references to `agent_pool`
+anywhere and instead uses its own, independent, already-working mechanism: `subagent_spawns: Arc<AtomicU64>`
+against `MAX_SUBAGENT_SPAWNS_PER_TURN`, and `nested_spawn_allowed = false` on every spawned child (capping
+delegation depth at 1), dispatched through a `self.subagents: Option<Arc<dyn SubagentRunner>>` seam — not
+through `agent_pool` at all. Deeper than the previous four crates: `agent_pool::Provisioner` (the trait a real
+container/host-restricted/remote-worker backend would implement) has **zero non-test implementations
+anywhere in the workspace** — this isn't a wired-but-bypassed layer, it's scaffolding for a backend that has
+never been built. (An unrelated same-named `agent_pool` SQL table exists in `crates/event-ledger`'s schema —
+confirmed to be a pure naming coincidence with no Rust code reading/writing it outside its own migration and
+compat tests, not part of this crate.)
+
+**Found, verified statically, and deliberately left unfixed given the reachability above: `ResourcePool::
+release`/`quarantine` (`crates/agent-pool/src/lib.rs:245-293`) take only a lease `id`, with no check that the
+caller's claimed owner matches the lease's stored `owner` — so any caller that knows or can guess another
+lease's id string can release or quarantine an environment it doesn't own.** `HostRuntime::release_environment`
+(`host_runtime.rs:127-141`) forwards the same gap without even accepting an owner parameter to check. This is
+a real API contract gap that would matter the moment `task_spawn` (or anything else) is ever wired to this
+pool, since spawned subagents would then be the callers with access to lease ids. **Not fixed this pass**:
+closing it means deciding the actual semantics (does an unowned lease, `owner: None`, block every release
+until claimed, or allow the first caller through? does every existing call site — including the crate's own
+~20 test call sites and `HostRuntime`'s wrapper methods — need a new required parameter, or an optional one
+that degrades to today's behavior?) — a real design decision belonging with whoever eventually builds the
+first real `Provisioner` backend and wires `task_spawn` to this pool, not a mechanical patch to make now
+against an interface with no real caller to validate the shape against.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
