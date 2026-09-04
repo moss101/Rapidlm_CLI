@@ -1522,6 +1522,46 @@ breaking — confirmed genuinely inert: the sole reader, `PermissionLattice::wit
 back to disk, so the extra element never has an observable effect. Not fixed this pass since there is nothing
 to demonstrably fix a bug in, but noted for completeness rather than silently dropped.)
 
+**Fresh review pass, 2026-09-03, `apps/rapid/src/interactive.rs`'s fallback-chain wiring — the admin `min_
+reasoning_effort` floor applied to the primary model but not to `[models] fallback` alternates.** `managed_
+config.rs`'s own module doc frames every one of its gates as a hard invariant that "only ever restrict[s],
+never widen[s]," and `resolve_gated` correctly raises the *primary* model's effort to the floor. But the
+fallback-chain wiring in `interactive.rs` already re-applies the managed `allowed_providers` allowlist to each
+`[models] fallback` candidate — with the comment "a fallback entry is never let through a restriction the
+primary itself has to honor" — and simply never got the equivalent line for `min_reasoning_effort`: the
+developer clearly reasoned about parity for one gate and missed it for the sibling one. Concretely: an admin
+sets `min_reasoning_effort = "high"`; the user's primary model is correctly raised to `"high"`, but a
+configured `[models] fallback` entry with no (or a lower) `reasoning_effort` runs at its own unraised value the
+moment the primary fails over — a normal, real trigger (rate limit, outage, auth hiccup), not an edge case.
+Verified via the standard temporary-revert cycle: the new test failed with the fallback candidate staying at
+`Low` instead of being raised to `High`. **Fixed:** extracted the floor comparison into a shared `below_floor`
+predicate `resolve_gated` and the fallback wiring both call (so the two paths can't silently drift apart again
+the way they just had), and further extracted the *whole* per-candidate policy application (allowlist filter +
+effort raise) into `apply_to_fallback_candidate`, replacing the fallback loop's own hand-rolled, partial
+version — this also simplified `interactive.rs`'s call site. New tests `below_floor_matches_resolve_gated_own_
+raise_condition` and `fallback_candidates_are_raised_to_the_effort_floor_and_filtered_by_allowlist`. Full
+`managed_config`/`interactive` test modules and `cargo build --workspace --tests` pass. **Live and reachable:**
+`[models] fallback` is a real, documented, tested user-facing feature, and `FallbackController`/
+`FallbackChainModel` is live production code wired at `interactive.rs`'s startup, not test-only scaffolding.
+
+**Same review pass, `managed_config.rs::load_policy` and `user_config.rs::read_config_file` — the same
+unbounded-read-before-bound-check pattern already fixed twice this session (`exec_tools.rs`, `host.rs`), found
+in the two files that define and load the byte/count ceilings the rest of this gating layer enforces on
+everything else.** `load_policy` read the managed policy document via `fs::read_to_string` with no cap at all;
+`read_config_file` read the user config via `fs::read` and only checked `bytes.len() > MAX_USER_CONFIG_BYTES`
+after the whole file was already buffered. **Fixed:** reused `exec_tools::read_file_bounded` (already widened
+to `pub(crate)` earlier this session) for both, mapping its `TooLarge`/`Io` outcomes onto each function's
+existing, unchanged error variants — `read_config_file`'s new test confirms the observable `TooLarge` contract
+survives the rewiring (verified via the revert cycle that this specific test does *not* discriminate old from
+new code, since both correctly reject an oversized file the same way — its value is guarding the wiring, not
+proving boundedness, which is `read_file_bounded`'s own separately-tested guarantee). New constant `MAX_
+MANAGED_POLICY_BYTES` (256 KiB, matching `MAX_USER_CONFIG_BYTES`). Full `managed_config`/`user_config` test
+modules and `cargo build --workspace --tests` pass. **Lower severity than the effort-floor gap above:** both
+paths are ordinarily admin/user-controlled files, not attacker-reachable input, so this is a defensive-
+consistency fix rather than a live exploit path — flagged by the same background review agent at lower
+confidence for exactly this reason, and fixed anyway since the established bounded-read helper was a direct,
+low-risk drop-in.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

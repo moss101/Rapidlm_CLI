@@ -48,6 +48,10 @@ use crate::user_config::{
 pub const MANAGED_CONFIG_ENV: &str = "RAPIDLM_MANAGED_CONFIG";
 /// Wire identity of the managed policy format.
 pub const MANAGED_SCHEMA: &str = "rapidlm.managed_config.v1";
+/// Read cap for the managed policy document, matching
+/// `user_config::MAX_USER_CONFIG_BYTES` — a small TOML file, well under
+/// this in any real deployment.
+pub const MAX_MANAGED_POLICY_BYTES: usize = 256 * 1024;
 
 /// Which configuration layer decided a field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -596,7 +600,28 @@ pub fn load_policy(env: &[(String, String)]) -> Result<Option<ManagedPolicy>, Ma
     else {
         return Ok(None);
     };
-    let text = std::fs::read_to_string(path)?;
+    // Bound the read itself, not just trust the file's size on disk — the
+    // same stat-then-read gap `read_file_bounded` closes elsewhere in this
+    // binary. This document defines several of the byte/count ceilings
+    // this module enforces on everything else; it should not be the one
+    // unbounded read in the whole gating layer.
+    let bytes = crate::exec_tools::read_file_bounded(
+        std::path::Path::new(path),
+        MAX_MANAGED_POLICY_BYTES,
+    )
+    .map_err(|err| match err {
+        crate::exec_tools::BoundedReadError::Io(io_err) => ManagedConfigError::Io(io_err),
+        crate::exec_tools::BoundedReadError::TooLarge => ManagedConfigError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("managed policy exceeds {MAX_MANAGED_POLICY_BYTES} bytes"),
+        )),
+    })?;
+    let text = String::from_utf8(bytes).map_err(|_| {
+        ManagedConfigError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "managed policy is not valid UTF-8",
+        ))
+    })?;
     ManagedPolicy::parse(&text).map(Some)
 }
 
@@ -668,7 +693,7 @@ pub fn resolve_gated(
 
     // Effort floor: raising is enforcement, reported with provenance.
     if let Some(floor) = policy.min_reasoning_effort {
-        let raised = active.entry.reasoning_effort.is_none_or(|current| current < floor);
+        let raised = below_floor(active.entry.reasoning_effort, floor);
         if raised {
             let mut gated = active;
             gated.entry.reasoning_effort = Some(floor);
@@ -687,6 +712,43 @@ pub fn resolve_gated(
 
 fn active_profile_id(env: &[(String, String)], config: &UserConfig) -> Result<String, GatedConfigError> {
     Ok(resolve_active(env, config)?.profile_id)
+}
+
+/// Whether `current` is unset or below `floor` — the `min_reasoning_effort`
+/// enforcement predicate. Shared by [`resolve_gated`] (the primary model)
+/// and the interactive fallback-chain wiring in `interactive.rs`, so an
+/// admin's effort floor applies uniformly regardless of which path selected
+/// the active model, rather than each site re-deriving its own comparison
+/// and risking the two silently drifting apart.
+pub fn below_floor(current: Option<ReasoningEffort>, floor: ReasoningEffort) -> bool {
+    current.is_none_or(|c| c < floor)
+}
+
+/// Apply the managed policy's provider allowlist and effort floor to one
+/// `[models] fallback` candidate, mirroring exactly what [`resolve_gated`]
+/// applies to the primary model — a fallback entry must never be let
+/// through a restriction, or under an effort floor, the primary itself has
+/// to honor. `Err` carries the candidate's profile id when the allowlist
+/// filters it out (the caller decides how to report that); `Ok` carries the
+/// candidate with its effort raised to the floor if it was below one.
+pub fn apply_to_fallback_candidate(
+    mut candidate: ActiveModel,
+    policy: Option<&ManagedPolicy>,
+) -> Result<ActiveModel, String> {
+    let Some(policy) = policy else {
+        return Ok(candidate);
+    };
+    if let Some(allowed) = policy.allowed_providers()
+        && !allowed.iter().any(|name| name == candidate.entry.provider.as_str())
+    {
+        return Err(candidate.profile_id);
+    }
+    if let Some(floor) = policy.min_reasoning_effort()
+        && below_floor(candidate.entry.reasoning_effort, floor)
+    {
+        candidate.entry.reasoning_effort = Some(floor);
+    }
+    Ok(candidate)
 }
 
 fn finish(
@@ -715,7 +777,7 @@ fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::user_config::parse_config_document;
+    use crate::user_config::{parse_config_document, resolve_fallback_chain};
 
     fn user_doc() -> &'static str {
         r#"
@@ -889,6 +951,78 @@ reasoning_effort = "low"
         let gated = resolve_gated(&[], &config, Some(&policy)).expect("gated");
         assert_eq!(gated.active.entry.reasoning_effort, Some(ReasoningEffort::Ultra));
         assert!(gated.reports.is_empty());
+    }
+
+    #[test]
+    fn below_floor_matches_resolve_gated_own_raise_condition() {
+        // `below_floor` is the shared predicate `resolve_gated` (above) and
+        // `interactive.rs`'s fallback-chain wiring both use, so the admin
+        // `min_reasoning_effort` floor applies identically regardless of
+        // which path selected the active model — this pins its exact
+        // semantics down directly, independent of either call site.
+        assert!(below_floor(None, ReasoningEffort::High));
+        assert!(below_floor(Some(ReasoningEffort::Low), ReasoningEffort::High));
+        assert!(!below_floor(Some(ReasoningEffort::High), ReasoningEffort::High));
+        assert!(!below_floor(Some(ReasoningEffort::Ultra), ReasoningEffort::High));
+    }
+
+    #[test]
+    fn fallback_candidates_are_raised_to_the_effort_floor_and_filtered_by_allowlist() {
+        // The gap this closes: `resolve_gated` raised the *primary* model
+        // to the admin's `min_reasoning_effort` floor, but a `[models]
+        // fallback` alternate reached via `apply_to_fallback_candidate`
+        // (the interactive fallback-chain wiring) previously ran at its
+        // own, un-raised configured effort — silently below the floor the
+        // moment the primary failed over.
+        let doc = r#"
+[models]
+default = "local"
+fallback = ["alt"]
+
+[model.local]
+provider = "openai-compatible"
+model = "llama3.2"
+base_url = "http://127.0.0.1:11434/v1"
+reasoning_effort = "ultra"
+
+[model.alt]
+provider = "anthropic"
+model = "claude"
+base_url = "https://api.anthropic.com"
+reasoning_effort = "low"
+"#;
+        let config = parse_config_document(doc, "user.toml").expect("parse");
+        let primary = resolve_active(&[], &config).expect("primary");
+        let (candidates, warnings) = resolve_fallback_chain(&[], &config, &primary);
+        assert!(warnings.is_empty());
+        let alt = candidates.into_iter().next().expect("alt candidate");
+        assert_eq!(alt.entry.reasoning_effort, Some(ReasoningEffort::Low));
+
+        let policy = parse_policy(&policy_doc("min_reasoning_effort = \"high\"\n"));
+        let raised = apply_to_fallback_candidate(alt.clone(), Some(&policy)).expect("allowed");
+        assert_eq!(
+            raised.entry.reasoning_effort,
+            Some(ReasoningEffort::High),
+            "a fallback candidate's effort must be raised to the admin floor, \
+             the same as the primary model"
+        );
+
+        // The provider allowlist still filters fallback candidates too.
+        let policy = parse_policy(&policy_doc("allowed_providers = [\"openai-compatible\"]\n"));
+        let filtered = apply_to_fallback_candidate(alt, Some(&policy));
+        assert_eq!(filtered, Err("alt".to_owned()));
+
+        // No policy at all: the candidate passes through unchanged.
+        let unchanged = apply_to_fallback_candidate(
+            candidates_from(&config, &primary).into_iter().next().unwrap(),
+            None,
+        )
+        .expect("no policy, always allowed");
+        assert_eq!(unchanged.entry.reasoning_effort, Some(ReasoningEffort::Low));
+    }
+
+    fn candidates_from(config: &UserConfig, primary: &ActiveModel) -> Vec<ActiveModel> {
+        resolve_fallback_chain(&[], config, primary).0
     }
 
     #[test]

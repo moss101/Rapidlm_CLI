@@ -1754,9 +1754,10 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
 
             // Fallback chain: opt-in via `[models] fallback`, resolved
             // against the same raw config the primary came from, then
-            // narrowed by the same managed-provider allowlist (if any) the
+            // narrowed/raised by the same managed policy (if any) the
             // primary was already gated through — a fallback entry is never
-            // let through a restriction the primary itself has to honor.
+            // let through a restriction, or under an effort floor, the
+            // primary itself has to honor.
             if let Some(config) = crate::user_config::load_config(
                 &crate::user_config::resolve_config_source(&process_env),
             )
@@ -1767,20 +1768,17 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                 for warning in warnings {
                     eprintln!("warning: {warning}");
                 }
-                let allowed_providers = crate::managed_config::load_policy(&process_env)
-                    .unwrap_or(None)
-                    .and_then(|policy| policy.allowed_providers().map(<[String]>::to_vec));
+                let policy = crate::managed_config::load_policy(&process_env).unwrap_or(None);
                 for candidate in candidates {
-                    if let Some(allowed) = &allowed_providers
-                        && !allowed.iter().any(|name| name == candidate.entry.provider.as_str())
-                    {
-                        eprintln!(
-                            "warning: models.fallback entry '{}' is not on the managed provider allowlist; skipped",
-                            candidate.profile_id
-                        );
-                        continue;
+                    match crate::managed_config::apply_to_fallback_candidate(
+                        candidate,
+                        policy.as_ref(),
+                    ) {
+                        Ok(candidate) => models.push(candidate),
+                        Err(profile_id) => eprintln!(
+                            "warning: models.fallback entry '{profile_id}' is not on the managed provider allowlist; skipped"
+                        ),
                     }
-                    models.push(candidate);
                 }
             }
             models.insert(0, primary);

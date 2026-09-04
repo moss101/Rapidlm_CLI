@@ -22,7 +22,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use llm_router::{parse_purpose_name, purpose_name, PhaseRoute, ReasoningEffort};
@@ -311,13 +310,20 @@ pub fn load_config(source: &ConfigSource) -> Result<Option<UserConfig>, UserConf
 
 /// Read and parse one config document.
 pub fn read_config_file(path: &Path) -> Result<UserConfig, UserConfigError> {
-    let bytes = fs::read(path).map_err(|_| UserConfigError::Unreadable {
-        path: path.display().to_string(),
-    })?;
     let shown = path.display().to_string();
-    if bytes.len() > MAX_USER_CONFIG_BYTES {
-        return Err(UserConfigError::TooLarge { path: shown });
-    }
+    // Bound the read itself, not just check the size of what was already
+    // fully buffered — the same stat-then-read gap `read_file_bounded`
+    // closes elsewhere in this binary.
+    let bytes = crate::exec_tools::read_file_bounded(path, MAX_USER_CONFIG_BYTES).map_err(|err| {
+        match err {
+            crate::exec_tools::BoundedReadError::TooLarge => {
+                UserConfigError::TooLarge { path: shown.clone() }
+            }
+            crate::exec_tools::BoundedReadError::Io(_) => {
+                UserConfigError::Unreadable { path: shown.clone() }
+            }
+        }
+    })?;
     let body = String::from_utf8(bytes).map_err(|_| UserConfigError::InvalidUtf8 {
         path: shown.clone(),
     })?;
@@ -809,6 +815,7 @@ fn _assert_error_traits() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
@@ -1277,6 +1284,33 @@ env_key = ["MISSING_A", "PRESENT_B"]
             selection,
             Err(UserConfigError::ExplicitConfigMissing { .. })
         ));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_config_file_bounds_the_read_and_still_reports_too_large() {
+        // `read_config_file` used to buffer the whole file via `fs::read`
+        // before checking its length; it now reads through `read_file_
+        // bounded`'s `max_bytes + 1` cap instead. The `TooLarge` outcome
+        // for an oversized document is unchanged either way (this pins
+        // that observable contract down against a regression in the
+        // rewiring); the actual memory-bounding property of the read
+        // itself is `read_file_bounded`'s own, already-tested guarantee
+        // (see `exec_tools.rs`/`host.rs`'s dedicated tests for that).
+        let dir = std::env::temp_dir().join(format!("rapidlm-cfg-bound-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let padding = "a".repeat(MAX_USER_CONFIG_BYTES * 2);
+        let doc = format!("{VALID_DOC}\npadding = \"{padding}\"\n");
+        assert!(
+            toml::from_str::<toml::Value>(&doc).is_ok(),
+            "the fixture itself must be valid TOML when read in full"
+        );
+        let file = dir.join("oversized.toml");
+        fs::write(&file, &doc).expect("write");
+
+        let err = read_config_file(&file).expect_err("oversized document must be rejected");
+        assert!(matches!(err, UserConfigError::TooLarge { .. }), "{err:?}");
+
         fs::remove_dir_all(&dir).ok();
     }
 
