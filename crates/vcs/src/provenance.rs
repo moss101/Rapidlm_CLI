@@ -1276,27 +1276,36 @@ fn unix_secs_to_rfc3339(secs: u64) -> Result<String, ProvenanceError> {
     let hour = rem / 3_600;
     let min = (rem % 3_600) / 60;
     let sec = rem % 60;
-    let (year, month, day) = civil_from_days(days);
-    if !(0..=9999).contains(&year) {
-        return Err(ProvenanceError::InvalidTimestamp);
-    }
+    let (year, month, day) = civil_from_days(days)?;
     Ok(format!(
         "{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z"
     ))
 }
 
-fn civil_from_days(z: i64) -> (i32, u32, u32) {
+fn civil_from_days(z: i64) -> Result<(i32, u32, u32), ProvenanceError> {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = u64::try_from(z - era * 146_097).unwrap_or(0);
+    let doe =
+        u64::try_from(z - era * 146_097).map_err(|_| ProvenanceError::InvalidTimestamp)?;
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = i64::try_from(yoe).unwrap_or(0) + era * 400;
+    let y = i64::try_from(yoe).map_err(|_| ProvenanceError::InvalidTimestamp)? + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m as u32, d as u32)
+    // Checked, not `as`: an `as i32` truncation here would let the range
+    // check below validate the wrapped value instead of the true year, the
+    // exact defect `capability-broker::audit`'s sibling routine already
+    // avoids the same way (`i32::try_from` before the range check, not
+    // after a silent cast).
+    let year = i32::try_from(y).map_err(|_| ProvenanceError::InvalidTimestamp)?;
+    if !(0..=9999).contains(&year) {
+        return Err(ProvenanceError::InvalidTimestamp);
+    }
+    let month = u32::try_from(m).map_err(|_| ProvenanceError::InvalidTimestamp)?;
+    let day = u32::try_from(d).map_err(|_| ProvenanceError::InvalidTimestamp)?;
+    Ok((year, month, day))
 }
 
 #[cfg(test)]
@@ -1570,6 +1579,19 @@ mod tests {
         assert_eq!(stamp.as_str(), "1970-01-01T00:00:00Z");
         let leap = RecordedAt::from_unix_secs(1_582_934_400).expect("leap day");
         assert_eq!(leap.as_str(), "2020-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn recorded_at_rejects_a_year_that_would_wrap_back_into_range_as_i32() {
+        // The true decoded year for this instant is 4_294_969_320
+        // (~2^32 + 2024), which silently truncates to 2024 via `as i32` —
+        // an unchecked cast would let the (0..=9999) sanity check validate
+        // the wrapped value instead of the real one, rendering the
+        // unremarkable-looking "2024-06-15T12:00:00Z" for an instant that
+        // is billions of years in the future.
+        let err = RecordedAt::from_unix_secs(135_536_078_519_870_400)
+            .expect_err("a year that wraps to a plausible value must still be rejected");
+        assert_eq!(err, ProvenanceError::InvalidTimestamp);
     }
 
     #[test]

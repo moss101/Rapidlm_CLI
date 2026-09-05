@@ -4205,6 +4205,39 @@ intended five sites) — before restoring the fix. Full `-p rapid --lib` suite a
 independently verified by reading every claimed call site directly (not accepted from the report) before
 fixing, confirming all three were genuine and none were already covered elsewhere.
 
+**Fresh review pass, 2026-09-05, `crates/vcs/src/provenance.rs::civil_from_days` — a sanity check validated
+the wrong value, the same "check runs after a silent truncating cast" shape as the `p9_commands.rs::
+estimate_compacted_tokens`/`compact_policy` fix earlier in this document, found via a third targeted
+background hunt (this one for silent integer truncation via `as` casts, as opposed to the panic- and
+gate-gap-focused hunts above).** `unix_secs_to_rfc3339`'s civil-date algorithm computed the true decoded
+year correctly as an `i64` (`y`), then cast it to `i32` with a bare `y as i32` *before* the function's own
+`(0..=9999).contains(&year)` sanity check ran — so the check validated the post-wrap value, not the real
+one. **Concrete reproduction:** `RecordedAt::from_unix_secs(135_536_078_519_870_400)` (an ordinary `u64`,
+nowhere near `u64::MAX`, so the earlier `i64::try_from(secs / 86_400)` guard never trips) decodes to a true
+year of 4,294,969,320 (~2³²+2024) — but `as i32` truncates that to 2024, which passes the range check and
+renders the entirely unremarkable `"2024-06-15T12:00:00Z"`, silently defeating a check meant to reject
+nonsensical/forged timestamps. `crates/capability-broker/src/audit.rs::unix_secs_to_civil` has a near-
+identical civil-date routine for audit-log formatting and already gets this right (`i32::try_from(y).map_err
+(...)?`, checked, before its own range check) — strong evidence this was a genuine oversight in
+`provenance.rs`, not an intentional design choice, and a ready-made template for the fix.
+
+**Reachability, checked explicitly before fixing (not assumed):** `RecordedAt::from_unix_secs`/`from_
+system_time` have zero callers anywhere in the workspace outside this file's own unit tests (confirmed via
+grep — no other crate or `apps/rapid` file references them), consistent with this document's earlier finding
+that the whole `crates/vcs::provenance` crate is unwired. Latent today, not an active vulnerability — but a
+real, exported `pub fn` bug that would become live the moment any caller starts timestamping provenance from
+attacker-forgeable content (e.g. a future feature reading a git commit's author/committer time). **Fixed
+anyway**, matching this session's established precedent for latent-but-cheap, real bugs (the `mobile-sim::
+find_udid` panic, `event-ledger`'s dangling-pin TOCTOU): mirrored `capability-broker::audit`'s exact pattern
+— `civil_from_days` now returns `Result<(i32, u32, u32), ProvenanceError>`, using checked `i32::try_from`/
+`u32::try_from` throughout instead of `as`, with the year range check moved inside the function immediately
+after the checked conversion rather than left to the caller. New test `recorded_at_rejects_a_year_that_
+would_wrap_back_into_range_as_i32` using the exact reproduction magnitude above. Verified via the revert
+cycle: reverting just the year cast back to `y as i32` reproduced the predicted bug exactly — the call
+returned `Ok(RecordedAt { rfc3339: "2024-06-15T12:00:00Z" })` instead of the expected `Err` — before
+restoring the fix. Full `-p vcs --lib` suite (18 tests, up from 17) and `cargo build --workspace --tests`
+pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
