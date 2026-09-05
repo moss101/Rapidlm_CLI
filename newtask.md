@@ -4804,6 +4804,37 @@ expected hash before reversal, `ReversibilityClass` for irreversible/compensatab
   pass with no regressions. **Still not done, same as noted above:** the actual multi-file
   `WorkspaceTransaction` migration (this fix only makes each individual file write atomic, not a multi-file
   operation as one unit) and `UndoAction`/`UndoPlan`/`ReversibilityClass` wiring.
+- **Correction 2026-09-05 (self-review of the `atomic_write` commit above): the new helper's temp-file
+  name collided under concurrent same-target callers, and one of its four call sites relies on that not
+  happening.** `atomic_write`'s temp path was `.{filename}.{pid}.tmp` — unique per process, not per call.
+  Three of the four call sites (`execute_write`, `execute_patch`, `execute_todo_write` in `exec_tools.rs`)
+  are safe regardless, because they already hold `self.write_locks.lock_for(&target)` for the whole
+  read-modify-write. The fourth, `findings_store.rs::save` (reused by the same commit), calls
+  `atomic_write` with **no lock at all**. Two concurrent calls to the same target within one process
+  (same PID → identical temp path) race `OpenOptions::create_new`: the loser's failure-cleanup
+  (`fs::remove_file(&tmp)`) unlinks the *winner's* still-in-flight temp file out from under it, so both
+  calls can fail — reproduced empirically by a background self-review agent (8 threads, same target,
+  8/8 failures) and independently reconfirmed here via the revert-cycle below. Latent, not live, today
+  (`FindingsStore::save`'s only caller, `p9_commands.rs::run_findings`'s `dismiss` subcommand, runs once
+  per single-threaded CLI process) — but the helper's doc comment discussed crash-safety at length while
+  never stating the "caller must already serialize per-path" precondition 3 of its 4 users silently
+  depend on. One of the three pre-existing sibling implementations, `crates/workspace/src/backends/
+  direct.rs::write_confined`, already solves exactly this with a `TMP_SEQ` per-process atomic counter
+  appended to the temp name alongside the PID. **Fixed the same way:** added `exec_tools.rs::
+  ATOMIC_WRITE_SEQ` (`static AtomicU64`), appended via `fetch_add(1, Ordering::Relaxed)` to the temp
+  filename (`.{filename}.{pid}.{seq}.tmp`) — makes every call's temp path unique regardless of whether
+  the caller holds any lock, closing the gap structurally rather than by documenting a precondition
+  callers have to remember. New tests: `atomic_write_never_races_itself_across_concurrent_calls_to_the_
+  same_target` (8 threads hammer `atomic_write` on one shared target with no external lock, asserting all
+  8 succeed and the final content is exactly one writer's full bytes) and, closing a minor coverage gap
+  the same self-review flagged, `atomic_write_cleans_up_its_temp_file_when_only_the_final_rename_fails`
+  (the existing failure test only ever fails at `create_new`, so `remove_file` never runs against a real
+  leftover file; this one makes the target an existing directory so `create_new`/`write_all`/`sync_all`
+  all succeed and only the final `rename` fails, confirming the temp file left behind actually gets
+  cleaned up). Revert-cycle verified: reverted the `ATOMIC_WRITE_SEQ` fix back to the bare `.{filename}.
+  {pid}.tmp` name, re-ran the new race test — failed 7/8 with exactly the predicted `AlreadyExists`/
+  `NotFound` errors — then restored from backup. Full `-p rapid --lib` suite (416 tests, up from 414) and
+  `cargo build --workspace --tests` pass with no regressions.
 
 ### 2.2 `AgentExecutionCapsule` + `AgentResultEnvelope` + write-scoped narrow leases
 

@@ -3058,6 +3058,16 @@ fn bounded_text(bytes: &[u8], cap: usize) -> String {
 /// this adds crash-safety only, not path validation, unlike those three
 /// siblings which also re-validate confinement themselves for their own,
 /// less-trusted callers.
+/// Per-process counter appended to `atomic_write`'s temp-file name so two
+/// concurrent calls (from different threads, or from a caller that doesn't
+/// hold `write_locks` around the target path — e.g. `findings_store.rs`)
+/// never share a temp path, even though they share a PID. Without this, two
+/// racing calls for the same target could open the same `.tmp` path with
+/// `create_new`, and the loser's cleanup would `remove_file` the winner's
+/// still-in-flight temp file out from under it. Mirrors
+/// `workspace::backends::direct::write_confined`'s `TMP_SEQ`.
+static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = target.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no parent")
@@ -3066,9 +3076,10 @@ pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no file name")
     })?;
     let tmp = parent.join(format!(
-        ".{}.{}.tmp",
+        ".{}.{}.{}.tmp",
         file_name.to_string_lossy(),
-        std::process::id()
+        std::process::id(),
+        ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let result = (|| -> std::io::Result<()> {
         let mut file = fs::OpenOptions::new()
@@ -8239,6 +8250,63 @@ use std::sync::{Arc, Mutex};
             fs::read(&target).expect("read"),
             b"original content, must survive",
             "a failed write must never have touched the pre-existing target"
+        );
+    }
+
+    #[test]
+    fn atomic_write_never_races_itself_across_concurrent_calls_to_the_same_target() {
+        // Before the ATOMIC_WRITE_SEQ fix, the temp filename varied only by
+        // PID, so N threads racing atomic_write on the same target shared
+        // one temp path: the loser's failure-cleanup would remove_file the
+        // winner's still-in-flight temp file, and both calls could fail.
+        // findings_store.rs::save calls atomic_write without holding any
+        // write_locks guard (unlike the exec_tools.rs call sites), so this
+        // property has to hold unconditionally, not just under a lock.
+        let root = TempRoot::new("atomic-write-concurrent");
+        let target = root.0.join("shared.txt");
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let target = target.clone();
+                std::thread::spawn(move || atomic_write(&target, format!("writer-{i}").as_bytes()))
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().expect("thread")).collect();
+        let failures: Vec<_> = results.iter().filter(|r| r.is_err()).collect();
+        assert!(
+            failures.is_empty(),
+            "every concurrent call to the same target should succeed: {failures:?}"
+        );
+        let content = fs::read_to_string(&target).expect("read");
+        assert!(
+            content.starts_with("writer-"),
+            "final content must be exactly one writer's full bytes, never mixed: {content:?}"
+        );
+    }
+
+    #[test]
+    fn atomic_write_cleans_up_its_temp_file_when_only_the_final_rename_fails() {
+        // The read-only-directory test above fails before create_new ever
+        // succeeds, so it never exercises fs::remove_file against a real
+        // leftover temp file. Force create_new/write_all/sync_all to all
+        // succeed and only the final rename to fail, by making the target
+        // an existing directory: renaming a regular file over a directory
+        // is refused, but everything up to that point already landed on
+        // disk as a real temp file that the cleanup branch must remove.
+        let root = TempRoot::new("atomic-write-rename-fails");
+        let target = root.0.join("actually_a_dir");
+        fs::create_dir_all(&target).expect("mkdir");
+
+        let result = atomic_write(&target, b"this must never land");
+        assert!(result.is_err(), "renaming a file over an existing directory must fail");
+
+        let leftovers: Vec<_> = fs::read_dir(&root.0)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a real leftover temp file must still be cleaned up when only rename fails: {leftovers:?}"
         );
     }
 
