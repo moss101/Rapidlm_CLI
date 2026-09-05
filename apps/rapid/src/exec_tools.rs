@@ -2230,9 +2230,6 @@ impl WorkspaceTools {
         // silently change task truth" invariant: a broken dependency graph
         // is exactly the kind of untrue state this feature exists to
         // prevent, not something to persist and hope is corrected later.
-        // Deliberately not attempted: full cycle detection (A depends on B
-        // depends on A) — a real, separate, harder graph-analysis problem;
-        // this only catches the two cheap, common cases (dangling, self).
         let known_ids: std::collections::BTreeSet<&str> =
             todos.iter().filter_map(|todo| todo.id.as_deref()).collect();
         for todo in &todos {
@@ -2257,6 +2254,20 @@ impl WorkspaceTools {
                     });
                 }
             }
+        }
+        // Full cycle check (A depends on B depends on A), now that every
+        // edge is confirmed to name a real, non-self task — see
+        // `find_dependency_cycle`'s own doc comment for why this is cheap
+        // enough to run unconditionally rather than staying unattempted.
+        if let Some(cycle) = find_dependency_cycle(&todos) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "dependency cycle detected: {}",
+                    cycle.join(" -> ")
+                ))),
+            });
         }
         let document = serde_json::json!({
             "schema": 1,
@@ -4132,6 +4143,73 @@ fn parse_todo_ref_list(
         .collect()
 }
 
+/// Three-color DFS cycle check over `todos`'s `depends_on` graph, run only
+/// after `execute_todo_write`'s own self/dangling-reference check has
+/// already confirmed every `depends_on` entry names a real task in this
+/// same list — so this never has to handle a missing node, only cycles
+/// among otherwise-well-formed edges. `MAX_TODOS` (50) bounds the graph to
+/// at most 50 nodes, so a plain DFS (no cutoff needed, unlike the unbounded-
+/// input glob-matcher fix elsewhere in this codebase) is O(V+E) and
+/// effectively free — this was previously left unattempted as "a real,
+/// separate, harder graph-analysis problem", which undersold it once the
+/// bound was accounted for. Returns the cycle's ids, in dependency order,
+/// starting from wherever it was first re-entered — not necessarily the
+/// caller's own starting node, which is fine: any accurate description of
+/// *a* real cycle is enough for the model to fix it, and reporting from an
+/// arbitrary starting point avoids favoring one node's phrasing over
+/// another's for what is, after all, a cycle (no single "start").
+fn find_dependency_cycle(todos: &[TodoEntry]) -> Option<Vec<String>> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mark {
+        InProgress,
+        Done,
+    }
+    fn visit<'a>(
+        id: &'a str,
+        by_id: &std::collections::BTreeMap<&'a str, &'a TodoEntry>,
+        marks: &mut std::collections::BTreeMap<&'a str, Mark>,
+        path: &mut Vec<&'a str>,
+    ) -> Option<Vec<String>> {
+        match marks.get(id) {
+            Some(Mark::Done) => return None,
+            Some(Mark::InProgress) => {
+                let start = path.iter().position(|node| *node == id).unwrap_or(0);
+                let mut cycle: Vec<String> = path[start..].iter().map(|node| node.to_string()).collect();
+                cycle.push(id.to_owned());
+                return Some(cycle);
+            }
+            None => {}
+        }
+        marks.insert(id, Mark::InProgress);
+        path.push(id);
+        if let Some(todo) = by_id.get(id) {
+            for dep in &todo.depends_on {
+                if let Some(cycle) = visit(dep.as_str(), by_id, marks, path) {
+                    return Some(cycle);
+                }
+            }
+        }
+        path.pop();
+        marks.insert(id, Mark::Done);
+        None
+    }
+
+    let by_id: std::collections::BTreeMap<&str, &TodoEntry> = todos
+        .iter()
+        .filter_map(|todo| todo.id.as_deref().map(|id| (id, todo)))
+        .collect();
+    let mut marks = std::collections::BTreeMap::new();
+    for id in by_id.keys() {
+        if !marks.contains_key(id) {
+            let mut path = Vec::new();
+            if let Some(cycle) = visit(id, &by_id, &mut marks, &mut path) {
+                return Some(cycle);
+            }
+        }
+    }
+    None
+}
+
 /// Parse bounded `{"question", "options"}` ask-user arguments.
 fn parse_ask_user_args(raw: &str) -> Result<(String, Vec<String>), ToolStepError> {
     const ALLOWED: &[&str] = &["question", "options"];
@@ -5143,7 +5221,7 @@ impl WorkspaceTools {
             ),
             ToolSurface::new(
                 TODO_WRITE_TOOL,
-                "Maintain your task list for this workspace: pass the full set of tasks with                  status pending | in_progress | completed | cancelled; entries with an id                  update that task, entries without one are added. Optional depends_on                  (other task ids), owner, and evidence_ids persist as durable state and                  survive compaction; omitting one on an update leaves it unchanged, an                  empty array/null clears it. A dependency on an unknown or self task id is                  refused; depending on a task that is not yet completed is allowed and                  marks this one as blocked in your task list until it is. Arguments JSON:                  {\"todos\":[{\"id\":\"1\",\"content\":\"...\",\"status\":\"in_progress\",                  \"depends_on\":[\"2\"]}]}.",
+                "Maintain your task list for this workspace: pass the full set of tasks with                  status pending | in_progress | completed | cancelled; entries with an id                  update that task, entries without one are added. Optional depends_on                  (other task ids), owner, and evidence_ids persist as durable state and                  survive compaction; omitting one on an update leaves it unchanged, an                  empty array/null clears it. A dependency on an unknown or self task id,                  or one that would create a dependency cycle, is refused; depending on a                  task that is not yet completed is allowed and marks this one as blocked                  in your task list until it is. Arguments JSON:                  {\"todos\":[{\"id\":\"1\",\"content\":\"...\",\"status\":\"in_progress\",                  \"depends_on\":[\"2\"]}]}.",
                 arguments_schema(
                     "Update the task list",
                     serde_json::json!({
@@ -8862,6 +8940,79 @@ use std::sync::{Arc, Mutex};
     }
 
     #[test]
+    fn todo_write_refuses_a_two_node_dependency_cycle_without_persisting_anything() {
+        let root = TempRoot::new("todo-two-node-cycle");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        let cycle = make_call(
+            "c1",
+            TODO_WRITE_TOOL,
+            r#"{"todos":[{"id":"1","content":"a","status":"pending","depends_on":["2"]},{"id":"2","content":"b","status":"pending","depends_on":["1"]}]}"#,
+        );
+        let validated = tools.validate(&cycle, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("handled") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.unwrap().contains("dependency cycle"));
+            }
+            other => panic!("expected a dependency-cycle refusal, got {other:?}"),
+        }
+        assert!(
+            !root.0.join(TODOS_PATH).exists(),
+            "a refused write must never touch disk"
+        );
+    }
+
+    #[test]
+    fn todo_write_refuses_a_dependency_cycle_spanning_an_already_persisted_task() {
+        // Proves the check walks the graph across the merged (existing +
+        // new) state, not just edges introduced by this one call: task "1"
+        // is already persisted depending on "2"; this write only adds "2"
+        // depending on "3" and "3" depending back on "1" — a real 3-node
+        // cycle that only exists once the new entries are merged in.
+        let root = TempRoot::new("todo-three-node-cycle");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        let seed = make_call(
+            "c1",
+            TODO_WRITE_TOOL,
+            r#"{"todos":[{"id":"1","content":"a","status":"pending","depends_on":["2"]},{"id":"2","content":"b","status":"pending"}]}"#,
+        );
+        let validated = tools.validate(&seed, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("handled") {
+            ToolStepResult::Succeeded { .. } => {}
+            other => panic!("expected the seed write to succeed, got {other:?}"),
+        }
+
+        let close_the_cycle = make_call(
+            "c2",
+            TODO_WRITE_TOOL,
+            r#"{"todos":[{"id":"2","content":"b","status":"pending","depends_on":["3"]},{"id":"3","content":"c","status":"pending","depends_on":["1"]}]}"#,
+        );
+        let validated = tools.validate(&close_the_cycle, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("handled") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.unwrap().contains("dependency cycle"));
+            }
+            other => panic!("expected a dependency-cycle refusal, got {other:?}"),
+        }
+        // The seed write must still be exactly as it was — the refused
+        // second call must never have touched disk at all.
+        let stored = fs::read_to_string(root.0.join(TODOS_PATH)).expect("read");
+        let document: serde_json::Value = serde_json::from_str(&stored).expect("valid json");
+        let ids: Vec<&str> = document["todos"]
+            .as_array()
+            .expect("todos array")
+            .iter()
+            .map(|todo| todo["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, vec!["1", "2"], "task 3 must never have been persisted");
+    }
+
+    #[test]
     fn todo_write_rejects_unknown_keys_and_oversized_metadata() {
         let root = TempRoot::new("todo-bad-shapes");
         let mut tools = permissive_workspace(&root.0);
@@ -8914,6 +9065,27 @@ use std::sync::{Arc, Mutex};
         assert!(
             !todo_write.description().contains("completed-only"),
             "description falsely claims a completed dependency is refused: {}",
+            todo_write.description()
+        );
+    }
+
+    #[test]
+    fn todo_write_description_mentions_cycle_refusal() {
+        // Now that a real cycle is refused (not just dangling/self), the
+        // model-facing description must say so — otherwise a model hitting
+        // this refusal for the first time has no documented reason to
+        // expect it, the same "no other signal to correct a wrong mental
+        // model" concern the sibling regression guard above exists for.
+        let root = TempRoot::new("todo-description-cycle");
+        let tools = permissive_workspace(&root.0);
+        let surface = tools.tool_surface();
+        let todo_write = surface
+            .iter()
+            .find(|tool| tool.name() == TODO_WRITE_TOOL)
+            .expect("todo_write is advertised");
+        assert!(
+            todo_write.description().contains("cycle"),
+            "description must mention that a dependency cycle is refused: {}",
             todo_write.description()
         );
     }

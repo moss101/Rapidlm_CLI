@@ -5385,6 +5385,31 @@ blocker, rather than looping autonomously).
   index`'s render loop has no entry-count cap of its own (only the write path enforces `MAX_TODOS`), which
   is quadratic in the worst case for a hand-edited oversized file but not a real DoS at any size that fits
   the existing 256 KB read bound.
+- **Full cycle detection implemented 2026-09-05 — the one item this section had left as "a real, separate,
+  harder graph-analysis problem" turned out not to be, once `MAX_TODOS` (50) was accounted for.** Confirmed
+  directly before implementing: the self/dangling check just above already guarantees, by the time cycle
+  detection would run, that every `depends_on` entry names a real, non-self task in the merged list — so
+  cycle detection never has to handle a missing node, only cycles among otherwise-well-formed edges, and the
+  graph is bounded to at most 50 nodes by the existing `MAX_TODOS` cap. A plain three-color DFS over that is
+  O(V+E), not the open-ended graph-analysis problem the original framing implied. **Implemented:** new free
+  function `find_dependency_cycle(todos: &[TodoEntry]) -> Option<Vec<String>>` in `exec_tools.rs` (mark-based
+  DFS: unvisited → in-progress → done per node; a re-entered in-progress node closes a cycle, reported as the
+  ids in dependency order), called from `execute_todo_write` right after the existing self/dangling check and
+  before persisting — refuses with `ToolStepResult::Failed` (handled, model-visible, no partial write) the
+  same way the other two checks already do. The tool's own schema description updated to mention cycle
+  refusal alongside the existing unknown/self wording, so a model hitting this for the first time has a
+  documented reason to expect it rather than an unexplained new failure mode. New tests:
+  `todo_write_refuses_a_two_node_dependency_cycle_without_persisting_anything` (the direct case);
+  `todo_write_refuses_a_dependency_cycle_spanning_an_already_persisted_task` (a 3-node cycle that only exists
+  once a new write is merged against an already-persisted task, confirming the check walks the *merged*
+  graph, not just this call's own new entries, and that the refused write leaves the prior persisted state
+  completely untouched); `todo_write_description_mentions_cycle_refusal` (regression guard on the schema text
+  itself, mirroring this section's own established pattern of asserting on tool-description strings directly
+  rather than only on behavior). Verified via the revert cycle: made the cycle check a no-op, reran both
+  cycle tests — both failed exactly as predicted (`Succeeded` where `Failed` was expected, the cycle
+  silently persisted) — then restored. Full `-p rapid --lib` suite (428 tests, up from 425) and `cargo build
+  --workspace --tests` pass. **`AGT-016`'s dependency-graph validation is now complete** for `todo_write`'s
+  own shape: dangling, self, and cycle references are all refused before anything is written.
 
 ### 2.6 `SessionLease` + fencing generation
 
