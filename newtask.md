@@ -5410,6 +5410,22 @@ blocker, rather than looping autonomously).
   silently persisted) — then restored. Full `-p rapid --lib` suite (428 tests, up from 425) and `cargo build
   --workspace --tests` pass. **`AGT-016`'s dependency-graph validation is now complete** for `todo_write`'s
   own shape: dangling, self, and cycle references are all refused before anything is written.
+- **Self-review of the commit above, same day: no bugs, but one real test-coverage gap, closed.** Hand-traced
+  the shipped `find_dependency_cycle` against four scenarios — a 3-node cycle's exact reported path, a cycle
+  reached via a non-cyclic prefix edge (confirming the prefix node is correctly excluded from the reported
+  cycle), a diamond/fan-in shape (one node reachable via two independent non-cyclic paths), and the
+  precondition that nothing between the self/dangling check and the cycle-check call site could invalidate
+  it — all confirmed correct by reading the actual code, not by re-deriving how DFS cycle detection normally
+  works. The one real gap: no test exercised the diamond/fan-in shape, the exact case a naive single-state
+  "visited" set (as opposed to the shipped two-state unvisited/in-progress/done `Mark` scheme) would
+  misdetect as a cycle — so a future refactor collapsing the two states, or checking `InProgress` before
+  `Done`, could ship a real regression with nothing to catch it. **Fixed:** new test `todo_write_accepts_a_
+  diamond_shaped_dependency_graph_as_not_a_cycle` (task 1 depends on 2 and 3; both 2 and 3 depend on 4 —
+  confirms the write succeeds, not refused). Verified this test actually has teeth, not just that it passes
+  against already-correct code: temporarily merged the `Mark::Done`/`Mark::InProgress` match arms (the exact
+  single-state regression shape described above), reran the new test — failed exactly as predicted
+  (`Failed { ... "dependency cycle detected: 1 -> 3 -> 4" }` on a graph with no real cycle), then restored.
+  Full `-p rapid --lib` suite (429 tests, up from 428) and `cargo build --workspace --tests` pass.
 
 ### 2.6 `SessionLease` + fencing generation
 

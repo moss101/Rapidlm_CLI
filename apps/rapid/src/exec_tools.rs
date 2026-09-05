@@ -9013,6 +9013,32 @@ use std::sync::{Arc, Mutex};
     }
 
     #[test]
+    fn todo_write_accepts_a_diamond_shaped_dependency_graph_as_not_a_cycle() {
+        // A legitimate, acyclic shape that a naive "mark visited and never
+        // revisit" cycle check could false-positive on: task 4 is reachable
+        // from task 1 via two independent paths (1->2->4 and 1->3->4), not
+        // because of any cycle. `find_dependency_cycle`'s DFS marks a node
+        // `Done` once its own subtree is fully explored, so reaching it a
+        // second time via a different path must short-circuit cleanly
+        // rather than being mistaken for re-entering an in-progress node.
+        let root = TempRoot::new("todo-diamond-not-a-cycle");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        let diamond = make_call(
+            "c1",
+            TODO_WRITE_TOOL,
+            r#"{"todos":[{"id":"1","content":"top","status":"pending","depends_on":["2","3"]},{"id":"2","content":"left","status":"pending","depends_on":["4"]},{"id":"3","content":"right","status":"pending","depends_on":["4"]},{"id":"4","content":"shared","status":"pending"}]}"#,
+        );
+        let validated = tools.validate(&diamond, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("handled") {
+            ToolStepResult::Succeeded { .. } => {}
+            other => panic!("a diamond-shaped (non-cyclic) dependency graph must not be refused, got {other:?}"),
+        }
+        assert!(root.0.join(TODOS_PATH).exists(), "the write must have actually persisted");
+    }
+
+    #[test]
     fn todo_write_rejects_unknown_keys_and_oversized_metadata() {
         let root = TempRoot::new("todo-bad-shapes");
         let mut tools = permissive_workspace(&root.0);
