@@ -4472,6 +4472,32 @@ issuance but exists by spawn time" concern doesn't apply at either real call sit
 time verification happen back-to-back synchronously in the same call stack with no window for the file to
 appear in between.
 
+**Second signal worth recording explicitly, 2026-09-05, this time about *roadmap scoping* rather than blind
+bug hunts: two consecutive, independently-run scoping passes over §1.x/§2.x/§3.x came back with nothing that
+passes the "pure wiring, no open design question" bar.** After landing and self-reviewing six real Phase 2/3
+items in one sitting (§2.1's atomic writes, §2.9's external-scanner commit/merge gate, §2.8's `policy_version`,
+§0a's own interactive memory/todos wiring, §2.5's `todo_write` cycle detection, §3.2's cron auto-quarantine —
+all closed, all with a self-review pass and any findings fixed), the next two candidates a scoping agent
+proposed each looked like pure wiring on the roadmap but broke apart on reading the actual implementation
+site's own doc comments: §1.1's macOS Seatbelt/`JobRegistry` resource-governance gap turned out to be exactly
+the "unifying the two [sandbox execution] paths is separate follow-up work, not attempted here" item both
+`exec_tools.rs` and `sandbox_exec.rs` already explicitly flag; §2.6's CTX-003 ("surface inadequate retrieved
+context as a distinct condition") has no existing threshold to build from and needs an actual product
+definition of "inadequate." A third, more skeptical pass — explicitly instructed to check for "not attempted
+here"/"needs a decision"/"out of scope" language at each candidate's own implementation site before proposing
+it, not just trust the roadmap paragraph — searched §1.x/§2.2–2.10/§3.x again and found **nothing that
+passed**: background memory consolidation (§1.4 row 11) has no write-trigger design and no model-facing tool
+that would ever populate a memory to consolidate in the first place; sandboxed-`shell_exec` disk/network
+quotas (§2.10) have no existing per-process monitoring mechanism to build on, unlike the CPU/RSS work this
+session already reused from `host_restricted.rs`; a multi-file `.qwen/team-memory/`-style tier (§1.4 row 12)
+has no existing multi-file merge/precedence convention to extend. Recording this the same way the third-
+clean-bug-hunt-sweep note above does: **the supply of small, pure-wiring roadmap items is now genuinely
+exhausted** for whoever picks this up next, at least across the sections searched twice. What remains
+clusters around a handful of real, unresolved architecture questions (no live TUI turn-execution loop at all;
+`GoalUsage` cost accrual has no safe integration point in `agent-runtime::goal`'s event-sourcing model without
+risking double-counting; several items need new config/protocol surfaces with no existing precedent to copy)
+that call for explicit user direction, not another automated scoping pass over the same ground.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
