@@ -6045,8 +6045,35 @@ their results become evidence, not just a console warning).
   `cargo build --workspace --tests` pass with no regressions. **`VER-009`/`ExternalFinding` is now fully
   closed** — every deferred item this section ever flagged (the gate itself, durable evidence, the
   external-scanner half, and now this integration) has landed; only the separately-documented, deliberately
-  accepted shell-string-wrapping and git-global-flag-position scope limits above remain, both structural
-  and already precisely written up rather than oversights.
+  accepted shell-string-wrapping, git-global-flag-position, and (see the self-review correction directly
+  below) external-scanner whole-repo-scope limits remain, all structural and already precisely written up
+  rather than oversights.
+- **Self-review of the integration above, same day, found two real bugs and one real, previously-
+  undocumented scope limit — fixed and documented rather than left implicit.** (1) `scan_external_findings`'s
+  two finding-message strings hardcoded "before committing" even when called from `scan_git_merge_gate`, so
+  a merge blocked by a configured scanner read "verify before committing" / "fix ... before committing" —
+  cosmetically wrong but real; fixed by threading the existing `boundary: &str` (`"commit"`/`"merge"`,
+  already used by `record_gate_decision`) into `scan_external_findings` and using it in both messages. New
+  assertions on the existing `git_merge_is_blocked_by_a_configured_external_scanner_finding` test
+  (`detail.contains("before this merge")` / `!detail.contains("before this commit")`) pin this; revert-cycle
+  verified by reverting the interpolation back to the hardcoded string and confirming that exact assertion
+  fails. (2) No test exercised `scan_external_findings`'s `Unavailable`/`Error`-without-findings branch
+  through the actual gate (only via `run_configured_scanners` directly, in `external_scan.rs`'s own tests) —
+  closed with new test `git_commit_is_blocked_by_a_configured_but_uninstalled_scanner` (a scanner argv
+  pointing at a nonexistent binary, confirming the commit is still blocked, not silently let through just
+  because there was no finding to report). (3) **A real, previously-undocumented scope limit:**
+  `run_configured_scanners` scans the *whole workspace root* (matching `rapid scan`'s own behavior exactly),
+  not just the commit's staged files or the merge's incoming changes the way the sibling in-process
+  secrets/patch scan is scoped — so a stale, undismissed finding anywhere in the repo, including in a file
+  this commit/merge never touches, now blocks every future commit/merge until dismissed or fixed. This is a
+  real, meaningful behavior difference from the file-scoped content scan, not a bug with one obvious fix:
+  correctly scoping it down would mean correlating SARIF `artifactLocation` URIs against a computed
+  changed-file set, which is real, separate, non-trivial work (a configured scanner's argv is user-
+  controlled and not guaranteed to accept or honor a file list at all) — deliberately not attempted as a
+  rider on this self-review, and instead written up explicitly in `scan_external_findings`'s own doc comment
+  so it reads as a documented boundary, not a silent surprise, the same treatment §2.9's other two accepted
+  scope limits already get. Full `-p rapid --lib` suite (421 tests, up from 420) and `cargo build --workspace
+  --tests` pass with no regressions.
 - ~~Cross-reference, 2026-09-04: a new gap in the already-built `PatchPolicyGate` itself... `scan_for_
   secrets_advisory`/`scan_patch_advisory`... collapse every scan error via `.ok()?`... Not fixed this
   pass~~ **Fixed, 2026-09-04, same day as this note (during the `crates/security` review pass — see §0a's

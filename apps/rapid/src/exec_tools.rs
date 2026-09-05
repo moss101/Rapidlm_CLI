@@ -3478,7 +3478,7 @@ fn scan_git_commit_gate(root: &Path, argv: &[String]) -> Option<String> {
         })
         .collect::<Vec<_>>();
     let mut findings = collect_content_findings(root, files.into_iter());
-    findings.extend(scan_external_findings(root));
+    findings.extend(scan_external_findings(root, "commit"));
     record_gate_decision(root, "commit", !findings.is_empty(), &findings);
     if findings.is_empty() {
         return None;
@@ -3534,7 +3534,7 @@ fn scan_git_merge_gate(root: &Path, argv: &[String]) -> Option<String> {
             .collect::<Vec<_>>();
         findings.extend(collect_content_findings(root, files.into_iter()));
     }
-    findings.extend(scan_external_findings(root));
+    findings.extend(scan_external_findings(root, "merge"));
     record_gate_decision(root, "merge", !findings.is_empty(), &findings);
     if findings.is_empty() {
         return None;
@@ -3569,12 +3569,29 @@ fn scan_git_merge_gate(root: &Path, argv: &[String]) -> Option<String> {
 /// real (`agent_runtime`) one — a different type serving a different
 /// purpose, and the same thing `sandbox_exec.rs::run_sandboxed`/
 /// `mint_proc_exec_lease` already do for this exact lease-minting ceremony.
-fn scan_external_findings(root: &Path) -> Vec<String> {
+///
+/// A real, deliberate scope difference from the content scan above, not an
+/// oversight: `run_configured_scanners` scans the *whole workspace root*
+/// (matching exactly what `rapid scan` itself already does), not just this
+/// commit's staged files or this merge's incoming changes. A stale,
+/// undismissed finding anywhere in the repo — including in a file this
+/// commit/merge never touches — blocks every future commit/merge until it's
+/// dismissed or fixed, a stricter bar than the file-scoped secrets/patch
+/// scan enforces. Left this way rather than filtering findings down to only
+/// this commit's/merge's own changed files: a configured scanner's argv is
+/// user-controlled and not guaranteed to accept a file list at all (a
+/// `semgrep --config=... .`-shaped invocation scans everything it's given
+/// regardless), and correlating SARIF `artifactLocation` URIs back against
+/// a changed-file set correctly (relative-path normalization, a finding in
+/// a file the merge itself introduces vs. one merely touched) is real,
+/// separate scoping work — not a rider on wiring this in for the first
+/// time. Whoever picks that up next should treat it as its own scoped task.
+fn scan_external_findings(root: &Path, boundary: &str) -> Vec<String> {
     let entries = match crate::external_scan::load_scanners_config(root) {
         Ok(entries) => entries,
         Err(err) => {
             return vec![format!(
-                "{err}; fix or remove {} before committing",
+                "{err}; fix or remove {} before this {boundary}",
                 crate::external_scan::SCANNERS_CONFIG_PATH
             )];
         }
@@ -3605,8 +3622,8 @@ fn scan_external_findings(root: &Path) -> Vec<String> {
                 .map(|finding| format!("{} ({})", finding.rule_id(), finding.fingerprint().as_hex()))
                 .collect();
             findings.push(format!(
-                "advisory: scanner {} reported: {} — verify before committing, or dismiss a \
-                 false positive with `rapid findings dismiss <fingerprint>`",
+                "advisory: scanner {} reported: {} — verify before this {boundary}, or dismiss \
+                 a false positive with `rapid findings dismiss <fingerprint>`",
                 outcome.scanner_id,
                 details.join(", ")
             ));
@@ -6396,6 +6413,79 @@ use std::sync::{Arc, Mutex};
             }
             other => panic!("expected the commit to be blocked by the malformed scanners config, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn git_commit_is_blocked_by_a_configured_but_uninstalled_scanner() {
+        // Distinct from the malformed-config test above (the config itself
+        // fails to parse) and from the finding test (the scanner ran and
+        // reported a real finding): here the config parses fine, but the
+        // scanner binary itself doesn't exist, so `run_configured_scanners`
+        // reports `ExternalScanStatus::Unavailable` with zero findings —
+        // exercising `scan_external_findings`'s `else if ... != Passed`
+        // branch, which none of the other new tests reach. Per `security::
+        // gate`'s own contract ("unavailable and error never become pass",
+        // already relied on by `rapid scan`'s exit code), this must still
+        // block, not silently let the commit through just because there
+        // was nothing to actually flag as a finding.
+        let root = TempRoot::new("commit-gate-external-scanner-unavailable");
+        git_init(&root.0);
+        let configure = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root.0)
+                .args(args)
+                .output()
+                .expect("git config");
+            assert!(out.status.success());
+        };
+        configure(&["config", "user.name", "t"]);
+        configure(&["config", "user.email", "t@t.invalid"]);
+        fs::create_dir_all(root.0.join(".rapidlm")).expect("dir");
+        let json = serde_json::json!({
+            "schema": 1,
+            "scanners": [{
+                "id": "fakescan",
+                "kind": "sast",
+                "argv": ["rapidlm-definitely-not-a-real-binary-xyz"],
+            }],
+        });
+        fs::write(
+            root.0.join(crate::external_scan::SCANNERS_CONFIG_PATH),
+            serde_json::to_vec(&json).expect("serialize"),
+        )
+        .expect("write scanners.json");
+
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        fs::write(root.0.join("app.rs"), b"fn main() {}\n").expect("write file");
+        let stage = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["add", "app.rs"])
+            .output()
+            .expect("git add");
+        assert!(stage.status.success());
+
+        let commit_call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","add app"]}"#);
+        let validated = tools.validate(&commit_call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                let detail = detail.expect("detail");
+                assert!(detail.contains("commit blocked"), "{detail}");
+                assert!(detail.contains("Unavailable"), "{detail}");
+                assert!(detail.contains("fakescan"), "{detail}");
+            }
+            other => panic!("expected an uninstalled scanner to block the commit, got {other:?}"),
+        }
+        let log = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["log", "--oneline"])
+            .output()
+            .expect("git log");
+        assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 1, "only the seed commit");
     }
 
     #[test]
