@@ -4289,6 +4289,39 @@ walk_node`'s existing `max_walk_depth` pattern) precisely because both byte caps
 the future without anyone re-deriving this stack-depth math, but that follow-up deserves its own dedicated
 verification pass rather than a rushed addition here.
 
+**Fifth targeted background hunt, 2026-09-05 — a fifth distinct bug shape (a type's front-door constructor
+validating an invariant that its `#[derive(Deserialize)]` silently skips, letting a value violating that
+invariant reach code that assumes it can't) came back clean: four naive-derive gaps found, all four checked
+and none fixed, because each one's only reachable untrusted-input path already has a working, independent
+mitigation.** Unlike the four hunts above, this one didn't produce a shippable fix — recorded here so the
+next pass doesn't re-spend effort re-discovering the same four, and because "the defense held" is itself the
+useful finding.
+
+1. `crates/workspace/src/patch/model.rs::PatchMetadata` — `new()` rejects a blank `intent`; the hand-written
+   `SemanticPatch::deserialize`'s `.validate()` call checks length/control-chars/duplicate-evidence but not
+   blank-intent. Not fixed: no call site anywhere reads `.intent()` and branches on emptiness, so nothing
+   currently depends on the invariant this gap would violate.
+2. `crates/kernel/src/session/projection.rs::GoalSnapshot` — the live event-folding path enforces several
+   `MAX_*` bounds that the type's naive `Deserialize` (reached via `SessionSnapshot`'s hand-written impl,
+   decoding a persisted crash-recovery checkpoint) skips. Not fixed: `recovery/mod.rs::verify_loaded_
+   checkpoint` never trusts the decoded value directly — it independently replays the raw event log and
+   requires byte-for-byte equality before accepting the checkpoint, failing closed as `StorageCorrupt` on
+   any tampering that would have produced an out-of-bounds `GoalSnapshot`.
+3. `crates/protocol/src/config.rs::ModelPolicyName` — `FromStr` rejects an empty name; `#[serde(transparent)]`
+   skips it. Not fixed: the only production path (`RapidConfig::from_json_value`) runs `walk_object`/
+   `check_leaf` (which explicitly rejects an empty `PolicyName` leaf) before ever calling `serde_json::
+   from_value`, so the naive derive is never reached with unvalidated input in practice.
+4. `crates/tui/src/state.rs::ApprovalKey`/`AppState` — `ApprovalKey::parse` enforces a length bound and a
+   hex-digit/`-`-only charset that the naive derives on both types skip. Not fixed: no call site anywhere in
+   the workspace deserializes `AppState` or a bare `ApprovalKey` from an external source — the derive appears
+   to be test/round-trip-only, and the one confirmed untrusted entry point (`parse_approval_key`) already
+   correctly routes through `ApprovalKey::parse`.
+
+Also checked and confirmed already sound (hand-written `Deserialize` or explicit re-validation at the real
+load site, not a naive derive at all): `capability-broker`'s `Capability`/`ResourceDescriptor`, `plugin-host`'s
+`PluginManifest`/`HookSpec`/`SkillDescriptor`, the MCP trust store, `vcs::ProvenanceEdge`, `process-
+supervisor::JobSpec`, `scheduler::GraphProposal`, and `handoff`'s `FreshIssuance`/`IssuedRef`.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
