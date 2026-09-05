@@ -4498,6 +4498,88 @@ clusters around a handful of real, unresolved architecture questions (no live TU
 risking double-counting; several items need new config/protocol surfaces with no existing precedent to copy)
 that call for explicit user direction, not another automated scoping pass over the same ground.
 
+**Correction (2026-09-05, user-directed investigation): "no live TUI turn-execution loop at all" (this
+section's own note, three paragraphs up) was already stale by the time it was written.** A required,
+verify-the-actual-code-first investigation (not a repeat of the scoping-agent search that produced the
+stale note) traced `apps/rapid/src/interactive.rs` end to end: `rapid` with no subcommand already opens a
+real interactive session — raw terminal mode, an in-process kernel client, a real per-session event ledger
+— whose turn loop (`SessionLoop::submit_turn` → `spawn_interactive_turn` → `run_interactive_turn` →
+`run_interactive_turn_inner` → the same `crate::host::run_live_exec` entry the headless `rapid exec` path
+uses) was substantially built and already self-reviewed in two prior sessions this same day (`5087559 fix:
+interactive rapid session never ran a turn and crashed on message 2`, `b653015 fix: three lease-stranding
+gaps found self-reviewing turn execution`, `f912b43 feat: interactive turn loop now loads memory index and
+todos index` — all landed *before* this section's own "no live loop" note). Cancellation (Ctrl-C → kernel
+`Interrupt` → a polling watchdog bridges it into the `agent_runtime::CancellationToken` the execution
+engine actually checks), panic safety (`catching_panics` wraps the background thread so the turn's kernel
+lease and `turn_in_flight` flag are never stranded), and plain-text transcript rendering (`drain_kernel_
+events` → `reduce()` → `render_new_transcript_entries`) were all real and working. What was genuinely
+missing was narrower and different in kind from "no loop": (1) no test seam existed to drive this exact
+production call chain with a scripted, deterministic model — every existing test that reached a real turn
+deliberately never waited for it to finish, since doing so needed either a real network call or a mock
+that didn't exist, so "successful completion," "tool-call continuation," and "no lost final output" were
+never actually proven end to end; (2) a genuine, previously-undiscovered race in `drain_kernel_events`
+itself (below) that the new tests immediately surfaced. `crates/tui`'s fuller panel/view-model rendering
+surface (approval, agents, diff, context, memory, trace-jobs, model panels) is *still* not wired into this
+loop — `render_new_transcript_entries`'s own doc comment already says so ("a real next step, not an
+oversight") — but that is a visual-rendering gap, explicitly out of this task's scope (kept separate per
+the driving instruction's own "keep UI rendering concerns separate from execution state transitions"
+constraint), not a turn-execution-loop gap.
+**Implemented:** `apps/rapid/src/interactive.rs`'s `run_interactive_turn_inner` split into
+`build_interactive_turn_context` (context/permission-lattice/`ExecTools` setup, unchanged behavior) +
+`execute_interactive_turn<B: LiveModelCall>` (generic over the model backing — spec/request/sink build,
+`run_live_exec` call, outcome mapping), mirroring the same generic-over-backing pattern `run_live_exec`
+itself already establishes one layer down. `#[cfg(test)]`-gated generic siblings
+(`run_interactive_turn_inner_with_backing`/`run_interactive_turn_with_backing`/`spawn_interactive_turn_
+with_backing`) thread a scripted backing through the *exact* production call chain — same thread/panic-
+safety/lease-release/`turn_in_flight` semantics, same real kernel session and `ExecTools`, only the model
+resolution step swapped. The Ctrl-C-to-cancellation watchdog (previously inlined in `run_interactive_turn`)
+was extracted into a small `CancelBridge` for the same reason. New tests (`ScriptedModel` implementing
+`LiveModelCall`, `ScriptedSession` bootstrapping a real kernel session the same way `run_started_session`
+does) cover: successful completion with real tool execution and assistant-output propagation, execution
+failure, cancellation, two sequential turns with no lost or duplicated output, no-duplicate-execution when
+a second message arrives mid-turn (`SessionLoop::submit_turn`'s own `turn_in_flight` guard, tested
+directly), and the cancellation bridge itself (a real `kernel::CancelToken`, cancelled from the test's own
+thread, observed reaching the bridged token).
+**A real bug found by the new tests, not invented for them:** `drain_kernel_events` unconditionally
+re-fetched a fresh `get_session()` snapshot and applied it after draining whatever the event-stream channel
+currently had queued. `get_session()` always reflects the ledger's durable tip; the channel's own live-tail
+delivery (`crates/event-ledger/src/subscription.rs`) has an independent ~10ms polling lag. A turn that
+finishes fast enough — every scripted test, and plausibly a real turn that fails before ever calling the
+model — lets `get_session()` "see" a later seq than the channel has delivered yet; applying that snapshot
+directly overwrites the UI-side kernel projection's `seq` counter, and `crates/kernel/src/session/
+projection.rs`'s `apply_next` requires every event's seq to be exactly `snapshot.seq + 1` or it's a hard
+`SeqGap` protocol error. The turn's own late-arriving terminal event (`TurnCompleted`/`TurnFailed`) would
+then violate that invariant when it finally arrived on a *later* `drain_kernel_events` call, get silently
+discarded via `reduce()`'s own error-swallowing (which also sets `actions_blocked = true` — but the very
+next successful snapshot application resets it, erasing the evidence), and the transcript would
+permanently lose that final entry: a genuine, if narrow, "final output lost" bug in the exact scenario the
+driving instruction's own testing requirements called out. **Fixed:** only apply the fetched snapshot when
+`ui.snapshot().seq() >= snapshot.seq()` (the channel has already caught up to it) or when `ui.snapshot()`
+is `None` (bootstrap) — otherwise skip it this tick and let the channel catch up naturally on a later one,
+which it always does (the ledger's own subscription mechanism guarantees gapless, in-order delivery; the
+only failure mode is *when*, never *whether*). Verified via the revert cycle: hardcoding the check to
+always-apply reproduced the exact predicted failures in two of the new tests across repeated runs; restoring
+it fixed both. A self-review pass on the resulting diff found and fixed two further issues: a doc comment
+left describing the old, unsplit function that had drifted onto the wrong (new) function after the split,
+and `CancelBridge`'s `stop()` not being reachable on a panicking unwind through turn execution (the exact
+same class of skipped-cleanup gap `catching_panics` already exists to close for the turn's own kernel lease,
+just for the watchdog thread instead) — closed with a `Drop` impl that signals (but does not block on
+joining) the watchdog so it exits within one 50ms poll tick regardless of how execution ends. Full
+`-p rapid --lib` suite (441 tests, up from 435 — 6 new), `cargo clippy -p rapid --lib --tests` (no new
+lints), `cargo test -p tui -p kernel` (unchanged, 9/9 and existing suites pass — no code in either crate was
+touched), and `cargo build --workspace --tests` all pass.
+**Deliberately not attempted, named explicitly so the next architectural decision is scoped correctly:**
+`GoalUsage` cost-accrual policy and inadequate-context-handling policy — both untouched, per the driving
+instruction's own scope boundary. `ExecOutcome.cost_usd_micros`/`tool_calls`/`tokens` (already existing,
+computed by `crate::host::run_live_exec`'s own `CostAccumulator`, not added by this work) and the
+per-progress-event durable ledger trail `InteractiveTurnSink` already records are exactly the kind of
+policy-neutral lifecycle data a future `GoalUsage` feature would consume — nothing new was added to expose
+them, since they already exist; no dollar-calculation or "inadequate" threshold policy was invented.
+Wiring `crates/tui`'s richer panel surface into this loop (a real, separate, visual-rendering task) and
+adding live approval-resolution for `KernelApi::Approve`-shaped slash commands (a large, separate surface
+spanning goals/agents/knowledge/playbooks/MCP/plugins, not specific to turn execution) are both real,
+identified, explicitly out-of-scope gaps for whoever picks up TUI work next — neither is "the turn loop."
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

@@ -2810,6 +2810,121 @@ fn spawn_interactive_turn(
     });
 }
 
+/// Test-only-but-real sibling of `spawn_interactive_turn`: identical thread/
+/// panic-safety/lease-release shape, but runs `backing` instead of resolving
+/// a real model from process env/config — see `run_interactive_turn_inner_
+/// with_backing`'s own doc comment for why this seam exists.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn spawn_interactive_turn_with_backing<B: crate::host::LiveModelCall + Send + 'static>(
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    turn_id: protocol::TurnId,
+    actor: ActorRef,
+    root: PathBuf,
+    trusted: bool,
+    text: String,
+    kernel_cancel: kernel::CancelToken,
+    turn_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    backing: B,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let outcome = catching_panics(std::panic::AssertUnwindSafe(|| {
+            run_interactive_turn_with_backing(
+                &client,
+                session_id,
+                &actor,
+                &root,
+                trusted,
+                &text,
+                &kernel_cancel,
+                backing,
+            )
+        }));
+        let _ = client.finish_turn(kernel::FinishTurn::new(
+            session_id,
+            turn_id,
+            actor,
+            TraceId::new(),
+            outcome,
+        ));
+        turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+    })
+}
+
+/// Bridge a `kernel::CancelToken` (set by `Interrupt`/Ctrl-C) into a fresh
+/// `agent_runtime::CancellationToken` (what `run_live_exec` actually
+/// checks) — different types from different crates with no dependency
+/// between them, so a poller thread is the bridge, the same pattern already
+/// used for `execute_mcp_tool`/`fetch_page`'s cross-crate cancellation,
+/// rather than substituting a fresh, never-cancelled token that would make
+/// Ctrl-C during a real in-flight turn silently do nothing. Extracted from
+/// `run_interactive_turn`'s own body (unchanged logic) so a test can drive
+/// the actual bridge mechanism directly and deterministically, rather than
+/// only observing its effect indirectly through a full scripted turn.
+struct CancelBridge {
+    token: agent_runtime::CancellationToken,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    watchdog: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CancelBridge {
+    fn start(kernel_cancel: &kernel::CancelToken) -> Self {
+        let token = agent_runtime::CancellationToken::new();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog = {
+            let bridge = token.clone();
+            let kernel_cancel = kernel_cancel.clone();
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if kernel_cancel.is_cancelled() {
+                        bridge.cancel();
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            })
+        };
+        Self {
+            token,
+            stop,
+            watchdog: Some(watchdog),
+        }
+    }
+
+    /// Stop the watchdog thread and join it. Called once the bridged token
+    /// is no longer needed, right after the turn it bridged for finishes.
+    /// `Drop` below is the fallback for the path that doesn't reach this —
+    /// a panic inside `run_interactive_turn_inner`/`run_interactive_turn_
+    /// inner_with_backing` unwinds straight past this call (an adversarial
+    /// self-review of the wider turn-execution feature already found the
+    /// same class of skipped-cleanup gap for the turn's own kernel lease,
+    /// see `catching_panics`'s own doc comment) — without `Drop` the
+    /// watchdog thread would poll forever for the rest of the process, one
+    /// leaked thread per panic.
+    fn stop(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(watchdog) = self.watchdog.take() {
+            let _ = watchdog.join();
+        }
+    }
+}
+
+impl Drop for CancelBridge {
+    fn drop(&mut self) {
+        // Only ever reached without `stop()` already having run when a
+        // panic unwound past it — `stop()` itself leaves `watchdog: None`,
+        // so the ordinary path here is just this same store again
+        // (idempotent) with nothing left to join. Deliberately does not
+        // join: blocking a panicking unwind on a 50ms-granularity poll
+        // loop would slow down crash reporting for no real benefit — the
+        // watchdog thread reliably exits on its own within one poll tick
+        // once `stop` is set, whether or not anything waits for it.
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn run_interactive_turn(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
@@ -2819,35 +2934,40 @@ fn run_interactive_turn(
     text: &str,
     kernel_cancel: &kernel::CancelToken,
 ) -> kernel::TurnOutcome {
-    // `kernel::CancelToken` (set by `Interrupt`/Ctrl-C) and `agent_runtime::
-    // CancellationToken` (what `run_live_exec` actually checks) are
-    // different types from different crates with no dependency between
-    // them — bridged with a poller, the same pattern already used for
-    // `execute_mcp_tool`/`fetch_page`'s cross-crate cancellation, rather
-    // than substituting a fresh, never-cancelled token that would make
-    // Ctrl-C during a real in-flight turn silently do nothing.
-    let bridge = agent_runtime::CancellationToken::new();
-    let stop_watchdog = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let watchdog = {
-        let bridge = bridge.clone();
-        let kernel_cancel = kernel_cancel.clone();
-        let stop = std::sync::Arc::clone(&stop_watchdog);
-        std::thread::spawn(move || {
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                if kernel_cancel.is_cancelled() {
-                    bridge.cancel();
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        })
-    };
-
+    let bridge = CancelBridge::start(kernel_cancel);
     let outcome =
-        run_interactive_turn_inner(client, session_id, actor, root, trusted, text, &bridge);
+        run_interactive_turn_inner(client, session_id, actor, root, trusted, text, &bridge.token);
+    bridge.stop();
+    outcome
+}
 
-    stop_watchdog.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = watchdog.join();
+/// Test-only-but-real sibling of `run_interactive_turn`: same cancellation
+/// bridge, but calls `run_interactive_turn_inner_with_backing` instead of
+/// resolving a real model.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn run_interactive_turn_with_backing<B: crate::host::LiveModelCall>(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    text: &str,
+    kernel_cancel: &kernel::CancelToken,
+    backing: B,
+) -> kernel::TurnOutcome {
+    let bridge = CancelBridge::start(kernel_cancel);
+    let outcome = run_interactive_turn_inner_with_backing(
+        client,
+        session_id,
+        actor,
+        root,
+        trusted,
+        text,
+        &bridge.token,
+        backing,
+    );
+    bridge.stop();
     outcome
 }
 
@@ -2864,6 +2984,57 @@ fn run_interactive_turn(
 fn preserve_memory_and_todos(preserved: PreservedLiveContext, root: &Path) -> PreservedLiveContext {
     let preserved = preserved.with_memory_index(crate::host::load_memory_index(root));
     preserved.with_todos_index(crate::host::load_todos_index(root))
+}
+
+/// Build the context/tools half of one interactive turn — everything that
+/// does not depend on which model backs it. Split out from
+/// `run_interactive_turn_inner` so a test can reuse this exact, real setup
+/// (memory/todos index, permission lattice, `ExecTools`) while swapping in a
+/// scripted [`crate::host::LiveModelCall`] instead of the real
+/// env/config-resolved one — see `execute_interactive_turn`'s own doc
+/// comment for why the model half is a separate seam.
+///
+/// `forced_mode` is threaded straight through to `exec_permission_lattice`'s
+/// own identical parameter (the same override `rapid cron`'s propose-only
+/// execution already uses to force `Plan` mode) — production always passes
+/// `None` here, unchanged from before this function existed. A test passes
+/// `Some(PermissionMode::BypassPermissions)` instead of the real mode
+/// `exec_permission_lattice` would otherwise resolve from process env or a
+/// `PROJECT_SETTINGS_FILES` entry read relative to the test *process's* cwd
+/// (not the test's own isolated workspace root) — neither of which a test
+/// can control without mutating global process state shared with every
+/// other test running concurrently in the same binary.
+fn build_interactive_turn_context(
+    root: &Path,
+    trusted: bool,
+    text: &str,
+    forced_mode: Option<crate::permissions::PermissionMode>,
+) -> Result<(PreservedLiveContext, ExecTools), kernel::TurnOutcome> {
+    let preserved =
+        match build_live_context(Some(root), Some(root), text.to_owned(), trusted, 8192, 256) {
+            Ok(preserved) => preserved,
+            Err(err) => {
+                return Err(kernel::TurnOutcome::Failed {
+                    reason: format!("context error: {err}"),
+                });
+            }
+        };
+    let preserved = preserve_memory_and_todos(preserved, root);
+    let permission_lattice = match exec_permission_lattice(Some(root), forced_mode) {
+        Ok(lattice) => lattice,
+        Err(err) => {
+            return Err(kernel::TurnOutcome::Failed {
+                reason: format!("permission configuration error: {err}"),
+            });
+        }
+    };
+    let tools = if trusted {
+        ExecTools::workspace_with_permissions(root, permission_lattice)
+            .unwrap_or_else(|_| ExecTools::noop())
+    } else {
+        ExecTools::noop()
+    };
+    Ok((preserved, tools))
 }
 
 /// Actually resolve a model, build workspace tools, and run one turn through
@@ -2885,29 +3056,9 @@ fn run_interactive_turn_inner(
     text: &str,
     cancel: &agent_runtime::CancellationToken,
 ) -> kernel::TurnOutcome {
-    let preserved =
-        match build_live_context(Some(root), Some(root), text.to_owned(), trusted, 8192, 256) {
-            Ok(preserved) => preserved,
-            Err(err) => {
-                return kernel::TurnOutcome::Failed {
-                    reason: format!("context error: {err}"),
-                };
-            }
-        };
-    let preserved = preserve_memory_and_todos(preserved, root);
-    let permission_lattice = match exec_permission_lattice(Some(root), None) {
-        Ok(lattice) => lattice,
-        Err(err) => {
-            return kernel::TurnOutcome::Failed {
-                reason: format!("permission configuration error: {err}"),
-            };
-        }
-    };
-    let mut tools = if trusted {
-        ExecTools::workspace_with_permissions(root, permission_lattice)
-            .unwrap_or_else(|_| ExecTools::noop())
-    } else {
-        ExecTools::noop()
+    let (preserved, mut tools) = match build_interactive_turn_context(root, trusted, text, None) {
+        Ok(built) => built,
+        Err(outcome) => return outcome,
     };
 
     // One store, fully built before `ConfiguredModel` borrows from it — the
@@ -2952,6 +3103,64 @@ fn run_interactive_turn_inner(
         }
     };
 
+    execute_interactive_turn(client, session_id, actor, text, preserved, &mut tools, backing, cancel)
+}
+
+/// Test-only-but-real sibling of `run_interactive_turn_inner`: identical
+/// context/tools setup (`build_interactive_turn_context`, so a scripted
+/// turn still executes real tool calls against a real workspace), but takes
+/// an already-resolved `backing` instead of reading it from process env/
+/// config — the seam that lets a test drive the actual turn-execution
+/// boundary deterministically instead of only proving it "doesn't crash"
+/// against whatever model happens to be configured on the machine running
+/// the test (or none at all).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    text: &str,
+    cancel: &agent_runtime::CancellationToken,
+    backing: B,
+) -> kernel::TurnOutcome {
+    // `BypassPermissions`, not the real env/settings-resolved mode: see
+    // `build_interactive_turn_context`'s own doc comment on `forced_mode`
+    // for why a test can't safely control that resolution any other way.
+    // This test seam is about proving the turn-execution *loop* — dispatch,
+    // event propagation, completion/failure/cancellation mapping, lease
+    // lifecycle — works correctly, not about re-testing the permission gate
+    // itself (which has its own dedicated test suite in `permissions.rs`
+    // and `exec_tools.rs`).
+    let forced_mode = Some(crate::permissions::PermissionMode::BypassPermissions);
+    let (preserved, mut tools) = match build_interactive_turn_context(root, trusted, text, forced_mode)
+    {
+        Ok(built) => built,
+        Err(outcome) => return outcome,
+    };
+    execute_interactive_turn(client, session_id, actor, text, preserved, &mut tools, backing, cancel)
+}
+
+/// Run one turn's model/tool-call loop through the shared, already-governed
+/// `run_live_exec` entry (the same one the headless `rapid exec` path uses)
+/// and map its terminal status onto the kernel's own `TurnOutcome`. Generic
+/// over the model backing (`B: LiveModelCall`) rather than hardcoding
+/// `SelectedModel`, mirroring `run_live_exec`'s own generic-over-backing
+/// shape one layer up — this is what actually makes `run_interactive_turn_
+/// inner_with_backing` possible without duplicating this mapping logic.
+#[allow(clippy::too_many_arguments)]
+fn execute_interactive_turn<B: crate::host::LiveModelCall>(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    text: &str,
+    preserved: PreservedLiveContext,
+    tools: &mut ExecTools,
+    backing: B,
+    cancel: &agent_runtime::CancellationToken,
+) -> kernel::TurnOutcome {
     let spec = match AgentSpec::builder(
         protocol::AgentId::new(),
         AgentRole::Coder,
@@ -2979,7 +3188,7 @@ fn run_interactive_turn_inner(
         preserved,
         backing,
         &request,
-        &mut tools,
+        tools,
         &mut sink,
         cancel,
         ContextRetryPolicy::default(),
@@ -3046,8 +3255,31 @@ fn drain_kernel_events(
             break;
         }
     }
+    // Refresh from a full snapshot too (clears a stale protocol-error block
+    // and re-merges goal/agent rows) — but only once the incremental event
+    // stream drained above has genuinely caught up to it. `get_session`
+    // always reflects the ledger's current tip; the live-tail delivery
+    // above has its own independent polling lag (`TAIL_POLL_INTERVAL` in
+    // `crates/event-ledger/src/subscription.rs`). Applying an *ahead*
+    // snapshot here would silently fast-forward the projection's own `seq`
+    // past events still in flight in the channel — `kernel::session::
+    // projection::apply_next` requires each event's seq to be exactly
+    // `snapshot.seq + 1`, so when those events finally arrive (on a later
+    // tick) they'd violate that invariant and get discarded with a
+    // swallowed protocol error instead of ever reaching the transcript.
+    // Found via a scripted turn that finished well inside one live-tail
+    // poll interval, which a human-paced real session essentially never
+    // does (`SessionLoop::run`'s own ~50ms tick is 5x that poll interval),
+    // but a turn that fails before ever calling the model could plausibly
+    // hit in production too.
     let snapshot = block_on(client.get_session(session_id), cancel)?;
-    *ui = reduce(ui.clone(), &UiEvent::Snapshot(snapshot));
+    let caught_up = match ui.snapshot() {
+        Some(current) => current.seq() >= snapshot.seq(),
+        None => true,
+    };
+    if caught_up {
+        *ui = reduce(ui.clone(), &UiEvent::Snapshot(snapshot));
+    }
     render_new_transcript_entries(&ui.transcript()[rendered.min(ui.transcript().len())..]);
     Ok(())
 }
@@ -4180,6 +4412,412 @@ base_url = "http://127.0.0.1:11434/v1"
             matches!(outcome, kernel::TurnOutcome::Failed { .. }),
             "a panic must be caught and reported as Failed, not left to unwind: {outcome:?}"
         );
+    }
+
+    // --- Scripted turn-execution-loop coverage -----------------------------
+    //
+    // Every test above that exercises a real turn (`a_second_plain_text_
+    // message_does_not_crash_the_session_and_a_turn_actually_runs`) deliberately
+    // never waits for it to actually finish, because doing so would need
+    // either a real network call to whatever model happens to be configured
+    // on the machine running the test, or mocking one — and until now
+    // `run_interactive_turn_inner` had no seam for that (it always resolved
+    // its model from process env/config). `run_interactive_turn_inner_with_
+    // backing` (and its siblings up the call chain) close that gap by taking
+    // an already-resolved `crate::host::LiveModelCall` instead — the tests
+    // below drive the exact same functions `SessionLoop::submit_turn` calls
+    // in production, just with a scripted model, so they can assert on real
+    // completion, real tool execution, real failure/cancellation mapping,
+    // and real lease release deterministically instead of only "doesn't
+    // crash."
+    use agent_runtime::{ModelStepError, ModelStepInput, ModelStepOutput, ProposedToolCall};
+    use std::collections::VecDeque;
+    use tui::state::{ToolActivityStatus, TranscriptEntry};
+
+    /// Scripted live model: a fixed sequence of steps, consumed in order.
+    /// Mirrors `exec_tools.rs`'s own private `ScriptedModel` test double
+    /// (same established pattern, not reusable directly — that one is
+    /// private to `exec_tools`'s own test module).
+    struct ScriptedModel {
+        outputs: VecDeque<Result<ModelStepOutput, ModelStepError>>,
+    }
+
+    impl ScriptedModel {
+        fn terminal(text: &str) -> Self {
+            Self {
+                outputs: VecDeque::from(vec![Ok(ModelStepOutput::Terminal {
+                    text: text.to_owned(),
+                    tokens: 1,
+                    cost_usd_micros: None,
+                })]),
+            }
+        }
+
+        fn write_then_answer(path: &str, content: &str, answer: &str) -> Self {
+            let call = ProposedToolCall::new(
+                "c1",
+                crate::exec_tools::WORKSPACE_WRITE_TOOL,
+                format!(r#"{{"path":"{path}","content":"{content}"}}"#),
+            )
+            .expect("call");
+            Self {
+                outputs: VecDeque::from(vec![
+                    Ok(ModelStepOutput::ToolCalls {
+                        calls: vec![call],
+                        tokens: 1,
+                        cost_usd_micros: None,
+                    }),
+                    Ok(ModelStepOutput::Terminal {
+                        text: answer.to_owned(),
+                        tokens: 1,
+                        cost_usd_micros: None,
+                    }),
+                ]),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                outputs: VecDeque::from(vec![Err(ModelStepError::Failed)]),
+            }
+        }
+
+        fn cancelled() -> Self {
+            Self {
+                outputs: VecDeque::from(vec![Err(ModelStepError::Cancelled)]),
+            }
+        }
+    }
+
+    impl crate::host::LiveModelCall for ScriptedModel {
+        fn step(
+            &mut self,
+            _blocks: &[context_engine::compile::ContextBlock],
+            _input: &ModelStepInput<'_>,
+            _cancel: &agent_runtime::CancellationToken,
+        ) -> Result<ModelStepOutput, ModelStepError> {
+            self.outputs.pop_front().unwrap_or(Err(ModelStepError::Failed))
+        }
+    }
+
+    /// A real kernel session plus a real trusted workspace root, wired the
+    /// same way `run_started_session` wires one for `SessionLoop` — minus
+    /// the terminal/crossterm machinery, which is orthogonal to turn
+    /// execution and already covered by `terminal.rs`'s own tests. `stream`/
+    /// `ui` are bootstrapped and live exactly the way `run_started_session`
+    /// bootstraps and holds them for the whole session: an initial `Snapshot`
+    /// applied *before* subscribing, and the subscription started from that
+    /// snapshot's own seq — a kernel event replayed with no snapshot behind
+    /// it yet (subscribing from seq 0, before `SessionCreated`) does not
+    /// fold into the transcript the same way, found the hard way when this
+    /// harness's first version subscribed from 0 into a fresh `AppState::
+    /// new()` and silently produced an empty transcript for every turn.
+    struct ScriptedSession {
+        client: InProcessKernelClient,
+        session_id: protocol::SessionId,
+        actor: ActorRef,
+        root: PathBuf,
+        stream: EventStream,
+        ui: AppState,
+    }
+
+    impl ScriptedSession {
+        fn create(env: &TempEnv) -> Self {
+            let ledger_path = env.project.join(PROJECT_MARKER).join(LEDGER_NAME);
+            fs::create_dir_all(ledger_path.parent().expect("ledger has a parent"))
+                .expect("ledger dir");
+            let client = InProcessKernelClient::open(&ledger_path).expect("open ledger");
+            let actor = human_actor().expect("actor");
+            let cancel = CancellationToken::new();
+            let snapshot = block_on(
+                client.create_session(CreateSession::new(ProjectId::new(), actor.clone(), TraceId::new())),
+                &cancel,
+            )
+            .expect("create session");
+            let session_id = snapshot.id();
+            let stream = block_on(
+                client.subscribe(SubscribeEvents::new(session_id, snapshot.seq())),
+                &cancel,
+            )
+            .expect("subscribe");
+            let ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+            Self {
+                client,
+                session_id,
+                actor,
+                root: env.project.clone(),
+                stream,
+                ui,
+            }
+        }
+
+        fn transcript(&self) -> &[tui::state::TranscriptEntry] {
+            self.ui.transcript()
+        }
+
+        /// Submit `text`, run it to completion against `backing` through the
+        /// real `spawn_interactive_turn_with_backing` → `run_interactive_
+        /// turn_with_backing` → `run_interactive_turn_inner_with_backing` →
+        /// `execute_interactive_turn` chain (exactly what production's
+        /// `submit_turn` calls, just with the model backing swapped), then
+        /// folds every event the turn produced into `self.ui` the same way
+        /// repeated `drain_kernel_events` calls would. Asserts the lease
+        /// actually released and `turn_in_flight` actually reset before
+        /// returning, since every test below relies on both.
+        fn run_turn(&mut self, text: &str, backing: ScriptedModel) {
+            let cancel = CancellationToken::new();
+            let expected_seq = block_on(self.client.get_session(self.session_id), &cancel)
+                .expect("session")
+                .seq();
+            let handle = block_on(
+                self.client.submit_turn(SubmitTurn::new(
+                    self.session_id,
+                    expected_seq,
+                    self.actor.clone(),
+                    TraceId::new(),
+                    text,
+                )),
+                &cancel,
+            )
+            .expect("submit turn");
+            let turn_cancel = self
+                .client
+                .turn_cancel_token(self.session_id)
+                .expect("turn cancel token present immediately after a successful submit");
+            let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let join = spawn_interactive_turn_with_backing(
+                self.client.clone(),
+                self.session_id,
+                handle.turn_id(),
+                self.actor.clone(),
+                self.root.clone(),
+                true,
+                text.to_owned(),
+                turn_cancel,
+                std::sync::Arc::clone(&turn_in_flight),
+                backing,
+            );
+            join.join()
+                .expect("the turn thread must not panic (catching_panics wraps its body)");
+            assert!(
+                !turn_in_flight.load(std::sync::atomic::Ordering::SeqCst),
+                "turn_in_flight must reset to false once the turn thread finishes"
+            );
+            let snapshot = block_on(self.client.get_session(self.session_id), &cancel).expect("session");
+            assert!(
+                snapshot.active_turn().is_none(),
+                "the turn's kernel lease must be released once finish_turn has run \
+                 (the state the loop returns to idle in)"
+            );
+
+            // `subscribe`'s replay/live-tail delivery runs on its own worker
+            // thread (`crates/event-ledger/src/subscription.rs`), feeding a
+            // channel `try_recv()` only ever reads non-blocking — a single
+            // `drain_kernel_events` call right after a turn finishes can
+            // race that worker and see nothing yet, even though every event
+            // is already durably on disk. Production never notices this:
+            // `SessionLoop::run` calls `drain()` every ~50ms for the life of
+            // the session, so a missed pass is simply caught by the next
+            // one. A test calling it once does not get that for free, so
+            // retry here — bounded and short, since the worker only has to
+            // catch up on a handful of already-written events. Not an
+            // early-exit-once-new-entries loop: a partial delivery would
+            // already grow the transcript and stop the retry before the
+            // turn's own terminal event has necessarily arrived, so every
+            // attempt runs regardless.
+            for _ in 0..30 {
+                drain_kernel_events(
+                    &self.client,
+                    &mut self.stream,
+                    &mut self.ui,
+                    self.session_id,
+                    &cancel,
+                )
+                .expect("drain");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for ScriptedSession {
+        fn drop(&mut self) {
+            close_stream(&mut self.stream);
+        }
+    }
+
+    #[test]
+    fn interactive_turn_completes_and_propagates_tool_and_assistant_output() {
+        // Successful completion + output propagation + tool-call/result
+        // continuation + no lost final output, all in one coherent scripted
+        // turn: a tool call that really executes against the real workspace,
+        // then a terminal answer.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "write a note",
+            ScriptedModel::write_then_answer("scripted-note.md", "hello", "scripted turn done"),
+        );
+
+        let written = fs::read_to_string(env.project.join("scripted-note.md"))
+            .expect("the scripted tool call must have really written the file");
+        assert_eq!(written, "hello");
+
+        let transcript = session.transcript();
+        assert!(
+            transcript.iter().any(|entry| matches!(
+                entry,
+                TranscriptEntry::ToolActivity { tool, status: ToolActivityStatus::Completed }
+                    if tool == crate::exec_tools::WORKSPACE_WRITE_TOOL
+            )),
+            "expected a completed workspace_write tool-activity entry: {transcript:?}"
+        );
+        assert!(
+            transcript
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::Assistant { text } if text == "scripted turn done")),
+            "the final assistant answer must not be lost: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn interactive_turn_execution_failure_is_reported_and_the_lease_releases() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("do something", ScriptedModel::failing());
+
+        let transcript = session.transcript();
+        assert!(
+            transcript
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::TurnFailed { .. })),
+            "a failing model step must surface as a failed turn: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn interactive_turn_cancellation_is_reported_and_the_lease_releases() {
+        // Mirrors `agent_runtime::turn`'s own established idiom for testing
+        // cancellation deterministically (`ScriptedModel::new(vec![Err(
+        // ModelStepError::Cancelled)])`) rather than racing a real cancel
+        // against a real in-flight step — see `cancel_bridge_relays_a_
+        // kernel_cancel_into_the_bridged_token` below for a test of the
+        // actual concurrent Ctrl-C-to-cancellation-token bridge instead.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("do something", ScriptedModel::cancelled());
+
+        let transcript = session.transcript();
+        assert!(
+            transcript
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::TurnInterrupted)),
+            "a cancelled model step must surface as an interrupted turn: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn sequential_turns_both_complete_with_no_lost_or_duplicated_output() {
+        // Proves the loop actually returns to an idle/ready state after a
+        // turn completes: a second, independent turn on the same session
+        // must also run to completion, and both turns' output must appear
+        // exactly once each — neither lost nor duplicated.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("first message", ScriptedModel::terminal("first answer"));
+        session.run_turn("second message", ScriptedModel::terminal("second answer"));
+
+        let answers: Vec<&str> = session
+            .transcript()
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Assistant { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            answers,
+            vec!["first answer", "second answer"],
+            "both turns' answers must appear, in order, exactly once each: {answers:?}"
+        );
+    }
+
+    #[test]
+    fn second_submission_while_a_turn_is_in_flight_is_silently_dropped_not_duplicated() {
+        // Targets `SessionLoop::submit_turn`'s own `turn_in_flight` guard
+        // directly: a submission that arrives while one is already running
+        // must never reach `kernel::SubmitTurn` a second time (which would
+        // either hit `SessionConflict` or, worse, actually start a second
+        // concurrent turn) — see the guard's own comment for why dropping
+        // it is the deliberate choice, not queuing it.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let cancel = CancellationToken::new();
+        let before_seq = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, before_seq)),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = AppState::new();
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut loop_state = SessionLoop {
+            client: &session.client,
+            stream: &mut stream,
+            ui: &mut ui,
+            session_id: session.session_id,
+            actor: &session.actor,
+            cancel: &cancel,
+            interrupt_count: &mut interrupt_count,
+            saw_ctrl_c: &mut saw_ctrl_c,
+            root: &session.root,
+            trusted: true,
+            turn_in_flight,
+        };
+        loop_state
+            .submit_turn("a message arriving while another turn is in flight")
+            .expect("submit_turn itself must not error even when dropped");
+
+        let after_seq = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        assert_eq!(
+            before_seq, after_seq,
+            "a submission while turn_in_flight is set must never reach kernel::SubmitTurn"
+        );
+        close_stream(&mut stream);
+    }
+
+    #[test]
+    fn cancel_bridge_relays_a_kernel_cancel_into_the_bridged_token() {
+        // The actual concurrent mechanism Ctrl-C relies on: a real
+        // `kernel::CancelToken`, cancelled from this test's own thread,
+        // must reach the bridged `agent_runtime::CancellationToken` within
+        // the watchdog's own poll interval — not just that a scripted model
+        // reporting `ModelStepError::Cancelled` maps to the right outcome
+        // (that's `interactive_turn_cancellation_is_reported_and_the_lease_
+        // releases`, above; this test is the bridge itself).
+        let kernel_cancel =
+            kernel::CancellationTree::root(kernel::CancelOwner::Client).expect("root token");
+        let bridge = CancelBridge::start(&kernel_cancel);
+        assert!(!bridge.token.is_cancelled(), "must start uncancelled");
+
+        kernel_cancel.cancel();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !bridge.token.is_cancelled() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            bridge.token.is_cancelled(),
+            "the watchdog must relay a kernel cancel into the bridged token"
+        );
+        bridge.stop();
     }
 
     #[test]
