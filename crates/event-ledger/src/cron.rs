@@ -493,14 +493,30 @@ impl CronStore {
         succeeded: bool,
         now_ms: i64,
     ) -> Result<u32, CronStoreError> {
+        // The UPDATE and the read-back SELECT must observe each other
+        // atomically. `rapid cron poll` has no single-instance lock, and a
+        // fired job's prompt can legitimately still be executing when the
+        // next external `poll` invocation re-claims and re-fires the same
+        // row (`complete()` already reactivated it before execution even
+        // started) — so two concurrent `record_execution_result` calls for
+        // the same job id are a real, reachable shape, not a theoretical
+        // one. Without a transaction, one caller's SELECT could read back a
+        // *different* caller's write instead of its own — silently
+        // dropping an earned failure from the count (skipping a real
+        // quarantine), or quarantining with a reason string naming the
+        // wrong count. Same fix `claim_due` already uses for its own
+        // "read, then decide" concern: wrap both statements in one
+        // IMMEDIATE transaction so no other writer's UPDATE can land
+        // between them.
         let conn = self.connect()?;
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         let changed = if succeeded {
-            conn.execute(
+            tx.execute(
                 "UPDATE cron_jobs SET consecutive_failures = 0, updated_at_ms = ?2 WHERE id = ?1",
                 params![id, now_ms],
             )?
         } else {
-            conn.execute(
+            tx.execute(
                 "UPDATE cron_jobs SET consecutive_failures = consecutive_failures + 1,
                      updated_at_ms = ?2
                  WHERE id = ?1",
@@ -510,11 +526,12 @@ impl CronStore {
         if changed == 0 {
             return Err(CronStoreError::JobNotFound { id: id.to_string() });
         }
-        let failures: i64 = conn.query_row(
+        let failures: i64 = tx.query_row(
             "SELECT consecutive_failures FROM cron_jobs WHERE id = ?1",
             params![id],
             |row| row.get(0),
         )?;
+        tx.commit()?;
         Ok(failures as u32)
     }
 
@@ -739,6 +756,49 @@ mod tests {
             1,
             "the counter must start over from 0, not resume the pre-reset streak"
         );
+    }
+
+    #[test]
+    fn record_execution_result_is_atomic_under_real_concurrent_callers() {
+        // The bug this guards against, reproduced during self-review before
+        // this fix: without a transaction wrapping the UPDATE and its
+        // read-back SELECT, one caller's SELECT could observe a DIFFERENT
+        // concurrent caller's write instead of its own — e.g. two threads
+        // both reporting a failure for the same job could each read back
+        // count 1 instead of 1 and 2, silently losing a failure from the
+        // count `report_execution`'s quarantine decision relies on.
+        // `rapid cron poll` has no single-instance lock, so two concurrent
+        // `record_execution_result` calls for the same job id (a fired job
+        // still executing when a later `poll` invocation re-claims and
+        // re-fires it, since `complete()` already reactivated the row
+        // before execution even started) are a real, reachable shape, not
+        // a theoretical one.
+        let (store, _db) = TempDb::open_store();
+        let job = add_job(&store, 1_000);
+        const THREADS: u32 = 8;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|n| {
+                let store = store.clone();
+                let id = job.id.clone();
+                std::thread::spawn(move || {
+                    store
+                        .record_execution_result(&id, false, 1_000 + i64::from(n))
+                        .expect("record")
+                })
+            })
+            .collect();
+        let mut results: Vec<u32> = handles.into_iter().map(|h| h.join().expect("thread")).collect();
+        results.sort_unstable();
+        assert_eq!(
+            results,
+            (1..=THREADS).collect::<Vec<_>>(),
+            "each concurrent caller must observe its own atomic increment exactly once, \
+             with no lost or duplicated reads: {results:?}"
+        );
+
+        let final_job = store.get(&job.id).expect("get");
+        assert_eq!(final_job.consecutive_failures, THREADS);
     }
 
     #[test]

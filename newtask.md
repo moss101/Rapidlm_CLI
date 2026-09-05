@@ -6597,6 +6597,40 @@ existing `security::scanners::secrets::Finding` pattern (§2.9) to give backgrou
   is still just an opaque string, never threaded into real session/ledger state) is the one piece of the
   original disclosure list still open** — unchanged from before, a real, separate gap this pass did not
   touch.
+- **Self-review of the commit above, same day, found one real concurrency bug — empirically reproduced,
+  not just theorized — and fixed it the same way `claim_due` already solves the identical class of
+  problem.** `CronStore::record_execution_result`'s UPDATE and its read-back SELECT ran as two separate,
+  non-transactional statements, unlike `claim_due`, which explicitly wraps its own "read, then decide"
+  concern in a `BEGIN IMMEDIATE` transaction with a comment explaining exactly why. This is reachable in
+  the real call pattern, not just a theoretical gap: `rapid cron poll` has no single-instance lock, and
+  `PromptCron::poll` already reactivates a claimed row (`complete()`) *before* the caller even starts
+  executing the fired prompt — so a slow-running `exec_turn` can still be in flight when a later, separate
+  `rapid cron poll` invocation re-claims and re-fires the same job, giving two concurrent `report_execution`
+  calls for the same job id. The self-reviewing agent reproduced this directly (a temporary, reverted test
+  issuing the exact two statements `record_execution_result` uses from two real connections, one
+  deliberately delayed between its own UPDATE and SELECT): one thread's readback returned the *other*
+  thread's write, not its own. Consequence: a real failure could silently vanish from the count a
+  quarantine decision relies on (an earned quarantine never triggers), or a quarantine could fire with a
+  reason string naming the wrong failure count. **Fixed:** wrapped both statements in one `BEGIN IMMEDIATE`
+  transaction, mirroring `claim_due`'s own pattern and rationale verbatim. New test
+  `record_execution_result_is_atomic_under_real_concurrent_callers`: 8 real threads all report a failure
+  for the same job concurrently, and the sorted set of their own returned counts must be exactly `1..=8`
+  — no lost or duplicated reads. **A note on verification, honestly recorded rather than glossed over:**
+  this session's own revert-cycle discipline (temporarily undo the fix, confirm the new test now fails,
+  restore) did not reliably reproduce the race through natural thread scheduling — 15 consecutive runs of
+  the reverted (non-transactional) code all passed the new concurrency test, because 8 threads issuing
+  UPDATE-then-SELECT back-to-back rarely land in the same narrow interleaving window the self-review agent
+  had to force open with a deliberate sleep. Verification here rests instead on (1) that agent's own
+  successful, code-literal manual reproduction of the exact failure before the fix, and (2) `claim_due`'s
+  already-established, already-tested precedent that `BEGIN IMMEDIATE` closes exactly this class of gap —
+  not on this session's own flaky-by-nature attempt to re-trigger the same narrow race. Checked and found
+  sound (no further fix needed): migration safety for the v5 `ALTER TABLE` against existing rows, `CronJob`
+  field-construction consistency across all call sites, and the `code == 0` exit-code success signal
+  (confirmed the wall-time-watchdog `Interrupted` path is never reachable from `rapid cron poll`'s call
+  shape today, so no other `JsonlExitCode` variant can currently be miscategorized as a failure — flagged
+  as a latent conflation worth re-checking if wall-time bounds are ever added to this specific call path).
+  Full `-p event-ledger` (92 tests, up from 91) and the combined `-p event-ledger -p scheduler -p rapid
+  --lib` suite (550 tests total) and `cargo build --workspace --tests` pass.
 
 ### 3.3 Verified-success-per-token as a tracked, reported metric
 
