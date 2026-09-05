@@ -302,6 +302,7 @@ pub enum ToolActivityStatus {
     Failed,
     Denied,
     ApprovalRequired,
+    ContextRequired,
 }
 
 /// Job row keyed by [`JobId`].
@@ -536,6 +537,9 @@ fn apply_kernel(
         }
         EventKind::ToolFailed => {
             push_tool_activity(&mut state, event, ToolActivityStatus::Failed)?;
+        }
+        EventKind::ToolContextRequired => {
+            push_tool_activity(&mut state, event, ToolActivityStatus::ContextRequired)?;
         }
         EventKind::ToolDenied => {
             push_tool_activity(&mut state, event, ToolActivityStatus::Denied)?;

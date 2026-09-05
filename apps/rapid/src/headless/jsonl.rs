@@ -91,6 +91,14 @@ pub enum JsonlExitCode {
     GoalIncomplete = 6,
     Sandbox = 7,
     ResourceExhausted = 8,
+    /// The model correctly recognized it needed something only the user can
+    /// supply and stopped to ask, rather than guessing — distinct from
+    /// every error code above it (nothing actually went wrong) and from
+    /// `Success` (the run did not produce a final answer): a script can
+    /// branch on this specific code to re-run with the missing input
+    /// instead of treating it as either a clean success or a failure to
+    /// retry/alert on.
+    NeedsContext = 9,
     Interrupted = 130,
 }
 

@@ -560,6 +560,7 @@ fn exchange_wire_bytes(exchange: &agent_runtime::ToolStepExchange) -> usize {
                 detail.as_deref().map_or(0, str::len)
             }
             ToolStepResult::ApprovalRequired { .. } => 0,
+            ToolStepResult::ContextRequired { question, .. } => question.len(),
         })
         .sum();
     calls + results + 128
@@ -611,6 +612,16 @@ fn tool_result_text(tool: &ToolStepResult) -> (&str, String) {
         ToolStepResult::ApprovalRequired { call_id } => (
             call_id,
             "approval required: the user must approve this call".to_owned(),
+        ),
+        // The turn stops immediately when this result is produced (see
+        // `dispatch_prepared`'s own unconditional handling, mirroring
+        // `ApprovalRequired`), so this text is never actually sent to the
+        // model on a next request within the same turn — it exists only so
+        // the stored `ToolStepExchange` history stays honest if something
+        // later inspects it (a resumed goal-driven continuation, a replay).
+        ToolStepResult::ContextRequired { call_id, question } => (
+            call_id,
+            format!("no interactive user available to answer: {question}"),
         ),
     }
 }

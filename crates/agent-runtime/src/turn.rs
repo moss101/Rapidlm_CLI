@@ -67,9 +67,24 @@ pub enum TurnEventKind {
     ToolFailed,
     ToolDenied,
     ToolApprovalRequired,
+    ToolContextRequired,
 }
 
 /// Why a turn stopped without `turn.completed`.
+///
+/// `ContextRequired` is distinct from `ContextBoundExceeded`: the latter is
+/// the model's own context *window* overflowing (real material exists but
+/// doesn't fit — a host/context-owner concern, repaired by
+/// `execute_with_context_recovery`'s compaction-and-retry loop, never by
+/// asking the user anything). `ContextRequired` is the model itself
+/// reporting, through a real structured call (`ToolStepResult::
+/// ContextRequired`, today only reachable via `ask_user` with no live
+/// answer source), that the *user* needs to supply something no amount of
+/// retrying or compacting can produce — an ambiguous target, a missing
+/// preference, a credential only the user has. The two must never be
+/// conflated: promoting ordinary window overflow to "ask the user" would be
+/// wrong exactly as often as compaction would be wrong for a genuine
+/// information gap.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum TurnStopReason {
@@ -81,12 +96,17 @@ pub enum TurnStopReason {
     RepeatedToolCall,
     EmptyResponse,
     ContextBoundExceeded,
+    ContextRequired,
 }
 
-/// Bounded detail for the failing tool when a turn stops on
-/// [`TurnStopReason::ToolFailed`]. `tool` names the failing call; `error` is
-/// the bounded one-line underlying outcome, safe for operator display — never
-/// a substitute for the structured model-visible result.
+/// Bounded detail attached to a stop that needs one: [`TurnStopReason::
+/// ToolFailed`] (`tool` names the failing call; `error` is the bounded
+/// one-line underlying outcome) and [`TurnStopReason::ContextRequired`]
+/// (`tool` is always the tool that raised it, e.g. `"ask_user"`; `error`
+/// carries the model's own question text, not an error message — reused
+/// here rather than a second, parallel struct shaped identically). Safe for
+/// operator/user display in both cases — never a substitute for the
+/// structured model-visible result.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct TurnFailureDetail {
     tool: String,
@@ -94,7 +114,15 @@ pub struct TurnFailureDetail {
 }
 
 /// Byte bound for the operator-facing error text in [`TurnFailureDetail`].
-const FAILURE_DETAIL_ERROR_BYTES: usize = 300;
+/// Sized to hold a `ContextRequired` question in full: `ask_user` bounds a
+/// question to 1024 bytes and its options to 8 entries of up to 256 bytes
+/// each (see `apps/rapid/src/exec_tools.rs`'s `parse_ask_user_args`), so the
+/// combined question-plus-options text this stop attaches never actually
+/// hits this bound in practice — the bound exists to keep the type honestly
+/// finite, not to routinely truncate it. `ToolFailed`'s own error text is
+/// already pre-bounded far below this (see `MAX_RESULT_DETAIL_BYTES`) before
+/// it ever reaches here, so raising this bound changes nothing for it.
+const FAILURE_DETAIL_ERROR_BYTES: usize = 4096;
 
 impl TurnFailureDetail {
     pub fn new(tool: impl Into<String>, error: &str) -> Self {
@@ -346,12 +374,26 @@ pub enum ModelStepOutput {
 /// is an unhandled failure and cannot complete the turn. `Denied` carries the
 /// typed refusal reason text so a headless denial is model-visible, never a
 /// silent pass; detail text is bounded by the producing driver.
+///
+/// `ContextRequired` is distinct from `Failed`/`Denied`: the *call itself*
+/// executed correctly (a driver asked its own configured way of reaching a
+/// human, e.g. `ask_user`), it simply had no live answer source to read from
+/// — the model asked a well-formed question that only a human can answer,
+/// not a malfunction. Stops the turn the same unconditional way
+/// `ApprovalRequired` does (see `dispatch_prepared`'s own handling of both)
+/// rather than letting the loop continue on the model's own judgment, since
+/// silently nudging the model to guess is exactly the behavior this variant
+/// exists to replace. `question` is the driver's own bounded question text
+/// (e.g. `ask_user`'s own `question` argument, already capped by its parser)
+/// — carried here, not reconstructed from prose downstream, so the specific
+/// question a user sees is the model's own, not a generic substitute.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ToolStepResult {
     Succeeded { call_id: String, summary: String },
     Failed { call_id: String, handled: bool, detail: Option<String> },
     Denied { call_id: String, detail: Option<String> },
     ApprovalRequired { call_id: String },
+    ContextRequired { call_id: String, question: String },
 }
 
 /// One kernel-shaped lifecycle event emitted by the loop.
@@ -410,6 +452,19 @@ pub enum TurnEvent {
         tool: String,
     },
     ToolApprovalRequired {
+        turn_id: TurnId,
+        call_id: String,
+        tool: String,
+    },
+    /// A tool call that stopped the turn because the model needs
+    /// information only the user can supply. Mirrors
+    /// [`TurnEvent::ToolApprovalRequired`]'s own dedicated-shape precedent
+    /// rather than reusing `ToolFailed`'s: the model didn't fail anything,
+    /// so surfacing it as a failure marker in a UI would misrepresent the
+    /// outcome. The question itself lives on the turn's terminal
+    /// `TurnResult.failure_detail`, not here — this is only the per-call
+    /// progress marker.
+    ToolContextRequired {
         turn_id: TurnId,
         call_id: String,
         tool: String,
@@ -641,6 +696,7 @@ impl TurnEventKind {
             Self::ToolFailed => "tool.failed",
             Self::ToolDenied => "tool.denied",
             Self::ToolApprovalRequired => "tool.approval_required",
+            Self::ToolContextRequired => "tool.context_required",
         }
     }
 
@@ -663,6 +719,7 @@ impl TurnStopReason {
             Self::RepeatedToolCall => "repeated_tool_call",
             Self::EmptyResponse => "empty_response",
             Self::ContextBoundExceeded => "context_bound_exceeded",
+            Self::ContextRequired => "context_required",
         }
     }
 }
@@ -845,7 +902,8 @@ impl ToolStepResult {
             Self::Succeeded { call_id, .. }
             | Self::Failed { call_id, .. }
             | Self::Denied { call_id, .. }
-            | Self::ApprovalRequired { call_id } => call_id,
+            | Self::ApprovalRequired { call_id }
+            | Self::ContextRequired { call_id, .. } => call_id,
         }
     }
 
@@ -870,6 +928,7 @@ impl TurnEvent {
             Self::ToolFailed { .. } => TurnEventKind::ToolFailed,
             Self::ToolDenied { .. } => TurnEventKind::ToolDenied,
             Self::ToolApprovalRequired { .. } => TurnEventKind::ToolApprovalRequired,
+            Self::ToolContextRequired { .. } => TurnEventKind::ToolContextRequired,
         }
     }
 
@@ -887,7 +946,8 @@ impl TurnEvent {
             | Self::ToolCompleted { turn_id, .. }
             | Self::ToolFailed { turn_id, .. }
             | Self::ToolDenied { turn_id, .. }
-            | Self::ToolApprovalRequired { turn_id, .. } => *turn_id,
+            | Self::ToolApprovalRequired { turn_id, .. }
+            | Self::ToolContextRequired { turn_id, .. } => *turn_id,
         }
     }
 }
@@ -1498,6 +1558,22 @@ where
                     TurnStopReason::ApprovalRequired,
                 )?));
             }
+        } else if let ToolStepResult::ContextRequired { question, .. } = &result {
+            // Unconditional, the same way ApprovalRequired is: the model
+            // asked a real question and there was no one to answer it, so
+            // the loop must not continue on its own judgment — that is
+            // exactly the silent-guessing behavior this variant exists to
+            // replace. `state.failure_detail` carries the question itself
+            // (not `unhandled_tool_failure`/`ToolFailed` bookkeeping — this
+            // is not a malfunction).
+            state.failure_detail = Some(TurnFailureDetail::new(call.tool.clone(), question));
+            if stop_outcome.is_none() {
+                stop_outcome = Some(ToolBatchOutcome::Stopped(fail(
+                    state,
+                    events,
+                    TurnStopReason::ContextRequired,
+                )?));
+            }
         } else if result.is_unhandled_failure() {
             state.unhandled_tool_failure = true;
             state.failure_detail = Some(TurnFailureDetail::new(
@@ -1542,6 +1618,11 @@ fn emit_tool_result<E: TurnEventSink>(
             tool: call.tool.clone(),
         },
         ToolStepResult::ApprovalRequired { .. } => TurnEvent::ToolApprovalRequired {
+            turn_id: state.turn_id,
+            call_id: call.call_id.clone(),
+            tool: call.tool.clone(),
+        },
+        ToolStepResult::ContextRequired { .. } => TurnEvent::ToolContextRequired {
             turn_id: state.turn_id,
             call_id: call.call_id.clone(),
             tool: call.tool.clone(),
@@ -1609,8 +1690,12 @@ fn fail<E: TurnEventSink>(
     reason: TurnStopReason,
 ) -> Result<TurnResult, TurnError> {
     // A ToolFailed stop carries the most recent failing tool so the CLI can
-    // name it; every other stop has no tool detail by definition.
-    let detail = if reason == TurnStopReason::ToolFailed {
+    // name it; a ContextRequired stop carries the model's own question the
+    // same way (`dispatch_prepared` sets `state.failure_detail` for both
+    // before calling this); every other stop has no tool detail by
+    // definition.
+    let detail = if matches!(reason, TurnStopReason::ToolFailed | TurnStopReason::ContextRequired)
+    {
         state.failure_detail.clone()
     } else {
         None
@@ -3164,6 +3249,35 @@ mod tests {
     }
 
     #[test]
+    fn context_required_stops_without_complete_and_carries_the_question() {
+        let mut model = ScriptedModel::new(vec![tools_out(vec![call("c1", "ask_user")], 1)]);
+        let mut tools = ScriptedTools::new(vec![Ok(ToolStepResult::ContextRequired {
+            call_id: "c1".to_owned(),
+            question: "Which environment should I deploy to?".to_owned(),
+        })]);
+        let mut events = Vec::new();
+        let result = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(result.status(), TurnStatus::Failed);
+        assert_eq!(result.reason(), Some(TurnStopReason::ContextRequired));
+        let detail = result.failure_detail().expect("failure detail");
+        assert_eq!(detail.tool(), "ask_user");
+        assert_eq!(detail.error(), "Which environment should I deploy to?");
+        // Never reuses `tool.failed`'s event shape: a consumer that treats
+        // any `tool.failed` as an operator-visible failure marker must not
+        // see one for a call that didn't actually fail.
+        assert!(kinds(&events).contains(&"tool.context_required"));
+        assert!(!kinds(&events).contains(&"tool.failed"));
+        assert!(!kinds(&events).contains(&"turn.completed"));
+    }
+
+    #[test]
     fn kernel_event_kind_wire_forms_are_stable() {
         assert_eq!(TurnEventKind::TurnStarted.as_str(), "turn.started");
         assert_eq!(TurnEventKind::TurnInterrupted.as_str(), "turn.interrupted");
@@ -3180,6 +3294,10 @@ mod tests {
         assert_eq!(
             TurnEventKind::ToolApprovalRequired.as_str(),
             "tool.approval_required"
+        );
+        assert_eq!(
+            TurnEventKind::ToolContextRequired.as_str(),
+            "tool.context_required"
         );
         assert!(TurnEventKind::TurnCompleted.is_terminal());
         assert!(!TurnEventKind::ModelCompleted.is_terminal());

@@ -1474,6 +1474,20 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             None,
         )
         .map_err(|err| err.to_string())?;
+        // A subagent needing context is not a subagent failure: collapsing
+        // it into the generic `Err` below would discard the child's own
+        // question and tell the parent model only "subagent turn failed",
+        // giving it nothing to act on. `open_questions` is the existing,
+        // already-consumed mechanism for a child to surface something it
+        // couldn't resolve (`exec_tools.rs`'s subagent-summary rendering
+        // already appends every entry as "open question: ..."), so the
+        // question is reused through it rather than inventing a parallel
+        // channel — the parent model decides what to do next (ask the user
+        // itself, proceed on its own judgment, etc.), exactly as it already
+        // does for any other open question a child reports.
+        if let Some(question) = context_required_question(&outcome) {
+            return Ok(subagent_context_required_report(&outcome, question));
+        }
         if !is_effective_success(&outcome) {
             return Err(format!(
                 "subagent turn {}",
@@ -2196,6 +2210,21 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                     (Some(text), JsonlExitCode::Success, outcome.cost_usd_micros)
                 }
             }
+            Ok(outcome) if context_required_question(&outcome).is_some() => {
+                // Checked before `describe_turn_failure`'s generic "(failing
+                // tool: ...)" framing below: the model asked a real,
+                // specific question, not a malfunction — print it as-is,
+                // not wrapped in failure language, and exit `NeedsContext`
+                // (not `Success`, so a script can tell "stopped needing
+                // input" apart from "produced a confident final answer,"
+                // and not any error code either, since nothing actually
+                // went wrong).
+                let question = context_required_question(&outcome)
+                    .expect("guard just matched Some")
+                    .to_owned();
+                crate::exec_diag::stderr_line(&format!("needs context: {question}"));
+                (Some(question), JsonlExitCode::NeedsContext, outcome.cost_usd_micros)
+            }
             Ok(outcome) => {
                 let mut message = describe_turn_failure(
                     &outcome.result,
@@ -2761,6 +2790,15 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
                 None,
                 None,
             ),
+            TurnEvent::ToolContextRequired { turn_id, call_id, tool } => (
+                EventKind::ToolContextRequired,
+                turn_id,
+                Some(call_id),
+                Some(tool),
+                None,
+                None,
+                None,
+            ),
         };
         let payload = serde_json::json!({
             "turn_id": turn_id,
@@ -3244,25 +3282,88 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
     }
 
     match run_result {
-        Ok(outcome) => match outcome.result.status() {
-            AgentTerminalStatus::Succeeded => kernel::TurnOutcome::Completed {
-                text: Some(outcome.result.summary().to_owned()),
+        Ok(outcome) => match context_required_question(&outcome) {
+            // Not `Failed`: the model correctly recognized it needed
+            // something only the user can supply and asked for it, cleanly
+            // — the same shape of outcome as an ordinary completion (the
+            // kernel's own `TurnOutcome` has no third "stopped, but not a
+            // failure" shape, and none of its other two variants fit either:
+            // `Interrupted` is specifically for cancellation, not this). The
+            // question becomes the turn's own assistant-visible text so the
+            // *existing* transcript/session-ready pipeline shows it and
+            // returns to input-ready with no special-cased UI path and no
+            // failure banner — the user's next message is an ordinary new
+            // turn, not a resumption of this one.
+            Some(question) => kernel::TurnOutcome::Completed {
+                text: Some(question.to_owned()),
             },
-            AgentTerminalStatus::Cancelled => kernel::TurnOutcome::Interrupted,
-            AgentTerminalStatus::Failed => kernel::TurnOutcome::Failed {
-                reason: outcome.result.summary().to_owned(),
-            },
-            // `#[non_exhaustive]`: a future variant this match hasn't been
-            // taught yet. The summary text is still real and safe to show;
-            // treating it as failed rather than silently succeeding is the
-            // conservative direction for an unrecognized status.
-            _ => kernel::TurnOutcome::Failed {
-                reason: outcome.result.summary().to_owned(),
+            None => match outcome.result.status() {
+                AgentTerminalStatus::Succeeded => kernel::TurnOutcome::Completed {
+                    text: Some(outcome.result.summary().to_owned()),
+                },
+                AgentTerminalStatus::Cancelled => kernel::TurnOutcome::Interrupted,
+                AgentTerminalStatus::Failed => kernel::TurnOutcome::Failed {
+                    reason: outcome.result.summary().to_owned(),
+                },
+                // `#[non_exhaustive]`: a future variant this match hasn't
+                // been taught yet. The summary text is still real and safe
+                // to show; treating it as failed rather than silently
+                // succeeding is the conservative direction for an
+                // unrecognized status.
+                _ => kernel::TurnOutcome::Failed {
+                    reason: outcome.result.summary().to_owned(),
+                },
             },
         },
         Err(err) => kernel::TurnOutcome::Failed {
             reason: err.to_string(),
         },
+    }
+}
+
+/// The model's own question when a turn stopped because it genuinely needs
+/// something only the user can supply (`TurnStopReason::ContextRequired`,
+/// reachable today via `ask_user` with no interactive answer source) — the
+/// bounded `error` half of `failure_detail`, reused for this stop reason
+/// exactly as it already is for `ToolFailed` (see `TurnFailureDetail`'s own
+/// doc comment). `None` for every other outcome, including every other
+/// failure — never guessed from `outcome.result.summary()`'s prose, and
+/// never confused with `TurnStopReason::ContextBoundExceeded` (the model's
+/// context *window* overflowing — a host/context-owner repair, not a
+/// question for the user; `execute_with_context_recovery` already handles
+/// that one entirely on its own, before this function ever sees the result).
+fn context_required_question(outcome: &crate::host::ExecOutcome) -> Option<&str> {
+    if outcome.stop_reason != Some(agent_runtime::TurnStopReason::ContextRequired) {
+        return None;
+    }
+    outcome.failure_detail.as_ref().map(TurnFailureDetail::error)
+}
+
+/// The `SubagentReport` for a child turn that stopped needing context —
+/// see `LiveSubagentRunner::run`'s own call site for why this must not
+/// fall through to the generic "subagent turn failed" `Err` path.
+/// `open_questions` is the existing, already-consumed mechanism this reuses
+/// (`ExecTools::execute_task_spawn` already renders every entry as "open
+/// question: ..." in the parent-visible summary) rather than a new,
+/// competing channel for the same information.
+fn subagent_context_required_report(
+    outcome: &crate::host::ExecOutcome,
+    question: &str,
+) -> crate::exec_tools::SubagentReport {
+    crate::exec_tools::SubagentReport {
+        summary: format!(
+            "the subagent could not proceed without more information from the user: {question}"
+        ),
+        status: outcome.result.status().as_str().to_owned(),
+        tool_calls: outcome.tool_calls,
+        tokens: outcome.tokens,
+        cost_usd_micros: outcome.cost_usd_micros,
+        stop_reason: outcome.stop_reason.map(|reason| reason.as_str().to_owned()),
+        claims: Vec::new(),
+        blockers: Vec::new(),
+        open_questions: vec![question.to_owned()],
+        patch_summary: None,
+        artifacts: Vec::new(),
     }
 }
 
@@ -3357,6 +3458,7 @@ fn render_new_transcript_entries(entries: &[tui::state::TranscriptEntry]) {
                     ToolActivityStatus::Failed => "✗",
                     ToolActivityStatus::Denied => "⛔",
                     ToolActivityStatus::ApprovalRequired => "⏸",
+                    ToolActivityStatus::ContextRequired => "❓",
                 };
                 format!("{marker} {tool}")
             }
@@ -4595,6 +4697,34 @@ base_url = "http://127.0.0.1:11434/v1"
                 ]),
             }
         }
+
+        /// A single `ask_user` call, reaching the *real*
+        /// `ExecTools::execute_ask_user` (no answer source configured, the
+        /// same as every real production caller today) — the model's step
+        /// is scripted, but everything from the tool call onward
+        /// (`ContextRequired`, the turn stopping, `TurnStopReason::
+        /// ContextRequired`, the question flowing through `failure_detail`)
+        /// is the real, unmocked orchestration path.
+        fn asks_for_context(question: &str, options: &[&str]) -> Self {
+            let options_json = options
+                .iter()
+                .map(|option| format!("{option:?}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let call = ProposedToolCall::new(
+                "c1",
+                crate::exec_tools::ASK_USER_TOOL,
+                format!(r#"{{"question":{question:?},"options":[{options_json}]}}"#),
+            )
+            .expect("call");
+            Self {
+                outputs: VecDeque::from(vec![Ok(ModelStepOutput::ToolCalls {
+                    calls: vec![call],
+                    tokens: 1,
+                    cost_usd_micros: None,
+                })]),
+            }
+        }
     }
 
     impl crate::host::LiveModelCall for ScriptedModel {
@@ -5027,6 +5157,232 @@ base_url = "http://127.0.0.1:11434/v1"
         assert_eq!(usage.turns(), 2);
         assert_eq!(usage.tokens(), 350);
         assert_eq!(usage.cost(), 50);
+    }
+
+    // --- Inadequate-context semantics ---------------------------------
+
+    #[test]
+    fn a_turn_that_needs_context_ends_cleanly_with_the_models_own_question() {
+        // The real, unmocked path: a scripted model proposes a real
+        // `ask_user` call, which reaches the real `ExecTools::execute_ask_
+        // user` (no answer source configured, same as every real production
+        // caller today) and returns `ContextRequired`. No failure banner: the
+        // question surfaces as an ordinary assistant message, not
+        // `TranscriptEntry::TurnFailed`.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "deploy the app",
+            ScriptedModel::asks_for_context(
+                "Which environment: staging or production?",
+                &["staging", "production"],
+            ),
+        );
+
+        let transcript = session.transcript();
+        assert!(
+            transcript.iter().any(|entry| matches!(
+                entry,
+                TranscriptEntry::Assistant { text }
+                    if text == "Which environment: staging or production?\n1. staging\n2. production"
+            )),
+            "the model's own question (with its own options) must reach the transcript \
+             verbatim: {transcript:?}"
+        );
+        assert!(
+            !transcript.iter().any(|entry| matches!(entry, TranscriptEntry::TurnFailed { .. })),
+            "needing context is not a failure and must not show a failure banner: {transcript:?}"
+        );
+        assert!(
+            !transcript.iter().any(|entry| matches!(entry, TranscriptEntry::TurnInterrupted)),
+            "needing context is not a cancellation: {transcript:?}"
+        );
+        assert!(
+            !transcript.iter().any(|entry| matches!(
+                entry,
+                TranscriptEntry::ToolActivity { status: ToolActivityStatus::Failed, .. }
+            )),
+            "needing context must not show a failure marker on the ask_user call either: \
+             {transcript:?}"
+        );
+        assert!(
+            transcript.iter().any(|entry| matches!(
+                entry,
+                TranscriptEntry::ToolActivity { status: ToolActivityStatus::ContextRequired, .. }
+            )),
+            "the ask_user call gets its own non-failure activity marker: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn a_context_required_question_appears_exactly_once_not_duplicated() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "do something ambiguous",
+            ScriptedModel::asks_for_context("Which file did you mean?", &["a.rs", "b.rs"]),
+        );
+
+        let occurrences = session
+            .transcript()
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    TranscriptEntry::Assistant { text }
+                        if text == "Which file did you mean?\n1. a.rs\n2. b.rs"
+                )
+            })
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "the clarification question must appear exactly once, not duplicated as a second \
+             UI-visible message: {:?}",
+            session.transcript()
+        );
+    }
+
+    #[test]
+    fn a_turn_needing_context_still_accrues_its_usage_to_the_active_goal() {
+        // Mirrors the already-shipped GoalUsage semantic this task must not
+        // bypass: real tokens were spent proposing the `ask_user` call, so
+        // they must still accrue even though the turn stopped needing
+        // clarification rather than completing with a confident answer.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.create_active_goal();
+
+        session.run_turn(
+            "do something",
+            ScriptedModel::asks_for_context("Which target?", &["x", "y"]),
+        );
+
+        let usage = session.goal_usage();
+        assert_eq!(usage.turns(), 1, "a context-required turn still counts as one incurred turn");
+        assert_eq!(usage.tokens(), 1, "ScriptedModel::asks_for_context reports 1 token");
+    }
+
+    #[test]
+    fn after_needing_context_the_next_turn_proceeds_normally_with_no_stuck_state() {
+        // "The session returns to input-ready" and "the next user turn can
+        // proceed normally" — not a resumption of the same turn, an entirely
+        // ordinary new one, proven by actually running a second real turn
+        // and confirming both its own tool call and final answer show up.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+
+        session.run_turn(
+            "do something ambiguous",
+            ScriptedModel::asks_for_context("Which environment?", &["staging", "prod"]),
+        );
+        session.run_turn(
+            "staging",
+            ScriptedModel::write_then_answer("note.md", "staging", "done in staging"),
+        );
+
+        let transcript = session.transcript();
+        assert!(
+            transcript.iter().any(|entry| matches!(
+                entry,
+                TranscriptEntry::Assistant { text }
+                    if text == "Which environment?\n1. staging\n2. prod"
+            )),
+            "the first turn's question must still be present: {transcript:?}"
+        );
+        assert!(
+            transcript.iter().any(|entry| matches!(
+                entry,
+                TranscriptEntry::Assistant { text } if text == "done in staging"
+            )),
+            "the second, ordinary turn must run to completion normally: {transcript:?}"
+        );
+        assert!(
+            transcript.iter().any(|entry| matches!(
+                entry,
+                TranscriptEntry::ToolActivity { tool, status: ToolActivityStatus::Completed }
+                    if tool == crate::exec_tools::WORKSPACE_WRITE_TOOL
+            )),
+            "the second turn's own tool call must have really executed, proving no stuck \
+             turn_in_flight and no duplicate/skipped execution: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn context_required_question_is_none_for_every_other_stop_reason() {
+        // Direct unit coverage of the shared extraction helper: it must not
+        // mistake an ordinary tool-failure's `failure_detail` (also a
+        // `TurnFailureDetail{tool, error}`, by construction — see that
+        // struct's own doc comment on the deliberate reuse) for a
+        // clarification question just because both happen to carry text in
+        // the same-shaped field. Only `ContextRequired` counts.
+        let with_tool_failed = test_exec_outcome(
+            Some(agent_runtime::TurnStopReason::ToolFailed),
+            Some(agent_runtime::TurnFailureDetail::new("shell_exec", "not found")),
+        );
+        assert_eq!(context_required_question(&with_tool_failed), None);
+
+        let with_no_reason = test_exec_outcome(None, None);
+        assert_eq!(context_required_question(&with_no_reason), None);
+
+        let with_context_required = test_exec_outcome(
+            Some(agent_runtime::TurnStopReason::ContextRequired),
+            Some(agent_runtime::TurnFailureDetail::new("ask_user", "Which one?")),
+        );
+        assert_eq!(context_required_question(&with_context_required), Some("Which one?"));
+    }
+
+    #[test]
+    fn a_subagent_needing_context_reports_an_open_question_not_a_generic_failure() {
+        // Without this, `LiveSubagentRunner::run` would fall through to its
+        // generic `Err("subagent turn {status}")` path, discarding the
+        // child's own question entirely and leaving the parent model with
+        // nothing to act on.
+        let outcome = test_exec_outcome(
+            Some(agent_runtime::TurnStopReason::ContextRequired),
+            Some(agent_runtime::TurnFailureDetail::new(
+                "ask_user",
+                "Which environment should I deploy to?",
+            )),
+        );
+        let question = context_required_question(&outcome).expect("context required");
+        let report = subagent_context_required_report(&outcome, question);
+        assert_eq!(
+            report.open_questions,
+            vec!["Which environment should I deploy to?".to_owned()]
+        );
+        assert!(
+            report.summary.contains("Which environment should I deploy to?"),
+            "{}",
+            report.summary
+        );
+    }
+
+    /// Minimal `ExecOutcome` for testing `context_required_question` in
+    /// isolation, without running a real turn — the fields it doesn't
+    /// inspect are filled with harmless placeholders.
+    fn test_exec_outcome(
+        stop_reason: Option<agent_runtime::TurnStopReason>,
+        failure_detail: Option<agent_runtime::TurnFailureDetail>,
+    ) -> crate::host::ExecOutcome {
+        let result = AgentResult::new(
+            protocol::AgentId::new(),
+            AgentTerminalStatus::Failed,
+            "test summary",
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("result");
+        crate::host::ExecOutcome {
+            result,
+            failure_cause: None,
+            failure_detail,
+            stop_reason,
+            tool_calls: 0,
+            tokens: 0,
+            cost_usd_micros: None,
+        }
     }
 
     #[test]

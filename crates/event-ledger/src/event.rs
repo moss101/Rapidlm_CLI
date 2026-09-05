@@ -182,6 +182,7 @@ define_event_kinds! {
     ToolCompleted = "tool.completed" => Tool,
     ToolFailed = "tool.failed" => Tool,
     ToolDenied = "tool.denied" => Tool,
+    ToolContextRequired = "tool.context_required" => Tool,
     ApprovalRequested = "approval.requested" => Approval,
     ApprovalResolved = "approval.resolved" => Approval,
     ApprovalExpired = "approval.expired" => Approval,

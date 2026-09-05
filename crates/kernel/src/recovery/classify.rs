@@ -196,7 +196,10 @@ fn apply_inflight(
         | EventKind::ToolStarted => {
             upsert_tool(tools, event, optional_id(event.payload(), "call_id")?)
         }
-        EventKind::ToolCompleted | EventKind::ToolFailed | EventKind::ToolDenied => {
+        EventKind::ToolCompleted
+        | EventKind::ToolFailed
+        | EventKind::ToolDenied
+        | EventKind::ToolContextRequired => {
             remove_tool(tools, optional_id(event.payload(), "call_id")?);
             Ok(())
         }

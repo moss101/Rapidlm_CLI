@@ -1398,6 +1398,9 @@ impl WorkspaceTools {
                 Ok(ToolStepResult::ApprovalRequired { .. }) => {
                     format!("tool {}: approval_required", call.tool())
                 }
+                Ok(ToolStepResult::ContextRequired { question, .. }) => {
+                    format!("tool {}: context_required ({})", call.tool(), single_line(question))
+                }
                 Err(err) => format!("tool {}: error ({})", call.tool(), err.as_str()),
             };
             crate::exec_diag::stderr_line(&bounded_detail(&line));
@@ -2619,30 +2622,40 @@ impl WorkspaceTools {
     }
 
     /// `ask_user`: surface a question with options; the selected option is
-    /// read from the configured stdin source. Headless runs (no source)
-    /// return a typed refusal so the model can proceed on judgment.
+    /// read from the configured stdin source. With no source configured —
+    /// every production caller today, TUI and headless alike (`set_ask_
+    /// source` is wired only in this module's own tests) — the model asked
+    /// a real question with no one to answer it: `ContextRequired` stops
+    /// the turn cleanly with that exact question, rather than the previous
+    /// behavior of nudging the model to silently guess and continue, which
+    /// hid the fact that it wanted to ask something at all. A source that
+    /// *is* configured but fails to produce an answer (a real timeout, a
+    /// malformed response) stays a plain `Failed` below — a distinct case
+    /// (case C, not A, in this task's own taxonomy): an interactive user
+    /// was expected to be reachable and the attempt itself broke, not "no
+    /// one was ever there to ask."
     fn execute_ask_user(
         &self,
         call: &ValidatedToolCall,
         _cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         let (question, options) = parse_ask_user_args(call.arguments())?;
-        let Some(ask) = self.ask_stdin.as_deref() else {
-            return Ok(ToolStepResult::Failed {
-                call_id: call.call_id().to_owned(),
-                handled: true,
-                detail: Some(bounded_detail(
-                    "ask_user requires an interactive user; none is available in this \
-                     headless run — proceed with best judgment and state assumptions",
-                )),
-            });
-        };
         let listing: String = options
             .iter()
             .enumerate()
             .map(|(index, option)| format!("{}. {option}", index + 1))
             .collect::<Vec<_>>()
             .join("\n");
+        let Some(ask) = self.ask_stdin.as_deref() else {
+            // The options the model proposed are real structure it wants
+            // the answer shaped by, not just the bare question — carried
+            // along here rather than dropped, since nothing else re-derives
+            // them once the turn stops.
+            return Ok(ToolStepResult::ContextRequired {
+                call_id: call.call_id().to_owned(),
+                question: format!("{question}\n{listing}"),
+            });
+        };
         let prompt = format!("{question}\n{listing}\nAnswer with the option number: ");
         match ask(&prompt, &options, ASK_USER_TIMEOUT) {
             Ok(chosen) => Ok(ToolStepResult::Succeeded {
@@ -5446,8 +5459,11 @@ impl WorkspaceTools {
             ),
             ToolSurface::new(
                 ASK_USER_TOOL,
-                "Ask the user to choose between options. In headless runs this returns a \
-                 typed refusal. Arguments JSON: {\"question\":\"...\",\"options\":[\"a\",\"b\"]}.",
+                "Ask the user a question with a fixed set of options, when the turn genuinely \
+                 cannot proceed without information only the user can supply. Calling this ends \
+                 the turn and shows the user your exact question; they answer in a later \
+                 message, not within this turn — do not expect a reply now. Arguments JSON: \
+                 {\"question\":\"...\",\"options\":[\"a\",\"b\"]}.",
                 arguments_schema(
                     "Ask the user a question",
                     serde_json::json!({
@@ -11201,12 +11217,14 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn ask_user_reads_selection_or_refuses_headless() {
+    fn ask_user_reads_selection_or_reports_context_required_with_no_source() {
         use std::sync::Mutex as StdMutex;
         let root = TempRoot::new("ask");
         let mut tools = permissive_workspace(&root.0);
 
-        // Headless: no source wired -> typed refusal, never a turn-kill.
+        // No source wired (today: every production caller) -> ContextRequired
+        // carrying the model's own question verbatim, not a plain refusal the
+        // model could shrug off and guess past.
         let call = make_call(
             "a1",
             ASK_USER_TOOL,
@@ -11214,12 +11232,11 @@ for line in sys.stdin:
         );
         let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
         match tools.execute(&validated, &CancellationToken::new()).expect("e") {
-            ToolStepResult::Failed { handled, detail, .. } => {
-                assert!(handled);
-                let detail = detail.unwrap();
-                assert!(detail.contains("interactive user"), "{detail}");
+            ToolStepResult::ContextRequired { call_id, question } => {
+                assert_eq!(call_id, "a1");
+                assert_eq!(question, "Deploy?\n1. yes\n2. no");
             }
-            other => panic!("expected headless refusal, got {other:?}"),
+            other => panic!("expected ContextRequired, got {other:?}"),
         }
 
         // Interactive: a source returns the selected option.

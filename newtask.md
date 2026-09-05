@@ -4662,6 +4662,125 @@ value — nothing needed re-pricing); wiring `agent_runtime::GoalDriver` itself 
 larger, separate architectural question about autonomous goal continuation, not implied by "make `GoalUsage`
 reflect actual consumption"); real concurrency control for `goal.json`'s lost-update race, named above.
 
+**Inadequate-context semantics shipped 2026-09-05, user-directed.** A required, verify-first investigation
+established this was mostly a *missing distinction*, not a missing mechanism: `ExecTools::execute_ask_user`
+(`apps/rapid/src/exec_tools.rs`) already let a model ask the user a real question through a real, wired tool
+(`ask_user`), reading the answer from a configurable `ask_stdin: Option<Arc<dyn Fn(...) -> Result<String,
+String>>>`. But `set_ask_source` (the only setter) has exactly one caller anywhere in the workspace — a test
+— so in production, both the interactive TUI and headless `rapid exec` hit the identical no-source fallback:
+the model's real question was silently discarded and it was nudged to "proceed with best judgment," exactly
+the failure mode this task exists to fix. Of the task's own five-way taxonomy (missing information / context-
+window exhaustion / retrieval failure / ordinary model uncertainty / unsatisfied preconditions), only the
+first has no existing structured outcome: window exhaustion is already `TurnStopReason::ContextBoundExceeded`
+(repaired entirely by `execute_with_context_recovery`'s compaction-and-retry loop, never user-facing);
+retrieval failure and unsatisfied preconditions are ordinary tool/config failures already; ordinary
+uncertainty is deliberately never promoted to a special state. **Adopted definition:** "the model called
+`ask_user` with a real question and no interactive answer source exists to answer it" — nothing broader,
+nothing inferred from prose.
+**Representation, chosen to reuse rather than add:** a new `TurnStopReason::ContextRequired` (distinct from,
+never conflatable with, `ContextBoundExceeded` — verified `execute_with_context_recovery` matches the latter
+by exact equality) and `ToolStepResult::ContextRequired { call_id, question }`, handled by `dispatch_prepared`
+exactly like the existing `ApprovalRequired` precedent: it unconditionally stops the turn rather than letting
+the loop continue on the model's own judgment. The question itself rides on the *existing* `TurnFailureDetail
+{tool, error}` struct (previously used only for `ToolFailed`) rather than a new, identically-shaped struct —
+`tool` is always `"ask_user"`, `error` carries the question. `kernel::TurnOutcome` (`Completed{text}/
+Failed{reason}/Interrupted`) was deliberately left untouched: it already collapses every other stop reason,
+including `ApprovalRequired`, into `Failed{reason: String}` with no sub-reason precedent, so a context-required
+turn maps to `Completed{text: question}` instead — the real distinction stays one layer down, in
+`agent_runtime::TurnStopReason`, where `apps/rapid`'s own mapping code already has full access to it.
+**Terminate-vs-suspend, resolved from the architecture rather than asked:** Option A (special terminal
+outcome, no suspended state) — the kernel's turn/lease model is strictly one-turn-at-a-time with no
+suspension concept anywhere in the live codebase, so Option B (resume in place) had no real mechanism to hang
+off of. The next user message starts an entirely ordinary new turn.
+**TUI/headless behavior:** `apps/rapid/src/interactive.rs` gained one shared helper,
+`context_required_question(outcome) -> Option<&str>`, that both `execute_interactive_turn` and `exec_turn`
+call identically. The TUI maps a context-required outcome to `kernel::TurnOutcome::Completed{text: Some
+(question)}` — the question appears as an ordinary assistant message, no `TranscriptEntry::TurnFailed`
+banner, session returns to input-ready with no stuck `turn_in_flight`. Headless `rapid exec` prints the
+question directly (skipping the ordinary `describe_turn_failure` failure framing entirely) and exits with a
+new `JsonlExitCode::NeedsContext = 9` (following the existing distinct-code-per-situation pattern
+`GoalIncomplete = 6` already established), not `Success` or any error code.
+**Goal behavior:** deliberately zero new code. `accrue_turn_usage` (shipped in the `GoalUsage` work directly
+above) already accrues for any `Ok(outcome)` regardless of terminal status — a context-required turn's real
+tokens/cost accrue exactly once, automatically, through the unmodified existing path. Goal lifecycle state
+(`Active`/`Blocked`/`Paused`) is left untouched on purpose: both of those states require an explicit human
+lifecycle action to resume, wrong for a condition meant to resolve via the user's very next ordinary message.
+**Replay:** no new risk introduced. `Completed{text: question}` reuses the existing, already-replay-safe
+`TurnCompleted` event shape unchanged (no new kernel `EventKind`, no new projection/reducer logic) — replaying
+the ledger re-folds the same text, never re-triggers a model call.
+**Self-review found six real issues in the first pass, all fixed and re-verified:**
+1. **(Highest severity) The mid-turn progress event reused `TurnEvent::ToolFailed`'s shape**, meaning the TUI
+   still rendered a "✗ ask_user" failure marker on the way to the clean, non-failure question — silently
+   contradicting the "no failure banner" requirement even though the *turn's own* terminal outcome was
+   correctly `Completed`. Unlike `ApprovalRequired` (which the original implementation claimed to mirror but
+   didn't, in this one respect), that variant already has its own dedicated event and TUI status precedent.
+   Fixed by adding the same dedicated shape for this case: `EventKind::ToolContextRequired` (`event-ledger`),
+   `TurnEventKind`/`TurnEvent::ToolContextRequired` (`agent-runtime`), a new `ToolActivityStatus::
+   ContextRequired` (`tui::state`) rendered as `❓` instead of `✗` (`apps/rapid/src/interactive.rs`), and
+   `crates/kernel/src/recovery/classify.rs`'s in-flight-tool tracking updated to treat it as terminal (removes
+   the call from the in-flight set, like `ToolCompleted`/`ToolFailed`/`ToolDenied` — unlike
+   `ApprovalRequired`, which stays in-flight because approval resumes the *same* call; this doesn't).
+   Revert-cycle verified: reverting the event-shape change reproduced the exact "✗ ask_user" marker in both a
+   new `agent-runtime` unit test and the existing `apps/rapid` scripted-turn test; restoring fixed both.
+2. **The question was silently truncated at 300 bytes** (`TurnFailureDetail`'s shared bound, sized for short
+   `ToolFailed` error strings, not user-facing questions) even though `ask_user` allows up to 1024 bytes of
+   question plus up to 8 options of 256 bytes each (~3.1 KB worst case) — directly violating the task's own
+   "preserve the model's own specific question verbatim" requirement. Fixed by raising the shared bound to
+   4096 bytes (comfortably covers the worst case; confirmed via `ToolFailed`'s own separate, much smaller
+   pre-bound — `MAX_RESULT_DETAIL_BYTES = 256` — that this change has zero practical effect on `ToolFailed`'s
+   real-world truncation).
+3. **The model-visible `ask_user` tool schema description still said** "In headless runs this returns a typed
+   refusal" — false since this task's very first commit, since headless and interactive now behave
+   identically. Rewritten to accurately describe the real behavior (the turn ends, the user sees the exact
+   question, no reply arrives within the same turn).
+4. **`ask_user`'s `options` list was silently dropped** when surfaced via `ContextRequired` — real structure
+   the model proposed for shaping the answer, lost instead of shown. Fixed by folding the same numbered
+   listing already built for the interactive-answer path into the question text carried by `ContextRequired`
+   (without the "answer with the option number" instruction, which doesn't apply — the user replies in prose,
+   in a later message).
+5. **A subagent (`task_spawn`) that itself needed context collapsed into a fully generic `Err("subagent turn
+   failed")`**, discarding the child's own question entirely and giving the parent model nothing to act on.
+   Fixed by reusing `SubagentReport.open_questions` — an already-existing, already-consumed mechanism
+   (`ExecTools::execute_task_spawn` already renders every entry as "open question: ..." in the parent-visible
+   summary) — rather than inventing a second channel for the same information: a context-required child now
+   returns a normal report whose `open_questions` carries the question. Extracted into a small, directly
+   testable helper (`subagent_context_required_report`) since `LiveSubagentRunner::run` itself isn't reachable
+   through the scripted-model test harness (it always builds a live model from real config). Revert-cycle
+   verified: reverting the helper to drop the question reproduced the exact predicted empty-`open_questions`
+   failure in a new unit test; restoring fixed it.
+6. **No direct `agent-runtime`-level unit test exercised `ContextRequired` through `dispatch_prepared`/
+   `fail()` directly** — all prior coverage was indirect, through `apps/rapid`. Fixed by adding
+   `context_required_stops_without_complete_and_carries_the_question`, mirroring the existing
+   `approval_required_stops_without_complete` test exactly.
+**Tests:** 5 new in `apps/rapid/src/interactive.rs`'s existing scripted-turn harness (a context-required turn
+ends cleanly with the model's own question and no failure/interrupt banner, and now also asserts no `✗`
+marker and a real `ContextRequired` marker instead; the question appears exactly once; usage still accrues to
+an active goal; the next turn after one needing context runs completely normally, proving no stuck state;
+`context_required_question` returns `None` for every other stop reason including an ordinary `ToolFailed`
+carrying the same-shaped `TurnFailureDetail`) plus 1 more added during self-review fixes (a subagent needing
+context reports an open question, not a generic failure) — 6 new in `apps/rapid` total. 2 new in
+`crates/agent-runtime/src/turn.rs` (the direct `dispatch_prepared` coverage from finding 6, plus a wire-form
+stability assertion for the new `TurnEventKind`). All reach the real, unmocked orchestration path: the
+scripted-model tests only script the model's own step, letting a real `ask_user` `ProposedToolCall` reach the
+real, unmocked `ExecTools::execute_ask_user`. Full `-p rapid --lib` suite (463 tests, up from 457 — 6 new),
+`-p agent-runtime --lib` (278 tests, up from 277 — 1 new: the direct `dispatch_prepared` coverage from
+finding 6; the wire-form stability check was one more assertion added to an existing test, not a new one),
+`-p tui -p kernel -p event-ledger --lib` (475 tests, all passing — both `kernel` and `tui` needed real,
+additive changes for this task, the new `EventKind`/in-flight-tracking arm and the new `ToolActivityStatus`/
+projection arm respectively, not just incidental exposure), `cargo clippy -p agent-runtime -p rapid -p tui
+-p kernel -p event-ledger --lib --tests --no-deps` (zero new lints on any touched file — every finding in the
+report is pre-existing, in files this task never touched), and `cargo build --workspace --tests` all pass. Revert-cycle verified beyond the two
+findings above: the `execute_ask_user` → `ContextRequired` wiring and the TUI's `Completed{text}` mapping
+decision were each reverted and confirmed to reproduce the exact predicted `TurnFailed` banner, then restored.
+**Deliberately not attempted, per the driving instruction's own scope:** `GoalUsage` redesign or pricing
+logic (untouched, reused as-is); TUI panel-richness wiring; slash-command implementation; broad retrieval
+improvements or RAG redesign; generic prompt-engineering changes; context-compression/summarization redesign
+(the identified semantic needed none of it); sandbox changes; unrelated lifecycle cleanup. ACP (Agent Client
+Protocol) event mapping (`crates/acp/src/v1.rs::map_kernel_event`) was checked, not extended: the new
+`EventKind::ToolContextRequired` safely falls through its existing `_ => None` wildcard (no update emitted,
+no incorrect status shown) — real feature parity for ACP-based IDE clients is a separate surface this task's
+own scope never named (only the TUI and headless `rapid exec` were).
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
