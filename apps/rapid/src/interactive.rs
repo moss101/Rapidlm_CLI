@@ -1743,7 +1743,15 @@ pub(crate) fn exec_turn(
     // closed on an unreadable policy above, so by this point a load failure
     // here would mean the file changed underneath us mid-turn; skipping the
     // (non-security-critical) ceiling narrowing in that edge case is safer
-    // than failing a turn whose permission lattice already resolved.
+    // than failing a turn whose permission lattice already resolved. Also
+    // captures `policy_version` for the router-decision log below, reusing
+    // this same read rather than loading a third time — the version
+    // attached to a decision must describe the policy this specific read
+    // actually saw, and every extra independent read only widens the
+    // (already-accepted, see above) window for the file to have changed
+    // between reads and the log naming a policy that wasn't the one
+    // actually applied.
+    let mut policy_version: Option<String> = None;
     if let Ok(Some(policy)) = crate::managed_config::load_policy(&std::env::vars().collect::<Vec<_>>()) {
         if let Some(max) = policy.max_write_bytes_per_turn() {
             tools.narrow_write_ceiling(max);
@@ -1754,6 +1762,7 @@ pub(crate) fn exec_turn(
         if let Some(max) = policy.max_subagent_spawns_per_turn() {
             tools.narrow_subagent_spawn_ceiling(max);
         }
+        policy_version = Some(policy.policy_version().to_owned());
     }
     // Observability for the fail-closed default: when headless exec runs
     // without workspace tools (or under a mode that refuses every call), say
@@ -1953,16 +1962,14 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                 Ok(controller) => {
                     let diag = parsed.verbose.then(|| StepDiag::stderr(&base_url));
                     let mut chain = FallbackChainModel::new(backends, controller, diag);
-                    // Re-loading rather than threading a value from earlier
-                    // in `exec_turn` — same rationale as the disk/network
-                    // ceiling narrowing above: non-security-critical, so a
-                    // load failure here just means no version is attached
-                    // rather than failing the whole turn.
-                    if let Ok(Some(managed_policy)) =
-                        crate::managed_config::load_policy(&std::env::vars().collect::<Vec<_>>())
-                    {
-                        chain.set_policy_version(Some(managed_policy.policy_version().to_owned()));
-                    }
+                    // Reuses the single read captured above (disk/network
+                    // ceiling narrowing) rather than loading a third time —
+                    // see that read's own doc comment for why: a third
+                    // independent read could see a different file than the
+                    // one that actually gated this turn's permission mode,
+                    // and would make the recorded version describe a
+                    // policy that wasn't the one actually applied.
+                    chain.set_policy_version(policy_version.clone());
                     router_decisions = chain.decisions();
                     SelectedModel::FallbackChain(Box::new(chain))
                 }

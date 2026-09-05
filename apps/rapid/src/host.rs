@@ -937,6 +937,16 @@ pub struct RouterDecisionRecord {
     /// managed policy is configured at all — the remaining half of Modbit
     /// `MOD-005`'s "policy version" ask, closed 2026-09-05. A content
     /// identity, not a semantic version; see that field's own doc comment.
+    /// Best-effort, not transactional: `interactive.rs`'s real caller reads
+    /// the policy file once for this turn and reuses that single read for
+    /// both this field and its own disk/network-ceiling narrowing, but that
+    /// read is still independent of the earlier, security-relevant read
+    /// `exec_permission_lattice` uses to actually gate permission mode — if
+    /// the file changes between those two reads, this field can describe a
+    /// policy that wasn't the one actually enforced for the turn. Narrowing
+    /// that further would mean threading a value across a function boundary
+    /// that already deliberately re-loads rather than threads (see that
+    /// site's own doc comment); not attempted here.
     pub policy_version: Option<String>,
 }
 

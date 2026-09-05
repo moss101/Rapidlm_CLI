@@ -5696,6 +5696,31 @@ model, routing reason, policy version, estimated vs. actual cost — "routing mu
   now fully closed** except the one piece both this entry and the cost entry above independently concluded
   needs genuinely separate infrastructure: an *estimated* (not actual) cost per decision, which needs a real
   `ModelCatalog` pricing lookup this record has no access to.
+- **Self-review of the commit above, same day, found one real gap: the new code re-loaded the managed
+  policy from disk a *third* independent time within `exec_turn`, on top of two pre-existing reads.**
+  `exec_permission_lattice` reads it once, early, to gate permission mode (security-relevant, fails the
+  turn closed on error); `exec_turn` itself already re-reads it a second time for disk/network-ceiling
+  narrowing (an established, documented pattern — re-loading rather than threading a value across that
+  function boundary, since a load failure there is tolerable but failing an already-resolved turn isn't).
+  The `policy_version` wiring added a third independent read with no reconciliation to any of the others.
+  Concretely: if the policy file changed between reads, a `RouterDecisionRecord` could carry a
+  `policy_version` describing a document that was not the one that actually gated that turn's permission
+  mode — the exact failure mode the field exists to prevent, since its whole purpose is letting an auditor
+  trust "this version was in effect." A transient failure on just the third read would also silently record
+  `None` even though a real policy *was* enforced, implying "no policy" when one existed. **Fixed:**
+  collapsed the second and third reads into one — `exec_turn`'s existing disk/network-ceiling-narrowing
+  block now also captures `policy.policy_version().to_owned()` into an outer `policy_version: Option<String>`
+  local, and the `FallbackChainModel::set_policy_version` call site reuses that captured value instead of
+  loading a third time. This does not close the gap against the *first*, earliest read
+  (`exec_permission_lattice`'s) — doing that would mean threading a value across the exact function boundary
+  the codebase's own existing doc comment already explains was deliberately not threaded, a real architectural
+  decision from a prior session this pass had no basis to revisit unprompted. Documented the residual,
+  accepted risk explicitly on `RouterDecisionRecord::policy_version`'s own doc comment (best-effort, not
+  transactional) rather than leaving it as a silent gap. No new dedicated test: this is a same-function
+  variable-reuse refactor with no new branching logic, and the existing `set_policy_version`/`policy_version`
+  unit tests (host.rs, managed_config.rs, jsonl.rs) already cover the mechanism this reuses. Full
+  `-p rapid --lib` suite (424 tests, unchanged — no new test count expected) and `cargo build --workspace
+  --tests` pass.
 - **Unrelated security fix found while auditing this crate, 2026-08-30: an integer overflow in chunked
   HTTP decoding let any configured provider crash the process.** `crates/llm-router/src/providers/
   openai_compatible.rs::decode_chunked` (shared by both the OpenAI-compatible and Anthropic adapters via
