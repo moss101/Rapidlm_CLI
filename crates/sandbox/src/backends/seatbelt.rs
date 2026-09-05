@@ -1,14 +1,13 @@
 //! macOS Seatbelt (`sandbox-exec`) sandbox backend.
 //!
-//! Wraps the same `sandbox-exec -f <profile>` invocation `apps/rapid`'s
-//! existing async job-based `shell_exec(sandbox: true)` path already uses
-//! (`apps/rapid/src/exec_tools.rs::seatbelt_profile`/`find_sandbox_exec`),
-//! but through `SandboxManager`'s ordinary synchronous `SandboxBackend`
-//! contract instead of a special-cased job. The two paths are deliberately
-//! left unmerged for now (see `newtask.md` §1.1 item #2 and
-//! `apps/rapid/src/sandbox_exec.rs`'s own doc comment on the same split) —
-//! wiring `apps/rapid` to prefer this backend over the existing job path is
-//! separate follow-up work, not attempted here.
+//! Backs `apps/rapid`'s async job-based `shell_exec(sandbox: true)` path
+//! (`exec_tools.rs::JobRegistry::start_sandboxed`, via
+//! `apps/rapid/src/sandbox_exec.rs::build_manager_seatbelt`) through
+//! `SandboxManager`'s ordinary synchronous `SandboxBackend` contract, driven
+//! from a background thread rather than a special-cased raw `sandbox-exec`
+//! argv wrap — see `apps/rapid/src/sandbox_exec.rs`'s own doc comment for why
+//! that path stays async instead of collapsing onto the synchronous
+//! `run_sandboxed` shape non-macOS uses.
 //!
 //! Lands at [`SandboxTier::HostRestricted`] (so `isolation()` reports
 //! [`IsolationStrength::ProcessPolicy`]) even though a real Seatbelt profile
@@ -24,15 +23,14 @@
 //! but-broader-than-`None` mode exists here): `None` adds a real `(deny
 //! network*)` rule, verified empirically against the real `sandbox-exec`
 //! binary that a later `(allow default)` does not undo an earlier `(deny
-//! network*)` — a genuine guarantee neither the existing job-based Seatbelt
-//! path nor `HostRestrictedBackend`'s process-policy-only isolation makes
-//! today. `Open` omits that rule entirely, leaving network exactly as
-//! unrestricted as the existing job-based path already leaves it — added
-//! specifically so routing `apps/rapid`'s macOS `shell_exec(sandbox: true)`
-//! through this backend (see `newtask.md` §1.1) doesn't silently tighten
-//! network behavior as an unannounced side effect of an unrelated
-//! resource-governance fix; a caller has to explicitly ask for `None` to
-//! get the stronger guarantee.
+//! network*)` — a genuine guarantee `HostRestrictedBackend`'s process-
+//! policy-only isolation never makes. `Open` omits that rule entirely,
+//! leaving network unrestricted — what `start_sandboxed` requests, matching
+//! the network-open behavior `apps/rapid`'s macOS sandboxed shell_exec had
+//! before it gained real resource governance (`newtask.md` §1.1), so wiring
+//! it through this backend didn't silently tighten network behavior as an
+//! unannounced side effect; a caller has to explicitly ask for `None` to get
+//! the stronger guarantee.
 
 use std::collections::HashMap;
 use std::fs;
@@ -286,16 +284,13 @@ impl SandboxBackend for SeatbeltBackend {
 
 /// `(version 1) (deny file-write*)` plus one `(allow file-write* (subpath
 /// ...))` per resolved read-write mount, `/dev/` and `/private/tmp/` always
-/// allowed for ordinary scratch/pipe use (matching the existing job-based
-/// path's own profile), a `(deny network*)` only when `network` is
-/// `SandboxNetwork::None` (omitted entirely for `Open` — `prepare` has
-/// already confirmed `network` is one of these two, nothing else reaches
-/// here), and `(allow default)` last for everything else — same shape and
-/// rule order as `apps/rapid/src/exec_tools.rs::seatbelt_profile`,
-/// empirically verified (outside this crate, against the real
-/// `sandbox-exec` binary) that a trailing `(allow default)` does not undo
-/// an earlier `(deny network*)` or narrow `(allow file-write* (subpath
-/// ...))`.
+/// allowed for ordinary scratch/pipe use, a `(deny network*)` only when
+/// `network` is `SandboxNetwork::None` (omitted entirely for `Open` —
+/// `prepare` has already confirmed `network` is one of these two, nothing
+/// else reaches here), and `(allow default)` last for everything else —
+/// empirically verified (against the real `sandbox-exec` binary) that a
+/// trailing `(allow default)` does not undo an earlier `(deny network*)` or
+/// narrow `(allow file-write* (subpath ...))`.
 fn render_profile(write_roots: &[CanonicalHostPath], network: SandboxNetwork) -> String {
     let mut profile = String::from("(version 1)\n(deny file-write*)\n");
     for root in write_roots {

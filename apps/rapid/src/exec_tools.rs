@@ -209,6 +209,16 @@ struct JobShared {
     state: Arc<Mutex<JobState>>,
     child: Arc<Mutex<Option<std::process::Child>>>,
     reported: Arc<AtomicBool>,
+    /// Set only for a `start_sandboxed` job (`None` for a plain `start`
+    /// one): a real `capability_broker::CancellationToken`, cloned into the
+    /// in-flight `SandboxManager::exec` call, whose `.cancel()` that call's
+    /// own internal wait loop actually observes. `cancelled` above is
+    /// polled by the plain-`Command` supervisor loop this struct was
+    /// originally built for; a sandboxed job has no such loop on the
+    /// `apps/rapid` side (`exec`'s own internal loop already enforces
+    /// timeout/cancellation/resource ceilings), so cancelling it needs this
+    /// concrete type instead of a bare flag.
+    sandbox_cancel: Option<capability_broker::CancellationToken>,
 }
 
 enum JobState {
@@ -279,6 +289,7 @@ impl JobRegistry {
             state: Arc::new(Mutex::new(JobState::Running)),
             child: Arc::new(Mutex::new(None)),
             reported: Arc::new(AtomicBool::new(false)),
+            sandbox_cancel: None,
         };
         self.jobs
             .lock()
@@ -432,6 +443,147 @@ impl JobRegistry {
         Ok(id)
     }
 
+    /// Same shape as [`Self::start`] — a detached job the model polls via
+    /// `job_status`/`job_output` — but for macOS `shell_exec(sandbox: true)`:
+    /// `argv` runs through `crates/sandbox`'s `SeatbeltBackend` instead of a
+    /// plain `std::process::Command`, giving it the same real process-group
+    /// isolation and CPU/memory/pid ceilings the non-macOS sandboxed path
+    /// (`sandbox_exec::run_sandboxed`) already has, closing the gap
+    /// `newtask.md` §1.1 names: the previous macOS job (raw `sandbox-exec`
+    /// argv wrapping, dispatched through the plain `start` above) enforced
+    /// only wall-clock timeout and `MAX_JOB_OUTPUT_BYTES`, nothing else.
+    ///
+    /// Shares `start`'s own per-turn budget (`MAX_BACKGROUND_JOBS`) — one
+    /// counter for every kind of background job, not a separate ceiling per
+    /// kind. Unlike `start`, there is no polling supervisor loop on this
+    /// side: `SandboxManager::exec`'s own internal wait loop already
+    /// enforces timeout/cancellation/resource ceilings, so this thread just
+    /// calls `prepare`/`exec`/`destroy` once and reports the outcome.
+    ///
+    /// One real, deliberate difference from `start`, not silently dropped:
+    /// output is not streamed incrementally — `job_output` sees nothing
+    /// until the sandboxed call fully completes, then the whole captured
+    /// buffer appears at once (`SandboxBackend::exec` has no way to expose
+    /// partial output while still running). Streaming would need a change
+    /// to the `SandboxBackend` trait itself, affecting every backend — a
+    /// real, separate follow-up, not attempted here.
+    fn start_sandboxed(
+        &self,
+        root: &Path,
+        argv: &[String],
+        timeout: Duration,
+        output_limit: u64,
+    ) -> Result<String, ToolStepError> {
+        if self.started_this_turn.fetch_add(1, Ordering::SeqCst) >= MAX_BACKGROUND_JOBS as u64 {
+            return Err(ToolStepError::Failed);
+        }
+        let id = format!("job-{}", self.seq.fetch_add(1, Ordering::SeqCst) + 1);
+        let sandbox_cancel = capability_broker::CancellationToken::new();
+        let shared = JobShared {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            output: Arc::new(Mutex::new(Vec::new())),
+            overflow: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(Mutex::new(JobState::Running)),
+            child: Arc::new(Mutex::new(None)),
+            reported: Arc::new(AtomicBool::new(false)),
+            sandbox_cancel: Some(sandbox_cancel.clone()),
+        };
+        self.jobs
+            .lock()
+            .map_err(|_| ToolStepError::Failed)?
+            .insert(id.clone(), shared.clone());
+
+        let root = root.to_path_buf();
+        let argv: Vec<String> = argv.to_vec();
+        let worker = shared.clone();
+        let spawned = std::thread::Builder::new()
+            .name("rapidlm-sandboxed-job".to_owned())
+            .spawn(move || {
+                let outcome = (|| -> Result<crate::sandbox_exec::SandboxRunOutcome, crate::sandbox_exec::SandboxRunError> {
+                    let manager = crate::sandbox_exec::build_manager_seatbelt();
+                    let spec = crate::sandbox_exec::build_spec(
+                        &root,
+                        timeout,
+                        output_limit,
+                        sandbox::SandboxNetwork::Open,
+                    )?;
+                    let issuer = capability_broker::LeaseIssuer::ephemeral();
+                    let command_name = argv.first().map(String::as_str).unwrap_or("shell");
+                    let (lease, revision) =
+                        crate::sandbox_exec::mint_proc_exec_lease(&issuer, command_name)?;
+                    let validator = capability_broker::LeaseValidator::new(issuer, revision);
+                    // Resolve the program and build the exec request BEFORE
+                    // `prepare()` runs, not after: `prepare()` writes a real
+                    // temp Seatbelt profile file that only `destroy()`
+                    // removes, with no `Drop` fallback anywhere in the
+                    // chain, so once `prepare()` succeeds every following
+                    // step must be infallible (or itself already call
+                    // `destroy()`) to guarantee that file is always cleaned
+                    // up rather than leaked on a `resolve_program`/
+                    // `SandboxExecRequest::new` failure.
+                    let program = crate::sandbox_exec::resolve_program(&root, command_name)?;
+                    let resolved_argv = std::iter::once(program).chain(argv.iter().skip(1).cloned());
+                    let request = sandbox::SandboxExecRequest::new(resolved_argv, timeout, output_limit)
+                        .map_err(crate::sandbox_exec::SandboxRunError::Sandbox)?;
+                    let handle = manager
+                        .prepare(&spec, &lease, &sandbox_cancel)
+                        .map_err(crate::sandbox_exec::SandboxRunError::Sandbox)?;
+                    let result =
+                        manager.exec(&spec, &handle, &request, &lease, &validator, &sandbox_cancel);
+                    let _ = manager.destroy(&handle, &sandbox_cancel);
+                    let result = result.map_err(crate::sandbox_exec::SandboxRunError::Sandbox)?;
+                    Ok(crate::sandbox_exec::SandboxRunOutcome {
+                        exit_code: result.exit().code(),
+                        timed_out: result.exit().timed_out(),
+                        signal: result.exit().signal(),
+                        oom: result.exit().oom(),
+                        policy_violation: result.exit().policy_violation(),
+                        output: result.output().to_vec(),
+                    })
+                })();
+                match outcome {
+                    Ok(outcome) => {
+                        if let Ok(mut spool) = worker.output.lock() {
+                            let room = MAX_JOB_OUTPUT_BYTES.saturating_sub(spool.len());
+                            let take = outcome.output.len().min(room);
+                            spool.extend_from_slice(&outcome.output[..take]);
+                            if take < outcome.output.len()
+                                || outcome.output.len() >= output_limit as usize
+                            {
+                                worker.overflow.store(true, Ordering::SeqCst);
+                            }
+                        }
+                        let state = match outcome.exit_code {
+                            Some(code) => JobState::Completed(code),
+                            None => JobState::Failed(sandboxed_status_line(
+                                outcome.exit_code,
+                                outcome.timed_out,
+                                outcome.signal,
+                                outcome.oom,
+                                outcome.policy_violation,
+                            )),
+                        };
+                        if let Ok(mut slot) = worker.state.lock() {
+                            *slot = state;
+                        }
+                    }
+                    Err(err) => {
+                        if let Ok(mut slot) = worker.state.lock() {
+                            *slot = JobState::Failed(format!("sandboxed exec failed: {err}"));
+                        }
+                    }
+                }
+            });
+        if spawned.is_err() {
+            if let Ok(mut jobs) = self.jobs.lock() {
+                jobs.remove(&id);
+            }
+            return Err(ToolStepError::Failed);
+        }
+        self.prune();
+        Ok(id)
+    }
+
     fn snapshot(&self, id: &str) -> Option<String> {
         let jobs = self.jobs.lock().ok()?;
         jobs.get(id)
@@ -518,6 +670,9 @@ impl JobRegistry {
         };
         for job in jobs.values() {
             job.cancelled.store(true, Ordering::SeqCst);
+            if let Some(token) = &job.sandbox_cancel {
+                token.cancel();
+            }
             if let Ok(mut child) = job.child.try_lock() {
                 if let Some(child) = child.as_mut() {
                     let _ = child.kill();
@@ -1916,27 +2071,23 @@ impl WorkspaceTools {
             });
         }
         if args.sandbox {
-            // Seatbelt confinement (macOS): workspace writes allowed, other
-            // writes denied. Runs as an async background job — see
-            // sandbox_exec's own doc comment for why the two paths aren't
-            // unified yet.
-            if let Some(sandbox_exec) = find_sandbox_exec() {
-                let profile_path = self
-                    .resolve_in_root(".rapidlm/seatbelt.sb")
-                    .map_err(|_| ToolStepError::Failed)?;
-                fs::write(
-                    &profile_path,
-                    seatbelt_profile(self.root()).as_bytes(),
-                )
-                .map_err(|_| ToolStepError::Failed)?;
-                let mut sandboxed = vec![sandbox_exec.to_string_lossy().into_owned()];
-                sandboxed.push("-f".to_owned());
-                sandboxed.push(profile_path.to_string_lossy().into_owned());
-                sandboxed.extend(args.argv.iter().cloned());
-                let job_id = self.jobs.start(&sandboxed, self.root(), args.timeout)?;
+            // Seatbelt confinement (macOS): `SandboxManager` + `SeatbeltBackend`
+            // (crates/sandbox), giving this async job the same real
+            // process-group isolation and CPU/memory/pid-count governance
+            // `sandbox_exec::run_sandboxed` already has on non-macOS, instead
+            // of the wall-clock-timeout-only supervision plain `start` gives
+            // it. Runs as an async background job (`start_sandboxed`),
+            // unlike `run_sandboxed` below which is synchronous.
+            if find_sandbox_exec().is_some() {
+                let job_id = self.jobs.start_sandboxed(
+                    self.root(),
+                    &args.argv,
+                    args.timeout,
+                    MAX_JOB_OUTPUT_BYTES as u64,
+                )?;
                 let mut summary = format!(
                     "started sandboxed job {job_id}: {} (timeout {}s); poll with job_status",
-                    sandboxed[3..].join(" "),
+                    args.argv.join(" "),
                     args.timeout.as_secs()
                 );
                 if let Some(note) = scan_command_advisory(self.root(), &args.argv) {
@@ -4330,15 +4481,11 @@ fn truncate_str(text: &str, cap: usize) -> String {
     text[..end].to_owned()
 }
 
-/// Generate a macOS Seatbelt profile permitting workspace writes only.
-fn seatbelt_profile(workspace: &Path) -> String {
-    format!(
-        "(version 1)\n(deny file-write*)\n(allow file-write*\n  (subpath {workspace:?})\n  \
-         (subpath \"/dev/\" )\n  (subpath \"/private/tmp/\"))\n(allow default)"
-    )
-}
-
-/// Locate sandbox-exec (macOS). None = sandboxing unavailable.
+/// Locate sandbox-exec (macOS). `None` = sandboxing unavailable — gates
+/// whether `execute_shell`'s sandbox branch uses the async
+/// `JobRegistry::start_sandboxed` (via `SeatbeltBackend`, which does its own
+/// internal profile generation/writing) or falls back to the synchronous
+/// non-macOS `sandbox_exec::run_sandboxed` path.
 fn find_sandbox_exec() -> Option<PathBuf> {
     let mut path = PathBuf::from("/usr/bin/sandbox-exec");
     if path.exists() {
@@ -8060,6 +8207,206 @@ use std::sync::{Arc, Mutex};
             }
             other => panic!("expected sandboxed start, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sandboxed_shell_exec_job_completes_via_seatbelt_with_real_governed_output() {
+        // End-to-end proof that the macOS async sandbox job actually runs
+        // through `SandboxManager` + `SeatbeltBackend` (`start_sandboxed`),
+        // not just that `execute_shell` returns a "started sandboxed job"
+        // summary — that much a purely-synchronous job-creation failure
+        // could also produce. Skips (rather than fails) off macOS or
+        // without a real `sandbox-exec` binary, mirroring the same
+        // `seatbelt_available()`-style gating `crates/sandbox`'s own tests
+        // use, since this exercises the real OS sandbox, not a fake.
+        if find_sandbox_exec().is_none() {
+            return;
+        }
+        let root = TempRoot::new("sandboxed-job-real");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        let call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["sh","-c","echo sandboxed-job-marker"],"sandbox":true,"timeout_ms":10000}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        let job_id = match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.starts_with("started sandboxed job"), "{summary}");
+                let word = summary
+                    .split_whitespace()
+                    .find(|word| word.starts_with("job-"))
+                    .expect("job id in summary");
+                word.trim_end_matches(':').to_owned()
+            }
+            other => panic!("expected sandboxed job start, got {other:?}"),
+        };
+
+        let mut completed = false;
+        for _ in 0..100 {
+            let status_call =
+                make_call("s1", JOB_STATUS_TOOL, &format!(r#"{{"job_id":"{job_id}"}}"#));
+            let validated = tools.validate(&status_call, &cancel).expect("validate");
+            if let ToolStepResult::Succeeded { summary, .. } =
+                tools.execute(&validated, &cancel).expect("execute")
+                && summary.contains("completed exit 0")
+            {
+                completed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(completed, "sandboxed job must complete via the real Seatbelt backend");
+
+        let output_call = make_call(
+            "o1",
+            JOB_OUTPUT_TOOL,
+            &format!(r#"{{"job_id":"{job_id}","offset":0}}"#),
+        );
+        let validated = tools.validate(&output_call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("sandboxed-job-marker"), "{summary}");
+            }
+            other => panic!("expected job output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandboxed_shell_exec_job_confines_writes_to_the_workspace_root() {
+        // The whole point of routing this async job through `SeatbeltBackend`
+        // instead of a plain `Command`: a real macOS filesystem boundary, not
+        // just resource ceilings. A write outside the mounted workspace root
+        // must be denied by the OS sandbox itself.
+        if find_sandbox_exec().is_none() {
+            return;
+        }
+        let root = TempRoot::new("sandboxed-job-confine");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let outside = std::env::temp_dir().join(format!(
+            "rapid-sandboxed-job-confine-outside-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&outside);
+
+        let call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            &format!(
+                r#"{{"argv":["sh","-c","echo escaped > {}"],"sandbox":true,"timeout_ms":10000}}"#,
+                outside.display()
+            ),
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        let job_id = match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                let word = summary
+                    .split_whitespace()
+                    .find(|word| word.starts_with("job-"))
+                    .expect("job id in summary");
+                word.trim_end_matches(':').to_owned()
+            }
+            other => panic!("expected sandboxed job start, got {other:?}"),
+        };
+
+        let mut terminal = false;
+        for _ in 0..100 {
+            let status_call =
+                make_call("s1", JOB_STATUS_TOOL, &format!(r#"{{"job_id":"{job_id}"}}"#));
+            let validated = tools.validate(&status_call, &cancel).expect("validate");
+            if let ToolStepResult::Succeeded { summary, .. } =
+                tools.execute(&validated, &cancel).expect("execute")
+                && !summary.contains("running")
+            {
+                terminal = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(terminal, "sandboxed job must reach a terminal state");
+        assert!(
+            !outside.exists(),
+            "a write outside the mounted workspace root must be denied by the real sandbox, \
+             not silently succeed"
+        );
+        let _ = fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn sandboxed_shell_exec_job_is_killed_when_the_registry_drops() {
+        // Proves the `JobShared.sandbox_cancel` wiring has real effect: the
+        // token `kill_all` cancels must be the same clone `SandboxManager::
+        // exec`'s own internal wait loop is checking, so a still-running
+        // sandboxed job's real process actually dies on shutdown rather than
+        // being orphaned (the `cancelled` flag alone, `kill_all`'s original
+        // mechanism, is only ever polled by the plain-`Command` supervisor
+        // loop — a sandboxed job has none, since `exec` blocks synchronously
+        // on the worker thread).
+        if find_sandbox_exec().is_none() {
+            return;
+        }
+        let root = TempRoot::new("sandboxed-job-cancel");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let pid_path = root.0.join("pid.txt");
+
+        let call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            &format!(
+                r#"{{"argv":["sh","-c","echo $$ > {} && sleep 30"],"sandbox":true,"timeout_ms":20000}}"#,
+                pid_path.display()
+            ),
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.starts_with("started sandboxed job"), "{summary}");
+            }
+            other => panic!("expected sandboxed job start, got {other:?}"),
+        }
+
+        fn alive(pid: i32) -> bool {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        }
+        let mut pid = None;
+        for _ in 0..150 {
+            if let Ok(contents) = fs::read_to_string(&pid_path)
+                && let Ok(parsed) = contents.trim().parse::<i32>()
+            {
+                pid = Some(parsed);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = pid.expect("sandboxed job wrote its pid before entering sleep");
+        assert!(alive(pid), "sandboxed job's real process must still be running before drop");
+
+        // Shutdown path: dropping the real WorkspaceTools (and the
+        // JobRegistry it owns) must kill the still-running sandboxed child,
+        // not just mark it cancelled with nothing left alive to observe it.
+        drop(tools);
+
+        let mut still_alive = true;
+        for _ in 0..150 {
+            if !alive(pid) {
+                still_alive = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !still_alive,
+            "dropping the registry must cancel and kill the sandboxed job's real process, \
+             not orphan it"
+        );
     }
 
     #[test]

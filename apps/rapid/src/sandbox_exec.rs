@@ -1,22 +1,26 @@
-//! Non-macOS `shell_exec` sandboxing via the tiered `sandbox` crate.
+//! `shell_exec` sandboxing via the tiered `sandbox` crate, shared by both
+//! live platform paths.
 //!
-//! macOS keeps its existing Seatbelt path in `exec_tools.rs` unchanged; this
-//! module is the `SandboxManager`-backed path for everywhere else, closing
-//! the gap where `sandbox: true` previously just failed outright
-//! ("sandbox-exec is unavailable on this platform").
+//! This module builds the `SandboxManager`/`SandboxSpec` plumbing both paths
+//! need and exposes two entry points that differ only in which backend they
+//! register and how they're driven: [`build_manager`] +
+//! synchronous [`run_sandboxed`] (everywhere except macOS with `sandbox-exec`
+//! present — `HostRestrictedBackend`, real process-group isolation plus
+//! CPU/memory/pid limits, closing the gap where `sandbox: true` previously
+//! just failed outright there), and [`build_manager_seatbelt`] (macOS,
+//! `SeatbeltBackend`, driven asynchronously from
+//! `exec_tools.rs::JobRegistry::start_sandboxed` as a background job polled
+//! through `job_status`/`job_output` — the same async shape that path
+//! already had before it gained real resource governance). The two entry
+//! points aren't merged into one execution shape because the macOS job path
+//! needs to keep its async, pollable UX; see `newtask.md` §1.1 for why that
+//! was the deciding constraint.
 //!
-//! Deliberately scoped to the always-available `HostRestrictedBackend` tier
-//! only: real process-group isolation plus CPU/memory/pid limits, a genuine
-//! improvement over today's status quo on Linux/Windows, but not yet the
-//! stronger `Container`/`Gvisor` tiers. Which tier to prefer, and how to
-//! degrade gracefully when a stronger one isn't available (Docker/Podman or
-//! `runsc` missing), is a real policy decision — see `newtask.md` §1.1 —
-//! deliberately deferred rather than guessed here.
-//!
-//! Runs synchronously, unlike the macOS Seatbelt path (an async background
-//! job via `self.jobs.start`, polled through `job_status`/`job_output`).
-//! Unifying the two into one execution shape is separate follow-up work,
-//! not attempted here — see `newtask.md` §1.1's own note on this split.
+//! Deliberately scoped to the `HostRestrictedBackend`/`SeatbeltBackend`
+//! tier only: not yet the stronger `Container`/`Gvisor` tiers. Which tier to
+//! prefer, and how to degrade gracefully when a stronger one isn't available
+//! (Docker/Podman or `runsc` missing), is a real policy decision — see
+//! `newtask.md` §1.1 — deliberately deferred rather than guessed here.
 
 use std::fmt;
 use std::path::Path;
@@ -31,7 +35,7 @@ use capability_broker::{
 use protocol::{RepoPath, SandboxTier, SessionId};
 use sandbox::{
     HostRestrictedBackend, MountMode, SandboxError, SandboxExecRequest, SandboxManager,
-    SandboxMount, SandboxSpec,
+    SandboxMount, SandboxNetwork, SandboxSpec, SeatbeltBackend,
 };
 
 /// Fixed mount-point label inside the sandbox's virtual filesystem — never
@@ -123,10 +127,34 @@ pub(crate) fn build_manager() -> SandboxManager {
     manager
 }
 
-fn build_spec(
+/// Same shape as [`build_manager`], but for the macOS async sandboxed-job
+/// path (`exec_tools.rs::JobRegistry::start_sandboxed`): registers
+/// [`SeatbeltBackend`] instead of [`HostRestrictedBackend`] at the same
+/// [`SandboxTier::HostRestricted`] tier (the two are mutually exclusive at
+/// one tier per `SandboxManager` — never call this and [`build_manager`] on
+/// the same `SandboxManager`). Registration is infallible for the same
+/// reason `build_manager`'s own doc comment gives.
+pub(crate) fn build_manager_seatbelt() -> SandboxManager {
+    let mut manager = SandboxManager::new();
+    manager
+        .register(Box::new(SeatbeltBackend::new()))
+        .expect("SeatbeltBackend is the only registered backend and always valid");
+    manager
+}
+
+/// `network` is a real parameter, not always `SandboxNetwork::None`, because
+/// this is now shared by two callers with different, deliberate network
+/// postures: `run_sandboxed` (below) keeps requesting `None` — unchanged,
+/// `HostRestrictedBackend` doesn't enforce it anyway (a separate, pre-
+/// existing, not-fixed-here gap) — while `JobRegistry::start_sandboxed`
+/// requests `Open`, preserving the network-open behavior the macOS async
+/// job path already has today rather than silently tightening it as a side
+/// effect of adding resource governance.
+pub(crate) fn build_spec(
     root: &Path,
     timeout: Duration,
     output_limit: u64,
+    network: SandboxNetwork,
 ) -> Result<SandboxSpec, SandboxRunError> {
     let host_str = root.to_str().ok_or(SandboxRunError::InvalidRoot)?;
     let host =
@@ -141,6 +169,7 @@ fn build_spec(
         .output_limit(output_limit)
         .cpu_millis(SANDBOX_CPU_MILLIS)
         .memory_mb(SANDBOX_MEMORY_MB)
+        .network(network)
         .build()
         .map_err(SandboxRunError::Sandbox)
 }
@@ -264,7 +293,7 @@ pub fn run_sandboxed(
     output_limit: u64,
 ) -> Result<SandboxRunOutcome, SandboxRunError> {
     let manager = build_manager();
-    let spec = build_spec(root, timeout, output_limit)?;
+    let spec = build_spec(root, timeout, output_limit, SandboxNetwork::None)?;
     let issuer = LeaseIssuer::ephemeral();
     let command_name = argv.first().map(String::as_str).unwrap_or("shell");
     let (lease, revision) = mint_proc_exec_lease(&issuer, command_name)?;

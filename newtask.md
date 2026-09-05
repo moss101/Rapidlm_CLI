@@ -4632,6 +4632,88 @@ not guessed, before wiring `shell_exec` through it. | Landlock + Seatbelt + chil
   `job_output`" UX `JobRegistry`-based `shell_exec(sandbox: true)` already gives the model on macOS
   (confirmed necessary: `SandboxManager` is synchronous-only crate-wide, no poll/handle primitive exists
   anywhere in `crates/sandbox` to build on) — tracked as the immediate next commit, not this one.
+- **Unification finished 2026-09-05, second of two commits: `apps/rapid`'s macOS async sandboxed
+  `shell_exec` job now actually runs through `SandboxManager` + `SeatbeltBackend`, closing the gap the
+  first commit's own note left open.** Preceded by a decision-oriented scoping pass (per explicit
+  instruction: investigate first, do not implement immediately) comparing two options for giving the
+  macOS async path the same governance the already-shipped non-macOS synchronous path has: (A) reuse/adapt
+  `SeatbeltBackend`'s existing governance, or (B) port the resource-governance/lifecycle machinery into
+  `JobRegistry` itself. Concluded (A) is the clear technical call, for the same reason the first commit's
+  scoping pass already reached the same conclusion for the network-policy prerequisite: `SeatbeltBackend`
+  already reuses `host_restricted.rs`'s hardened process-group/CPU/memory/pid logic specifically to avoid a
+  second, independently-maintained copy — porting that same machinery into `JobRegistry` (option B) would
+  either need exposing crate-internal helpers as real public API or risk a second, subtly different copy,
+  exactly the failure mode `seatbelt.rs`'s own doc comment already warns against. The async-vs-sync
+  sub-question (wrap `SandboxManager` in a new async job type vs. switch macOS to the synchronous shape
+  non-macOS uses) was resolved by close reading of the driving instruction itself — "the same governance
+  guarantees as the existing governed path" applied to "the macOS *async* path" already decided to keep the
+  async job-polling UX, not collapse it.
+  **Implemented:** `apps/rapid/src/sandbox_exec.rs` gained `build_manager_seatbelt()` (registers
+  `SeatbeltBackend` instead of `HostRestrictedBackend` — the two are mutually exclusive at one
+  `SandboxTier::HostRestricted` per manager, never call both on the same one) and `build_spec` widened to
+  take an explicit `network: SandboxNetwork` parameter (existing `run_sandboxed` caller passes `None`,
+  unchanged; the new job path passes `Open`, preserving the network-open behavior that path already had
+  before gaining real resource governance — the first commit's `SandboxNetwork::Open` work was the direct
+  prerequisite this unblocked). `apps/rapid/src/exec_tools.rs`'s `JobShared` gained one new optional field,
+  `sandbox_cancel: Option<capability_broker::CancellationToken>` (not a parallel job-kind abstraction —
+  `None` for a plain `start()` job, `Some` for a `start_sandboxed` one), and `kill_all()` now also calls
+  `.cancel()` on it when present. New `JobRegistry::start_sandboxed(root, argv, timeout, output_limit)`:
+  same per-turn `MAX_BACKGROUND_JOBS` budget as plain `start()`, mints a fresh `CancellationToken`, spawns a
+  background thread that runs `build_manager_seatbelt` → `build_spec` (network `Open`, output limit
+  `MAX_JOB_OUTPUT_BYTES` — matching the plain background-job spool cap, not the unrelated synchronous
+  path's `MAX_SHELL_OUTPUT_BYTES`) → mints a `Capability::ProcExec` lease → `prepare`/`exec`/`destroy`, then
+  reports the outcome into the *same* `JobShared.state`/`output` the plain-job path already uses, so
+  `job_status`/`job_output` needed no changes at all. Terminal-state formatting reuses the existing,
+  already-tested `sandboxed_status_line` verbatim rather than reimplementing it. `execute_shell`'s macOS
+  branch now calls `start_sandboxed` instead of hand-writing a Seatbelt profile file and running raw
+  `sandbox-exec` argv through the plain, ungoverned `start()`; the now-dead `seatbelt_profile()` function
+  was deleted, and `find_sandbox_exec()` kept as-is (it still correctly gates sync-vs-async platform
+  routing, and duplicating its probe via `SeatbeltBackend::health()` would have been a bigger, unnecessary
+  change for the same outcome).
+  **Two real issues found and fixed via a self-review agent pass, both verified via the revert cycle
+  against the real `sandbox-exec` binary on this dev machine:** (1) `start_sandboxed`'s background-thread
+  closure called `resolve_program`/`SandboxExecRequest::new` *after* `manager.prepare()` had already
+  succeeded — `prepare()` writes a real temp Seatbelt profile file that only `destroy()` removes, with no
+  `Drop` fallback anywhere in the chain, so a `resolve_program` failure (e.g. a nonexistent `argv[0]`) after
+  a successful `prepare()` leaked that file. Confirmed via a temporary scratch test snapshotting
+  `rapidlm-seatbelt-*.sb` files in the OS temp dir before/after a job with a bad program name, run in
+  isolation (`--test-threads=1`, filtered to just that test) to avoid a real race against other
+  concurrently-running tests touching the same shared global temp directory — with the bug present, a new
+  file was left behind; fixed by reordering `resolve_program`/`SandboxExecRequest::new` to run *before*
+  `prepare()` (neither depends on the handle `prepare()` returns), so every step after a successful
+  `prepare()` is now either infallible or already calls `destroy()`; reran the same isolated test after the
+  reorder — zero new files. The scratch test itself was deliberately **not** kept as a permanent regression
+  test: checking shared OS-temp-directory state is inherently racy under the full suite's default parallel
+  test execution (another concurrently-running sandboxed-job test's own transient profile file could
+  legitimately appear or disappear between the before/after snapshot), and no other test in this file
+  depends on global filesystem state that way — the fix was verified by hand instead of shipping a
+  flaky test. This exact same gap already exists, unfixed, in the already-shipped non-macOS `run_sandboxed`
+  (`sandbox_exec.rs`) — deliberately left untouched there, per the instruction to keep this change strictly
+  to sandbox-path unification rather than opportunistically fixing an unrelated pre-existing gap in
+  already-shipped code. (2) A doc comment on `crates/sandbox/src/backends/seatbelt.rs`'s `render_profile`
+  still referenced the now-deleted `apps/rapid/src/exec_tools.rs::seatbelt_profile` function — corrected,
+  along with the file's top-of-file module doc comment and `sandbox_exec.rs`'s own, both of which still
+  described the two paths as deliberately unmerged/"not attempted here."
+  Three new tests, all real end-to-end runs against the actual macOS `sandbox-exec` binary (gated on
+  `find_sandbox_exec().is_some()`, mirroring `seatbelt.rs`'s own `seatbelt_available()`-style skip pattern —
+  this dev machine is macOS with `sandbox-exec` present, so all three ran for real, not just as a
+  synchronous "job started" check): a sandboxed job actually completes via the real backend with correctly
+  captured output; a write outside the mounted workspace root is genuinely denied by the OS sandbox itself,
+  not merely by convention; dropping the `JobRegistry` (simulating shutdown) actually kills a still-running
+  sandboxed job's real process via the new `sandbox_cancel` wiring, verified via its own revert cycle
+  (temporarily removed `kill_all`'s new `.cancel()` call — the process was confirmed to survive the drop
+  exactly as predicted — then restored). Full `-p rapid --lib` suite (435 tests, up from 432 — 3 new, one
+  net addition since the temporary leak-check scratch test was removed after use), full `sandbox` crate
+  suite (102 tests, unchanged), and `cargo build --workspace --tests` all pass.
+  **Known, deliberately out-of-scope gaps, disclosed rather than silently left implicit:** the new
+  sandboxed job cannot stream output incrementally like the plain `Command`-based job path can —
+  `SandboxBackend::exec()` only returns output once the whole command completes, so `job_output` sees
+  nothing until the sandboxed call fully finishes, then the whole buffer at once; fixing this would mean
+  changing the `SandboxBackend` trait itself, affecting every backend, a real separate follow-up. The
+  pre-existing gap where nothing connects a turn's real `agent_runtime::CancellationToken` to the
+  `capability_broker::CancellationToken` `SandboxManager::exec` checks internally is now fixed for the new
+  macOS job path (a natural completeness requirement of adding it) but deliberately not touched for the
+  already-shipped non-macOS `run_sandboxed`, which has the identical gap.
 
 ### 1.2 Multi-agent / subagents
 
