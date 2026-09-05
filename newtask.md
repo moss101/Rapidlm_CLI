@@ -4580,6 +4580,88 @@ adding live approval-resolution for `KernelApi::Approve`-shaped slash commands (
 spanning goals/agents/knowledge/playbooks/MCP/plugins, not specific to turn execution) are both real,
 identified, explicitly out-of-scope gaps for whoever picks up TUI work next — neither is "the turn loop."
 
+**`GoalUsage` cost accrual shipped 2026-09-05, user-directed.** A required, verify-first investigation
+established this was a green-field integration, not a formula fix: nothing in `apps/rapid` associated any
+executed turn (headless `rapid exec` or the interactive TUI) with a goal at all before this work.
+`agent_runtime::GoalDriver` — an autonomous continuation loop with turn↔goal association *and* its own
+`GoalBudgetGuard` accrual already built in — exists in `crates/agent-runtime` but is called from zero places
+in `apps/rapid` (confirmed by grep); even reached, its own `after_model(tokens, 0, cancel)` already hardcodes
+cost to zero, since `agent_runtime::turn::TurnUsage` (that crate's own per-turn accounting) has no cost field
+at all — real dollar cost is only ever known one layer up, in `apps/rapid/src/host.rs`'s `CostAccumulator`,
+which wraps the model backend and is what actually produces `ExecOutcome.cost_usd_micros`. `GoalHost`
+(`apps/rapid/src/goal_host.rs`) — the actual host-owned goal contract both the interactive session and the
+`rapid goal` subcommand share — never touched `GoalUsage`/`GoalBudgetGuard` either; it only did lifecycle
+CRUD (create/pause/resume/complete/cancel), persisting `GoalSnapshot` (usage embedded) as a plain JSON file
+(`.rapidlm/goal.json`) — a mutable persisted aggregate, not event-sourced, no replay mechanism exists for it
+at all (the kernel's own event ledger is a wholly separate mechanism, referenced only for evidence-citation
+backing, never for usage). This settled the "persisted aggregate vs. derived projection" question the
+scoping brief flagged as a possible fork: the architecture had already decided it, no fork existed.
+**Implemented:** two new functions in `goal_host.rs`, `active_goal_id(goal_path) -> Option<GoalId>` (the
+current goal's id, only if `Active`) and `accrue_turn_usage(goal_path, goal_id, tokens, cost_usd_micros,
+active_ms) -> bool`, both doing a fresh `GoalHost::load`/`from_snapshot`+`save()` per call — deliberately
+never mutating a long-lived `GoalHost` in place, so this can never silently drop a separately-loaded
+`GoalHost`'s in-memory evidence-service state, a real footgun a naive `&mut self` method would have had.
+Accrual itself reuses `agent_runtime::GoalBudgetGuard::after_model`/`after_turn` verbatim (unmodified,
+already-tested `saturating_add` arithmetic and "only accrues while `Active`" rule) — no second cost/usage
+accumulation path was written. Both `execute_interactive_turn` (interactive TUI) and `exec_turn` (headless)
+call the identical two functions with the identical argument shapes — `outcome.tokens` as-is,
+`outcome.cost_usd_micros.unwrap_or(0)` (never inventing a nonzero value `CostAccumulator` never reported),
+and a wall-clock `active_ms` measured via `Instant::now()` around the same shared `run_live_exec` call both
+paths already had — converging through one mechanism, not a TUI-specific and a headless-specific copy.
+**The one genuinely subtle design point:** the goal id is captured via `active_goal_id` *before* the turn
+runs, not looked up fresh at completion — since goal mutation today only happens via a separate `rapid goal
+<verb>` process invocation (interactive slash commands for goal actions are still literal no-ops, per the
+prior TUI-loop work's own finding that `KernelApi::Approve` is an empty match arm), a goal replaced or
+cancelled by a separate process while a turn is still running must not have that turn's usage misattributed
+to whichever goal happens to be current once the turn finishes. `accrue_turn_usage` re-loads fresh at
+completion and only accrues if that same id is still the active goal's id — a real, if narrow, correctness
+property a self-review agent independently traced through and confirmed sound. **Semantics settled from
+existing behavior, not invented:** usage accrues for every `Ok(outcome)` `run_live_exec` produces regardless
+of terminal status (`Succeeded`, `Failed`, and `Cancelled` alike, whatever real tokens/cost were measured
+before the failure/cancellation) — modeled on `exec_turn`'s own pre-existing, unmodified `--jsonl`/
+`--verbose` reporting, which already read `outcome.cost_usd_micros` from every `Ok(outcome)` arm regardless
+of status before this work touched anything; never attempted for an `Err(...)` (no `ExecOutcome` was ever
+produced — a context/permission/model-config error before any model call — nothing to attribute). No
+`tool_calls` field was added to `GoalUsage` (unmodified: still `{turns, tokens, active_ms, cost}`) — the
+struct never modeled tool-call counts, and the task didn't need one to be added.
+**A second real issue found and fixed via the same self-review pass, this one empirically reproduced, not
+just reasoned about:** `GoalHost::save`'s pre-existing plain `fs::write` (no atomicity, unmodified until
+this fix) had always been able to race a concurrent reader into observing a torn write, but was low-risk
+while only the rare explicit `rapid goal <verb>` invocation ever called it. This work made `save()` fire on
+every completed turn instead — a self-review agent built a throwaway concurrency test (eight threads racing
+`accrue_turn_usage` against `Pause`/`Resume` commands, all writing the same file) and hit a real JSON parse
+error (genuine corruption) on the very first trial. Fixed by switching `save()` to the codebase's own
+existing `atomic_write` helper (`apps/rapid/src/exec_tools.rs`, write-to-temp-then-rename, already used and
+tested for exactly this elsewhere, not a new mechanism). Verified via a one-off (not kept — inherently
+timing-dependent, would be flaky in the permanent suite per this session's own testing discipline) 8-thread
+concurrent-save test: 10/10 clean with the fix, 5/10 corrupted with `fs::write` reverted — the corruption
+rate itself, not just presence/absence, confirms this isn't a rare edge case once every turn writes the
+file. **Deliberately not fixed, a real, separate limitation this doesn't attempt to close:** atomicity
+prevents *corruption* (a reader never sees a half-written file), not the *lost-update* race — two processes
+each doing load→modify→save can still have one's update silently overwritten by the other's, since there is
+no read-modify-write locking on this single-slot file, only atomicity of each individual write. Closing that
+would need real locking or optimistic concurrency control on `goal.json` itself — a genuinely bigger,
+separate piece of work, not "the narrowest correct integration" this task asked for.
+**Tests:** 10 new in `goal_host.rs` (`active_goal_id`/`accrue_turn_usage` in isolation — no goal file, paused
+goal, active goal, accumulation across calls, goal-id-mismatch protection, inactive-goal protection,
+missing-file protection, zero-usage-doesn't-invent-cost, `u64::MAX`-boundary saturation) and 6 new in
+`interactive.rs`'s existing scripted-turn harness (`ScriptedSession`, built for the prior TUI-loop task,
+extended with `goal_path()`/`create_active_goal()`/`goal_usage()` helpers) exercising the real call chain
+end to end: successful turn accrues real tokens+cost+turns+active_ms; a turn with no active goal creates or
+touches no goal file; a turn that fails *after* a real tool call reported real usage still accrues that
+usage; a cancelled turn (same shape) still accrues; a turn that fails on its very first model step (zero
+usage ever reported) still counts one turn but zero tokens/cost; two sequential turns accumulate to an exact
+sum, proving no duplicate accrual and no lost-turn overwrite. Revert-cycle verified: the core accrual call
+site, the goal-id-mismatch guard, and the inactive-goal guard each reproduced their exact predicted failure
+when reverted, then passed again restored. Full `-p rapid --lib` suite (457 tests, up from 441 — 16 new),
+`cargo clippy -p rapid --lib --tests` (zero new lints), `cargo test -p agent-runtime --lib -- goal` (48
+tests, unchanged — that crate was never touched), and `cargo build --workspace --tests` all pass.
+**Deliberately not attempted, per the driving instruction's own scope:** inadequate-context-handling policy;
+any provider pricing-table logic (`ExecOutcome.cost_usd_micros` was already the authoritative, fully-measured
+value — nothing needed re-pricing); wiring `agent_runtime::GoalDriver` itself into `apps/rapid` (a much
+larger, separate architectural question about autonomous goal continuation, not implied by "make `GoalUsage`
+reflect actual consumption"); real concurrency control for `goal.json`'s lost-update race, named above.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

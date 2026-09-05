@@ -208,7 +208,19 @@ impl GoalHost {
             fs::create_dir_all(parent).map_err(|_| GoalPersistError::Io)?;
         }
         let json = serde_json::to_string_pretty(snapshot).map_err(|_| GoalPersistError::Json)?;
-        fs::write(path, json).map_err(|_| GoalPersistError::Io)
+        // Write-then-rename, not a plain `fs::write`: `accrue_turn_usage`
+        // now calls this on every completed/failed/cancelled turn, not only
+        // the rare explicit `rapid goal <verb>` invocation this was
+        // originally written for — a reader (this same function's own
+        // `GoalHost::load`, called concurrently by another turn or a
+        // separate `rapid goal` process) racing a plain truncate-then-write
+        // could observe a partially-written, corrupt JSON file. `rename` is
+        // atomic on the same filesystem, so a racing reader now only ever
+        // sees the fully-old or fully-new content, never a torn write.
+        // Reuses the same helper `exec_tools.rs`'s own writes already rely
+        // on for this, rather than a second copy of the same crash-safety
+        // logic.
+        crate::exec_tools::atomic_write(path, json.as_bytes()).map_err(|_| GoalPersistError::Io)
     }
 
     /// Export the host-owned goal contract + evidence verdicts + a host
@@ -346,6 +358,69 @@ impl GoalHost {
 impl Default for GoalHost {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The active goal's id at `goal_path`, if one is currently `Active`. Read at
+/// the *start* of a turn — the caller re-checks this same id still names the
+/// active goal at [`accrue_turn_usage`] time, rather than trusting whatever
+/// happens to be active when the turn finishes. Without that, a goal
+/// replaced or cancelled by a separate `rapid goal` invocation while a turn
+/// was still running in another process could have that turn's usage
+/// misattributed to whatever goal happens to be current now, not the one
+/// that actually incurred it.
+pub fn active_goal_id(goal_path: &Path) -> Option<protocol::GoalId> {
+    let host = GoalHost::load(goal_path).ok()??;
+    let snapshot = host.snapshot()?;
+    (snapshot.state() == agent_runtime::GoalState::Active).then(|| snapshot.id())
+}
+
+/// Attribute one turn's measured resource consumption to `goal_id` and
+/// persist the update, via the same [`agent_runtime::GoalBudgetGuard`]
+/// accrual API `GoalDriver`'s own (not yet wired into `apps/rapid`)
+/// autonomous continuation loop uses — reused here rather than a second,
+/// independent accumulation, and its own `saturating_add` arithmetic and
+/// "usage only accrues while `Active`" rule apply unchanged.
+///
+/// A best-effort side effect of an already-completed turn, not something
+/// the turn's own outcome depends on: returns `false` (accrues nothing) when
+/// there is no goal file, the goal has since changed identity or is no
+/// longer active (see [`active_goal_id`]'s own doc comment), or the updated
+/// snapshot could not be persisted — logging a warning only for the last
+/// case, since the first two are ordinary "nothing to attribute to," not a
+/// failure. Never touches the evidence doc: this always starts from a fresh
+/// [`GoalHost::load`] and ends with a fresh [`GoalHost::from_snapshot`], so
+/// there is no risk of silently dropping evidence records some other,
+/// longer-lived `GoalHost` instance may have loaded — this function owns
+/// only the usage half of the file.
+pub fn accrue_turn_usage(
+    goal_path: &Path,
+    goal_id: protocol::GoalId,
+    tokens: u64,
+    cost_usd_micros: u64,
+    active_ms: u64,
+) -> bool {
+    let Ok(Some(host)) = GoalHost::load(goal_path) else {
+        return false;
+    };
+    let Some(snapshot) = host.snapshot() else {
+        return false;
+    };
+    if snapshot.id() != goal_id || snapshot.state() != agent_runtime::GoalState::Active {
+        return false;
+    }
+    let snapshot = snapshot.clone();
+    let mut guard = agent_runtime::GoalBudgetGuard::from_snapshot(&snapshot);
+    let cancel = CancellationToken::new();
+    let _ = guard.after_model(tokens, cost_usd_micros, &cancel);
+    let _ = guard.after_turn(active_ms, &cancel);
+    let updated_host = GoalHost::from_snapshot(guard.apply(snapshot));
+    match updated_host.save(goal_path) {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!("warning: goal usage could not be persisted: {err}");
+            false
+        }
     }
 }
 
@@ -701,5 +776,173 @@ mod tests {
         .expect("write");
         assert_eq!(host.load_evidence(&evidence_path).expect("empty doc"), 0);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- `active_goal_id` / `accrue_turn_usage` -----------------------------
+
+    fn active_host_with_budget(budget: GoalBudget) -> (GoalHost, GoalId) {
+        let mut host = GoalHost::new();
+        let spec = GoalSpec::new(
+            GoalId::new(),
+            "ship auth",
+            vec![Criterion::new("c1", "tests pass").expect("criterion")],
+            budget,
+            vec![],
+        )
+        .expect("spec");
+        let created = host
+            .apply(GoalCommand::Create(spec), &human(), &CancellationToken::new())
+            .expect("create");
+        let goal_id = created.goal_id();
+        assert_eq!(host.snapshot().expect("snap").state(), agent_runtime::GoalState::Active);
+        (host, goal_id)
+    }
+
+    #[test]
+    fn active_goal_id_is_none_without_a_goal_file() {
+        let path = scratch("active-id-missing");
+        let _ = fs::remove_file(&path);
+        assert_eq!(active_goal_id(&path), None);
+    }
+
+    #[test]
+    fn active_goal_id_is_none_when_the_goal_is_paused() {
+        let path = scratch("active-id-paused");
+        let (mut host, goal_id) = active_host_with_budget(GoalBudget::default());
+        host.apply(
+            GoalCommand::Pause { goal_id, process_recovered: false },
+            &human(),
+            &CancellationToken::new(),
+        )
+        .expect("pause");
+        host.save(&path).expect("save");
+        assert_eq!(active_goal_id(&path), None);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn active_goal_id_returns_the_id_of_an_active_goal() {
+        let path = scratch("active-id-active");
+        let (host, goal_id) = active_host_with_budget(GoalBudget::default());
+        host.save(&path).expect("save");
+        assert_eq!(active_goal_id(&path), Some(goal_id));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn accrue_turn_usage_updates_tokens_cost_turns_and_active_ms() {
+        let path = scratch("accrue-basic");
+        let (host, goal_id) = active_host_with_budget(GoalBudget::default());
+        host.save(&path).expect("save");
+
+        assert!(accrue_turn_usage(&path, goal_id, 500, 1_200, 3_000));
+
+        let reloaded = GoalHost::load(&path).expect("load").expect("some");
+        let usage = reloaded.snapshot().expect("snap").usage();
+        assert_eq!(usage.turns(), 1, "one completed turn must count as one");
+        assert_eq!(usage.tokens(), 500);
+        assert_eq!(usage.cost(), 1_200);
+        assert_eq!(usage.active_ms(), 3_000);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn accrue_turn_usage_accumulates_across_multiple_calls() {
+        let path = scratch("accrue-accumulate");
+        let (host, goal_id) = active_host_with_budget(GoalBudget::default());
+        host.save(&path).expect("save");
+
+        assert!(accrue_turn_usage(&path, goal_id, 100, 10, 500));
+        assert!(accrue_turn_usage(&path, goal_id, 250, 40, 750));
+
+        let reloaded = GoalHost::load(&path).expect("load").expect("some");
+        let usage = reloaded.snapshot().expect("snap").usage();
+        assert_eq!(usage.turns(), 2, "two separate turns must accumulate, not overwrite");
+        assert_eq!(usage.tokens(), 350);
+        assert_eq!(usage.cost(), 50);
+        assert_eq!(usage.active_ms(), 1_250);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn accrue_turn_usage_does_nothing_when_the_goal_id_does_not_match() {
+        // The exact scenario `active_goal_id`'s own doc comment describes: a
+        // turn started under one goal, but by completion time the goal file
+        // now names a *different* goal (replaced by a separate `rapid goal`
+        // invocation while the turn was still running). The stale turn's
+        // usage must not land on the new goal.
+        let path = scratch("accrue-mismatch");
+        let (host, _stale_goal_id) = active_host_with_budget(GoalBudget::default());
+        host.save(&path).expect("save");
+        let unrelated_goal_id = GoalId::new();
+
+        assert!(!accrue_turn_usage(&path, unrelated_goal_id, 999, 999, 999));
+
+        let reloaded = GoalHost::load(&path).expect("load").expect("some");
+        assert_eq!(reloaded.snapshot().expect("snap").usage(), agent_runtime::GoalUsage::default());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn accrue_turn_usage_does_nothing_when_the_goal_is_not_active() {
+        let path = scratch("accrue-inactive");
+        let (mut host, goal_id) = active_host_with_budget(GoalBudget::default());
+        host.apply(
+            GoalCommand::Pause { goal_id, process_recovered: false },
+            &human(),
+            &CancellationToken::new(),
+        )
+        .expect("pause");
+        host.save(&path).expect("save");
+
+        assert!(!accrue_turn_usage(&path, goal_id, 999, 999, 999));
+
+        let reloaded = GoalHost::load(&path).expect("load").expect("some");
+        assert_eq!(reloaded.snapshot().expect("snap").usage(), agent_runtime::GoalUsage::default());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn accrue_turn_usage_does_nothing_without_a_goal_file() {
+        let path = scratch("accrue-missing");
+        let _ = fs::remove_file(&path);
+        assert!(!accrue_turn_usage(&path, GoalId::new(), 100, 100, 100));
+        assert!(!path.exists(), "must not invent a goal file that never existed");
+    }
+
+    #[test]
+    fn accrue_turn_usage_with_zero_tokens_and_cost_does_not_invent_usage() {
+        // A turn that failed before any model call still counts as one
+        // incurred turn (real wall-clock time was spent), but must not
+        // fabricate nonzero tokens/cost it never actually measured.
+        let path = scratch("accrue-zero");
+        let (host, goal_id) = active_host_with_budget(GoalBudget::default());
+        host.save(&path).expect("save");
+
+        assert!(accrue_turn_usage(&path, goal_id, 0, 0, 50));
+
+        let reloaded = GoalHost::load(&path).expect("load").expect("some");
+        let usage = reloaded.snapshot().expect("snap").usage();
+        assert_eq!(usage.turns(), 1);
+        assert_eq!(usage.tokens(), 0);
+        assert_eq!(usage.cost(), 0);
+        assert_eq!(usage.active_ms(), 50);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn accrue_turn_usage_saturates_instead_of_overflowing_at_large_values() {
+        let path = scratch("accrue-saturate");
+        let (host, goal_id) = active_host_with_budget(GoalBudget::default());
+        host.save(&path).expect("save");
+
+        assert!(accrue_turn_usage(&path, goal_id, u64::MAX - 10, u64::MAX - 10, 0));
+        assert!(accrue_turn_usage(&path, goal_id, 100, 100, 0));
+
+        let reloaded = GoalHost::load(&path).expect("load").expect("some");
+        let usage = reloaded.snapshot().expect("snap").usage();
+        assert_eq!(usage.tokens(), u64::MAX, "must saturate, not wrap, past u64::MAX");
+        assert_eq!(usage.cost(), u64::MAX, "must saturate, not wrap, past u64::MAX");
+        let _ = fs::remove_file(&path);
     }
 }

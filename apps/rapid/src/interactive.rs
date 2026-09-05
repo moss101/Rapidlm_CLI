@@ -34,7 +34,9 @@ use tui::{
     RecordingBackend, TerminalError, TerminalGuard, dispatch, parse_command, reduce,
 };
 
-use crate::goal_host::{EVIDENCE_FILE, GOAL_FILE, SESSIONS_DB_FILE, GoalHost};
+use crate::goal_host::{
+    EVIDENCE_FILE, GOAL_FILE, GoalHost, SESSIONS_DB_FILE, accrue_turn_usage, active_goal_id,
+};
 use crate::headless::jsonl::JsonlExitCode;
 use crate::exec_tools::ExecTools;
 use crate::host::{
@@ -2042,6 +2044,16 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     // any model calls, as a typed Usage error, not a mid-turn surprise.
     let json_schema_requested = parsed.json_schema.is_some();
     let json_schema_capture: std::rc::Rc<std::cell::RefCell<Option<String>>>;
+    // Goal-usage attribution: captured *before* the run, not derived from
+    // whatever goal happens to be active once it finishes — see
+    // `active_goal_id`/`accrue_turn_usage`'s own doc comments for why. Not
+    // gated on `TrustStatus::Trusted`: `goal.json` isn't a workspace-tools
+    // concern the way trust otherwise gates this run, and the interactive
+    // TUI's own equivalent (`sync_persisted_goal`) reads it unconditionally
+    // too.
+    let goal_path = workspace.as_ref().map(|(root, _)| root.join(PROJECT_MARKER).join(GOAL_FILE));
+    let goal_id = goal_path.as_deref().and_then(active_goal_id);
+    let turn_started = Instant::now();
     let run_result = if let Some(schema_path) = parsed.json_schema.as_ref() {
         let schema_text = match std::fs::read_to_string(schema_path) {
             Ok(text) => text,
@@ -2089,6 +2101,16 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             diag,
         )
     };
+    if let (Ok(outcome), Some(goal_path), Some(goal_id)) = (&run_result, &goal_path, goal_id) {
+        let active_ms = u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        accrue_turn_usage(
+            goal_path,
+            goal_id,
+            outcome.tokens,
+            outcome.cost_usd_micros.unwrap_or(0),
+            active_ms,
+        );
+    }
     // `--jsonl`: everything above stays exactly as for plain-text exec; only
     // the outcome below is reported differently. `rapid_schema` is written
     // now (not earlier) since nothing before this point can fail *after* a
@@ -3103,7 +3125,7 @@ fn run_interactive_turn_inner(
         }
     };
 
-    execute_interactive_turn(client, session_id, actor, text, preserved, &mut tools, backing, cancel)
+    execute_interactive_turn(client, session_id, actor, root, text, preserved, &mut tools, backing, cancel)
 }
 
 /// Test-only-but-real sibling of `run_interactive_turn_inner`: identical
@@ -3140,7 +3162,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         Ok(built) => built,
         Err(outcome) => return outcome,
     };
-    execute_interactive_turn(client, session_id, actor, text, preserved, &mut tools, backing, cancel)
+    execute_interactive_turn(client, session_id, actor, root, text, preserved, &mut tools, backing, cancel)
 }
 
 /// Run one turn's model/tool-call loop through the shared, already-governed
@@ -3150,11 +3172,24 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
 /// `SelectedModel`, mirroring `run_live_exec`'s own generic-over-backing
 /// shape one layer up — this is what actually makes `run_interactive_turn_
 /// inner_with_backing` possible without duplicating this mapping logic.
+///
+/// Also attributes the turn's measured usage (`ExecOutcome.tokens`/
+/// `.cost_usd_micros`, plus wall-clock time measured here) to whichever goal
+/// was active when the turn *started* — see `active_goal_id`/
+/// `accrue_turn_usage`'s own doc comments for why "started," not "whichever
+/// goal happens to be active once the turn finishes." Attributed for every
+/// outcome that actually reached `run_live_exec`'s own terminal status
+/// (`Succeeded`, `Cancelled`, and `Failed` alike — the same "any incurred
+/// usage counts" behavior `exec_turn`'s existing `--jsonl`/`--verbose`
+/// reporting already gives a headless run, just now also reflected in
+/// `GoalUsage`), never for a turn that errored out before producing an
+/// `ExecOutcome` at all (nothing was measured to attribute).
 #[allow(clippy::too_many_arguments)]
 fn execute_interactive_turn<B: crate::host::LiveModelCall>(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
     actor: &ActorRef,
+    root: &Path,
     text: &str,
     preserved: PreservedLiveContext,
     tools: &mut ExecTools,
@@ -3184,7 +3219,10 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
         actor,
     };
 
-    match crate::host::run_live_exec(
+    let goal_path = root.join(PROJECT_MARKER).join(GOAL_FILE);
+    let goal_id = active_goal_id(&goal_path);
+    let started = Instant::now();
+    let run_result = crate::host::run_live_exec(
         preserved,
         backing,
         &request,
@@ -3193,7 +3231,19 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
         cancel,
         ContextRetryPolicy::default(),
         None,
-    ) {
+    );
+    if let (Ok(outcome), Some(goal_id)) = (&run_result, goal_id) {
+        let active_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        accrue_turn_usage(
+            &goal_path,
+            goal_id,
+            outcome.tokens,
+            outcome.cost_usd_micros.unwrap_or(0),
+            active_ms,
+        );
+    }
+
+    match run_result {
         Ok(outcome) => match outcome.result.status() {
             AgentTerminalStatus::Succeeded => kernel::TurnOutcome::Completed {
                 text: Some(outcome.result.summary().to_owned()),
@@ -4487,6 +4537,64 @@ base_url = "http://127.0.0.1:11434/v1"
                 outputs: VecDeque::from(vec![Err(ModelStepError::Cancelled)]),
             }
         }
+
+        /// A terminal answer that reports real, nonzero token/cost usage
+        /// (unlike `terminal`'s own `cost_usd_micros: None`) — for tests
+        /// that need to observe a real cost value flow through, not just
+        /// tokens.
+        fn terminal_with_usage(text: &str, tokens: u64, cost_usd_micros: u64) -> Self {
+            Self {
+                outputs: VecDeque::from(vec![Ok(ModelStepOutput::Terminal {
+                    text: text.to_owned(),
+                    tokens,
+                    cost_usd_micros: Some(cost_usd_micros),
+                })]),
+            }
+        }
+
+        /// One real tool call that reports usage, then a failing second
+        /// step — "failed execution after some model usage": the turn's
+        /// `ExecOutcome` still carries the first step's real tokens/cost
+        /// even though the turn as a whole did not succeed.
+        fn usage_then_fail(path: &str, content: &str, tokens: u64, cost_usd_micros: u64) -> Self {
+            let call = ProposedToolCall::new(
+                "c1",
+                crate::exec_tools::WORKSPACE_WRITE_TOOL,
+                format!(r#"{{"path":"{path}","content":"{content}"}}"#),
+            )
+            .expect("call");
+            Self {
+                outputs: VecDeque::from(vec![
+                    Ok(ModelStepOutput::ToolCalls {
+                        calls: vec![call],
+                        tokens,
+                        cost_usd_micros: Some(cost_usd_micros),
+                    }),
+                    Err(ModelStepError::Failed),
+                ]),
+            }
+        }
+
+        /// Same shape as `usage_then_fail`, but cancelled instead of failed
+        /// — "cancelled execution after some model usage."
+        fn usage_then_cancel(path: &str, content: &str, tokens: u64, cost_usd_micros: u64) -> Self {
+            let call = ProposedToolCall::new(
+                "c1",
+                crate::exec_tools::WORKSPACE_WRITE_TOOL,
+                format!(r#"{{"path":"{path}","content":"{content}"}}"#),
+            )
+            .expect("call");
+            Self {
+                outputs: VecDeque::from(vec![
+                    Ok(ModelStepOutput::ToolCalls {
+                        calls: vec![call],
+                        tokens,
+                        cost_usd_micros: Some(cost_usd_micros),
+                    }),
+                    Err(ModelStepError::Cancelled),
+                ]),
+            }
+        }
     }
 
     impl crate::host::LiveModelCall for ScriptedModel {
@@ -4496,6 +4604,13 @@ base_url = "http://127.0.0.1:11434/v1"
             _input: &ModelStepInput<'_>,
             _cancel: &agent_runtime::CancellationToken,
         ) -> Result<ModelStepOutput, ModelStepError> {
+            // Deterministic, not incidental: without this, whether a
+            // scripted turn's measured `active_ms` reads as nonzero would
+            // depend on how fast the surrounding context/redaction-registry
+            // setup happens to run on whatever machine executes the test —
+            // real work today, but not something a test should rely on
+            // staying slow enough to round up to a whole millisecond.
+            std::thread::sleep(std::time::Duration::from_millis(5));
             self.outputs.pop_front().unwrap_or(Err(ModelStepError::Failed))
         }
     }
@@ -4637,6 +4752,47 @@ base_url = "http://127.0.0.1:11434/v1"
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+
+        fn goal_path(&self) -> PathBuf {
+            self.root.join(PROJECT_MARKER).join(GOAL_FILE)
+        }
+
+        /// Create and persist a fresh `Active` goal at this session's own
+        /// `goal.json`, the same file `execute_interactive_turn` looks for.
+        /// Returns its id.
+        fn create_active_goal(&self) -> protocol::GoalId {
+            let mut host = GoalHost::new();
+            let spec = GoalSpec::new(
+                protocol::GoalId::new(),
+                "ship the thing",
+                vec![],
+                GoalBudget::default(),
+                vec![],
+            )
+            .expect("spec");
+            let effect = host
+                .apply(
+                    GoalCommand::Create(spec),
+                    &GoalActor::Human,
+                    &agent_runtime::CancellationToken::new(),
+                )
+                .expect("create goal");
+            host.save(&self.goal_path()).expect("save goal");
+            effect.goal_id()
+        }
+
+        /// Reload `goal.json` fresh from disk and read its usage — never
+        /// cached, so this always reflects whatever `accrue_turn_usage`
+        /// actually persisted, not some in-memory copy this harness itself
+        /// might be tempted to keep in sync by hand.
+        fn goal_usage(&self) -> agent_runtime::GoalUsage {
+            GoalHost::load(&self.goal_path())
+                .expect("load goal")
+                .expect("goal exists")
+                .snapshot()
+                .expect("snapshot")
+                .usage()
+        }
     }
 
     impl Drop for ScriptedSession {
@@ -4739,6 +4895,138 @@ base_url = "http://127.0.0.1:11434/v1"
             vec!["first answer", "second answer"],
             "both turns' answers must appear, in order, exactly once each: {answers:?}"
         );
+    }
+
+    // --- GoalUsage accrual ---------------------------------------------
+
+    #[test]
+    fn a_successful_turn_accrues_its_real_tokens_and_cost_to_the_active_goal() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.create_active_goal();
+
+        session.run_turn(
+            "do something billable",
+            ScriptedModel::terminal_with_usage("done", 777, 4_200),
+        );
+
+        let usage = session.goal_usage();
+        assert_eq!(usage.turns(), 1);
+        assert_eq!(usage.tokens(), 777);
+        assert_eq!(usage.cost(), 4_200);
+        // Real wall-clock time was spent; this harness cannot pin an exact
+        // value, but it must not have stayed at the zero it starts at.
+        assert!(usage.active_ms() > 0, "active_ms must reflect real elapsed time, got 0");
+    }
+
+    #[test]
+    fn a_turn_with_no_active_goal_does_not_create_or_affect_one() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        // Deliberately no `create_active_goal()` call.
+
+        session.run_turn("no goal here", ScriptedModel::terminal_with_usage("done", 100, 100));
+
+        assert!(
+            !session.goal_path().exists(),
+            "a turn run with no goal file present must not invent one"
+        );
+    }
+
+    #[test]
+    fn a_failed_turn_still_accrues_the_usage_it_actually_incurred() {
+        // "Usage reflects resources actually consumed, not only successful
+        // user-visible outcomes" — the same behavior `exec_turn`'s own
+        // existing `--jsonl`/`--verbose` reporting already gives a failed
+        // headless run (its `cost_usd_micros` is read from `Ok(outcome)`
+        // regardless of terminal status), now also reflected in `GoalUsage`.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.create_active_goal();
+
+        session.run_turn(
+            "do something that fails partway",
+            ScriptedModel::usage_then_fail("note.md", "partial", 300, 150),
+        );
+
+        assert!(
+            session
+                .transcript()
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::TurnFailed { .. })),
+            "sanity check: the turn must actually have failed"
+        );
+        let usage = session.goal_usage();
+        assert_eq!(usage.turns(), 1, "a failed turn still counts as one incurred turn");
+        assert_eq!(usage.tokens(), 300);
+        assert_eq!(usage.cost(), 150);
+    }
+
+    #[test]
+    fn a_cancelled_turn_still_accrues_the_usage_it_actually_incurred() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.create_active_goal();
+
+        session.run_turn(
+            "do something that gets cancelled",
+            ScriptedModel::usage_then_cancel("note.md", "partial", 60, 30),
+        );
+
+        assert!(
+            session
+                .transcript()
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::TurnInterrupted)),
+            "sanity check: the turn must actually have been interrupted"
+        );
+        let usage = session.goal_usage();
+        assert_eq!(usage.turns(), 1);
+        assert_eq!(usage.tokens(), 60);
+        assert_eq!(usage.cost(), 30);
+    }
+
+    #[test]
+    fn zero_usage_failure_before_any_model_call_does_not_invent_cost() {
+        // `run_interactive_turn_inner`'s own model-configuration-error early
+        // return (unconfigured/misconfigured model) never reaches `execute_
+        // interactive_turn` at all — no `ExecOutcome` is ever produced, so
+        // there is nothing to attribute. Exercised here at the boundary
+        // that *is* reachable from a test (a model step failing on its very
+        // first call, before any tool ran or any token was reported) rather
+        // than by actually leaving the model unconfigured, which `Scripted
+        // Model` sidesteps entirely — `failing()`'s first call already
+        // covers "fails before producing any usage-bearing output."
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.create_active_goal();
+
+        session.run_turn("fails immediately", ScriptedModel::failing());
+
+        let usage = session.goal_usage();
+        assert_eq!(usage.turns(), 1, "the turn still ran (and failed), so it still counts");
+        assert_eq!(usage.tokens(), 0, "must not invent tokens that were never reported");
+        assert_eq!(usage.cost(), 0, "must not invent cost that was never reported");
+    }
+
+    #[test]
+    fn sequential_turns_accumulate_goal_usage_without_double_counting() {
+        // "A completed piece of billable work must affect GoalUsage exactly
+        // once": run two real, separate turns against the same goal and
+        // confirm the total is exactly their sum — not the sum counted
+        // twice (a duplicate accrual bug) and not just the last turn's
+        // value (an overwrite-instead-of-accumulate bug).
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.create_active_goal();
+
+        session.run_turn("first", ScriptedModel::terminal_with_usage("first done", 100, 10));
+        session.run_turn("second", ScriptedModel::terminal_with_usage("second done", 250, 40));
+
+        let usage = session.goal_usage();
+        assert_eq!(usage.turns(), 2);
+        assert_eq!(usage.tokens(), 350);
+        assert_eq!(usage.cost(), 50);
     }
 
     #[test]
