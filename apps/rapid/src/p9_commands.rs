@@ -34,6 +34,7 @@ pub enum P9CommandError {
     Json(serde_json::Error),
     Playbook(PlaybookError),
     Agent(String),
+    Scan(String),
 }
 
 impl std::fmt::Display for P9CommandError {
@@ -44,6 +45,7 @@ impl std::fmt::Display for P9CommandError {
             Self::Json(err) => writeln!(f, "json: {err}"),
             Self::Playbook(err) => writeln!(f, "playbook: {err}"),
             Self::Agent(reason) => writeln!(f, "external agent: {reason}"),
+            Self::Scan(reason) => writeln!(f, "scan: {reason}"),
         }
     }
 }
@@ -863,6 +865,90 @@ pub fn run_findings(args: &[String]) -> Result<i32, P9CommandError> {
     }
 }
 
+/// `rapid scan [--root <path>] [--scanner <id>]`: run every scanner
+/// configured in `.rapidlm/scanners.json` (Modbit `VER-009`'s
+/// `ExternalFinding` half — `security::ExternalScannerAdapter`, wired here
+/// for the first time in this binary) and combine their results through
+/// `security::evaluate_scan_gate`. Findings already dismissed via
+/// `rapid findings dismiss <fingerprint>` are shown but never block, the
+/// same convention every other scanner in `exec_tools.rs` already uses.
+///
+/// Exit code is 0 when the combined verdict allows apply (pass/warn), 1
+/// otherwise (block/ask) — real findings, a required scanner erroring, or
+/// one being unavailable all fail closed, matching `security::gate`'s own
+/// "unavailable and error never become pass" contract.
+pub fn run_scan(args: &[String]) -> Result<i32, P9CommandError> {
+    let mut root = std::env::current_dir().map_err(P9CommandError::Io)?;
+    let mut only_scanner: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--root" => {
+                i += 1;
+                root = args.get(i).map(PathBuf::from).ok_or(P9CommandError::Usage)?;
+            }
+            "--scanner" => {
+                i += 1;
+                only_scanner = Some(args.get(i).ok_or(P9CommandError::Usage)?.as_str());
+            }
+            _ => return Err(P9CommandError::Usage),
+        }
+        i += 1;
+    }
+
+    let mut entries = crate::external_scan::load_scanners_config(&root)
+        .map_err(|err| P9CommandError::Scan(err.to_string()))?;
+    if let Some(id) = only_scanner {
+        entries.retain(|entry| entry.config().id() == id);
+        if entries.is_empty() {
+            return Err(P9CommandError::Scan(format!(
+                "no scanner named {id:?} configured in {}",
+                crate::external_scan::SCANNERS_CONFIG_PATH
+            )));
+        }
+    }
+    if entries.is_empty() {
+        println!(
+            "schema=rapidlm.scan scanners=0 (no scanners configured in {})",
+            crate::external_scan::SCANNERS_CONFIG_PATH
+        );
+        return Ok(0);
+    }
+
+    let store = crate::findings_store::FindingsStore::load(&root);
+    let cancel = capability_broker::CancellationToken::new();
+    let (verdict, outcomes) = crate::external_scan::run_configured_scanners(
+        &entries,
+        &root,
+        |fingerprint_hex| store.is_dismissed(fingerprint_hex),
+        &cancel,
+    )
+    .map_err(|err| P9CommandError::Scan(err.to_string()))?;
+
+    for outcome in &outcomes {
+        println!(
+            "schema=rapidlm.scan scanner={} status={:?} findings={} undismissed={}",
+            outcome.scanner_id,
+            outcome.report.status(),
+            outcome.report.findings().len(),
+            outcome.undismissed.len()
+        );
+        for finding in &outcome.undismissed {
+            println!(
+                "  fingerprint={} rule={} severity={:?} {}..{} {}",
+                finding.fingerprint().as_hex(),
+                finding.rule_id(),
+                finding.severity(),
+                finding.range().start(),
+                finding.range().end(),
+                finding.message()
+            );
+        }
+    }
+    println!("schema=rapidlm.scan verdict={verdict}");
+    Ok(if verdict.allows_apply() { 0 } else { 1 })
+}
+
 #[cfg(test)]
 mod findings_tests {
     use super::*;
@@ -932,6 +1018,151 @@ mod findings_tests {
             root.to_string_lossy().into_owned(),
         ];
         assert!(matches!(run_findings(&args), Err(P9CommandError::Usage)));
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+    static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-p9-scan-{tag}-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    fn write_scanners_config(root: &std::path::Path, raw: &str) {
+        std::fs::create_dir_all(root.join(".rapidlm")).expect("dir");
+        std::fs::write(root.join(crate::external_scan::SCANNERS_CONFIG_PATH), raw).expect("write");
+    }
+
+    fn write_scanners(root: &std::path::Path, scanners: Vec<serde_json::Value>) {
+        let doc = serde_json::json!({"schema": 1, "scanners": scanners});
+        write_scanners_config(root, &serde_json::to_string(&doc).expect("serialize"));
+    }
+
+    const CLEAN_SARIF: &str =
+        r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"fakescan"}},"results":[]}]}"#;
+
+    fn finding_sarif() -> String {
+        r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"fakescan"}},"results":[{"ruleId":"no-eval","level":"error","message":{"text":"eval is unsafe"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/app.rs"},"region":{"byteOffset":10,"byteLength":4}}}]}]}]}"#.to_owned()
+    }
+
+    // `serde_json::json!` handles escaping the SARIF body's own embedded
+    // quotes when the whole document is serialized — hand-formatting a
+    // JSON string containing another JSON string inline (the earlier,
+    // broken version of this helper) breaks exactly that escaping.
+    fn sh_scanner(id: &str, sarif_body: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "kind": "sast",
+            "argv": ["sh", "-c", format!("printf '%s' '{sarif_body}'")],
+        })
+    }
+
+    #[test]
+    fn no_scanners_configured_is_a_clean_exit() {
+        let root = temp_root("none");
+        let args = vec!["--root".to_owned(), root.to_string_lossy().into_owned()];
+        let code = run_scan(&args).expect("scan");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn malformed_config_is_a_scan_error() {
+        let root = temp_root("malformed");
+        write_scanners_config(&root, "not json");
+        let args = vec!["--root".to_owned(), root.to_string_lossy().into_owned()];
+        assert!(matches!(run_scan(&args), Err(P9CommandError::Scan(_))));
+    }
+
+    #[test]
+    fn a_clean_scanner_exits_zero() {
+        let root = temp_root("clean");
+        write_scanners(&root, vec![sh_scanner("fakescan", CLEAN_SARIF)]);
+        let args = vec!["--root".to_owned(), root.to_string_lossy().into_owned()];
+        let code = run_scan(&args).expect("scan");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn a_scanner_with_a_finding_exits_nonzero_and_a_dismissed_one_exits_zero() {
+        let root = temp_root("finding");
+        write_scanners(&root, vec![sh_scanner("fakescan", &finding_sarif())]);
+        let args = vec!["--root".to_owned(), root.to_string_lossy().into_owned()];
+        let code = run_scan(&args).expect("scan");
+        assert_eq!(code, 1, "an undismissed finding must fail the gate");
+
+        // The fingerprint printed to stdout by the run above is what a real
+        // user would copy into `rapid findings dismiss` — reproduce that
+        // deterministically here via the scanner's own fingerprint
+        // computation instead of scraping captured stdout.
+        let (_, outcomes) = crate::external_scan::run_configured_scanners(
+            &crate::external_scan::load_scanners_config(&root).expect("load"),
+            &root,
+            |_| false,
+            &capability_broker::CancellationToken::new(),
+        )
+        .expect("scan");
+        let fingerprint = outcomes[0].undismissed[0].fingerprint().as_hex().to_owned();
+
+        let dismiss_args = vec![
+            "dismiss".to_owned(),
+            fingerprint,
+            "--reason".to_owned(),
+            "test fixture".to_owned(),
+            "--root".to_owned(),
+            root.to_string_lossy().into_owned(),
+        ];
+        run_findings(&dismiss_args).expect("dismiss");
+
+        let code = run_scan(&args).expect("scan");
+        assert_eq!(code, 0, "a fully-dismissed finding must not keep blocking");
+    }
+
+    #[test]
+    fn scanner_filter_selects_only_the_named_scanner() {
+        let root = temp_root("filter");
+        write_scanners(
+            &root,
+            vec![
+                sh_scanner("clean-one", CLEAN_SARIF),
+                sh_scanner("dirty-one", &finding_sarif()),
+            ],
+        );
+        let clean_only = vec![
+            "--root".to_owned(),
+            root.to_string_lossy().into_owned(),
+            "--scanner".to_owned(),
+            "clean-one".to_owned(),
+        ];
+        assert_eq!(run_scan(&clean_only).expect("scan"), 0);
+
+        let dirty_only = vec![
+            "--root".to_owned(),
+            root.to_string_lossy().into_owned(),
+            "--scanner".to_owned(),
+            "dirty-one".to_owned(),
+        ];
+        assert_eq!(run_scan(&dirty_only).expect("scan"), 1);
+    }
+
+    #[test]
+    fn unknown_scanner_name_is_a_scan_error() {
+        let root = temp_root("unknown-scanner");
+        write_scanners(&root, vec![sh_scanner("fakescan", CLEAN_SARIF)]);
+        let args = vec![
+            "--root".to_owned(),
+            root.to_string_lossy().into_owned(),
+            "--scanner".to_owned(),
+            "does-not-exist".to_owned(),
+        ];
+        assert!(matches!(run_scan(&args), Err(P9CommandError::Scan(_))));
     }
 }
 

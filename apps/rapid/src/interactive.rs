@@ -343,6 +343,7 @@ fn run_subcommand(args: &[String]) -> Result<i32, InteractiveError> {
         Some("inspect-export") => p9(&args[1..], crate::p9_commands::run_inspect_export),
         Some("cron") => p9(&args[1..], crate::p9_commands::run_cron),
         Some("findings") => p9(&args[1..], crate::p9_commands::run_findings),
+        Some("scan") => p9(&args[1..], crate::p9_commands::run_scan),
         Some("agents") => p9(&args[1..], crate::p9_commands::run_agents),
         Some("plugins") => p9(&args[1..], crate::p9_commands::run_plugins),
         Some("completions") => p9(&args[1..], crate::p9_commands::run_completions),

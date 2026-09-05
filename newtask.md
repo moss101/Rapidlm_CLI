@@ -5735,6 +5735,56 @@ their results become evidence, not just a console warning).
   explicit `rapid scan` entry point, not a hook on every tool call). This is new user-facing feature and
   config-surface work, not a wiring task the way `CommandFinding`/`PatchFinding` were — correctly left
   alone this whole section rather than a gap anyone missed.
+- **`ExternalFinding` implemented 2026-09-05, exactly along the lines the note above anticipated: a new
+  `rapid scan [--root <path>] [--scanner <id>]` entry point, a new `.rapidlm/scanners.json` config surface,
+  and — as a bonus, since it turned out to already exist — `crates/security::gate`'s own generic multi-
+  scanner aggregator (`ScanGatePolicy`/`evaluate_scan_gate`), itself dormant with zero callers anywhere
+  until this same change.** New `apps/rapid/src/external_scan.rs`: `.rapidlm/scanners.json` (id/kind/argv/
+  timeout/output-limit/`on_findings` disposition per scanner — missing file is normal and returns an empty
+  list, but a malformed one is a real error, unlike the fail-open convention every other project-local
+  advisory file in this codebase uses, since a user who wrote this file meant for it to configure real
+  scanning) parses into `ExternalScannerConfig`s pinned to `SandboxTier::HostRestricted` (the only backend
+  `sandbox_exec::build_manager` registers — `ExternalScannerConfig::new`'s own default, `Container`, would
+  otherwise fail closed with `Unavailable` on every real run). `SandboxedScannerExec` (a real
+  `SupervisedScannerExec` impl, not a mock) runs each planned scan through the exact same capability-broker
+  lease + `SandboxManager::prepare/exec/destroy` ceremony `sandbox_exec.rs::run_sandboxed` already uses for
+  `shell_exec(sandbox: true)` — `build_manager`/`mint_proc_exec_lease` promoted to `pub(crate)` and reused
+  verbatim rather than duplicated. **One real design question resolved by direct source investigation, not
+  assumption:** whether the scanner's SARIF output should be read back from `SCAN_OUT_MOUNT` (`security::
+  external.rs`'s declared "scan-out" temp mount) or from stdout. Traced `crates/sandbox`'s own source first
+  (an Explore-agent research pass, then independently spot-checked): `SandboxMount::temp` is a pure
+  declaration with no host directory ever allocated, and `HostRestrictedBackend` — the only registered
+  backend — never materializes a `Temp` mount to a real path at all (its own doc comment: "isolation is
+  process-policy only"). So a configured scanner's argv must emit SARIF on stdout (Semgrep's own default,
+  or `--output -`), captured via `SandboxExecResult::output()` (already proven end-to-end by `sandbox_exec.
+  rs`'s own tests) — avoiding a bigger, unneeded change (teaching `HostRestrictedBackend` to materialize
+  `Temp` mounts) for a problem stdout capture already solves.
+
+  Findings are filtered against the same `FindingsStore` every other scanner in `exec_tools.rs` already
+  shares (`rapid findings dismiss <fingerprint>` works uniformly across this new scanner too) — a scanner
+  whose findings are *all* dismissed reports `ScannerOutcome::Clean` to the gate rather than `Findings`, the
+  same "a fully-triaged finding set must not keep blocking" invariant the git-commit/merge `PatchPolicyGate`
+  already established, while the raw report still shows every finding for visibility. `run_scan` prints a
+  per-scanner line plus each undismissed finding, then the combined `GateVerdict`, exiting `0` when the
+  verdict allows apply (pass/warn) and `1` otherwise (block/ask) — a required scanner reporting `Unavailable`
+  (not installed) or `Error` fails closed exactly like a real finding, matching `security::gate`'s own
+  stated contract ("unavailable and error never become pass") rather than silently skipping an uninstalled
+  scanner's check.
+
+  Verified with both unit tests (config parsing: valid/malformed/unknown-kind/unknown-disposition) and real,
+  non-mocked integration tests exercising the whole pipeline: a real `sh -c` "scanner" writing clean/finding
+  SARIF to stdout, run through the actual sandbox+lease ceremony, normalized, gated, and (for the CLI layer)
+  actually dismissed via `rapid findings dismiss` and re-scanned to confirm the gate reopens clean — plus a
+  manual end-to-end run of the built `rapid` binary against a real two-scanner demo project (one clean, one
+  with a finding), confirming the exact printed report, exit codes (1 → dismiss → 0), `--scanner` filtering,
+  and `.rapidlm/findings.json` persistence, before this was considered done. Full `-p rapid --lib` suite
+  (401 tests, up from 384) and `cargo build --workspace --tests` pass. **Deliberately not attempted:**
+  wiring `ExternalScannerKind::Sca`/`Container` into any always-on hook (this stays `rapid scan`-only, an
+  explicit invocation, matching the note above's own reasoning about latency/availability), and gating
+  `git commit`/`git merge` on a configured external scanner the way the secrets/patch scanners already are
+  — a real, natural follow-up now that the plumbing exists, but a separate policy decision (should an
+  external scan run on every commit, given it can be slow and requires an installed binary) left for
+  whoever picks it up next rather than bundled into first landing this feature.
 - ~~Cross-reference, 2026-09-04: a new gap in the already-built `PatchPolicyGate` itself... `scan_for_
   secrets_advisory`/`scan_patch_advisory`... collapse every scan error via `.ok()?`... Not fixed this
   pass~~ **Fixed, 2026-09-04, same day as this note (during the `crates/security` review pass — see §0a's

@@ -111,7 +111,7 @@ fn cap_err(err: impl fmt::Debug) -> SandboxRunError {
     SandboxRunError::Capability(format!("{err:?}"))
 }
 
-fn build_manager() -> SandboxManager {
+pub(crate) fn build_manager() -> SandboxManager {
     let mut manager = SandboxManager::new();
     // Always available (process-group + rlimits, no external dependency);
     // registration can only fail on a duplicate-tier or malformed-capability
@@ -191,7 +191,12 @@ fn resolve_program_on_path(program: &str) -> Result<String, SandboxRunError> {
 /// (`LeaseValidator::new`'s own revision check fails closed on a mismatch),
 /// rather than recomputing the policy document a second time and hoping it
 /// stays byte-for-byte identical.
-fn mint_proc_exec_lease(
+///
+/// `pub(crate)` alongside `build_manager`: reused as-is by
+/// `external_scan.rs`'s `SupervisedScannerExec` impl, which needs the exact
+/// same lease-minting ceremony for a plan `ExternalScannerAdapter::plan`
+/// already built, rather than a second copy of this policy/approval dance.
+pub(crate) fn mint_proc_exec_lease(
     issuer: &LeaseIssuer,
     command_name: &str,
 ) -> Result<(CapabilityLease, PolicyRevision), SandboxRunError> {
