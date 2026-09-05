@@ -29,6 +29,15 @@ use protocol::{ArtifactId, ErrorCode, JobId, LeaseId, SessionId};
 /// Maximum stdin bytes accepted at spawn. Larger payloads must become artifacts.
 pub const MAX_STDIN_BYTES: usize = 64 * 1024;
 
+/// Maximum process timeout accepted at spawn.
+///
+/// `cancel::await_exit` computes `job.started_at() + limit` (an `Instant + Duration`
+/// addition that panics on overflow). No real caller needs anything close to this —
+/// the largest today is `external_agents::DEFAULT_AGENT_TIMEOUT` at 600s — bounding it
+/// here keeps an unreasonably large caller-supplied timeout from ever reaching that
+/// addition instead of relying on every caller independently choosing a safe value.
+pub const MAX_PROC_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Process-scope command family that is the distinct high-risk shell grant.
 ///
 /// `Invocation::Shell` / [`ShellMode::ShellString`] is refused unless the bound
@@ -327,8 +336,10 @@ impl ExecSpec {
         if self.cancel.is_cancelled() {
             return Err(SpawnError::Cancelled);
         }
-        if self.timeout == Some(Duration::ZERO) {
-            return Err(SpawnError::TimeoutInvalid);
+        if let Some(limit) = self.timeout {
+            if limit == Duration::ZERO || limit > MAX_PROC_TIMEOUT {
+                return Err(SpawnError::TimeoutInvalid);
+            }
         }
         match &self.stdin {
             StdinSpec::Empty => {}
@@ -1649,7 +1660,7 @@ capability = "fs.read"
     }
 
     #[test]
-    fn empty_argv_and_zero_timeout_and_oversized_stdin_fail_closed() {
+    fn empty_argv_and_zero_or_oversized_timeout_and_oversized_stdin_fail_closed() {
         let echo = if Path::new("/bin/echo").is_file() {
             "/bin/echo"
         } else {
@@ -1679,6 +1690,19 @@ capability = "fs.read"
                 CancellationToken::new(),
             )
             .expect_err("timeout"),
+            SpawnError::TimeoutInvalid
+        );
+        assert_eq!(
+            ExecSpec::argv(
+                [echo],
+                temp_cwd(),
+                None::<(String, SecretOrValue)>,
+                StdinSpec::Empty,
+                Some(MAX_PROC_TIMEOUT + Duration::from_secs(1)),
+                4096,
+                CancellationToken::new(),
+            )
+            .expect_err("oversized timeout"),
             SpawnError::TimeoutInvalid
         );
         assert_eq!(

@@ -4099,6 +4099,25 @@ fix. Full `-p capability-broker --lib` suite (139 tests, up from 137), `--test l
 unchanged), `-p process-supervisor --lib` (106 tests, unchanged), and full `-p rapid --lib` suite (381 tests,
 unchanged) all pass, plus `cargo build --workspace --tests` clean.
 
+**Fresh review pass, 2026-09-05, closing one of the two low-severity `process-supervisor` notes already on
+record above (line ~2035): `ExecSpec::validate` never bounded `timeout` from above, only rejecting zero.**
+`cancel::await_exit` computes `job.started_at() + limit` — an `Instant + Duration` addition that panics on
+overflow — so an unreasonably large caller-supplied timeout would panic the whole supervisor thread rather
+than fail closed the way every other malformed `ExecSpec` field already does. Confirmed not currently
+reachable (both real callers hardcode small timeouts: `external_agents::DEFAULT_AGENT_TIMEOUT` 600s,
+`hooks::HARD_MAX_HOOK_TIMEOUT` 30s), which is why this was flagged as defense-in-depth rather than an active
+bug. **Fixed:** added `MAX_PROC_TIMEOUT` (24 hours — generous enough that no real caller is ever near it,
+narrow enough that `started_at() + limit` can never overflow), enforced alongside the existing zero-timeout
+check in `validate()`, reusing the existing `SpawnError::TimeoutInvalid` bucket rather than adding a new
+variant for what's still one invariant ("timeout must be a sane, usable duration"). Extended the existing
+`empty_argv_and_zero_timeout_and_oversized_stdin_fail_closed` test (renamed to `..._zero_or_oversized_
+timeout_and_...`) with a `MAX_PROC_TIMEOUT + 1s` case. Verified via the revert cycle: reverting just the
+upper-bound check reproduced the predicted failure exactly — the spec built successfully instead of
+returning `TimeoutInvalid` — before restoring the fix. Full `-p process-supervisor --lib` suite (106 tests,
+unchanged) and `cargo build --workspace --tests` pass. The sibling note (unjoined reader threads on a
+`TreeStillAlive` escalation failure) remains open — a real gap, but one needing a join-on-error-path change
+to `await_exit_draining` rather than a bound, not bundled into this fix.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
