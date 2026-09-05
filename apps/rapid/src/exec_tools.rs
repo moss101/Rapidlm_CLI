@@ -3453,7 +3453,9 @@ fn commit_flags_include_all(flags: &[String]) -> bool {
 /// blocks) on anything that isn't a real, readable git repo with staged
 /// changes: this can only ever narrow which commits succeed, never widen
 /// what's allowed, so a repo this can't introspect must not be blocked by
-/// a check that can't run.
+/// a check that can't run. Also runs `scan_external_findings` (see below)
+/// — whatever `.rapidlm/scanners.json` configures — combining its findings
+/// with this scan's own into the one blocking decision below.
 fn scan_git_commit_gate(root: &Path, argv: &[String]) -> Option<String> {
     let verb_index = find_git_verb_index(root, argv, "commit")?;
     let include_all = commit_flags_include_all(&argv[verb_index + 1..]);
@@ -3475,7 +3477,8 @@ fn scan_git_commit_gate(root: &Path, argv: &[String]) -> Option<String> {
             Some((path.to_owned(), content))
         })
         .collect::<Vec<_>>();
-    let findings = collect_content_findings(root, files.into_iter());
+    let mut findings = collect_content_findings(root, files.into_iter());
+    findings.extend(scan_external_findings(root));
     record_gate_decision(root, "commit", !findings.is_empty(), &findings);
     if findings.is_empty() {
         return None;
@@ -3503,7 +3506,8 @@ fn scan_git_commit_gate(root: &Path, argv: &[String]) -> Option<String> {
 /// shell-string-wrapping scope limit) as `scan_git_commit_gate`. Fails
 /// open the same way the commit gate does: an unreadable repo, an
 /// unresolvable ref, or a deleted-by-incoming-branch path are all silently
-/// skipped rather than treated as a reason to block.
+/// skipped rather than treated as a reason to block. Also runs
+/// `scan_external_findings` (see below), same as the commit gate.
 fn scan_git_merge_gate(root: &Path, argv: &[String]) -> Option<String> {
     let verb_index = find_git_verb_index(root, argv, "merge")?;
     let targets: Vec<&str> = argv[verb_index + 1..]
@@ -3530,6 +3534,7 @@ fn scan_git_merge_gate(root: &Path, argv: &[String]) -> Option<String> {
             .collect::<Vec<_>>();
         findings.extend(collect_content_findings(root, files.into_iter()));
     }
+    findings.extend(scan_external_findings(root));
     record_gate_decision(root, "merge", !findings.is_empty(), &findings);
     if findings.is_empty() {
         return None;
@@ -3540,6 +3545,81 @@ fn scan_git_merge_gate(root: &Path, argv: &[String]) -> Option<String> {
          then retry the merge.",
         findings.join("\n")
     ))
+}
+
+/// The external-scanner half of `PatchPolicyGate` (Modbit `VER-009`'s
+/// `ExternalFinding`), reached from both gates above: whatever
+/// `.rapidlm/scanners.json` configures is run exactly the way `rapid scan`
+/// (`external_scan.rs::run_configured_scanners`, `p9_commands.rs::run_scan`)
+/// already runs it — same sandbox+lease ceremony, same `evaluate_scan_gate`
+/// aggregation, same `FindingsStore` dismiss mechanism — but reached from
+/// the commit/merge boundary instead of an explicit command. Deliberately
+/// opt-in, unlike the always-on in-process secrets/patch scan above: no
+/// `.rapidlm/scanners.json` at all means nothing to run, and this returns
+/// immediately at no cost to a repo that hasn't configured any scanners. A
+/// *malformed* config, unlike a missing one, blocks rather than silently
+/// skipping — mirroring `load_scanners_config`'s own "a typo must not be
+/// treated as no scanners" rationale, now extended to the commit boundary:
+/// a broken scanning setup must not silently let commits through the exact
+/// gate it was configured to enforce. Once the scanners actually run, the
+/// policy is `verdict.allows_apply()` — the same Pass/Warn-only rule
+/// `rapid scan`'s own exit code already uses, so `Unavailable`/`Error`
+/// never quietly becomes a pass here either. Mints its own short-lived
+/// `capability_broker::CancellationToken` rather than taking the caller's
+/// real (`agent_runtime`) one — a different type serving a different
+/// purpose, and the same thing `sandbox_exec.rs::run_sandboxed`/
+/// `mint_proc_exec_lease` already do for this exact lease-minting ceremony.
+fn scan_external_findings(root: &Path) -> Vec<String> {
+    let entries = match crate::external_scan::load_scanners_config(root) {
+        Ok(entries) => entries,
+        Err(err) => {
+            return vec![format!(
+                "{err}; fix or remove {} before committing",
+                crate::external_scan::SCANNERS_CONFIG_PATH
+            )];
+        }
+    };
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let store = crate::findings_store::FindingsStore::load(root);
+    let cancel = capability_broker::CancellationToken::new();
+    let (verdict, outcomes) = match crate::external_scan::run_configured_scanners(
+        &entries,
+        root,
+        |fingerprint_hex| store.is_dismissed(fingerprint_hex),
+        &cancel,
+    ) {
+        Ok(result) => result,
+        Err(err) => return vec![format!("configured scanner could not run: {err}")],
+    };
+    if verdict.allows_apply() {
+        return Vec::new();
+    }
+    let mut findings = Vec::new();
+    for outcome in &outcomes {
+        if !outcome.undismissed.is_empty() {
+            let details: Vec<String> = outcome
+                .undismissed
+                .iter()
+                .map(|finding| format!("{} ({})", finding.rule_id(), finding.fingerprint().as_hex()))
+                .collect();
+            findings.push(format!(
+                "advisory: scanner {} reported: {} — verify before committing, or dismiss a \
+                 false positive with `rapid findings dismiss <fingerprint>`",
+                outcome.scanner_id,
+                details.join(", ")
+            ));
+        } else if outcome.report.status() != security::ExternalScanStatus::Passed {
+            findings.push(format!(
+                "scanner {} reported {:?}; configured scanners must run cleanly (or their \
+                 findings be dismissed) before this commit/merge — see `rapid scan` for detail",
+                outcome.scanner_id,
+                outcome.report.status()
+            ));
+        }
+    }
+    findings
 }
 
 /// Every advisory-only content scan a successful write/patch can trigger,
@@ -6150,6 +6230,174 @@ use std::sync::{Arc, Mutex};
         assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 2, "seed + the real commit");
     }
 
+    /// Writes `.rapidlm/scanners.json` with one real (sandboxed, not
+    /// mocked) scanner backed by `sh -c "printf ..."`, mirroring
+    /// `external_scan.rs::tests::sh_scanner`'s own fixture exactly — this
+    /// runs through the real `SandboxedScannerExec`/`SandboxManager`/lease
+    /// ceremony, not a stub.
+    fn write_sh_scanner_config(root: &Path, sarif_body: &str) {
+        let json = serde_json::json!({
+            "schema": 1,
+            "scanners": [{
+                "id": "fakescan",
+                "kind": "sast",
+                "argv": ["sh", "-c", format!("printf '%s' '{sarif_body}'")],
+            }],
+        });
+        fs::create_dir_all(root.join(".rapidlm")).expect("dir");
+        fs::write(
+            root.join(crate::external_scan::SCANNERS_CONFIG_PATH),
+            serde_json::to_vec(&json).expect("serialize"),
+        )
+        .expect("write scanners.json");
+    }
+
+    const CLEAN_SARIF_FIXTURE: &str =
+        r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"fakescan"}},"results":[]}]}"#;
+
+    fn finding_sarif_fixture() -> String {
+        r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"fakescan"}},"results":[{"ruleId":"no-eval","level":"error","message":{"text":"eval is unsafe"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/app.rs"},"region":{"byteOffset":10,"byteLength":4}}}]}]}]}"#.to_owned()
+    }
+
+    #[test]
+    fn git_commit_is_blocked_by_a_configured_external_scanner_finding() {
+        let root = TempRoot::new("commit-gate-external-scanner-finding");
+        git_init(&root.0);
+        let configure = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root.0)
+                .args(args)
+                .output()
+                .expect("git config");
+            assert!(out.status.success());
+        };
+        configure(&["config", "user.name", "t"]);
+        configure(&["config", "user.email", "t@t.invalid"]);
+        write_sh_scanner_config(&root.0, &finding_sarif_fixture());
+
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        fs::write(root.0.join("app.rs"), b"fn main() {}\n").expect("write file");
+        let stage = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["add", "app.rs"])
+            .output()
+            .expect("git add");
+        assert!(stage.status.success());
+
+        let commit_call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","add app"]}"#);
+        let validated = tools.validate(&commit_call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                let detail = detail.expect("detail");
+                assert!(detail.contains("commit blocked"), "{detail}");
+                assert!(detail.contains("fakescan"), "{detail}");
+            }
+            other => panic!("expected the commit to be blocked by the external scanner, got {other:?}"),
+        }
+        let log = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["log", "--oneline"])
+            .output()
+            .expect("git log");
+        assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 1, "only the seed commit");
+    }
+
+    #[test]
+    fn git_commit_succeeds_when_the_configured_external_scanner_is_clean() {
+        let root = TempRoot::new("commit-gate-external-scanner-clean");
+        git_init(&root.0);
+        let configure = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root.0)
+                .args(args)
+                .output()
+                .expect("git config");
+            assert!(out.status.success());
+        };
+        configure(&["config", "user.name", "t"]);
+        configure(&["config", "user.email", "t@t.invalid"]);
+        write_sh_scanner_config(&root.0, CLEAN_SARIF_FIXTURE);
+
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        fs::write(root.0.join("app.rs"), b"fn main() {}\n").expect("write file");
+        let stage = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["add", "app.rs"])
+            .output()
+            .expect("git add");
+        assert!(stage.status.success());
+
+        let commit_call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","add app"]}"#);
+        let validated = tools.validate(&commit_call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { .. } => {}
+            other => panic!("expected the commit to succeed with a clean external scan, got {other:?}"),
+        }
+        let log = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["log", "--oneline"])
+            .output()
+            .expect("git log");
+        assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 2, "seed + the real commit");
+    }
+
+    #[test]
+    fn git_commit_is_blocked_by_a_malformed_scanners_config_rather_than_silently_skipping_it() {
+        // A missing .rapidlm/scanners.json is normal (nothing configured)
+        // and must never block anything — but a *present, malformed* one is
+        // a real misconfiguration, and `scan_external_findings` documents
+        // treating that as a block rather than silently letting commits
+        // through the exact gate it was set up to enforce. No sandboxed
+        // scanner ever needs to run here — the config itself fails to parse.
+        let root = TempRoot::new("commit-gate-malformed-scanners-config");
+        git_init(&root.0);
+        let configure = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root.0)
+                .args(args)
+                .output()
+                .expect("git config");
+            assert!(out.status.success());
+        };
+        configure(&["config", "user.name", "t"]);
+        configure(&["config", "user.email", "t@t.invalid"]);
+        fs::create_dir_all(root.0.join(".rapidlm")).expect("dir");
+        fs::write(root.0.join(crate::external_scan::SCANNERS_CONFIG_PATH), b"not json").expect("write");
+
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        fs::write(root.0.join("app.rs"), b"fn main() {}\n").expect("write file");
+        let stage = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["add", "app.rs"])
+            .output()
+            .expect("git add");
+        assert!(stage.status.success());
+
+        let commit_call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","add app"]}"#);
+        let validated = tools.validate(&commit_call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                let detail = detail.expect("detail");
+                assert!(detail.contains("commit blocked"), "{detail}");
+                assert!(detail.contains("malformed"), "{detail}");
+            }
+            other => panic!("expected the commit to be blocked by the malformed scanners config, got {other:?}"),
+        }
+    }
+
     #[test]
     fn background_and_sandbox_shell_exec_cannot_bypass_the_git_commit_gate() {
         // `scan_git_commit_gate`/`scan_git_merge_gate` used to sit only on
@@ -6596,6 +6844,50 @@ use std::sync::{Arc, Mutex};
             other => panic!("expected the merge to succeed after dismissal, got {other:?}"),
         }
         assert!(root.0.join("config.rs").exists(), "the merge should have actually run this time");
+    }
+
+    #[test]
+    fn git_merge_is_blocked_by_a_configured_external_scanner_finding() {
+        // Same shape as `git_commit_is_blocked_by_a_configured_external_
+        // scanner_finding`, but at the merge boundary: `scan_external_
+        // findings` scans the whole workspace root regardless of which
+        // gate called it, so this is really confirming the shared call site
+        // in `scan_git_merge_gate` wires it in correctly, not re-testing
+        // `run_configured_scanners` itself.
+        let root = TempRoot::new("merge-gate-external-scanner-finding");
+        git_init(&root.0);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root.0)
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["config", "user.name", "t"]);
+        git(&["config", "user.email", "t@t.invalid"]);
+        git(&["checkout", "-b", "feature"]);
+        fs::write(root.0.join("app.rs"), b"fn main() {}\n").expect("write file");
+        git(&["add", "app.rs"]);
+        git(&["commit", "-m", "add app on feature"]);
+        git(&["checkout", "main"]);
+        write_sh_scanner_config(&root.0, &finding_sarif_fixture());
+
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let merge_call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","merge","feature"]}"#);
+        let validated = tools.validate(&merge_call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                let detail = detail.expect("detail");
+                assert!(detail.contains("merge blocked"), "{detail}");
+                assert!(detail.contains("fakescan"), "{detail}");
+            }
+            other => panic!("expected the merge to be blocked by the external scanner, got {other:?}"),
+        }
+        assert!(!root.0.join("app.rs").exists(), "the merge must never actually have happened");
     }
 
     #[test]

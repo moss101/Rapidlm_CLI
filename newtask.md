@@ -6005,6 +6005,48 @@ their results become evidence, not just a console warning).
   — a real, natural follow-up now that the plumbing exists, but a separate policy decision (should an
   external scan run on every commit, given it can be slow and requires an installed binary) left for
   whoever picks it up next rather than bundled into first landing this feature.
+- **The deferred follow-up above — gating `git commit`/`git merge` on configured external scanners —
+  implemented 2026-09-05.** Verified before starting (via a scoping research agent, then independently
+  re-read directly): `run_configured_scanners` and `scan_git_commit_gate`/`scan_git_merge_gate` were both
+  already fully built and tested but never connected — `execute_shell`'s gate check only ever called
+  `collect_content_findings` (the in-process secrets/patch scan), never `run_configured_scanners`. **Fixed
+  with the smallest connection, not a new mechanism:** new `exec_tools.rs::scan_external_findings(root)`,
+  called from both `scan_git_commit_gate` and `scan_git_merge_gate` right alongside the existing
+  `collect_content_findings` call, findings from both combined into the one blocking decision and the one
+  `record_gate_decision` log line. Reuses `run_configured_scanners`/`load_scanners_config` verbatim: same
+  sandbox+lease ceremony, same `evaluate_scan_gate` aggregation, same `FindingsStore` dismiss mechanism
+  `rapid scan` already established, so this is wiring, not new scanning logic. The policy decisions the
+  deferred note above flagged as open, resolved and documented explicitly rather than left implicit: (1)
+  no `.rapidlm/scanners.json` at all means zero cost, the gate behaves exactly as before (opt-in, matching
+  `rapid scan`'s own "nothing configured" convention); (2) a scanner run's own outcome is judged via
+  `verdict.allows_apply()`, the identical Pass/Warn-only rule `rapid scan`'s exit code already uses, so
+  `Unavailable`/`Error` never quietly becomes a pass at the commit boundary either; (3) a *malformed*
+  `.rapidlm/scanners.json` (present but fails to parse) blocks the commit/merge rather than silently
+  skipping it, a new decision this integration had to make that `rapid scan` itself didn't (the CLI just
+  returns a nonzero exit and stops; a gate has to decide whether to let the commit through), resolved by
+  extending `load_scanners_config`'s own already-documented rationale ("a typo must not be treated as no
+  scanners") to this boundary: a broken scanning setup must not silently let commits through the exact gate
+  it was configured to enforce. One implementation snag: `run_configured_scanners` takes a
+  `capability_broker::CancellationToken`, not the `agent_runtime::CancellationToken` `execute_shell`'s own
+  caller supplies, two distinct types with the same name. Rather than plumbing a conversion, followed the
+  precedent already set by `sandbox_exec.rs::run_sandboxed`/`mint_proc_exec_lease` (neither accepts the
+  caller's real cancellation token either; both mint a fresh, short-lived `capability_broker::
+  CancellationToken::new()` internally for the lease ceremony) — `scan_external_findings` does the same.
+  New tests, all against a real (sandboxed, non-mocked) `sh -c "printf ..."` scanner fixture mirroring
+  `external_scan.rs::tests::sh_scanner`'s own: `git_commit_is_blocked_by_a_configured_external_scanner_
+  finding`, `git_commit_succeeds_when_the_configured_external_scanner_is_clean`,
+  `git_commit_is_blocked_by_a_malformed_scanners_config_rather_than_silently_skipping_it`, and
+  `git_merge_is_blocked_by_a_configured_external_scanner_finding` (confirming the shared helper is wired
+  into both boundaries, not just commit). Revert-cycle verified: reverted both call sites' `scan_external_
+  findings` calls, re-ran the four new tests — the three block-path tests failed exactly as predicted
+  (`Succeeded` instead of `Failed`, a real commit/merge landing where one should have been blocked), the
+  clean-pass test still passed (expected — nothing to detect either way with the wiring removed); restored
+  from backup and reconfirmed all four pass again. Full `-p rapid --lib` suite (420 tests, up from 416) and
+  `cargo build --workspace --tests` pass with no regressions. **`VER-009`/`ExternalFinding` is now fully
+  closed** — every deferred item this section ever flagged (the gate itself, durable evidence, the
+  external-scanner half, and now this integration) has landed; only the separately-documented, deliberately
+  accepted shell-string-wrapping and git-global-flag-position scope limits above remain, both structural
+  and already precisely written up rather than oversights.
 - ~~Cross-reference, 2026-09-04: a new gap in the already-built `PatchPolicyGate` itself... `scan_for_
   secrets_advisory`/`scan_patch_advisory`... collapse every scan error via `.ok()?`... Not fixed this
   pass~~ **Fixed, 2026-09-04, same day as this note (during the `crates/security` review pass — see §0a's
