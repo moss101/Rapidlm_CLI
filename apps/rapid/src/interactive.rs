@@ -2851,15 +2851,31 @@ fn run_interactive_turn(
     outcome
 }
 
+/// Fold `.rapidlm/MEMORY.md` and `.rapidlm/todos.json` into `preserved`,
+/// exactly the way `exec_turn` already does (`load_memory_index`/
+/// `load_todos_index`, both bounded and fail-open — a missing or corrupt
+/// file yields `None`, never an error). Extracted into its own function
+/// (rather than inlined in `run_interactive_turn_inner`, the way `exec_turn`
+/// inlines its own copy) specifically so it's unit-testable on its own: the
+/// existing interactive-loop test cancels the turn before any model call to
+/// stay fast and deterministic, so it never observes the built context —
+/// this function can be asserted on directly against a fixture workspace
+/// without needing to run a real turn.
+fn preserve_memory_and_todos(preserved: PreservedLiveContext, root: &Path) -> PreservedLiveContext {
+    let preserved = preserved.with_memory_index(crate::host::load_memory_index(root));
+    preserved.with_todos_index(crate::host::load_todos_index(root))
+}
+
 /// Actually resolve a model, build workspace tools, and run one turn through
 /// the same `run_live_exec` entry the headless `rapid exec` path uses.
 ///
 /// Deliberately simpler than `exec_turn`'s full setup for a first working
 /// version of interactive execution: a single configured model (no fallback
 /// chain, no managed-policy ceilings) and no proactive context retrieval,
-/// memory index, reminders, hooks, or MCP servers. All of that is real and
-/// worth adding — omitted here to land working end-to-end turn execution
-/// first, not silently dropped as an oversight.
+/// reminders, hooks, or MCP servers. All of that is real and worth adding —
+/// omitted here to land working end-to-end turn execution first, not
+/// silently dropped as an oversight. Memory index and todo index (2026-09-05)
+/// are the first of these to be wired in — see `preserve_memory_and_todos`.
 fn run_interactive_turn_inner(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
@@ -2878,6 +2894,7 @@ fn run_interactive_turn_inner(
                 };
             }
         };
+    let preserved = preserve_memory_and_todos(preserved, root);
     let permission_lattice = match exec_permission_lattice(Some(root), None) {
         Ok(lattice) => lattice,
         Err(err) => {
@@ -3958,6 +3975,54 @@ base_url = "http://127.0.0.1:11434/v1"
             err,
             InteractiveError::Config(ConfigLoadError::SourceTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn preserve_memory_and_todos_folds_both_indexes_and_fails_open_when_neither_exists() {
+        // The interactive turn loop used to omit both indexes entirely (see
+        // `run_interactive_turn_inner`'s own doc comment) — this is the
+        // bug reproduction plus the fix, at the level that's actually
+        // testable: the existing full interactive-session tests
+        // deliberately cancel before a real model call, so they never
+        // observe the built context, which is exactly why this logic was
+        // extracted into its own function instead of staying inlined.
+        let root = std::env::temp_dir().join(format!(
+            "rapidlm-interactive-preserve-memory-todos-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".rapidlm")).expect("dir");
+
+        let bare = PreservedLiveContext::new("goal", Vec::new(), "", "", 8192, 256).expect("bare");
+        let folded = preserve_memory_and_todos(bare, &root);
+        assert_eq!(
+            folded.memory_index(),
+            None,
+            "no MEMORY.md yet: must fail open, not error"
+        );
+        assert_eq!(
+            folded.todos_index(),
+            None,
+            "no todos.json yet: must fail open, not error"
+        );
+
+        std::fs::write(root.join(".rapidlm").join("MEMORY.md"), "remember this\n").expect("write");
+        std::fs::write(
+            root.join(crate::exec_tools::TODOS_PATH),
+            r#"{"schema":1,"todos":[{"id":"t1","content":"do the thing","status":"pending"}]}"#,
+        )
+        .expect("write");
+
+        let bare = PreservedLiveContext::new("goal", Vec::new(), "", "", 8192, 256).expect("bare");
+        let folded = preserve_memory_and_todos(bare, &root);
+        assert_eq!(folded.memory_index(), Some("remember this"));
+        let todos = folded.todos_index().expect("todos index present");
+        assert!(todos.contains("do the thing"), "{todos}");
+
+        drop(std::fs::remove_dir_all(&root));
     }
 
     #[test]

@@ -3926,6 +3926,26 @@ temporarily reverting `submit_turn` to its old "append `turn.started`, drain, st
   the headless path. A natural refactor (extract `exec_turn`'s setup into a function both paths share) rather
   than a duplicate implementation to maintain in parallel — not attempted here given the size of everything
   else in this change.
+  - **The memory-index and todos-index pieces of this gap closed 2026-09-05** — the smallest, lowest-risk
+    slice of the list above: `exec_turn`'s existing `host::load_memory_index(root)`/`load_todos_index(root)`
+    calls (both already bounded and fail-open — a missing or corrupt file yields `None`, never an error) are
+    the exact same two-line pattern `run_interactive_turn_inner` needed, with no new plumbing (it already has
+    `root: &Path` and the built `PreservedLiveContext` in scope). Extracted into a new
+    `preserve_memory_and_todos(preserved, root)` rather than inlined the way `exec_turn` inlines its own copy
+    — specifically so it's independently unit-testable: the existing full interactive-session tests
+    (`a_second_plain_text_message_does_not_crash_the_session_and_a_turn_actually_runs` and siblings)
+    deliberately cancel the turn before any real model call to stay fast and deterministic, so none of them
+    ever observe the built context, and adding a slow/real-model-dependent test just to see this one field
+    would be the wrong trade. New test
+    `preserve_memory_and_todos_folds_both_indexes_and_fails_open_when_neither_exists`: calls the extracted
+    function directly against a fixture workspace, confirms both fields are `None` when no `.rapidlm/
+    MEMORY.md`/`todos.json` exist yet, then writes both and confirms the built context actually carries their
+    content. Revert-cycle verified: temporarily made the function a no-op passthrough, reran the test — failed
+    exactly as predicted (`None` where `Some("remember this")` was expected), then restored. Full
+    `-p rapid --lib` suite (425 tests, up from 424) and `cargo build --workspace --tests` pass. **Still not
+    attempted, same list as before minus these two:** managed-policy ceilings, proactive context retrieval,
+    reminders, hooks, and MCP servers for the interactive turn loop — each is its own real slice of this same
+    gap, not bundled in here.
 - **No response streaming**: `agent_runtime::TurnEvent` doesn't carry model text deltas or tool result content
   (it's structural telemetry — which step, how many tokens, which tool, pass/fail), only the final `TurnResult`
   does. The transcript shows tool call *activity* (name + stage) live as it happens, but the assistant's actual
