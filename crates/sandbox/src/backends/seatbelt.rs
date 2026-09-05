@@ -19,13 +19,20 @@
 //! this is the taxonomy gap `newtask.md` flags, deliberately not resolved
 //! by widening `protocol::SandboxTier` speculatively for one backend.
 //!
-//! Only `SandboxNetwork::None` is accepted (`Allowlist`/`Proxy` are
-//! refused as unsupported): the profile below adds a real `(deny
-//! network*)` rule for that case — verified empirically against the real
-//! `sandbox-exec` binary that a later `(allow default)` does not undo an
-//! earlier `(deny network*)` — a genuine guarantee neither the existing
-//! job-based Seatbelt path nor `HostRestrictedBackend`'s process-policy-only
-//! isolation makes today.
+//! `SandboxNetwork::None` and `SandboxNetwork::Open` are both accepted
+//! (`Allowlist`/`Proxy` are refused as unsupported — no narrower-than-`Open`-
+//! but-broader-than-`None` mode exists here): `None` adds a real `(deny
+//! network*)` rule, verified empirically against the real `sandbox-exec`
+//! binary that a later `(allow default)` does not undo an earlier `(deny
+//! network*)` — a genuine guarantee neither the existing job-based Seatbelt
+//! path nor `HostRestrictedBackend`'s process-policy-only isolation makes
+//! today. `Open` omits that rule entirely, leaving network exactly as
+//! unrestricted as the existing job-based path already leaves it — added
+//! specifically so routing `apps/rapid`'s macOS `shell_exec(sandbox: true)`
+//! through this backend (see `newtask.md` §1.1) doesn't silently tighten
+//! network behavior as an unannounced side effect of an unrelated
+//! resource-governance fix; a caller has to explicitly ask for `None` to
+//! get the stronger guarantee.
 
 use std::collections::HashMap;
 use std::fs;
@@ -115,7 +122,7 @@ impl SeatbeltBackend {
     pub fn new() -> Self {
         let caps = SandboxCapabilities::new(
             SandboxTier::HostRestricted,
-            NetworkCapability::none_only(),
+            NetworkCapability::none_and_open(),
             MountCapability::workspace_temp(),
             ResourceCapability::bounded(),
         )
@@ -170,7 +177,7 @@ impl SandboxBackend for SeatbeltBackend {
         if spec.image().is_some() {
             return Err(SandboxError::InvalidSpec);
         }
-        if !matches!(spec.network(), SandboxNetwork::None) {
+        if !matches!(spec.network(), SandboxNetwork::None | SandboxNetwork::Open) {
             return Err(SandboxError::UnsupportedNetwork);
         }
         let sandbox_exec = sandbox_exec_binary().ok_or(SandboxError::HealthFailed)?;
@@ -192,7 +199,7 @@ impl SandboxBackend for SeatbeltBackend {
         let cwd_host = resolve_cwd(spec.cwd(), spec.mounts())?;
         check_cancel(cancel)?;
         let handle = SandboxHandle::new(SandboxTier::HostRestricted, lease.lease_id())?;
-        let profile = render_profile(&write_roots);
+        let profile = render_profile(&write_roots, spec.network());
         let profile_path = std::env::temp_dir()
             .join(format!("rapidlm-seatbelt-{}.sb", handle.id().as_runtime()));
         fs::write(&profile_path, profile.as_bytes()).map_err(|_| SandboxError::HealthFailed)?;
@@ -280,14 +287,16 @@ impl SandboxBackend for SeatbeltBackend {
 /// `(version 1) (deny file-write*)` plus one `(allow file-write* (subpath
 /// ...))` per resolved read-write mount, `/dev/` and `/private/tmp/` always
 /// allowed for ordinary scratch/pipe use (matching the existing job-based
-/// path's own profile), a `(deny network*)` (only reached when `prepare`
-/// has already confirmed the request was `SandboxNetwork::None`), and
-/// `(allow default)` last for everything else — same shape and rule order
-/// as `apps/rapid/src/exec_tools.rs::seatbelt_profile`, empirically
-/// verified (outside this crate, against the real `sandbox-exec` binary)
-/// that a trailing `(allow default)` does not undo an earlier `(deny
-/// network*)` or narrow `(allow file-write* (subpath ...))`.
-fn render_profile(write_roots: &[CanonicalHostPath]) -> String {
+/// path's own profile), a `(deny network*)` only when `network` is
+/// `SandboxNetwork::None` (omitted entirely for `Open` — `prepare` has
+/// already confirmed `network` is one of these two, nothing else reaches
+/// here), and `(allow default)` last for everything else — same shape and
+/// rule order as `apps/rapid/src/exec_tools.rs::seatbelt_profile`,
+/// empirically verified (outside this crate, against the real
+/// `sandbox-exec` binary) that a trailing `(allow default)` does not undo
+/// an earlier `(deny network*)` or narrow `(allow file-write* (subpath
+/// ...))`.
+fn render_profile(write_roots: &[CanonicalHostPath], network: SandboxNetwork) -> String {
     let mut profile = String::from("(version 1)\n(deny file-write*)\n");
     for root in write_roots {
         profile.push_str(&format!(
@@ -296,7 +305,9 @@ fn render_profile(write_roots: &[CanonicalHostPath]) -> String {
         ));
     }
     profile.push_str("(allow file-write* (subpath \"/dev/\") (subpath \"/private/tmp/\"))\n");
-    profile.push_str("(deny network*)\n");
+    if matches!(network, SandboxNetwork::None) {
+        profile.push_str("(deny network*)\n");
+    }
     profile.push_str("(allow default)\n");
     profile
 }
@@ -910,6 +921,80 @@ capability = "fs.read"
         let result = backend.exec(&handle, &request, &lease, &live).expect("exec");
         assert_ne!(result.exit().code(), Some(0), "curl must fail with network denied");
         backend.destroy(&handle, &live).expect("destroy");
+    }
+
+    #[test]
+    fn open_network_genuinely_reaches_a_real_local_endpoint_not_just_unblocked_by_accident() {
+        // Symmetric to `network_is_genuinely_denied_not_just_unrequested`
+        // above, proving the other direction just as concretely: `Open`
+        // must not silently degrade into some other policy that happens to
+        // let a *specific* command through. A real TCP listener on the
+        // loopback interface (not a real internet host, so this stays
+        // deterministic in a network-restricted CI/sandbox environment) —
+        // the sandboxed process must actually reach it, not merely exit
+        // zero for an unrelated reason.
+        if !seatbelt_available() {
+            return;
+        }
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("local endpoint");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+        let hits = Arc::new(AtomicU32::new(0));
+        let hits_thread = Arc::clone(&hits);
+        let accept_thread = thread::spawn(move || {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(4) {
+                match listener.accept() {
+                    Ok(_) => {
+                        hits_thread.fetch_add(1, Ordering::SeqCst);
+                        break;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let backend = SeatbeltBackend::new();
+        let ws = TempWorkspace::new();
+        let open_spec = SandboxSpec::builder(SandboxTier::HostRestricted)
+            .cwd(cwd())
+            .mount(ws.mount("src", MountMode::ReadWrite))
+            .network(SandboxNetwork::Open)
+            .build()
+            .expect("spec");
+        let lease = proc_lease();
+        let live = CancellationToken::new();
+        let handle = backend.prepare(&open_spec, &lease, &live).expect("prepare");
+        let request = SandboxExecRequest::new(
+            [
+                "/usr/bin/curl",
+                "-s",
+                "-m",
+                "3",
+                "-o",
+                "/dev/null",
+                &format!("http://{addr}/"),
+            ],
+            Duration::from_secs(10),
+            4096,
+        )
+        .expect("request");
+        let _ = backend.exec(&handle, &request, &lease, &live).expect("exec");
+        backend.destroy(&handle, &live).expect("destroy");
+
+        accept_thread.join().expect("accept thread");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the sandboxed curl must have genuinely reached the local listener under Open"
+        );
     }
 
     #[cfg(unix)]

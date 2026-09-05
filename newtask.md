@@ -4587,6 +4587,51 @@ not guessed, before wiring `shell_exec` through it. | Landlock + Seatbelt + chil
   real design/API-surface decision, not a rider on the parity work that surfaced it, and row 2's own note
   already correctly scoped "unify the two paths" as separate, dedicated follow-up rather than something to
   rush alongside other work.
+- **Unification started 2026-09-05, first of two commits: `SeatbeltBackend`'s network policy made
+  configurable, closing the one blocking prerequisite a decision-oriented scoping pass surfaced before any
+  `apps/rapid` wiring could safely begin.** That scoping pass (comparing "reuse `SeatbeltBackend`" against
+  "port the resource-governance machinery into `JobRegistry`") concluded reuse is the correct technical
+  call — `SeatbeltBackend` already reuses `host_restricted.rs`'s hardened process-group/CPU/memory/pid
+  logic rather than risking a second, independently-maintained copy, exactly the reasoning `seatbelt.rs`'s
+  own doc comment already states for why it was built the way it was — but surfaced one real, user-facing
+  behavior-change risk that needed an explicit decision first: `SeatbeltBackend`'s Seatbelt profile denied
+  network egress *unconditionally* (verified: `prepare()` rejected anything but `SandboxNetwork::None`, and
+  `render_profile()` always emitted `(deny network*)`), whereas *both* of today's live paths (the macOS
+  `JobRegistry` job's own profile, and non-macOS `HostRestrictedBackend`) leave network open. Routing macOS
+  through `SeatbeltBackend` as-is would have silently broken any sandboxed command doing legitimate network
+  I/O (`curl`, `pip install`, `npm install`) that passes today. **Decision (explicit, not invented): make it
+  configurable, defaulting to today's network-open behavior, with deny available as an opt-in** — the
+  `sandbox` crate's own `SandboxNetwork` enum had no "unrestricted" variant to select at all (only `None`/
+  `Allowlist`/`Proxy`, the latter two unimplemented everywhere), so this needed a small, real type-system
+  addition, not just a config flag. **Implemented:** new `SandboxNetwork::Open` variant
+  (`crates/sandbox/src/backend.rs`); `NetworkCapability` gained an `open: bool` field, a new
+  `none_and_open()` constructor, and an `open_supported()` accessor, mirroring the existing `allowlist`/
+  `proxy` pattern exactly; `SeatbeltBackend::new()` now declares `none_and_open()` instead of `none_only()`;
+  `prepare()`'s network validation now accepts `Open` alongside `None`; `render_profile()` takes the
+  requested `SandboxNetwork` and only emits `(deny network*)` for `None`, omitting it entirely for `Open`.
+  Four other crates had their own exhaustive `match SandboxNetwork { ... }` that the compiler caught
+  immediately on adding the variant — `container.rs`/`gvisor.rs`/`host_restricted.rs`'s own `from_network`
+  helpers (each backend's `prepare()` already calls `self.supports(spec)?` before reaching these, and none
+  of these three backends declare `open` support, so `Open` is unreachable through any validated call path
+  in each — mapped to the most restrictive existing state as a defensive fallback, not a real code path,
+  same treatment `Proxy` already gets in `host_restricted.rs`) and two pure descriptive formatters
+  (`remote.rs::network_str`, `plugin-host/src/hooks.rs::network_as_str`, both just added a `"open"` string
+  literal — no behavior to change). New test
+  `open_network_genuinely_reaches_a_real_local_endpoint_not_just_unblocked_by_accident` — symmetric to the
+  existing `network_is_genuinely_denied_not_just_unrequested`, but against a local loopback `TcpListener`
+  rather than a real internet host (deterministic in a network-restricted CI/sandbox environment): a real
+  sandboxed `curl` under `Open` must actually reach the listener, not just exit non-zero for an unrelated
+  reason. Verified via the revert cycle: reverted `render_profile`'s conditional back to unconditional
+  `(deny network*)`, reran the new test against the real `sandbox-exec` binary — failed exactly as
+  predicted (0 hits, not 1) — then restored. Full `sandbox` crate suite (102 tests, up from 101),
+  `plugin-host` crate suite (119 tests, unchanged), and `cargo build --workspace --tests` pass. **Still not
+  done, the actual point of this whole item:** the `apps/rapid` half — platform/health-aware
+  `SandboxManager` registration (`SeatbeltBackend` on macOS-with-`sandbox-exec`, else
+  `HostRestrictedBackend` as today), and the new async job-wrapper machinery around
+  `SandboxManager::prepare`/`exec`/`destroy` that preserves the "start now, poll via `job_status`/
+  `job_output`" UX `JobRegistry`-based `shell_exec(sandbox: true)` already gives the model on macOS
+  (confirmed necessary: `SandboxManager` is synchronous-only crate-wide, no poll/handle primitive exists
+  anywhere in `crates/sandbox` to build on) — tracked as the immediate next commit, not this one.
 
 ### 1.2 Multi-agent / subagents
 

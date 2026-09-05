@@ -133,7 +133,11 @@ impl HostNetworkHelper {
         match network {
             SandboxNetwork::None => Ok(Self::Isolated),
             SandboxNetwork::Allowlist => Ok(Self::Allowlist),
-            SandboxNetwork::Proxy => Err(SandboxError::UnsupportedNetwork),
+            // This backend never declares `NetworkCapability::open_supported`
+            // (see its `NetworkCapability::allowlist()` capability above),
+            // and `prepare`'s own `self.supports(spec)?` already refuses an
+            // `Open` request before this is ever reached.
+            SandboxNetwork::Open | SandboxNetwork::Proxy => Err(SandboxError::UnsupportedNetwork),
         }
     }
 }

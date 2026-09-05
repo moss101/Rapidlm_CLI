@@ -60,6 +60,14 @@ pub enum IsolationStrength {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum SandboxNetwork {
     None,
+    /// Unrestricted network egress — no allowlist/proxy narrowing, just "not
+    /// denied." A distinct, explicit opt-in rather than the absence of a
+    /// deny rule: a caller that wants today's ordinary "network just works"
+    /// posture (matching what unsandboxed execution already gets) must ask
+    /// for it by name, the same way `None` is an explicit request for
+    /// isolation rather than an implicit default a backend might silently
+    /// interpret either way.
+    Open,
     Allowlist,
     Proxy,
 }
@@ -119,6 +127,7 @@ pub enum SandboxError {
 /// Network modes a backend can materialize. `None` is always implied.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct NetworkCapability {
+    open: bool,
     allowlist: bool,
     proxy: bool,
 }
@@ -376,6 +385,18 @@ impl IsolationStrength {
 impl NetworkCapability {
     pub const fn none_only() -> Self {
         Self {
+            open: false,
+            allowlist: false,
+            proxy: false,
+        }
+    }
+
+    /// Supports both the isolated (`None`) and unrestricted (`Open`) modes,
+    /// but not `Allowlist`/`Proxy` narrowing — a backend that can either
+    /// fully deny or fully allow network egress, with nothing in between.
+    pub const fn none_and_open() -> Self {
+        Self {
+            open: true,
             allowlist: false,
             proxy: false,
         }
@@ -383,6 +404,7 @@ impl NetworkCapability {
 
     pub const fn allowlist() -> Self {
         Self {
+            open: false,
             allowlist: true,
             proxy: false,
         }
@@ -390,6 +412,7 @@ impl NetworkCapability {
 
     pub const fn allowlist_and_proxy() -> Self {
         Self {
+            open: false,
             allowlist: true,
             proxy: true,
         }
@@ -398,9 +421,14 @@ impl NetworkCapability {
     pub const fn supports(self, network: SandboxNetwork) -> bool {
         match network {
             SandboxNetwork::None => true,
+            SandboxNetwork::Open => self.open,
             SandboxNetwork::Allowlist => self.allowlist,
             SandboxNetwork::Proxy => self.proxy,
         }
+    }
+
+    pub const fn open_supported(self) -> bool {
+        self.open
     }
 
     pub const fn allowlist_supported(self) -> bool {

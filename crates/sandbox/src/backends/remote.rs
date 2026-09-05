@@ -1356,6 +1356,7 @@ fn mount_mode_str(mode: MountMode) -> &'static str {
 fn network_str(network: SandboxNetwork) -> &'static str {
     match network {
         SandboxNetwork::None => "none",
+        SandboxNetwork::Open => "open",
         SandboxNetwork::Allowlist => "allowlist",
         SandboxNetwork::Proxy => "proxy",
     }

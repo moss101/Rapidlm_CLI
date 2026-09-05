@@ -156,7 +156,13 @@ impl ContainerNetwork {
 
     pub const fn from_network(network: SandboxNetwork) -> Self {
         match network {
-            SandboxNetwork::None => Self::Isolated,
+            // This backend never declares `NetworkCapability::open_supported`
+            // (see `NetworkCapability::allowlist_and_proxy` above), and
+            // `prepare`'s own `self.supports(spec)?` already refuses an
+            // `Open` request before this is ever reached — mapped to the
+            // most restrictive state as a defensive fallback, not a real
+            // code path.
+            SandboxNetwork::None | SandboxNetwork::Open => Self::Isolated,
             SandboxNetwork::Allowlist => Self::Allowlist,
             SandboxNetwork::Proxy => Self::Proxy,
         }

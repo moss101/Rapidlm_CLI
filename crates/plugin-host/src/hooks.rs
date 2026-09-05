@@ -1735,6 +1735,7 @@ fn optional_array<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a [
 fn network_as_str(network: SandboxNetwork) -> &'static str {
     match network {
         SandboxNetwork::None => "none",
+        SandboxNetwork::Open => "open",
         SandboxNetwork::Allowlist => "allowlist",
         SandboxNetwork::Proxy => "proxy",
     }
