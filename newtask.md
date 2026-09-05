@@ -4411,6 +4411,47 @@ is more likely a different *method* (e.g. deeper reading of one specific high-st
 of the many already-identified-but-deliberately-deferred larger items elsewhere in this document) than
 another blind shape-search.
 
+**Self-review, 2026-09-05 — the "different method" this section's own note above suggested: rather than
+another blind shape-search over the whole codebase, a targeted adversarial re-read of this same session's
+own 9 most recent commits (the ones with no second pair of eyes on them yet, unlike everything else in the
+tree by this point).** Read every diff in full — the capability-broker/kernel/context-engine/glob-matcher
+fixes above, plus the two newest Phase 2 features (`rapid scan`, router cost attribution). One real,
+confirmed bug found and fixed; three other concerns investigated and confirmed sound (recorded here so they
+aren't re-litigated):
+
+**Fixed:** `external_scan.rs::parse_scanner_entry`'s `timeout_secs`/`output_limit_bytes`/`on_findings`
+fields used `obj.get(key).and_then(Value::as_TYPE)`, which returns `None` for both "key absent" (correct:
+use the default) and "key present with the wrong JSON type" (wrong: silently used the default too, instead
+of erroring) — indistinguishable to the `if let Some(..)` guard that followed. This directly contradicted
+the module's own doc comment on `load_scanners_config`: "a file that exists but is malformed IS an error
+here... silently treating a typo as 'no scanners' would hide exactly the kind of misconfiguration this
+command exists to catch." Concrete, plausible scenario: a hand-edited `.rapidlm/scanners.json` with
+`"timeout_secs": "30"` (quoted — an easy, realistic typo) silently ran with the 60-second default instead
+of the intended 30, with no error anywhere telling the author their config wasn't doing what they wrote.
+`id`/`kind`/`argv` did not have this gap (their `.ok_or(...)` calls correctly treat any non-string/non-array
+`Value` as an error); `on_findings` had the same gap but degraded to the safe default (`Block`) rather than
+something worse. **Fixed** by matching on `obj.get(key)` directly (distinguishing `None` from `Some(wrong-
+type)`) for all three fields, erroring with a message naming the offending value on a type mismatch. New
+test `parse_rejects_a_present_but_wrong_typed_field_rather_than_silently_using_the_default` (quoted
+`timeout_secs`, quoted `output_limit_bytes`, numeric `on_findings`). Verified via the revert cycle: reverting
+just the type-checking change reproduced the predicted pass-through exactly (the test's own assertion failed
+because the malformed config was accepted instead of rejected) before restoring the fix. Full `-p rapid
+--lib` suite (405 tests, up from 404) and `cargo build --workspace --tests` pass.
+
+**Investigated, confirmed sound, not bugs:** (1) the two glob-matcher call-budget fixes (`e1039fe`) — hand-
+derived and simulated many "`**`-heavy pattern vs. deeply-nested real path" shapes; every genuine match
+resolves in double-to-triple-digit calls (a literal-segment mismatch fails fast, not combinatorially), far
+under the 10,000 budget — no legitimate pattern/path pair was found where a real match is missed, only
+genuinely-unmatchable inputs approach the budget, and those correctly resolve to `false` regardless of why.
+(2) `RouterDecisionRecord::spent_usd_micros` (`372311d`) — no realistic turn approaches `u64` overflow;
+`model_label()`'s `"{provider}/{model}"` format can't collide since `ProviderId`'s charset excludes `/`,
+so the first `/` always demarcates provider from model unambiguously; `current` is captured once per loop
+iteration and used consistently for both the step call and the bookkeeping in the same synchronous
+iteration, no drift possible. (3) `LiveHostResolver` (`ff5cd48`) — the "file doesn't exist yet at lease-
+issuance but exists by spawn time" concern doesn't apply at either real call site: lease minting and spawn-
+time verification happen back-to-back synchronously in the same call stack with no window for the file to
+appear in between.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

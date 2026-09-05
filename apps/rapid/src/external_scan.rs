@@ -147,19 +147,37 @@ fn parse_scanner_entry(value: &serde_json::Value) -> Result<ScannerEntry, String
     let mut config = ExternalScannerConfig::new(id, kind, argv)
         .map_err(|err| err.to_string())?
         .with_tier(protocol::SandboxTier::HostRestricted);
-    if let Some(secs) = obj.get("timeout_secs").and_then(serde_json::Value::as_u64) {
+    // A key that's *present with the wrong JSON type* (e.g. a quoted
+    // `"timeout_secs": "30"`) must error the same way an unknown "kind" or
+    // "on_findings" value already does, not silently fall through to the
+    // default the way `.and_then(Value::as_u64)` alone would (it returns
+    // `None` for both "absent" and "wrong type" — indistinguishable to an
+    // `if let Some(..)` guard) — this file's own doc comment on
+    // `load_scanners_config` states a malformed config is a real error, not
+    // something to go quiet about.
+    if let Some(value) = obj.get("timeout_secs") {
+        let secs = value
+            .as_u64()
+            .ok_or_else(|| format!("\"timeout_secs\" must be a non-negative integer, got {value}"))?;
         config = config
             .with_timeout(Duration::from_secs(secs))
             .map_err(|err| err.to_string())?;
     }
-    if let Some(limit) = obj.get("output_limit_bytes").and_then(serde_json::Value::as_u64) {
+    if let Some(value) = obj.get("output_limit_bytes") {
+        let limit = value.as_u64().ok_or_else(|| {
+            format!("\"output_limit_bytes\" must be a non-negative integer, got {value}")
+        })?;
         config = config.with_output_limit(limit).map_err(|err| err.to_string())?;
     }
-    let on_findings = match obj.get("on_findings").and_then(serde_json::Value::as_str) {
-        Some("warn") => FindingsDisposition::Warn,
-        Some("ask") => FindingsDisposition::Ask,
-        Some("block") | None => FindingsDisposition::Block,
-        Some(other) => return Err(format!("unknown \"on_findings\": {other:?}")),
+    let on_findings = match obj.get("on_findings") {
+        None => FindingsDisposition::Block,
+        Some(value) => match value.as_str() {
+            Some("warn") => FindingsDisposition::Warn,
+            Some("ask") => FindingsDisposition::Ask,
+            Some("block") => FindingsDisposition::Block,
+            Some(other) => return Err(format!("unknown \"on_findings\": {other:?}")),
+            None => return Err(format!("\"on_findings\" must be a string, got {value}")),
+        },
     };
     Ok(ScannerEntry { config, on_findings })
 }
@@ -369,6 +387,26 @@ mod tests {
         let bad_disposition =
             br#"{"scanners":[{"id":"x","kind":"sast","argv":["x"],"on_findings":"nope"}]}"#;
         assert!(parse_scanners_config(bad_disposition).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_a_present_but_wrong_typed_field_rather_than_silently_using_the_default() {
+        // A quoted "30" here is a real, plausible typo — the kind of thing a
+        // human hand-editing this file would actually write. Before the
+        // fix, `.and_then(Value::as_u64)` couldn't distinguish "absent" from
+        // "wrong type" and silently kept the default timeout instead of
+        // erroring, contradicting this file's own "malformed config is a
+        // real error" contract.
+        let quoted_timeout =
+            br#"{"scanners":[{"id":"x","kind":"sast","argv":["x"],"timeout_secs":"30"}]}"#;
+        assert!(parse_scanners_config(quoted_timeout).is_err());
+
+        let quoted_output_limit = br#"{"scanners":[{"id":"x","kind":"sast","argv":["x"],"output_limit_bytes":"1048576"}]}"#;
+        assert!(parse_scanners_config(quoted_output_limit).is_err());
+
+        let numeric_on_findings =
+            br#"{"scanners":[{"id":"x","kind":"sast","argv":["x"],"on_findings":1}]}"#;
+        assert!(parse_scanners_config(numeric_on_findings).is_err());
     }
 
     #[test]
