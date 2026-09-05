@@ -4158,6 +4158,53 @@ already-reviewed files; its report also claimed a whole-daemon crash, which inde
 `dispatch_connection`'s existing `catch_unwind` wrapper showed to be incorrect — recorded here so the actual,
 narrower severity is what's on record, not the agent's first-pass overclaim.
 
+**Fresh review pass, 2026-09-05, extending the `shell_exec` credential-redaction fix (commit `e1cf742`) to
+three sibling tool-result sinks it deliberately did not cover at the time — the exact "gate on one path,
+sibling path forgotten" shape this session keeps finding, per a second background review agent tasked with
+hunting specifically for that shape.** `redact_output` (`exec_tools.rs:903`) scrubs the active model
+credential from `shell_exec`'s captured output at its three call sites — but three other places in the same
+file build a model-visible `summary`/`detail` string from captured local-process or fetched-network output
+without ever calling it, each a real, reachable leak of the same value `shell_exec`'s own doc comment already
+names (`~/.rapidlm/config.toml` stores it in plaintext).
+
+1. **`execute_mcp_tool`'s success and tool-error arms** (`exec_tools.rs`) returned `output.text` — an MCP
+   server's own response — unredacted. A filesystem-capable MCP server's `read_file` tool pointed at
+   `~/.rapidlm/config.toml` would hand the plaintext key back verbatim, identical in effect to the already-
+   fixed `cat ~/.rapidlm/config.toml` via `shell_exec`.
+2. **`hooks.rs`'s `post_tool_use`/`pre_tool_use` hook output, folded into the tool result at
+   `exec_tools.rs`'s two hook call sites** — `hooks.rs` has no `security` dependency at all, so this path was
+   never wired to begin with. A hook is literally `sh -c <command>` with combined stdout+stderr captured
+   (`run_hook_once`) — the same command-execution sink as `shell_exec`, but *worse* here: a `post_tool_use`
+   hook fires automatically on every successful tool call, so a debugging hook like `cat ~/.rapidlm/
+   config.toml; echo logged` would leak the credential on every single tool call without the model ever
+   choosing to run anything sensitive itself.
+3. **`execute_web_fetch`'s success arm** returned fetched page text unredacted — weaker threat model (network
+   content, not a local read-back) but the same sink in principle, e.g. a misconfigured internal endpoint
+   that echoes request state back.
+
+**Fixed:** wrapped all five call sites (`execute_mcp_tool`'s two `Ok(output)` arms, `execute_web_fetch`'s
+success arm, and both hook call sites — the pre-hook `Denied` reason and the post-hook `recorded` string
+folded into `summary`) in `self.redact_output(...)`, applied after the existing `bounded_detail`/
+`truncate_str` bounding, matching the exact order and pattern the original `shell_exec` fix already
+established. No changes needed to `hooks.rs` itself — the redaction snapshot already lives on the caller
+(`ExecTools`/`WorkspaceTools`) in `exec_tools.rs`, so wiring it in at the point each hook's return value is
+consumed keeps the fix minimal and localized, same as the `execute_mcp_tool`/`execute_web_fetch` sites.
+
+Three new tests, one per sink, using the identical "register a fake secret, trigger the sink, assert the
+raw value never reaches the summary, and the `[REDACTED:secret:...]` marker does" pattern as the original
+`shell_exec_scrubs_a_registered_secret_from_captured_output`: `mcp_tool_result_scrubs_a_registered_secret_
+from_returned_text` (a real local `python3` MCP stdio server whose tool returns the secret verbatim),
+`post_tool_use_hook_output_scrubs_a_registered_secret` (`post_tool_use: ["echo <secret>"]` on an otherwise
+plain `workspace_write`), and `web_fetch_scrubs_a_registered_secret_from_the_fetched_page` (a real local HTTP
+fixture server whose response body is the secret). Verified via the revert cycle: reverting all five call
+sites at once reproduced the predicted leak in all three new tests simultaneously — each panicked with the
+raw secret string appearing verbatim in its own assertion output (the pre-existing `shell_exec` test, whose
+call site wasn't touched, correctly kept passing throughout, confirming the revert script touched only the
+intended five sites) — before restoring the fix. Full `-p rapid --lib` suite and `cargo build --workspace
+--tests` pass. Found via a background review agent tasked with hunting this specific shape workspace-wide;
+independently verified by reading every claimed call site directly (not accepted from the report) before
+fixing, confirming all three were genuine and none were already covered elsewhere.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

@@ -1303,10 +1303,10 @@ impl WorkspaceTools {
                 crate::hooks::PreHookOutcome::Denied { reason } => {
                     return Ok(ToolStepResult::Denied {
                         call_id: call.call_id().to_owned(),
-                        detail: Some(bounded_detail(&format!(
+                        detail: Some(self.redact_output(bounded_detail(&format!(
                             "{} blocked by pre_tool_use hook: {reason}",
                             call.tool()
-                        ))),
+                        )))),
                     });
                 }
                 crate::hooks::PreHookOutcome::Allowed => {}
@@ -1396,9 +1396,9 @@ impl WorkspaceTools {
                 if !recorded.is_empty() {
                     return Ok(ToolStepResult::Succeeded {
                         call_id: call_id.clone(),
-                        summary: bounded_detail(&format!(
+                        summary: self.redact_output(bounded_detail(&format!(
                             "{summary}\n[post_tool_use: {recorded}]"
-                        )),
+                        ))),
                     });
                 }
             }
@@ -2503,18 +2503,18 @@ impl WorkspaceTools {
         match outcome {
             Ok(output) if !output.is_error => Ok(ToolStepResult::Succeeded {
                 call_id: call.call_id().to_owned(),
-                summary: bounded_detail(&format!(
+                summary: self.redact_output(bounded_detail(&format!(
                     "[mcp:{server_name}]\n{}",
                     crate::exec_tools::truncate_str(&output.text, MCP_RESULT_CAP)
-                )),
+                ))),
             }),
             Ok(output) => Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
-                detail: Some(bounded_detail(&format!(
+                detail: Some(self.redact_output(bounded_detail(&format!(
                     "[mcp:{server_name}] tool error: {}",
                     output.text
-                ))),
+                )))),
             }),
             Err(err) => Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
@@ -2547,7 +2547,7 @@ impl WorkspaceTools {
             }),
             Ok(text) => Ok(ToolStepResult::Succeeded {
                 call_id: call.call_id().to_owned(),
-                summary: bounded_detail(&format!("fetched {url}:\n{text}")),
+                summary: self.redact_output(bounded_detail(&format!("fetched {url}:\n{text}"))),
             }),
             Err(refusal) => Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
@@ -5342,6 +5342,43 @@ use std::sync::{Arc, Mutex};
             other => panic!("expected the inherited gate to fail the child's write, got {other:?}"),
         }
         assert!(!root.0.join("broken2.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_tool_use_hook_output_scrubs_a_registered_secret() {
+        // A post_tool_use hook is a real command whose stdout is folded into
+        // every successful tool call's summary (hooks.rs::run_post_tool_
+        // hooks) — the same "run a local command, capture its output, hand
+        // it to the model" sink as shell_exec, just firing automatically
+        // rather than by the model's own choice. A debugging hook like
+        // `cat ~/.rapidlm/config.toml` must not leak the active credential
+        // through this path either.
+        let root = TempRoot::new("hook-redaction");
+        let secret = "sk-not-a-real-secret-0123456789abcdef";
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_hooks(crate::hooks::HooksConfig {
+            post_tool_use: vec![format!("echo {secret}")],
+            ..Default::default()
+        });
+        let mut registry = security::SecretRedactionRegistry::new();
+        let refer = auth::SecretRef::from_alias("test-secret").expect("alias");
+        let cancel_redact = security::RedactionCancellation::new();
+        registry
+            .register_canary(&refer, secret.as_bytes(), &cancel_redact)
+            .expect("register");
+        tools.set_redaction(registry.snapshot());
+
+        let cancel = CancellationToken::new();
+        let call = make_call("c1", WORKSPACE_WRITE_TOOL, r#"{"path":"a.txt","content":"hi"}"#);
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(!summary.contains(secret), "{summary}");
+                assert!(summary.contains("[REDACTED:secret:"), "{summary}");
+            }
+            other => panic!("expected write success, got {other:?}"),
+        }
     }
 
     #[cfg(unix)]
@@ -9059,6 +9096,38 @@ use std::sync::{Arc, Mutex};
     }
 
     #[test]
+    fn web_fetch_scrubs_a_registered_secret_from_the_fetched_page() {
+        // Weaker threat model than shell_exec/MCP (the text originates from
+        // the network, not a local file read-back), but the same sink: a
+        // misconfigured internal endpoint that happens to echo the active
+        // credential back must not hand it to the model verbatim either.
+        let root = TempRoot::new("web-fetch-redaction");
+        let secret = "sk-not-a-real-secret-0123456789abcdef";
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let addr = spawn_http_fixture(secret);
+        let url = format!("http://{addr}/page");
+        tools.set_fetch_allowlist(vec!["127.0.0.1".to_owned()]);
+        let mut registry = security::SecretRedactionRegistry::new();
+        let refer = auth::SecretRef::from_alias("test-secret").expect("alias");
+        let cancel_redact = security::RedactionCancellation::new();
+        registry
+            .register_canary(&refer, secret.as_bytes(), &cancel_redact)
+            .expect("register");
+        tools.set_redaction(registry.snapshot());
+
+        let call = make_call("w3", WEB_FETCH_TOOL, &format!(r#"{{"url":"{url}"}}"#));
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(!summary.contains(secret), "{summary}");
+                assert!(summary.contains("[REDACTED:secret:"), "{summary}");
+            }
+            other => panic!("expected fetch success, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn mcp_stdio_servers_register_and_dispatch_through_the_session() {
         const SERVER_SCRIPT: &str = r#"#!/usr/bin/env python3
 import sys, json
@@ -9152,6 +9221,74 @@ for line in sys.stdin:
         match tools.execute(&validated, &CancellationToken::new()).expect("dispatch") {
             ToolStepResult::Succeeded { summary, .. } => {
                 assert!(summary.contains("echo: ping"), "{summary}");
+            }
+            other => panic!("expected MCP success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_tool_result_scrubs_a_registered_secret_from_returned_text() {
+        // Same real leak vector as `shell_exec_scrubs_a_registered_secret_
+        // from_captured_output`, one tool over: a filesystem-capable MCP
+        // server (e.g. a generic read_file tool) can just as easily echo
+        // back a value the caller has already registered as sensitive.
+        const SERVER_SCRIPT: &str = r#"#!/usr/bin/env python3
+import sys, json
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "leaky", "version": "1.0"}}})
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": "read_file", "description": "returns a fixed secret",
+             "inputSchema": {"type": "object"}}]}})
+    elif method == "tools/call":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"content": [
+            {"type": "text", "text": "sk-not-a-real-secret-0123456789abcdef"}]}})
+"#;
+        let root = TempRoot::new("mcp-redaction");
+        let script_path = root.0.join("mcp-leaky-server.py");
+        fs::write(&script_path, SERVER_SCRIPT).expect("write server");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let servers = vec![McpServerConfig {
+            name: "leaky".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script_path.display().to_string()],
+        }];
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(&servers);
+        let secret = "sk-not-a-real-secret-0123456789abcdef";
+        let mut registry = security::SecretRedactionRegistry::new();
+        let refer = auth::SecretRef::from_alias("test-secret").expect("alias");
+        let cancel_redact = security::RedactionCancellation::new();
+        registry
+            .register_canary(&refer, secret.as_bytes(), &cancel_redact)
+            .expect("register");
+        tools.set_redaction(registry.snapshot());
+
+        let call = make_call("m1", "mcp__leaky__read_file", "{}");
+        let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
+        match tools.execute(&validated, &CancellationToken::new()).expect("dispatch") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(!summary.contains(secret), "{summary}");
+                assert!(summary.contains("[REDACTED:secret:"), "{summary}");
             }
             other => panic!("expected MCP success, got {other:?}"),
         }
