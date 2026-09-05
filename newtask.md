@@ -4385,6 +4385,32 @@ concurrency model is real, not a moot question (`exec_tools.rs::batch_dispatch` 
 per write-group via `std::thread::scope` and dispatches concurrently), so this is a genuine clean result, not
 an artifact of nothing running concurrently to race in the first place.
 
+**Seventh targeted background hunt, 2026-09-05 — panics inside hand-written error `Display`/`Debug` impls
+themselves (distinct from panics in the "forward" logic that constructs the error, already covered) — also
+came back clean, the third consecutive clean sweep after the Deserialize-bypass and budget-race hunts
+above.** Systematically enumerated and read all 649 hand-written `Display`/`Debug` impls across the
+workspace (verified complete via brace-matched extraction, string-literal-aware so English prose in message
+text couldn't false-positive) for byte-index slicing, in-body arithmetic, `.unwrap()`/`.expect()`, and
+`from_utf8` on text-bearing fields. The only two matches (`ContentHash::fmt`, `ArtifactId::fmt`, both
+`str::from_utf8(...).expect(...)` on a hex-encoding helper's output) were confirmed unreachable — the
+helper writes only a constant ASCII prefix plus hex-table lookups into a fixed-size buffer, always valid
+UTF-8 regardless of the wrapped digest's actual bytes. The rest of the codebase's convention held up
+uniformly: error `Display` impls either delegate straight to an already-safe inner `Display` (`write!(f,
+"{err}")`, bottoming out in a leaf type, never a cycle) or, for anything holding attacker-controlled text
+(`SecretAwareValue`, `RedactedOutput`, `ApprovalRequest`, etc.), report only a length or a fixed-size hex
+fingerprint — never a slice of the real content.
+
+**Three clean sweeps in a row is a real signal, not a coincidence worth ignoring: the supply of easily-
+discoverable bugs matching "grep for a specific, well-defined shape, verify, fix" is now largely exhausted
+for this codebase, at least for the shapes tried.** Six of seven targeted hunts this pass (panic-on-input,
+gate-gaps, integer truncation, unbounded recursion, `Deserialize`-bypass, non-atomic budget races, panic-in-
+Display) found and fixed real, verified bugs in the first four; the last three came back clean under the
+same rigor. Recording this explicitly so whoever picks this up next calibrates effort accordingly — another
+hunt in this same style is lower expected value than it was a few hunts ago, and the next productive avenue
+is more likely a different *method* (e.g. deeper reading of one specific high-stakes file, or picking up one
+of the many already-identified-but-deliberately-deferred larger items elsewhere in this document) than
+another blind shape-search.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
