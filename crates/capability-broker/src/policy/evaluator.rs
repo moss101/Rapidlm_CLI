@@ -975,6 +975,24 @@ fn build_explanation(decision: &Decision, matched: &[MatchedRule]) -> String {
     }
 }
 
+/// Bounds total recursive calls across one `glob_matches` invocation.
+///
+/// Both `**` (segment level, `glob_match_segments`) and `*` (character
+/// level, `glob_star_question`) backtrack by trying two branches per step —
+/// a pattern or path that is one long run of either construct makes the
+/// *total* number of calls across all branches blow up combinatorially
+/// (backtracking over which of the other side's few remaining segments/
+/// bytes each step consumes) long before any single call chain is deep
+/// enough to threaten the stack on its own. `PathGlob`/`RepoPath` already
+/// cap total bytes at 4096, but that alone does not bound this: a shared
+/// call budget, decremented on every call and checked before recursing
+/// further, bounds both total work and max depth (depth can never exceed
+/// calls spent) in one guard, on every filesystem/git/browser permission
+/// check this function backs. No real policy glob or requested path is
+/// remotely close to exhausting it in genuine use — real matches resolve
+/// in a handful of calls.
+const MAX_GLOB_MATCH_CALLS: u32 = 10_000;
+
 /// `*` matches within one path segment. `**` matches zero or more segments.
 fn glob_matches(pattern: &str, path: &str) -> bool {
     let pattern_abs = pattern.starts_with('/');
@@ -984,7 +1002,8 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
     }
     let pat: Vec<&str> = split_segments(pattern);
     let val: Vec<&str> = split_segments(path);
-    glob_match_segments(&pat, &val)
+    let mut budget = MAX_GLOB_MATCH_CALLS;
+    glob_match_segments(&pat, &val, &mut budget)
 }
 
 fn split_segments(path: &str) -> Vec<&str> {
@@ -993,39 +1012,51 @@ fn split_segments(path: &str) -> Vec<&str> {
         .collect()
 }
 
-fn glob_match_segments(pattern: &[&str], path: &[&str]) -> bool {
+fn glob_match_segments(pattern: &[&str], path: &[&str], budget: &mut u32) -> bool {
+    let Some(remaining) = budget.checked_sub(1) else {
+        return false;
+    };
+    *budget = remaining;
     match (pattern.split_first(), path.split_first()) {
         (None, None) => true,
         (None, Some(_)) => false,
-        (Some((&"**", rest)), None) => glob_match_segments(rest, path),
+        (Some((&"**", rest)), None) => glob_match_segments(rest, path, budget),
         (Some((&"**", rest)), Some(_)) => {
-            glob_match_segments(rest, path) || glob_match_segments(pattern, &path[1..])
+            glob_match_segments(rest, path, budget)
+                || glob_match_segments(pattern, &path[1..], budget)
         }
         (Some(_), None) => false,
         (Some((p, prest)), Some((v, vrest))) => {
-            segment_matches(p, v) && glob_match_segments(prest, vrest)
+            segment_matches(p, v, budget) && glob_match_segments(prest, vrest, budget)
         }
     }
 }
 
-fn segment_matches(pattern: &str, value: &str) -> bool {
+fn segment_matches(pattern: &str, value: &str, budget: &mut u32) -> bool {
     if pattern == "*" || pattern == value {
         return true;
     }
-    glob_star_question(pattern.as_bytes(), value.as_bytes())
+    glob_star_question(pattern.as_bytes(), value.as_bytes(), budget)
 }
 
-fn glob_star_question(pattern: &[u8], value: &[u8]) -> bool {
+fn glob_star_question(pattern: &[u8], value: &[u8], budget: &mut u32) -> bool {
+    let Some(remaining) = budget.checked_sub(1) else {
+        return false;
+    };
+    *budget = remaining;
     match (pattern.split_first(), value.split_first()) {
         (None, None) => true,
         (None, Some(_)) => false,
-        (Some((b'*', rest)), None) => glob_star_question(rest, value),
+        (Some((b'*', rest)), None) => glob_star_question(rest, value, budget),
         (Some((b'*', rest)), Some(_)) => {
-            glob_star_question(rest, value) || glob_star_question(pattern, &value[1..])
+            glob_star_question(rest, value, budget)
+                || glob_star_question(pattern, &value[1..], budget)
         }
         (Some(_), None) => false,
-        (Some((b'?', prest)), Some((_, vrest))) => glob_star_question(prest, vrest),
-        (Some((p, prest)), Some((v, vrest))) if p == v => glob_star_question(prest, vrest),
+        (Some((b'?', prest)), Some((_, vrest))) => glob_star_question(prest, vrest, budget),
+        (Some((p, prest)), Some((v, vrest))) if p == v => {
+            glob_star_question(prest, vrest, budget)
+        }
         (Some(_), Some(_)) => false,
     }
 }
@@ -1614,6 +1645,42 @@ resource = { root = "repo", glob = "src/**" }
         assert!(glob_matches("/tmp/**", "/tmp/out"));
         assert!(glob_matches("refs/heads/*", "refs/heads/main"));
         assert!(!glob_matches("refs/heads/*", "refs/tags/v1"));
+    }
+
+    #[test]
+    fn glob_matching_bounds_pathological_backtracking_on_every_permission_check() {
+        // A long run of `*`/`**` is redundant but not pathological on its
+        // own — still just "match anything" and must resolve correctly.
+        let redundant_stars = "*".repeat(4096);
+        assert!(glob_matches(&redundant_stars, "short.rs"));
+        let redundant_double_stars = std::iter::repeat_n("**", 2048)
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(glob_match_segments(
+            &split_segments(&redundant_double_stars),
+            &split_segments("a/b/c.rs"),
+            &mut MAX_GLOB_MATCH_CALLS.saturating_mul(2),
+        ));
+
+        // A pattern that can *never* match (an impossible trailing literal)
+        // is the actually pathological case: naive backtracking without a
+        // call budget explores a combinatorial number of ways to interleave
+        // "consume a star/`**`" against "consume a segment/byte" before
+        // concluding no match is possible — on this file's real production
+        // path (every filesystem/git/browser permission check), that would
+        // hang the decision instead of just risking the stack. The call
+        // budget must make both resolve to `false` quickly.
+        let unmatchable_chars = format!("{}Z", "*".repeat(4096));
+        assert!(!glob_matches(&unmatchable_chars, "short.rs"));
+        let unmatchable_segments = format!(
+            "{}/z",
+            std::iter::repeat_n("**", 2048).collect::<Vec<_>>().join("/")
+        );
+        assert!(!glob_match_segments(
+            &split_segments(&unmatchable_segments),
+            &split_segments("a/b/c.rs"),
+            &mut MAX_GLOB_MATCH_CALLS.saturating_mul(2),
+        ));
     }
 
     #[test]

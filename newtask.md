@@ -4322,6 +4322,49 @@ load site, not a naive derive at all): `capability-broker`'s `Capability`/`Resou
 `PluginManifest`/`HookSpec`/`SkillDescriptor`, the MCP trust store, `vcs::ProvenanceEdge`, `process-
 supervisor::JobSpec`, `scheduler::GraphProposal`, and `handoff`'s `FreshIssuance`/`IssuedRef`.
 
+**Follow-up, 2026-09-05: the two lower-confidence recursion sightings deliberately deferred earlier in this
+section (`plugin-host::skills.rs::match_segment_chars`, `capability-broker::policy::evaluator.rs::
+glob_star_question`) got their own dedicated pass, and turned up a more severe bug than the one that
+prompted deferring them — a genuine algorithmic-complexity hang, not merely a borderline stack-depth
+question.** A depth-only guard (the fix already applied to `context-engine`'s stack-overflow case) turns out
+to be the *wrong* fix for these two: both `'*'`-in-a-segment (`match_segment_chars`/`glob_star_question`) and
+`**`-across-segments (`capability-broker`'s `glob_match_segments`) branch twice per step, so a per-call depth
+counter alone still lets the *total number of calls* across all branches blow up combinatorially (the
+classic naive-backtracking-matcher trap) — discovered only because a first attempt at a depth-256 guard for
+`plugin-host` was tested and still hung for over two minutes on a real, RepoPath-legal 4096-byte pattern,
+which is what prompted this deeper investigation rather than shipping the depth-only version. **Empirically
+confirmed the growth rate on both files before concluding it was real, not assumed:** in `plugin-host`, an
+unmatchable pattern of 24 `*`s against an 8-byte segment resolved in 0.41s; the identical shape at 40 `*`s
+took 20.70s — roughly 50× slower for 16 more characters, unambiguously exponential. In `capability-broker`,
+the analogous `**`-across-segments case (24 `**` groups against an 8-segment path) was killed after running
+past 60 seconds with no sign of completing. Both are on real production paths: `plugin-host`'s gates every
+skill-activation path-glob check, and `capability-broker`'s evaluator backs **every filesystem/git/browser
+permission check in the system** — a malicious or malformed skill frontmatter path glob, or a crafted policy
+rule, could hang either indefinitely rather than merely risk a stack overflow.
+
+**Fixed both with a shared call-count budget** (a `&mut u32` decremented on every recursive call across
+*all* of a matcher's mutually-recursive functions, bailing to `false` — the safe/conservative "no match"
+default — the instant it hits zero) rather than a per-call depth counter: this bounds both total work *and*
+max depth in one guard, since depth can never exceed calls spent, unlike a depth-only counter which bounds
+neither total work nor (as the combinatorial case shows) actually prevents the hang. `MAX_GLOB_MATCH_CALLS =
+10_000` in both files — generous for any real glob match (which resolves in a handful of calls) while
+keeping worst-case pathological work small and fast regardless of how large `RepoPath`/`PathGlob`'s own
+4096-byte cap is or ever becomes.
+
+New tests in both files verify a long *redundant* run of `*`/`**` still resolves correctly (it legitimately
+means "match anything," and does so quickly under budget) alongside an *unmatchable* pathological pattern
+(an impossible trailing literal, forcing exhaustive backtracking) resolving to `false` quickly rather than
+hanging. **Revert-cycle verification adapted for a hang rather than a crash or a graceful assertion
+failure**, since neither a fixed wall-clock kill nor a plain "did it panic" check would confirm exponential
+*growth* specifically: for `plugin-host`, timed the reverted (unbounded) code at two pattern sizes (24 vs 40
+stars) and confirmed the ~50× slowdown for a 16-character increase, the empirical signature of exponential
+blowup rather than merely "somewhat slow"; for `capability-broker`, confirmed the reverted `**` case exceeded
+60 seconds (killed rather than awaited to completion, since the point — that it doesn't resolve quickly — was
+already conclusively established) before restoring both fixes. Full `-p plugin-host --lib` suite (119 tests,
+up from 118, 0.46s total), full `-p capability-broker --lib` suite (140 tests, up from 139, 0.26s total),
+`--test lease_toctou` (2 tests, unchanged), full `-p rapid --lib` suite, and `cargo build --workspace --tests`
+all pass.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

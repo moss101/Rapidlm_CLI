@@ -1651,39 +1651,66 @@ fn estimate_tokens(text: &str) -> u32 {
     u32::try_from(tokens).unwrap_or(u32::MAX).max(1)
 }
 
+/// Bounds total recursive calls across one `glob_matches` invocation.
+///
+/// `RepoPath` (both a skill's own `paths` globs and a query's `task_paths`)
+/// already caps total bytes at `protocol::MAX_REPO_PATH_BYTES` (4096), but a
+/// pattern that is one long run of `*` makes `match_segment_chars` branch
+/// twice per character — a plain per-call depth counter still lets the
+/// *total* number of calls across all branches blow up combinatorially
+/// (backtracking over which of a short segment's few remaining bytes each
+/// step consumes), turning the match into a hang long before any single
+/// call chain gets deep enough to threaten the stack. A shared call budget,
+/// decremented on every call and checked before recursing further, bounds
+/// both total work *and* max depth (depth can never exceed calls spent) in
+/// one guard. No real glob pattern or path is remotely close to exhausting
+/// it in genuine use — real matches resolve in a handful of calls.
+const MAX_GLOB_MATCH_CALLS: u32 = 10_000;
+
 fn glob_matches(glob: &str, path: &str) -> bool {
     let glob_parts: Vec<&str> = glob.split('/').collect();
     let path_parts: Vec<&str> = path.split('/').collect();
-    match_glob_parts(&glob_parts, &path_parts)
+    let mut budget = MAX_GLOB_MATCH_CALLS;
+    match_glob_parts(&glob_parts, &path_parts, &mut budget)
 }
 
-fn match_glob_parts(glob: &[&str], path: &[&str]) -> bool {
+fn match_glob_parts(glob: &[&str], path: &[&str], budget: &mut u32) -> bool {
+    let Some(remaining) = budget.checked_sub(1) else {
+        return false;
+    };
+    *budget = remaining;
     match (glob.first().copied(), path.first().copied()) {
         (None, None) => true,
         (Some("**"), _) => {
-            match_glob_parts(&glob[1..], path)
-                || (!path.is_empty() && match_glob_parts(glob, &path[1..]))
+            match_glob_parts(&glob[1..], path, budget)
+                || (!path.is_empty() && match_glob_parts(glob, &path[1..], budget))
         }
-        (Some(pattern), Some(segment)) if match_segment(pattern, segment) => {
-            match_glob_parts(&glob[1..], &path[1..])
+        (Some(pattern), Some(segment)) if match_segment(pattern, segment, budget) => {
+            match_glob_parts(&glob[1..], &path[1..], budget)
         }
         _ => false,
     }
 }
 
-fn match_segment(pattern: &str, segment: &str) -> bool {
-    match_segment_chars(pattern.as_bytes(), segment.as_bytes())
+fn match_segment(pattern: &str, segment: &str, budget: &mut u32) -> bool {
+    match_segment_chars(pattern.as_bytes(), segment.as_bytes(), budget)
 }
 
-fn match_segment_chars(pattern: &[u8], segment: &[u8]) -> bool {
+fn match_segment_chars(pattern: &[u8], segment: &[u8], budget: &mut u32) -> bool {
+    let Some(remaining) = budget.checked_sub(1) else {
+        return false;
+    };
+    *budget = remaining;
     match (pattern.first().copied(), segment.first().copied()) {
         (None, None) => true,
         (Some(b'*'), _) => {
-            match_segment_chars(&pattern[1..], segment)
-                || (!segment.is_empty() && match_segment_chars(pattern, &segment[1..]))
+            match_segment_chars(&pattern[1..], segment, budget)
+                || (!segment.is_empty() && match_segment_chars(pattern, &segment[1..], budget))
         }
-        (Some(b'?'), Some(b)) if b != b'/' => match_segment_chars(&pattern[1..], &segment[1..]),
-        (Some(p), Some(s)) if p == s => match_segment_chars(&pattern[1..], &segment[1..]),
+        (Some(b'?'), Some(b)) if b != b'/' => {
+            match_segment_chars(&pattern[1..], &segment[1..], budget)
+        }
+        (Some(p), Some(s)) if p == s => match_segment_chars(&pattern[1..], &segment[1..], budget),
         _ => false,
     }
 }
@@ -1895,6 +1922,28 @@ mod tests {
 
     fn cleanup(path: &Path) {
         let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn glob_matches_ordinary_patterns_and_bounds_pathological_recursion() {
+        assert!(glob_matches("src/**/*.rs", "src/lib/mod.rs"));
+        assert!(!glob_matches("src/**/*.rs", "docs/readme.md"));
+
+        // A long run of `*` is redundant but not pathological on its own —
+        // it still just means "match anything" and resolves correctly and
+        // quickly under the call budget.
+        let redundant_stars = "*".repeat(4096);
+        assert!(glob_matches(&redundant_stars, "short.rs"));
+
+        // A run of `*` that can *never* match (an impossible trailing
+        // literal) is the actually pathological case: naive backtracking
+        // without a call budget explores a combinatorial number of ways to
+        // interleave "consume a star" against "consume a segment byte"
+        // before concluding no match is possible — this used to hang for
+        // minutes on a mere 8-byte segment, not just risk the stack.
+        // MAX_GLOB_MATCH_CALLS must make it resolve to `false` quickly.
+        let unmatchable = format!("{}Z", "*".repeat(4096));
+        assert!(!glob_matches(&unmatchable, "short.rs"));
     }
 
     #[test]
