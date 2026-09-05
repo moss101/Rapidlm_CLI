@@ -5270,6 +5270,32 @@ blocker, rather than looping autonomously).
   `apps/rapid` — that remains real, separate, larger work gated on `apps/rapid` growing a live turn-
   execution path that could use a real scheduler in the first place (the same root gap this document's own
   §0a meta-finding already names repeatedly).
+- **Self-review of the item above, 2026-09-05, found and fixed one real bug in the model-facing tool
+  description itself, matching this session's now-established pattern of dedicating a review pass to its
+  own newest code before moving on.** The `todo_write` schema's own description text claimed "a dependency
+  on an unknown or completed-only task id is refused" — but the real validation only ever refuses an
+  *unknown* or *self* reference; depending on a task that isn't completed yet is the normal, allowed
+  "blocked" case (the whole reason `load_todos_index` renders it as "blocked by"), not something the tool
+  rejects. A model reading its own tool schema would form a wrong mental model of the validation rule with
+  no other signal to correct it — this is exactly the kind of doc/code drift bug this session's own review
+  methodology exists to catch, just found in prose rather than logic this time. **Fixed:** reworded to "A
+  dependency on an unknown or self task id is refused; depending on a task that is not yet completed is
+  allowed and marks this one as blocked in your task list until it is" — stating both halves of the real
+  rule instead of the wrong one. New test `todo_write_description_does_not_claim_a_completed_dependency_is_
+  refused` (a direct regression guard on the description string itself, since nothing previously asserted
+  on it) plus `todo_write_allows_depending_on_a_task_that_is_not_yet_completed` (exercises the real, correct
+  behavior the fixed text describes). Verified via the revert cycle: reverting just the wording reproduced
+  the predicted failure exactly. Full `-p rapid --lib` suite (412 tests, up from 410) and `cargo build
+  --workspace --tests` pass. Three lower-severity items from the same review checked and left alone,
+  matching the disclosed scope: `load_todos_index` would mislabel a fully-dangling `depends_on` as satisfied
+  rather than blocked, but `todo_write` itself always refuses a dangling reference before writing and there
+  is no delete operation, so this is unreachable through the real tool-call path (only via a hand-edited or
+  corrupted `todos.json`); a real 2-node dependency cycle is accepted (as the original commit's own comment
+  already disclosed) but causes no hang or infinite loop anywhere, since nothing walks `depends_on`
+  recursively — the effect is purely a confusing but inert "mutually blocked" display; and `load_todos_
+  index`'s render loop has no entry-count cap of its own (only the write path enforces `MAX_TODOS`), which
+  is quadratic in the worst case for a hand-edited oversized file but not a real DoS at any size that fits
+  the existing 256 KB read bound.
 
 ### 2.6 `SessionLease` + fencing generation
 

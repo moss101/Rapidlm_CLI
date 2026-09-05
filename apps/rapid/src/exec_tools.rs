@@ -4989,7 +4989,7 @@ impl WorkspaceTools {
             ),
             ToolSurface::new(
                 TODO_WRITE_TOOL,
-                "Maintain your task list for this workspace: pass the full set of tasks with                  status pending | in_progress | completed | cancelled; entries with an id                  update that task, entries without one are added. Optional depends_on                  (other task ids), owner, and evidence_ids persist as durable state and                  survive compaction; omitting one on an update leaves it unchanged, an                  empty array/null clears it. A dependency on an unknown or completed-only                  task id is refused. Arguments JSON:                  {\"todos\":[{\"id\":\"1\",\"content\":\"...\",\"status\":\"in_progress\",                  \"depends_on\":[\"2\"]}]}.",
+                "Maintain your task list for this workspace: pass the full set of tasks with                  status pending | in_progress | completed | cancelled; entries with an id                  update that task, entries without one are added. Optional depends_on                  (other task ids), owner, and evidence_ids persist as durable state and                  survive compaction; omitting one on an update leaves it unchanged, an                  empty array/null clears it. A dependency on an unknown or self task id is                  refused; depending on a task that is not yet completed is allowed and                  marks this one as blocked in your task list until it is. Arguments JSON:                  {\"todos\":[{\"id\":\"1\",\"content\":\"...\",\"status\":\"in_progress\",                  \"depends_on\":[\"2\"]}]}.",
                 arguments_schema(
                     "Update the task list",
                     serde_json::json!({
@@ -8349,6 +8349,49 @@ use std::sync::{Arc, Mutex};
                 ToolStepResult::Failed { handled, .. } => assert!(handled, "{arguments}"),
                 other => panic!("expected handled refusal for {arguments}, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn todo_write_description_does_not_claim_a_completed_dependency_is_refused() {
+        // Regression guard: the tool's own model-facing description once
+        // claimed "a dependency on an unknown or completed-only task id is
+        // refused" — but the real validation only refuses unknown/self
+        // references; depending on a not-yet-completed task is the normal,
+        // allowed "blocked" case, not a rejection. A model reading a false
+        // claim here would form a wrong mental model of the tool with no
+        // other signal to correct it, so this is checked directly rather
+        // than only exercising the real (correct) behavior below.
+        let root = TempRoot::new("todo-description");
+        let tools = permissive_workspace(&root.0);
+        let surface = tools.tool_surface();
+        let todo_write = surface
+            .iter()
+            .find(|tool| tool.name() == TODO_WRITE_TOOL)
+            .expect("todo_write is advertised");
+        assert!(
+            !todo_write.description().contains("completed-only"),
+            "description falsely claims a completed dependency is refused: {}",
+            todo_write.description()
+        );
+    }
+
+    #[test]
+    fn todo_write_allows_depending_on_a_task_that_is_not_yet_completed() {
+        let root = TempRoot::new("todo-allowed-dependency");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let call = make_call(
+            "c1",
+            TODO_WRITE_TOOL,
+            r#"{"todos":[{"id":"1","content":"prereq","status":"pending"},{"id":"2","content":"depends on it","status":"pending","depends_on":["1"]}]}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { .. } => {}
+            other => panic!(
+                "depending on a not-yet-completed task must be allowed, got {other:?}"
+            ),
         }
     }
 
