@@ -4365,6 +4365,26 @@ up from 118, 0.46s total), full `-p capability-broker --lib` suite (140 tests, u
 `--test lease_toctou` (2 tests, unchanged), full `-p rapid --lib` suite, and `cargo build --workspace --tests`
 all pass.
 
+**Sixth targeted background hunt, 2026-09-05 — a non-atomic check-then-act race on a shared in-memory
+counter/budget (as opposed to a filesystem TOCTOU, already covered extensively elsewhere) — came back clean,
+no fixable finding.** Traced every `AtomicUsize`/`AtomicU64`/`Mutex`-guarded ceiling across `exec_tools.rs`,
+`kernel`, `agent-runtime`, `process-supervisor`, `event-ledger`, `capability-broker`, `mcp`, `workspace`,
+`telemetry`, `plugin-host`, `agent-pool`, `security::network_policy`, and `computer-use::browser::session`.
+Every site uses one of the two safe constructions consistently: atomic fetch-and-compare-on-the-returned-
+previous-value (e.g. `exec_tools.rs`'s `reserve_write_budget`/`reserve_fetch_budget`, `subagent_spawns.
+fetch_add(1, ..) >= max`), or a single mutex guard spanning both the read and the write (`kernel::turn::
+guard::try_occupy`, `agent-runtime::Scheduler::start_locked` — has its own dedicated concurrent test,
+`per_provider_limit_enforced_under_concurrent_dispatch`, `capability-broker::LeaseValidator::validate_use` —
+likewise, `concurrent_double_use_of_one_shot_lease_permits_one_side_effect`). One site initially looked like
+the target shape — `computer-use::browser::session.rs`'s `reserve_slot`/`commit_session` acquire the same
+lock twice, separately — but was traced fully and ruled out: `commit_session` re-checks the live-session
+count and profile-name conflict under its own freshly-held lock immediately before the actual `insert`, so
+that second acquisition is itself the sole atomic enforcement point; `reserve_slot`'s earlier check is only a
+fail-fast optimization before an expensive browser launch, not a source of double-admission. Confirmed the
+concurrency model is real, not a moot question (`exec_tools.rs::batch_dispatch` genuinely spawns one thread
+per write-group via `std::thread::scope` and dispatches concurrently), so this is a genuine clean result, not
+an artifact of nothing running concurrently to race in the first place.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
