@@ -5214,6 +5214,62 @@ blocker, rather than looping autonomously).
   closed_with_typed_limit`), confirming the `summary` relocation didn't change compaction behavior. This
   closes `AGT-017` for this item; the `scheduler::NodeState` structured-graph half of `AGT-016` (dependencies/
   owner/evidence-requirements/attempts) remains the one genuinely open piece of §2.5.
+- **The `AGT-016` remainder implemented 2026-09-05 — but scoped narrower than "adopt scheduler's graph"
+  after checking what that would actually buy, and the checking itself is worth recording.** Before writing
+  any code, verified `scheduler::NodeState` and `Node` directly against source rather than trusting this
+  document's own prior description: `NodeState` (`crates/scheduler/src/kinds.rs`) is a bare status-tag enum
+  with *zero fields* — dependencies live as graph `Edge`s (`EdgeKind::DependsOn`), and `attempts` is real on
+  `Node` (`crates/scheduler/src/graph.rs`), but `owner` and any per-node "evidence requirement" field do not
+  exist anywhere in the crate (`grep -rn "owner" crates/scheduler/src/` returns zero hits). So "adopt
+  scheduler's types" would buy nothing for `owner`/evidence that isn't already missing there too, and
+  `scheduler::service::GraphService` — the actual execution engine, as opposed to the graph *data* types —
+  has zero callers anywhere in `apps/rapid` (confirmed by grep): the graph is only ever used today as a
+  standalone, serializable data structure via the `rapid playbook-compile` debug command, never wired to
+  live turn execution. Given that, routing `todo_write` through `scheduler`'s types would be a bigger,
+  riskier change for no real capability gain over extending `todo_write`'s own shape directly — the smaller,
+  equally-honest option this document's own §2.5 entry above already named as the alternative.
+
+  **Implemented:** `TodoEntry` (the persisted/in-memory shape) gained `depends_on: Vec<String>` (other
+  todos' ids), `owner: Option<String>`, and `evidence_ids: Vec<String>` — all optional, all backward-
+  compatible with an older `.rapidlm/todos.json` that has none of these keys (`load_todos` reads them back
+  leniently, defaulting to empty/`None` rather than dropping the whole entry). The harder design question
+  was merge semantics: `content`/`status` are required on every `todo_write` call and always fully replace
+  the stored value (unchanged) — but making the three new fields behave the same way would mean an ordinary
+  status-only update (by far the most common real call shape) silently wiping a task's dependencies/owner/
+  evidence every time it didn't re-assert them. Instead, `TodoWriteEntry` (the parsed-input shape, now
+  distinct from `TodoEntry`) gives these three fields *patch* semantics: a key absent from an entry's JSON
+  leaves the stored value untouched; a key present — including an explicit empty array or `null` — is
+  authoritative and can clear it. A `depends_on` reference that names an unknown task id, or a task naming
+  itself, is refused before anything is written (`ToolStepResult::Failed`, handled, model-visible, no
+  partial write) — matching `AGT-016`'s own "durable state... cannot silently change task truth" invariant;
+  full cycle detection (A depends on B depends on A) is a real, separate, harder graph-analysis problem and
+  deliberately not attempted. `load_todos_index` (the context-projection half `AGT-017` already closed)
+  now also renders `owner` and `depends_on` when present, and labels a dependency that isn't yet `completed`
+  as "blocked by" instead of "depends on" — giving the model the same "known state plus the blocker" signal
+  `detect_stall` already surfaces for a different failure shape, per `AGT-017`'s own text. `evidence_ids` is
+  deliberately not rendered there: it's an audit trail the model already knows the content of (it cited it
+  when writing the todo), not new information worth spending context budget on every turn. The tool's own
+  JSON schema and description were updated to document all three new fields and the patch-vs-clear
+  distinction, so a model discovers this from the tool surface itself, not just from a successful call.
+
+  Five new tests: `todo_write_depends_on_owner_and_evidence_round_trip_and_persist` (write, read back from
+  disk); `todo_write_omitting_a_metadata_field_preserves_it_but_an_explicit_empty_value_clears_it` (the core
+  patch-semantics distinction — an omitted field survives a status-only update, an explicit empty array/
+  `null` clears it); `todo_write_refuses_a_dangling_or_self_dependency_without_persisting_anything` (both
+  refusal cases, plus confirming a refused write never touches disk at all); `todo_write_rejects_unknown_
+  keys_and_oversized_metadata` (unknown key, over-cap `depends_on`, oversized `owner`, wrong-typed
+  `depends_on`/`owner` — all refused, not silently defaulted, matching the `scanners.json` type-checking
+  fix's own discipline earlier this session); and `load_todos_index_renders_owner_and_distinguishes_blocked_
+  from_satisfied_dependencies` (four todos exercising all three render states: bare, owner+satisfied-
+  dependency, and blocked-by). Verified via the revert cycle: reverting just the patch-semantics guard and
+  just the dependency-reference validation reproduced both predicted failures exactly (an omitted `depends_
+  on` was wiped instead of preserved; a dangling reference silently succeeded instead of being refused)
+  before restoring both fixes. Full `-p rapid --lib` suite (410 tests, up from 405) and `cargo build
+  --workspace --tests` pass. **This closes `AGT-016`/`AGT-017` for `todo_write`'s own shape.** Still open,
+  and explicitly not attempted: actually adopting `scheduler`'s graph types/execution engine for anything in
+  `apps/rapid` — that remains real, separate, larger work gated on `apps/rapid` growing a live turn-
+  execution path that could use a real scheduler in the first place (the same root gap this document's own
+  §0a meta-finding already names repeatedly).
 
 ### 2.6 `SessionLease` + fencing generation
 

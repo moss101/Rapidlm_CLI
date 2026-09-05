@@ -1349,12 +1349,43 @@ pub fn load_todos_index(root: &Path) -> Option<String> {
     .ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let entries = value.get("todos")?.as_array()?;
+    // `owner`/`depends_on` are rendered when present (Modbit `AGT-016`/
+    // `AGT-017`: durable plan-node state, and the known blocker, surfaced to
+    // the model rather than left implicit) — a dependency that isn't yet
+    // "completed" is labeled "blocked by" instead of "depends on", giving
+    // the model the same "known state plus blocker" signal `detect_stall`
+    // already surfaces for a different failure shape. `evidence_ids` is
+    // deliberately not rendered here: it's an audit trail the model already
+    // knows the content of (it cited it when writing the todo), not new
+    // information worth spending context budget on every turn.
     let lines: Vec<String> = entries
         .iter()
         .filter_map(|entry| {
             let content = entry.get("content")?.as_str()?;
             let status = entry.get("status")?.as_str()?;
-            Some(format!("- [{status}] {content}"))
+            let mut line = format!("- [{status}] {content}");
+            if let Some(owner) = entry.get("owner").and_then(serde_json::Value::as_str) {
+                line.push_str(&format!(" (owner: {owner})"));
+            }
+            let deps: Vec<&str> = entry
+                .get("depends_on")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            if !deps.is_empty() {
+                let blocked = deps.iter().any(|dep| {
+                    entries.iter().any(|other| {
+                        other.get("id").and_then(serde_json::Value::as_str) == Some(*dep)
+                            && other.get("status").and_then(serde_json::Value::as_str)
+                                != Some("completed")
+                    })
+                });
+                let label = if blocked { "blocked by" } else { "depends on" };
+                line.push_str(&format!(" ({label}: {})", deps.join(", ")));
+            }
+            Some(line)
         })
         .collect();
     if lines.is_empty() {
@@ -2102,6 +2133,40 @@ mod tests {
         let rendered = load_todos_index(&root).expect("rendered");
         assert_eq!(rendered, "- [in_progress] wire the thing\n- [pending] test it");
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_todos_index_renders_owner_and_distinguishes_blocked_from_satisfied_dependencies() {
+        let root = std::env::temp_dir().join(format!(
+            "rapidlm-host-todos-metadata-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".rapidlm")).expect("dir");
+        std::fs::write(
+            root.join(crate::exec_tools::TODOS_PATH),
+            br#"{"schema":1,"todos":[
+                {"id":"1","content":"prereq","status":"completed"},
+                {"id":"2","content":"still open","status":"pending"},
+                {"id":"3","content":"ready to start","status":"pending",
+                 "owner":"alice","depends_on":["1"]},
+                {"id":"4","content":"waiting on something","status":"pending",
+                 "depends_on":["2"]}
+            ]}"#,
+        )
+        .expect("write");
+        let rendered = load_todos_index(&root).expect("rendered");
+        assert_eq!(
+            rendered,
+            "- [completed] prereq\n\
+             - [pending] still open\n\
+             - [pending] ready to start (owner: alice) (depends on: 1)\n\
+             - [pending] waiting on something (blocked by: 2)"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

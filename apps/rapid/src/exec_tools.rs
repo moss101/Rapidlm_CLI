@@ -51,6 +51,15 @@ pub const MAX_TODO_CONTENT_BYTES: usize = 512;
 pub const MAX_TODOS: usize = 50;
 /// Workspace-relative path of the persisted task list.
 pub const TODOS_PATH: &str = ".rapidlm/todos.json";
+/// Hard cap on a task's `owner` label (Modbit `AGT-016`: durable plan-node
+/// state outside the transcript).
+pub const MAX_TODO_OWNER_BYTES: usize = 128;
+/// Hard cap on one `depends_on`/`evidence_ids` reference string.
+pub const MAX_TODO_REF_ID_BYTES: usize = 128;
+/// Hard cap on `depends_on` entries per task.
+pub const MAX_TODO_DEPENDS_ON: usize = 16;
+/// Hard cap on `evidence_ids` entries per task.
+pub const MAX_TODO_EVIDENCE_IDS: usize = 16;
 /// Tool name for entering plan mode (Claude `EnterPlanMode` parity).
 pub const PLAN_ENTER_TOOL: &str = "plan_enter";
 /// Tool name for exiting plan mode with the written plan (Claude `ExitPlanMode`).
@@ -2161,11 +2170,27 @@ impl WorkspaceTools {
                     if let Some(slot) = todos.iter_mut().find(|todo| todo.id.as_deref() == Some(id)) {
                         slot.content = entry.content.clone();
                         slot.status = entry.status.clone();
+                        // Patch semantics: a key absent from this entry's
+                        // JSON leaves the stored value untouched — see
+                        // `TodoWriteEntry`'s doc comment for why an ordinary
+                        // status-only update must not silently wipe these.
+                        if let Some(depends_on) = &entry.depends_on {
+                            slot.depends_on = depends_on.clone();
+                        }
+                        if let Some(owner) = &entry.owner {
+                            slot.owner = owner.clone();
+                        }
+                        if let Some(evidence_ids) = &entry.evidence_ids {
+                            slot.evidence_ids = evidence_ids.clone();
+                        }
                     } else {
                         todos.push(TodoEntry {
                             id: Some(id.to_owned()),
                             content: entry.content.clone(),
                             status: entry.status.clone(),
+                            depends_on: entry.depends_on.clone().unwrap_or_default(),
+                            owner: entry.owner.clone().unwrap_or_default(),
+                            evidence_ids: entry.evidence_ids.clone().unwrap_or_default(),
                         });
                     }
                 }
@@ -2183,6 +2208,9 @@ impl WorkspaceTools {
                         id: Some(next.to_string()),
                         content: entry.content.clone(),
                         status: entry.status.clone(),
+                        depends_on: entry.depends_on.clone().unwrap_or_default(),
+                        owner: entry.owner.clone().unwrap_or_default(),
+                        evidence_ids: entry.evidence_ids.clone().unwrap_or_default(),
                     });
                 }
             }
@@ -2196,12 +2224,49 @@ impl WorkspaceTools {
                 ))),
             });
         }
+        // `depends_on` must name a real task (in this same write or already
+        // persisted) — a dangling or self reference is refused before
+        // anything is written, matching `AGT-016`'s "durable state... cannot
+        // silently change task truth" invariant: a broken dependency graph
+        // is exactly the kind of untrue state this feature exists to
+        // prevent, not something to persist and hope is corrected later.
+        // Deliberately not attempted: full cycle detection (A depends on B
+        // depends on A) — a real, separate, harder graph-analysis problem;
+        // this only catches the two cheap, common cases (dangling, self).
+        let known_ids: std::collections::BTreeSet<&str> =
+            todos.iter().filter_map(|todo| todo.id.as_deref()).collect();
+        for todo in &todos {
+            for dep in &todo.depends_on {
+                let this_id = todo.id.as_deref().unwrap_or("?");
+                if Some(dep.as_str()) == todo.id.as_deref() {
+                    return Ok(ToolStepResult::Failed {
+                        call_id: call.call_id().to_owned(),
+                        handled: true,
+                        detail: Some(bounded_detail(&format!(
+                            "task {this_id:?} cannot depend on itself"
+                        ))),
+                    });
+                }
+                if !known_ids.contains(dep.as_str()) {
+                    return Ok(ToolStepResult::Failed {
+                        call_id: call.call_id().to_owned(),
+                        handled: true,
+                        detail: Some(bounded_detail(&format!(
+                            "task {this_id:?} depends on unknown task id {dep:?}"
+                        ))),
+                    });
+                }
+            }
+        }
         let document = serde_json::json!({
             "schema": 1,
             "todos": todos.iter().map(|todo| serde_json::json!({
                 "id": todo.id,
                 "content": todo.content,
                 "status": todo.status,
+                "depends_on": todo.depends_on,
+                "owner": todo.owner,
+                "evidence_ids": todo.evidence_ids,
             })).collect::<Vec<_>>(),
         });
         fs::write(
@@ -2250,10 +2315,24 @@ impl WorkspaceTools {
                 let id = entry.get("id")?.as_str()?.to_owned();
                 let content = entry.get("content")?.as_str()?.to_owned();
                 let status = entry.get("status")?.as_str()?.to_owned();
+                // Fail-open on the newer fields: a file written before this
+                // feature existed simply has none of these keys, which must
+                // read back as "no dependencies/owner/evidence recorded",
+                // not drop the whole entry the way a missing id/content/
+                // status would.
+                let depends_on = todo_ref_list(entry.get("depends_on"));
+                let owner = entry
+                    .get("owner")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                let evidence_ids = todo_ref_list(entry.get("evidence_ids"));
                 Some(TodoEntry {
                     id: Some(id),
                     content,
                     status,
+                    depends_on,
+                    owner,
+                    evidence_ids,
                 })
             })
             .collect()
@@ -3038,15 +3117,40 @@ struct TaskSpawnArgs {
 
 struct EmptyArgs;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Persisted/in-memory task-list entry (Modbit `AGT-016`: plan nodes carry
+/// status, dependencies, owner, and evidence requirements as durable state
+/// outside the transcript). `depends_on`/`evidence_ids` are other todos'
+/// `id`s and free-text evidence references respectively; empty when unset.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct TodoEntry {
     id: Option<String>,
     content: String,
     status: String,
+    depends_on: Vec<String>,
+    owner: Option<String>,
+    evidence_ids: Vec<String>,
+}
+
+/// One `todo_write` input entry. `content`/`status` are always required and
+/// always replace the stored value for that id (unchanged from before this
+/// item existed) — but `depends_on`/`owner`/`evidence_ids` use patch
+/// semantics: `None` means the key was absent from this entry's JSON object
+/// ("don't touch the stored value"), `Some(_)` means it was present and is
+/// now authoritative, including an empty array/`null` explicitly clearing
+/// it. Without this distinction, an ordinary status-only update (the most
+/// common `todo_write` call) would silently wipe a task's dependencies/
+/// owner/evidence every time it didn't re-assert them.
+struct TodoWriteEntry {
+    id: Option<String>,
+    content: String,
+    status: String,
+    depends_on: Option<Vec<String>>,
+    owner: Option<Option<String>>,
+    evidence_ids: Option<Vec<String>>,
 }
 
 struct TodoArgs {
-    todos: Vec<TodoEntry>,
+    todos: Vec<TodoWriteEntry>,
 }
 
 struct RepoReadArgs {
@@ -3752,9 +3856,20 @@ fn parse_repo_glob_args(raw: &str) -> Result<RepoGlobArgs, ToolStepError> {
 
 /// Parse bounded `{"todos": [...]}` task-list arguments. Each entry carries
 /// `content` (bounded) and `status`; `id` is optional (merge-by-id when
-/// present). Unknown keys, unknown statuses, and bound violations are refused.
+/// present). `depends_on`/`owner`/`evidence_ids` are optional patch fields —
+/// see `TodoWriteEntry`'s own doc comment for why absence and explicit
+/// clearing are distinct. Unknown keys, unknown statuses, and bound
+/// violations are refused.
 fn parse_todo_args(raw: &str) -> Result<TodoArgs, ToolStepError> {
     const STATUSES: &[&str] = &["pending", "in_progress", "completed", "cancelled"];
+    const ALLOWED_KEYS: &[&str] = &[
+        "id",
+        "content",
+        "status",
+        "depends_on",
+        "owner",
+        "evidence_ids",
+    ];
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
     let object = value.as_object().ok_or(ToolStepError::Invalid)?;
     if !object.contains_key("todos") || object.len() != 1 {
@@ -3770,7 +3885,9 @@ fn parse_todo_args(raw: &str) -> Result<TodoArgs, ToolStepError> {
     let mut todos = Vec::with_capacity(entries.len());
     for entry in entries {
         let entry = entry.as_object().ok_or(ToolStepError::Invalid)?;
-        if entry.len() > 3 {
+        if entry.len() > ALLOWED_KEYS.len()
+            || !entry.keys().all(|key| ALLOWED_KEYS.contains(&key.as_str()))
+        {
             return Err(ToolStepError::Invalid);
         }
         let content = entry
@@ -3791,13 +3908,74 @@ fn parse_todo_args(raw: &str) -> Result<TodoArgs, ToolStepError> {
             Some(id) => Some(id.as_str().ok_or(ToolStepError::Invalid)?.to_owned()),
             None => None,
         };
-        todos.push(TodoEntry {
+        let depends_on = match entry.get("depends_on") {
+            Some(value) => Some(parse_todo_ref_list(value, MAX_TODO_DEPENDS_ON)?),
+            None => None,
+        };
+        let owner = match entry.get("owner") {
+            Some(serde_json::Value::Null) => Some(None),
+            Some(value) => {
+                let owner = value.as_str().ok_or(ToolStepError::Invalid)?;
+                if owner.is_empty() || owner.len() > MAX_TODO_OWNER_BYTES {
+                    return Err(ToolStepError::Invalid);
+                }
+                Some(Some(owner.to_owned()))
+            }
+            None => None,
+        };
+        let evidence_ids = match entry.get("evidence_ids") {
+            Some(value) => Some(parse_todo_ref_list(value, MAX_TODO_EVIDENCE_IDS)?),
+            None => None,
+        };
+        todos.push(TodoWriteEntry {
             id,
             content: content.to_owned(),
             status: status.to_owned(),
+            depends_on,
+            owner,
+            evidence_ids,
         });
     }
     Ok(TodoArgs { todos })
+}
+
+/// Read back a persisted `depends_on`/`evidence_ids` array leniently: a
+/// missing key or any non-string entry is simply dropped, never fails the
+/// whole read — this is trusted, already-validated state being reloaded,
+/// not fresh model input (`parse_todo_ref_list` below is the strict,
+/// input-validating counterpart).
+fn todo_ref_list(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse a bounded array of reference-id strings (`depends_on`/
+/// `evidence_ids`). An empty array is valid (explicitly clears the field).
+fn parse_todo_ref_list(
+    value: &serde_json::Value,
+    max_entries: usize,
+) -> Result<Vec<String>, ToolStepError> {
+    let items = value.as_array().ok_or(ToolStepError::Invalid)?;
+    if items.len() > max_entries {
+        return Err(ToolStepError::Invalid);
+    }
+    items
+        .iter()
+        .map(|item| {
+            let id = item.as_str().ok_or(ToolStepError::Invalid)?;
+            if id.is_empty() || id.len() > MAX_TODO_REF_ID_BYTES {
+                return Err(ToolStepError::Invalid);
+            }
+            Ok(id.to_owned())
+        })
+        .collect()
 }
 
 /// Parse bounded `{"question", "options"}` ask-user arguments.
@@ -4811,7 +4989,7 @@ impl WorkspaceTools {
             ),
             ToolSurface::new(
                 TODO_WRITE_TOOL,
-                "Maintain your task list for this workspace: pass the full set of tasks with                  status pending | in_progress | completed | cancelled; entries with an id                  update that task, entries without one are added. Arguments JSON:                  {\"todos\":[{\"id\":\"1\",\"content\":\"...\",\"status\":\"in_progress\"}]}.",
+                "Maintain your task list for this workspace: pass the full set of tasks with                  status pending | in_progress | completed | cancelled; entries with an id                  update that task, entries without one are added. Optional depends_on                  (other task ids), owner, and evidence_ids persist as durable state and                  survive compaction; omitting one on an update leaves it unchanged, an                  empty array/null clears it. A dependency on an unknown or completed-only                  task id is refused. Arguments JSON:                  {\"todos\":[{\"id\":\"1\",\"content\":\"...\",\"status\":\"in_progress\",                  \"depends_on\":[\"2\"]}]}.",
                 arguments_schema(
                     "Update the task list",
                     serde_json::json!({
@@ -4822,7 +5000,13 @@ impl WorkspaceTools {
                                 "content": {"type": "string"},
                                 "status": {"type": "string",
                                            "enum": ["pending", "in_progress",
-                                                    "completed", "cancelled"]}
+                                                    "completed", "cancelled"]},
+                                "depends_on": {"type": "array", "items": {"type": "string"},
+                                               "description": "other task ids this one waits on"},
+                                "owner": {"type": ["string", "null"],
+                                          "description": "who/what is responsible, e.g. a subagent label"},
+                                "evidence_ids": {"type": "array", "items": {"type": "string"},
+                                                  "description": "free-text evidence references"}
                             },
                             "required": ["content", "status"]
                         }, "description": "full task list (merge-by-id)"}
@@ -8016,6 +8200,150 @@ use std::sync::{Arc, Mutex};
             r#"{"items":[]}"#,
         ] {
             let call = make_call("c3", TODO_WRITE_TOOL, arguments);
+            let validated = tools.validate(&call, &cancel).expect("known tool validates");
+            match tools.execute(&validated, &cancel).expect("handled") {
+                ToolStepResult::Failed { handled, .. } => assert!(handled, "{arguments}"),
+                other => panic!("expected handled refusal for {arguments}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn todo_write_depends_on_owner_and_evidence_round_trip_and_persist() {
+        let root = TempRoot::new("todo-metadata");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        let call = make_call(
+            "c1",
+            TODO_WRITE_TOOL,
+            r#"{"todos":[{"id":"1","content":"design the API","status":"completed"},{"id":"2","content":"implement it","status":"in_progress","depends_on":["1"],"owner":"subagent-impl","evidence_ids":["design-doc"]}]}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        tools.execute(&validated, &cancel).expect("execute");
+
+        let persisted = fs::read_to_string(root.0.join(TODOS_PATH)).expect("persisted");
+        let value: serde_json::Value = serde_json::from_str(&persisted).expect("json");
+        let todos = value["todos"].as_array().expect("todos array");
+        let second = &todos[1];
+        assert_eq!(second["depends_on"], serde_json::json!(["1"]));
+        assert_eq!(second["owner"], "subagent-impl");
+        assert_eq!(second["evidence_ids"], serde_json::json!(["design-doc"]));
+    }
+
+    #[test]
+    fn todo_write_omitting_a_metadata_field_preserves_it_but_an_explicit_empty_value_clears_it() {
+        let root = TempRoot::new("todo-patch-semantics");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        let seed = make_call(
+            "c1",
+            TODO_WRITE_TOOL,
+            r#"{"todos":[{"id":"1","content":"do it","status":"pending","depends_on":["2"],"owner":"alice"},{"id":"2","content":"prereq","status":"completed"}]}"#,
+        );
+        let validated = tools.validate(&seed, &cancel).expect("validate");
+        tools.execute(&validated, &cancel).expect("seed");
+
+        // Status-only update: depends_on/owner are absent from the JSON and
+        // must survive unchanged, not be silently wiped.
+        let status_only = make_call(
+            "c2",
+            TODO_WRITE_TOOL,
+            r#"{"todos":[{"id":"1","content":"do it","status":"in_progress"}]}"#,
+        );
+        let validated = tools.validate(&status_only, &cancel).expect("validate");
+        tools.execute(&validated, &cancel).expect("status-only update");
+        let persisted = fs::read_to_string(root.0.join(TODOS_PATH)).expect("persisted");
+        let value: serde_json::Value = serde_json::from_str(&persisted).expect("json");
+        let first = &value["todos"][0];
+        assert_eq!(first["status"], "in_progress");
+        assert_eq!(
+            first["depends_on"],
+            serde_json::json!(["2"]),
+            "an omitted field must be preserved, not cleared: {first}"
+        );
+        assert_eq!(first["owner"], "alice");
+
+        // Explicit empty array / null: now the fields really are cleared.
+        let explicit_clear = make_call(
+            "c3",
+            TODO_WRITE_TOOL,
+            r#"{"todos":[{"id":"1","content":"do it","status":"in_progress","depends_on":[],"owner":null}]}"#,
+        );
+        let validated = tools.validate(&explicit_clear, &cancel).expect("validate");
+        tools.execute(&validated, &cancel).expect("explicit clear");
+        let persisted = fs::read_to_string(root.0.join(TODOS_PATH)).expect("persisted");
+        let value: serde_json::Value = serde_json::from_str(&persisted).expect("json");
+        let first = &value["todos"][0];
+        assert_eq!(first["depends_on"], serde_json::json!([]));
+        assert_eq!(first["owner"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn todo_write_refuses_a_dangling_or_self_dependency_without_persisting_anything() {
+        let root = TempRoot::new("todo-bad-deps");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        let dangling = make_call(
+            "c1",
+            TODO_WRITE_TOOL,
+            r#"{"todos":[{"id":"1","content":"do it","status":"pending","depends_on":["nope"]}]}"#,
+        );
+        let validated = tools.validate(&dangling, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("handled") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.unwrap().contains("unknown task id"));
+            }
+            other => panic!("expected a dangling-dependency refusal, got {other:?}"),
+        }
+        assert!(
+            !root.0.join(TODOS_PATH).exists(),
+            "a refused write must never touch disk"
+        );
+
+        let self_dep = make_call(
+            "c2",
+            TODO_WRITE_TOOL,
+            r#"{"todos":[{"id":"1","content":"do it","status":"pending","depends_on":["1"]}]}"#,
+        );
+        let validated = tools.validate(&self_dep, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("handled") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                assert!(detail.unwrap().contains("cannot depend on itself"));
+            }
+            other => panic!("expected a self-dependency refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn todo_write_rejects_unknown_keys_and_oversized_metadata() {
+        let root = TempRoot::new("todo-bad-shapes");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+
+        let too_many_deps = format!(
+            r#"{{"todos":[{{"id":"1","content":"x","status":"pending","depends_on":[{}]}}]}}"#,
+            (0..MAX_TODO_DEPENDS_ON + 1)
+                .map(|n| format!("\"{n}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let oversized_owner = format!(
+            r#"{{"todos":[{{"id":"1","content":"x","status":"pending","owner":"{}"}}]}}"#,
+            "o".repeat(MAX_TODO_OWNER_BYTES + 1)
+        );
+        for arguments in [
+            r#"{"todos":[{"id":"1","content":"x","status":"pending","unexpected_key":true}]}"#,
+            too_many_deps.as_str(),
+            oversized_owner.as_str(),
+            r#"{"todos":[{"id":"1","content":"x","status":"pending","depends_on":"not-an-array"}]}"#,
+            r#"{"todos":[{"id":"1","content":"x","status":"pending","owner":123}]}"#,
+        ] {
+            let call = make_call("c1", TODO_WRITE_TOOL, arguments);
             let validated = tools.validate(&call, &cancel).expect("known tool validates");
             match tools.execute(&validated, &cancel).expect("handled") {
                 ToolStepResult::Failed { handled, .. } => assert!(handled, "{arguments}"),
