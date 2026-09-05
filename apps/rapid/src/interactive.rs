@@ -1952,7 +1952,17 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             ) {
                 Ok(controller) => {
                     let diag = parsed.verbose.then(|| StepDiag::stderr(&base_url));
-                    let chain = FallbackChainModel::new(backends, controller, diag);
+                    let mut chain = FallbackChainModel::new(backends, controller, diag);
+                    // Re-loading rather than threading a value from earlier
+                    // in `exec_turn` — same rationale as the disk/network
+                    // ceiling narrowing above: non-security-critical, so a
+                    // load failure here just means no version is attached
+                    // rather than failing the whole turn.
+                    if let Ok(Some(managed_policy)) =
+                        crate::managed_config::load_policy(&std::env::vars().collect::<Vec<_>>())
+                    {
+                        chain.set_policy_version(Some(managed_policy.policy_version().to_owned()));
+                    }
                     router_decisions = chain.decisions();
                     SelectedModel::FallbackChain(Box::new(chain))
                 }
@@ -2096,12 +2106,21 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             RouterDecisionReason::FallbackTo => ("fallback_to", decision.resolved_model.as_str()),
             RouterDecisionReason::Stop(why) => (why.as_str(), ""),
         };
-        match decision.spent_usd_micros {
-            Some(spent) => eprintln!(
+        match (decision.spent_usd_micros, &decision.policy_version) {
+            (Some(spent), Some(version)) => eprintln!(
+                "router: requested={} resolved={} reason={reason_tag} spent_usd_micros={spent} \
+                 policy_version={version}",
+                decision.requested_model, decision.resolved_model
+            ),
+            (Some(spent), None) => eprintln!(
                 "router: requested={} resolved={} reason={reason_tag} spent_usd_micros={spent}",
                 decision.requested_model, decision.resolved_model
             ),
-            None => eprintln!(
+            (None, Some(version)) => eprintln!(
+                "router: requested={} resolved={} reason={reason_tag} policy_version={version}",
+                decision.requested_model, decision.resolved_model
+            ),
+            (None, None) => eprintln!(
                 "router: requested={} resolved={} reason={reason_tag}",
                 decision.requested_model, decision.resolved_model
             ),
@@ -2115,6 +2134,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                 resolved,
                 reason_tag,
                 decision.spent_usd_micros,
+                decision.policy_version.as_deref(),
             ) {
                 let _ = io.records().write(&record);
                 next_jsonl_seq += 1;

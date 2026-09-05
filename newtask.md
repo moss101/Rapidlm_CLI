@@ -5654,6 +5654,48 @@ model, routing reason, policy version, estimated vs. actual cost — "routing mu
   and `cargo build --workspace --tests` pass. **Still not attempted, and this is now the entire remainder of
   `MOD-005`:** `policy_version` (no versioning concept exists to cite) and the *estimated* half of cost (needs
   a real `ModelCatalog` pricing lookup, separate infrastructure this record doesn't touch).
+- **`policy_version` implemented 2026-09-05, closing everything achievable in `MOD-005` without new pricing
+  infrastructure.** Same investigate-before-designing approach as the cost half above: `ManagedPolicy`
+  (`managed_config.rs`) had no version concept of any kind to cite — no schema revision counter, no admin-
+  supplied label field, nothing. Rather than inventing a new authoring surface (a `version = "..."` field
+  administrators would have to remember to bump), used what's actually available: the raw document's own
+  content. **Implemented:** a small, deliberately non-cryptographic `fnv1a_hex` helper (16 hex digits,
+  dependency-free — considered and rejected both `std::collections::hash_map::DefaultHasher`, whose specific
+  algorithm the stdlib does not guarantee stable across Rust releases, which would make a "version" silently
+  drift on a toolchain upgrade with no content change at all, and pulling in `sha2` as a new direct
+  `apps/rapid` dependency for a job that needs no collision resistance, only "did the bytes change"). New
+  `ManagedPolicy::policy_version(&self) -> &str`, computed once in `parse()` over the exact TOML bytes
+  `load_policy` read (a content identity, not a semantic version — a single whitespace change produces a
+  different value on purpose, so this only tells "did the loaded document's bytes change," not "did the
+  meaning change"). Threaded through: `RouterDecisionRecord` gained `policy_version: Option<String>`;
+  `FallbackChainModel` gained a `policy_version: Option<String>` field defaulting to `None` plus a
+  `set_policy_version` setter — a setter rather than a `new()` parameter specifically to avoid touching the
+  8 existing test call sites for a field most of them never need to exercise, mirroring how `hooks_config`/
+  `shadow_diagnostics_config` are propagated to subagents elsewhere in this codebase (set after construction,
+  not threaded through the constructor). `interactive.rs::exec_turn`'s real `FallbackChainModel::new` call
+  site calls `set_policy_version` right after construction, re-loading `managed_config::load_policy` rather
+  than threading a value from earlier in the same function — same accepted rationale the disk/network-
+  ceiling narrowing a few lines above it already documents: non-security-critical, so a load failure here
+  just means no version gets attached, not a reason to fail the whole turn. Surfaced through both existing
+  consumers: the stderr `router:` line appends `policy_version=<hash>` when `Some` (independently of whether
+  `spent_usd_micros` is also `Some`, so all four combinations print correctly), and `JsonlRecord::
+  router_decision` gained the field as a new parameter (`null` when `None`). New tests:
+  `policy_version_is_stable_for_identical_documents_and_differs_for_any_change` (`managed_config.rs` — two
+  byte-identical documents hash the same, a real change and even a whitespace-only change both hash
+  differently, and the output is confirmed to be exactly 16 lowercase hex digits),
+  `decisions_carry_no_policy_version_until_set_and_a_real_one_after` (`host.rs` — one chain, two `step()`
+  calls around a `set_policy_version` in between, confirming the first recorded decision has `None` and the
+  second has the attached value, not a global default leaking backward), and
+  `router_decision_carries_a_real_policy_version_when_reported` (golden JSON, `headless/jsonl.rs`). Verified
+  via two separate revert cycles (the hash computation and the propagation are independent pieces of logic):
+  reverting `parse()`'s call to `fnv1a_hex` to a constant string reproduced the "a real content change must
+  change the version" failure exactly as predicted; reverting the `RouterDecisionRecord` push sites'
+  `self.policy_version.clone()` back to a hardcoded `None` reproduced the `host.rs` test's exact predicted
+  failure (`None` where `Some("deadbeefcafef00d")` was expected); both restored and reconfirmed passing. Full
+  `-p rapid --lib` suite (424 tests, up from 421) and `cargo build --workspace --tests` pass. **`MOD-005` is
+  now fully closed** except the one piece both this entry and the cost entry above independently concluded
+  needs genuinely separate infrastructure: an *estimated* (not actual) cost per decision, which needs a real
+  `ModelCatalog` pricing lookup this record has no access to.
 - **Unrelated security fix found while auditing this crate, 2026-08-30: an integer overflow in chunked
   HTTP decoding let any configured provider crash the process.** `crates/llm-router/src/providers/
   openai_compatible.rs::decode_chunked` (shared by both the OpenAI-compatible and Anthropic adapters via

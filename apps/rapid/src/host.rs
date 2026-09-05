@@ -932,6 +932,12 @@ pub struct RouterDecisionRecord {
     /// record doesn't have access to, and is deliberately not attempted
     /// here (see `newtask.md` §2.8).
     pub spent_usd_micros: Option<u64>,
+    /// `managed_config::ManagedPolicy::policy_version` of whatever managed
+    /// policy was active when this decision was made, or `None` when no
+    /// managed policy is configured at all — the remaining half of Modbit
+    /// `MOD-005`'s "policy version" ask, closed 2026-09-05. A content
+    /// identity, not a semantic version; see that field's own doc comment.
+    pub policy_version: Option<String>,
 }
 
 /// Why a step's resolved model differs from (or repeats) the one requested.
@@ -994,6 +1000,11 @@ pub struct FallbackChainModel<B> {
     /// reflects what was actually spent on the model being retried/
     /// abandoned, not a running turn-wide total.
     spent_usd_micros: std::collections::BTreeMap<String, u64>,
+    /// Set once via `set_policy_version` (not a `new()` parameter, to avoid
+    /// touching every existing test call site for a field most callers
+    /// leave `None`) and copied onto every `RouterDecisionRecord` pushed
+    /// from then on.
+    policy_version: Option<String>,
 }
 
 impl<B: LiveModelCall> FallbackChainModel<B> {
@@ -1008,7 +1019,15 @@ impl<B: LiveModelCall> FallbackChainModel<B> {
             diag,
             decisions: RouterDecisionLog::new(),
             spent_usd_micros: std::collections::BTreeMap::new(),
+            policy_version: None,
         }
+    }
+
+    /// Attach the active managed policy's content version, if any, to every
+    /// `RouterDecisionRecord` this chain records from this point on. Not a
+    /// `new()` parameter — see the field's own doc comment for why.
+    pub fn set_policy_version(&mut self, version: Option<String>) {
+        self.policy_version = version;
     }
 
     /// Cumulative cost reported so far this turn for `model`, or `None` if
@@ -1096,6 +1115,7 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                         resolved_model: model_label(&current),
                         reason: RouterDecisionReason::RetrySame,
                         spent_usd_micros: self.spent_on(&current),
+                        policy_version: self.policy_version.clone(),
                     });
                     if !sleep_millis_cancellable(cancel, *backoff_ms) {
                         return Err(ModelStepError::Cancelled);
@@ -1112,6 +1132,7 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                         resolved_model: model_label(to),
                         reason: RouterDecisionReason::FallbackTo,
                         spent_usd_micros: self.spent_on(&current),
+                        policy_version: self.policy_version.clone(),
                     });
                     if !sleep_millis_cancellable(cancel, *backoff_ms) {
                         return Err(ModelStepError::Cancelled);
@@ -1128,6 +1149,7 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                         resolved_model: String::new(),
                         reason: RouterDecisionReason::Stop(reason.as_str().to_owned()),
                         spent_usd_micros: self.spent_on(&current),
+                        policy_version: self.policy_version.clone(),
                     });
                     return Err(err);
                 }
@@ -1142,6 +1164,7 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                         resolved_model: String::new(),
                         reason: RouterDecisionReason::Stop(reason.as_str().to_owned()),
                         spent_usd_micros: self.spent_on(&current),
+                        policy_version: self.policy_version.clone(),
                     });
                     return Err(err);
                 }
@@ -1750,6 +1773,35 @@ mod tests {
             Some(2_500),
             "the decision must report what was already spent on the model being abandoned, \
              not None just because this specific step's own attempt never succeeded"
+        );
+    }
+
+    #[test]
+    fn decisions_carry_no_policy_version_until_set_and_a_real_one_after() {
+        // No alternate configured, so an auth failure (never retried on the
+        // same backend) goes straight to `Stop` — one `RouterDecisionRecord`
+        // pushed per `step()` call, giving two independent decisions to
+        // compare before/after `set_policy_version` on the same chain.
+        let primary_ref = model_ref("b-ai", "deepseek");
+        let controller = chain_controller(primary_ref.clone(), Vec::new());
+        let primary = ScriptedBacking::new(vec![auth_failure(), auth_failure()]);
+        let mut chain =
+            FallbackChainModel::new(vec![(primary_ref, primary)], controller, None);
+
+        let _ = chain.step(&[], &step_input(), &CancellationToken::new());
+        chain.set_policy_version(Some("deadbeefcafef00d".to_owned()));
+        let _ = chain.step(&[], &step_input(), &CancellationToken::new());
+
+        let decisions = chain.decisions().snapshot();
+        assert_eq!(decisions.len(), 2, "one Stop decision per step call");
+        assert_eq!(
+            decisions[0].policy_version, None,
+            "no managed policy was set yet when the first decision was recorded"
+        );
+        assert_eq!(
+            decisions[1].policy_version.as_deref(),
+            Some("deadbeefcafef00d"),
+            "once set, every subsequent decision must carry the attached policy version"
         );
     }
 

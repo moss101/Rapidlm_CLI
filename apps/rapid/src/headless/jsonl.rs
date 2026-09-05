@@ -208,6 +208,7 @@ impl JsonlRecord {
         resolved_model: &str,
         reason: &str,
         spent_usd_micros: Option<u64>,
+        policy_version: Option<&str>,
     ) -> Result<Self, JsonlError> {
         Ok(Self {
             schema: JSONL_SCHEMA,
@@ -220,6 +221,7 @@ impl JsonlRecord {
                 "resolved_model": resolved_model,
                 "reason": reason,
                 "spent_usd_micros": spent_usd_micros,
+                "policy_version": policy_version,
             }))?,
         })
     }
@@ -621,12 +623,13 @@ mod tests {
             "anthropic/claude",
             "fallback_to",
             None,
+            None,
         )
         .expect("router decision");
         assert_eq!(
             encode(&record),
             format!(
-                r#"{{"schema":1,"type":"router.decision","session_id":"{SESSION_ID}","seq":1,"time":"{TIME}","data":{{"reason":"fallback_to","requested_model":"openai/gpt-5","resolved_model":"anthropic/claude","spent_usd_micros":null}}}}"#
+                r#"{{"schema":1,"type":"router.decision","session_id":"{SESSION_ID}","seq":1,"time":"{TIME}","data":{{"policy_version":null,"reason":"fallback_to","requested_model":"openai/gpt-5","resolved_model":"anthropic/claude","spent_usd_micros":null}}}}"#
             )
         );
     }
@@ -641,12 +644,34 @@ mod tests {
             "anthropic/claude",
             "fallback_to",
             Some(4_200),
+            None,
         )
         .expect("router decision");
         assert_eq!(
             encode(&record),
             format!(
-                r#"{{"schema":1,"type":"router.decision","session_id":"{SESSION_ID}","seq":1,"time":"{TIME}","data":{{"reason":"fallback_to","requested_model":"openai/gpt-5","resolved_model":"anthropic/claude","spent_usd_micros":4200}}}}"#
+                r#"{{"schema":1,"type":"router.decision","session_id":"{SESSION_ID}","seq":1,"time":"{TIME}","data":{{"policy_version":null,"reason":"fallback_to","requested_model":"openai/gpt-5","resolved_model":"anthropic/claude","spent_usd_micros":4200}}}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn router_decision_carries_a_real_policy_version_when_reported() {
+        let record = JsonlRecord::router_decision(
+            session_id(),
+            1,
+            TIME,
+            "openai/gpt-5",
+            "anthropic/claude",
+            "fallback_to",
+            None,
+            Some("abcd1234abcd1234"),
+        )
+        .expect("router decision");
+        assert_eq!(
+            encode(&record),
+            format!(
+                r#"{{"schema":1,"type":"router.decision","session_id":"{SESSION_ID}","seq":1,"time":"{TIME}","data":{{"policy_version":"abcd1234abcd1234","reason":"fallback_to","requested_model":"openai/gpt-5","resolved_model":"anthropic/claude","spent_usd_micros":null}}}}"#
             )
         );
     }

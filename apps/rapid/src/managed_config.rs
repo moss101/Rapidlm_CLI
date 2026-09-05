@@ -179,6 +179,21 @@ pub struct ManagedPolicy {
     /// Per-turn `task_spawn` count ceiling override, applied via
     /// `WorkspaceTools::narrow_subagent_spawn_ceiling` — narrow-only.
     max_subagent_spawns_per_turn: Option<u64>,
+    /// Stable content identity of the raw document this was parsed from
+    /// (Modbit `MOD-005`'s "policy version" half — the other half,
+    /// *estimated* cost, needs a real `ModelCatalog` pricing lookup this
+    /// module has no access to, and stays unattempted). A 16-hex-digit
+    /// FNV-1a-64 of the exact bytes `load_policy` read, not a semantic
+    /// version — two byte-identical documents always produce the same
+    /// value, and a single whitespace change produces a different one, on
+    /// purpose: this exists so a `router.decision` log can tell "the policy
+    /// changed" from "the policy didn't," not to be a human-meaningful
+    /// version number. Deliberately non-cryptographic: this is an audit
+    /// label, not a security boundary, so a fast, dependency-free hash is
+    /// the right tool rather than pulling in `sha2` (already used elsewhere
+    /// in this workspace, but for content *fingerprints* that gate
+    /// dismissal, a different job with a real collision-resistance need).
+    policy_version: String,
 }
 
 impl ManagedPolicy {
@@ -410,7 +425,14 @@ impl ManagedPolicy {
             max_write_bytes_per_turn,
             max_fetch_bytes_per_turn,
             max_subagent_spawns_per_turn,
+            policy_version: fnv1a_hex(toml_str.as_bytes()),
         })
+    }
+
+    /// Stable content identity of the document this was parsed from — see
+    /// the field's own doc comment for exactly what this is and isn't.
+    pub fn policy_version(&self) -> &str {
+        &self.policy_version
     }
 
     pub fn locked_default(&self) -> Option<&str> {
@@ -520,6 +542,24 @@ fn field_error(field_id: &str, reason: &str) -> ConfigFieldError {
         reason: reason.to_string(),
         remediation: "fix the managed policy document",
     }
+}
+
+/// FNV-1a-64 of `bytes`, hex-encoded to 16 lowercase digits. Backs
+/// `ManagedPolicy::policy_version` — see that field's doc comment for why a
+/// small, dependency-free, non-cryptographic hash is the right tool here
+/// rather than `std::collections::hash_map::DefaultHasher` (algorithm not
+/// guaranteed stable across Rust releases, which would make a "version"
+/// silently drift on a toolchain upgrade) or `sha2` (a real dependency for a
+/// job that needs no collision resistance).
+fn fnv1a_hex(bytes: &[u8]) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
 }
 
 /// Outcome of gating one resolution.
@@ -833,6 +873,36 @@ base_url = "http://gateway.internal:8080"
         let wrong_schema = "schema = \"rapidlm.managed_config.v0\"\n[policy]\n";
         let err = ManagedPolicy::parse(wrong_schema).expect_err("schema");
         assert!(matches!(err, ManagedConfigError::SchemaMismatch { .. }));
+    }
+
+    #[test]
+    fn policy_version_is_stable_for_identical_documents_and_differs_for_any_change() {
+        let a = parse_policy(&policy_doc("locked_default = \"cloud\"\n"));
+        let b = parse_policy(&policy_doc("locked_default = \"cloud\"\n"));
+        assert_eq!(
+            a.policy_version(),
+            b.policy_version(),
+            "two byte-identical documents must produce the same version"
+        );
+        assert_eq!(
+            a.policy_version().len(),
+            16,
+            "16 lowercase hex digits (a 64-bit hash)"
+        );
+        assert!(a.policy_version().chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+        let changed = parse_policy(&policy_doc("locked_default = \"local\"\n"));
+        assert_ne!(
+            a.policy_version(),
+            changed.policy_version(),
+            "a real content change must change the version"
+        );
+
+        // Even a whitespace-only change is a byte-level difference, and
+        // this is deliberately a content hash, not a semantic one — see
+        // the field's own doc comment.
+        let whitespace_only = parse_policy(&format!("{}\n", policy_doc("locked_default = \"cloud\"\n")));
+        assert_ne!(a.policy_version(), whitespace_only.policy_version());
     }
 
     #[test]
