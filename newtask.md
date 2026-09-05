@@ -4766,6 +4766,44 @@ expected hash before reversal, `ReversibilityClass` for irreversible/compensatab
   `ReversibilityClass` types (`CheckpointManager`/`RewindOp`/`RewindPreview` in `workspace::checkpoint`
   already give optimistic-concurrency-checked, previewable, reversible undo, unnamed as such — a
   wiring/naming task, not a build-from-scratch one, but not attempted in this pass).
+- **Sub-gap fixed 2026-09-05: `apps/rapid`'s own file writes were not atomic even before any
+  `WorkspaceTransaction` migration — a single-file, low-risk slice of the still-unattempted L-effort
+  work above.** Investigated via a research agent whether any smaller slice of the migration existed
+  before accepting the "L effort" framing wholesale; it did. `execute_write`, `execute_patch`, and
+  `execute_todo_write` in `apps/rapid/src/exec_tools.rs` all called `fs::write(target, bytes)` directly
+  — which truncates the target file in place before the new bytes are guaranteed to have landed. A
+  process kill mid-write (OOM kill, `SIGKILL`, host crash) between the truncate and the write completing
+  leaves the file zero-length or partially written, with the previous content unrecoverably destroyed —
+  and `apps/rapid` has no signal handler anywhere (confirmed by grep) to protect against this. Three
+  other places in the codebase already solve this correctly with the standard temp-file +
+  `sync_all` + `rename` pattern (`rename` is atomic on the same filesystem, so a kill mid-write can only
+  ever corrupt the *temp* file, never the real target): `crates/workspace/src/backends/direct.rs::
+  write_confined`, `crates/workspace/src/backends/git_worktree.rs::atomic_write`, and
+  `crates/kernel/src/project/trust.rs::persist`. **Fixed:** added `apps/rapid/src/exec_tools.rs::
+  atomic_write(target, bytes)`, mirroring that established pattern (creates a `.{filename}.{pid}.tmp`
+  sibling with `create_new` so concurrent writers can't collide, writes, `sync_all`s, renames over the
+  target, and removes the temp file on any failure path). Swapped all 6 call sites that write
+  model-authored persistent content: `execute_write` (all 3 branches — shadow-diagnostics-passed,
+  shadow-diagnostics-skipped, and the no-shadow-diagnostics plain path), `execute_patch` (both the exact-
+  match and whitespace-insensitive tiers), and `execute_todo_write`'s persist call. Also reused from
+  `apps/rapid/src/findings_store.rs::save` (was its own direct `fs::write`, now calls
+  `crate::exec_tools::atomic_write`) — same "project-local advisory state" persistence shape. **Deliberately
+  left as plain `fs::write`:** the seatbelt sandbox profile write in `execute_shell`'s sandboxed branch
+  (`.rapidlm/seatbelt.sb`) — a synthetic file fully regenerated on every sandboxed call, not persistent
+  model-authored content, so atomicity buys nothing there. New tests:
+  `atomic_write_creates_overwrites_and_leaves_no_temp_file` (create, overwrite, and confirm no `.tmp`
+  sibling survives) and `atomic_write_never_truncates_the_target_when_the_write_itself_fails` (seeds a
+  target with real content, chmods its parent directory read-only so the temp-file creation fails,
+  confirms the target's original bytes are untouched afterward). Revert-cycle verified: reverted
+  `atomic_write`'s body internally to a plain `fs::write` and re-ran the failure test — it failed, though
+  at a different assertion than expected (the reverted version's `result.is_err()` check failed because
+  overwriting an *existing* file's bytes in place doesn't require directory write permission, only file
+  write permission, unlike creating the new temp-file directory entry — a meaningfully different but still
+  valid confirmation that the fix changes real behavior), then restored from backup and reconfirmed both
+  new tests pass. Full `-p rapid --lib` suite (414 tests, up from 412) and `cargo build --workspace --tests`
+  pass with no regressions. **Still not done, same as noted above:** the actual multi-file
+  `WorkspaceTransaction` migration (this fix only makes each individual file write atomic, not a multi-file
+  operation as one unit) and `UndoAction`/`UndoPlan`/`ReversibilityClass` wiring.
 
 ### 2.2 `AgentExecutionCapsule` + `AgentResultEnvelope` + write-scoped narrow leases
 

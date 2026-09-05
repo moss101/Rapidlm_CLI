@@ -13,7 +13,7 @@
 //! result, never a silent pass.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::collections::{BTreeMap, HashMap};
@@ -1482,7 +1482,7 @@ impl WorkspaceTools {
                     });
                 }
                 ShadowVerifyOutcome::Passed { diagnostics_tail } => {
-                    fs::write(&target, args.content.as_bytes()).map_err(|_| ToolStepError::Failed)?;
+                    atomic_write(&target, args.content.as_bytes()).map_err(|_| ToolStepError::Failed)?;
                     let mut summary = format!(
                         "wrote {} bytes to {} (shadow diagnostics: ok)\n{diagnostics_tail}",
                         args.content.len(),
@@ -1499,7 +1499,7 @@ impl WorkspaceTools {
                     // setup must never block a normal write. Falls through
                     // to the direct write below, noting the skip so it is
                     // not silently invisible.
-                    fs::write(&target, args.content.as_bytes())
+                    atomic_write(&target, args.content.as_bytes())
                         .map_err(|_| ToolStepError::Failed)?;
                     let mut summary = format!(
                         "wrote {} bytes to {} (shadow diagnostics skipped: {reason})",
@@ -1514,7 +1514,7 @@ impl WorkspaceTools {
                 }
             }
         }
-        fs::write(&target, args.content.as_bytes()).map_err(|_| ToolStepError::Failed)?;
+        atomic_write(&target, args.content.as_bytes()).map_err(|_| ToolStepError::Failed)?;
         let mut summary = format!("wrote {} bytes to {}", args.content.len(), args.path);
         append_write_advisories(&mut summary, self.root(), &args.path, args.content.as_bytes());
         Ok(ToolStepResult::Succeeded {
@@ -1810,7 +1810,7 @@ impl WorkspaceTools {
                     detail: Some(bounded_detail(&detail)),
                 });
             }
-            fs::write(&target, updated.as_bytes()).map_err(|_| ToolStepError::Failed)?;
+            atomic_write(&target, updated.as_bytes()).map_err(|_| ToolStepError::Failed)?;
             let mut summary = format!("replaced {exact_occurrences} occurrence(s) in {}", args.path);
             append_write_advisories(&mut summary, self.root(), &args.path, updated.as_bytes());
             return Ok(ToolStepResult::Succeeded {
@@ -1870,7 +1870,7 @@ impl WorkspaceTools {
                 detail: Some(bounded_detail(&detail)),
             });
         }
-        fs::write(&target, updated.as_bytes()).map_err(|_| ToolStepError::Failed)?;
+        atomic_write(&target, updated.as_bytes()).map_err(|_| ToolStepError::Failed)?;
         let mut summary = format!(
             "replaced {} occurrence(s) in {} (whitespace-insensitive match)",
             selected.len(),
@@ -2269,11 +2269,8 @@ impl WorkspaceTools {
                 "evidence_ids": todo.evidence_ids,
             })).collect::<Vec<_>>(),
         });
-        fs::write(
-            &target,
-            serde_json::to_vec_pretty(&document).map_err(|_| ToolStepError::Failed)?,
-        )
-        .map_err(|_| ToolStepError::Failed)?;
+        let serialized = serde_json::to_vec_pretty(&document).map_err(|_| ToolStepError::Failed)?;
+        atomic_write(&target, &serialized).map_err(|_| ToolStepError::Failed)?;
         let count = |status: &str| {
             todos
                 .iter()
@@ -3039,6 +3036,55 @@ fn bounded_text(bytes: &[u8], cap: usize) -> String {
         summary.push_str(TRUNCATION_MARKER);
     }
     summary
+}
+
+/// Write `bytes` to `target` atomically: write to a sibling temp file,
+/// `fsync` it, then rename into place. A plain `fs::write` opens `target`
+/// with truncate — a hard kill (OOM, a supervisor `SIGKILL`, a closed
+/// terminal under the OS's default un-caught `Ctrl-C` handling; this binary
+/// registers no signal handler anywhere, confirmed by grep, so a
+/// cooperative `CancellationToken` check between tool calls cannot preempt
+/// a write already in flight) landing between that truncate and the write
+/// completing destroys the file's prior content with nothing having
+/// replaced it yet — real, if low-probability, data loss for model-authored
+/// source content. `rename` is atomic on the same filesystem, so a kill
+/// mid-write can only ever leave the *temp* file corrupted, never `target`
+/// itself. Mirrors the pattern already established and tested three times
+/// elsewhere in this codebase (`workspace::backends::{direct,git_worktree}
+/// ::atomic_write`, `kernel::project::trust::persist`) — `target` is
+/// expected to already be a trusted path (either a model-supplied path
+/// already confined via `resolve_in_root`, or a fixed, non-model-controlled
+/// project-local constant like `findings_store.rs`'s own store path), so
+/// this adds crash-safety only, not path validation, unlike those three
+/// siblings which also re-validate confinement themselves for their own,
+/// less-trusted callers.
+pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = target.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no parent")
+    })?;
+    let file_name = target.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no file name")
+    })?;
+    let tmp = parent.join(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, target)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Char-boundary-safe cut of model-visible detail text.
@@ -8148,6 +8194,52 @@ use std::sync::{Arc, Mutex};
         assert!(!glob_path_match("src/*.rs", "other/a.rs"));
         assert!(glob_path_match("src/?.rs", "src/a.rs"));
         assert!(!glob_path_match("src/?.rs", "src/ab.rs"));
+    }
+
+    #[test]
+    fn atomic_write_creates_overwrites_and_leaves_no_temp_file() {
+        let root = TempRoot::new("atomic-write-basic");
+        let target = root.0.join("file.txt");
+
+        atomic_write(&target, b"first").expect("create");
+        assert_eq!(fs::read(&target).expect("read"), b"first");
+
+        atomic_write(&target, b"second, longer content").expect("overwrite");
+        assert_eq!(fs::read(&target).expect("read"), b"second, longer content");
+
+        // No leftover `.file.txt.<pid>.tmp` sibling after a successful write.
+        let leftovers: Vec<_> = fs::read_dir(&root.0)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_never_truncates_the_target_when_the_write_itself_fails() {
+        // The property that actually distinguishes this from a plain
+        // `fs::write`: a failure partway through must never touch the real
+        // target at all, since everything happens on a temp file until the
+        // final rename. Force a failure by making the containing directory
+        // read-only, so the temp file's own `create_new` can't even open —
+        // confirms the original content survives completely untouched.
+        use std::os::unix::fs::PermissionsExt;
+        let root = TempRoot::new("atomic-write-failure");
+        let target = root.0.join("file.txt");
+        fs::write(&target, b"original content, must survive").expect("seed");
+
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o500)).expect("chmod read-only");
+        let result = atomic_write(&target, b"this must never land");
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).expect("chmod restore");
+
+        assert!(result.is_err(), "expected the write to fail under a read-only directory");
+        assert_eq!(
+            fs::read(&target).expect("read"),
+            b"original content, must survive",
+            "a failed write must never have touched the pre-existing target"
+        );
     }
 
     #[test]

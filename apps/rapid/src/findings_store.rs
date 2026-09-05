@@ -112,7 +112,7 @@ impl FindingsStore {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(target, serde_json::to_vec_pretty(&document)?)
+        crate::exec_tools::atomic_write(&target, &serde_json::to_vec_pretty(&document)?)
     }
 }
 
