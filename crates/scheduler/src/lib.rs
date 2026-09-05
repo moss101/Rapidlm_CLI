@@ -15,8 +15,9 @@ pub mod proposal;
 pub mod service;
 
 pub use cron::{
-    CronError, DuePrompt, PollReport, PromptCron, CRON_FACADE_SCHEMA, FIRING_LEASE_TIMEOUT_MS,
-    MAX_POLL_BATCH, QUARANTINE_UNPARSEABLE_SCHEDULE,
+    CronError, DuePrompt, ExecutionReport, PollReport, PromptCron, CRON_FACADE_SCHEMA,
+    FIRING_LEASE_TIMEOUT_MS, MAX_CONSECUTIVE_EXECUTION_FAILURES, MAX_POLL_BATCH,
+    QUARANTINE_UNPARSEABLE_SCHEDULE,
 };
 
 pub use graph::{Edge, EdgeCondition, GraphDiff, Node, NodeExplain, ReadyContext, RuntimeGraph};

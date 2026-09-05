@@ -29,6 +29,15 @@ pub const MAX_POLL_BATCH: usize = 64;
 pub const QUARANTINE_UNPARSEABLE_SCHEDULE: &str =
     "stored schedule no longer parses; kept, not loaded";
 
+/// Consecutive prompt-*execution* failures (distinct from the unparseable-
+/// schedule case above, which `poll()` itself already catches) before
+/// [`PromptCron::report_execution`] auto-quarantines a job. A defensible
+/// numeric default, not a contested product question — chosen the same way
+/// this codebase's other per-turn ceilings are (e.g. `MAX_SUBAGENT_SPAWNS_
+/// PER_TURN`): "three strikes" stops an unattended job from firing and
+/// failing forever without quarantining on one transient blip.
+pub const MAX_CONSECUTIVE_EXECUTION_FAILURES: u32 = 3;
+
 /// Typed failures of the cron facade.
 #[derive(Debug)]
 pub enum CronError {
@@ -92,6 +101,16 @@ pub struct PollReport {
     pub requeued: usize,
 }
 
+/// Outcome of one [`PromptCron::report_execution`] call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionReport {
+    /// The job's consecutive-failure streak after this report.
+    pub consecutive_failures: u32,
+    /// Whether this report crossed [`MAX_CONSECUTIVE_EXECUTION_FAILURES`]
+    /// and the job was just quarantined as a result.
+    pub quarantined: bool,
+}
+
 /// Claim-lease prompt cron. Storage lives in [`CronStore`]; this type adds
 /// schedule validation, fire-time derivation, and the poll loop.
 #[derive(Clone, Debug)]
@@ -146,6 +165,42 @@ impl PromptCron {
     /// Quarantine a job: kept, not loaded.
     pub fn quarantine(&self, id: &str, reason: &str, now_ms: i64) -> Result<(), CronError> {
         Ok(self.store.quarantine(id, reason, now_ms)?)
+    }
+
+    /// Record whether a fired job's prompt execution actually succeeded,
+    /// and auto-quarantine after [`MAX_CONSECUTIVE_EXECUTION_FAILURES`] in a
+    /// row — closing the gap `poll()`'s own module doc names: completing a
+    /// job's lease only ever meant "the schedule re-parsed," never "the
+    /// prompt's execution succeeded," so a job whose prompt failed on every
+    /// real run kept firing forever with nothing to stop it. The caller
+    /// (whoever actually ran the fired prompt, outside this crate) reports
+    /// the real outcome here; this method owns the "how many failures
+    /// before quarantine" policy, the same "detection vs. policy" split
+    /// `poll()` already uses for the unparseable-schedule case.
+    pub fn report_execution(
+        &self,
+        id: &str,
+        succeeded: bool,
+        now_ms: i64,
+    ) -> Result<ExecutionReport, CronError> {
+        let consecutive_failures = self.store.record_execution_result(id, succeeded, now_ms)?;
+        if !succeeded && consecutive_failures >= MAX_CONSECUTIVE_EXECUTION_FAILURES {
+            self.store.quarantine(
+                id,
+                &format!(
+                    "quarantined after {consecutive_failures} consecutive execution failures"
+                ),
+                now_ms,
+            )?;
+            return Ok(ExecutionReport {
+                consecutive_failures,
+                quarantined: true,
+            });
+        }
+        Ok(ExecutionReport {
+            consecutive_failures,
+            quarantined: false,
+        })
     }
 
     /// Crash recovery: requeue stale `firing` rows. Returns the count.
@@ -349,6 +404,77 @@ mod tests {
         // Quarantined rows stay quarantined on later polls: kept, not loaded.
         let later = cron.poll(NOW_MS + 1, &live(), 10).expect("poll later");
         assert!(later.fired.is_empty());
+    }
+
+    #[test]
+    fn report_execution_auto_quarantines_after_max_consecutive_failures() {
+        let (cron, _db) = TempDb::open_cron();
+        let job = cron
+            .add("run checks", None, "*/5 * * * *", NOW_MS, &live())
+            .expect("add");
+
+        for n in 1..MAX_CONSECUTIVE_EXECUTION_FAILURES {
+            let report = cron
+                .report_execution(&job.id, false, NOW_MS + i64::from(n))
+                .expect("report");
+            assert_eq!(report.consecutive_failures, n);
+            assert!(
+                !report.quarantined,
+                "must not quarantine before the threshold is reached (failure {n})"
+            );
+            let live_job = cron.store().get(&job.id).expect("get");
+            assert_eq!(live_job.status, event_ledger::cron::CronJobStatus::Active);
+        }
+
+        let final_report = cron
+            .report_execution(
+                &job.id,
+                false,
+                NOW_MS + i64::from(MAX_CONSECUTIVE_EXECUTION_FAILURES),
+            )
+            .expect("report");
+        assert_eq!(
+            final_report.consecutive_failures,
+            MAX_CONSECUTIVE_EXECUTION_FAILURES
+        );
+        assert!(final_report.quarantined, "the threshold-crossing report must quarantine");
+        let quarantined_job = cron.store().get(&job.id).expect("get");
+        assert_eq!(
+            quarantined_job.status,
+            event_ledger::cron::CronJobStatus::Quarantined
+        );
+        assert!(
+            quarantined_job
+                .quarantine_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("consecutive execution failures"),
+            "{:?}",
+            quarantined_job.quarantine_reason
+        );
+    }
+
+    #[test]
+    fn report_execution_success_resets_the_streak_and_never_quarantines() {
+        let (cron, _db) = TempDb::open_cron();
+        let job = cron
+            .add("run checks", None, "*/5 * * * *", NOW_MS, &live())
+            .expect("add");
+
+        for n in 0..MAX_CONSECUTIVE_EXECUTION_FAILURES - 1 {
+            cron.report_execution(&job.id, false, NOW_MS + i64::from(n))
+                .expect("report failure");
+        }
+        // A success right before the threshold resets the streak entirely —
+        // the job must never be quarantined by this sequence.
+        let reset = cron
+            .report_execution(&job.id, true, NOW_MS + 100)
+            .expect("report success");
+        assert_eq!(reset.consecutive_failures, 0);
+        assert!(!reset.quarantined);
+        let live_job = cron.store().get(&job.id).expect("get");
+        assert_eq!(live_job.status, event_ledger::cron::CronJobStatus::Active);
+        assert_eq!(live_job.consecutive_failures, 0);
     }
 
     #[test]

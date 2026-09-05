@@ -78,6 +78,13 @@ pub struct CronJob {
     pub quarantine_reason: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Consecutive prompt-execution failures reported via
+    /// `record_execution_result` — reset to 0 on any success, incremented on
+    /// each failure. Distinct from `poll()`'s own quarantine (unparseable
+    /// schedules): this tracks whether the fired prompt's actual execution
+    /// succeeded, which only the caller running it (outside this crate) can
+    /// observe.
+    pub consecutive_failures: u32,
 }
 
 /// Typed failures for cron storage operations.
@@ -287,6 +294,7 @@ impl CronStore {
             quarantine_reason: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
+            consecutive_failures: 0,
         })
     }
 
@@ -296,7 +304,8 @@ impl CronStore {
         let job = conn
             .query_row(
                 "SELECT id, prompt, session_id, schedule, status, next_fire_at_ms,
-                        last_claim_ms, quarantine_reason, created_at_ms, updated_at_ms
+                        last_claim_ms, quarantine_reason, created_at_ms, updated_at_ms,
+                        consecutive_failures
                  FROM cron_jobs WHERE id = ?1",
                 params![id],
                 job_from_row,
@@ -318,7 +327,8 @@ impl CronStore {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id, prompt, session_id, schedule, status, next_fire_at_ms,
-                    last_claim_ms, quarantine_reason, created_at_ms, updated_at_ms
+                    last_claim_ms, quarantine_reason, created_at_ms, updated_at_ms,
+                    consecutive_failures
              FROM cron_jobs ORDER BY next_fire_at_ms, id",
         )?;
         let rows = stmt.query_map([], job_from_row)?;
@@ -343,7 +353,8 @@ impl CronStore {
         let due: Vec<CronJob> = {
             let mut stmt = tx.prepare(
                 "SELECT id, prompt, session_id, schedule, status, next_fire_at_ms,
-                        last_claim_ms, quarantine_reason, created_at_ms, updated_at_ms
+                        last_claim_ms, quarantine_reason, created_at_ms, updated_at_ms,
+                        consecutive_failures
                  FROM cron_jobs
                  WHERE status = 'active' AND next_fire_at_ms <= ?1
                  ORDER BY next_fire_at_ms, id
@@ -466,6 +477,47 @@ impl CronStore {
         Ok(())
     }
 
+    /// Record whether a fired job's prompt execution actually succeeded —
+    /// distinct from `complete`, which only ever means "the schedule
+    /// re-parsed and the row was rescheduled," never "the prompt's
+    /// execution succeeded" (that's observed entirely outside this crate,
+    /// by whoever actually runs the fired prompt). A success resets the
+    /// counter to 0; a failure increments it. Returns the counter's new
+    /// value so the caller can decide whether to quarantine — this store
+    /// only tracks the count, it never quarantines on its own, matching
+    /// `poll()`'s own "detection here, policy in the facade" separation for
+    /// the unparseable-schedule case.
+    pub fn record_execution_result(
+        &self,
+        id: &str,
+        succeeded: bool,
+        now_ms: i64,
+    ) -> Result<u32, CronStoreError> {
+        let conn = self.connect()?;
+        let changed = if succeeded {
+            conn.execute(
+                "UPDATE cron_jobs SET consecutive_failures = 0, updated_at_ms = ?2 WHERE id = ?1",
+                params![id, now_ms],
+            )?
+        } else {
+            conn.execute(
+                "UPDATE cron_jobs SET consecutive_failures = consecutive_failures + 1,
+                     updated_at_ms = ?2
+                 WHERE id = ?1",
+                params![id, now_ms],
+            )?
+        };
+        if changed == 0 {
+            return Err(CronStoreError::JobNotFound { id: id.to_string() });
+        }
+        let failures: i64 = conn.query_row(
+            "SELECT consecutive_failures FROM cron_jobs WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(failures as u32)
+    }
+
     fn connect(&self) -> Result<Connection, CronStoreError> {
         let conn = Connection::open(&self.path)?;
         MigrationRunner::apply(&conn)?;
@@ -493,6 +545,7 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         quarantine_reason: row.get("quarantine_reason")?,
         created_at_ms: row.get("created_at_ms")?,
         updated_at_ms: row.get("updated_at_ms")?,
+        consecutive_failures: row.get("consecutive_failures")?,
     })
 }
 
@@ -653,6 +706,51 @@ mod tests {
         let kept = store.get(&job.id).expect("get");
         assert_eq!(kept.status, CronJobStatus::Quarantined);
         assert_eq!(kept.quarantine_reason.as_deref(), Some("operator stop"));
+    }
+
+    #[test]
+    fn record_execution_result_accumulates_failures_and_resets_on_success() {
+        let (store, _db) = TempDb::open_store();
+        let job = add_job(&store, 1_000);
+        assert_eq!(job.consecutive_failures, 0, "a brand-new job starts at 0");
+
+        assert_eq!(
+            store.record_execution_result(&job.id, false, 2_000).expect("record"),
+            1
+        );
+        assert_eq!(
+            store.record_execution_result(&job.id, false, 3_000).expect("record"),
+            2
+        );
+        let mid = store.get(&job.id).expect("get");
+        assert_eq!(mid.consecutive_failures, 2);
+        assert_eq!(mid.updated_at_ms, 3_000);
+
+        // A single success resets the streak entirely, not just decrements it.
+        assert_eq!(
+            store.record_execution_result(&job.id, true, 4_000).expect("record"),
+            0
+        );
+        let after_success = store.get(&job.id).expect("get");
+        assert_eq!(after_success.consecutive_failures, 0);
+
+        assert_eq!(
+            store.record_execution_result(&job.id, false, 5_000).expect("record"),
+            1,
+            "the counter must start over from 0, not resume the pre-reset streak"
+        );
+    }
+
+    #[test]
+    fn record_execution_result_on_an_unknown_id_is_job_not_found() {
+        let (store, _db) = TempDb::open_store();
+        let err = store
+            .record_execution_result("cron-missing", false, 1_000)
+            .expect_err("missing id");
+        match err {
+            CronStoreError::JobNotFound { id } => assert_eq!(id, "cron-missing"),
+            other => panic!("expected JobNotFound, got {other:?}"),
+        }
     }
 
     #[test]

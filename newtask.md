@@ -6565,6 +6565,38 @@ existing `security::scanners::secrets::Finding` pattern (§2.9) to give backgrou
   distinctly come back out (proving the parameter, not some fixed ambient default, decides the outcome).
   Full `-p rapid` suite (322 lib tests), `cargo test -p rapid --tests` (the new binary-level test correctly
   sits at 1 ignored, not slowing the normal suite), and `cargo build --workspace --tests` all pass.
+- **The disclosed failure-count/quarantine gap closed 2026-09-05.** The policy decision the note above
+  deferred — how many consecutive failures, quarantine vs. keep retrying — was resolved with a defensible
+  numeric default (three), matching how this codebase's other per-turn ceilings (`MAX_SUBAGENT_SPAWNS_
+  PER_TURN` etc.) are chosen: not a contested product question, a "stop failing forever" backstop.
+  **Implemented across all three layers `poll()`'s own execution wiring spans:** `event-ledger::cron::
+  CronStore` gained a `consecutive_failures: u32` column (new v5 migration, `ALTER TABLE cron_jobs ADD
+  COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0`, `CURRENT_SCHEMA_VERSION` bumped to 5) and
+  `record_execution_result(id, succeeded, now_ms) -> Result<u32, CronStoreError>` (pure data layer: reset
+  to 0 on success, increment on failure, return the new count — no quarantine decision here, matching how
+  the store itself never decided the unparseable-schedule quarantine either). `scheduler::PromptCron`
+  gained `report_execution(id, succeeded, now_ms) -> Result<ExecutionReport, CronError>`, which owns the
+  actual policy: calls the store method, and quarantines (with a reason naming the failure count) once
+  `MAX_CONSECUTIVE_EXECUTION_FAILURES` (3) is reached on a failure — the same "detection in the store,
+  policy in the facade" split `poll()`'s own unparseable-schedule handling already uses. `apps/rapid`'s
+  `rapid cron poll` fired-job loop now calls a new `report_cron_execution_outcome` helper after each
+  `exec_turn` (success = exit code `0`, matching `JsonlExitCode::Success`; anything else, including a hard
+  `Err`, counts as a failure) — extracted into its own function (mirroring this session's `preserve_memory_
+  and_todos` precedent) specifically so it's unit-testable without a real model call: it's silent (prints
+  nothing) on an ordinary non-quarantining report, and prints a line only when quarantine just triggered or
+  the report call itself failed. Nine new tests across the three crates: two in `event-ledger` (the
+  counter's own accumulate/reset behavior, and an unknown-id error path), two in `scheduler` (auto-
+  quarantine at exactly the threshold, and a success resetting the streak so it never quarantines), three
+  in `apps/rapid` (silent until quarantine, silent on success, and the unknown-id warning path). Verified
+  via three separate revert cycles, one per layer, each reproducing its own test's exact predicted failure:
+  swapping the store's success/failure branches broke the accumulate-and-reset test; changing the facade's
+  `>=` threshold check to `>` broke the exactly-at-threshold quarantine test; making the `apps/rapid` helper
+  always print (not just on quarantine) broke the silent-on-success test — all three restored afterward.
+  Full `-p event-ledger` (91 tests), `-p scheduler` (26 tests), and `-p rapid --lib` (432 tests, up from
+  429) suites and `cargo build --workspace --tests` pass. **Session continuity (a cron job's `session_id`
+  is still just an opaque string, never threaded into real session/ledger state) is the one piece of the
+  original disclosure list still open** — unchanged from before, a real, separate gap this pass did not
+  touch.
 
 ### 3.3 Verified-success-per-token as a tracked, reported metric
 

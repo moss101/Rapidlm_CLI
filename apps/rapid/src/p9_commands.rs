@@ -768,7 +768,12 @@ pub fn run_cron(args: &[String]) -> Result<i32, P9CommandError> {
             // mode, before the mode table is even consulted for anything else,
             // so a cron-fired turn can explore (read-only tools stay allowed
             // in every mode) and produce a proposal, but can never write,
-            // patch, or run a mutating shell command unattended.
+            // patch, or run a mutating shell command unattended. Each fired
+            // job's real outcome also now feeds `report_execution` — the
+            // previously-disclosed gap where a job whose prompt fails every
+            // real run kept firing forever, since `complete()`/rescheduling
+            // only ever meant "the schedule re-parsed," not "the prompt's
+            // execution succeeded."
             for due in &report.fired {
                 println!(
                     "id={} session={} prompt={}",
@@ -776,12 +781,23 @@ pub fn run_cron(args: &[String]) -> Result<i32, P9CommandError> {
                     due.session_id.as_deref().unwrap_or("-"),
                     elide_prompt(&due.prompt),
                 );
-                match crate::interactive::exec_turn(
+                let succeeded = match crate::interactive::exec_turn(
                     &[due.prompt.clone()],
                     Some(crate::permissions::PermissionMode::Plan),
                 ) {
-                    Ok(code) => println!("id={} outcome=exit:{code}", due.id),
-                    Err(err) => println!("id={} outcome=error:{err:?}", due.id),
+                    Ok(code) => {
+                        println!("id={} outcome=exit:{code}", due.id);
+                        code == 0
+                    }
+                    Err(err) => {
+                        println!("id={} outcome=error:{err:?}", due.id);
+                        false
+                    }
+                };
+                if let Some(line) =
+                    report_cron_execution_outcome(&cron, &due.id, succeeded, unix_now_ms())
+                {
+                    println!("{line}");
                 }
             }
             Ok(0)
@@ -795,6 +811,33 @@ fn unix_now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Report a fired job's real execution outcome to `cron` (§3.2's disclosed
+/// gap: completing a job's lease only ever meant "the schedule re-parsed,"
+/// never "the prompt's execution succeeded," so a job that failed every
+/// real run kept firing forever) and return an operator-visible line only
+/// when there's something to say — quarantine just triggered, or the report
+/// call itself failed. Extracted from the poll loop (rather than inlined)
+/// specifically so this is testable without a real `exec_turn`/model call:
+/// build a `PromptCron` over a temp store, add a job, and call this
+/// directly.
+fn report_cron_execution_outcome(
+    cron: &scheduler::PromptCron,
+    id: &str,
+    succeeded: bool,
+    now_ms: i64,
+) -> Option<String> {
+    match cron.report_execution(id, succeeded, now_ms) {
+        Ok(report) if report.quarantined => Some(format!(
+            "id={id} quarantined=true consecutive_failures={}",
+            report.consecutive_failures
+        )),
+        Ok(_) => None,
+        Err(err) => Some(format!(
+            "id={id} warning: failed to record execution result ({err})"
+        )),
+    }
 }
 
 /// Bound the prompt echo in list/poll output so one huge prompt cannot flood
@@ -2381,5 +2424,94 @@ mod release_tests {
         let err = read_bounded_file(path.to_str().unwrap(), 64).unwrap_err();
         assert!(matches!(err, P9CommandError::Agent(_)));
         drop(std::fs::remove_file(&path));
+    }
+}
+
+#[cfg(test)]
+mod cron_tests {
+    use super::*;
+    static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn temp_cron() -> (scheduler::PromptCron, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "rapidlm-p9-cron-{}-{}.sqlite",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let cron = scheduler::PromptCron::open(&path).expect("open cron store");
+        (cron, path)
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn report_cron_execution_outcome_is_silent_until_quarantine_triggers() {
+        let (cron, path) = temp_cron();
+        let job = cron
+            .add(
+                "run checks",
+                None,
+                "*/5 * * * *",
+                1_000,
+                &capability_broker::CancellationToken::new(),
+            )
+            .expect("add job");
+
+        for n in 1..scheduler::MAX_CONSECUTIVE_EXECUTION_FAILURES {
+            let line = report_cron_execution_outcome(&cron, &job.id, false, 1_000 + i64::from(n));
+            assert_eq!(line, None, "no line to print before the threshold (failure {n})");
+        }
+        let line = report_cron_execution_outcome(
+            &cron,
+            &job.id,
+            false,
+            1_000 + i64::from(scheduler::MAX_CONSECUTIVE_EXECUTION_FAILURES),
+        );
+        let line = line.expect("a line must be printed once quarantine triggers");
+        assert!(line.contains("quarantined=true"), "{line}");
+        assert!(
+            line.contains(&format!(
+                "consecutive_failures={}",
+                scheduler::MAX_CONSECUTIVE_EXECUTION_FAILURES
+            )),
+            "{line}"
+        );
+        let stored = cron.store().get(&job.id).expect("get");
+        assert_eq!(stored.status, event_ledger::cron::CronJobStatus::Quarantined);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn report_cron_execution_outcome_is_silent_on_success() {
+        let (cron, path) = temp_cron();
+        let job = cron
+            .add(
+                "run checks",
+                None,
+                "*/5 * * * *",
+                1_000,
+                &capability_broker::CancellationToken::new(),
+            )
+            .expect("add job");
+        let line = report_cron_execution_outcome(&cron, &job.id, true, 1_000);
+        assert_eq!(line, None);
+        let stored = cron.store().get(&job.id).expect("get");
+        assert_eq!(stored.status, event_ledger::cron::CronJobStatus::Active);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn report_cron_execution_outcome_surfaces_a_report_error_for_an_unknown_id() {
+        let (cron, path) = temp_cron();
+        let line = report_cron_execution_outcome(&cron, "cron-missing", false, 1_000);
+        let line = line.expect("an error line must be printed");
+        assert!(line.contains("warning"), "{line}");
+        cleanup(&path);
     }
 }

@@ -10,7 +10,7 @@ use std::time::Duration;
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 /// Schema version written after the latest bundled migration succeeds.
-pub const CURRENT_SCHEMA_VERSION: i32 = 4;
+pub const CURRENT_SCHEMA_VERSION: i32 = 5;
 
 /// Bounded SQLite lock wait. Matches the ledger busy-timeout recovery rule.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
@@ -392,6 +392,16 @@ CREATE TABLE cron_jobs (
 CREATE INDEX idx_cron_jobs_due ON cron_jobs(status, next_fire_at_ms);
 ";
 
+/// v5: track consecutive prompt-execution failures per cron job, so a job
+/// whose fired prompt fails every real run can be auto-quarantined instead
+/// of firing forever — `quarantine_reason` already existed for the
+/// unparseable-schedule case `poll()` itself catches, but nothing tracked
+/// *execution* outcomes, which only the caller running the fired prompt
+/// (outside `crates/scheduler`) can observe.
+const V5_CRON_FAILURE_TRACKING_SQL: &str = "
+ALTER TABLE cron_jobs ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0;
+";
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -408,6 +418,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 4,
         sql: V4_CRON_SQL,
+    },
+    Migration {
+        version: 5,
+        sql: V5_CRON_FAILURE_TRACKING_SQL,
     },
 ];
 
