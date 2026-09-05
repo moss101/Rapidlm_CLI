@@ -4238,6 +4238,57 @@ returned `Ok(RecordedAt { rfc3339: "2024-06-15T12:00:00Z" })` instead of the exp
 restoring the fix. Full `-p vcs --lib` suite (18 tests, up from 17) and `cargo build --workspace --tests`
 pass.
 
+**Fresh review pass, 2026-09-05, `crates/context-engine/src/ingest/walk.rs::match_chars` — an unbounded
+recursive glob matcher, reachable from ordinary repo content, that genuinely crashes the process (a real
+stack overflow, not a graceful error), found via a fourth targeted background hunt (unbounded recursion
+reachable from untrusted input, distinct from the panic/gate-gap/truncation shapes already hunted above).**
+`match_chars`'s `'*'` arm recurses once per pattern character with no depth counter anywhere in the call
+chain (`glob_match_path` → `glob_match_parts` → `match_component` → `match_chars`), driven directly by
+`IgnoreRule.glob` — parsed line-by-line from `.gitignore`/`.rapidlmignore` content read via `read_ignore_
+source`, which enforces only a **total-file** cap (`MAX_IGNORE_FILE_BYTES`, 256 KiB) with no per-line limit.
+A single line of ~250,000 `*` characters is entirely within that file-size budget, and `is_ignored` (called
+from `step_entry`/`push_dir` on every single file/directory a walk visits — confirmed live via `ingest/
+pipeline.rs`, `ingest/watch.rs`, and the `grep` retrieval tool) would recurse ~250,000 levels deep the very
+first time it checks any entry against that rule.
+
+**This one is not latent or borderline — independently verified as an actual, reproducible crash, not just a
+plausible one.** Wrote a real end-to-end test (`walk_survives_a_pathologically_long_ignore_line`: a repo
+with an ordinary file plus a `.gitignore` containing one 250,000-`*` line) and ran it, unfixed, in isolation:
+it did not fail gracefully — the whole test process aborted with `fatal runtime error: stack overflow,
+aborting` (`SIGABRT`). A cloned repository (or an agent-authored `.gitignore` via `workspace_write`) with
+one adversarial or even just severely malformed line is enough to crash any subsequent index/reindex/grep
+over it.
+
+**Fixed:** added `MAX_IGNORE_LINE_BYTES` (1024 — generous for any real gitignore line, which is never
+remotely this long) and rejected any ignore line over that bound in `parse_ignore_line`, before it can ever
+become an `IgnoreRule` that reaches the recursive matcher. Two new tests: a narrow, always-safe unit test
+(`oversized_ignore_line_is_dropped_before_it_can_recurse`, checks `parse_ignore_line`'s return value
+directly — never invokes the recursive matcher at all, so it can never itself trigger a stack overflow even
+if the guard regresses) and the end-to-end `walk_survives_a_pathologically_long_ignore_line` above.
+**Revert-cycle verification handled carefully given the failure mode isn't a catchable panic**: reverting
+just the length guard first reproduced a safe, ordinary assertion failure on the narrow unit test (proving
+the guard itself works), then — as a separate, deliberate step — running the end-to-end test in an isolated
+process with the guard still reverted reproduced the actual predicted stack overflow/`SIGABRT` exactly,
+confirming the crash is real and not merely theoretical, before restoring the fix and confirming both tests
+pass normally. Full `-p context-engine --lib` suite (312 tests, up from 310) and `cargo build --workspace
+--tests` pass.
+
+**Two structurally identical but lower-confidence sightings from the same hunt, checked and *not* fixed this
+pass:** `crates/plugin-host/src/skills.rs::match_segment_chars` (skill-frontmatter path globs, `RepoPath`-
+bounded at 4096 bytes) and `crates/capability-broker/src/policy/evaluator.rs::glob_star_question` (every
+filesystem/git/browser permission check, `PathGlob`-bounded at 4096 bytes) share the identical unguarded
+char-by-char `'*'` recursion shape. Unlike the finding above, both are already bounded by an existing 4096-
+byte input cap, putting worst-case recursion depth in the ~4096–8192 range — order-of-magnitude too shallow
+to reliably exhaust a normal 2MB+ thread stack (rough estimate: a few hundred KB to ~1MB even in an
+unoptimized debug build), so this was **not** independently reproduced as an actual crash the way the
+`context-engine` case was, and deliberately not fixed under that uncertainty — especially for `capability-
+broker`'s evaluator, the single most security-sensitive of the three files, where an under-tested depth-
+guard change risked introducing a subtler correctness regression in permission evaluation itself. Worth a
+dedicated follow-up (thread an explicit small depth counter through both, matching `parse/symbols.rs::
+walk_node`'s existing `max_walk_depth` pattern) precisely because both byte caps could plausibly widen in
+the future without anyone re-deriving this stack-depth math, but that follow-up deserves its own dedicated
+verification pass rather than a rushed addition here.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

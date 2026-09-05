@@ -24,6 +24,18 @@ pub const DEFAULT_BINARY_PROBE_BYTES: usize = 8192;
 /// Maximum UTF-8 bytes accepted in one ignore file.
 pub const MAX_IGNORE_FILE_BYTES: usize = 256 * 1024;
 
+/// Maximum bytes accepted in one ignore-file line.
+///
+/// `MAX_IGNORE_FILE_BYTES` bounds the whole file, not any single line — a
+/// `.gitignore`/`.rapidlmignore` consisting of one line of tens of thousands
+/// of `*` characters is well within that budget. `match_chars` recurses once
+/// per pattern character with no depth counter of its own, so an unbounded
+/// line would recurse deep enough to exhaust the stack the first time any
+/// walk step (`step_entry`/`push_dir`, run on every visited file/directory)
+/// checks it against a rule. Real ignore lines are never remotely this long;
+/// the cap exists purely to keep that recursion shallow.
+pub const MAX_IGNORE_LINE_BYTES: usize = 1024;
+
 /// Maximum repository-relative directory depth descended.
 pub const DEFAULT_MAX_DEPTH: usize = 256;
 
@@ -627,6 +639,9 @@ fn parse_ignore_rules(src: &str, base: &str, out: &mut Vec<IgnoreRule>) {
 }
 
 fn parse_ignore_line(raw: &str, base: &str) -> Option<IgnoreRule> {
+    if raw.len() > MAX_IGNORE_LINE_BYTES {
+        return None;
+    }
     let line = raw.strip_suffix('\r').unwrap_or(raw);
     let line = trim_unescaped_trailing_space(line);
     if line.is_empty() || line.starts_with('#') {
@@ -897,6 +912,21 @@ mod tests {
     }
 
     #[test]
+    fn oversized_ignore_line_is_dropped_before_it_can_recurse() {
+        // match_chars recurses once per pattern character with no depth
+        // counter of its own — a line this long would otherwise recurse
+        // deep enough to blow the stack the first time any walk step
+        // checks a path against it (see MAX_IGNORE_LINE_BYTES's own doc
+        // comment). A real pattern is never remotely this long, so the cap
+        // must reject only the pathological case, not shrink normal use.
+        let huge = "*".repeat(MAX_IGNORE_LINE_BYTES + 1);
+        assert!(parse_ignore_line(&huge, "").is_none());
+
+        let reasonable = "*".repeat(64);
+        assert!(parse_ignore_line(&reasonable, "").is_some());
+    }
+
+    #[test]
     fn gitignore_and_rapidlmignore_exclude_paths() {
         let ws = TempWorkspace::new();
         ws.write_file("core/src/lib.rs", b"fn main() {}");
@@ -922,6 +952,22 @@ mod tests {
             || p.contains("build")
             || p.contains("private")
             || p.ends_with(".log")));
+    }
+
+    #[test]
+    fn walk_survives_a_pathologically_long_ignore_line() {
+        let ws = TempWorkspace::new();
+        ws.write_file("core/src/lib.rs", b"fn main() {}");
+        // Well within MAX_IGNORE_FILE_BYTES (256 KiB) as one single line —
+        // the total-file cap alone does not stop this.
+        let huge_line = "*".repeat(250_000);
+        ws.write_file("core/.gitignore", huge_line.as_bytes());
+        let manifest = parse_manifest(&ws, &[("core", "core")]);
+        let limits = WalkLimits::default();
+        let cancel = CancellationToken::new();
+        let paths = paths_of(walk_one(&manifest, &limits, &cancel));
+        assert!(paths.contains(&"src/lib.rs".to_owned()), "{paths:?}");
+        assert!(paths.contains(&".gitignore".to_owned()), "{paths:?}");
     }
 
     #[test]
