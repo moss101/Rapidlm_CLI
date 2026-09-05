@@ -12,9 +12,9 @@ use std::time::Instant;
 
 use capability_broker::{
     ActionRequest, ApprovalChoice, ApprovalResolution, ApprovalScopeId, CanonicalAction,
-    CancellationToken, ExecIntent, LeaseIssuer, LeaseValidator, PolicyDocument,
-    PolicyRevision, PolicySource, PolicyStack, PrincipalRef, Resolver, evaluate, issue,
-    normalize_exec, request_approval, validate_use,
+    CancellationToken, ExecIntent, LeaseIssuer, LeaseValidator, LiveHostResolver, PolicyDocument,
+    PolicyRevision, PolicySource, PolicyStack, PrincipalRef, evaluate, issue, normalize_exec,
+    request_approval, validate_use,
 };
 use agent_runtime::ToolDriver;
 use crate::external_agents::CliRunner;
@@ -48,27 +48,6 @@ impl std::fmt::Display for P9CommandError {
     }
 }
 
-struct FrozenPathResolver;
-
-impl Resolver for FrozenPathResolver {
-    fn resolve_cwd(
-        &self,
-        requested: &str,
-    ) -> Result<capability_broker::CanonicalHostPath, capability_broker::CommandNormalizeError>
-    {
-        capability_broker::CanonicalHostPath::from_resolved(requested)
-    }
-
-    fn resolve_executable(
-        &self,
-        requested: &str,
-        _cwd: &capability_broker::CanonicalHostPath,
-    ) -> Result<capability_broker::CanonicalHostPath, capability_broker::CommandNormalizeError>
-    {
-        capability_broker::CanonicalHostPath::from_resolved(requested)
-            .map_err(|_| capability_broker::CommandNormalizeError::UnresolvedExecutable)
-    }
-}
 
 fn node_kind_from_str(raw: &str) -> Option<NodeKind> {
     match raw {
@@ -329,7 +308,7 @@ pub fn run_agent_cli(args: &[String]) -> Result<i32, P9CommandError> {
             }
             _ => return Err(P9CommandError::Usage),
         };
-        let command = normalize_exec(&intent, &FrozenPathResolver, &cancel)
+        let command = normalize_exec(&intent, &LiveHostResolver, &cancel)
             .map_err(|err| P9CommandError::Agent(format!("{err:?}")))?;
         let action = CanonicalAction::Command(command);
         let request = ActionRequest::new(

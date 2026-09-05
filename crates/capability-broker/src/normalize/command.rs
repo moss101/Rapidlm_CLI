@@ -89,6 +89,67 @@ pub trait Resolver {
     ) -> Result<CanonicalHostPath, CommandNormalizeError>;
 }
 
+/// Resolves `cwd`/executable via real filesystem syscalls (`std::fs::
+/// canonicalize`, which follows symlinks through the OS) rather than pure
+/// lexical `..`/`.`-folding, so a symlink retargeted between lease approval
+/// and use resolves to a *different* path and fails the lease's action-hash
+/// comparison — the same real-syscall verification `normalize::fs` already
+/// does for filesystem writes (`FsResolver::read_link`, walked component by
+/// component), applied here to commands for the first time. Every
+/// production caller that mints or re-verifies a `proc.exec` lease should
+/// use this rather than a bespoke lexical-only resolver, and — critically —
+/// the *same* one on both the issuing and the re-verifying side: comparing
+/// a real resolution against a lexical one would disagree on any symlinked
+/// executable even with no attack involved, not just a swapped one.
+///
+/// Callers are expected to have already resolved `requested` to an absolute
+/// path (`$PATH` search, workspace-root-relative resolution, etc. — this
+/// resolver does not search `$PATH` itself, matching every resolver it
+/// replaces) — this only verifies what that path currently, really points
+/// at. Does not defend against a plain regular file's *content* being
+/// swapped in place with no symlink involved (that needs a fingerprint
+/// bound into the canonical form itself, a larger data-model change, not
+/// attempted here) — this closes the symlink-retargeting class of attack
+/// specifically, at parity with what `normalize::fs` already guarantees for
+/// writes, not a strictly stronger guarantee than that established
+/// precedent.
+pub struct LiveHostResolver;
+
+impl LiveHostResolver {
+    fn canonicalize(requested: &str) -> Result<String, ()> {
+        let canonical = std::fs::canonicalize(requested).map_err(|_| ())?;
+        let text = canonical.to_str().ok_or(())?;
+        // `std::fs::canonicalize` on Windows returns a `\\?\`-prefixed
+        // (verbatim) path; `CanonicalHostPath::from_resolved` rejects UNC
+        // paths outright, which would otherwise make every real resolution
+        // fail closed on that platform. Documented Rust stdlib behavior,
+        // not a workaround for anything unusual — strip the prefix, which
+        // still names the identical real path, just in the same non-
+        // verbatim form every other caller already produces.
+        let stripped = text.strip_prefix(r"\\?\").unwrap_or(text);
+        Ok(stripped.to_owned())
+    }
+}
+
+impl Resolver for LiveHostResolver {
+    fn resolve_cwd(&self, requested: &str) -> Result<CanonicalHostPath, CommandNormalizeError> {
+        let resolved =
+            Self::canonicalize(requested).map_err(|()| CommandNormalizeError::UnresolvedCwd)?;
+        CanonicalHostPath::from_resolved(&resolved)
+    }
+
+    fn resolve_executable(
+        &self,
+        requested: &str,
+        _cwd: &CanonicalHostPath,
+    ) -> Result<CanonicalHostPath, CommandNormalizeError> {
+        let resolved = Self::canonicalize(requested)
+            .map_err(|()| CommandNormalizeError::UnresolvedExecutable)?;
+        CanonicalHostPath::from_resolved(&resolved)
+            .map_err(|_| CommandNormalizeError::UnresolvedExecutable)
+    }
+}
+
 /// Typed normalize failure. Display never echoes attacker-controlled input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandNormalizeError {
@@ -1027,5 +1088,91 @@ mod tests {
         assert_eq!(honest.executable().as_str(), "/usr/bin/git");
         assert_eq!(with_name.executable().as_str(), "/usr/bin/git");
         assert_ne!(with_name.executable().as_str(), "/tmp/evil/git");
+    }
+
+    #[cfg(unix)]
+    struct TempDir(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "rapidlm-live-host-resolver-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.subsec_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            Self(dir)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `LiveHostResolver` is the real-syscall analogue of the `LexicalResolver`
+    /// fixture above: this uses an actual temp directory and a real symlink,
+    /// not a simulated one, since the whole point is exercising
+    /// `std::fs::canonicalize`'s genuine OS-level symlink following.
+    #[cfg(unix)]
+    #[test]
+    fn live_host_resolver_follows_a_real_symlink_to_its_current_target() {
+        let dir = TempDir::new("basic");
+        let real_target = dir.0.join("real-tool");
+        std::fs::write(&real_target, b"#!/bin/sh\n").expect("seed executable");
+        let link = dir.0.join("tool-link");
+        std::os::unix::fs::symlink(&real_target, &link).expect("symlink");
+
+        let resolved = LiveHostResolver
+            .resolve_executable(
+                link.to_str().expect("utf8 path"),
+                &CanonicalHostPath::from_resolved(dir.0.to_str().expect("utf8 path"))
+                    .expect("cwd"),
+            )
+            .expect("resolve through symlink");
+        let canonical_real =
+            std::fs::canonicalize(&real_target).expect("canonicalize real target");
+        assert_eq!(resolved.as_str(), canonical_real.to_str().expect("utf8"));
+    }
+
+    /// The exact TOCTOU scenario this resolver exists to close: resolve the
+    /// symlink once (as if at lease-approval time), retarget it, then resolve
+    /// again (as if at spawn time) — the two resolutions must disagree, which
+    /// is what makes the lease's action-hash comparison reject the swap.
+    #[cfg(unix)]
+    #[test]
+    fn live_host_resolver_disagrees_after_a_symlink_is_retargeted() {
+        let dir = TempDir::new("toctou");
+        let approved_target = dir.0.join("approved-tool");
+        let attacker_target = dir.0.join("attacker-tool");
+        std::fs::write(&approved_target, b"#!/bin/sh\necho approved\n").expect("seed approved");
+        std::fs::write(&attacker_target, b"#!/bin/sh\necho pwned\n").expect("seed attacker");
+        let link = dir.0.join("tool-link");
+        std::os::unix::fs::symlink(&approved_target, &link).expect("symlink to approved");
+
+        let cwd =
+            CanonicalHostPath::from_resolved(dir.0.to_str().expect("utf8 path")).expect("cwd");
+        let approved_resolution = LiveHostResolver
+            .resolve_executable(link.to_str().expect("utf8 path"), &cwd)
+            .expect("resolve at approval time");
+
+        std::fs::remove_file(&link).expect("unlink");
+        std::os::unix::fs::symlink(&attacker_target, &link).expect("retarget symlink");
+
+        let spawn_time_resolution = LiveHostResolver
+            .resolve_executable(link.to_str().expect("utf8 path"), &cwd)
+            .expect("resolve at spawn time");
+
+        assert_ne!(
+            approved_resolution, spawn_time_resolution,
+            "a retargeted symlink must resolve to a different path, so the \
+             lease's action-hash comparison rejects the swap"
+        );
     }
 }

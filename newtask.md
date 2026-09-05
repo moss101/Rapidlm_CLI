@@ -4049,6 +4049,56 @@ the raw value. Verified via the revert cycle: a no-op `redact_output` reproduces
 secret string appears verbatim in the panicking assertion's own output). Full `-p rapid --lib` suite and
 `cargo build --workspace --tests` pass.
 
+**Fresh review pass, 2026-09-05, `crates/capability-broker` command-execution normalization — closed a
+TOCTOU gap between lease approval and spawn, matching a protection the crate already had for filesystem
+writes but never had for commands.** `normalize::fs::FsResolver` (the filesystem-write path) does real
+`exists`/`is_dir`/`read_link` syscalls, walking symlink chains component-by-component — proven by the
+crate's own `tests/lease_toctou.rs::Mutation::Symlink` case, which uses a real `LiveFs` resolver and
+correctly rejects a symlink retargeted between issuance and use. `normalize::command::CanonicalHostPath::
+from_resolved` (the command-execution path) is purely lexical: it validates control characters/NUL,
+rejects UNC paths, and rejects any `..` component, but performs **zero filesystem syscalls**. Every
+production `Resolver` for commands — `apps/rapid/src/p9_commands.rs::FrozenPathResolver`, `crates/
+process-supervisor/src/spawn.rs::FrozenPathResolver`, `apps/rapid/src/exec_tools.rs::
+AlreadyResolvedPathResolver` — called `from_resolved` directly with no real resolution, so a symlinked
+executable retargeted after a lease was approved (swapping the binary a `proc.exec` lease authorized for
+a different one at the identical literal path string) would resolve to the *same* canonical path both at
+approval time and at spawn time, and `spawn.rs::verify_lease_bound`'s action-hash comparison — the actual
+fail-closed check immediately before the real OS spawn — would never detect the swap. Confirmed via direct
+reading of `lease_toctou.rs`'s `table_driven_mutations_return_lease_invalid_before_side_effect` that its
+`Mutation::Symlink` case only exercises the filesystem-write path (`world.commands` is `FixedResolver`, a
+dumb lexical stub matching production exactly) — there was no existing test anywhere proving commands are
+protected against a symlink/binary swap, precisely confirming the gap rather than assuming it.
+
+**Fixed:** added one shared `capability_broker::LiveHostResolver` (in `normalize/command.rs`, re-exported
+from `lib.rs`) that calls `std::fs::canonicalize` (following real symlinks) before handing the result to
+`CanonicalHostPath::from_resolved`, stripping the `\\?\` verbatim-path prefix `canonicalize` adds on
+Windows first (undocumented handling would otherwise make `from_resolved`'s UNC rejection fail closed on
+every real resolution on that platform). Replaced all three bespoke lexical-only resolvers with this one
+type at their single call sites (`p9_commands.rs::run_agent_cli`'s lease-minting block, `spawn.rs::
+Prepared::canonical_command` — the most security-critical of the three, called from `verify_lease_bound`
+immediately before spawn — and `exec_tools.rs::scan_command_advisory`, an advisory-only scanner where a
+resolution failure already silently returns `None`), deleting the three duplicate `FrozenPathResolver`/
+`AlreadyResolvedPathResolver` structs entirely rather than leaving them as dead code. Used the *same*
+resolver type on both the lease-issuance side and the lease-verification/spawn-time side deliberately: a
+real (symlink-following) resolver on only one side would make any symlinked executable mismatch between
+approval and spawn even with no attack involved, since one side would resolve through the link and the
+other wouldn't — this consistency requirement is why the fix is one shared crate-level type rather than
+three independent local ones. Deliberately scoped to symlink-retargeting only, matching exact parity with
+what `normalize::fs` already guarantees for writes — a plain regular file's content being swapped in place
+with no symlink involved is a separate, harder problem needing an inode/device fingerprint bound into
+`CanonicalCommand`'s action hash, a larger data-model change left out of scope for this fix.
+
+Two new tests in `normalize::command::tests` (`live_host_resolver_follows_a_real_symlink_to_its_current_
+target`, `live_host_resolver_disagrees_after_a_symlink_is_retargeted`) — the second builds a real symlink
+pointing at an "approved" file, resolves it once, retargets the same symlink to an "attacker" file, resolves
+again, and asserts the two resolutions differ (so the lease's action-hash comparison would reject the swap).
+Verified via the revert cycle: temporarily made `canonicalize()` a no-op matching the old lexical behavior —
+both tests failed exactly as predicted, the second with `left: CanonicalHostPath(".../tool-link") right:
+CanonicalHostPath(".../tool-link")` (identical, proving the swap would go undetected) — before restoring the
+fix. Full `-p capability-broker --lib` suite (139 tests, up from 137), `--test lease_toctou` (2 tests,
+unchanged), `-p process-supervisor --lib` (106 tests, unchanged), and full `-p rapid --lib` suite (381 tests,
+unchanged) all pass, plus `cargo build --workspace --tests` clean.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

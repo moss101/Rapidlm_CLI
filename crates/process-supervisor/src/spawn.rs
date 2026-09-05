@@ -21,8 +21,8 @@ use capability_broker::normalize::command::{
 };
 use capability_broker::{
     ActionRequest, CancellationToken, CanonicalAction, CanonicalCommand, CanonicalHostPath,
-    Capability, CommandNormalizeError, ExecIntent, LeaseUseGuard, PrincipalRef, ProcessScope,
-    ResourceDescriptor, Resolver, ShellMode, normalize_exec,
+    Capability, CommandNormalizeError, ExecIntent, LeaseUseGuard, LiveHostResolver, PrincipalRef,
+    ProcessScope, ResourceDescriptor, ShellMode, normalize_exec,
 };
 use protocol::{ArtifactId, ErrorCode, JobId, LeaseId, SessionId};
 
@@ -389,7 +389,7 @@ impl ExecSpec {
                 env_names,
             ),
         };
-        normalize_exec(&intent, &FrozenPathResolver, &self.cancel).map_err(map_normalize)
+        normalize_exec(&intent, &LiveHostResolver, &self.cancel).map_err(map_normalize)
     }
 }
 
@@ -626,22 +626,6 @@ fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     acc == 0
 }
 
-struct FrozenPathResolver;
-
-impl Resolver for FrozenPathResolver {
-    fn resolve_cwd(&self, requested: &str) -> Result<CanonicalHostPath, CommandNormalizeError> {
-        CanonicalHostPath::from_resolved(requested)
-    }
-
-    fn resolve_executable(
-        &self,
-        requested: &str,
-        _cwd: &CanonicalHostPath,
-    ) -> Result<CanonicalHostPath, CommandNormalizeError> {
-        CanonicalHostPath::from_resolved(requested)
-            .map_err(|_| CommandNormalizeError::UnresolvedExecutable)
-    }
-}
 
 struct Prepared {
     program: PathBuf,

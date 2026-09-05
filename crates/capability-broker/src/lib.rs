@@ -42,7 +42,7 @@ pub use lease::{
 };
 pub use normalize::command::{
     CancellationToken, CanonicalCommand, CanonicalHostPath, CommandInvocation,
-    CommandNormalizeError, ExecIntent, Resolver, ShellMode, normalize_exec,
+    CommandNormalizeError, ExecIntent, LiveHostResolver, Resolver, ShellMode, normalize_exec,
 };
 pub use normalize::fs::{
     CanonicalFsAction, CanonicalFsIdentity, CanonicalFsTarget, FsIntent, FsNormalizeError,

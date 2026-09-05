@@ -3455,30 +3455,6 @@ fn secrets_scan(root: &Path, path: &str, content: &[u8]) -> Result<Option<String
     )))
 }
 
-/// `capability_broker::Resolver` for a path already made absolute by the
-/// caller (`resolve_program`, below) — mirrors `p9_commands.rs`'s
-/// `FrozenPathResolver` exactly (a trivial, always-available impl duplicated
-/// rather than shared across modules for two callers this small).
-struct AlreadyResolvedPathResolver;
-
-impl capability_broker::Resolver for AlreadyResolvedPathResolver {
-    fn resolve_cwd(
-        &self,
-        requested: &str,
-    ) -> Result<capability_broker::CanonicalHostPath, capability_broker::CommandNormalizeError> {
-        capability_broker::CanonicalHostPath::from_resolved(requested)
-    }
-
-    fn resolve_executable(
-        &self,
-        requested: &str,
-        _cwd: &capability_broker::CanonicalHostPath,
-    ) -> Result<capability_broker::CanonicalHostPath, capability_broker::CommandNormalizeError> {
-        capability_broker::CanonicalHostPath::from_resolved(requested)
-            .map_err(|_| capability_broker::CommandNormalizeError::UnresolvedExecutable)
-    }
-}
-
 /// Advisory-only dangerous-command scan of a `shell_exec` call (Modbit
 /// `VER-007`'s `CommandFinding` scanner — real, mature, built, with zero
 /// call sites anywhere in `apps/rapid` before this; see `newtask.md` §2.9's
@@ -3499,7 +3475,8 @@ fn scan_command_advisory(root: &Path, argv: &[String]) -> Option<String> {
     let intent = capability_broker::ExecIntent::argv(resolved_argv, root_str, Vec::<String>::new());
     let cancel = capability_broker::CancellationToken::new();
     let command =
-        capability_broker::normalize_exec(&intent, &AlreadyResolvedPathResolver, &cancel).ok()?;
+        capability_broker::normalize_exec(&intent, &capability_broker::LiveHostResolver, &cancel)
+            .ok()?;
     let scanner = security::CommandRiskScanner::new();
     let scan_cancel = security::CommandScanCancellation::new();
     let report = scanner.scan(&command, &scan_cancel).ok()?;
