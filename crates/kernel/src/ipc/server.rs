@@ -745,7 +745,12 @@ fn auth_handshake(
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
     fn unhex(text: &str) -> Option<Vec<u8>> {
-        if !text.len().is_multiple_of(2) {
+        // `text.len()` counts bytes, not chars — a non-ASCII byte (e.g. inside a
+        // multi-byte UTF-8 sequence) can still make the length even while landing
+        // the `i..i+2` step on a non-char-boundary offset, which panics on slice.
+        // Requiring every byte to be an ASCII hex digit guarantees single-byte
+        // chars, so every stepped offset is always a valid boundary.
+        if !text.len().is_multiple_of(2) || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
         (0..text.len())
@@ -1811,6 +1816,46 @@ mod tests {
             read_frame(&mut stream, MAX_FRAME_BYTES).is_err(),
             "connection must not survive a rejected handshake"
         );
+    }
+
+    #[test]
+    fn non_ascii_hex_proof_fails_closed_without_panicking() {
+        let tmp = TempIpc::create();
+        let cancel = CancellationToken::new();
+        let runtime = temp_runtime("nonascii");
+        let auth_cancel = auth::CancellationToken::new();
+        let daemon = DaemonAuth::open(&runtime, &auth_cancel).expect("open");
+        let _token: DaemonTokenHandle = daemon.issue(&auth_cancel).expect("issue");
+        let server = IpcServer::bind(
+            ListenSpec::unix_socket(&tmp.sock),
+            tmp.client.clone(),
+            cancel,
+        )
+        .expect("bind")
+        .with_auth(std::sync::Arc::new(daemon));
+        let _guard = server.spawn().expect("spawn");
+        let mut stream = connect(&tmp.sock);
+
+        let challenge_frame = read_frame(&mut stream, MAX_FRAME_BYTES).expect("challenge frame");
+        let challenge_value: Value = serde_json::from_slice(&challenge_frame).expect("json");
+        let cid = challenge_value["params"]["challenge_id"]
+            .as_str()
+            .expect("cid")
+            .to_owned();
+
+        // "a中" is 4 bytes (even length passes a length-only check) but the
+        // second stepped offset lands inside the multi-byte '中' sequence.
+        let bogus_proof = serde_json::json!({
+            "schema": 1u16,
+            "id": "auth-0",
+            "params": { "challenge_id": cid, "response": "a中" }
+        });
+        write_frame(&mut stream, &serde_json::to_vec(&bogus_proof).unwrap(), MAX_FRAME_BYTES)
+            .unwrap();
+        let verdict =
+            read_frame(&mut stream, MAX_FRAME_BYTES).expect("clean verdict frame, not a dropped connection");
+        let verdict: Value = serde_json::from_slice(&verdict).unwrap();
+        assert_eq!(verdict["error"]["code"], "auth.required");
     }
 
     #[test]

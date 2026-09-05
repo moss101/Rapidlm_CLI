@@ -4118,6 +4118,46 @@ unchanged) and `cargo build --workspace --tests` pass. The sibling note (unjoine
 `TreeStillAlive` escalation failure) remains open — a real gap, but one needing a join-on-error-path change
 to `await_exit_draining` rather than a bound, not bundled into this fix.
 
+**Fresh review pass, 2026-09-05, `crates/kernel/src/ipc/server.rs::auth_handshake`'s local `unhex` helper —
+a char-boundary panic reachable pre-authentication over the daemon's Unix socket, in the same bug family
+already fixed elsewhere this session (`mobile-sim::find_udid`, `event-ledger::parse_fingerprint`'s sibling
+guard) but not yet checked in this file.** `unhex` decoded `challenge_id`/`response` hex strings taken
+directly from the client's first reply frame — i.e. from any local process that can connect to the socket,
+before authentication succeeds — by checking only that `text.len()` (a *byte* count) was even, then slicing
+`&text[i..i+2]` at every even byte offset. A non-ASCII byte inside the string can make the byte length even
+while landing a stepped offset mid-character, since UTF-8 continuation bytes don't align with a fixed
+2-byte stride. **Concrete trigger:** a `response` value of `"a中"` (4 bytes: `61 e4 b8 ad`) passes the
+even-length check, and the very first slice `&text[0..2]` panics — byte offset 2 falls inside `中`'s 3-byte
+sequence (`bytes 1..4`).
+
+**Correcting an overclaim before fixing:** `handle_connection` already runs inside a per-connection
+`std::panic::catch_unwind` (`accept_loop`/`dispatch_connection`, confirmed by direct reading), so this panic
+does **not** crash the daemon or affect other connected sessions — only the one malformed connection's
+thread unwinds, and `InflightGuard`'s `Drop` still runs during unwind, so the connection-count bookkeeping
+stays correct too. What actually breaks is narrower but still real: instead of the clean `IpcError::
+AuthRequired` → `write_transport_error` response every other malformed-handshake path already gets (per the
+function's own doc comment, and per the existing `unauthenticated_connection_fails_closed_before_any_
+kernel_api` test), the client's connection is just abruptly dropped mid-panic with no response frame at
+all — a real, if less severe, divergence from the stated "fails the connection closed" contract, and one a
+malformed or buggy (not even necessarily adversarial) local client could trigger by accident.
+
+**Fixed:** `unhex` now additionally requires every byte to be an ASCII hex digit
+(`text.bytes().all(|b| b.is_ascii_hexdigit())`) before slicing — guaranteeing every character is single-byte,
+so every stepped offset is always a valid boundary — returning `None` (→ the existing clean `AuthRequired`
+path) instead of panicking. New test `non_ascii_hex_proof_fails_closed_without_panicking`: spawns a real
+server with auth enabled, sends a `response` of `"a中"` as the proof, and asserts the client receives a clean
+`{"error":{"code":"auth.required"}}` verdict frame rather than a dropped connection. Verified via the revert
+cycle: reverting just the added ASCII check reproduced the predicted panic exactly (`end byte index 2 is not
+a char boundary; it is inside '中'`) on the per-connection thread, caught by `catch_unwind` as expected (the
+test process itself did not crash), with the test's own assertion failing on the resulting `Io` error from
+the client's dropped-connection read — confirming both the bug and that the fix's test actually detects it —
+before restoring the fix. Full `-p kernel --lib` suite (169 tests, up from 168) and `cargo build --workspace
+--tests` pass. Found via a background review agent tasked with hunting one specific bug shape
+(panic-on-untrusted-input via unchecked arithmetic/slicing/`unwrap`) workspace-wide rather than re-reading
+already-reviewed files; its report also claimed a whole-daemon crash, which independent verification against
+`dispatch_connection`'s existing `catch_unwind` wrapper showed to be incorrect — recorded here so the actual,
+narrower severity is what's on record, not the agent's first-pass overclaim.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
