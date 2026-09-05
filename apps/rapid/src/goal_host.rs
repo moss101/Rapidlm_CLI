@@ -9,7 +9,7 @@
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_runtime::{
@@ -21,6 +21,12 @@ use event_ledger::ledger::{CancellationToken as LedgerCancel, EventLedger, Ledge
 
 /// Canonical persisted-goal file name under the project `.rapidlm/` dir.
 pub const GOAL_FILE: &str = "goal.json";
+
+/// Canonical cross-process advisory-lock file name, sibling to [`GOAL_FILE`]
+/// under the same `.rapidlm/` dir — see [`GoalLock`]'s own doc comment for
+/// why this must be a stable, never-replaced file distinct from `goal.json`
+/// itself.
+pub const GOAL_LOCK_FILE: &str = "goal.lock";
 
 /// Canonical persisted evidence doc file name under the project `.rapidlm/` dir.
 pub const EVIDENCE_FILE: &str = "goal-evidence.json";
@@ -87,6 +93,12 @@ impl BackingResolver for LedgerEventBacking {
 pub enum GoalPersistError {
     Io,
     Json,
+    /// The cross-process [`GoalLock`] could not be acquired or released —
+    /// distinct from an ordinary `Io` failure so a caller (or a human
+    /// reading stderr) can tell "another writer holds the lock and this
+    /// attempt to open/lock the lock file itself failed" apart from an
+    /// ordinary read/write failure on `goal.json` proper.
+    Lock,
 }
 
 impl fmt::Display for GoalPersistError {
@@ -94,11 +106,88 @@ impl fmt::Display for GoalPersistError {
         match self {
             Self::Io => f.write_str("goal store I/O failed"),
             Self::Json => f.write_str("goal store JSON is malformed or unsupported"),
+            Self::Lock => f.write_str("goal store lock could not be acquired"),
         }
     }
 }
 
 impl Error for GoalPersistError {}
+
+/// Cross-process advisory lock guarding one project's `goal.json` read-
+/// modify-write transactions ([`GoalHost::update`]). Backed by
+/// `std::fs::File`'s own native `lock`/`unlock` (stable since Rust 1.89 —
+/// `flock(2)` on Unix, `LockFileEx` on Windows under the hood, no third-
+/// party crate needed) — an OS-level lock tied to this open file *handle*,
+/// not to a path, an inode, or a lockfile-existence protocol: the OS
+/// releases it automatically when this handle closes, including on process
+/// crash or `kill -9`, so no stale-lock recovery logic is needed here.
+///
+/// Locks a stable **sibling** file ([`GOAL_LOCK_FILE`]), never `goal.json`
+/// itself: [`GoalHost::save`] replaces `goal.json` via `atomic_write`'s
+/// temp-file-then-rename, which swaps the file's inode on every write. A
+/// lock held against that inode would not protect whichever process next
+/// *opens* `goal.json` after the rename — the new inode was never locked.
+/// The sibling file is never replaced by rename, so a lock against it
+/// protects every transaction regardless of how many times the underlying
+/// `goal.json` inode has been swapped out from under it.
+///
+/// Blocks (no arbitrary timeout) until acquired, matching this codebase's
+/// existing blocking-lock convention (`exec_tools.rs`'s per-path
+/// `WriteLocks`, a plain blocking `std::sync::Mutex`) — hold times here are
+/// designed to be milliseconds (one bounded file read, an in-memory state
+/// transition, one atomic write), never a model call, tool execution, or
+/// external command; see [`GoalHost::update`]'s own doc comment.
+///
+/// Do not acquire a second `GoalLock` for the same `goal_path` while one is
+/// already held on the same call stack: `flock`/`LockFileEx` block even a
+/// second open file handle from the *same* process (this is exactly the
+/// property that makes the lock cross-process-safe in the first place), so
+/// nested acquisition would self-deadlock. [`GoalHost::update`] is the only
+/// intended caller and never nests.
+struct GoalLock {
+    _file: fs::File,
+}
+
+impl GoalLock {
+    /// Blocks until the lock is acquired. Creates the lock file (and its
+    /// parent directory, mirroring [`GoalHost::save`]'s own
+    /// `create_dir_all`) if it doesn't exist yet; the file's content is
+    /// never read or written — only its stable existence as a lock target
+    /// matters.
+    fn acquire(goal_path: &Path) -> Result<Self, GoalPersistError> {
+        let lock_path = Self::lock_path(goal_path);
+        if let Some(parent) = lock_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|_| GoalPersistError::Lock)?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|_| GoalPersistError::Lock)?;
+        file.lock().map_err(|_| GoalPersistError::Lock)?;
+        Ok(Self { _file: file })
+    }
+
+    fn lock_path(goal_path: &Path) -> PathBuf {
+        goal_path.with_file_name(GOAL_LOCK_FILE)
+    }
+}
+
+/// Failure from [`GoalHost::update`]'s own transaction machinery (lock
+/// acquisition, the fresh reload, or the final atomic write) as opposed to
+/// whatever `E` the caller's own `mutate` closure returns — kept distinct
+/// so a caller can tell "the transaction itself never got a chance to
+/// run/persist" apart from "it ran and refused the mutation on its own
+/// terms" (an ordinary `GoalStateError` or similar, not a persistence
+/// failure at all).
+#[derive(Debug)]
+pub enum GoalTransactionError<E> {
+    Persist(GoalPersistError),
+    Mutate(E),
+}
 
 /// Durable host-owned goal contract. Completing still requires the evidence gate
 /// (`evidence.can_complete`), so the model cannot complete by assertion alone.
@@ -221,6 +310,50 @@ impl GoalHost {
         // on for this, rather than a second copy of the same crash-safety
         // logic.
         crate::exec_tools::atomic_write(path, json.as_bytes()).map_err(|_| GoalPersistError::Io)
+    }
+
+    /// Perform one locked, read-modify-write transaction against
+    /// `goal_path`: acquire the cross-process [`GoalLock`], replace this
+    /// host's machine/snapshot with whatever is *currently* persisted on
+    /// disk (never whatever this `GoalHost` may have loaded earlier, which
+    /// can be stale under a concurrent writer — another process, or an
+    /// earlier point in this same one), let `mutate` observe/change it,
+    /// persist the result via [`GoalHost::save`] (still `atomic_write`
+    /// underneath — corruption safety and lost-update safety are separate
+    /// guarantees, and both are still needed here), then release the lock.
+    ///
+    /// `self.evidence` is untouched: evidence lives in a separate file with
+    /// its own, unrelated hazards, not this transaction's concern. A caller
+    /// whose `mutate` needs up-to-date evidence (e.g. gating `Complete`)
+    /// must already have loaded it into `self` beforehand — the reload
+    /// here only ever replaces the machine/snapshot half, on the same
+    /// `GoalHost` instance, so `mutate` sees both the fresh snapshot and
+    /// whatever evidence this instance already carries.
+    ///
+    /// If `mutate` returns `Err`, nothing is written: a refused mutation
+    /// must never overwrite the freshly-reloaded on-disk snapshot with a
+    /// no-op save that could race a concurrent writer for no reason. Held
+    /// for milliseconds only — one bounded read, an in-memory state
+    /// transition, one atomic write — never across a model call, tool
+    /// execution, or external command; a caller with genuinely slow work
+    /// to do (e.g. `goal claim`'s own check commands) should finish that
+    /// work *before* calling this, not from inside `mutate`.
+    ///
+    /// Never call this again from inside `mutate` — see [`GoalLock`]'s own
+    /// doc comment on why nested acquisition self-deadlocks.
+    pub fn update<T, E>(
+        &mut self,
+        goal_path: &Path,
+        mutate: impl FnOnce(&mut GoalHost) -> Result<T, E>,
+    ) -> Result<T, GoalTransactionError<E>> {
+        let _lock = GoalLock::acquire(goal_path).map_err(GoalTransactionError::Persist)?;
+        self.machine = GoalHost::load(goal_path)
+            .map_err(GoalTransactionError::Persist)?
+            .map(|host| host.machine)
+            .unwrap_or_default();
+        let result = mutate(self).map_err(GoalTransactionError::Mutate)?;
+        self.save(goal_path).map_err(GoalTransactionError::Persist)?;
+        Ok(result)
     }
 
     /// Export the host-owned goal contract + evidence verdicts + a host
@@ -382,17 +515,23 @@ pub fn active_goal_id(goal_path: &Path) -> Option<protocol::GoalId> {
 /// independent accumulation, and its own `saturating_add` arithmetic and
 /// "usage only accrues while `Active`" rule apply unchanged.
 ///
+/// Runs the whole read-check-mutate-write sequence through
+/// [`GoalHost::update`]'s cross-process lock: two turns finishing at once
+/// (a TUI turn and a concurrent headless `rapid exec`, or two headless
+/// turns against the same project) must both actually land, not have the
+/// second silently overwrite the first's accrual with a stale reload — the
+/// exact hazard this exists to close. The goal-id/state check re-verifies
+/// against the snapshot reloaded *inside* the lock, not whatever might have
+/// been true when this turn started.
+///
 /// A best-effort side effect of an already-completed turn, not something
 /// the turn's own outcome depends on: returns `false` (accrues nothing) when
 /// there is no goal file, the goal has since changed identity or is no
 /// longer active (see [`active_goal_id`]'s own doc comment), or the updated
 /// snapshot could not be persisted — logging a warning only for the last
 /// case, since the first two are ordinary "nothing to attribute to," not a
-/// failure. Never touches the evidence doc: this always starts from a fresh
-/// [`GoalHost::load`] and ends with a fresh [`GoalHost::from_snapshot`], so
-/// there is no risk of silently dropping evidence records some other,
-/// longer-lived `GoalHost` instance may have loaded — this function owns
-/// only the usage half of the file.
+/// failure. Never touches the evidence doc: this owns only the usage half
+/// of the file, and `GoalHost::update` never mutates it.
 pub fn accrue_turn_usage(
     goal_path: &Path,
     goal_id: protocol::GoalId,
@@ -400,24 +539,26 @@ pub fn accrue_turn_usage(
     cost_usd_micros: u64,
     active_ms: u64,
 ) -> bool {
-    let Ok(Some(host)) = GoalHost::load(goal_path) else {
-        return false;
-    };
-    let Some(snapshot) = host.snapshot() else {
-        return false;
-    };
-    if snapshot.id() != goal_id || snapshot.state() != agent_runtime::GoalState::Active {
-        return false;
-    }
-    let snapshot = snapshot.clone();
-    let mut guard = agent_runtime::GoalBudgetGuard::from_snapshot(&snapshot);
-    let cancel = CancellationToken::new();
-    let _ = guard.after_model(tokens, cost_usd_micros, &cancel);
-    let _ = guard.after_turn(active_ms, &cancel);
-    let updated_host = GoalHost::from_snapshot(guard.apply(snapshot));
-    match updated_host.save(goal_path) {
+    let mut host = GoalHost::new();
+    let result = host.update(goal_path, |host| {
+        let Some(snapshot) = host.snapshot() else {
+            return Err(());
+        };
+        if snapshot.id() != goal_id || snapshot.state() != agent_runtime::GoalState::Active {
+            return Err(());
+        }
+        let snapshot = snapshot.clone();
+        let mut guard = agent_runtime::GoalBudgetGuard::from_snapshot(&snapshot);
+        let cancel = CancellationToken::new();
+        let _ = guard.after_model(tokens, cost_usd_micros, &cancel);
+        let _ = guard.after_turn(active_ms, &cancel);
+        *host = GoalHost::from_snapshot(guard.apply(snapshot));
+        Ok(())
+    });
+    match result {
         Ok(()) => true,
-        Err(err) => {
+        Err(GoalTransactionError::Mutate(())) => false,
+        Err(GoalTransactionError::Persist(err)) => {
             eprintln!("warning: goal usage could not be persisted: {err}");
             false
         }
@@ -831,7 +972,7 @@ mod tests {
 
     #[test]
     fn accrue_turn_usage_updates_tokens_cost_turns_and_active_ms() {
-        let path = scratch("accrue-basic");
+        let path = scratch_dir("accrue-basic").join(GOAL_FILE);
         let (host, goal_id) = active_host_with_budget(GoalBudget::default());
         host.save(&path).expect("save");
 
@@ -848,7 +989,7 @@ mod tests {
 
     #[test]
     fn accrue_turn_usage_accumulates_across_multiple_calls() {
-        let path = scratch("accrue-accumulate");
+        let path = scratch_dir("accrue-accumulate").join(GOAL_FILE);
         let (host, goal_id) = active_host_with_budget(GoalBudget::default());
         host.save(&path).expect("save");
 
@@ -871,7 +1012,7 @@ mod tests {
         // now names a *different* goal (replaced by a separate `rapid goal`
         // invocation while the turn was still running). The stale turn's
         // usage must not land on the new goal.
-        let path = scratch("accrue-mismatch");
+        let path = scratch_dir("accrue-mismatch").join(GOAL_FILE);
         let (host, _stale_goal_id) = active_host_with_budget(GoalBudget::default());
         host.save(&path).expect("save");
         let unrelated_goal_id = GoalId::new();
@@ -885,7 +1026,7 @@ mod tests {
 
     #[test]
     fn accrue_turn_usage_does_nothing_when_the_goal_is_not_active() {
-        let path = scratch("accrue-inactive");
+        let path = scratch_dir("accrue-inactive").join(GOAL_FILE);
         let (mut host, goal_id) = active_host_with_budget(GoalBudget::default());
         host.apply(
             GoalCommand::Pause { goal_id, process_recovered: false },
@@ -904,7 +1045,7 @@ mod tests {
 
     #[test]
     fn accrue_turn_usage_does_nothing_without_a_goal_file() {
-        let path = scratch("accrue-missing");
+        let path = scratch_dir("accrue-missing").join(GOAL_FILE);
         let _ = fs::remove_file(&path);
         assert!(!accrue_turn_usage(&path, GoalId::new(), 100, 100, 100));
         assert!(!path.exists(), "must not invent a goal file that never existed");
@@ -915,7 +1056,7 @@ mod tests {
         // A turn that failed before any model call still counts as one
         // incurred turn (real wall-clock time was spent), but must not
         // fabricate nonzero tokens/cost it never actually measured.
-        let path = scratch("accrue-zero");
+        let path = scratch_dir("accrue-zero").join(GOAL_FILE);
         let (host, goal_id) = active_host_with_budget(GoalBudget::default());
         host.save(&path).expect("save");
 
@@ -932,7 +1073,7 @@ mod tests {
 
     #[test]
     fn accrue_turn_usage_saturates_instead_of_overflowing_at_large_values() {
-        let path = scratch("accrue-saturate");
+        let path = scratch_dir("accrue-saturate").join(GOAL_FILE);
         let (host, goal_id) = active_host_with_budget(GoalBudget::default());
         host.save(&path).expect("save");
 
@@ -944,5 +1085,311 @@ mod tests {
         assert_eq!(usage.tokens(), u64::MAX, "must saturate, not wrap, past u64::MAX");
         assert_eq!(usage.cost(), u64::MAX, "must saturate, not wrap, past u64::MAX");
         let _ = fs::remove_file(&path);
+    }
+
+    // --- Cross-process-capable locking (`GoalHost::update`/`GoalLock`) -----
+    //
+    // These use `std::sync::Barrier` to release every racing thread at once
+    // rather than relying on incidental scheduling, and assert the exact
+    // final numeric outcome — not "probably didn't lose anything" after a
+    // sleep. Real OS-level file locks (`GoalLock`, backed by `std::fs::
+    // File`'s own `lock`/`unlock`) are used throughout, opened as separate
+    // file handles per thread exactly as separate processes would — the
+    // same kernel-level `flock`/`LockFileEx` mechanism that makes this
+    // cross-process-safe also serializes these threads correctly, so this
+    // is a genuine test of that mechanism, not an in-memory mutex standing
+    // in for it.
+
+    /// A bounded, non-hanging proof that no [`GoalLock`] is still held on
+    /// `goal_path`: spawns a thread that tries to acquire one itself and
+    /// waits — with a timeout, not forever, so a real regression fails this
+    /// assertion instead of hanging the whole test suite — for it to
+    /// succeed.
+    fn assert_lock_is_free(goal_path: &Path, when: &str) {
+        let goal_path = goal_path.to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = GoalLock::acquire(&goal_path);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or_else(|_| panic!("goal lock was not released {when}"));
+    }
+
+    #[test]
+    fn two_concurrent_turns_accruing_usage_both_survive_not_just_one() {
+        // The task's own worked example: cost starts at 0, turn A incurs
+        // 100, turn B incurs 200 — the final persisted cost must be
+        // exactly 300, never silently just 100 or just 200 from whichever
+        // writer's stale reload happened to save last.
+        let path = scratch_dir("accrue-race-example").join(GOAL_FILE);
+        let (host, goal_id) = active_host_with_budget(GoalBudget::default());
+        host.save(&path).expect("save");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let turn_a = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let path = path.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                accrue_turn_usage(&path, goal_id, 10, 100, 5)
+            })
+        };
+        let turn_b = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let path = path.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                accrue_turn_usage(&path, goal_id, 20, 200, 15)
+            })
+        };
+        assert!(turn_a.join().expect("thread"), "turn A's accrual must succeed");
+        assert!(turn_b.join().expect("thread"), "turn B's accrual must succeed");
+
+        let reloaded = GoalHost::load(&path).expect("load").expect("some");
+        let usage = reloaded.snapshot().expect("snap").usage();
+        assert_eq!(usage.cost(), 300, "neither writer's cost may silently vanish");
+        assert_eq!(usage.tokens(), 30);
+        assert_eq!(usage.active_ms(), 20);
+        assert_eq!(usage.turns(), 2, "both turns must count, not just one");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(GoalLock::lock_path(&path));
+    }
+
+    #[test]
+    fn many_concurrent_accruals_all_survive_with_an_exact_sum() {
+        let path = scratch_dir("accrue-race-many").join(GOAL_FILE);
+        let (host, goal_id) = active_host_with_budget(GoalBudget::default());
+        host.save(&path).expect("save");
+
+        const WRITERS: u64 = 16;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS as usize));
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    accrue_turn_usage(&path, goal_id, 10, 100, 5)
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert!(handle.join().expect("thread panicked"), "every writer must succeed");
+        }
+
+        let reloaded = GoalHost::load(&path).expect("load").expect("some");
+        let usage = reloaded.snapshot().expect("snap").usage();
+        assert_eq!(usage.turns(), WRITERS, "every concurrent accrual must count, none lost");
+        assert_eq!(usage.tokens(), WRITERS * 10);
+        assert_eq!(usage.cost(), WRITERS * 100);
+        assert_eq!(usage.active_ms(), WRITERS * 5);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(GoalLock::lock_path(&path));
+    }
+
+    #[test]
+    fn goal_id_mismatch_protection_holds_under_a_concurrent_correct_writer() {
+        // Not just the existing sequential test's guarantee — this proves
+        // the same-goal-id check and the mutation happen against the same
+        // locked/latest snapshot even when a second, unrelated writer is
+        // racing it for real, not merely called before/after in sequence.
+        let path = scratch_dir("mismatch-under-race").join(GOAL_FILE);
+        let (host, goal_id) = active_host_with_budget(GoalBudget::default());
+        host.save(&path).expect("save");
+        let unrelated_goal_id = protocol::GoalId::new();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let correct = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let path = path.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                accrue_turn_usage(&path, goal_id, 500, 50, 10)
+            })
+        };
+        let mismatched = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let path = path.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                accrue_turn_usage(&path, unrelated_goal_id, 999, 999, 999)
+            })
+        };
+        assert!(correct.join().expect("thread"), "the matching goal id must still accrue");
+        assert!(
+            !mismatched.join().expect("thread"),
+            "a mismatched goal id must never accrue, race or not"
+        );
+
+        let reloaded = GoalHost::load(&path).expect("load").expect("some");
+        let usage = reloaded.snapshot().expect("snap").usage();
+        assert_eq!(usage.tokens(), 500, "only the matching writer's usage may land");
+        assert_eq!(usage.cost(), 50);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(GoalLock::lock_path(&path));
+    }
+
+    #[test]
+    fn usage_accrual_racing_a_pause_command_never_loses_either_writers_intent() {
+        // Whichever of the two writers actually wins the lock first, the
+        // result must be internally consistent — never a corrupted mix.
+        // The pause transition must never be silently lost regardless of
+        // ordering (accrual never touches lifecycle state, so it can never
+        // legitimately erase a pause); a pause that wins first legitimately
+        // blocks the *later* accrual attempt, per `accrue_turn_usage_does_
+        // nothing_when_the_goal_is_not_active`'s already-established rule —
+        // this proves that rule still holds when the two race for real
+        // under the lock, not just when called sequentially.
+        let path = scratch_dir("accrue-vs-pause").join(GOAL_FILE);
+        let (host, goal_id) = active_host_with_budget(GoalBudget::default());
+        host.save(&path).expect("save");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let accrue = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let path = path.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                accrue_turn_usage(&path, goal_id, 500, 50, 10)
+            })
+        };
+        let pause = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let path = path.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let mut host = GoalHost::new();
+                host.update(&path, |host| {
+                    host.apply(
+                        GoalCommand::Pause { goal_id, process_recovered: false },
+                        &human(),
+                        &CancellationToken::new(),
+                    )
+                })
+            })
+        };
+        let _ = accrue.join().expect("accrue thread panicked");
+        pause
+            .join()
+            .expect("pause thread panicked")
+            .expect("pause transaction must always succeed regardless of ordering");
+
+        let reloaded = GoalHost::load(&path).expect("load").expect("some");
+        let snapshot = reloaded.snapshot().expect("snap");
+        assert_eq!(
+            snapshot.state(),
+            agent_runtime::GoalState::Paused,
+            "the pause transition must never be lost, whichever writer ran first"
+        );
+        assert!(
+            snapshot.usage().tokens() == 0 || snapshot.usage().tokens() == 500,
+            "usage must be exactly 'accrual never ran' or 'accrual fully landed', \
+             never a partial/corrupted value: {:?}",
+            snapshot.usage()
+        );
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(GoalLock::lock_path(&path));
+    }
+
+    #[test]
+    fn lock_is_released_after_a_successful_update() {
+        let path = scratch_dir("lock-release-ok").join(GOAL_FILE);
+        let (host, goal_id) = active_host_with_budget(GoalBudget::default());
+        host.save(&path).expect("save");
+
+        let mut updater = GoalHost::new();
+        updater
+            .update(&path, |host| {
+                host.apply(
+                    GoalCommand::Pause { goal_id, process_recovered: false },
+                    &human(),
+                    &CancellationToken::new(),
+                )
+            })
+            .expect("update");
+
+        assert_lock_is_free(&path, "after a successful update");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(GoalLock::lock_path(&path));
+    }
+
+    #[test]
+    fn lock_is_released_after_a_mutation_error() {
+        let path = scratch_dir("lock-release-err").join(GOAL_FILE);
+        let (host, _goal_id) = active_host_with_budget(GoalBudget::default());
+        host.save(&path).expect("save");
+
+        let mut updater = GoalHost::new();
+        let result: Result<(), GoalTransactionError<&'static str>> =
+            updater.update(&path, |_host| Err("refused"));
+        assert!(
+            matches!(result, Err(GoalTransactionError::Mutate("refused"))),
+            "a refused mutation must not be silently swallowed or treated as success"
+        );
+
+        assert_lock_is_free(&path, "after a mutation error");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(GoalLock::lock_path(&path));
+    }
+
+    #[test]
+    fn lock_is_released_after_a_panic_inside_mutate() {
+        let path = scratch_dir("lock-release-panic").join(GOAL_FILE);
+        let (host, _goal_id) = active_host_with_budget(GoalBudget::default());
+        host.save(&path).expect("save");
+
+        let mut updater = GoalHost::new();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            updater.update(&path, |_host| -> Result<(), ()> {
+                panic!("deliberate panic inside mutate, for lock-release testing");
+            })
+        }));
+        assert!(outcome.is_err(), "the panic must actually have propagated");
+
+        assert_lock_is_free(&path, "after a panic inside mutate");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(GoalLock::lock_path(&path));
+    }
+
+    #[test]
+    fn update_reloads_the_current_snapshot_not_a_stale_in_memory_one() {
+        // Two `GoalHost` instances both load the same original file; one
+        // mutates and saves through `update` first, then the second must
+        // see that change reflected when *it* calls `update` — proving the
+        // reload really happens fresh each time, not from whatever the
+        // instance loaded when it was first constructed.
+        let path = scratch_dir("update-reloads-fresh").join(GOAL_FILE);
+        let (host, goal_id) = active_host_with_budget(GoalBudget::default());
+        host.save(&path).expect("save");
+
+        let mut first = GoalHost::load(&path).expect("load").expect("some");
+        let mut second = GoalHost::load(&path).expect("load").expect("some");
+
+        first
+            .update(&path, |host| {
+                host.apply(
+                    GoalCommand::Pause { goal_id, process_recovered: false },
+                    &human(),
+                    &CancellationToken::new(),
+                )
+            })
+            .expect("first update");
+
+        // `second` still has the pre-pause snapshot in memory; its own
+        // `update` call must reload and see the goal already `Paused`, not
+        // silently resurrect `Active` by saving its own stale copy.
+        second
+            .update(&path, |host| {
+                let state = host.snapshot().expect("snap").state();
+                Ok::<_, ()>(state)
+            })
+            .map(|state| assert_eq!(state, agent_runtime::GoalState::Paused))
+            .expect("second update");
+
+        let reloaded = GoalHost::load(&path).expect("load").expect("some");
+        assert_eq!(reloaded.snapshot().expect("snap").state(), agent_runtime::GoalState::Paused);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(GoalLock::lock_path(&path));
     }
 }

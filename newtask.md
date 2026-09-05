@@ -4781,6 +4781,144 @@ Protocol) event mapping (`crates/acp/src/v1.rs::map_kernel_event`) was checked, 
 no incorrect status shown) — real feature parity for ACP-based IDE clients is a separate surface this task's
 own scope never named (only the TUI and headless `rapid exec` were).
 
+**`goal.json` concurrent-writer / lost-update problem fixed 2026-09-06, user-directed.** The prior `GoalUsage`
+task's own `atomic_write` fix (temp-file-then-rename) closed *corruption* — a reader can no longer observe a
+torn/half-written file — but never addressed *lost updates*: two writers can each load a valid snapshot,
+mutate different or overlapping fields, and atomically write valid JSON, with the later writer's save
+silently erasing the earlier writer's change. The task's own framing was explicit that these are two separate
+guarantees, and that framing held up under investigation: every real code path was a plain `load → mutate →
+save` with no synchronization at all.
+**Concurrency model found:** in-process turn execution was already safe — `turn_in_flight` (an `AtomicBool`)
+plus the kernel's own per-session `TurnLease` serialize every turn in one TUI process to exactly one at a
+time, and subagents never call `accrue_turn_usage` at all (confirmed by grep). The real, live hazard is
+**cross-process**: the interactive TUI, a headless `rapid exec`, and every `rapid goal <verb>` CLI invocation
+are each independent OS processes that read/write the exact same `.rapidlm/goal.json` with zero coordination
+today — `active_goal_id`'s own pre-existing doc comment already acknowledged a goal could be "replaced or
+cancelled by a separate `rapid goal` invocation while a turn was still running in another process," but
+never closed the actual data-race this implies. No existing lock/advisory-lock/lockfile/revision-counter/
+compare-and-swap mechanism exists anywhere in the workspace for this (searched exhaustively: `goal.json`,
+`GoalSnapshot`, `GoalHost`, `.save(`, `atomic_write`, `flock`, `advisory`, `lockfile`, `revision`, `generation`
+— the closest precedent, `exec_tools.rs`'s per-path `WriteLocks`, is a purely in-process `Arc<Mutex<...>>`
+registry, a fresh, empty, disconnected instance per process, not usable across processes at all).
+`GoalSnapshot` itself carries no revision/generation field, ruling out optimistic concurrency without first
+adding one — not attempted, since a lock cleanly solves the problem without it and the task's own guidance
+was not to introduce OCC merely because it's sophisticated.
+**Bug reproduced before any fix, deterministically:** a `std::sync::Barrier`-synchronized, real-multi-threaded
+test (`goal_host.rs`) matching the task's own worked example — cost starts at 0, one writer incurs 100 (as
+10 tokens/100 cost/5ms), the other incurs 200 (20/200/15ms) — reliably lost one writer's update entirely
+against the pre-fix code (reproduced via a temporary revert, not merely reasoned about): a 16-writer stress
+variant of the same test lost 15 of 16 increments in every run tried.
+**Chosen mechanism: Option A**, a cross-process advisory lock protecting the *entire* read-modify-write
+transaction, exactly as the task's own preferred direction described — `lock → reload the current on-disk
+snapshot → mutate → atomic-write → unlock`, with `atomic_write` kept unchanged underneath for corruption
+safety (the two guarantees stay explicitly separate, in both code comments and this doc). Locking only
+`save()` was explicitly rejected and never implemented: two writers who each load before either locks would
+still silently clobber each other, since the lock would arrive too late to matter — the task's own diagram of
+this exact failure mode was verified by a dedicated revert-cycle (below), not just read and agreed with.
+**Locking primitive:** `std::fs::File`'s own native `lock`/`unlock` — file locking was stabilized in the
+standard library at Rust 1.89 (this workspace's own `rust-version = "1.97.1"` already exceeds that), backed
+by `flock(2)` on Unix and `LockFileEx` on Windows under the hood — covering every platform this repo already
+claims support for (macOS/Linux/Windows, per `crates/auth`'s own `os_keychain_select` routing) with **zero new
+dependency**: `fs4` (a third-party crate offering the identical API) was added, inspected, and then removed
+once std's own native support was discovered — a smaller, more repository-consistent outcome than a new
+`Cargo.toml` dependency, confirmed by directly test-compiling a `std::fs::File::lock()` call against this
+toolchain before committing to the design. These locks are tied to an open file *handle*, not a path/inode/
+lockfile-existence protocol: the OS releases them automatically on handle close, including process crash or
+`kill -9` — no stale-lock recovery logic exists or is needed.
+**Lock target:** a stable sibling file, `.rapidlm/goal.lock` (new `GOAL_LOCK_FILE` constant), never `goal.json`
+itself — `atomic_write`'s temp-file-then-rename swaps `goal.json`'s inode on every save, so a lock held
+against that inode would not protect whichever process next *opens* the file after the rename; the sibling
+file is never replaced by rename, so it stays a valid lock target across every save. Added to `.gitignore` (a
+transient coordination file with no meaningful content, unlike the project's own dogfooded, git-tracked
+`goal.json`).
+**API: `GoalHost::update(&mut self, goal_path, mutate: FnOnce(&mut GoalHost) -> Result<T, E>) -> Result<T,
+GoalTransactionError<E>>`.** Acquires the lock, replaces `self`'s machine/snapshot with whatever is
+*currently* on disk (never whatever this `GoalHost` may have loaded earlier), runs `mutate`, persists via the
+existing `save()` (still `atomic_write` underneath) only if `mutate` returned `Ok`, then releases — callers
+cannot perform a stale read-modify-write outside the lock because there is no other way to both reload and
+persist. `self.evidence` is deliberately untouched by `update` (a separate file with its own, unrelated
+hazards, out of this task's scope) — a caller whose mutation needs up-to-date evidence (gating `Complete`)
+must already have loaded it into `self` beforehand. Read-only call sites (`GoalHost::load`, `sync_persisted_
+goal`, `show`/`export`/`verify`) are untouched and still need no lock.
+**`accrue_turn_usage` now routes through `update`** instead of its own bespoke `load`/mutate/`save`: the
+goal-id and `Active`-state re-verification happens against the snapshot reloaded *inside* the lock, in the
+same closure as the mutation itself — never a separate check-then-later-reload step, closing the TOCTOU gap
+the task explicitly warned about. Its external signature, return value (`bool`), and stderr diagnostic on a
+genuine persistence failure are all unchanged.
+**`run_goal_command` (`rapid goal create/replace/pause/resume/cancel/complete`) restructured**: each of those
+six subcommands used to mutate an already-loaded, possibly-stale `host` and rely on one unconditional `save()`
+at the very end of the function — now each routes its own mutation through `host.update(&path, ...)`,
+reloading fresh under the lock immediately before applying its `GoalCommand`. The blanket trailing `host.
+save(&path)` was removed entirely: `claim`/`evidence record`/`show`/`export`/`verify` never mutate the
+machine/snapshot at all (only evidence, a separate file), so re-saving `goal.json` for them was previously
+either a harmless no-op or, for `claim` specifically — which can run real external check commands for up to
+60+ seconds by its own `--timeout-secs` default — a real, if narrow, additional lost-update hazard: a stale
+snapshot loaded before a slow claim finally got saved again at the end, capable of overwriting a concurrent
+`accrue_turn_usage` update that landed during that window. Removing the blanket save closes this too, and
+lets `claim`'s slow check-command execution stay entirely outside any lock, matching the task's explicit
+"never hold the lock across tool execution" requirement — `claim` never needed the goal.json lock at all once
+its own machine-state independence was traced through.
+**Lock scope:** every acquisition in this codebase is milliseconds-long — one bounded file read, an in-memory
+state transition, one atomic write — never a model call, tool execution, network operation, or full turn.
+**Crash/error behavior:** lock acquisition, reload, and the final write are all typed failures (`GoalPersist
+Error::{Io, Json, Lock}`, a new `Lock` variant) surfaced through `GoalTransactionError<E>::Persist`, distinct
+from an ordinary mutation refusal (`GoalTransactionError::Mutate(E)`) — a caller can always tell "the
+transaction machinery itself failed" from "it ran and refused on its own terms." A refused mutation never
+triggers a save (nothing is silently overwritten by a no-op). `GoalId` mismatch and inactive-goal protections
+are unchanged and re-verified under the reloaded snapshot, not weakened.
+**Tests:** 8 new in `goal_host.rs`'s existing scripted/scratch-file test style, real threads (not an in-
+process mutex standing in for cross-process safety) opening separate file handles per thread exactly as
+separate processes would, `std::sync::Barrier`-synchronized for deterministic overlap rather than sleeps —
+two concurrent accruals both survive exactly (the task's own 100+200=300 example); 16 concurrent accruals all
+survive with an exact sum; goal-id-mismatch protection holds under a genuinely racing correct writer; usage
+accrual racing a `Pause` command loses neither writer's legitimate outcome (an exhaustive, not probabilistic,
+two-way assertion, since which one wins the race is legitimately order-dependent); the lock is released after
+a successful update, a mutation error, and a panic inside `mutate` (each via a bounded, non-hanging second-
+acquisition probe, never an unbounded wait that could hang the suite); and a direct proof that `update` really
+reloads fresh rather than trusting an existing in-memory copy. Plus 1 new cross-process integration test
+(`apps/rapid/tests/goal_concurrency.rs`): the real, compiled `rapid` binary, 8 concurrent `rapid exec`
+processes (not 2 — see below) each against a real scripted HTTP model server with a synchronized 300ms
+response delay, all racing the same project's `goal.json`; asserts every writer's turn count and token total
+survive exactly.
+**A real test-isolation bug found and fixed during this work, worth recording:** the very first version of the
+new `goal_host.rs` tests used the file's existing flat, non-directory-scoped `scratch(name)` helper for their
+goal-file path. `GoalLock::lock_path`'s `with_file_name` correctly derives a lock path from `goal.json`'s own
+parent directory (uniquely per real project) — but `scratch(name)` places every scratch file directly in the
+shared OS temp directory with only its *filename* varying, so `with_file_name` collapsed every one of those
+tests' lock paths onto the exact same physical `/tmp/.../goal.lock`, regardless of test name. Running the full
+`-p rapid --lib` suite under real parallelism (dozens of unrelated tests, all sharing that one accidental lock
+file) intermittently lost 2 of 16 accruals in one observed run — a genuine flake, not a production bug: every
+individual test's own data stayed correctly isolated by its own goal path, only the *lock* was accidentally
+shared. Fixed by switching every lock-touching test (old and new) to `scratch_dir(name).join(GOAL_FILE)` —
+each test's own directory, mirroring `.rapidlm/`'s real per-project layout — after which 8 consecutive full
+`-p rapid --lib` runs (and a further full `cargo test --workspace`) were clean.
+**Revert-cycle verification, both required cases:** (1) *lost update* — reverting `accrue_turn_usage` to its
+exact pre-fix `load`/mutate/`save` shape (no lock) reproduced the predicted loss in 5/5 runs of the 2-writer
+test (left=100 or left=200 instead of 300) and 3/3 runs of the 16-writer stress test (turns=1 instead of 16);
+restoring fixed both, 3/3 clean reruns. (2) *lock scope* — temporarily moving `update`'s reload to *before*
+lock acquisition (a lock that only protects mutate+save, exactly the insufficient shape the task's own
+diagram warns about) reproduced the identical predicted failure in 5/5 runs; restoring fixed it, 3/3 clean
+reruns. A third, cross-process-specific revert was also run: bypassing the lock inside the *same compiled
+binary* the integration test spawns reproduced a real shortfall in 3/3 runs of the 8-writer cross-process test
+(2-writer cross-process runs did not reliably reproduce it — the actual read-modify-write window turned out
+to be far narrower than ordinary inter-process scheduling jitter between two heavyweight `rapid` invocations,
+which is exactly why the committed test uses 8 writers, not 2); restoring the fix gave 5/5 clean reruns.
+**Tests added: 8 in `goal_host.rs` (471 total `-p rapid --lib`, up from 463) plus 1 new integration test
+(`goal_concurrency.rs`, 507 total across all `-p rapid` test binaries).** `cargo clippy -p rapid --lib --tests
+--no-deps`: two real, new findings, both fixed — a `clippy::suspicious_open_options` on `GoalLock::acquire`'s
+lock-file open (added an explicit `.truncate(false)`) and a `clippy::doc_lazy_continuation` on a doc comment
+in the new integration test (a line accidentally starting with a markdown list marker; reworded). Every other
+warning in the full clippy run is pre-existing and outside every file this task touched (confirmed by diffing
+against files actually changed). `cargo build --workspace --tests` and a full `cargo test --workspace` both
+clean.
+**Deliberately not attempted, per the driving instruction's own scope:** `goal-evidence.json`'s own separate
+concurrency hazard (`save_evidence` still uses plain `fs::write`, not `atomic_write`, and has no lock at all)
+— named explicitly here as a real, distinct, un-closed gap for whoever picks it up next, not silently left out;
+`GoalSnapshot` event-sourcing; `GoalUsage`/pricing redesign; `GoalDriver` integration (still zero call sites in
+`apps/rapid`, unchanged); inadequate-context-semantics changes; TUI panel wiring; slash-command implementation;
+retrieval/RAG work; any network-filesystem locking guarantee beyond what a local, `atomic_write`-based design
+already assumed everywhere else in this codebase.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

@@ -35,7 +35,8 @@ use tui::{
 };
 
 use crate::goal_host::{
-    EVIDENCE_FILE, GOAL_FILE, GoalHost, SESSIONS_DB_FILE, accrue_turn_usage, active_goal_id,
+    EVIDENCE_FILE, GOAL_FILE, GoalHost, GoalTransactionError, SESSIONS_DB_FILE, accrue_turn_usage,
+    active_goal_id,
 };
 use crate::headless::jsonl::JsonlExitCode;
 use crate::exec_tools::ExecTools;
@@ -457,8 +458,18 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
             } else {
                 GoalCommand::Replace(spec)
             };
-            host.apply(command, &GoalActor::Human, &cancel)
-                .map_err(|_| InteractiveError::Internal)?;
+            // Locked read-modify-write: `apply`'s `AlreadyActive` check must
+            // see whatever is *currently* on disk, not whatever this
+            // process's own `host` happened to load before a concurrent
+            // writer (another `rapid goal create`, a `rapid exec` turn's
+            // usage accrual) may have changed it.
+            host.update(&path, |host| host.apply(command, &GoalActor::Human, &cancel))
+                .map_err(|err| {
+                    if let GoalTransactionError::Persist(persist_err) = &err {
+                        eprintln!("{persist_err}");
+                    }
+                    InteractiveError::Internal
+                })?;
             Ok(0)
         }
         "show" => {
@@ -474,10 +485,20 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
             println!("complete: {}", host.can_complete(&cancel));
             Ok(0)
         }
-        "pause" => goal_lifecycle(&mut host, "pause", &cancel),
-        "resume" => goal_lifecycle(&mut host, "resume", &cancel),
-        "cancel" => goal_lifecycle(&mut host, "cancel", &cancel),
-        "complete" => goal_lifecycle(&mut host, "complete", &cancel),
+        // Each locked under `GoalHost::update`: `goal_lifecycle` reads the
+        // goal id and gates `complete` on evidence against whatever is
+        // *currently* on disk (reloaded fresh under the lock), not this
+        // process's possibly-stale outer `host` — the same reload-then-
+        // mutate-then-save transaction `create`/`replace` uses above.
+        "pause" | "resume" | "cancel" | "complete" => host
+            .update(&path, |host| goal_lifecycle(host, sub, &cancel))
+            .map_err(|err| match err {
+                GoalTransactionError::Persist(persist_err) => {
+                    eprintln!("{persist_err}");
+                    InteractiveError::Internal
+                }
+                GoalTransactionError::Mutate(inner) => inner,
+            }),
         "claim" => {
             let Some(ledger) = claim_ledger.as_ref() else {
                 eprintln!("ledger unavailable; claims cannot be audited");
@@ -591,10 +612,18 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
         _ => Err(InteractiveError::Usage),
     }?;
 
-    if let Err(err) = host.save(&path) {
-        eprintln!("{err}");
-        return Ok(JsonlExitCode::Runtime.as_i32());
-    }
+    // `goal.json` itself is no longer saved here: every subcommand that
+    // actually mutates the machine/snapshot (`create`/`replace`/`pause`/
+    // `resume`/`cancel`/`complete`, above) already persisted it itself,
+    // under `GoalHost::update`'s lock, against a freshly-reloaded snapshot
+    // — not this function's own possibly-stale outer `host`. The remaining
+    // subcommands (`show`/`export`/`verify`/`claim`/`evidence`) never touch
+    // `host.machine` at all, so re-saving it here would either be a no-op
+    // or, worse, silently overwrite a concurrent writer's update with this
+    // stale copy — exactly the lost-update hazard this task exists to
+    // close. Evidence is a separate file/concern (its own concurrency
+    // hazard, out of this task's scope) and still saved unconditionally,
+    // unchanged from before.
     if let Err(err) = host.save_evidence(&evidence_path) {
         eprintln!("{err}");
         return Ok(JsonlExitCode::Runtime.as_i32());
