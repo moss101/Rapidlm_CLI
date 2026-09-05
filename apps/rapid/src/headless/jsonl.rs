@@ -195,6 +195,11 @@ impl JsonlRecord {
     /// One mid-turn routing decision (Modbit `MOD-005`: "routing must be
     /// auditable"). `reason` is a short machine-stable tag
     /// (`"retry_same"`/`"fallback_to"`/`"stop"`), not free text.
+    /// `spent_usd_micros` is `None` (serializes as JSON `null`, never a
+    /// fabricated `0`) when no attempt on `requested_model` this turn ever
+    /// reported a real cost — same discipline as `session_finished`'s own
+    /// `cost_usd_micros` field, and its usual source (`RouterDecisionRecord::
+    /// spent_usd_micros`, `host.rs`) is itself built the same way.
     pub fn router_decision(
         session_id: SessionId,
         seq: u64,
@@ -202,6 +207,7 @@ impl JsonlRecord {
         requested_model: &str,
         resolved_model: &str,
         reason: &str,
+        spent_usd_micros: Option<u64>,
     ) -> Result<Self, JsonlError> {
         Ok(Self {
             schema: JSONL_SCHEMA,
@@ -213,6 +219,7 @@ impl JsonlRecord {
                 "requested_model": requested_model,
                 "resolved_model": resolved_model,
                 "reason": reason,
+                "spent_usd_micros": spent_usd_micros,
             }))?,
         })
     }
@@ -613,12 +620,33 @@ mod tests {
             "openai/gpt-5",
             "anthropic/claude",
             "fallback_to",
+            None,
         )
         .expect("router decision");
         assert_eq!(
             encode(&record),
             format!(
-                r#"{{"schema":1,"type":"router.decision","session_id":"{SESSION_ID}","seq":1,"time":"{TIME}","data":{{"reason":"fallback_to","requested_model":"openai/gpt-5","resolved_model":"anthropic/claude"}}}}"#
+                r#"{{"schema":1,"type":"router.decision","session_id":"{SESSION_ID}","seq":1,"time":"{TIME}","data":{{"reason":"fallback_to","requested_model":"openai/gpt-5","resolved_model":"anthropic/claude","spent_usd_micros":null}}}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn router_decision_carries_a_real_spent_amount_when_reported() {
+        let record = JsonlRecord::router_decision(
+            session_id(),
+            1,
+            TIME,
+            "openai/gpt-5",
+            "anthropic/claude",
+            "fallback_to",
+            Some(4_200),
+        )
+        .expect("router decision");
+        assert_eq!(
+            encode(&record),
+            format!(
+                r#"{{"schema":1,"type":"router.decision","session_id":"{SESSION_ID}","seq":1,"time":"{TIME}","data":{{"reason":"fallback_to","requested_model":"openai/gpt-5","resolved_model":"anthropic/claude","spent_usd_micros":4200}}}}"#
             )
         );
     }

@@ -5434,6 +5434,34 @@ model, routing reason, policy version, estimated vs. actual cost — "routing mu
   — no policy-versioning concept exists anywhere yet to cite, and per-decision cost attribution would need
   threading `CostAccumulator`'s per-step values back into whichever attempt they belonged to, not just the
   turn-level total this codebase currently tracks; both are real, separate follow-up.
+- **The cost half of that follow-up implemented 2026-09-05 — narrower than `MOD-005`'s literal "estimated
+  vs. actual" ask, and deliberately so.** Traced the actual shape before designing anything: `RetrySame`/
+  `FallbackTo`/`Stop` decisions are all recorded on the *failure* branch of `FallbackChainModel::step`'s
+  loop — none of them is itself a billable event, so there is no natural "actual cost of this decision" to
+  attach, and "estimated cost of the next attempt" would need a real pricing/catalog lookup this record has
+  no access to (a separate, real follow-up of its own, not attempted). What *is* well-defined and useful:
+  how much has already been spent on the model being retried or abandoned, cumulative across every earlier
+  successful attempt this turn — real audit information ("we spent $X on gpt-5 before falling back to
+  claude"), not a design guess. **Implemented:** `RouterDecisionRecord` gained `spent_usd_micros: Option<u64>`
+  ("unknown is not confirmed zero," same discipline as `CostAccumulator::total()`); `FallbackChainModel`
+  gained an internal `spent_usd_micros: BTreeMap<String, u64>` (keyed by `model_label`), accumulated from
+  every successful step's own `cost_usd_micros` regardless of which model produced it, persisting *across*
+  separate `step()` calls within one turn — the field's whole point is a running total, not a single step's
+  own outcome. Every `RouterDecisionRecord` push now reads `self.spent_on(&current)` at that moment. Surfaced
+  through both existing consumers: the stderr `router:` line appends `spent_usd_micros=<n>` only when
+  `Some`, and `JsonlRecord::router_decision` gained the field as a new required parameter (`null` when
+  `None`, same convention `session_finished`'s own cost field already uses). Two new tests in `host.rs`:
+  `spent_on_accumulates_across_multiple_successful_steps_for_the_same_model` (a direct check that cost adds
+  up correctly across two separate `step()` calls, not just within one) and `a_fallback_decision_reports_
+  cost_already_spent_on_the_abandoned_model` (an end-to-end check: a first step succeeds and reports real
+  cost, a second step hits an auth failure and falls back, and the resulting `RouterDecisionRecord` carries
+  the cost from the *first* step, not `None`) — plus two golden-JSON tests in `headless/jsonl.rs` (`None` →
+  `null`, `Some(4_200)` → `4200`). Verified via the revert cycle: reverting just the accumulation block in
+  `step()`'s `Ok` arm reproduced both `host.rs` test failures exactly as predicted (`None` where `Some(1000)`/
+  `Some(2500)` was expected) before restoring the fix. Full `-p rapid --lib` suite (404 tests, up from 401)
+  and `cargo build --workspace --tests` pass. **Still not attempted, and this is now the entire remainder of
+  `MOD-005`:** `policy_version` (no versioning concept exists to cite) and the *estimated* half of cost (needs
+  a real `ModelCatalog` pricing lookup, separate infrastructure this record doesn't touch).
 - **Unrelated security fix found while auditing this crate, 2026-08-30: an integer overflow in chunked
   HTTP decoding let any configured provider crash the process.** `crates/llm-router/src/providers/
   openai_compatible.rs::decode_chunked` (shared by both the OpenAI-compatible and Anthropic adapters via

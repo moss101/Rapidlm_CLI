@@ -2096,10 +2096,16 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             RouterDecisionReason::FallbackTo => ("fallback_to", decision.resolved_model.as_str()),
             RouterDecisionReason::Stop(why) => (why.as_str(), ""),
         };
-        eprintln!(
-            "router: requested={} resolved={} reason={reason_tag}",
-            decision.requested_model, decision.resolved_model
-        );
+        match decision.spent_usd_micros {
+            Some(spent) => eprintln!(
+                "router: requested={} resolved={} reason={reason_tag} spent_usd_micros={spent}",
+                decision.requested_model, decision.resolved_model
+            ),
+            None => eprintln!(
+                "router: requested={} resolved={} reason={reason_tag}",
+                decision.requested_model, decision.resolved_model
+            ),
+        }
         if let Some(io) = jsonl_io.as_mut() {
             if let Ok(record) = crate::headless::jsonl::JsonlRecord::router_decision(
                 session_id,
@@ -2108,6 +2114,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                 &decision.requested_model,
                 resolved,
                 reason_tag,
+                decision.spent_usd_micros,
             ) {
                 let _ = io.records().write(&record);
                 next_jsonl_seq += 1;

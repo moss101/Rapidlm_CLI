@@ -922,6 +922,16 @@ pub struct RouterDecisionRecord {
     pub requested_model: String,
     pub resolved_model: String,
     pub reason: RouterDecisionReason,
+    /// Cumulative cost already incurred on `requested_model` this turn, as
+    /// of this decision — `None` when no attempt on it ever reported a real
+    /// cost, matching `CostAccumulator::total()`'s own "unknown is not
+    /// confirmed zero" discipline. This is the achievable half of Modbit
+    /// `MOD-005`'s "estimated vs. actual cost" ask: the *actual* cost spent
+    /// on the model being retried/abandoned, not an *estimate* of the next
+    /// attempt's cost — that half needs a real pricing/catalog lookup this
+    /// record doesn't have access to, and is deliberately not attempted
+    /// here (see `newtask.md` §2.8).
+    pub spent_usd_micros: Option<u64>,
 }
 
 /// Why a step's resolved model differs from (or repeats) the one requested.
@@ -977,6 +987,13 @@ pub struct FallbackChainModel<B> {
     controller: FallbackController,
     diag: Option<StepDiag>,
     decisions: RouterDecisionLog,
+    /// Cumulative real cost reported so far this turn, per backend
+    /// (`model_label`-keyed) — populated from every successful step's own
+    /// `cost_usd_micros`, regardless of which model produced it. Read back
+    /// when a decision is recorded so `RouterDecisionRecord::spent_usd_micros`
+    /// reflects what was actually spent on the model being retried/
+    /// abandoned, not a running turn-wide total.
+    spent_usd_micros: std::collections::BTreeMap<String, u64>,
 }
 
 impl<B: LiveModelCall> FallbackChainModel<B> {
@@ -985,7 +1002,19 @@ impl<B: LiveModelCall> FallbackChainModel<B> {
     /// builds both from the same resolved `[models] fallback` list, so this
     /// invariant holds by construction.
     pub fn new(backends: Vec<(ModelRef, B)>, controller: FallbackController, diag: Option<StepDiag>) -> Self {
-        Self { backends, controller, diag, decisions: RouterDecisionLog::new() }
+        Self {
+            backends,
+            controller,
+            diag,
+            decisions: RouterDecisionLog::new(),
+            spent_usd_micros: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Cumulative cost reported so far this turn for `model`, or `None` if
+    /// no attempt on it has reported a real cost yet.
+    fn spent_on(&self, model: &ModelRef) -> Option<u64> {
+        self.spent_usd_micros.get(&model_label(model)).copied()
     }
 
     /// Shared handle to this chain's routing-decision log, readable after
@@ -1026,6 +1055,16 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
             let result = self.backend_mut(&current).step(blocks, input, cancel);
             let err = match result {
                 Ok(output) => {
+                    let cost = match &output {
+                        ModelStepOutput::Terminal { cost_usd_micros, .. }
+                        | ModelStepOutput::ToolCalls { cost_usd_micros, .. } => *cost_usd_micros,
+                    };
+                    if let Some(cost) = cost {
+                        *self
+                            .spent_usd_micros
+                            .entry(model_label(&current))
+                            .or_insert(0) += cost;
+                    }
                     self.diag_line(format!("fallback model={} outcome=ok", model_label(&current)));
                     return Ok(output);
                 }
@@ -1056,6 +1095,7 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                         requested_model: model_label(&current),
                         resolved_model: model_label(&current),
                         reason: RouterDecisionReason::RetrySame,
+                        spent_usd_micros: self.spent_on(&current),
                     });
                     if !sleep_millis_cancellable(cancel, *backoff_ms) {
                         return Err(ModelStepError::Cancelled);
@@ -1071,6 +1111,7 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                         requested_model: model_label(&current),
                         resolved_model: model_label(to),
                         reason: RouterDecisionReason::FallbackTo,
+                        spent_usd_micros: self.spent_on(&current),
                     });
                     if !sleep_millis_cancellable(cancel, *backoff_ms) {
                         return Err(ModelStepError::Cancelled);
@@ -1086,6 +1127,7 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                         requested_model: model_label(&current),
                         resolved_model: String::new(),
                         reason: RouterDecisionReason::Stop(reason.as_str().to_owned()),
+                        spent_usd_micros: self.spent_on(&current),
                     });
                     return Err(err);
                 }
@@ -1099,6 +1141,7 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                         requested_model: model_label(&current),
                         resolved_model: String::new(),
                         reason: RouterDecisionReason::Stop(reason.as_str().to_owned()),
+                        spent_usd_micros: self.spent_on(&current),
                     });
                     return Err(err);
                 }
@@ -1600,6 +1643,82 @@ mod tests {
             alt.outputs.borrow().len(),
             1,
             "the alternate backend must never have been called"
+        );
+    }
+
+    #[test]
+    fn spent_on_accumulates_across_multiple_successful_steps_for_the_same_model() {
+        let primary_ref = model_ref("b-ai", "deepseek");
+        let controller = chain_controller(primary_ref.clone(), Vec::new());
+        let primary = ScriptedBacking::new(vec![
+            Ok(ModelStepOutput::Terminal {
+                text: "one".to_owned(),
+                tokens: 1,
+                cost_usd_micros: Some(1_000),
+            }),
+            Ok(ModelStepOutput::Terminal {
+                text: "two".to_owned(),
+                tokens: 1,
+                cost_usd_micros: Some(500),
+            }),
+        ]);
+        let mut chain =
+            FallbackChainModel::new(vec![(primary_ref.clone(), primary)], controller, None);
+        assert_eq!(
+            chain.spent_on(&primary_ref),
+            None,
+            "nothing spent before any step has run"
+        );
+        let _ = chain
+            .step(&[], &step_input(), &CancellationToken::new())
+            .expect("first step");
+        assert_eq!(chain.spent_on(&primary_ref), Some(1_000));
+        let _ = chain
+            .step(&[], &step_input(), &CancellationToken::new())
+            .expect("second step");
+        assert_eq!(
+            chain.spent_on(&primary_ref),
+            Some(1_500),
+            "cost accumulates across steps within one turn, it is not reset per step"
+        );
+    }
+
+    #[test]
+    fn a_fallback_decision_reports_cost_already_spent_on_the_abandoned_model() {
+        let primary_ref = model_ref("b-ai", "deepseek");
+        let alt_ref = model_ref("openrouter", "ling-3");
+        let controller = chain_controller(primary_ref.clone(), vec![alt_ref.clone()]);
+        let primary = ScriptedBacking::new(vec![
+            Ok(ModelStepOutput::Terminal {
+                text: "first step ok".to_owned(),
+                tokens: 1,
+                cost_usd_micros: Some(2_500),
+            }),
+            auth_failure(),
+        ]);
+        let alt = ScriptedBacking::new(vec![ok_terminal("from alternate")]);
+        let mut chain = FallbackChainModel::new(
+            vec![(primary_ref, primary), (alt_ref, alt)],
+            controller,
+            None,
+        );
+        let _ = chain
+            .step(&[], &step_input(), &CancellationToken::new())
+            .expect("first step succeeds and reports a real cost");
+        let _ = chain
+            .step(&[], &step_input(), &CancellationToken::new())
+            .expect("second step falls back on an auth failure");
+
+        let decisions = chain.decisions().snapshot();
+        let fallback = decisions
+            .iter()
+            .find(|decision| decision.reason == RouterDecisionReason::FallbackTo)
+            .expect("a fallback decision was recorded");
+        assert_eq!(
+            fallback.spent_usd_micros,
+            Some(2_500),
+            "the decision must report what was already spent on the model being abandoned, \
+             not None just because this specific step's own attempt never succeeded"
         );
     }
 
