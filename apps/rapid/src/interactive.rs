@@ -119,7 +119,6 @@ pub enum InteractiveError {
     Kernel(protocol::ApiError),
     Service(ServiceError),
     Stream(EventStreamError),
-    Command(CommandError),
     PendingFuture,
     Io,
     Internal,
@@ -859,6 +858,115 @@ fn goal_lifecycle(
     host.apply(command, &GoalActor::Human, cancel)
         .map_err(|_| InteractiveError::Internal)?;
     Ok(0)
+}
+
+/// `/goal pause|resume|cancel`'s three real, wired verbs. A separate typed
+/// enum from `goal_lifecycle`'s own `&str kind` (headless-CLI-specific: it
+/// also accepts `"complete"`, which no TUI slash command reaches today) so
+/// [`SessionLoop::goal_lifecycle_command`] can't be handed a string the TUI
+/// grammar never actually parses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GoalLifecycleKind {
+    Pause,
+    Resume,
+    Cancel,
+}
+
+impl GoalLifecycleKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Cancel => "cancel",
+        }
+    }
+
+    fn command(self, goal_id: protocol::GoalId) -> GoalCommand {
+        match self {
+            Self::Pause => GoalCommand::Pause {
+                goal_id,
+                process_recovered: false,
+            },
+            Self::Resume => GoalCommand::Resume { goal_id },
+            Self::Cancel => GoalCommand::Cancel { goal_id },
+        }
+    }
+}
+
+/// Local-error text for a slash command the parser rejected. Kept short and
+/// specific rather than dumping the full command catalog — this used to be
+/// unreachable for a real reason: every non-`Empty` `CommandError` here used
+/// to propagate as `InteractiveError::Command`, which `SessionLoop::run`'s
+/// own `?` turned into ending the whole interactive session over a single
+/// mistyped or unsupported slash command. `CommandError::help()` already
+/// distinguishes "no usage to show" (unknown command) from "here is the
+/// right syntax" (bad arguments on a real command) — this only adds a short
+/// label for the former so the message reads as a sentence, not a dump.
+fn command_error_text(err: &CommandError) -> String {
+    match err {
+        CommandError::UnknownCommand => {
+            "unknown command — type /help for available commands".to_owned()
+        }
+        CommandError::TooLong => "command too long".to_owned(),
+        CommandError::InvalidArgs { .. } | CommandError::InvalidId { .. } => err.help().to_owned(),
+        CommandError::Empty | CommandError::NotACommand => String::new(),
+    }
+}
+
+/// Local-error text for a `KernelAction` that parsed correctly but has no
+/// production backend anywhere in the workspace today — investigated and
+/// recorded in `newtask.md`'s command inventory, not guessed. Each reason
+/// names the actual, specific gap (no registry, no store, not wired) rather
+/// than a generic "not implemented," per the driving instruction's own
+/// truthful-help requirement.
+fn unsupported_command_text(action: &KernelAction) -> String {
+    let reason = match action {
+        KernelAction::PauseAgent { .. }
+        | KernelAction::ResumeAgent { .. }
+        | KernelAction::SleepAgent { .. } => {
+            "no running-agent registry exists yet to pause, resume, or sleep a specific agent"
+        }
+        KernelAction::ShowGoalBudget { .. } => {
+            "goal budget has no display or mutation backend yet, in the TUI or the headless CLI"
+        }
+        KernelAction::ReindexContext => {
+            "on-demand reindex is not wired; context is already re-indexed automatically each turn"
+        }
+        KernelAction::SuggestKnowledge { .. }
+        | KernelAction::ApproveKnowledge { .. }
+        | KernelAction::RejectKnowledge { .. }
+        | KernelAction::EditKnowledge { .. } => "no knowledge-candidate store exists yet",
+        KernelAction::RunPlaybook { .. } => {
+            "playbooks can be compiled but nothing executes a compiled graph yet"
+        }
+        KernelAction::ValidatePlaybook { .. } => {
+            "playbook validation has no name-addressable store to resolve against yet"
+        }
+        KernelAction::SelectModel { .. } => {
+            "mid-session model switching is not wired yet; set RAPIDLM_MODEL or edit config.toml"
+        }
+        KernelAction::AddMcp { .. } | KernelAction::RemoveMcp { .. } | KernelAction::AuthMcp { .. } => {
+            "external MCP server trust management is not wired into the interactive session yet"
+        }
+        KernelAction::InstallPlugin { .. }
+        | KernelAction::RemovePlugin { .. }
+        | KernelAction::SetPluginPermissions { .. } => {
+            "plugin install/trust management is not wired into the interactive session yet"
+        }
+        KernelAction::ResumeSession { .. } => "cross-process session resume is not wired yet",
+        KernelAction::CompactSession => "on-demand transcript compaction is not wired yet",
+        KernelAction::ApplyChangeSet { .. } | KernelAction::Rollback { .. } => {
+            "no change-set apply/rollback backend exists yet"
+        }
+        KernelAction::Handoff { .. } | KernelAction::Takeover { .. } | KernelAction::ControlReturn => {
+            "execution handoff/takeover is not wired into the interactive session yet"
+        }
+        KernelAction::ComputerObserve | KernelAction::ComputerRecord | KernelAction::ComputerTest => {
+            "computer-use actions are not wired into the interactive session yet"
+        }
+        _ => "not available yet",
+    };
+    format!("not available: {reason}")
 }
 
 /// stderr guidance for the typed no-config fallback (mirrors the Grok Build
@@ -2654,6 +2762,12 @@ impl SessionLoop<'_> {
         Ok(LoopControl::Continue)
     }
 
+    /// Never returns `Err` for a bad/unknown command — a slash command is
+    /// local input, and a mistyped one must produce a local error message
+    /// through the normal render path, not end the whole interactive
+    /// session (see `command_error_text`'s own doc comment for why this
+    /// matters: it once did, silently, for every `CommandError` other than
+    /// `Empty`).
     fn dispatch_slash(&mut self, command: &str) -> Result<LoopControl, InteractiveError> {
         match parse_command(command) {
             Ok(parsed) => match dispatch(parsed) {
@@ -2667,60 +2781,214 @@ impl SessionLoop<'_> {
                     }
                     Ok(LoopControl::Continue)
                 }
-                FrontendAction::InlineHelp(_) => Ok(LoopControl::Continue),
+                FrontendAction::InlineHelp(help) => {
+                    self.append_command_output(help.usage().to_owned());
+                    Ok(LoopControl::Continue)
+                }
                 FrontendAction::Kernel(action) => {
                     self.apply_kernel_action(action)?;
                     Ok(LoopControl::Continue)
                 }
             },
             Err(CommandError::Empty) => Ok(LoopControl::Continue),
-            Err(err) => Err(InteractiveError::Command(err)),
+            Err(err) => {
+                self.append_command_error(command_error_text(&err));
+                Ok(LoopControl::Continue)
+            }
         }
+    }
+
+    fn append_command_output(&mut self, text: String) {
+        *self.ui = reduce(
+            self.ui.clone(),
+            &UiEvent::Local(LocalUiEvent::AppendCommandOutput(text)),
+        );
+    }
+
+    fn append_command_error(&mut self, text: String) {
+        *self.ui = reduce(
+            self.ui.clone(),
+            &UiEvent::Local(LocalUiEvent::AppendCommandError(text)),
+        );
+    }
+
+    fn goal_path(&self) -> PathBuf {
+        self.root.join(PROJECT_MARKER).join(GOAL_FILE)
+    }
+
+    /// `/goal start <text>` — the only goal mutation the TUI's own grammar
+    /// carries no criteria/requirements/budget for (see `parse_goal`), so
+    /// this builds the minimal equivalent of a bare `rapid goal create
+    /// <text>` with no flags. Reuses the exact same `GoalHost`/`GoalCommand`
+    /// transactional API `run_goal_command`'s own `"create"` branch and
+    /// `accrue_turn_usage` already use — no persistence logic is duplicated,
+    /// only this command's own argument handling is new.
+    fn start_goal(&mut self, statement: String) -> Result<(), InteractiveError> {
+        let statement = statement.trim();
+        if statement.is_empty() {
+            self.append_command_error("usage: /goal start <text>".to_owned());
+            return Ok(());
+        }
+        let spec = match GoalSpec::new(
+            protocol::GoalId::new(),
+            statement.to_owned(),
+            Vec::new(),
+            GoalBudget::new(None, None, None, None),
+            Vec::new(),
+        ) {
+            Ok(spec) => spec,
+            Err(err) => {
+                self.append_command_error(format!("goal start: {err}"));
+                return Ok(());
+            }
+        };
+        let goal_path = self.goal_path();
+        let mut host = match GoalHost::load(&goal_path) {
+            Ok(host) => host.unwrap_or_else(GoalHost::new),
+            Err(err) => {
+                self.append_command_error(format!("goal start: {err}"));
+                return Ok(());
+            }
+        };
+        let cancel = agent_runtime::CancellationToken::new();
+        match host.update(&goal_path, |host| {
+            host.apply(GoalCommand::Create(spec), &GoalActor::Human, &cancel)
+        }) {
+            Ok(_) => {
+                self.append_command_output(format!("goal started: {statement}"));
+                if let Some(snapshot) = host.snapshot() {
+                    let projection = project_goal(snapshot);
+                    *self.ui = reduce(
+                        self.ui.clone(),
+                        &UiEvent::Local(LocalUiEvent::SyncGoal(projection)),
+                    );
+                }
+            }
+            Err(GoalTransactionError::Persist(err)) => {
+                self.append_command_error(format!("goal start: {err}"));
+            }
+            Err(GoalTransactionError::Mutate(err)) => {
+                self.append_command_error(format!("goal start: {err}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// `/goal pause|resume|cancel` — mirrors `goal_lifecycle`'s exact
+    /// `GoalCommand` mapping (the headless `rapid goal` implementation),
+    /// but returns a rendered result instead of `println!`ing: this runs
+    /// inside the full-screen interactive TUI, where a raw stdout write
+    /// would corrupt the compositor's own painted frame. Not a call to
+    /// `goal_lifecycle` itself for exactly that reason — the shared,
+    /// reused part is the `GoalHost`/`GoalCommand`/`GoalActor` transactional
+    /// API underneath, not that CLI-only presentation function.
+    fn goal_lifecycle_command(&mut self, kind: GoalLifecycleKind) -> Result<(), InteractiveError> {
+        let goal_path = self.goal_path();
+        let mut host = match GoalHost::load(&goal_path) {
+            Ok(host) => host.unwrap_or_else(GoalHost::new),
+            Err(err) => {
+                self.append_command_error(format!("goal {}: {err}", kind.as_str()));
+                return Ok(());
+            }
+        };
+        let Some(goal_id) = host.snapshot().map(|s| s.id()) else {
+            self.append_command_error("no active goal".to_owned());
+            return Ok(());
+        };
+        let cancel = agent_runtime::CancellationToken::new();
+        let command = kind.command(goal_id);
+        match host.update(&goal_path, |host| {
+            host.apply(command, &GoalActor::Human, &cancel)
+        }) {
+            Ok(_) => {
+                self.append_command_output(format!("goal {}: ok", kind.as_str()));
+                match host.snapshot() {
+                    Some(snapshot) => {
+                        let projection = project_goal(snapshot);
+                        *self.ui = reduce(
+                            self.ui.clone(),
+                            &UiEvent::Local(LocalUiEvent::SyncGoal(projection)),
+                        );
+                    }
+                    // `pause`/`resume` keep a snapshot; `cancel` clears it
+                    // (see `agent_runtime::GoalState`'s own doc comment) —
+                    // without this the Goals route would keep showing the
+                    // cancelled goal as still `Active` until the next
+                    // session start happens to reload it.
+                    None => {
+                        *self.ui = reduce(
+                            self.ui.clone(),
+                            &UiEvent::Local(LocalUiEvent::ClearGoal(goal_id)),
+                        );
+                    }
+                }
+            }
+            Err(GoalTransactionError::Persist(err)) => {
+                self.append_command_error(format!("goal {}: {err}", kind.as_str()));
+            }
+            Err(GoalTransactionError::Mutate(err)) => {
+                self.append_command_error(format!("goal {}: {err}", kind.as_str()));
+            }
+        }
+        Ok(())
     }
 
     fn apply_kernel_action(&mut self, action: KernelAction) -> Result<(), InteractiveError> {
         self.cancel
             .check()
             .map_err(|_| InteractiveError::Cancelled)?;
-        match action.kernel_api() {
-            KernelApi::Interrupt => {
-                self.interrupt()?;
-            }
-            KernelApi::SubmitTurn => {
-                self.submit_turn("")?;
-            }
-            KernelApi::ForkSession => {
-                let seq = self.ui.snapshot().map(|s| s.seq()).unwrap_or(0);
-                let child = block_on(
-                    self.client.fork_session(ForkSession::new(
-                        self.session_id,
-                        seq,
-                        self.actor.clone(),
-                        TraceId::new(),
-                    )),
-                    self.cancel,
-                )?;
-                *self.ui = reduce(self.ui.clone(), &UiEvent::Snapshot(child));
-            }
-            KernelApi::Rewind => {
-                let to_seq = match &action {
-                    KernelAction::RewindSession { to_seq } => *to_seq,
-                    _ => None,
-                };
-                let Some(to_seq) = to_seq else {
-                    return Ok(());
-                };
-                let result = block_on(
-                    self.client
-                        .rewind(RewindSession::new(self.session_id, to_seq)),
-                    self.cancel,
-                )?;
-                *self.ui = reduce(
-                    self.ui.clone(),
-                    &UiEvent::Snapshot(result.snapshot().clone()),
-                );
-            }
-            KernelApi::Approve | KernelApi::Dispatch => {}
+        match action {
+            KernelAction::StartGoal { statement } => self.start_goal(statement)?,
+            KernelAction::PauseGoal => self.goal_lifecycle_command(GoalLifecycleKind::Pause)?,
+            KernelAction::ResumeGoal => self.goal_lifecycle_command(GoalLifecycleKind::Resume)?,
+            KernelAction::CancelGoal => self.goal_lifecycle_command(GoalLifecycleKind::Cancel)?,
+            other => match other.kernel_api() {
+                KernelApi::Interrupt => {
+                    self.interrupt()?;
+                }
+                KernelApi::SubmitTurn => {
+                    self.submit_turn("")?;
+                }
+                KernelApi::ForkSession => {
+                    let seq = self.ui.snapshot().map(|s| s.seq()).unwrap_or(0);
+                    let child = block_on(
+                        self.client.fork_session(ForkSession::new(
+                            self.session_id,
+                            seq,
+                            self.actor.clone(),
+                            TraceId::new(),
+                        )),
+                        self.cancel,
+                    )?;
+                    *self.ui = reduce(self.ui.clone(), &UiEvent::Snapshot(child));
+                }
+                KernelApi::Rewind => {
+                    let to_seq = match &other {
+                        KernelAction::RewindSession { to_seq } => *to_seq,
+                        _ => None,
+                    };
+                    let Some(to_seq) = to_seq else {
+                        return Ok(());
+                    };
+                    let result = block_on(
+                        self.client
+                            .rewind(RewindSession::new(self.session_id, to_seq)),
+                        self.cancel,
+                    )?;
+                    *self.ui = reduce(
+                        self.ui.clone(),
+                        &UiEvent::Snapshot(result.snapshot().clone()),
+                    );
+                }
+                // Every other parsed command: investigated and confirmed to
+                // have no real production backend anywhere in the workspace
+                // today (see `newtask.md`'s command inventory) — rendered
+                // as an honest, specific "not available" result instead of
+                // the silent no-op this used to be.
+                KernelApi::Approve | KernelApi::Dispatch => {
+                    self.append_command_error(unsupported_command_text(&other));
+                }
+            },
         }
         self.drain()
     }
@@ -3969,7 +4237,7 @@ impl InteractiveError {
             Self::Usage | Self::NotATty | Self::UserHomeMissing | Self::InvalidProjectRoot => {
                 JsonlExitCode::Usage.as_i32()
             }
-            Self::Config(_) | Self::Command(_) => JsonlExitCode::Usage.as_i32(),
+            Self::Config(_) => JsonlExitCode::Usage.as_i32(),
             Self::Kernel(err) => JsonlExitCode::from_api_error(err, false).as_i32(),
             Self::AlreadyActive
             | Self::Terminal(_)
@@ -3998,7 +4266,6 @@ impl Display for InteractiveError {
             Self::Kernel(err) => write!(f, "{err}"),
             Self::Service(err) => write!(f, "{err}"),
             Self::Stream(err) => write!(f, "{err}"),
-            Self::Command(err) => write!(f, "{err}"),
             Self::PendingFuture => f.write_str("in-process kernel future stayed pending"),
             Self::Io => f.write_str("interactive session I/O failed"),
             Self::Internal => f.write_str("interactive session failed internally"),
@@ -4699,6 +4966,273 @@ base_url = "http://127.0.0.1:11434/v1"
         assert_eq!(report.trust, TrustStatus::Untrusted);
         assert!(!report.executable_config_active);
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
+    }
+
+    // --- Slash-command control plane ------------------------------------
+    //
+    // Before this task, every `CommandError` other than `Empty` propagated
+    // as `InteractiveError::Command`, which `SessionLoop::run`'s own `?`
+    // turned into ending the *entire* interactive session — a single
+    // mistyped or unsupported slash command (`/xyz`, `/fork extra-arg`)
+    // crashed the whole TUI. `unknown_slash_command_shows_a_local_error_and_
+    // does_not_end_the_session` below reproduces and proves that fixed; it
+    // is also this task's primary interception revert-cycle regression
+    // test (see the revert-cycle notes in `newtask.md`).
+
+    #[test]
+    fn unknown_slash_command_shows_a_local_error_and_does_not_end_the_session() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/this-command-does-not-exist".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("an unknown slash command must not end the session with an error");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(
+            painted.contains("unknown command") && painted.contains("/help"),
+            "{painted}"
+        );
+    }
+
+    #[test]
+    fn invalid_slash_command_arguments_show_specific_usage_not_a_generic_failure_or_the_full_catalog() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/fork extra-argument".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("invalid arguments on a known command must not end the session either");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(painted.contains("/fork"), "{painted}");
+        assert!(
+            !painted.contains("/playbook"),
+            "a known-command syntax error should show that command's own usage, \
+             not the entire catalog dump: {painted}"
+        );
+    }
+
+    #[test]
+    fn help_command_renders_the_command_catalog_through_the_production_path() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        // A tall viewport so the whole catalog fits without scrolling —
+        // the transcript viewport auto-follows the tail by default, so a
+        // default 24-row terminal would only show the catalog's last screen
+        // full, not whether `/goal` (near the top) is present at all.
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Resize { width: 80, height: 60 },
+            InteractiveInput::Submit("/help".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(painted.contains("/goal"), "{painted}");
+        assert!(painted.contains("/quit"), "{painted}");
+    }
+
+    #[test]
+    fn slash_goal_start_creates_a_real_goal_through_goal_host_not_a_model_turn() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/goal start ship the thing".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(painted.contains("goal started: ship the thing"), "{painted}");
+
+        // The real mutation: `GoalHost`'s own concurrency-safe persistence,
+        // not a test-only bypass — the same file `rapid goal show` reads.
+        let goal_path = env.project.join(PROJECT_MARKER).join(GOAL_FILE);
+        let host = GoalHost::load(&goal_path)
+            .expect("load")
+            .expect("goal.json must exist after /goal start");
+        let snapshot = host.snapshot().expect("snapshot");
+        assert_eq!(snapshot.statement(), "ship the thing");
+        assert_eq!(snapshot.state(), agent_runtime::GoalState::Active);
+    }
+
+    #[test]
+    fn slash_goal_start_with_no_text_is_a_local_usage_error_not_an_empty_turn() {
+        // Before this task, `/goal start` (parsed correctly, statement
+        // empty after `join_text` rejects it — or here, dispatched with an
+        // empty statement some other way) reached `KernelApi::SubmitTurn`,
+        // which submitted an *empty-text* turn instead of ever creating a
+        // goal. `join_text` itself already rejects a bare `/goal start` at
+        // the parser level (`CommandError::InvalidArgs`), so this proves
+        // the parser-level rejection renders as a local usage error too,
+        // not a silently-submitted empty turn.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/goal start".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let goal_path = env.project.join(PROJECT_MARKER).join(GOAL_FILE);
+        assert!(
+            GoalHost::load(&goal_path).ok().flatten().is_none(),
+            "a bare /goal start must never create a goal"
+        );
+    }
+
+    #[test]
+    fn slash_goal_pause_then_resume_transitions_the_real_goal_through_goal_host() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/goal start pause and resume me".to_owned()),
+            InteractiveInput::Submit("/goal pause".to_owned()),
+            InteractiveInput::Submit("/goal resume".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(painted.contains("goal pause: ok"), "{painted}");
+        assert!(painted.contains("goal resume: ok"), "{painted}");
+
+        let goal_path = env.project.join(PROJECT_MARKER).join(GOAL_FILE);
+        let host = GoalHost::load(&goal_path).expect("load").expect("goal exists");
+        assert_eq!(
+            host.snapshot().expect("snapshot").state(),
+            agent_runtime::GoalState::Active,
+            "resume after pause must land back on Active"
+        );
+    }
+
+    #[test]
+    fn slash_goal_cancel_clears_the_real_goal_and_the_goals_panel_stops_showing_it() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/goal start cancel me please".to_owned()),
+            InteractiveInput::Submit("/goal cancel".to_owned()),
+            // Re-open the Goals route *after* the cancel so the captured
+            // frame reflects whatever `AppState.goals` holds post-cancel,
+            // not a stale render from before the cancel completed.
+            InteractiveInput::Submit("/goal".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(painted.contains("goal cancel: ok"), "{painted}");
+        // `rendered_output` is every frame this session ever painted,
+        // concatenated (the renderer's own capture buffer has no per-frame
+        // boundary) — "goal started: cancel me please" legitimately appears
+        // in an *earlier* frame and always will. What must not survive into
+        // the *last* painted frame is the Goals panel still showing that
+        // goal — split on this renderer's own screen-clear sequence
+        // (`crossterm::terminal::Clear(ClearType::All)`, emitted once per
+        // `TuiRenderer::render` call) and check only the final one.
+        let last_frame = painted.rsplit("\u{1b}[2J").next().expect("at least one frame");
+        assert!(
+            last_frame.contains("no goal"),
+            "the final frame must show the Goals panel's empty state, not the \
+             cancelled goal: {last_frame}"
+        );
+        assert!(
+            !last_frame.contains("cancel me please"),
+            "a cancelled goal must not keep showing in the Goals panel's final frame: {last_frame}"
+        );
+
+        let goal_path = env.project.join(PROJECT_MARKER).join(GOAL_FILE);
+        let host = GoalHost::load(&goal_path).expect("load");
+        assert!(
+            host.is_none_or(|h| h.snapshot().is_none()),
+            "cancel clears the host's own snapshot (see GoalState's doc comment) and \
+             GoalHost::save removes the now-empty goal.json"
+        );
+    }
+
+    #[test]
+    fn goal_lifecycle_commands_with_no_active_goal_show_a_local_error_not_a_crash() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/goal pause".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(painted.contains("no active goal"), "{painted}");
+    }
+
+    #[test]
+    fn unsupported_kernel_commands_render_an_honest_message_and_never_silently_no_op() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/mcp add example-mcp-server".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(painted.contains("not available"), "{painted}");
+        assert!(painted.contains("MCP"), "{painted}");
+    }
+
+    #[test]
+    fn a_slash_command_never_reaches_the_model_and_a_following_plain_message_still_does() {
+        // Mirrors `a_second_plain_text_message_does_not_crash_the_session_
+        // and_a_turn_actually_runs`'s own reasoning: scripted inputs process
+        // with no real delay, so this does not wait for a real model
+        // response (that would mean mocking the model or depending on
+        // whatever provider happens to be configured on the machine running
+        // the test). What this proves instead: a local command (`/goal
+        // show`, a read-only route open — no kernel event at all) does not
+        // touch `turn_in_flight`, and the *next* input — ordinary text — is
+        // still free to reach real `submit_turn` execution afterward
+        // (dropped only if a turn were already in flight, which nothing
+        // here put one into).
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options(vec![
+            InteractiveInput::Submit("/goal show".to_owned()),
+            InteractiveInput::Submit("hello".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+    }
+
+    #[test]
+    fn command_error_text_distinguishes_unknown_from_invalid_syntax() {
+        assert_eq!(
+            command_error_text(&CommandError::UnknownCommand),
+            "unknown command — type /help for available commands"
+        );
+        assert_eq!(command_error_text(&CommandError::TooLong), "command too long");
+        assert_eq!(
+            command_error_text(&CommandError::InvalidArgs { command: "fork" }),
+            "/fork"
+        );
+        assert_eq!(command_error_text(&CommandError::Empty), "");
+    }
+
+    #[test]
+    fn unsupported_command_text_names_the_specific_gap_not_a_generic_message() {
+        let agent_text = unsupported_command_text(&KernelAction::PauseAgent { id: None });
+        assert!(agent_text.contains("agent registry"), "{agent_text}");
+        let mcp_text = unsupported_command_text(&KernelAction::AddMcp {
+            target: "x".to_owned(),
+        });
+        assert!(mcp_text.contains("MCP"), "{mcp_text}");
+        assert_ne!(
+            agent_text, mcp_text,
+            "different unsupported command families must not collapse into one generic string"
+        );
     }
 
     #[test]

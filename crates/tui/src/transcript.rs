@@ -175,6 +175,10 @@ pub fn render_block_parts(entry: &crate::state::TranscriptEntry) -> (RenderBlock
             (RenderBlockKind::Error, format!("(turn failed: {reason})"))
         }
         TranscriptEntry::TurnInterrupted => (RenderBlockKind::System, "(interrupted)".to_owned()),
+        TranscriptEntry::CommandOutput { text } => (RenderBlockKind::System, text.clone()),
+        TranscriptEntry::CommandError { text } => {
+            (RenderBlockKind::Error, format!("(command error: {text})"))
+        }
     }
 }
 

@@ -5174,6 +5174,201 @@ empty sidebar content, unchanged from the crate's own pre-existing precedent for
 — building real view-models for them needs data `AppState` does not carry today, out of this task's scope to
 invent.
 
+**Slash-command control-plane wiring, done 2026-09-07, user-directed.** Framed against the now-real compositor
+path (`kernel events -> reduce() -> AppState -> compositor -> crossterm`, this document's own entry directly
+above): command-shaped functionality already existed in `crates/tui/src/commands.rs` (a ~37-variant `KernelAction`
+enum, a full parser, a static help catalog), but production behavior was badly broken, not merely incomplete —
+investigated before any edit, not assumed.
+**The actual bug, found and fixed first:** every `CommandError` other than `Empty` — an unknown command, or a
+known command with bad arguments — propagated as `InteractiveError::Command`, which `SessionLoop::run`'s own `?`
+turned into ending the *entire* interactive session. Reproduced directly: `/this-command-does-not-exist` (or
+`/fork extra-argument`) crashed the whole TUI. This is a strictly worse failure mode than the "does an unknown
+command silently become a model turn?" question the driving instruction asked to check first — the parser
+already correctly refuses to treat slash input as a prompt (`CommandError::NotACommand` only leaves `parse_command`
+for non-`/`-prefixed input, which `submit_composer` routes to a real turn *before* ever calling `parse_command`,
+so that boundary was already right); the defect was entirely in how a *recognized* parse failure was handled
+afterward. Fixed by making `dispatch_slash` never return `Err` for a `CommandError` again — it renders a local
+message and continues — and by deleting the now-permanently-unreachable `InteractiveError::Command` variant
+(and its two match arms) rather than leaving a dead branch that only *looks* handled.
+**Command inventory** (every `UiCommand`/`KernelAction` variant, classified; full backend survey by a dedicated
+investigation pass, cited by file/function, not guessed):
+- **A — already fully implemented:** `/help` was parsed correctly but its `FrontendAction::InlineHelp` result was
+  silently dropped — now renders (see below), so this moves from a de-facto no-op to real A. `/quit`; every
+  `Inspector`-routing command (`/agents`, `/goal` [show], `/diff`, `/memory`, `/context` [status/inspect],
+  `/knowledge` [list/show], `/playbook` [list/show], `/trace`, `/insights`, `/jobs` [list/show/logs], `/model`
+  [list/doctor], `/mcp` [list/doctor], `/permissions`, `/plugins` [list], `/policy`, `/sandbox`) — these already
+  reduce a real `SetRoute` and the panel renders whatever `AppState` actually carries (some panels render empty;
+  that gap belongs to the prior TUI-wiring task, not reopened here). `/fork`, `/rewind` — real `KernelClient`
+  calls, unchanged. `CancelAgent`/`TerminateAgent`/`CancelJob` already reach `self.interrupt()` (a real, if
+  session-wide rather than per-id, kernel call) — pre-existing, not touched.
+- **B — parsed but disconnected, now wired:** `/goal start <text>` (`KernelAction::StartGoal`) — before this task,
+  its `kernel_api()` classification of `KernelApi::SubmitTurn` sent it straight into `self.submit_turn("")`, an
+  *empty-text turn*, silently discarding the statement and never creating a goal. `/goal pause|resume|cancel`
+  (`PauseGoal`/`ResumeGoal`/`CancelGoal`) — real, wired, tested `GoalHost`/`GoalCommand` domain operations
+  (`run_goal_command`'s own headless-CLI branches, `accrue_turn_usage`) that the interactive dispatcher simply
+  never called (`KernelApi::Approve | KernelApi::Dispatch => {}`, a silent no-op for every one of them). `/help`
+  itself (see above).
+- **C — partially implemented:** none found distinct from A/B — `CancelAgent`/`TerminateAgent`/`CancelJob`'s
+  session-wide (not per-id) interrupt is closer to "correctly wired to the only cancellable unit that exists"
+  than "some subcommands stubbed"; left alone, see the Agents finding below.
+- **D — advertised but unsupported, confirmed by a dedicated backend-capability survey, not left to guess:**
+  `ShowGoalBudget` (`/goal budget`) — no display or mutation backend in *either* the TUI or the headless CLI
+  (`run_goal_command` has no `"budget"` arm despite `docs/reference/cli-command-reference.md` documenting one —
+  a pre-existing doc/CLI gap, not something this task's scope covers fixing). `PauseAgent`/`ResumeAgent`/
+  `SleepAgent` — `AgentProjection`'s reducer (`EventKind::AgentSpawned`/`AgentStarted`/`AgentStateChanged`/
+  `AgentCancelled`) is real, but *nothing in production ever emits these events*: subagents run via
+  `execute_task_spawn` → `SubagentRunner`, a synchronous in-process call that never touches the event ledger, so
+  there is no running-agent registry to pause/resume/sleep a specific id against. `ReindexContext` — a real
+  on-demand hook would mean touching `context_retrieval.rs`'s indexing pipeline, which the driving instruction
+  explicitly places out of scope ("no scope creep into retrieval/RAG") even though the underlying `IndexPipeline`
+  is real and already runs automatically every turn. `SuggestKnowledge`/`ApproveKnowledge`/`RejectKnowledge`/
+  `EditKnowledge` — `crates/knowledge` is real but models an unrelated P11 feedback/preference system, not a
+  `KnowledgeId`-addressable candidate store; no such store exists anywhere. `RunPlaybook` — `scheduler::playbook::
+  compile` is real (used by `p9_commands::run_playbook_compile`) but nothing executes a compiled graph in
+  production (`scheduler::service::GraphService` is a real, fully implemented execution service with zero callers
+  anywhere in `apps/rapid`). `ValidatePlaybook` — `compile`'s own validation is real and callable, but the TUI
+  grammar addresses playbooks by bare `name`, and no name-addressable playbook store exists to resolve one
+  against. `SelectModel` — no "switch model" API exists; the closest real lever is mutating the process's own
+  `RAPIDLM_MODEL` env var (read fresh every turn by `select_from_process_env_gated`), which is new plumbing, not
+  a call to an existing operation. `AddMcp`/`RemoveMcp`/`AuthMcp` — `mcp::trust::McpTrustStore` is a real, fully
+  implemented client-trust registry (`register_project_server`/`grant`/`revoke`) with the right shape, but zero
+  callers in `apps/rapid`; wiring it means new `ProjectMcpServerSpec`/`TrustGrant`/`TrustScope` construction
+  decisions from a bare string the TUI grammar doesn't carry inputs for — real backend, genuine new product
+  surface, matches the driving instruction's own "avoid broad MCP/plugin redesign." `InstallPlugin`/
+  `RemovePlugin`/`SetPluginPermissions` — same shape of gap: `plugin_host::install::PluginInstaller` is real and
+  production-quality (staged/atomic install with rollback) but has zero callers in `apps/rapid`; wiring it hits
+  the identical spec-construction and scope boundary as MCP. `ResumeSession`/`CompactSession` — no `resume` method
+  exists on `KernelClient` at all (its trait surface is exactly 8 methods: create/get_session, submit_turn,
+  interrupt, subscribe, approve, fork_session, rewind); `agent_runtime::compaction::Compactor` and
+  `context_engine::compact_policy::compact_with_policy` are both real but have zero on-demand callers (the latter
+  only fires automatically inside overflow recovery) — wiring either as a manual action is new integration work,
+  not a connection. `ApplyChangeSet`/`Rollback` — no `ChangeSet` type exists anywhere in the workspace; pure enum
+  skeleton. `Handoff`/`Takeover`/`ControlReturn` — `crates/handoff` (a real, substantial ownership-transfer state
+  machine) isn't even a Cargo dependency of `apps/rapid`; `computer_use::browser::takeover::TakeoverReconciler`
+  is real and maps closely to `Takeover`/`ControlReturn` but has zero callers — both are separate architectural
+  integrations, not narrow wires. `ComputerObserve`/`ComputerRecord`/`ComputerTest` — `ComputerUseRuntime` is real
+  but only instantiated in its own module's tests, never in production.
+- **E — purely local, unchanged:** `/quit`, every route-opening command already covered under A.
+**Dispatcher architecture chosen:** `apply_kernel_action` no longer dispatches solely on the coarse
+`action.kernel_api()` category (which collapsed `StartGoal` into the same bucket as every other `SubmitTurn`-
+shaped action and `PauseGoal`/`InstallPlugin`/`ComputerTest` into one silent no-op bucket). It now matches the
+*specific* `KernelAction` variant first for everything this task wires (`StartGoal`, `PauseGoal`, `ResumeGoal`,
+`CancelGoal`), falling through to the original `kernel_api()`-based dispatch — byte-for-byte unchanged — for
+`Interrupt`/`ForkSession`/`Rewind`/`SubmitTurn` (the last now structurally unreachable in practice, since
+`StartGoal` was its only real producer, but left in place rather than deleted defensively), and rendering
+`unsupported_command_text(&action)` for every one of the 28 remaining `Approve`/`Dispatch` variants — a workspace
+grep after implementation confirms all 37 `KernelAction` variants (minus the two now-superseded goal-budget/
+approval-broker exceptions noted above) resolve to an explicit, named production behavior, none silently no-op.
+Goal mutations reuse `GoalHost`/`GoalCommand`/`GoalActor`/`host.update` directly (the same transactional API
+`run_goal_command` and `accrue_turn_usage` already call) — not `goal_lifecycle` itself, since that CLI-only
+function `println!`s its result, which would corrupt the full-screen compositor; the shared, reused layer is the
+persistence API underneath, not the CLI's own presentation glue, mirroring the driving instruction's own diagram.
+**Command-result rendering:** `TranscriptEntry` gained two new, narrowly-scoped variants — `CommandOutput { text
+}` and `CommandError { text }` — rendered via the existing `RenderBlockKind::System`/`Error` kinds (already
+defined, previously only reached by `TurnInterrupted`/`TurnFailed`), so a command result is never misrepresented
+as assistant/model output and never wears a tool glyph. Reached through a new, narrow `LocalUiEvent::
+AppendCommandOutput`/`AppendCommandError` pair — the same "local chrome, not a kernel mutation" mechanism
+`SyncGoal` already established — never a raw `println!`/`write!` outside the renderer. A third narrow addition,
+`LocalUiEvent::ClearGoal(GoalId)`, closes a real correctness gap `/goal cancel` would otherwise have introduced:
+completion/cancel clear `GoalHost`'s own snapshot entirely (`agent_runtime::GoalState`'s own doc comment: "Completion/
+cancel clear the snapshot"), so without an explicit clear the Goals panel would keep showing a cancelled goal as
+still `Active` until the next session start happened to reload it.
+**Model-turn separation, verified explicitly:** a slash command never reaches `kernel::SubmitTurn` with real text,
+never acquires the turn lease, never appears in the transcript as `TranscriptEntry::User`/`Assistant`, and cannot
+be reached by mistyping past the parser (`CommandError::NotACommand` is structurally unreachable from
+`dispatch_slash` — `submit_composer` only calls it for input starting with `/`). Goal mutations run against
+`.rapidlm/goal.json`'s own independent cross-process lock, entirely separate from the kernel's turn lease — the
+same concurrency model `accrue_turn_usage` already relies on to write concurrently with a running turn — so no
+new "commands blocked while a turn is in flight" gate was invented; none of the existing invariants required one.
+**Help/unknown-command semantics:** `/help` renders `InlineHelp::usage()` (the full catalog, or one command's own
+usage line for `/help <command>`) through `CommandOutput`. An unknown command renders a short, specific message
+("unknown command — type /help for available commands"), never the full catalog dump. A known command with bad
+arguments renders `CommandError::help()`'s own per-command usage line (already correctly scoped by the existing
+parser, not a full dump) — proven distinct with `/fork extra-argument` rendering only `/fork`'s own usage, never
+`/playbook`'s.
+**Goal/evidence:** only `GoalHost`'s existing transactional `update`/`apply` API is used; no `load -> mutate ->
+save` outside it, no direct file writes, no evidence-store changes at all (evidence commands are not part of the
+TUI's parsed grammar today).
+**Approvals — investigated, deliberately left as an isolated gap, not implemented:** the backend is fully real
+and end-to-end tested (`ToolApprovalRequired` kernel events already produce a real `Modal::Approval{id}`;
+`kernel::KernelClient::approve(ResolveApproval)` is a real, unit-tested resolution call) — but there is no parsed
+slash command anywhere in `UiCommand` that represents "approve" or "deny" a pending approval; `KernelApi::Approve`
+is a different, unrelated classification meaning "this *other* action should be broker-gated," not "this command
+resolves an approval." Per the driving instruction's own explicit guidance for exactly this shape of gap
+("isolate that as a separate architectural gap" when semantics themselves are incomplete rather than only the
+dispatch), no new `/approve`/`/deny` command was invented this task — that would be a new command surface, not a
+disconnected wire.
+**MCP/plugin/knowledge:** covered under category D above — real, unwired backends exist for MCP and plugins;
+knowledge has no real backend at all. None implemented, per the driving instruction's explicit "avoid broad
+MCP/plugin redesign" and "do not build a retrieval/RAG subsystem" scope boundaries.
+**Files changed:** `apps/rapid/src/interactive.rs` (dispatcher rewrite, `GoalLifecycleKind`, `command_error_text`,
+`unsupported_command_text`, `start_goal`/`goal_lifecycle_command`/`goal_path` on `SessionLoop`, `InteractiveError::
+Command` removed); `crates/tui/src/state.rs` (`TranscriptEntry::CommandOutput`/`CommandError`, `LocalUiEvent::
+AppendCommandOutput`/`AppendCommandError`/`ClearGoal`, their reducer arms); `crates/tui/src/transcript.rs`
+(`render_block_parts` extended for the two new `TranscriptEntry` kinds).
+**Tests added: 11 in `apps/rapid/src/interactive.rs`'s `mod tests` (503 total `-p rapid --lib`, up from 491) plus
+5 in `crates/tui/src/state.rs` (222 total `-p tui --lib`, up from 219).** Every new `apps/rapid` test drives the
+real `run_interactive` entry point with `InteractiveOptions::capture_render` (not a lower-level bypass), proving
+the production dispatcher, not a reimplementation: unknown-command and invalid-argument local errors (with the
+session surviving to a following `/quit`); `/help`'s rendered catalog; `/goal start` creating a real goal (checked
+by loading the real `goal.json` back through `GoalHost::load`, not a test-only shortcut); a bare `/goal start`
+(no text) never creating one; `/goal pause` → `/goal resume` landing back on `GoalState::Active` (checked
+against the real file); `/goal cancel` clearing both the real file and the Goals panel's *final* rendered frame
+(split on the renderer's own screen-clear sequence, since the capture buffer otherwise legitimately contains every
+earlier frame too — an early version of this test asserted "does not contain" over the whole cumulative capture
+and false-failed on the goal's own now-historical "started" message); goal-lifecycle commands with no active goal
+showing "no active goal" rather than crashing; an unsupported command (`/mcp add ...`) rendering its own honest,
+specific message; a slash command followed by ordinary text still reaching real turn-submission machinery
+(mirrors this file's own pre-existing `a_second_plain_text_message_...` test's reasoning: no real model call is
+awaited, only that nothing crashes and the lease isn't wrongly held). Plus 2 direct unit tests on
+`command_error_text`/`unsupported_command_text` proving distinct, non-generic messages per error/command family.
+The 5 `crates/tui` tests exercise the new reducer arms in isolation (`ClearGoal` on a present/absent goal,
+`AppendCommandOutput`/`AppendCommandError` producing the right distinct `TranscriptEntry` kinds).
+**Revert-cycle verification, three of the four applicable cases (the fourth — "unknown command reaching the
+model" — does not apply: that boundary was already correct before this task, confirmed by tracing `parse_command`/
+`submit_composer` directly, not assumed):** (1) *interception* — temporarily restored the literal old fallthrough
+(`Err(err) => Err(InteractiveError::Internal)`); both the unknown-command and invalid-argument tests failed
+exactly as predicted (`Internal`, ending the session); restored, both pass again. (2) *production rendering* —
+temporarily bypassed `/help`'s structured result (dropped `help` unused, same as the original code); the
+`/help`-catalog test failed (blank rendered screen, no `/goal` anywhere); restored, passes again. (3) *mutation*
+— temporarily short-circuited `start_goal` to render a fake success message without ever calling `GoalHost::
+update`; the real-goal-creation test failed (`goal.json must exist after /goal start`); restored, passes again.
+**Self-review findings:** the workspace-wide post-implementation grep (above, under "Dispatcher architecture
+chosen") is itself a finding this task's own checklist asked for — it caught that my first `unsupported_command_
+text` draft's arithmetic (35 vs. 37 total variants) was wrong before I trusted it, not after; recounted directly
+against `grep -oP "KernelAction::\w+" crates/tui/src/commands.rs | sort -u` until it matched exactly. No slash
+command falls through to the model (verified above). No duplicate CLI/TUI domain logic — `goal_lifecycle_command`
+calls the same `GoalHost` API `goal_lifecycle` calls, not a copy of `goal_lifecycle` itself, specifically because
+that function's `println!`s are incompatible with the full-screen compositor. No `println!`/raw `write!` added
+outside the renderer. No widget performs a domain mutation — `SessionLoop`, not `crates/tui`, owns every
+`GoalHost` call. No direct unsafe goal file writes — every mutation goes through `GoalHost::update`'s existing
+lock. No persistence lock held across a slow operation — every new call is a single bounded `GoalHost::update`,
+no external command execution inside it. No TUI event loop blocking — same reasoning. No turn-lease bypass —
+goal mutations never touch `kernel::SubmitTurn`/`turn_in_flight`. No secrets in command output — none of the
+wired commands (goal start/pause/resume/cancel, help, error messages) surface any credential/config value. No
+parser/help mismatch introduced — `CATALOG_HELP`'s existing text was not changed; the driving instruction's
+"remove/adjust stale advertising" option was not exercised because the *parser* catalog was never the false
+claim — `CLI_USAGE` (the separate, pre-existing *headless-CLI* usage string) already documents subcommands with
+no `run_subcommand` arm at all (`run`, `resume`, `fork`... some do exist under different names), but that is a
+pre-existing headless-CLI documentation gap, not a slash-command one, and out of this task's scope. No command
+variant still silently no-ops (verified by the exhaustive grep above). No accidental `GoalDriver` integration —
+not referenced anywhere in this diff. No scope creep into retrieval/RAG — `ReindexContext` was deliberately left
+unwired specifically to avoid this, documented under category D above, not silently skipped.
+**Verification:** `cargo test -p tui --lib` (222 passed, up from 219), `cargo test -p rapid --lib` (503 passed, up
+from 491), `cargo build --workspace --tests` clean, `cargo clippy -p rapid -p tui --all-targets` — zero new
+findings on any file this task touched (confirmed by diff-hunk-range comparison; the pre-existing `interactive.rs`
+`collapsible_if` lints prior tasks already reported by line number are unchanged and outside every range this
+task edited). Full `cargo test --workspace`: 100% clean this run, zero failures anywhere (including the
+`exec_tools` test flagged as a known occasional flake by the prior task — it passed cleanly this run, consistent
+with "environmental, not a regression").
+**Deliberately not attempted, per the driving instruction's own scope:** `GoalDriver` integration; retrieval/RAG
+changes or a knowledge-candidate store; broad MCP/plugin redesign (real backends documented above, left unwired);
+a new `/approve`/`/deny` command (approval backend documented above, left isolated); `/goal budget` display or
+mutation (no backend in either surface); mid-session model switching; cross-process session resume; on-demand
+transcript compaction; change-set apply/rollback; execution handoff/takeover; computer-use action wiring;
+playbook execution; new persistence systems; TUI visual redesign; pricing; sandbox changes; execution-loop
+redesign; filling any of the data-poor panels the prior task already catalogued.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

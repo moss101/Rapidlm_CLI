@@ -90,6 +90,21 @@ pub enum LocalUiEvent {
     /// into the frontend without a kernel event. Local chrome, not a mutation
     /// of business authority.
     SyncGoal(GoalProjection),
+    /// Drop a host-owned goal projection that no longer has a snapshot to
+    /// project from — completion/cancel clear the host's own snapshot (see
+    /// `agent_runtime::GoalState`'s own doc comment), so without this a
+    /// completed/cancelled goal would keep showing as its last-known
+    /// (usually `Active`) lifecycle forever. Local chrome, not a mutation of
+    /// business authority — the real state change already happened in the
+    /// host; this only stops the frontend from displaying a stale row.
+    ClearGoal(GoalId),
+    /// A local slash-command's own output — help text, a confirmation — that
+    /// never touched the model. See [`TranscriptEntry::CommandOutput`].
+    AppendCommandOutput(String),
+    /// A local slash-command that could not run: unknown command, bad
+    /// arguments, or a refused domain mutation. Never a turn/tool failure —
+    /// see [`TranscriptEntry::CommandError`].
+    AppendCommandError(String),
 }
 
 /// Typed fold failure. Display never echoes untrusted payload text.
@@ -289,6 +304,16 @@ pub enum TranscriptEntry {
     },
     TurnFailed { reason: String },
     TurnInterrupted,
+    /// A local slash-command's own output (help text, a confirmation). Never
+    /// sent to or produced by the model — kept distinct from [`Self::
+    /// Assistant`] so a command result is never misrepresented as model
+    /// output.
+    CommandOutput { text: String },
+    /// A local slash-command that could not run (unknown command, bad
+    /// arguments, a refused domain mutation). Kept distinct from [`Self::
+    /// TurnFailed`] so a parser/dispatch error is never misrepresented as a
+    /// turn failure — no turn ever started.
+    CommandError { text: String },
 }
 
 /// One tool call's lifecycle, as reflected into the transcript. Not the
@@ -607,6 +632,18 @@ fn apply_local(mut state: AppState, event: &LocalUiEvent) -> Result<AppState, Ui
         LocalUiEvent::SyncGoal(goal) => {
             insert_goal(&mut state, goal.clone())?;
             state.selected_goal = Some(goal.id);
+        }
+        LocalUiEvent::ClearGoal(id) => {
+            state.goals.remove(id);
+            if state.selected_goal == Some(*id) {
+                state.selected_goal = None;
+            }
+        }
+        LocalUiEvent::AppendCommandOutput(text) => {
+            push_transcript(&mut state, TranscriptEntry::CommandOutput { text: text.clone() });
+        }
+        LocalUiEvent::AppendCommandError(text) => {
+            push_transcript(&mut state, TranscriptEntry::CommandError { text: text.clone() });
         }
     }
     Ok(state)
@@ -1662,6 +1699,64 @@ mod tests {
         assert_eq!(
             state.goals()[&GOAL_ID.parse().expect("g")].statement(),
             Some("ship feature X")
+        );
+    }
+
+    #[test]
+    fn clear_goal_drops_the_projection_and_deselects_it() {
+        let projection = GoalProjection {
+            id: GOAL_ID.parse().expect("goal"),
+            statement: Some("cancel me".to_owned()),
+            lifecycle: GoalLifecycle::Active,
+            stop_reason: None,
+            max_turns: None,
+            max_tokens: None,
+            turns: 0,
+            tokens: 0,
+        };
+        let state = reduce(
+            AppState::new(),
+            &UiEvent::Local(LocalUiEvent::SyncGoal(projection)),
+        );
+        let goal_id: GoalId = GOAL_ID.parse().expect("g");
+        assert!(state.goals().contains_key(&goal_id));
+
+        let state = reduce(state, &UiEvent::Local(LocalUiEvent::ClearGoal(goal_id)));
+        assert!(!state.goals().contains_key(&goal_id));
+        assert_eq!(state.selected_goal(), None);
+    }
+
+    #[test]
+    fn clear_goal_for_an_unknown_id_is_a_harmless_no_op() {
+        let goal_id: GoalId = GOAL_ID.parse().expect("g");
+        let state = reduce(
+            AppState::new(),
+            &UiEvent::Local(LocalUiEvent::ClearGoal(goal_id)),
+        );
+        assert!(state.goals().is_empty());
+        assert_eq!(state.selected_goal(), None);
+    }
+
+    #[test]
+    fn append_command_output_and_error_push_distinct_transcript_kinds() {
+        let state = reduce(
+            AppState::new(),
+            &UiEvent::Local(LocalUiEvent::AppendCommandOutput("goal started: x".to_owned())),
+        );
+        let state = reduce(
+            state,
+            &UiEvent::Local(LocalUiEvent::AppendCommandError("unknown command".to_owned())),
+        );
+        assert_eq!(
+            state.transcript(),
+            &[
+                TranscriptEntry::CommandOutput {
+                    text: "goal started: x".to_owned()
+                },
+                TranscriptEntry::CommandError {
+                    text: "unknown command".to_owned()
+                },
+            ]
         );
     }
 
