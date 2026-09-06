@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::io::Read;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -493,9 +494,23 @@ fn required_kinds_for(snapshot: &GoalSnapshot, requirement_id: &str) -> Vec<Evid
 /// Record one check observation into the goal evidence store: one record per
 /// required kind, System producer, citing the ledger event appended for the
 /// real run.
+///
+/// Persists immediately, under `GoalHost::update_evidence`'s lock — not
+/// accumulated in `host`'s own in-memory store across the whole claim and
+/// saved once at the end. `run_claim`'s own per-check loop can span many
+/// minutes across several checks (each running a real, potentially slow
+/// external command); batching every check's evidence into one save at the
+/// very end would mean any *other* evidence writer's own commit during
+/// that window — another `rapid goal evidence record`, a second concurrent
+/// `rapid goal claim` — gets silently erased when this claim finally
+/// flushes its own stale, pre-those-changes copy. Locking per check keeps
+/// each lock hold to milliseconds (the check's own command has already
+/// finished by the time this is called) while still reflecting every
+/// writer's committed work.
 #[allow(clippy::too_many_arguments)]
 fn record_goal_evidence(
     host: &mut GoalHost,
+    evidence_path: &Path,
     snapshot: &GoalSnapshot,
     check: &CheckSpec,
     run: &CheckRun,
@@ -510,7 +525,7 @@ fn record_goal_evidence(
         .with_locator(check.command.clone())
         .map_err(|_| GoalClaimError::InvalidCommand)?;
     let kinds = required_kinds_for(snapshot, &check.requirement_id);
-    let mut recorded = 0;
+    let mut specs = Vec::with_capacity(kinds.len());
     for kind in kinds {
         let assertion = if kind == EvidenceKind::Test {
             TEST_PASSED.to_owned()
@@ -533,10 +548,26 @@ fn record_goal_evidence(
         .with_command(check.command.clone())
         .map_err(|_| GoalClaimError::InvalidCommand)?
         .with_ledger_ref(citation.clone());
-        host.record_evidence(spec)
-            .map_err(|_| GoalClaimError::Ledger)?;
-        recorded += 1;
+        specs.push(spec);
     }
+    let recorded = specs.len();
+    host.update_evidence(evidence_path, |host| -> Result<(), agent_runtime::EvidenceError> {
+        for spec in specs {
+            host.record_evidence(spec)?;
+        }
+        Ok(())
+    })
+    .map_err(|err| {
+        match &err {
+            crate::goal_host::GoalTransactionError::Persist(persist_err) => {
+                eprintln!("{persist_err}");
+            }
+            crate::goal_host::GoalTransactionError::Mutate(mutate_err) => {
+                eprintln!("{mutate_err}");
+            }
+        }
+        GoalClaimError::Ledger
+    })?;
     Ok(recorded)
 }
 
@@ -545,6 +576,7 @@ fn record_goal_evidence(
 /// observations and `goal verify` completes.
 pub fn run_claim(
     host: &mut GoalHost,
+    evidence_path: &Path,
     ledger: &EventLedger,
     claim: GoalClaim,
     cancel: &CancellationToken,
@@ -601,7 +633,8 @@ pub fn run_claim(
                 .map_err(|_| GoalClaimError::Ledger)?;
 
         let node_id = EvidenceId::new();
-        let recorded = record_goal_evidence(host, &snapshot, check, &run, &citation)?;
+        let recorded =
+            record_goal_evidence(host, evidence_path, &snapshot, check, &run, &citation)?;
         evidence_recorded += recorded;
         citations.push(citation);
 
@@ -843,6 +876,7 @@ mod tests {
 
         let outcome = run_claim(
             &mut host,
+            &dir.join(crate::goal_host::EVIDENCE_FILE),
             &ledger,
             claim(vec![("c1", "/bin/echo ok")]),
             &CancellationToken::new(),
@@ -873,6 +907,7 @@ mod tests {
 
         let outcome = run_claim(
             &mut host,
+            &dir.join(crate::goal_host::EVIDENCE_FILE),
             &ledger,
             claim(vec![("c1", "/usr/bin/false")]),
             &CancellationToken::new(),
@@ -897,6 +932,7 @@ mod tests {
 
         let outcome = run_claim(
             &mut host,
+            &dir.join(crate::goal_host::EVIDENCE_FILE),
             &ledger,
             claim(vec![("c1", "/bin/echo ok")]),
             &CancellationToken::new(),
@@ -928,7 +964,13 @@ mod tests {
             1,
         )
         .expect("claim");
-        let outcome = run_claim(&mut host, &ledger, slow, &CancellationToken::new())
+        let outcome = run_claim(
+            &mut host,
+            &dir.join(crate::goal_host::EVIDENCE_FILE),
+            &ledger,
+            slow,
+            &CancellationToken::new(),
+        )
             .expect("claim runs");
 
         assert!(!outcome.accepted);
@@ -945,6 +987,7 @@ mod tests {
         let mut host = host_with_requirements(&[("c1", "test")]);
         let err = run_claim(
             &mut host,
+            &ledger_dir.join(crate::goal_host::EVIDENCE_FILE),
             &ledger,
             claim(vec![("nope", "/bin/echo ok")]),
             &CancellationToken::new(),

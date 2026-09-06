@@ -814,6 +814,17 @@ impl EvidenceService {
         self.backing = Some(backing);
     }
 
+    /// Discard every record, leaving the installed backing resolver (if
+    /// any) untouched. For a host re-loading the on-disk evidence doc fresh
+    /// under a lock: `restore` rejects a record whose id is already present
+    /// (`EvidenceError::DuplicateId`), so reloading onto a non-empty store
+    /// would spuriously fail on every record this instance already had —
+    /// this clears just the store half of that state, not the whole
+    /// service, so a previously-installed resolver survives the reload.
+    pub fn reset_store(&mut self) {
+        self.store = EvidenceStore::new();
+    }
+
     fn backing(&self) -> Option<&SharedBackingResolver> {
         self.backing.as_ref()
     }

@@ -490,15 +490,29 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
         // *currently* on disk (reloaded fresh under the lock), not this
         // process's possibly-stale outer `host` — the same reload-then-
         // mutate-then-save transaction `create`/`replace` uses above.
-        "pause" | "resume" | "cancel" | "complete" => host
-            .update(&path, |host| goal_lifecycle(host, sub, &cancel))
-            .map_err(|err| match err {
-                GoalTransactionError::Persist(persist_err) => {
-                    eprintln!("{persist_err}");
-                    InteractiveError::Internal
+        "pause" | "resume" | "cancel" | "complete" => {
+            if sub == "complete" {
+                // `complete`'s own gate reads whatever `host.evidence`
+                // currently holds — refresh it right before gating so a
+                // concurrently-committed record (another `rapid goal
+                // evidence record`, a `rapid goal claim` finishing a check)
+                // isn't missed just because it landed after this process's
+                // own startup load. See `GoalHost::reload_evidence`'s own
+                // doc comment for why this plain, unlocked read is safe.
+                if let Err(err) = host.reload_evidence(&evidence_path) {
+                    eprintln!("{err}");
+                    return Ok(JsonlExitCode::Runtime.as_i32());
                 }
-                GoalTransactionError::Mutate(inner) => inner,
-            }),
+            }
+            host.update(&path, |host| goal_lifecycle(host, sub, &cancel))
+                .map_err(|err| match err {
+                    GoalTransactionError::Persist(persist_err) => {
+                        eprintln!("{persist_err}");
+                        InteractiveError::Internal
+                    }
+                    GoalTransactionError::Mutate(inner) => inner,
+                })
+        }
         "claim" => {
             let Some(ledger) = claim_ledger.as_ref() else {
                 eprintln!("ledger unavailable; claims cannot be audited");
@@ -525,11 +539,12 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
                     eprintln!("{err}");
                     InteractiveError::Usage
                 })?;
-            let outcome = crate::goal_claim::run_claim(&mut host, ledger, claim, &cancel)
-                .map_err(|err| {
-                    eprintln!("{err}");
-                    InteractiveError::Internal
-                })?;
+            let outcome =
+                crate::goal_claim::run_claim(&mut host, &evidence_path, ledger, claim, &cancel)
+                    .map_err(|err| {
+                        eprintln!("{err}");
+                        InteractiveError::Internal
+                    })?;
             for check in &outcome.checks {
                 let status = if check.timed_out {
                     "timeout"
@@ -604,7 +619,7 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
                 return Err(InteractiveError::Usage);
             };
             match action {
-                "record" => goal_evidence_record(&mut host, &args[2..]),
+                "record" => goal_evidence_record(&mut host, &evidence_path, &args[2..]),
                 "list" => goal_evidence_list(&host),
                 _ => Err(InteractiveError::Usage),
             }
@@ -612,22 +627,22 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
         _ => Err(InteractiveError::Usage),
     }?;
 
-    // `goal.json` itself is no longer saved here: every subcommand that
-    // actually mutates the machine/snapshot (`create`/`replace`/`pause`/
-    // `resume`/`cancel`/`complete`, above) already persisted it itself,
-    // under `GoalHost::update`'s lock, against a freshly-reloaded snapshot
-    // — not this function's own possibly-stale outer `host`. The remaining
-    // subcommands (`show`/`export`/`verify`/`claim`/`evidence`) never touch
-    // `host.machine` at all, so re-saving it here would either be a no-op
-    // or, worse, silently overwrite a concurrent writer's update with this
-    // stale copy — exactly the lost-update hazard this task exists to
-    // close. Evidence is a separate file/concern (its own concurrency
-    // hazard, out of this task's scope) and still saved unconditionally,
-    // unchanged from before.
-    if let Err(err) = host.save_evidence(&evidence_path) {
-        eprintln!("{err}");
-        return Ok(JsonlExitCode::Runtime.as_i32());
-    }
+    // Neither `goal.json` nor `goal-evidence.json` is saved here: every
+    // subcommand that actually mutates state now persists it itself, under
+    // its own lock, against a freshly-reloaded snapshot/store — not this
+    // function's own possibly-stale outer `host`. `create`/`replace`/
+    // `pause`/`resume`/`cancel`/`complete` persist `goal.json` through
+    // `GoalHost::update`, above; `claim`/`evidence record` persist
+    // `goal-evidence.json` through `GoalHost::update_evidence` (`claim`
+    // once per check, immediately after that check's own — potentially
+    // long-running — external command finishes, never while it's still
+    // running). `show`/`export`/`verify` never mutate either file. A
+    // trailing unconditional save here — the previous shape, still correct
+    // for `goal.json` back when this evidence half hadn't yet been fixed —
+    // would now only ever be a no-op-at-best, stale-overwrite-at-worst:
+    // exactly the lost-update hazard this task exists to close, just
+    // narrowed to whatever tiny window separates the locked transaction
+    // above from this line.
     Ok(result)
 }
 
@@ -655,7 +670,11 @@ fn one<'a>(flags: &'a std::collections::BTreeMap<String, Vec<String>>, key: &str
     flags.get(key).and_then(|values| values.first()).map(String::as_str)
 }
 
-fn goal_evidence_record(host: &mut GoalHost, args: &[String]) -> Result<i32, InteractiveError> {
+fn goal_evidence_record(
+    host: &mut GoalHost,
+    evidence_path: &Path,
+    args: &[String],
+) -> Result<i32, InteractiveError> {
     let flags = parse_flags(args)?;
     let Some(snapshot) = host.snapshot() else {
         println!("no active goal");
@@ -744,17 +763,29 @@ fn goal_evidence_record(host: &mut GoalHost, args: &[String]) -> Result<i32, Int
         }
         _ => return Err(InteractiveError::Usage),
     }
-    let record = host.record_evidence(spec).map_err(|err| {
-        eprintln!("{err}");
+    // Locked read-modify-write: reloads the evidence store fresh under the
+    // lock immediately before appending, so a concurrent writer (another
+    // `rapid goal evidence record`, or a `rapid goal claim` persisting a
+    // check's own evidence) can never have its already-committed record
+    // silently erased by this process's own possibly-stale in-memory copy.
+    host.update_evidence(evidence_path, |host| -> Result<(), agent_runtime::EvidenceError> {
+        let record = host.record_evidence(spec)?;
+        println!(
+            "recorded {} kind={} status={} producer={}",
+            record.id(),
+            record.kind(),
+            record.status(),
+            record.producer()
+        );
+        Ok(())
+    })
+    .map_err(|err| {
+        match &err {
+            GoalTransactionError::Persist(persist_err) => eprintln!("{persist_err}"),
+            GoalTransactionError::Mutate(mutate_err) => eprintln!("{mutate_err}"),
+        }
         InteractiveError::Internal
     })?;
-    println!(
-        "recorded {} kind={} status={} producer={}",
-        record.id(),
-        record.kind(),
-        record.status(),
-        record.producer()
-    );
     Ok(0)
 }
 

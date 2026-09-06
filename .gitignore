@@ -12,10 +12,12 @@ coverage/
 # Local orchestration state (keep workflow scripts)
 .grok/rapidlm-v2/
 
-# Cross-process advisory lock for .rapidlm/goal.json (see GoalHost::update /
-# GoalLock) — a transient coordination file with no meaningful content,
-# never itself part of the persisted goal contract.
+# Cross-process advisory locks for .rapidlm/goal.json and .rapidlm/
+# goal-evidence.json (see GoalHost::update / update_evidence / GoalLock) —
+# transient coordination files with no meaningful content, never
+# themselves part of the persisted goal or evidence contract.
 .rapidlm/goal.lock
+.rapidlm/goal-evidence.lock
 
 # OS / editor
 .DS_Store

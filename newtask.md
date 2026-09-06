@@ -4919,6 +4919,129 @@ concurrency hazard (`save_evidence` still uses plain `fs::write`, not `atomic_wr
 retrieval/RAG work; any network-filesystem locking guarantee beyond what a local, `atomic_write`-based design
 already assumed everywhere else in this codebase.
 
+**`goal-evidence.json` corruption/lost-update problem fixed 2026-09-06, user-directed.** Explicitly named as a
+still-open gap by the `goal.json` task directly above; this closes it. `goal-evidence.json` is a single closed
+document (`{schema, schema_version, records: [...]}` — a `Vec<EvidenceRecord>` plus a `BTreeMap<EvidenceId,
+usize>` index in memory), owned entirely by `apps/rapid/src/goal_host.rs` (`GoalHost::save_evidence`/
+`load_evidence`, on the same `GoalHost` that owns `goal.json`) and mutated only through `agent_runtime::
+evidence::EvidenceStore::record`/`restore` — append-only and immutable in every production path: the one
+record-*mutating* method that exists, `EvidenceStore::invalidate_subject`, has zero callers anywhere outside
+its own crate (confirmed by grep), so it never reaches persistence at all. Records carry a stable id
+(`EvidenceId`) with existing, already-enforced duplicate detection (`EvidenceError::DuplicateId`) — this task
+did not invent or touch that semantic.
+**Both hazards the `goal.json` task's own doc comment named were real, found by tracing every read/write, not
+assumed:** (1) *corruption* — `save_evidence` used a plain `fs::write` (open+truncate, then write), the exact
+pre-fix shape `goal.json` itself used to have; (2) *lost updates* — worse than `goal.json`'s own case in one
+specific respect: `run_claim` (`rapid goal claim`) recorded each check's evidence into `host`'s in-memory
+store via `record_goal_evidence`, called from *inside* its own per-check loop (each check runs a real,
+possibly slow external command, up to its own `--timeout-secs`, defaulting 60s), but only ever persisted the
+whole accumulated store *once*, unconditionally, at the very end of `run_goal_command` — after `run_claim`
+fully returns. A claim with several slow checks could hold a stale, pre-accumulation copy in memory for
+minutes; any other evidence writer committing during that window (another `rapid goal evidence record`, a
+second concurrent `rapid goal claim`) would have its own already-durable record silently erased the moment
+this claim's own stale copy finally flushed.
+**Both reproduced empirically before any fix, not just reasoned about.** *Corruption*: a one-off stress probe
+(reader threads continuously reading/parsing while writer threads loop `save_evidence` for a fixed 3s window
+— inherently timing-dependent, not kept in the permanent suite, per this codebase's own testing discipline)
+observed 340 corrupt reads out of 37,091 (~0.9%) against the pre-fix plain `fs::write`; the identical probe
+against the fixed `atomic_write`-based version observed 0 corrupt reads out of 15,035 in the same window.
+*Lost updates*: the task's own worked example (two writers, initial state `[]`, both should survive) — a
+`std::sync::Barrier`-synchronized two-writer test and a 16-writer stress variant both reliably lost entries
+against the pre-fix code (see revert-cycle results below for exact numbers).
+**Mechanism: the exact same pattern `goal.json` established, reused rather than redesigned, because the
+underlying hazard and the file's own read-modify-write semantics are the same shape** — `GoalHost::
+update_evidence`, mirroring `GoalHost::update` field-for-field: acquire a cross-process advisory lock (`std::
+fs::File`'s own native `lock`/`unlock`, the same zero-new-dependency mechanism `goal.json`'s own lock uses) →
+reload the evidence store fresh from disk (discarding whatever this `GoalHost` had in memory, which can be
+stale) → run the caller's `mutate` closure → persist via `save_evidence` (now `atomic_write`-based) only if
+`mutate` returned `Ok` → release. `save_evidence` switched from `fs::write` to the same `atomic_write` helper
+`goal.json` already used — closes the corruption half on its own, independent of locking.
+**Independent locks, not one shared lock — resolved from actual call paths, not assumed.** Traced every
+production call site (`create`/`replace`/`pause`/`resume`/`cancel`/`complete` only ever mutate `goal.json`'s
+machine/snapshot; `claim`/`evidence record` only ever mutate evidence) and found no operation ever needs to
+write both files as one atomic domain unit. The one real cross-file question — `Complete`'s own evidence gate
+reading a possibly-stale `host.evidence` — resolves without shared locking because evidence is append-only/
+immutable in every reachable path: a stale evidence view can only under-count real evidence and refuse
+conservatively, never over-count and allow completion on insufficient evidence, so the fix is a fresher
+*read* (safe, unlocked), not a shared lock spanning both files. Documented as the load-bearing reasoning
+directly in `GoalLock`'s own doc comment (`goal_host.rs`) so a future change to evidence's mutability doesn't
+silently invalidate the independent-locks decision without someone having to notice why it was made.
+**A small, additional fix following directly from that same reasoning:** `GoalHost::reload_evidence` (a thin,
+obviously-correct wrapper reusing `update_evidence`'s own reset-then-reload pattern, exposed as an ordinary
+*unlocked* read since no lock is needed for it) is now called by `run_goal_command`'s `complete` branch
+immediately before gating, so a concurrently-committed record that lands after this process's own startup
+load is no longer missed — previously `complete` always gated against whatever evidence happened to be loaded
+once, at the very top of the function, before dispatch.
+**Lock target:** a stable sibling file, `.rapidlm/goal-evidence.lock` (new `EVIDENCE_LOCK_FILE` constant,
+independent of `GOAL_LOCK_FILE`) — never `goal-evidence.json` itself, for the identical inode-swap reason
+`goal.json`'s own lock avoids `goal.json`. `GoalLock` itself was generalized (it now takes the lock-file name
+as a parameter instead of hardcoding `goal.json`'s own) rather than duplicated, so both files share one
+locking *implementation* while keeping two independent lock *instances*. Added to `.gitignore` alongside the
+existing `goal.lock` entry.
+**`record_goal_evidence` (`goal_claim.rs`) restructured to persist per check, not once per claim:** each
+check's required evidence records are still built the same way, but now committed via `update_evidence`
+immediately after that check's own external command finishes (never while it's still running — the lock is
+only ever held for the record-and-save step) instead of accumulating across the whole claim in `host`'s
+in-memory store. `run_claim`/`record_goal_evidence` both gained an `evidence_path: &Path` parameter to make
+this possible. The blanket unconditional `save_evidence` previously at the end of `run_goal_command` was
+removed entirely, mirroring the `goal.json` task's own removal of the analogous blanket `save` — every
+subcommand that actually mutates either file now persists it itself, under its own lock, against a
+freshly-reloaded snapshot/store, never this function's own possibly-stale outer `host`.
+**Crash/error behavior:** a new `GoalPersistError::Lock` variant (shared with `goal.json`'s own transaction
+machinery, not duplicated) surfaces lock-acquisition failures distinctly from I/O or JSON failures. A refused
+mutation (an `EvidenceError`, e.g. `DuplicateId`/`TooManyRecords`) never triggers a save. A malformed existing
+evidence doc is a typed `GoalTransactionError::Persist(GoalPersistError::Json)` — proven, not just asserted,
+to leave the original (garbage) file completely untouched and to release the lock cleanly even on that
+failure path. OS-level lock release on process crash/`kill -9` is the same guarantee `goal.json`'s own lock
+already relies on (no new platform-specific code — `EvidenceLock` reuses the identical, already-cross-
+platform `GoalLock` primitive).
+**Tests:** 9 new in `goal_host.rs`'s existing scratch-directory test style (every new test uses `scratch_dir`
+from the start, having learned the exact lesson the `goal.json` task's own self-review found the hard way:
+a flat, non-directory-scoped scratch path collapses onto a shared lock file across unrelated parallel tests) —
+two and sixteen concurrent evidence additions both survive exactly; goal-id-mismatch-style isolation nothing
+new needed since evidence has no such check, but a fresh-reload proof (`update_evidence_reloads_the_current_
+store_not_a_stale_in_memory_one`) mirrors `goal.json`'s own; the lock releases after a successful update, a
+mutation error, and a panic inside `mutate` (bounded, non-hanging second-acquisition probes, matching
+`goal.json`'s own pattern exactly); a malformed existing doc is a typed, non-corrupting, lock-releasing
+failure; `save_evidence` alone (bypassing the lock deliberately, to isolate `atomic_write`'s own guarantee)
+never produces corrupt JSON under 8 concurrent direct callers; and the cross-file invariant test proving a
+concurrently-committed record becomes visible to a fresh, unlocked reload for gating purposes. Plus 1 new
+cross-process integration test (`apps/rapid/tests/goal_evidence_concurrency.rs`): the real, compiled `rapid`
+binary, 8 concurrent `rapid goal evidence record` processes (reusing the exact writer count `goal_concurrency.
+rs`'s own cross-process test already established as necessary — 2 processes proved too narrow a window to
+reliably overlap against ordinary inter-process scheduling jitter, 8 gives `C(8,2)=28` pairwise chances)
+against the same project, asserting every writer's own distinct record — not just a matching count — survives.
+**Revert-cycle verification, all four applicable cases (the fifth, cross-file-invariant, does not apply —
+by design there is no shared lock to break, confirmed above from actual call paths, not assumed):** (1)
+*corruption* — see the stress-probe numbers above (340/37,091 vs. 0/15,035). (2) *lost update* — reverting
+`update_evidence` to bypass its lock entirely reproduced the loss in 5/5 runs of the two-writer test and 1/1
+run of the sixteen-writer stress test (15 of 16 lost); restoring the lock fixed both, reconfirmed clean
+across repeated runs. (3) *lock scope* — moving the reload to *before* lock acquisition (a lock that only
+protects mutate+save, exactly the insufficient shape both tasks' own instructions warn about) reproduced the
+identical predicted failure in 5/5 runs; restoring fixed it. (4) *cross-process* — bypassing the lock inside
+the same compiled binary the integration test spawns reproduced a real shortfall in 3/3 runs of the 8-writer
+cross-process test (2–3 of 8 records surviving, not 8); restoring gave 3/3 clean reruns.
+**A real, pre-existing, unrelated test flake surfaced during full-suite verification, investigated and ruled
+out, not silently ignored:** `context_retrieval::tests::timeout_watcher_is_stopped_even_when_retrieve_inner_
+errors_early` failed once under full-workspace parallel load. `git diff` confirms `context_retrieval.rs` was
+never touched by this task; the same test passed 5/5 when rerun in isolation immediately after. Consistent
+with this repository's own documented history of similar timing-sensitive flakes surfacing only under heavy
+sustained parallel load (see the `computer-use` fixtures note elsewhere in this document) — not a regression
+this task introduced, and out of this task's own scope to chase down further.
+**Tests added: 9 in `goal_host.rs` (489 total `-p rapid --lib`, up from 480) plus 1 new integration test
+(`goal_evidence_concurrency.rs`, 9 test binaries total across `-p rapid`, up from 8).** `cargo clippy -p
+agent-runtime -p rapid --lib --tests --no-deps`: zero new findings on any file this task touched, confirmed by
+line-range comparison against the diff (the two pre-existing `interactive.rs` `collapsible_if` lints the prior
+task already reported by line number are unchanged and outside every range this task edited). `cargo build
+--workspace --tests` and a full `cargo test --workspace` both clean (75 test binaries, 0 failures).
+**Deliberately not attempted, per the driving instruction's own scope:** event-sourcing goal evidence;
+redesigning the evidence schema or what qualifies as valid evidence; `GoalUsage`/pricing; inadequate-context
+semantics; `GoalDriver` integration; TUI panel rendering; slash commands; retrieval/RAG redesign; any other
+persistence store. `goal-evidence.json`'s duplicate-id semantics, immutability, and ordering were inspected
+and left completely unchanged — this task adds no new deduplication policy and does not touch `EvidenceStore`
+beyond the one additive `reset_store` helper `update_evidence` needs to reload without spuriously tripping its
+own existing duplicate check against records already in memory.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity
