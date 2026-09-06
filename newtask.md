@@ -5042,6 +5042,138 @@ and left completely unchanged — this task adds no new deduplication policy and
 beyond the one additive `reset_store` helper `update_evidence` needs to reload without spuriously tripping its
 own existing duplicate check against records already in memory.
 
+**TUI panel wiring, done 2026-09-06, user-directed.** The user's own framing: the turn-execution work already
+feeds durable kernel events into `tui::state::AppState` via `reduce()` on the live interactive path, but the
+richer panel/rendering machinery in `crates/tui` was never wired into that path — a presentation/state-
+projection gap, explicitly not a turn-executor redesign. Investigation confirmed the gap exactly as framed and
+found it worse than "half-wired": `apps/rapid` imported only `tui::state`, nothing from `tui::layout`/
+`panels::*`/`transcript`/`status`, and production's only rendering was `render_new_transcript_entries` — a
+plain `write!`+`\r\n` loop with zero cursor control, zero layout, zero panels — a gap the code's own comments
+already flagged as "a real next step, not an oversight." Meanwhile `crates/tui` already had a complete, tested,
+*unused* rendering stack: `layout::compute_layout_with_composer` (responsive transcript/composer/status/
+sidebar/modal geometry, already correct for narrow terminals per its own tests), `transcript::{Transcript,
+TranscriptViewport}` (a virtualized, bounded scroll-position store with a real auto-follow contract —
+`follow_tail`, re-engaged only on scrolling back to the last line), `composer::ComposerModel` (a stateless-per-
+call rich-text view builder), `status::{StatusChrome, render_status_with}` (a status line that already sums
+real `AgentProjection` cost with no new pricing logic needed), and per-route panel view-models (`AgentsViewModel`,
+`GoalViewModel`, etc.). The only reference *compositor* — the algorithm deciding which region paints what —
+lived exclusively in `crates/tui/tests/ui_snapshots.rs`, a test-only file; nothing production-facing existed to
+call.
+**Architecture chosen, matching the driving instruction's own required flow (`kernel/event ledger -> reduce()
+-> AppState -> panels/widgets -> terminal`):** a new production module, `crates/tui/src/compositor.rs`
+(`Screen`, `paint_screen`, `sidebar_lines`, `compute_screen_layout`, `ui_mode_for`), is the one place that
+decides "what goes where" — it is frontend-agnostic (never touches a real terminal) so both a test and the real
+`rapid` binary can use it identically. It routes each `UiRoute` to real `AppState`-only data where that data
+genuinely exists today (`Agents` via the existing `AgentsViewModel`; `Goals` via a small new `goal_lines`
+formatter over `GoalViewModel`'s existing row data, since `GoalViewModel` has no `.render()`/`Frame` of its own
+yet) and renders the remaining routes (`Diff`/`Context`/`Memory`/`Jobs`/`Approvals`/`Graph`/`Computer`/
+`Resources`/`Models`) with empty sidebar content — each needs external data (`ContextPacket`, memory
+observations, full `ApprovalPrompt` specs, etc.) `AppState`'s current minimal projections do not carry, so
+rendering anything for them would mean inventing content from nothing; this honestly extends the identical "no
+sidebar model yet" precedent the crate's own reference compositor already established for 4 of those 9 routes.
+A new `transcript::render_block_parts`/`Transcript::push_entry` pair gives production the exact same tool-
+status-glyph text (`→`/`✓`/`✗`/`⛔`/`⏸`/`❓`) the old plain-text renderer used, now flowing through the real
+virtualized `Transcript` type instead of a bespoke loop. `apps/rapid/src/interactive.rs` gained one new private
+type, `TuiRenderer` (owning the rendering-local state `AppState` deliberately does not: a persistent
+`Transcript`/`TranscriptViewport` pair, incrementally synced from `AppState.transcript()`'s new entries every
+tick with the exact same `entries[rendered..]` slicing the old renderer used, so scroll position survives
+across frames instead of resetting every tick) and a `RenderSink` (`Stdout` in production; `Captured(Vec<u8>)`
+behind a new, test-only `InteractiveOptions::capture_render`/`InteractiveReport::rendered_output` pair, so a
+test can inspect exactly what the *production* render path painted without raw cursor/clear escape sequences
+corrupting the test process's own terminal). `SessionLoop::drain` now calls `drain_kernel_events` (unchanged)
+then `self.renderer.render(self.ui)` — the single new call site; `render_new_transcript_entries` is deleted
+entirely, not left as unreferenced dead code.
+**Turn/tool lifecycle rendering:** unchanged from Task 4's own event/state model — this task adds no new
+execution-side event or state variant. `TranscriptEntry`/`ToolActivityStatus` (including the `ContextRequired`
+Task 4 shipped, rendered `❓` and never `✗`) flow through `render_block_parts` unchanged; every frame is
+recomputed fresh from the current `AppState` (no separate "busy" flag anywhere in the renderer), so the UI
+cannot visually stay "busy" after a real `Completed`/`Failed`/`Interrupted`/`ContextRequired` kernel event has
+already landed in `ui.transcript()` — a structural guarantee from statelessness, not a flag that could be left
+set. Confirmed for real, unmocked turns (not just synthetic `TranscriptEntry` values) via new apps/rapid-level
+tests: a completed tool call renders its own `✓` glyph and final answer text; a tool that finishes *before* a
+later model-step failure keeps its own `✓` (never gets swept into the turn's separate failure banner); a real
+`ask_user` call that reaches `TurnStopReason::ContextRequired` renders `❓` and never `✗`, with the model's own
+question text intact; a cancelled turn renders `(interrupted)`.
+**Input/focus/scroll:** `InteractiveInput` gained `PageUp`/`PageDown` (mapped from `KeyCode::PageUp`/
+`PageDown` in `map_crossterm`) — the only new keybindings; Enter/Backspace/Char/CtrlC/Resize handling is
+unchanged, so Task 4's own proof that Ctrl-C reaches the real cancellation token is not at risk (nothing new
+consumes that key). `SessionLoop::handle_input`'s new arms call `TuiRenderer::page_up`/`page_down`, which scroll
+one page (the viewport's own current height) via the existing, unmodified `TranscriptViewport::scroll_by` —
+reusing its established auto-follow contract rather than reimplementing scroll state: scrolling up detaches
+from the tail, scrolling back down to the last line re-engages it automatically. `TuiRenderer::render` never
+rebuilds the viewport from scratch — it only ever calls `resize_rect` on the one persisted instance, which is
+specifically documented not to reset `anchor`/`follow_tail`, so a live event arriving while the user has
+scrolled up does not force them back to the bottom, and a user already at the tail keeps following it. No
+production-focus/pane-navigation model was invented — routes already switch via the existing slash commands
+(`/goal`, `/agents`, etc.), which already reduce `SetRoute` into `AppState`; this task only made the render step
+actually read `state.route()` back, closing the one missing link.
+**Small-terminal / composer-sizing behavior:** `TuiRenderer::render` reads its size from `AppState.viewport()`
+(the single authoritative source, not a second independent `crossterm::terminal::size()` query at render time)
+— but `Viewport` defaults to 80x24 and, unlike the composer/route, is never resized by anything until crossterm
+reports a live resize event, which it does not synthesize at startup. Fixed with one best-effort initial sync in
+`run_started_session` (`crossterm::terminal::size()` folded into a `SetViewport` before the loop starts;
+harmless no-op on a non-tty, which scripted tests already override deterministically with their own leading
+`Resize` input) — without it, a real terminal of any size other than 80x24 would render wrong until the user
+happened to resize. `ComposerModel`'s own width/height negotiation (`SetWidth` then `preferred_height()` sized
+at that same width, fed into `compute_screen_layout`, then rendered at the layout's own clamped composer height)
+keeps the renderer's own pre-pass and `paint_screen`'s internal recompute self-consistent — verified directly by
+a dedicated test that renders at 1x1, 5x3, 80x1, 0x0, and 1x24 and asserts no panic.
+**Tests added: 11 in `apps/rapid/src/interactive.rs`'s `mod tests` (491 total `-p rapid --lib`, up from 480)
+plus 5 pre-existing `crates/tui` compositor tests already covering the reference algorithm this task's module
+reuses (unchanged by this task).** Critically, one of the 11 is the specific test the driving instruction
+called out as essential — `run_interactive_actually_paints_through_the_production_compositor_not_a_placeholder`
+— which drives the *real* `run_interactive` entry point (not `crates/tui` in isolation) with `capture_render:
+true` and a scripted `/goal` route switch, asserting the captured output contains the real `goal_lines` "no
+goal" sidebar fallback — content the old plain-text renderer could never have produced, since switching route
+creates no transcript entry at all. Two more prove `SessionLoop::handle_input`'s actual `PageUp`/`PageDown` arms
+(not just `TuiRenderer`'s methods in isolation) reach the renderer's viewport and correctly detach/re-engage
+auto-follow.
+**Revert-cycle verification, all three applicable cases:** (1) *production panel wiring* — temporarily removed
+`SessionLoop::drain`'s `self.renderer.render(...)` call; the production-wiring test failed with empty painted
+output (confirmed: no Goals sidebar content at all); restored, reconfirmed passing. (2) *context-required visual
+semantics* — temporarily mapped `ToolActivityStatus::ContextRequired`'s glyph to `✗` (the failure glyph) in
+`transcript::render_block_parts`; both the pre-existing `crates/tui` compositor test and this task's own new
+`a_context_required_tool_call_renders_its_own_glyph_never_the_failure_glyph` apps/rapid test failed as predicted;
+restored, both reconfirmed passing. (3) *terminal lifecycle* — not applicable: this task introduces no separate
+"turn in progress" flag for the renderer to get stuck on (every frame is recomputed fresh from `AppState`, see
+above), so there is no new stuck-state surface to reproduce; the pre-existing turn-lifecycle event-loss/ordering
+guarantees Task 3's own TUI work already proved are untouched by this task and not re-tested here.
+**Self-review findings:** two real issues caught and fixed before landing — (a) `modal_lines` initially called an
+invented `state.pending_approval_id()` accessor; fixed to iterate the real `state.modal_stack()`/`Modal` enum.
+(b) a test's hand-built `EventEnvelope` initially guessed a wrong constructor shape and a non-hex `approval_id`
+string (`ApprovalKey::parse` requires hex digits or `-`); fixed by copying the exact working pattern from
+`ui_snapshots.rs`'s own `envelope()` helper. One deliberate, explicitly-documented trade-off, not a defect:
+`crates/tui/src/compositor.rs`'s `paint_screen` is algorithmically close to `ui_snapshots.rs`'s own test-local
+`paint_screen` — left as two separate implementations rather than unified, because `ui_snapshots.rs`'s
+transcript rows use a `"{kind}|{text}"` debug-golden format for its own assertions, genuinely different from
+production's plain-text format, and reconciling them risked a large rewrite of that file's many existing golden
+constants for no behavior change. No stale "panels are unwired" comments were left behind — the doc comment that
+previously said so was rewritten along with the code. No duplicate state ownership, no panel subscribing
+directly to kernel events (routing stays entirely through the one `AppState` produced by `reduce()`), no
+transcript-text-reparsing, no UI-side cost calculation (the status line's existing `StatusSnapshot.cost` already
+sums real `AgentProjection` values — this task added no pricing logic), no direct filesystem reads from
+rendering code.
+**Verification:** `cargo test -p tui --lib` (219 passed, unchanged, plus this task's 5 compositor tests already
+included in that count from the file's initial authoring), `cargo test -p rapid --lib` (491 passed, 0 failed),
+`cargo test -p rapid --tests` (all 6 integration binaries plus the bin target green: `configured_model_
+integration` 13 passed/1 ignored, `exec_diagnosability` 11, `goal_concurrency` 1, `goal_evidence_concurrency` 1,
+`real_model_bench` 5, `tool_call_bench` 6). `cargo clippy -p rapid -p tui --all-targets`: zero new findings on
+any file this task touched (the two pre-existing `interactive.rs` `collapsible_if` lints prior tasks already
+reported by line number are unchanged and outside every range this task edited). `cargo build --workspace
+--tests` clean. Full `cargo test --workspace`: one failure, `exec_tools::tests::shell_exec_runs_argv_inside_
+the_root_with_bounded_output` — confirmed pre-existing/environmental, not a regression: `git diff` shows
+`exec_tools.rs` untouched by this task, and the same test passed cleanly when rerun standalone immediately
+after.
+**Deliberately not attempted, per the driving instruction's own scope:** slash-command implementation; new
+goal-management commands; `GoalDriver` integration; persistence work; pricing/cost redesign; retrieval/RAG
+changes; new panel designs unrelated to existing components; a general theme/styling redesign; any change to
+`SessionLoop::submit_turn`, turn leases, execution threads, `run_live_exec`, cancellation semantics,
+`TurnStopReason`, goal usage accounting, or goal/evidence persistence — none of those files were touched by this
+task. `Diff`/`Context`/`Memory`/`Jobs`/`Approvals`/`Graph`/`Computer`/`Resources`/`Models` panels still render
+empty sidebar content, unchanged from the crate's own pre-existing precedent for the last four of those routes
+— building real view-models for them needs data `AppState` does not carry today, out of this task's scope to
+invent.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

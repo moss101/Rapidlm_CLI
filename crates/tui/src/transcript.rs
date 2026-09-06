@@ -144,6 +144,40 @@ impl RenderBlockKind {
     }
 }
 
+/// Map one `AppState.transcript()` entry onto the `(kind, text)` a
+/// [`RenderBlock`] is built from. `TranscriptEntry` and `RenderBlockKind`
+/// are deliberately different shapes — the former is the reducer's raw,
+/// timeline-ordered log of what happened; the latter is this crate's
+/// generic render-block taxonomy, which has no room for a separate "tool
+/// status" field. The status is folded into the text itself, one glyph per
+/// [`crate::state::ToolActivityStatus`] variant, matching the exact marker
+/// set the production interactive renderer already used before this
+/// function existed — in particular `ContextRequired` gets its own `❓`,
+/// never the `✗` used for a real `Failed`, so a context-required stop is
+/// never visually indistinguishable from a tool failure.
+pub fn render_block_parts(entry: &crate::state::TranscriptEntry) -> (RenderBlockKind, String) {
+    use crate::state::{ToolActivityStatus, TranscriptEntry};
+    match entry {
+        TranscriptEntry::User { text } => (RenderBlockKind::User, format!("> {text}")),
+        TranscriptEntry::Assistant { text } => (RenderBlockKind::Assistant, text.clone()),
+        TranscriptEntry::ToolActivity { tool, status } => {
+            let marker = match status {
+                ToolActivityStatus::Started => "→",
+                ToolActivityStatus::Completed => "✓",
+                ToolActivityStatus::Failed => "✗",
+                ToolActivityStatus::Denied => "⛔",
+                ToolActivityStatus::ApprovalRequired => "⏸",
+                ToolActivityStatus::ContextRequired => "❓",
+            };
+            (RenderBlockKind::Tool, format!("{marker} {tool}"))
+        }
+        TranscriptEntry::TurnFailed { reason } => {
+            (RenderBlockKind::Error, format!("(turn failed: {reason})"))
+        }
+        TranscriptEntry::TurnInterrupted => (RenderBlockKind::System, "(interrupted)".to_owned()),
+    }
+}
+
 impl RenderBlock {
     /// Sanitize `text` and build a block. Secret redaction drops the body.
     pub fn new(id: BlockId, kind: RenderBlockKind, text: &str) -> Self {
@@ -320,6 +354,12 @@ impl Transcript {
         self.index.insert(id, self.blocks.len());
         self.blocks.push(block);
         id
+    }
+
+    /// Append one `AppState.transcript()` entry via [`render_block_parts`].
+    pub fn push_entry(&mut self, entry: &crate::state::TranscriptEntry) -> BlockId {
+        let (kind, text) = render_block_parts(entry);
+        self.push(kind, &text)
     }
 
     /// Append an already-built block. IDs must be unique.

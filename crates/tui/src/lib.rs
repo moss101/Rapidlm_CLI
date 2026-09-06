@@ -2,6 +2,7 @@
 
 pub mod color;
 pub mod commands;
+pub mod compositor;
 pub mod composer;
 pub mod layout;
 pub mod panels {
@@ -36,6 +37,7 @@ pub use commands::{
 pub use composer::{
     ComposerCommand, ComposerError, ComposerEvent, ComposerModel, ComposerView, Motion,
 };
+pub use compositor::{Screen, compute_screen_layout, paint_screen, sidebar_lines, ui_mode_for};
 pub use layout::{LayoutRects, Rect, UiMode, compute_layout, compute_layout_with_composer};
 pub use panels::agents::{
     AgentCancelIntent, AgentHandoffObservation, AgentInspectIntent, AgentMergeIntent,
@@ -102,5 +104,5 @@ pub use terminal::{
 };
 pub use transcript::{
     BlockId, FrameWork, RenderBlock, RenderBlockKind, ScrollAnchor, Transcript, TranscriptError,
-    TranscriptViewport, VisibleRow, VisibleWindow,
+    TranscriptViewport, VisibleRow, VisibleWindow, render_block_parts,
 };

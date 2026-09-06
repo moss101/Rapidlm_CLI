@@ -97,6 +97,10 @@ pub enum InteractiveInput {
     Enter,
     Submit(String),
     Resize { width: u16, height: u16 },
+    /// Scroll the transcript viewport one page toward earlier output.
+    PageUp,
+    /// Scroll the transcript viewport one page toward later output.
+    PageDown,
     Eof,
 }
 
@@ -132,6 +136,14 @@ pub struct InteractiveReport {
     pub terminal_restored: bool,
     pub interrupt_count: u32,
     pub config: ConfigLoadResult,
+    /// Every byte the TUI renderer painted this run, when
+    /// [`InteractiveOptions::capture_render`] requested it — `None` in
+    /// production, where painted frames go to real stdout instead and are
+    /// never buffered in memory. Test-only, but a real production field: it
+    /// exists to let a test observe what the *actual* production render
+    /// path (`SessionLoop::drain` -> `TuiRenderer::render`) painted, not a
+    /// parallel or reimplemented one.
+    pub rendered_output: Option<String>,
 }
 
 /// Injected filesystem, env, input, and terminal for [`run_interactive`].
@@ -143,6 +155,13 @@ pub struct InteractiveOptions {
     pub cancel: CancellationToken,
     pub inputs: Option<Vec<InteractiveInput>>,
     pub terminal: Option<RecordingBackend>,
+    /// When true, the TUI renderer's painted bytes accumulate into
+    /// [`InteractiveReport::rendered_output`] instead of going to real
+    /// stdout. Always `false` in production (see [`InteractiveOptions::
+    /// from_env`]) — this exists so a test can inspect what the production
+    /// render path actually painted without corrupting the test process's
+    /// own terminal with raw cursor/clear escape sequences.
+    pub capture_render: bool,
 }
 
 struct ResolvedProject {
@@ -2451,6 +2470,21 @@ fn run_started_session(
         None => InputSource::Crossterm,
     };
 
+    // Crossterm only ever *reports* a resize through a live `Event::Resize`
+    // — it does not synthesize one at startup — so without this, `ui.
+    // viewport()` would stay stuck at `Viewport::default()`'s 80x24 for a
+    // real terminal of any other size until the user happened to resize it.
+    // Best-effort: a non-tty (headless test runs, `RecordingBackend`) simply
+    // leaves the existing default in place, which scripted tests already
+    // override deterministically with their own leading `Resize` input.
+    if let Ok((width, height)) = crossterm::terminal::size() {
+        ui = reduce(
+            ui,
+            &UiEvent::Local(LocalUiEvent::SetViewport { width, height }),
+        );
+    }
+
+    let mut renderer = TuiRenderer::new(options.capture_render);
     let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let loop_result = SessionLoop {
         client: &client,
@@ -2464,8 +2498,10 @@ fn run_started_session(
         root: &resolved.root,
         trusted: resolved.trust.is_trusted(),
         turn_in_flight: turn_in_flight.clone(),
+        renderer: &mut renderer,
     }
     .run(&mut inputs);
+    let rendered_output = renderer.captured_text();
 
     close_stream(&mut stream);
     let restore_ok = terminal.restore().is_ok() && terminal.is_restored();
@@ -2493,6 +2529,7 @@ fn run_started_session(
             terminal_restored: restore_ok,
             interrupt_count,
             config: resolved.config,
+            rendered_output,
         }),
         (Err(err), _) | (Ok(_), Err(err)) => Err(err),
     }
@@ -2514,6 +2551,7 @@ struct SessionLoop<'a> {
     /// rather than reaching `kernel::SubmitTurn` and hitting the exact
     /// `SessionConflict` this whole feature exists to stop crashing on.
     turn_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    renderer: &'a mut TuiRenderer,
 }
 
 impl SessionLoop<'_> {
@@ -2554,6 +2592,14 @@ impl SessionLoop<'_> {
                     self.ui.clone(),
                     &UiEvent::Local(LocalUiEvent::SetViewport { width, height }),
                 );
+                Ok(LoopControl::Continue)
+            }
+            InteractiveInput::PageUp => {
+                self.renderer.page_up();
+                Ok(LoopControl::Continue)
+            }
+            InteractiveInput::PageDown => {
+                self.renderer.page_down();
                 Ok(LoopControl::Continue)
             }
             InteractiveInput::Char(ch) => {
@@ -2763,7 +2809,8 @@ impl SessionLoop<'_> {
             self.ui,
             self.session_id,
             self.cancel,
-        )
+        )?;
+        self.renderer.render(self.ui).map_err(|_| InteractiveError::Io)
     }
 }
 
@@ -3452,7 +3499,6 @@ fn drain_kernel_events(
     session_id: protocol::SessionId,
     cancel: &CancellationToken,
 ) -> Result<(), InteractiveError> {
-    let rendered = ui.transcript().len();
     for i in 0..MAX_EVENTS_PER_TICK {
         cancel.check().map_err(|_| InteractiveError::Cancelled)?;
         match stream.try_recv() {
@@ -3491,45 +3537,145 @@ fn drain_kernel_events(
     if caught_up {
         *ui = reduce(ui.clone(), &UiEvent::Snapshot(snapshot));
     }
-    render_new_transcript_entries(&ui.transcript()[rendered.min(ui.transcript().len())..]);
     Ok(())
 }
 
-/// Print transcript entries this tick's drain just produced. Raw mode (held
-/// for the whole interactive session, see `TerminalGuard`) disables the
-/// terminal's own `\n` -> `\r\n` translation, so every line is written with
-/// an explicit `\r\n` — a bare `println!` here would stair-step down the
-/// screen instead of returning to column 0. This is deliberately plain text,
-/// not a rendered transcript panel (`crates/tui`'s fuller panel/view-model
-/// surface isn't wired into `apps/rapid` — see this module's own doc
-/// comment) — a real next step, not an oversight.
-fn render_new_transcript_entries(entries: &[tui::state::TranscriptEntry]) {
-    use std::io::Write as _;
-    use tui::state::{ToolActivityStatus, TranscriptEntry};
-    let mut out = io::stdout();
-    for entry in entries {
-        let line = match entry {
-            TranscriptEntry::User { text } => format!("> {text}"),
-            TranscriptEntry::Assistant { text } => text.clone(),
-            TranscriptEntry::ToolActivity { tool, status } => {
-                let marker = match status {
-                    ToolActivityStatus::Started => "→",
-                    ToolActivityStatus::Completed => "✓",
-                    ToolActivityStatus::Failed => "✗",
-                    ToolActivityStatus::Denied => "⛔",
-                    ToolActivityStatus::ApprovalRequired => "⏸",
-                    ToolActivityStatus::ContextRequired => "❓",
-                };
-                format!("{marker} {tool}")
-            }
-            TranscriptEntry::TurnFailed { reason } => format!("(turn failed: {reason})"),
-            TranscriptEntry::TurnInterrupted => "(interrupted)".to_owned(),
-        };
-        for physical_line in line.split('\n') {
-            let _ = write!(out, "{physical_line}\r\n");
+/// Where [`TuiRenderer`] writes painted screen bytes. Production always
+/// paints real stdout; a test may capture instead (see [`InteractiveOptions
+/// ::capture_render`]) so painted output can be asserted on without raw
+/// cursor/clear escape sequences corrupting the test process's own terminal.
+enum RenderSink {
+    Stdout(io::Stdout),
+    Captured(Vec<u8>),
+}
+
+impl io::Write for RenderSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Stdout(out) => out.write(buf),
+            Self::Captured(buf_out) => buf_out.write(buf),
         }
     }
-    let _ = out.flush();
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Stdout(out) => out.flush(),
+            Self::Captured(_) => Ok(()),
+        }
+    }
+}
+
+/// Owns the rendering-local state `AppState` deliberately does not: a
+/// virtualized [`tui::Transcript`]/[`tui::TranscriptViewport`] pair
+/// incrementally folded from `AppState.transcript()` (mirroring the exact
+/// `entries[rendered..]` slicing `drain_kernel_events` already used for its
+/// own plain-text predecessor), so scroll position survives across frames
+/// instead of resetting to the tail on every tick. Every other input —
+/// route, modal stack, composer text, agent/goal projections — is read
+/// fresh from `AppState` each frame; nothing here duplicates that state,
+/// only the parts `AppState` itself declines to own (see `crate::tui::
+/// transcript`'s own doc comment on why the viewport lives with the
+/// caller).
+struct TuiRenderer {
+    transcript: tui::Transcript,
+    viewport: tui::TranscriptViewport,
+    rendered_entries: usize,
+    sink: RenderSink,
+}
+
+impl TuiRenderer {
+    fn new(capture: bool) -> Self {
+        Self {
+            transcript: tui::Transcript::new(),
+            viewport: tui::TranscriptViewport::new(80, 24),
+            rendered_entries: 0,
+            sink: if capture {
+                RenderSink::Captured(Vec::new())
+            } else {
+                RenderSink::Stdout(io::stdout())
+            },
+        }
+    }
+
+    /// Bytes actually painted so far, when this renderer was built to
+    /// capture rather than write real stdout — `None` otherwise.
+    fn captured_text(&self) -> Option<String> {
+        match &self.sink {
+            RenderSink::Captured(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+            RenderSink::Stdout(_) => None,
+        }
+    }
+
+    fn sync_transcript(&mut self, ui: &AppState) {
+        let entries = ui.transcript();
+        let start = self.rendered_entries.min(entries.len());
+        for entry in &entries[start..] {
+            self.transcript.push_entry(entry);
+        }
+        self.rendered_entries = entries.len();
+    }
+
+    /// Scroll one page toward earlier transcript output. Landing back on
+    /// the last line re-enables auto-follow (see `TranscriptViewport::
+    /// scroll_by`'s own doc comment) — scrolling never needs separate
+    /// "snap back to tail" handling here.
+    fn page_up(&mut self) {
+        let page = i64::from(self.viewport.height().max(1));
+        self.viewport.scroll_by(&self.transcript, -page);
+    }
+
+    /// Scroll one page toward later transcript output.
+    fn page_down(&mut self) {
+        let page = i64::from(self.viewport.height().max(1));
+        self.viewport.scroll_by(&self.transcript, page);
+    }
+
+    /// Paint one full frame from `ui` — the only place `apps/rapid` turns
+    /// `AppState` into terminal bytes. `TerminalBackend` (see `TerminalGuard`)
+    /// only ever manages raw-mode/alt-screen/cursor state, never content, so
+    /// content goes straight through crossterm's own cursor/clear commands,
+    /// same as this renderer's plain-text predecessor did.
+    fn render(&mut self, ui: &AppState) -> io::Result<()> {
+        use std::io::Write as _;
+        self.sync_transcript(ui);
+
+        let viewport = ui.viewport();
+        let size = tui::Rect::new(0, 0, viewport.width(), viewport.height());
+        let modal_open = !ui.modal_stack().is_empty();
+
+        let mut composer = tui::ComposerModel::new();
+        let _ = composer.apply(tui::ComposerCommand::SetWidth(size.width()));
+        let _ = composer.apply(tui::ComposerCommand::Insert(ui.composer().text().to_owned()));
+        let requested_height = composer.preferred_height();
+        let layout = tui::compute_screen_layout(ui, size, requested_height, modal_open);
+        let composer_view = composer.render(layout.composer().width(), layout.composer().height());
+
+        self.viewport.resize_rect(layout.transcript());
+
+        let chrome = tui::StatusChrome::default();
+        let screen = tui::paint_screen(
+            ui,
+            &self.transcript,
+            &self.viewport,
+            composer_view.lines(),
+            &chrome,
+            size,
+            modal_open,
+            &tui::CancellationToken::new(),
+        );
+
+        crossterm::queue!(
+            self.sink,
+            crossterm::cursor::MoveTo(0, 0),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+        )?;
+        for (i, row) in screen.rows().iter().enumerate() {
+            let y = u16::try_from(i).unwrap_or(u16::MAX);
+            crossterm::queue!(self.sink, crossterm::cursor::MoveTo(0, y))?;
+            write!(self.sink, "{row}")?;
+        }
+        self.sink.flush()
+    }
 }
 
 fn next_input(
@@ -3565,6 +3711,8 @@ fn map_crossterm(event: CrosstermEvent) -> Option<InteractiveInput> {
                 KeyCode::Enter => Some(InteractiveInput::Enter),
                 KeyCode::Backspace => Some(InteractiveInput::Backspace),
                 KeyCode::Char(ch) => Some(InteractiveInput::Char(ch)),
+                KeyCode::PageUp => Some(InteractiveInput::PageUp),
+                KeyCode::PageDown => Some(InteractiveInput::PageDown),
                 _ => None,
             }
         }
@@ -3800,6 +3948,7 @@ impl InteractiveOptions {
             cancel: CancellationToken::new(),
             inputs: None,
             terminal: None,
+            capture_render: false,
         })
     }
 }
@@ -4299,6 +4448,18 @@ base_url = "http://127.0.0.1:11434/v1"
                 cancel: CancellationToken::new(),
                 inputs: Some(inputs),
                 terminal: Some(RecordingBackend::new()),
+                capture_render: false,
+            }
+        }
+
+        /// Same as [`Self::options`], but with the TUI renderer's painted
+        /// bytes captured into the eventual `InteractiveReport::
+        /// rendered_output` instead of discarded — for tests that need to
+        /// inspect what the production render path actually painted.
+        fn options_capturing_render(&self, inputs: Vec<InteractiveInput>) -> InteractiveOptions {
+            InteractiveOptions {
+                capture_render: true,
+                ..self.options(inputs)
             }
         }
     }
@@ -4858,6 +5019,10 @@ base_url = "http://127.0.0.1:11434/v1"
 
         fn transcript(&self) -> &[tui::state::TranscriptEntry] {
             self.ui.transcript()
+        }
+
+        fn state(&self) -> &AppState {
+            &self.ui
         }
 
         /// Submit `text`, run it to completion against `backing` through the
@@ -5471,6 +5636,7 @@ base_url = "http://127.0.0.1:11434/v1"
         let mut interrupt_count = 0u32;
         let mut saw_ctrl_c = false;
         let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut renderer = TuiRenderer::new(true);
         let mut loop_state = SessionLoop {
             client: &session.client,
             stream: &mut stream,
@@ -5483,6 +5649,7 @@ base_url = "http://127.0.0.1:11434/v1"
             root: &session.root,
             trusted: true,
             turn_in_flight,
+            renderer: &mut renderer,
         };
         loop_state
             .submit_turn("a message arriving while another turn is in flight")
@@ -5538,6 +5705,7 @@ base_url = "http://127.0.0.1:11434/v1"
             cancel: CancellationToken::new(),
             inputs: None,
             terminal: None,
+            capture_render: false,
         };
         let resolved = resolve_project(&options).expect("resolve");
         assert_eq!(
@@ -5546,6 +5714,310 @@ base_url = "http://127.0.0.1:11434/v1"
                 .expect("canon")
                 .join(PROJECT_MARKER)
                 .as_path()
+        );
+    }
+
+    // --- TUI panel wiring -----------------------------------------------
+    //
+    // `TuiRenderer` is exercised two ways below: directly, against `AppState`
+    // built through the real kernel/turn-execution path (`ScriptedSession`)
+    // — the fast, deterministic way to check *what* gets painted for a given
+    // state; and once through the actual `run_interactive` entry point with
+    // `capture_render: true` — the one test proving `SessionLoop` itself
+    // actually calls this renderer, not just that the renderer works in
+    // isolation (see `run_interactive_actually_paints_through_the_production_
+    // compositor_not_a_placeholder` below).
+
+    #[test]
+    fn idle_render_paints_composer_and_status_chrome_with_no_turn_activity() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut renderer = TuiRenderer::new(true);
+        renderer.render(session.state()).expect("render");
+        let painted = renderer.captured_text().expect("captured");
+        assert!(
+            !painted.trim().is_empty(),
+            "an idle session still paints composer/status chrome, not a blank screen"
+        );
+    }
+
+    #[test]
+    fn a_completed_tool_call_renders_its_own_completion_glyph() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "write a note",
+            ScriptedModel::write_then_answer("note.md", "hello", "scripted turn done"),
+        );
+        let mut renderer = TuiRenderer::new(true);
+        renderer.render(session.state()).expect("render");
+        let painted = renderer.captured_text().expect("captured");
+        assert!(
+            painted.contains(&format!("✓ {}", crate::exec_tools::WORKSPACE_WRITE_TOOL)),
+            "{painted}"
+        );
+        assert!(painted.contains("scripted turn done"), "{painted}");
+    }
+
+    #[test]
+    fn a_failed_turn_renders_a_turn_failed_banner_distinct_from_completion() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("do something that fails", ScriptedModel::failing());
+        let mut renderer = TuiRenderer::new(true);
+        renderer.render(session.state()).expect("render");
+        let painted = renderer.captured_text().expect("captured");
+        assert!(painted.contains("turn failed"), "{painted}");
+    }
+
+    #[test]
+    fn a_tool_call_that_completes_before_a_later_failure_still_shows_its_own_completion_glyph() {
+        // `usage_then_fail` succeeds its tool call, then fails the model's
+        // *next* step — the tool itself never failed, so its own activity
+        // marker must stay "completed," not get swept into the turn's
+        // eventual failure banner.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "do something that fails later",
+            ScriptedModel::usage_then_fail("note.md", "hello", 5, 1),
+        );
+        let mut renderer = TuiRenderer::new(true);
+        renderer.render(session.state()).expect("render");
+        let painted = renderer.captured_text().expect("captured");
+        assert!(
+            painted.contains(&format!("✓ {}", crate::exec_tools::WORKSPACE_WRITE_TOOL)),
+            "{painted}"
+        );
+        assert!(painted.contains("turn failed"), "{painted}");
+    }
+
+    #[test]
+    fn a_context_required_tool_call_renders_its_own_glyph_never_the_failure_glyph() {
+        // Task 4 shipped a dedicated non-failure rendering for `ContextRequired`
+        // at the `crates/tui` compositor level; this proves the *apps/rapid*
+        // production renderer preserves that distinction end to end, against
+        // a real turn that really reached `TurnStopReason::ContextRequired`.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "deploy the app",
+            ScriptedModel::asks_for_context(
+                "Which environment: staging or production?",
+                &["staging", "production"],
+            ),
+        );
+        let mut renderer = TuiRenderer::new(true);
+        renderer.render(session.state()).expect("render");
+        let painted = renderer.captured_text().expect("captured");
+        assert!(
+            painted.contains(&format!("❓ {}", crate::exec_tools::ASK_USER_TOOL)),
+            "{painted}"
+        );
+        assert!(
+            !painted.contains(&format!("✗ {}", crate::exec_tools::ASK_USER_TOOL)),
+            "context-required must never render with the failure glyph: {painted}"
+        );
+        assert!(
+            painted.contains("Which environment: staging or production?"),
+            "{painted}"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_turn_renders_the_interrupted_marker() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("cancel me", ScriptedModel::cancelled());
+        let mut renderer = TuiRenderer::new(true);
+        renderer.render(session.state()).expect("render");
+        let painted = renderer.captured_text().expect("captured");
+        assert!(painted.contains("(interrupted)"), "{painted}");
+    }
+
+    #[test]
+    fn tiny_and_zero_terminals_render_without_panicking() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        for (width, height) in [(1, 1), (5, 3), (80, 1), (0, 0), (1, 24)] {
+            let state = reduce(
+                session.state().clone(),
+                &UiEvent::Local(LocalUiEvent::SetViewport { width, height }),
+            );
+            let mut renderer = TuiRenderer::new(true);
+            renderer
+                .render(&state)
+                .unwrap_or_else(|err| panic!("{width}x{height} must not error: {err}"));
+        }
+    }
+
+    #[test]
+    fn resizing_between_frames_repaints_at_the_new_width_without_panicking() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("first", ScriptedModel::terminal("first done"));
+        let mut renderer = TuiRenderer::new(true);
+
+        let wide = reduce(
+            session.state().clone(),
+            &UiEvent::Local(LocalUiEvent::SetViewport { width: 120, height: 30 }),
+        );
+        renderer.render(&wide).expect("render wide");
+
+        let narrow = reduce(
+            session.state().clone(),
+            &UiEvent::Local(LocalUiEvent::SetViewport { width: 40, height: 10 }),
+        );
+        renderer.render(&narrow).expect("render narrow");
+        let painted = renderer.captured_text().expect("captured");
+        assert!(painted.contains("first done"), "{painted}");
+    }
+
+    #[test]
+    fn page_up_stops_auto_follow_and_page_down_back_to_the_tail_restores_it() {
+        // Directly exercises `TuiRenderer::page_up`/`page_down` (what
+        // `SessionLoop::handle_input` calls for `InteractiveInput::PageUp`/
+        // `PageDown`) against a transcript longer than one page, proving the
+        // established `TranscriptViewport` auto-follow contract (`crates/tui
+        // ::transcript`'s own doc comment: landing back on the last line
+        // re-enables follow) survives being driven through this renderer
+        // rather than being reimplemented here.
+        let mut renderer = TuiRenderer::new(true);
+        for i in 0..40 {
+            renderer.transcript.push_entry(&tui::state::TranscriptEntry::Assistant {
+                text: format!("line {i}"),
+            });
+        }
+        let state = reduce(
+            AppState::new(),
+            &UiEvent::Local(LocalUiEvent::SetViewport { width: 80, height: 8 }),
+        );
+        renderer.render(&state).expect("render");
+        assert!(
+            renderer.viewport.follow_tail(),
+            "a freshly rendered transcript starts following the tail"
+        );
+
+        renderer.page_up();
+        assert!(
+            !renderer.viewport.follow_tail(),
+            "scrolling up must detach from the tail, not force the user back down"
+        );
+
+        for _ in 0..10 {
+            renderer.page_down();
+        }
+        assert!(
+            renderer.viewport.follow_tail(),
+            "scrolling back down to the bottom must re-engage auto-follow"
+        );
+    }
+
+    #[test]
+    fn page_up_and_page_down_reach_the_renderers_viewport_through_session_loop_handle_input() {
+        // Proves `SessionLoop::handle_input`'s own `PageUp`/`PageDown` arms
+        // (not just `TuiRenderer`'s methods in isolation) actually reach the
+        // renderer — constructed the same way production's `run_started_
+        // session` constructs one, not a parallel test-only path.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let cancel = CancellationToken::new();
+        let before_seq = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, before_seq)),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = AppState::new();
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        for i in 0..40 {
+            renderer.transcript.push_entry(&tui::state::TranscriptEntry::Assistant {
+                text: format!("line {i}"),
+            });
+        }
+        renderer.viewport.resize(80, 8);
+
+        {
+            let mut loop_state = SessionLoop {
+                client: &session.client,
+                stream: &mut stream,
+                ui: &mut ui,
+                session_id: session.session_id,
+                actor: &session.actor,
+                cancel: &cancel,
+                interrupt_count: &mut interrupt_count,
+                saw_ctrl_c: &mut saw_ctrl_c,
+                root: &session.root,
+                trusted: true,
+                turn_in_flight: turn_in_flight.clone(),
+                renderer: &mut renderer,
+            };
+            loop_state
+                .handle_input(InteractiveInput::PageUp)
+                .expect("page up");
+        }
+        assert!(!renderer.viewport.follow_tail(), "PageUp must reach the renderer's viewport");
+
+        {
+            let mut loop_state = SessionLoop {
+                client: &session.client,
+                stream: &mut stream,
+                ui: &mut ui,
+                session_id: session.session_id,
+                actor: &session.actor,
+                cancel: &cancel,
+                interrupt_count: &mut interrupt_count,
+                saw_ctrl_c: &mut saw_ctrl_c,
+                root: &session.root,
+                trusted: true,
+                turn_in_flight,
+                renderer: &mut renderer,
+            };
+            for _ in 0..10 {
+                loop_state
+                    .handle_input(InteractiveInput::PageDown)
+                    .expect("page down");
+            }
+        }
+        assert!(
+            renderer.viewport.follow_tail(),
+            "PageDown back to the tail must reach the renderer's viewport too"
+        );
+        close_stream(&mut stream);
+    }
+
+    #[test]
+    fn run_interactive_actually_paints_through_the_production_compositor_not_a_placeholder() {
+        // The critical regression test: proves the *real* `run_interactive`
+        // entry point (production's own `SessionLoop::drain` ->
+        // `TuiRenderer::render`), not `crates/tui`'s compositor tested in
+        // isolation, actually paints route-specific sidebar content. `/goal`
+        // with no active goal reaches `goal_lines`'s "no goal" fallback —
+        // content the old plain-text `render_new_transcript_entries` could
+        // never have produced, since switching route creates no transcript
+        // entry at all. See this test's own revert-cycle note in newtask.md.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Resize { width: 80, height: 24 },
+            InteractiveInput::Submit("/goal".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
+        assert!(
+            painted.contains("no goal"),
+            "the real production compositor must have painted the Goals sidebar: {painted}"
         );
     }
 }
