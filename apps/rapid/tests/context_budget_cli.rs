@@ -257,13 +257,20 @@ fn overflow_regression_small_budget_rejects_what_a_large_budget_accepts() {
 /// The router/fallback architectural question the task calls out
 /// explicitly: is context built before or after the effective model is
 /// known? Here it is built before (a fallback chain's effective model
-/// isn't chosen until request time) — so the pre-built budget must be the
-/// *minimum* across every candidate the chain could dispatch to, proven by
-/// configuring a large primary and a small alternate and observing the
-/// primary's own (successful, first) request already carries the small
-/// alternate's numbers, not its own larger ones.
+/// isn't chosen until request time) — so the pre-built budget must combine
+/// the *minimum* context_limit with the *maximum* max_output across every
+/// candidate the chain could dispatch to (not the minimum of both — see
+/// `context_budget_for`'s own doc comment for why the minimum of max_output
+/// is actually unsafe: each backend still sends its own real per-request
+/// output cap independently, so under-reserving headroom for a backend
+/// with a *larger* real cap risks exactly the overflow this budget exists
+/// to prevent). The two backends are deliberately crossed (primary: large
+/// context, large output; alternate: small context, small output) so the
+/// correct result is a genuine chimera matching neither backend's own real
+/// pair — the only fixture shape that can actually tell "correct" apart
+/// from "minimum of both" and from "just use the primary."
 #[test]
-fn fallback_chain_budget_is_the_minimum_across_every_candidate_not_just_the_primary() {
+fn fallback_chain_budget_combines_min_context_and_max_output_not_just_the_primary() {
     let home = temp_dir("fallback-budget");
     let project = home.join("project");
     git_project(&project);
@@ -278,19 +285,19 @@ fn fallback_chain_budget_is_the_minimum_across_every_candidate_not_just_the_prim
              \n\
              [model.primary]\n\
              provider = \"openai-compatible\"\n\
-             model = \"big-model\"\n\
+             model = \"big-context-big-output\"\n\
              base_url = \"http://{}/v1\"\n\
              api_key = \"scripted-key\"\n\
-             context_window = 200000\n\
-             max_tokens = 8000\n\
+             context_window = 50000\n\
+             max_tokens = 6000\n\
              \n\
              [model.alternate]\n\
              provider = \"openai-compatible\"\n\
-             model = \"small-model\"\n\
+             model = \"small-context-small-output\"\n\
              base_url = \"http://127.0.0.1:1/v1\"\n\
              api_key = \"scripted-key\"\n\
-             context_window = 4096\n\
-             max_tokens = 512\n",
+             context_window = 8000\n\
+             max_tokens = 500\n",
             server.addr
         ),
     )
@@ -299,23 +306,33 @@ fn fallback_chain_budget_is_the_minimum_across_every_candidate_not_just_the_prim
     let (code, _stdout, stderr) = run_exec(&project, &home, &config, "say hi");
     assert_eq!(code, Some(0), "the primary must have served this turn successfully: {stderr}");
     assert!(
-        stderr.contains("context budget: context_window=4096 output_reserve=512"),
-        "the diagnostic must report the chain-wide minimum, not the primary's own \
-         larger capability: {stderr}"
+        stderr.contains("context budget: context_window=8000 output_reserve=6000"),
+        "the diagnostic must report the chain-wide (min context_limit, max \
+         max_output) pairing — 8000 from the alternate, 6000 from the primary — \
+         never the primary's own pair (50000, 6000) or the min/min pair \
+         (8000, 500): {stderr}"
     );
 
     let requests = server.requests.lock().expect("requests");
     assert_eq!(requests.len(), 1, "the primary alone must have served this turn");
     assert!(
-        requests[0].contains("Context window: 4096 tokens. Reserve 512 tokens"),
-        "the primary's own real request must carry the chain-wide minimum budget, \
-         since the effective model was not yet known when context was built: {}",
+        requests[0].contains("Context window: 8000 tokens. Reserve 6000 tokens"),
+        "the primary's own real request must carry the chain-wide (min context, max \
+         output) budget, since the effective model was not yet known when context \
+         was built: {}",
         requests[0]
     );
     assert!(
-        !requests[0].contains("Context window: 200000 tokens"),
-        "the primary must never receive a budget sized only for itself, ignoring a \
-         smaller alternate the router could still have fallen back to: {}",
+        !requests[0].contains("Context window: 50000 tokens"),
+        "the primary must never receive a context_limit sized only for itself, \
+         ignoring a smaller alternate the router could still have fallen back to: {}",
+        requests[0]
+    );
+    assert!(
+        !requests[0].contains("Reserve 500 tokens"),
+        "the primary must never receive an output_reserve smaller than its own real \
+         output cap just because an alternate's is smaller — that would under-\
+         reserve headroom for the primary's own real, larger request: {}",
         requests[0]
     );
     let _ = std::fs::remove_dir_all(&home);

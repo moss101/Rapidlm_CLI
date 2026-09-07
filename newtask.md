@@ -7089,6 +7089,49 @@ fallback context mechanism (the minimum-across-candidates design gives the same 
 it); the pre-existing generic-error-message gap noted above; anything in `GoalUsage`/cost accounting
 (untouched, confirmed no pricing logic added); trust (untouched, confirmed no trust checks/grants touched).
 
+**Follow-up, same day, from a background adversarial self-review of commit `ac54cbc`: one severe bug found
+and fixed, independently re-derived and confirmed before trusting it, plus one real but cosmetic
+mislabeling also fixed.** The severe one: `context_budget_for`'s `FallbackChain` arm took the *minimum* of
+**both** `context_limit` and `max_output` across every backend, independently per field. That's the wrong
+direction for the second field — re-deriving the safety argument from scratch (not just trusting the
+review's framing): `output_reserve` only ever shapes how much of `context_limit` the context builder
+leaves unused when sizing the prompt; the *real, enforced* wire cap sent to whichever backend actually
+serves the turn is that backend's own independent `max_tokens`, forwarded untouched through `build_request`
+into the JSON body. So pairing the *smallest* `max_output` with the *smallest* `context_limit` under-
+reserves headroom whenever a *different* backend — one with a larger real output cap — is the one that
+actually serves the turn: prompt content sized to fit the derived (too-generous) leftover space, plus that
+backend's own real, larger output, can together exceed that backend's real context window — precisely the
+overflow class this whole task exists to close. Proven algebraically before touching code: for every
+backend i, using `context_limit_used = min_j(context_limit_j)` and `output_reserve_used = max_j(max_output_j)`
+guarantees `context_limit_used - output_reserve_used + max_output_i <= context_limit_i` for *every*
+candidate, because `context_limit_used <= context_limit_i` and `max_output_i <= output_reserve_used` by
+construction — true regardless of which single backend minimizes context and which maximizes output.
+**Fixed**: `.reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)))` → `.reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))` —
+minimum `context_limit`, **maximum** `max_output`. Neither of the two fallback-chain tests this task
+originally shipped could have caught this: both configured one backend to be simply smaller on *both*
+fields, so the buggy min/min and the correct min/max happened to agree. Both rewritten with deliberately
+crossed fixtures (primary: large context + large output; alternate: small context + small output) so the
+correct result is a genuine chimera — `(min context from the alternate, max output from the primary)` —
+matching neither backend's own real pair, which is the only fixture shape that actually discriminates
+"correct" from both "min of both" and "just use the primary." Revert-cycled: temporarily restored the
+buggy `min`/`min` reduction, confirmed both the unit test and the CLI wire-capture test fail with exactly
+the predicted wrong numbers, restored the fix, reconfirmed green.
+
+The cosmetic one: `rapid exec --verbose`'s `source=` diagnostic was keyed off `child_model_config` (the
+*primary's* raw config entry) rather than `backing` (what actually produced the printed numbers) — so a
+promoted alternate (when the primary itself fails `ConfiguredModel::build` in the ≥2-model path) or a
+fallback chain's genuinely cross-backend derived pair could be mislabeled `source=configured`/`source=
+default` in a way that didn't describe where the printed numbers actually came from. Stderr-only, no effect
+on real turn behavior, but a real, verified inaccuracy in exactly the diagnostic this task asked for.
+Fixed by keying the label off `backing` itself: `Configured` compares the resolved capability against the
+conservative defaults directly (self-consistent by construction — whatever produced the printed numbers is
+exactly what's being asked "does this look configured or default"); `FallbackChain` now reports honestly as
+a cross-candidate combination (`"chain: minimum context_limit / maximum max_output across N candidates"`)
+rather than claiming a single-model provenance it doesn't have. Both self-review fixes verified against the
+full `interactive::` suite (83 tests), the full `context_budget_cli` suite (4 tests, fixtures rewritten),
+`exec_diagnosability`/`trust_cli`/`goal_concurrency` (unaffected), zero new clippy warnings, and a full
+`cargo test --workspace` — see the follow-up commit for the final tally.
+
 **Next-Edit-Ripple implemented 2026-08-30 — the "genuine, moderate-sized wiring work" the note above
 anticipated, not the traversal algorithm (already existed).** Two small, additive `context-engine` reads
 closed the "resolve a file to symbols, resolve a symbol back to a file" gap `CodeGraph::impact()` itself

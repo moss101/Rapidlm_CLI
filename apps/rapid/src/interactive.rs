@@ -1959,15 +1959,36 @@ fn exec_discover_rules(cwd: &Path, root: &Path) -> Option<String> {
 /// so the budget a turn is sized against can never claim more headroom than
 /// the request that actually goes out believes it has.
 ///
-/// A fallback chain uses the minimum `context_limit`/`max_output` across
-/// every backend it could actually dispatch to (not just the primary): the
-/// effective model for a turn is not fully known until the router picks one
-/// at request time (see `crate::host::FallbackChainModel`), so context sized
-/// only for the primary could be too large for an alternate the chain falls
-/// back to mid-turn. Using the minimum of the whole candidate set means the
-/// context built *before* that choice is made is always valid for whichever
-/// one actually serves it — the same guarantee a full rebuild-on-fallback
-/// would give, without needing to rebuild context after every fallback.
+/// A fallback chain uses the *minimum* `context_limit` but the *maximum*
+/// `max_output` across every backend it could actually dispatch to (not
+/// just the primary) — not the minimum of both, see below. The effective
+/// model for a turn is not fully known until the router picks one at
+/// request time (see `crate::host::FallbackChainModel`), and each backend
+/// still sends its own real per-request output cap independently
+/// (`ConfiguredModel.max_output_tokens`, via `build_request` —
+/// `context_budget_for`'s own `output_reserve` never reaches the wire as a
+/// cap on anyone's request, it only ever shapes how much of `context_limit`
+/// the context builder leaves unused). That independence is exactly why the
+/// minimum of `max_output` would be unsafe here: pairing the smallest
+/// `context_limit` with the smallest `max_output` under-reserves headroom
+/// for whichever *other* backend actually serves the turn with its own,
+/// larger real output cap — prompt content sized to fit in the leftover
+/// space could then combine with that backend's real output to exceed its
+/// real context window, precisely the overflow class this whole budget
+/// exists to prevent. Pairing the minimum `context_limit` with the
+/// *maximum* `max_output` instead is provably safe for every candidate: for
+/// backend i, using `context_limit_used = min_j(context_limit_j)` and
+/// `output_reserve_used = max_j(max_output_j)`, the input budget actually
+/// built (`context_limit_used - output_reserve_used`) plus i's own real
+/// `max_output_i` never exceeds `context_limit_i`, because `context_limit_
+/// used <= context_limit_i` and `max_output_i <= output_reserve_used` by
+/// construction — true regardless of which single backend happens to
+/// minimize context and which happens to maximize output. Using the
+/// candidate-set extremes on each axis independently means the context
+/// built *before* the router's choice is made is always valid for whichever
+/// backend actually serves it — the same guarantee a full rebuild-on-
+/// fallback would give, without needing to rebuild context after every
+/// fallback.
 fn context_budget_for(backing: &SelectedModel<'_>) -> (u32, u32) {
     match backing {
         SelectedModel::Unconfigured(_) => (
@@ -1984,7 +2005,7 @@ fn context_budget_for(backing: &SelectedModel<'_>) -> (u32, u32) {
                 let caps = model.capabilities();
                 (caps.context_limit(), caps.max_output())
             })
-            .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)))
+            .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
             .unwrap_or((
                 crate::user_config::DEFAULT_CONTEXT_WINDOW,
                 crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -2376,17 +2397,31 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     // just resolved above, never a fixed placeholder.
     let (context_limit, output_reserve) = context_budget_for(&backing);
     if parsed.verbose {
-        // `child_model_config` is the primary's own raw config entry (unset
-        // for a fallback-chain alternate or an unconfigured model) — enough
-        // to tell an operator whether the number below came from their own
-        // `context_window`/`max_tokens` or the conservative built-in
-        // default, without re-deriving it a second time just to report it.
-        let source = match &child_model_config {
-            Some(active) if active.entry.context_window.is_some() || active.entry.max_tokens.is_some() => {
-                "configured"
+        // Keyed off `backing` itself (what actually produced the numbers
+        // above), not `child_model_config` (the *primary's* raw config
+        // entry): the primary is not necessarily what backs a resolved
+        // `Configured` model (the `backends.len() < 2`/controller-failure
+        // paths above can promote a surviving alternate instead), and a
+        // `FallbackChain`'s derived pair is a genuine cross-backend
+        // combination — attributing it to "the primary's config" would
+        // misdescribe where the printed numbers actually came from either
+        // way.
+        let source = match &backing {
+            SelectedModel::Unconfigured(_) => "default (no model configured)".to_owned(),
+            SelectedModel::Configured(model) => {
+                let caps = model.capabilities();
+                if caps.context_limit() == crate::user_config::DEFAULT_CONTEXT_WINDOW
+                    && caps.max_output() == crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS
+                {
+                    "default (context_window/max_tokens unset in model config)".to_owned()
+                } else {
+                    "configured".to_owned()
+                }
             }
-            Some(_) => "default (context_window/max_tokens unset in model config)",
-            None => "default (no model configured)",
+            SelectedModel::FallbackChain(_) => format!(
+                "chain: minimum context_limit / maximum max_output across {} candidates",
+                models.len()
+            ),
         };
         eprintln!(
             "context budget: context_window={context_limit} output_reserve={output_reserve} source={source}"
@@ -5152,64 +5187,81 @@ base_url = "http://127.0.0.1:11434/v1"
     }
 
     #[test]
-    fn context_budget_for_fallback_chain_uses_the_minimum_across_every_backend() {
-        // A large cloud-shaped primary and a small local-shaped alternate —
-        // the effective model for a real turn is not known until the router
-        // picks one at request time, so the pre-built context must already
-        // be valid for the *smaller* one, not just the primary.
-        let large_doc = r#"
+    fn context_budget_for_fallback_chain_uses_min_context_and_max_output_across_backends() {
+        // Deliberately crossed so the correct pairing is a genuine chimera
+        // matching neither backend's own real pair — this is the shape that
+        // actually discriminates the correct rule from two plausible-
+        // looking wrong ones: taking the minimum of *both* fields (unsafe —
+        // under-reserves headroom for whichever backend's own real request
+        // sends the larger output cap independently, see `context_budget_
+        // for`'s own doc comment) and naively using only the primary's own
+        // numbers (wrong whenever the primary isn't the most-constraining
+        // candidate on some field). A fixture where one backend is smaller
+        // on both fields, or where the two extremes happen to land on the
+        // same backend, cannot tell any of the three apart.
+        let primary_doc = r#"
 [models]
 default = "cloud"
 
 [model.cloud]
 provider = "openai-compatible"
-model = "big-model"
+model = "big-context-big-output"
 base_url = "http://127.0.0.1:11434/v1"
-context_window = 200000
-max_tokens = 8192
+context_window = 50000
+max_tokens = 6000
 "#;
-        let small_doc = r#"
+        let alternate_doc = r#"
 [models]
 default = "local"
 
 [model.local]
 provider = "openai-compatible"
-model = "small-model"
+model = "small-context-small-output"
 base_url = "http://127.0.0.1:11435/v1"
-context_window = 4096
-max_tokens = 1024
+context_window = 8000
+max_tokens = 500
 "#;
         let store_a = auth::InMemoryCredentialStore::new();
         let store_b = auth::InMemoryCredentialStore::new();
-        let large = ConfiguredModel::build(&active_from_doc(large_doc), &store_a).expect("build large");
-        let small = ConfiguredModel::build(&active_from_doc(small_doc), &store_b).expect("build small");
+        let primary =
+            ConfiguredModel::build(&active_from_doc(primary_doc), &store_a).expect("build primary");
+        let alternate =
+            ConfiguredModel::build(&active_from_doc(alternate_doc), &store_b).expect("build alternate");
 
-        let large_ref = llm_router::provider::ModelRef::new(
+        let primary_ref = llm_router::provider::ModelRef::new(
             llm_router::provider::ProviderId::parse("openai-compatible").expect("provider"),
             llm_router::provider::ModelId::parse("cloud").expect("model id"),
         );
-        let small_ref = llm_router::provider::ModelRef::new(
+        let alternate_ref = llm_router::provider::ModelRef::new(
             llm_router::provider::ProviderId::parse("openai-compatible").expect("provider"),
             llm_router::provider::ModelId::parse("local").expect("model id"),
         );
         let policy = llm_router::fallback::FallbackPolicy::standard();
         let router_cancel = llm_router::provider::CancellationToken::new();
         let controller = llm_router::fallback::FallbackController::from_explicit_chain(
-            large_ref.clone(),
-            vec![small_ref.clone()],
+            primary_ref.clone(),
+            vec![alternate_ref.clone()],
             policy,
             &router_cancel,
         )
         .expect("controller");
-        let chain = FallbackChainModel::new(vec![(large_ref, large), (small_ref, small)], controller, None);
+        let chain = FallbackChainModel::new(
+            vec![(primary_ref, primary), (alternate_ref, alternate)],
+            controller,
+            None,
+        );
         let backing = SelectedModel::FallbackChain(Box::new(chain));
 
         assert_eq!(
             context_budget_for(&backing),
-            (4096, 1024),
-            "the chain's derived budget must be the minimum across every backend it \
-             could dispatch to, so context sized before routing picks one is always \
-             valid for the smallest candidate"
+            (8000, 6000),
+            "must be (min context_limit, max max_output) across every backend — \
+             context_limit=8000 from the alternate (the primary's 50000 would be \
+             unsafe for the alternate), output_reserve=6000 from the primary (the \
+             alternate's 500 would under-reserve headroom for the primary's own \
+             real, larger output cap) — a chimera matching neither backend's own \
+             pair, which is exactly the point: min/min would give (8000, 500), and \
+             naively using only the primary would give (50000, 6000), both wrong"
         );
     }
 
