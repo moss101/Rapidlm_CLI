@@ -6962,6 +6962,133 @@ explicit-mode gap folds into the TUI kernel-dispatch finding under item 13 itsel
 30 `KernelAction` variants confirmed silently no-op in `apply_kernel_action`, not a separate unwired-crate
 problem the way this paragraph originally framed it.
 
+**RESOLVED, 2026-09-07: the P0 this paragraph's own numbers were flowing from — a hard-coded 8,192-token
+context budget, sourced from nowhere the resolved model actually described — is now genuinely model-
+derived.** Scoped and closed as its own task, separate from the compaction-reachability finding above
+(which stays correct and untouched: `LiveRecoveryController::recover_from_overflow`'s proportional
+`hard_tokens`/`soft_tokens` derivation from `context_limit`/`output_reserve`, and `context-engine::compile`'s
+own budget arithmetic — reserved-output/safety-margin subtraction, mandatory-content-exceeds-budget
+detection, retrieval's proportional share split — were already completely correct; the only real gap was
+what fed them).
+
+*Every production `8192`/`256` assumption found* (workspace-wide grep, not just the two literals the task
+named): three real call sites in `apps/rapid/src/interactive.rs` — `exec_turn` (headless `rapid exec`,
+line ~2025 pre-fix), `build_interactive_turn_context` (interactive TUI + autonomous `/goal run`, which
+reaches it through the identical `SessionLoop::submit_turn` an ordinary turn uses — no separate autonomous
+budget path ever existed to regress independently), and `LiveSubagentRunner::run` (`task_spawn` children).
+All three now derive their budget from the actually-resolved model instead. Every other `8192`/`8_192` hit
+in the workspace (checked individually, not assumed unrelated) was either an unrelated fixed-size I/O
+buffer (`sandbox`/`workspace`/`process-supervisor`/`mobile-sim` read-loop chunk sizes), a `crates/llm-router`
+*test fixture* value (golden JSON, `caps(...)` helper calls — real capability plumbing already existed
+there, confirmed below, just never consulted by `apps/rapid`), or `crates/tui/src/panels/model.rs`'s own
+already-correct display of a *provider-reported* `ctx:8192` for one specific catalog entry (not a RapidLM-
+side assumption at all).
+
+*Authoritative model-capability source — found, not built:* `apps/rapid/src/model.rs::ConfiguredModel::build`
+already constructed a real `llm_router::provider::ProviderCapabilities` (`context_limit`/`max_output`) for
+every resolved model, attached it to the adapter's own request-construction config
+(`OpenAiCompatibleConfig`/`AnthropicConfig`, both already exposing a `.capabilities()` accessor) — the
+*exact* object that governs the real provider request — but nothing ever read it back out for context
+sizing. New `ConfiguredModel::capabilities(&self) -> &ProviderCapabilities` (one accessor) and new
+`FallbackChainModel::backends(&self) -> impl Iterator<Item = &B>` (`apps/rapid/src/host.rs`, one accessor)
+are the entire "catalog" this task needed — confirmed via `crates/llm-router/src/catalog.rs::ModelCatalog`
+that a real, broader capability-catalog abstraction (context/tools/vision/reasoning/pricing/latency,
+`MOD-003` above) already exists in the router crate too, but is operator/config-driven (`CatalogConfig` +
+`ProviderCapIndex`, both caller-supplied) and has zero production callers in `apps/rapid` today — wiring it
+in would mean sourcing that config/probe data from somewhere that doesn't exist yet, which is squarely
+`MOD-003`'s own separate, larger scope, not this P0's. Deliberately not touched.
+
+*Precedence/unknown-model semantics — reused, not invented:* `ConfiguredModel::build` already resolves
+`context_limit`/`max_output` as `active.entry.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW)` /
+`active.entry.max_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)` (`apps/rapid/src/user_config.rs`:
+`DEFAULT_CONTEXT_WINDOW = 32_768`, `DEFAULT_MAX_OUTPUT_TOKENS = 4_096`) — an explicit per-model TOML
+override already wins over a conservative built-in default, and an unconfigured model gets the identical
+default an configured-but-unspecified one does. This resolves the task's own genuine-fork list from direct
+repository evidence, not a guess: (1) unknown/custom model → the existing conservative-fallback tier, no
+remote discovery, no third "known-models" static tier (would be `MOD-003` scope creep — a per-model-name
+table is also exactly the "avoid unexplained provider branches/substring guesses" trap the task warned
+against, and none was introduced); (2) source precedence → explicit config beats built-in default, already
+established; (3) output reserve → reuses the *same* `max_output` value already governing the real request's
+own output cap (`build_request`'s `max_output_tokens`), not a second independently-chosen number — "do not
+reserve 32K output if the request is capped at 4K" falls out automatically because it's literally the same
+number now. New `context_budget_for(&SelectedModel) -> (u32, u32)` (`interactive.rs`) is the one function
+implementing this precedence, consumed by both `exec_turn` and `run_interactive_turn_inner` — no context
+builder parses a model name or branches on provider identity anywhere.
+
+*Router/fallback — the task's flagged Option A vs. B fork, resolved:* `exec_turn`'s `[models] fallback`
+chain means the effective model genuinely isn't known until `FallbackController` picks one at request
+time (Option B is real here, not hypothetical) — confirmed by tracing `FallbackChainModel`'s own doc
+comment and construction. Rather than rebuilding context after every fallback (invasive, and this task's
+own instructions warn against redesigning the broader permission/retry machinery), `context_budget_for`'s
+`FallbackChain` arm takes the **minimum** `context_limit`/`max_output` across every backend the chain could
+dispatch to — proven safe because each backend's real per-request output cap is sent independently by its
+own `ConfiguredModel.max_output_tokens` (`build_request`), so the shared derived `output_reserve` is only
+ever a context-*sizing* input, never a wire-level cap on some other backend's real allowance; using the
+minimum can only be conservative, never cause an oversized prompt to reach a smaller model. Proven end to
+end, not just unit-level: `fallback_chain_budget_is_the_minimum_across_every_candidate_not_just_the_primary`
+(`apps/rapid/tests/context_budget_cli.rs`) configures a large primary + small alternate and asserts the
+*primary's own, successful, first* real HTTP request already carries the small alternate's numbers.
+
+*Reordering required — model resolution now precedes context construction, not the reverse:* both
+`exec_turn` and `run_interactive_turn_inner` previously called `build_live_context`/`build_interactive_
+turn_context` *before* resolving `backing: SelectedModel` — Option A's ideal ("effective model fully known
+before context construction") wasn't just unmet for the fallback-chain case, it was unmet for the *ordinary
+single-model* case too. Fixed by moving model/credential resolution ahead of context assembly in both
+functions; `apply_reminder_floor`'s dependency on `reminder_floor` (previously computed as part of context
+assembly) is now computed first and threaded through unchanged. One care point, verified not regressed:
+`exec_turn`'s credential-redaction registration used to run against an already-built `tools: ExecTools`;
+now it's captured as `Option<security::RedactionSnapshot>` during model resolution and applied to `tools`
+once `build_interactive_turn_context`/context assembly actually produces it — same effect, later
+application point.
+
+*Diagnostics:* `rapid exec --verbose` now prints one line — `context budget: context_window=N
+output_reserve=M source=<configured|default (...)>` — naming both numbers and whether they came from an
+explicit override or the conservative default, using the primary's own raw config entry (cheap, already
+in scope) rather than re-deriving anything a second time just to report it. Not added to the interactive
+TUI (would print on every Enter-press turn — the task's own "do not flood normal TUI output" instruction).
+
+*Pre-existing, unrelated-to-this-fix, and NOT attempted here — an honest negative finding, not swept
+under the rug:* a prompt whose own text alone (mandatory `ContextSource::Goal` content —
+`context-engine::compile::is_mandatory`) exceeds the resolved model's usable input budget already fails
+via `CompileError::MandatoryExceedsBudget`/`ReservedUntouchable` deep inside `context-engine::compile` —
+exactly the precise, typed detection the task wants — but by the time that failure reaches the CLI, it has
+already been flattened into a generic `"interactive session failed internally"` (`InteractiveError::
+Internal`, exit 5). Verified this is pre-existing, not newly introduced or newly reachable by this fix: the
+identical vague message reproduces with the *old* literal 8192/256 budget and a long-enough prompt, exactly
+as it does with any newly-configurable small budget. Threading `CompileError`'s real precision through to
+the CLI-visible message is real, worthwhile follow-up work — but it touches `InteractiveError`/`kernel::
+TurnOutcome`'s error-mapping surface broadly, well past "derive the right budget number," so it was
+deliberately left alone rather than folded into this P0's diff. `overflow_regression_small_budget_rejects_
+what_a_large_budget_accepts` (`context_budget_cli.rs`) still proves the *detection* itself is budget-
+dependent (same content: small budget fails, large budget succeeds) without depending on message wording.
+
+*Files changed:* `apps/rapid/src/interactive.rs` (`context_budget_for`, `exec_turn`/`run_interactive_turn_
+inner`/`build_interactive_turn_context`/`LiveSubagentRunner::run` reordered and rewired, `--verbose`
+diagnostic, `ScriptedModel` gained an opt-in system-prompt capture seam and 6 new tests), `apps/rapid/src/
+model.rs` (`ConfiguredModel::capabilities`), `apps/rapid/src/host.rs` (`FallbackChainModel::backends`), new
+`apps/rapid/tests/context_budget_cli.rs` (4 end-to-end tests). *Tests added:* 4 unit (`context_budget_for`
+resolution: unconfigured, configured-explicit, configured-default, fallback-chain-minimum) + 2 more in
+`interactive.rs`'s own test module (autonomous-iteration budget regression, interactive-turn small-vs-large
+budget) + 4 in `context_budget_cli.rs` (configured-reaches-the-wire, unconfigured-default-on-the-wire,
+overflow regression, fallback-chain-minimum-on-the-wire) = 10 new tests, all driving the real production
+path (real HTTP capture or the real `SessionLoop`/`submit_turn` chain), not just the budget-arithmetic
+helper in isolation. *Verification:* `cargo build --workspace --tests` clean; `cargo clippy -p rapid
+--all-targets` — zero new warnings (56 pre-existing, unrelated, before and after); full `cargo test
+--workspace` — see the commit for the final tally. *Revert cycles run, each broken/confirmed-failing/
+restored:* (1) hard-coded budget — `context_budget_for` forced back to `(8192, 256)`: 3 CLI tests + 4 unit
+tests failed, all showing the stale numbers on the real wire. (2) capability propagation — `ConfiguredModel
+::build` forced to ignore `active.entry.context_window`/`max_tokens`: the two tests asserting an explicit
+override actually took effect failed. (3) fallback-chain minimum — reverted to primary-only: both the unit
+test and the CLI wire-level test caught the primary's larger number leaking through. (4) output reserve —
+temporarily used the full context window as the reserve too (the task's own exact wording): both
+capability-resolution unit tests caught the missing headroom. (5) unknown-model fallback — bypassed with a
+made-up "precise-looking" `(999999, 999999)`: the unconfigured-default unit test caught it immediately. All
+five restored and reconfirmed green. *Deliberately out of scope, per the task's own boundary:* the broader
+`MOD-003`-style per-model capability catalog (vision/tools/reasoning/pricing/latency); a real rebuild-on-
+fallback context mechanism (the minimum-across-candidates design gives the same safety guarantee without
+it); the pre-existing generic-error-message gap noted above; anything in `GoalUsage`/cost accounting
+(untouched, confirmed no pricing logic added); trust (untouched, confirmed no trust checks/grants touched).
+
 **Next-Edit-Ripple implemented 2026-08-30 — the "genuine, moderate-sized wiring work" the note above
 anticipated, not the traversal algorithm (already existed).** Two small, additive `context-engine` reads
 closed the "resolve a file to symbols, resolve a symbol back to a file" gap `CodeGraph::impact()` itself

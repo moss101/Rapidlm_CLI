@@ -238,6 +238,21 @@ impl<'store> ConfiguredModel<'store> {
             reasoning_effort: active.entry.reasoning_effort,
         })
     }
+
+    /// The capabilities this model was actually configured with — the same
+    /// [`ProviderCapabilities`] object already attached to the adapter's own
+    /// request-construction config (`context_limit`/`max_output` resolved
+    /// from `context_window`/`max_tokens` if set, else the conservative
+    /// [`DEFAULT_CONTEXT_WINDOW`]/[`DEFAULT_MAX_OUTPUT_TOKENS`]). The
+    /// authoritative source for deriving this turn's context budget — never
+    /// re-derive it from `active.entry` a second time at a different call
+    /// site, which could silently drift from what the real request sends.
+    pub fn capabilities(&self) -> &ProviderCapabilities {
+        match &self.backend {
+            Backend::OpenAi(adapter) => adapter.config().capabilities(),
+            Backend::Anthropic(adapter) => adapter.config().capabilities(),
+        }
+    }
 }
 
 /// Seed the process-local credential store so the router's fail-closed

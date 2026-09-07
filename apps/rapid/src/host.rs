@@ -1053,6 +1053,15 @@ impl<B: LiveModelCall> FallbackChainModel<B> {
         self.decisions.clone()
     }
 
+    /// Every backend this chain could dispatch to, in configured order —
+    /// read-only access for a caller that needs to reason about the whole
+    /// candidate set (e.g. deriving a context budget safe no matter which
+    /// one ends up serving the request) without exposing mutation or the
+    /// routing controller itself.
+    pub fn backends(&self) -> impl Iterator<Item = &B> {
+        self.backends.iter().map(|(_, backend)| backend)
+    }
+
     fn backend_mut(&mut self, target: &ModelRef) -> &mut B {
         &mut self
             .backends

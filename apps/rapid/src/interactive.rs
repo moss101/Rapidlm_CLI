@@ -1798,14 +1798,18 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // Subagents run in the same trusted project as the parent (only
         // spawned when the workspace is trusted), so they get the same
         // AGENTS.md rules and system prompt as the top-level turn instead of
-        // running with neither.
+        // running with neither. Budget comes from `model` (just built
+        // above, from the same `active` config the parent turn resolved) —
+        // a child never gets a hard-coded placeholder its parent's real
+        // context budget already disagrees with.
+        let caps = model.capabilities();
         let preserved = build_live_context(
             Some(&self.root),
             Some(&self.root),
             prompt.to_owned(),
             true,
-            8192,
-            256,
+            caps.context_limit(),
+            caps.max_output(),
         )
         .map_err(|_| "child context rejected".to_owned())?;
         let spec = AgentSpec::builder(
@@ -1935,6 +1939,59 @@ fn exec_discover_rules(cwd: &Path, root: &Path) -> Option<String> {
 }
 
 /// Build the preserved context shared by every live-exec caller: AGENTS.md
+/// Derive `build_live_context`'s `(context_limit, output_reserve)` pair from
+/// `backing`'s actual resolved model(s) — the one authoritative source every
+/// context-budget consumer downstream (compaction thresholds, the retrieval
+/// share, the system prompt's own rendered token-budget line, overflow
+/// recovery — see `LiveRecoveryController::recover_from_overflow` and
+/// `build_packet`, both of which already derive proportionally from these
+/// two numbers) sizes itself against. Never a second, independently-guessed
+/// number: both fields come straight from the same [`llm_router::provider::
+/// ProviderCapabilities`] already attached to the model's own adapter config
+/// (see [`ConfiguredModel::capabilities`]), the same object that already
+/// governs the real provider request.
+///
+/// Unknown-capability precedence (an unconfigured model, or a configured one
+/// that didn't set an explicit `context_window`/`max_tokens`) is not a new
+/// policy invented here — it reuses exactly what `ConfiguredModel::build`
+/// already falls back to for the *request itself*
+/// (`crate::user_config::DEFAULT_CONTEXT_WINDOW`/`DEFAULT_MAX_OUTPUT_TOKENS`),
+/// so the budget a turn is sized against can never claim more headroom than
+/// the request that actually goes out believes it has.
+///
+/// A fallback chain uses the minimum `context_limit`/`max_output` across
+/// every backend it could actually dispatch to (not just the primary): the
+/// effective model for a turn is not fully known until the router picks one
+/// at request time (see `crate::host::FallbackChainModel`), so context sized
+/// only for the primary could be too large for an alternate the chain falls
+/// back to mid-turn. Using the minimum of the whole candidate set means the
+/// context built *before* that choice is made is always valid for whichever
+/// one actually serves it — the same guarantee a full rebuild-on-fallback
+/// would give, without needing to rebuild context after every fallback.
+fn context_budget_for(backing: &SelectedModel<'_>) -> (u32, u32) {
+    match backing {
+        SelectedModel::Unconfigured(_) => (
+            crate::user_config::DEFAULT_CONTEXT_WINDOW,
+            crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS,
+        ),
+        SelectedModel::Configured(model) => {
+            let caps = model.capabilities();
+            (caps.context_limit(), caps.max_output())
+        }
+        SelectedModel::FallbackChain(chain) => chain
+            .backends()
+            .map(|model| {
+                let caps = model.capabilities();
+                (caps.context_limit(), caps.max_output())
+            })
+            .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)))
+            .unwrap_or((
+                crate::user_config::DEFAULT_CONTEXT_WINDOW,
+                crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS,
+            )),
+    }
+}
+
 /// project instructions discovered under `root`/`cwd`, and the
 /// conditional-section system prompt (environment, trust posture, token
 /// budget). Used by both the top-level `exec` turn and `task_spawn`
@@ -2017,73 +2074,6 @@ pub(crate) fn exec_turn(
     let workspace_cancel = CancellationToken::new();
     let workspace = exec_workspace(&workspace_cancel);
     let trusted = matches!(&workspace, Some((_, TrustStatus::Trusted)));
-
-    // Prompt/context stack: project instructions (AGENTS.md convention +
-    // compat paths) and the conditional-section system prompt (environment,
-    // trust posture, token budget).
-    let cwd = std::env::current_dir().ok();
-    let preserved = build_live_context(
-        workspace.as_ref().map(|(root, _)| root.as_path()),
-        cwd.as_deref(),
-        prompt.clone(),
-        trusted,
-        8192,
-        256,
-    )
-    .map_err(|_| InteractiveError::Internal)?;
-    // Memory index: .rapidlm/MEMORY.md is always loaded (bounded, advisory).
-    let memory_index = workspace
-        .as_ref()
-        .and_then(|(root, _)| crate::host::load_memory_index(root));
-    let preserved = preserved.with_memory_index(memory_index);
-    // Plan/todo projection: .rapidlm/todos.json (written by todo_write)
-    // survives compaction and a fresh invocation, not just the transcript.
-    let todos_index = workspace
-        .as_ref()
-        .and_then(|(root, _)| crate::host::load_todos_index(root));
-    let preserved = preserved.with_todos_index(todos_index);
-    // Proactive context retrieval: only for a trusted project (it walks the
-    // tree and writes an incremental index under .rapidlm/index/). Fails
-    // open inside retrieve() itself — an unindexable or slow repo yields no
-    // blocks rather than blocking the turn.
-    let preserved = if let Some((root, TrustStatus::Trusted)) = &workspace {
-        let retrieved = crate::context_retrieval::retrieve(root, &prompt, 2048);
-        preserved.with_retrieved_context(retrieved)
-    } else {
-        preserved
-    };
-    // Reminder feeds: load the project roster if present and admit the
-    // always-on feeds (the CLI host grants no capabilities, so feeds gated
-    // on a capability stay inactive). A broken roster warns and the turn
-    // continues without reminders — advisory context, kept not loaded.
-    let mut reminder_floor = agent_runtime::reminders::ReminderFloor::Baseline;
-    let preserved = match load_active_reminders() {
-        Ok(Some((block, floor))) => {
-            reminder_floor = floor;
-            preserved.with_reminders_block(Some(block))
-        }
-        Ok(None) => preserved,
-        Err(err) => {
-            eprintln!("warning: reminders not loaded: {err}");
-            preserved
-        }
-    };
-    let spec = AgentSpec::builder(
-        protocol::AgentId::new(),
-        AgentRole::Coder,
-        prompt,
-        protocol::WorkspaceViewId::new(),
-    )
-    .permissions_profile("work")
-    .build()
-    .map_err(|_| InteractiveError::Internal)?;
-    let session_id = protocol::SessionId::new();
-    let request = AgentExecutionRequest::new(spec, session_id);
-    let cancel = agent_runtime::CancellationToken::new();
-    if let Some(max_wall_time) = parsed.max_wall_time {
-        spawn_wall_time_watchdog(cancel.clone(), max_wall_time);
-    }
-    let mut events: Vec<agent_runtime::TurnEvent> = Vec::new();
 
     // Tools stay fail-closed: workspace tools are granted only when the
     // project is explicitly trusted and its root still resolves, and every
@@ -2200,7 +2190,33 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         }
     }
 
+    // Reminder feeds: load the project roster if present and admit the
+    // always-on feeds (the CLI host grants no capabilities, so feeds gated
+    // on a capability stay inactive). A broken roster warns and the turn
+    // continues without reminders — advisory context, kept not loaded.
+    // Computed here, ahead of model selection just below (not inline with
+    // the rest of context assembly, which now comes after model selection
+    // so its budget can be derived from the resolved model) because
+    // `apply_reminder_floor` needs `reminder_floor` to pick the model's
+    // reasoning effort.
+    let mut reminder_floor = agent_runtime::reminders::ReminderFloor::Baseline;
+    let mut reminder_block: Option<String> = None;
+    match load_active_reminders() {
+        Ok(Some((block, floor))) => {
+            reminder_floor = floor;
+            reminder_block = Some(block);
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("warning: reminders not loaded: {err}");
+        }
+    }
+
     // Layered model selection (env overrides > user config > typed fallback).
+    // Resolved before context construction below — not after, as it was
+    // before this fix — so the context budget (`context_budget_for`) is
+    // derived from the model that will actually run this turn, never a
+    // hard-coded placeholder sized before the model was even known.
     let process_env: Vec<(String, String)> = std::env::vars().collect();
     let mut base_url = String::from("unconfigured");
     let mut child_model_config: Option<crate::user_config::ActiveModel> = None;
@@ -2353,6 +2369,78 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             }
         }
     };
+
+    // Prompt/context stack: project instructions (AGENTS.md convention +
+    // compat paths) and the conditional-section system prompt (environment,
+    // trust posture, token budget) — sized against `backing`, the model
+    // just resolved above, never a fixed placeholder.
+    let (context_limit, output_reserve) = context_budget_for(&backing);
+    if parsed.verbose {
+        // `child_model_config` is the primary's own raw config entry (unset
+        // for a fallback-chain alternate or an unconfigured model) — enough
+        // to tell an operator whether the number below came from their own
+        // `context_window`/`max_tokens` or the conservative built-in
+        // default, without re-deriving it a second time just to report it.
+        let source = match &child_model_config {
+            Some(active) if active.entry.context_window.is_some() || active.entry.max_tokens.is_some() => {
+                "configured"
+            }
+            Some(_) => "default (context_window/max_tokens unset in model config)",
+            None => "default (no model configured)",
+        };
+        eprintln!(
+            "context budget: context_window={context_limit} output_reserve={output_reserve} source={source}"
+        );
+    }
+    let cwd = std::env::current_dir().ok();
+    let preserved = build_live_context(
+        workspace.as_ref().map(|(root, _)| root.as_path()),
+        cwd.as_deref(),
+        prompt.clone(),
+        trusted,
+        context_limit,
+        output_reserve,
+    )
+    .map_err(|_| InteractiveError::Internal)?;
+    // Memory index: .rapidlm/MEMORY.md is always loaded (bounded, advisory).
+    let memory_index = workspace
+        .as_ref()
+        .and_then(|(root, _)| crate::host::load_memory_index(root));
+    let preserved = preserved.with_memory_index(memory_index);
+    // Plan/todo projection: .rapidlm/todos.json (written by todo_write)
+    // survives compaction and a fresh invocation, not just the transcript.
+    let todos_index = workspace
+        .as_ref()
+        .and_then(|(root, _)| crate::host::load_todos_index(root));
+    let preserved = preserved.with_todos_index(todos_index);
+    // Proactive context retrieval: only for a trusted project (it walks the
+    // tree and writes an incremental index under .rapidlm/index/). Fails
+    // open inside retrieve() itself — an unindexable or slow repo yields no
+    // blocks rather than blocking the turn.
+    let preserved = if let Some((root, TrustStatus::Trusted)) = &workspace {
+        let retrieved = crate::context_retrieval::retrieve(root, &prompt, 2048);
+        preserved.with_retrieved_context(retrieved)
+    } else {
+        preserved
+    };
+    let preserved = preserved.with_reminders_block(reminder_block);
+    let spec = AgentSpec::builder(
+        protocol::AgentId::new(),
+        AgentRole::Coder,
+        prompt,
+        protocol::WorkspaceViewId::new(),
+    )
+    .permissions_profile("work")
+    .build()
+    .map_err(|_| InteractiveError::Internal)?;
+    let session_id = protocol::SessionId::new();
+    let request = AgentExecutionRequest::new(spec, session_id);
+    let cancel = agent_runtime::CancellationToken::new();
+    if let Some(max_wall_time) = parsed.max_wall_time {
+        spawn_wall_time_watchdog(cancel.clone(), max_wall_time);
+    }
+    let mut events: Vec<agent_runtime::TurnEvent> = Vec::new();
+
     // Scrub the active model's own resolved credential from captured
     // shell_exec output: a command that reads back a config file
     // containing it (a real, plausible thing to run, not a contrived
@@ -3564,6 +3652,13 @@ impl SessionLoop<'_> {
                 .and_then(|queue| queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front());
             #[cfg(test)]
             if let Some(backing) = scripted {
+                // No real `ConfiguredModel` behind a scripted backing to
+                // derive a budget from — the same conservative default
+                // `context_budget_for` uses for an unconfigured model.
+                let budget = (
+                    crate::user_config::DEFAULT_CONTEXT_WINDOW,
+                    crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS,
+                );
                 spawn_interactive_turn_with_backing(
                     self.client.clone(),
                     self.session_id,
@@ -3575,6 +3670,7 @@ impl SessionLoop<'_> {
                     turn_cancel,
                     std::sync::Arc::clone(&self.turn_in_flight),
                     backing,
+                    budget,
                 );
                 return self.drain();
             }
@@ -3791,6 +3887,7 @@ fn spawn_interactive_turn_with_backing<B: crate::host::LiveModelCall + Send + 's
     kernel_cancel: kernel::CancelToken,
     turn_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     backing: B,
+    budget: (u32, u32),
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let outcome = catching_panics(std::panic::AssertUnwindSafe(|| {
@@ -3803,6 +3900,7 @@ fn spawn_interactive_turn_with_backing<B: crate::host::LiveModelCall + Send + 's
                 &text,
                 &kernel_cancel,
                 backing,
+                budget,
             )
         }));
         let _ = client.finish_turn(kernel::FinishTurn::new(
@@ -3919,6 +4017,7 @@ fn run_interactive_turn_with_backing<B: crate::host::LiveModelCall>(
     text: &str,
     kernel_cancel: &kernel::CancelToken,
     backing: B,
+    budget: (u32, u32),
 ) -> kernel::TurnOutcome {
     let bridge = CancelBridge::start(kernel_cancel);
     let outcome = run_interactive_turn_inner_with_backing(
@@ -3930,6 +4029,7 @@ fn run_interactive_turn_with_backing<B: crate::host::LiveModelCall>(
         text,
         &bridge.token,
         backing,
+        budget,
     );
     bridge.stop();
     outcome
@@ -3951,7 +4051,10 @@ fn preserve_memory_and_todos(preserved: PreservedLiveContext, root: &Path) -> Pr
 }
 
 /// Build the context/tools half of one interactive turn — everything that
-/// does not depend on which model backs it. Split out from
+/// does not depend on which model backs it, except the `(context_limit,
+/// output_reserve)` budget itself, which the caller must derive from
+/// whichever model it resolved (or, for a test, chooses to simulate) before
+/// calling this — see [`context_budget_for`]. Split out from
 /// `run_interactive_turn_inner` so a test can reuse this exact, real setup
 /// (memory/todos index, permission lattice, `ExecTools`) while swapping in a
 /// scripted [`crate::host::LiveModelCall`] instead of the real
@@ -3973,16 +4076,24 @@ fn build_interactive_turn_context(
     trusted: bool,
     text: &str,
     forced_mode: Option<crate::permissions::PermissionMode>,
+    context_limit: u32,
+    output_reserve: u32,
 ) -> Result<(PreservedLiveContext, ExecTools), kernel::TurnOutcome> {
-    let preserved =
-        match build_live_context(Some(root), Some(root), text.to_owned(), trusted, 8192, 256) {
-            Ok(preserved) => preserved,
-            Err(err) => {
-                return Err(kernel::TurnOutcome::Failed {
-                    reason: format!("context error: {err}"),
-                });
-            }
-        };
+    let preserved = match build_live_context(
+        Some(root),
+        Some(root),
+        text.to_owned(),
+        trusted,
+        context_limit,
+        output_reserve,
+    ) {
+        Ok(preserved) => preserved,
+        Err(err) => {
+            return Err(kernel::TurnOutcome::Failed {
+                reason: format!("context error: {err}"),
+            });
+        }
+    };
     let preserved = preserve_memory_and_todos(preserved, root);
     let permission_lattice = match exec_permission_lattice(Some(root), forced_mode) {
         Ok(lattice) => lattice,
@@ -4020,14 +4131,18 @@ fn run_interactive_turn_inner(
     text: &str,
     cancel: &agent_runtime::CancellationToken,
 ) -> kernel::TurnOutcome {
-    let (preserved, mut tools) = match build_interactive_turn_context(root, trusted, text, None) {
-        Ok(built) => built,
-        Err(outcome) => return outcome,
-    };
-
+    // Model resolved *before* context construction below — not after — so
+    // the context budget (`context_budget_for`) is derived from the model
+    // that will actually run this turn, never a hard-coded placeholder sized
+    // before the model was even known. `redaction_snapshot` is captured here
+    // too (it depends on the resolved credential, not on `tools`, which
+    // doesn't exist yet) and applied to `tools` once `build_interactive_
+    // turn_context` returns it below.
+    //
     // One store, fully built before `ConfiguredModel` borrows from it — the
     // borrow must not outlive it, matching `exec_turn`'s own ordering.
     let credential_store = auth::InMemoryCredentialStore::new();
+    let mut redaction_snapshot: Option<security::RedactionSnapshot> = None;
     let backing = match crate::user_config::select_from_process_env_gated() {
         Ok(ModelSelection::Configured { active, warnings }) => {
             for warning in warnings {
@@ -4047,7 +4162,7 @@ fn run_interactive_turn_inner(
                     .register_canary(&refer, plaintext.as_bytes(), &cancel)
                     .is_ok()
                 {
-                    tools.set_redaction(registry.snapshot());
+                    redaction_snapshot = Some(registry.snapshot());
                 }
             }
             match ConfiguredModel::build(&active, &credential_store) {
@@ -4066,6 +4181,16 @@ fn run_interactive_turn_inner(
             };
         }
     };
+    let (context_limit, output_reserve) = context_budget_for(&backing);
+
+    let (preserved, mut tools) =
+        match build_interactive_turn_context(root, trusted, text, None, context_limit, output_reserve) {
+            Ok(built) => built,
+            Err(outcome) => return outcome,
+        };
+    if let Some(snapshot) = redaction_snapshot {
+        tools.set_redaction(snapshot);
+    }
 
     execute_interactive_turn(client, session_id, actor, root, text, preserved, &mut tools, backing, cancel)
 }
@@ -4077,7 +4202,12 @@ fn run_interactive_turn_inner(
 /// config — the seam that lets a test drive the actual turn-execution
 /// boundary deterministically instead of only proving it "doesn't crash"
 /// against whatever model happens to be configured on the machine running
-/// the test (or none at all).
+/// the test (or none at all). `budget` is the caller's simulated
+/// `(context_limit, output_reserve)` for `backing` — a scripted
+/// `LiveModelCall` has no real `ProviderCapabilities` to derive one from
+/// (unlike production's `context_budget_for`), so the test names it
+/// directly; see `ScriptedSession::run_turn_with_budget` for the call site
+/// that actually varies it.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
@@ -4089,6 +4219,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     text: &str,
     cancel: &agent_runtime::CancellationToken,
     backing: B,
+    budget: (u32, u32),
 ) -> kernel::TurnOutcome {
     // `BypassPermissions`, not the real env/settings-resolved mode: see
     // `build_interactive_turn_context`'s own doc comment on `forced_mode`
@@ -4099,8 +4230,15 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     // itself (which has its own dedicated test suite in `permissions.rs`
     // and `exec_tools.rs`).
     let forced_mode = Some(crate::permissions::PermissionMode::BypassPermissions);
-    let (preserved, mut tools) = match build_interactive_turn_context(root, trusted, text, forced_mode)
-    {
+    let (context_limit, output_reserve) = budget;
+    let (preserved, mut tools) = match build_interactive_turn_context(
+        root,
+        trusted,
+        text,
+        forced_mode,
+        context_limit,
+        output_reserve,
+    ) {
         Ok(built) => built,
         Err(outcome) => return outcome,
     };
@@ -4945,6 +5083,133 @@ mod tests {
             merged.iter().any(|rule| rule.effect == RuleEffect::Deny),
             "the second file's deny rule must survive the merge, got {} total rules",
             merged.len()
+        );
+    }
+
+    // --- Model-derived context budget (context_budget_for) --------------
+
+    fn active_from_doc(doc: &str) -> crate::user_config::ActiveModel {
+        let config = crate::user_config::parse_config_document(doc, "user.toml").expect("parse");
+        crate::user_config::resolve_active(&[], &config).expect("active")
+    }
+
+    #[test]
+    fn context_budget_for_unconfigured_uses_the_conservative_default() {
+        assert_eq!(
+            context_budget_for(&SelectedModel::Unconfigured(UnconfiguredModel)),
+            (
+                crate::user_config::DEFAULT_CONTEXT_WINDOW,
+                crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS
+            ),
+            "no model configured must fall back to the same conservative default a \
+             configured-but-unspecified model gets, never the old hard-coded 8192/256"
+        );
+    }
+
+    #[test]
+    fn context_budget_for_configured_model_uses_its_own_explicit_capabilities() {
+        let doc = r#"
+[models]
+default = "local"
+
+[model.local]
+provider = "openai-compatible"
+model = "big-model"
+base_url = "http://127.0.0.1:11434/v1"
+context_window = 200000
+max_tokens = 8192
+"#;
+        let store = auth::InMemoryCredentialStore::new();
+        let model = ConfiguredModel::build(&active_from_doc(doc), &store).expect("build");
+        let backing = SelectedModel::Configured(Box::new(model));
+        assert_eq!(context_budget_for(&backing), (200_000, 8192));
+    }
+
+    #[test]
+    fn context_budget_for_configured_model_without_explicit_capabilities_uses_the_default() {
+        let doc = r#"
+[models]
+default = "local"
+
+[model.local]
+provider = "openai-compatible"
+model = "unspecified-model"
+base_url = "http://127.0.0.1:11434/v1"
+"#;
+        let store = auth::InMemoryCredentialStore::new();
+        let model = ConfiguredModel::build(&active_from_doc(doc), &store).expect("build");
+        let backing = SelectedModel::Configured(Box::new(model));
+        assert_eq!(
+            context_budget_for(&backing),
+            (
+                crate::user_config::DEFAULT_CONTEXT_WINDOW,
+                crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS
+            ),
+            "a configured model that never set context_window/max_tokens must get the \
+             same conservative default as an unconfigured one, not a silently invented \
+             precise-looking number"
+        );
+    }
+
+    #[test]
+    fn context_budget_for_fallback_chain_uses_the_minimum_across_every_backend() {
+        // A large cloud-shaped primary and a small local-shaped alternate —
+        // the effective model for a real turn is not known until the router
+        // picks one at request time, so the pre-built context must already
+        // be valid for the *smaller* one, not just the primary.
+        let large_doc = r#"
+[models]
+default = "cloud"
+
+[model.cloud]
+provider = "openai-compatible"
+model = "big-model"
+base_url = "http://127.0.0.1:11434/v1"
+context_window = 200000
+max_tokens = 8192
+"#;
+        let small_doc = r#"
+[models]
+default = "local"
+
+[model.local]
+provider = "openai-compatible"
+model = "small-model"
+base_url = "http://127.0.0.1:11435/v1"
+context_window = 4096
+max_tokens = 1024
+"#;
+        let store_a = auth::InMemoryCredentialStore::new();
+        let store_b = auth::InMemoryCredentialStore::new();
+        let large = ConfiguredModel::build(&active_from_doc(large_doc), &store_a).expect("build large");
+        let small = ConfiguredModel::build(&active_from_doc(small_doc), &store_b).expect("build small");
+
+        let large_ref = llm_router::provider::ModelRef::new(
+            llm_router::provider::ProviderId::parse("openai-compatible").expect("provider"),
+            llm_router::provider::ModelId::parse("cloud").expect("model id"),
+        );
+        let small_ref = llm_router::provider::ModelRef::new(
+            llm_router::provider::ProviderId::parse("openai-compatible").expect("provider"),
+            llm_router::provider::ModelId::parse("local").expect("model id"),
+        );
+        let policy = llm_router::fallback::FallbackPolicy::standard();
+        let router_cancel = llm_router::provider::CancellationToken::new();
+        let controller = llm_router::fallback::FallbackController::from_explicit_chain(
+            large_ref.clone(),
+            vec![small_ref.clone()],
+            policy,
+            &router_cancel,
+        )
+        .expect("controller");
+        let chain = FallbackChainModel::new(vec![(large_ref, large), (small_ref, small)], controller, None);
+        let backing = SelectedModel::FallbackChain(Box::new(chain));
+
+        assert_eq!(
+            context_budget_for(&backing),
+            (4096, 1024),
+            "the chain's derived budget must be the minimum across every backend it \
+             could dispatch to, so context sized before routing picks one is always \
+             valid for the smallest candidate"
         );
     }
 
@@ -6018,6 +6283,93 @@ base_url = "http://127.0.0.1:11434/v1"
         assert_eq!(usage.cost(), 500, "200 + 300 — each iteration's real cost accrued exactly once");
     }
 
+    /// Context-budget P0 regression, autonomous side: `continue_or_stop_
+    /// autonomous_goal` submits its iteration through the exact same
+    /// `SessionLoop::submit_turn` an ordinary human-typed message uses —
+    /// there is no separate autonomous-specific budget logic to regress
+    /// independently. Proves it empirically rather than only by
+    /// architectural argument: the scripted model's `step()` actually
+    /// receives a system-prompt block whose rendered "Token budget"
+    /// section carries the real, model-derived default
+    /// (`DEFAULT_CONTEXT_WINDOW`/`DEFAULT_MAX_OUTPUT_TOKENS` —
+    /// `context_budget_for`'s own fallback for a scripted/unconfigured
+    /// backing), not the old hard-coded `8192`/`256` this task closes out.
+    #[test]
+    fn autonomous_goal_iteration_carries_the_real_model_derived_budget_not_the_old_hardcoded_one() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut host = GoalHost::new();
+        let spec = GoalSpec::new(
+            protocol::GoalId::new(),
+            "ship the thing",
+            vec![],
+            GoalBudget::new(Some(1), None, None, None),
+            vec![],
+        )
+        .expect("spec");
+        host.apply(
+            GoalCommand::Create(spec),
+            &GoalActor::Human,
+            &agent_runtime::CancellationToken::new(),
+        )
+        .expect("create goal");
+        host.save(&session.goal_path()).expect("save goal");
+
+        let cancel = CancellationToken::new();
+        let snapshot = block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backings = scripted_backing_queue(vec![
+            ScriptedModel::terminal_with_usage("working on it", 10, 5)
+                .capturing_system_prompt(std::sync::Arc::clone(&captured)),
+        ]);
+
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight,
+            backings,
+        );
+
+        loop_state.start_autonomous_goal().expect("start");
+        drive_autonomous_goal(&mut loop_state);
+
+        let prompts = captured.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(prompts.len(), 1, "exactly one autonomous iteration must have called step()");
+        let expected = format!(
+            "Context window: {} tokens. Reserve {} tokens",
+            crate::user_config::DEFAULT_CONTEXT_WINDOW,
+            crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS
+        );
+        assert!(
+            prompts[0].contains(&expected),
+            "autonomous iteration's system prompt must carry the real model-derived \
+             default budget, not the old hard-coded 8192/256: {:?}",
+            prompts[0]
+        );
+        assert!(
+            !prompts[0].contains("Context window: 8192 tokens"),
+            "must never regress to the old hard-coded literal: {:?}",
+            prompts[0]
+        );
+    }
+
     #[test]
     fn autonomous_goal_completes_immediately_when_evidence_already_satisfies_it_no_turn_runs() {
         // A different, complementary property from the budget test above:
@@ -6562,11 +6914,34 @@ base_url = "http://127.0.0.1:11434/v1"
     /// Mirrors `exec_tools.rs`'s own private `ScriptedModel` test double
     /// (same established pattern, not reusable directly — that one is
     /// private to `exec_tools`'s own test module).
+    #[derive(Default)]
     struct ScriptedModel {
         outputs: VecDeque<Result<ModelStepOutput, ModelStepError>>,
+        /// Set via `capturing_system_prompt`: when present, every `step()`
+        /// call appends whichever system-source block's text it was handed
+        /// (there is at most one — the rendered system prompt) so a test
+        /// can assert on what the context builder actually produced for
+        /// this turn, e.g. the "Context window: N tokens" line
+        /// `context_budget_for`'s derived budget renders into it — without
+        /// needing a real HTTP capture. `Arc<Mutex<_>>`, not `Rc<RefCell<_>>`:
+        /// a `ScriptedModel` is moved into `spawn_interactive_turn_with_
+        /// backing`'s own thread (`B: LiveModelCall + Send`), so the sink
+        /// must cross that boundary too.
+        captured_system_prompt: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
     }
 
     impl ScriptedModel {
+        /// Route every future `step()` call's system-prompt text into
+        /// `sink` (appended, oldest first) in addition to producing this
+        /// model's already-scripted outputs.
+        fn capturing_system_prompt(
+            mut self,
+            sink: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        ) -> Self {
+            self.captured_system_prompt = Some(sink);
+            self
+        }
+
         fn terminal(text: &str) -> Self {
             Self {
                 outputs: VecDeque::from(vec![Ok(ModelStepOutput::Terminal {
@@ -6574,6 +6949,7 @@ base_url = "http://127.0.0.1:11434/v1"
                     tokens: 1,
                     cost_usd_micros: None,
                 })]),
+                ..Default::default()
             }
         }
 
@@ -6597,18 +6973,21 @@ base_url = "http://127.0.0.1:11434/v1"
                         cost_usd_micros: None,
                     }),
                 ]),
+                ..Default::default()
             }
         }
 
         fn failing() -> Self {
             Self {
                 outputs: VecDeque::from(vec![Err(ModelStepError::Failed)]),
+                ..Default::default()
             }
         }
 
         fn cancelled() -> Self {
             Self {
                 outputs: VecDeque::from(vec![Err(ModelStepError::Cancelled)]),
+                ..Default::default()
             }
         }
 
@@ -6623,6 +7002,7 @@ base_url = "http://127.0.0.1:11434/v1"
                     tokens,
                     cost_usd_micros: Some(cost_usd_micros),
                 })]),
+                ..Default::default()
             }
         }
 
@@ -6646,6 +7026,7 @@ base_url = "http://127.0.0.1:11434/v1"
                     }),
                     Err(ModelStepError::Failed),
                 ]),
+                ..Default::default()
             }
         }
 
@@ -6667,6 +7048,7 @@ base_url = "http://127.0.0.1:11434/v1"
                     }),
                     Err(ModelStepError::Cancelled),
                 ]),
+                ..Default::default()
             }
         }
 
@@ -6695,6 +7077,7 @@ base_url = "http://127.0.0.1:11434/v1"
                     tokens: 1,
                     cost_usd_micros: None,
                 })]),
+                ..Default::default()
             }
         }
     }
@@ -6702,10 +7085,18 @@ base_url = "http://127.0.0.1:11434/v1"
     impl crate::host::LiveModelCall for ScriptedModel {
         fn step(
             &mut self,
-            _blocks: &[context_engine::compile::ContextBlock],
+            blocks: &[context_engine::compile::ContextBlock],
             _input: &ModelStepInput<'_>,
             _cancel: &agent_runtime::CancellationToken,
         ) -> Result<ModelStepOutput, ModelStepError> {
+            if let Some(sink) = &self.captured_system_prompt {
+                let mut sink = sink.lock().unwrap_or_else(|p| p.into_inner());
+                for block in blocks {
+                    if block.source() == context_engine::compile::ContextSource::System {
+                        sink.push(block.text().to_owned());
+                    }
+                }
+            }
             // Deterministic, not incidental: without this, whether a
             // scripted turn's measured `active_ms` reads as nonzero would
             // depend on how fast the surrounding context/redaction-registry
@@ -6785,7 +7176,24 @@ base_url = "http://127.0.0.1:11434/v1"
         /// repeated `drain_kernel_events` calls would. Asserts the lease
         /// actually released and `turn_in_flight` actually reset before
         /// returning, since every test below relies on both.
+        ///
+        /// Uses the same conservative default budget `context_budget_for`
+        /// falls back to for an unconfigured model — most callers below
+        /// don't care what it is, only that the turn completes. A test that
+        /// needs to prove budget-dependent context behavior for a specific
+        /// simulated model capability uses `run_turn_with_budget` instead.
         fn run_turn(&mut self, text: &str, backing: ScriptedModel) {
+            self.run_turn_with_budget(
+                text,
+                backing,
+                (
+                    crate::user_config::DEFAULT_CONTEXT_WINDOW,
+                    crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS,
+                ),
+            );
+        }
+
+        fn run_turn_with_budget(&mut self, text: &str, backing: ScriptedModel, budget: (u32, u32)) {
             let cancel = CancellationToken::new();
             let expected_seq = block_on(self.client.get_session(self.session_id), &cancel)
                 .expect("session")
@@ -6817,6 +7225,7 @@ base_url = "http://127.0.0.1:11434/v1"
                 turn_cancel,
                 std::sync::Arc::clone(&turn_in_flight),
                 backing,
+                budget,
             );
             join.join()
                 .expect("the turn thread must not panic (catching_panics wraps its body)");
@@ -6939,6 +7348,50 @@ base_url = "http://127.0.0.1:11434/v1"
                 .any(|entry| matches!(entry, TranscriptEntry::Assistant { text } if text == "scripted turn done")),
             "the final assistant answer must not be lost: {transcript:?}"
         );
+    }
+
+    /// Context-budget P0 regression, interactive-TUI side: an ordinary
+    /// Enter-press turn's system prompt must carry whichever
+    /// `(context_limit, output_reserve)` the resolved model actually has —
+    /// proven here by driving two real turns through the production
+    /// `build_interactive_turn_context` path with two different simulated
+    /// budgets (small vs. large) and asserting each turn's own captured
+    /// system prompt shows its own numbers, never the other turn's and
+    /// never the old hard-coded `8192`/`256`.
+    #[test]
+    fn interactive_turn_system_prompt_reflects_its_own_resolved_budget_small_and_large_differ() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+
+        let small_captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        session.run_turn_with_budget(
+            "say hi",
+            ScriptedModel::terminal("ok").capturing_system_prompt(std::sync::Arc::clone(&small_captured)),
+            (2_000, 200),
+        );
+        let large_captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        session.run_turn_with_budget(
+            "say hi again",
+            ScriptedModel::terminal("ok").capturing_system_prompt(std::sync::Arc::clone(&large_captured)),
+            (200_000, 8_000),
+        );
+
+        let small_prompt = small_captured.lock().unwrap_or_else(|p| p.into_inner())[0].clone();
+        let large_prompt = large_captured.lock().unwrap_or_else(|p| p.into_inner())[0].clone();
+        assert!(
+            small_prompt.contains("Context window: 2000 tokens. Reserve 200 tokens"),
+            "{small_prompt:?}"
+        );
+        assert!(
+            large_prompt.contains("Context window: 200000 tokens. Reserve 8000 tokens"),
+            "{large_prompt:?}"
+        );
+        for prompt in [&small_prompt, &large_prompt] {
+            assert!(
+                !prompt.contains("Context window: 8192 tokens"),
+                "must never regress to the old hard-coded literal: {prompt:?}"
+            );
+        }
     }
 
     #[test]
