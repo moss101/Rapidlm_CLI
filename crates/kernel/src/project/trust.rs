@@ -372,6 +372,13 @@ impl ProjectTrustStore {
                 match records.get(&identity.canonical_root) {
                     Some(stored) if stored.identity.material_eq(identity) => Ok(stored.status),
                     _ => {
+                        // No `max_records` guard needed here, unlike `set`:
+                        // this arm only ever *overwrites* a key already
+                        // observed at the unlocked peek above (the store has
+                        // no removal API, so that key cannot have vanished
+                        // by the time the lock was acquired) — it can never
+                        // grow the record count, so `persist`'s own bound
+                        // check can't newly trip because of this insert.
                         records.insert(
                             identity.canonical_root.clone(),
                             StoredRecord {

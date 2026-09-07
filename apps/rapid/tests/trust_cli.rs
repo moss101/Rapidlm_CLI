@@ -390,14 +390,18 @@ fn security_gate_revoke_disables_workspace_tools_again() {
 
     let server = spawn_scripted_server(TERMINAL_BODY.to_owned());
     let config = write_config(&home, server);
-    let (_code, _stdout, stderr) = run_exec(&project, &home, &config, "say pong");
+    let (code, stdout, stderr) = run_exec(&project, &home, &config, "say pong");
+    assert_eq!(code, Some(0), "exec must actually reach the model, not fail before the gate: {stderr}");
+    assert!(stdout.contains("hello from scripted model"), "{stdout}");
     assert!(!stderr.contains("workspace tools are disabled"), "{stderr}");
 
     run_trust(&project, &home, &["revoke"]);
 
     let server = spawn_scripted_server(TERMINAL_BODY.to_owned());
     let config = write_config(&home, server);
-    let (_code, _stdout, stderr) = run_exec(&project, &home, &config, "say pong");
+    let (code, stdout, stderr) = run_exec(&project, &home, &config, "say pong");
+    assert_eq!(code, Some(0), "exec must actually reach the model, not fail before the gate: {stderr}");
+    assert!(stdout.contains("hello from scripted model"), "{stdout}");
     assert!(
         stderr.contains("workspace tools are disabled"),
         "revoke must re-close the gate: {stderr}"

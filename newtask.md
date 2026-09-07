@@ -3274,6 +3274,19 @@ device-hint/VCS-fingerprint population for real callers (would give `material_eq
 teeth, but needs a caller that can actually produce that material — a separate piece of work); the
 shell-exec-can-invoke-the-rapid-binary residual noted above.
 
+**Follow-up, same day, from a background adversarial self-review of commit `abe07ad`:** no severe or
+exploitable bug found (locking, lock-scope, identity-resolution consistency, and the single-caller/
+never-mutated `trusted` claims were all independently re-verified, not just re-read). Two minor findings,
+both fixed: (1) `trust_cli.rs::security_gate_revoke_disables_workspace_tools_again` asserted only on stderr
+content for both `rapid exec` legs, discarding the exit code — its negative-direction assertion
+(`!stderr.contains("workspace tools are disabled")`) would have passed vacuously if that leg's `exec`
+crashed or errored before ever reaching the warning line; now asserts `code == Some(0)` and the expected
+stdout on both legs, matching its already-rigorous sibling test. (2) `trust.rs::get`'s self-heal insert
+(inside `transact`) had no explicit `max_records` bound check, unlike `set`'s — confirmed not exploitable
+(this arm only ever overwrites a key already observed at the unlocked peek, never grows the record count,
+and `persist`'s own bound check still fail-closes regardless), so left as a one-line comment explaining why
+rather than a redundant runtime guard.
+
 **Same sweep, next applied to `apps/rapid/src/web_fetch.rs` — the real, live, model-callable `web_fetch`
 tool. Two real, directly reachable, severe findings; both fixed.**
 
