@@ -222,6 +222,7 @@ usage: rapid [subcommand]
   rapid                         interactive TUI
   rapid exec <prompt>           one-shot/headless task
   rapid run <goal/playbook>     durable graph run
+  rapid trust grant|status|revoke   explicit project-trust control plane
   rapid goal create|show|pause|resume|cancel|budget|verify
   rapid resume [session/run]    resume durable session/run
   rapid fork [checkpoint]       non-destructive branch
@@ -282,8 +283,39 @@ Environment:
                            config
   RAPIDLM_MODEL            Model id override for this run
 
-Workspace tools stay disabled until the project is trusted: run `rapid`
-interactively once in the project to approve trust.
+Workspace tools stay disabled until the project is trusted: run
+`rapid trust grant` once in the project to approve trust.
+";
+
+/// `rapid trust`-specific usage, printed by `rapid trust --help`/`-h` and on
+/// usage errors. Documents the explicit, human-only control plane for the
+/// project-trust security boundary: no model tool, slash command, or
+/// autonomous-goal code path can reach this command — see `run_trust_command`'s
+/// own doc comment.
+pub const TRUST_USAGE: &str = "\
+usage: rapid trust grant|status|revoke
+
+Explicit control plane for the project-trust security boundary. Trust gates
+workspace file/shell tools, proactive context retrieval, and trusted-project
+integrations (web_fetch allowlist, hooks, MCP servers) for the project
+discovered from the current directory (nearest ancestor with `.rapidlm` or
+`.git`, matching every other trust check in this binary) — never a path you
+name explicitly, so the project being decided on is always the one the
+command actually runs against.
+
+Commands:
+  grant     Trust the current project. Idempotent: granting an
+            already-trusted project reports so and makes no further change.
+  status    Report whether the current project is trusted.
+  revoke    Untrust the current project. Idempotent: revoking an
+            already-untrusted project reports so and makes no further
+            change.
+
+  -h, --help  Print this help
+
+This is the only reachable way to change a project's trust record — trust
+never arises implicitly from opening a project, a model requesting a
+privileged operation, or an autonomous goal needing more permissions.
 ";
 
 /// Process entry: no subcommand starts the TUI against the detected project.
@@ -409,6 +441,7 @@ fn p9(
 fn run_subcommand(args: &[String]) -> Result<i32, InteractiveError> {
     match args.first().map(String::as_str) {
         Some("exec") => exec_turn(&args[1..], None),
+        Some("trust") => run_trust_command(&args[1..]),
         Some("goal") => run_goal_command(&args[1..]),
         Some("playbook-compile") => p9(&args[1..], crate::p9_commands::run_playbook_compile),
         Some("mcp-tools") => p9(&args[1..], crate::p9_commands::run_mcp_tools),
@@ -427,6 +460,87 @@ fn run_subcommand(args: &[String]) -> Result<i32, InteractiveError> {
         Some("insights") => p9(&args[1..], crate::p9_commands::run_insights),
         Some("release-manifest") => p9(&args[1..], crate::p9_commands::run_release_manifest),
         _ => Err(InteractiveError::Usage),
+    }
+}
+
+/// `rapid trust grant|status|revoke`: the explicit, reachable production
+/// control plane for the project-trust security boundary (see
+/// `crates/kernel/src/project/trust.rs`'s `ProjectTrustStore`). Reached only
+/// from [`run_subcommand`], itself reached only from [`run`] — this
+/// function's own OS-process argv, not a model tool call, a slash command,
+/// or an autonomous-goal iteration, is the only way to invoke it. Compare
+/// [`exec_workspace`]/[`resolve_project`], the trust *readers* every turn
+/// (autonomous or not) goes through: they can only ever observe whatever
+/// this command — or a human editing the catalog file directly — already
+/// persisted; nothing on the turn/tool-execution path can call
+/// `ProjectTrustStore::set` itself.
+///
+/// Resolves the project identity exactly the way every trust *check* in
+/// this binary already does — [`canonicalize_dir`] then
+/// [`detect_project_root`] then `ProjectIdentity::new` — so a grant here is
+/// guaranteed to be observed by the next `rapid exec`/interactive session
+/// against the same directory. `detect_project_root` never reports "no
+/// project found": it walks up to the nearest `.rapidlm`/`.git` marker, or
+/// falls back to the (canonicalized) current directory if none exists
+/// anywhere above it — the same fallback every other trust check already
+/// relies on. Diverging from it here would let `grant`/`status` resolve a
+/// *different* identity than the checks that gate real operations, which is
+/// the one thing this command must never do.
+fn run_trust_command(args: &[String]) -> Result<i32, InteractiveError> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{TRUST_USAGE}");
+        return Ok(0);
+    }
+    let Some(sub) = args.first().map(String::as_str) else {
+        eprint!("{TRUST_USAGE}");
+        return Err(InteractiveError::Usage);
+    };
+    if !matches!(sub, "grant" | "status" | "revoke") {
+        eprint!("{TRUST_USAGE}");
+        return Err(InteractiveError::Usage);
+    }
+
+    let cancel = CancellationToken::new();
+    let cwd = std::env::current_dir().map_err(|_| InteractiveError::Io)?;
+    let cwd = canonicalize_dir(&cwd)?;
+    let root = detect_project_root(&cwd, &cancel)?;
+    let identity = ProjectIdentity::new(root.as_path(), None)
+        .map_err(|_| InteractiveError::InvalidProjectRoot)?;
+    let user_home = exec_user_home().ok_or(InteractiveError::UserHomeMissing)?;
+    let store = ProjectTrustStore::open(user_home.join(TRUST_CATALOG_NAME));
+    let root_display = root.display();
+
+    match sub {
+        "grant" => {
+            let before = store.get(&identity, &cancel).map_err(InteractiveError::Trust)?;
+            store
+                .set(&identity, TrustStatus::Trusted, &cancel)
+                .map_err(InteractiveError::Trust)?;
+            if before.is_trusted() {
+                println!("already trusted: {root_display}");
+            } else {
+                println!("trust granted: {root_display}");
+            }
+            Ok(0)
+        }
+        "revoke" => {
+            let before = store.get(&identity, &cancel).map_err(InteractiveError::Trust)?;
+            store
+                .set(&identity, TrustStatus::Untrusted, &cancel)
+                .map_err(InteractiveError::Trust)?;
+            if before.is_trusted() {
+                println!("trust revoked: {root_display}");
+            } else {
+                println!("already untrusted: {root_display}");
+            }
+            Ok(0)
+        }
+        "status" => {
+            let status = store.get(&identity, &cancel).map_err(InteractiveError::Trust)?;
+            println!("{}: {root_display}", status.as_str());
+            Ok(0)
+        }
+        _ => unreachable!("validated above"),
     }
 }
 
@@ -2034,7 +2148,7 @@ pub(crate) fn exec_turn(
     if tools_withheld {
         eprintln!(
             "warning: workspace tools are disabled for this run: the project is not trusted; \
-approve trust by running `rapid` interactively once in this project, and set \
+approve trust by running `rapid trust grant` in this project, and set \
 {PERMISSION_MODE_ENV} (e.g. bypassPermissions) to control tool approvals"
         );
     } else if mode_refuses_all {
@@ -6200,6 +6314,74 @@ base_url = "http://127.0.0.1:11434/v1"
         assert!(
             painted.contains("autonomous goal execution started"),
             "{painted}"
+        );
+    }
+
+    /// Autonomous-goal regression for the project-trust P0: drives the same
+    /// real, production `run_interactive` entry point (not a manually
+    /// constructed `SessionLoop` with `trusted` hardcoded) as
+    /// `production_run_interactive_goal_run_does_not_crash_and_renders_
+    /// truthfully` above, but against a `TempEnv` that — like every
+    /// `TempEnv` — starts with no trust record at all, so this whole
+    /// `/goal start` → `/goal run` → several ticks → `/goal stop` cycle
+    /// executes against a genuinely untrusted project through the real
+    /// resolution path. Autonomous continuation calls the exact same
+    /// `SessionLoop::submit_turn` an ordinary human-typed message does (see
+    /// `continue_or_stop_autonomous_goal`'s own doc comment), so there is
+    /// architecturally no special-cased trust bypass for it — this proves
+    /// that empirically end to end: after the cycle, the on-disk trust
+    /// catalog must still show no record (not even an untrusted one — the
+    /// autonomous run must never have written to it at all) for this
+    /// project's identity, and `rapid trust status`'s own store lookup must
+    /// still report `Untrusted`, exactly as if no autonomous goal had run.
+    #[test]
+    fn autonomous_goal_run_in_an_untrusted_project_never_self_grants_trust() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let mut inputs = vec![
+            InteractiveInput::Submit("/goal start ship the thing".to_owned()),
+            InteractiveInput::Submit("/goal run".to_owned()),
+        ];
+        inputs.extend((0..80).map(|_| InteractiveInput::Resize { width: 80, height: 24 }));
+        inputs.push(InteractiveInput::Submit("/goal stop".to_owned()));
+        inputs.push(InteractiveInput::Submit("/quit".to_owned()));
+        let report = run_interactive(env.options_capturing_render(inputs)).expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        assert_eq!(
+            report.trust,
+            TrustStatus::Untrusted,
+            "the session itself must have resolved this project as untrusted"
+        );
+
+        let catalog_path = env.user_home.join(TRUST_CATALOG_NAME);
+        assert!(
+            !catalog_path.exists(),
+            "an autonomous goal run against an untrusted project must never create a \
+             trust catalog at all — no self-grant, not even a redundant untrusted record"
+        );
+
+        // Independently re-check via a fresh store handle, the same call
+        // `rapid trust status` itself makes — not just the report snapshot
+        // captured at session start.
+        let identity = identity_for(&env.project);
+        let store = ProjectTrustStore::open(&catalog_path);
+        assert_eq!(
+            store.get(&identity, &CancellationToken::new()).expect("get"),
+            TrustStatus::Untrusted,
+            "no autonomous iteration may leave this project trusted"
+        );
+
+        // The only reachable way to change that is an explicit grant (real
+        // production coverage for `rapid trust grant` itself lives in
+        // apps/rapid/tests/trust_cli.rs) — confirmed here only to show the
+        // store this session used is the same one that command would use,
+        // not a fixture the autonomous path could never have touched.
+        store
+            .set(&identity, TrustStatus::Trusted, &CancellationToken::new())
+            .expect("explicit grant");
+        assert_eq!(
+            store.get(&identity, &CancellationToken::new()).expect("get"),
+            TrustStatus::Trusted
         );
     }
 

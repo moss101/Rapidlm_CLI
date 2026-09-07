@@ -32,6 +32,7 @@ pub const MAX_CATALOG_BYTES: u64 = 1024 * 1024;
 
 const CANCEL_CHECK_EVERY: usize = 32;
 const PART_SUFFIX: &str = ".part";
+const LOCK_SUFFIX: &str = ".lock";
 const CATALOG_KEYS: &[&str] = &["schema", "records"];
 const RECORD_KEYS: &[&str] = &[
     "canonical_root",
@@ -81,6 +82,67 @@ pub struct ProjectTrustStore {
     max_bytes: u64,
 }
 
+/// Cross-process advisory lock guarding one [`ProjectTrustStore`]'s
+/// read-modify-write transaction ([`ProjectTrustStore::transact`]). Locks a
+/// stable **sibling** file, never the catalog itself: [`ProjectTrustStore::
+/// persist`] replaces the catalog via temp-file-then-rename, which swaps
+/// its inode on every write, so a lock held against that inode would not
+/// protect whichever process next *opens* the catalog after the rename.
+///
+/// An OS-level lock tied to this open file *handle* (`std::fs::File::lock`,
+/// stable since Rust 1.89 — no third-party crate), not to a path, an inode,
+/// or a lockfile-existence protocol: the OS releases it automatically when
+/// the handle closes, including on process crash, so no stale-lock recovery
+/// logic is needed.
+///
+/// This mirrors `apps/rapid`'s own `GoalLock` — the pattern already
+/// established for `goal.json`/`goal-evidence.json`'s cross-process
+/// safety — reimplemented narrowly here rather than shared: `kernel` sits
+/// below `apps/rapid` in the workspace dependency graph (`apps/rapid`
+/// depends on `kernel`, never the reverse), so this crate cannot import
+/// `apps/rapid`'s lock type.
+///
+/// Blocks (no arbitrary timeout) until acquired. Hold times are designed to
+/// be milliseconds — one bounded file read, a `BTreeMap` mutation, one
+/// atomic write — never a model call, tool execution, or external command.
+struct TrustLock {
+    _file: File,
+}
+
+impl TrustLock {
+    /// Blocks until the lock guarding `catalog`'s sibling lock file is
+    /// acquired. Creates the lock file (and its parent directory) if it
+    /// doesn't exist yet; its content is never read or written — only its
+    /// stable existence as a lock target matters.
+    fn acquire(catalog: &Path) -> Result<Self, ProjectTrustError> {
+        let lock_path = Self::lock_path(catalog);
+        if let Some(parent) = lock_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|_| ProjectTrustError::Lock)?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|_| ProjectTrustError::Lock)?;
+        file.lock().map_err(|_| ProjectTrustError::Lock)?;
+        Ok(Self { _file: file })
+    }
+
+    /// Sibling lock path, derived by appending `.lock` to the catalog's own
+    /// file name — the same technique [`part_path`] already uses for the
+    /// atomic-write temp file, so two differently-named catalogs opened
+    /// from the same directory (only ever exercised by tests; production
+    /// always opens the one fixed `TRUST_CATALOG_NAME`) never share a lock.
+    fn lock_path(catalog: &Path) -> PathBuf {
+        let mut out = catalog.as_os_str().to_os_string();
+        out.push(LOCK_SUFFIX);
+        PathBuf::from(out)
+    }
+}
+
 /// Typed trust-store failure. Messages never include path or fingerprint values.
 #[derive(Debug)]
 pub enum ProjectTrustError {
@@ -92,6 +154,11 @@ pub enum ProjectTrustError {
     TooManyRecords,
     CatalogCorrupt,
     UnsupportedSchema { found: u16 },
+    /// The cross-process transaction lock could not be created, opened, or
+    /// acquired. Never returned because another holder is *slow* — the lock
+    /// blocks until acquired — only on an I/O failure standing up the lock
+    /// file itself.
+    Lock,
     Io(io::Error),
 }
 
@@ -278,55 +345,98 @@ impl ProjectTrustStore {
 
     /// Return stored status, or [`TrustStatus::Untrusted`] when absent.
     ///
-    /// A record whose material identity no longer matches is invalidated
-    /// before the untrusted status is returned.
+    /// A record whose material identity no longer matches is invalidated.
+    /// That invalidation is a real write, so it goes through the same
+    /// locked, reload-inside-the-lock transaction [`Self::set`] uses — an
+    /// unlocked write here, built from this method's own unlocked peek at
+    /// `records`, could otherwise silently overwrite a fresh, concurrently
+    /// completed grant for the very identity being invalidated against.
     pub fn get(
         &self,
         identity: &ProjectIdentity,
         cancel: &CancellationToken,
     ) -> Result<TrustStatus, ProjectTrustError> {
         cancel.check().map_err(|_| ProjectTrustError::Cancelled)?;
-        let mut records = self.load(cancel)?;
+        let records = self.load(cancel)?;
         cancel.check().map_err(|_| ProjectTrustError::Cancelled)?;
         match records.get(&identity.canonical_root) {
             None => Ok(TrustStatus::Untrusted),
             Some(stored) if stored.identity.material_eq(identity) => Ok(stored.status),
-            Some(_) => {
-                records.insert(
-                    identity.canonical_root.clone(),
-                    StoredRecord {
-                        identity: identity.clone(),
-                        status: TrustStatus::Untrusted,
-                    },
-                );
-                self.persist(&records, cancel)?;
-                Ok(TrustStatus::Untrusted)
-            }
+            Some(_) => self.transact(cancel, |records| {
+                // Re-check under the lock against a fresh reload: a
+                // concurrent `set` may have landed for this exact identity
+                // between the unlocked peek above and this transaction
+                // acquiring the lock, in which case there is nothing stale
+                // to invalidate — return its real, current status instead
+                // of clobbering it with an unconditional Untrusted write.
+                match records.get(&identity.canonical_root) {
+                    Some(stored) if stored.identity.material_eq(identity) => Ok(stored.status),
+                    _ => {
+                        records.insert(
+                            identity.canonical_root.clone(),
+                            StoredRecord {
+                                identity: identity.clone(),
+                                status: TrustStatus::Untrusted,
+                            },
+                        );
+                        Ok(TrustStatus::Untrusted)
+                    }
+                }
+            }),
         }
     }
 
-    /// Persist `status` for `identity`, replacing any record at the same root.
+    /// Persist `status` for `identity`, replacing any record at the same
+    /// root. Idempotent: granting (or revoking) an identity that already
+    /// holds that exact status just re-persists the same single record —
+    /// the catalog is keyed by canonical root, so this can never create a
+    /// duplicate.
     pub fn set(
         &self,
         identity: &ProjectIdentity,
         status: TrustStatus,
         cancel: &CancellationToken,
     ) -> Result<(), ProjectTrustError> {
+        self.transact(cancel, |records| {
+            let exists = records.contains_key(&identity.canonical_root);
+            if !exists && records.len() >= self.max_records {
+                return Err(ProjectTrustError::TooManyRecords);
+            }
+            records.insert(
+                identity.canonical_root.clone(),
+                StoredRecord {
+                    identity: identity.clone(),
+                    status,
+                },
+            );
+            Ok(())
+        })
+    }
+
+    /// Locked read-modify-write transaction: acquire the cross-process
+    /// [`TrustLock`], reload the catalog fresh from disk *inside* the lock
+    /// (never a snapshot `load`ed before the lock was held, which can be
+    /// stale under a concurrent writer — another process, or an earlier
+    /// unlocked peek in this same one), let `mutate` observe/change it,
+    /// persist the result via [`Self::persist`] (still `atomic_write`-
+    /// shaped underneath — corruption safety and lost-update safety are
+    /// separate guarantees, and both are still needed here), then release
+    /// the lock. If `mutate` returns `Err`, nothing is written.
+    fn transact<T>(
+        &self,
+        cancel: &CancellationToken,
+        mutate: impl FnOnce(
+            &mut BTreeMap<CanonicalRoot, StoredRecord>,
+        ) -> Result<T, ProjectTrustError>,
+    ) -> Result<T, ProjectTrustError> {
+        cancel.check().map_err(|_| ProjectTrustError::Cancelled)?;
+        let _lock = TrustLock::acquire(&self.catalog)?;
         cancel.check().map_err(|_| ProjectTrustError::Cancelled)?;
         let mut records = self.load(cancel)?;
         cancel.check().map_err(|_| ProjectTrustError::Cancelled)?;
-        let exists = records.contains_key(&identity.canonical_root);
-        if !exists && records.len() >= self.max_records {
-            return Err(ProjectTrustError::TooManyRecords);
-        }
-        records.insert(
-            identity.canonical_root.clone(),
-            StoredRecord {
-                identity: identity.clone(),
-                status,
-            },
-        );
-        self.persist(&records, cancel)
+        let result = mutate(&mut records)?;
+        self.persist(&records, cancel)?;
+        Ok(result)
     }
 
     fn load(
@@ -408,6 +518,7 @@ impl fmt::Display for ProjectTrustError {
             Self::UnsupportedSchema { found } => {
                 write!(f, "unsupported trust catalog schema {found}")
             }
+            Self::Lock => f.write_str("trust catalog lock unavailable"),
             Self::Io(_) => f.write_str("trust catalog I/O failed"),
         }
     }
@@ -430,7 +541,8 @@ impl PartialEq for ProjectTrustError {
             | (Self::InvalidFingerprint, Self::InvalidFingerprint)
             | (Self::InvalidManifestHash, Self::InvalidManifestHash)
             | (Self::TooManyRecords, Self::TooManyRecords)
-            | (Self::CatalogCorrupt, Self::CatalogCorrupt) => true,
+            | (Self::CatalogCorrupt, Self::CatalogCorrupt)
+            | (Self::Lock, Self::Lock) => true,
             (
                 Self::CatalogTooLarge {
                     limit: a_limit,
@@ -1005,6 +1117,175 @@ mod tests {
                 &live(),
             )
             .expect("update existing");
+    }
+
+    // --- Cross-process transaction lock / lost-update safety ------------
+
+    /// Spawns a thread that tries to acquire `TrustLock` on `catalog` and
+    /// waits (with a timeout) for it to succeed — proves the lock from a
+    /// prior transaction was actually released, not just that the prior
+    /// call returned.
+    fn assert_lock_is_free(catalog: &Path, when: &str) {
+        let catalog = catalog.to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = TrustLock::acquire(&catalog);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or_else(|_| panic!("trust catalog lock was not released {when}"));
+    }
+
+    #[test]
+    fn lock_is_released_after_a_successful_set() {
+        let tmp = TempCatalog::create();
+        let store = tmp.store();
+        store
+            .set(
+                &identity("/tmp/rapidlm-trust-lock-ok", Some(FP_A)),
+                TrustStatus::Trusted,
+                &live(),
+            )
+            .expect("set");
+        assert_lock_is_free(&tmp.path, "after a successful set");
+    }
+
+    #[test]
+    fn lock_is_released_after_a_domain_error() {
+        let tmp = TempCatalog::create();
+        let store = tmp.bounded(1, MAX_CATALOG_BYTES);
+        store
+            .set(
+                &identity("/tmp/rapidlm-trust-lock-err-one", Some(FP_A)),
+                TrustStatus::Trusted,
+                &live(),
+            )
+            .expect("first");
+        let err = store
+            .set(
+                &identity("/tmp/rapidlm-trust-lock-err-two", Some(FP_A)),
+                TrustStatus::Trusted,
+                &live(),
+            )
+            .expect_err("second must be refused: record bound");
+        assert_eq!(err, ProjectTrustError::TooManyRecords);
+        assert_lock_is_free(&tmp.path, "after a refused domain mutation");
+    }
+
+    #[test]
+    fn lock_is_released_after_a_cancelled_transaction() {
+        let tmp = TempCatalog::create();
+        let store = tmp.store();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = store
+            .set(
+                &identity("/tmp/rapidlm-trust-lock-cancel", Some(FP_A)),
+                TrustStatus::Trusted,
+                &cancel,
+            )
+            .expect_err("cancelled");
+        assert_eq!(err, ProjectTrustError::Cancelled);
+        assert_lock_is_free(&tmp.path, "after a cancelled transaction");
+    }
+
+    /// The task's own worked example: 16 threads each grant trust for a
+    /// distinct project root, released together via a barrier so their
+    /// transactions genuinely race for the lock rather than merely running
+    /// in sequence. Every one of the 16 grants must survive — none lost to
+    /// a writer whose transaction reloaded a snapshot made stale by another
+    /// writer's concurrent save.
+    #[test]
+    fn many_concurrent_grants_for_distinct_roots_all_survive() {
+        let tmp = TempCatalog::create();
+        const WRITERS: usize = 16;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|i| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let store = tmp.store();
+                std::thread::spawn(move || {
+                    let id = identity(&format!("/tmp/rapidlm-trust-race-{i}"), Some(FP_A));
+                    barrier.wait();
+                    store.set(&id, TrustStatus::Trusted, &live())
+                })
+            })
+            .collect();
+        for (i, handle) in handles.into_iter().enumerate() {
+            handle
+                .join()
+                .unwrap_or_else(|_| panic!("writer {i} thread panicked"))
+                .unwrap_or_else(|err| panic!("writer {i} must succeed: {err}"));
+        }
+
+        let reloaded = tmp.store();
+        for i in 0..WRITERS {
+            let id = identity(&format!("/tmp/rapidlm-trust-race-{i}"), Some(FP_A));
+            assert_eq!(
+                reloaded.get(&id, &live()).expect("get"),
+                TrustStatus::Trusted,
+                "writer {i} must survive 16 concurrent writers, none lost"
+            );
+        }
+    }
+
+    /// The reload-inside-the-lock regression: one thread's `get` finds a
+    /// stale-identity record for a root and must invalidate it (a real
+    /// write, see `get`'s own doc comment), while another thread
+    /// concurrently `set`s a fresh, matching grant for that exact root.
+    /// Whichever transaction's lock-protected reload actually runs last
+    /// must see the other's result and never blindly overwrite it: the
+    /// getter's invalidation only fires if the record is *still* stale
+    /// after its own fresh reload, and the setter's grant always simply
+    /// wins because `set` is unconditional. Under every possible
+    /// interleaving the final, reloaded state must be the fresh grant —
+    /// never regressed back to `Untrusted` by a racing stale write. Before
+    /// this task's locking fix (reload before lock, write unconditionally)
+    /// this was a real, observable lost update, not just a theoretical one.
+    #[test]
+    fn concurrent_set_and_self_healing_get_never_lose_a_fresh_grant() {
+        let tmp = TempCatalog::create();
+        let root = "/tmp/rapidlm-trust-race-root";
+        let stale = identity(root, Some(FP_A));
+        tmp.store()
+            .set(&stale, TrustStatus::Trusted, &live())
+            .expect("seed a record that will look stale to the fresh identity");
+
+        let fresh = identity(root, Some(FP_B));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let getter = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let store = tmp.store();
+            let fresh = fresh.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.get(&fresh, &live())
+            })
+        };
+        let setter = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let store = tmp.store();
+            let fresh = fresh.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.set(&fresh, TrustStatus::Trusted, &live())
+            })
+        };
+        let _ = getter.join().expect("getter thread panicked");
+        setter
+            .join()
+            .expect("setter thread panicked")
+            .expect("the explicit grant must always succeed");
+
+        let reloaded = tmp.store();
+        assert_eq!(
+            reloaded.get(&fresh, &live()).expect("final read"),
+            TrustStatus::Trusted,
+            "a concurrent explicit grant for the current identity must never be \
+             erased by a racing stale-identity self-heal, regardless of which \
+             transaction's lock-protected reload happened to run last"
+        );
     }
 
     #[test]

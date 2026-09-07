@@ -3117,6 +3117,163 @@ copying the existing `ProjectIdentity::new(root, None)` call pattern already use
 codebase, it would silently inherit this same gap rather than getting the protection the module's own doc
 comment advertises. Worth a note for whoever builds that UI, not something to patch in isolation now.
 
+**RESOLVED, 2026-09-07: both findings above closed for real — a reachable production grant/status/revoke
+command now exists, and `ProjectTrustStore`'s persistence is now a cross-process-safe locked transaction.**
+This was scoped as its own P0 ("make the existing trust security boundary reachable, explicit,
+concurrency-safe, and testable") and treated as a closure of *this exact* finding, not new work — the
+"missing writer" this note flagged is now built, and the "no locking because no writer exists yet" reasoning
+above no longer applies now that one does.
+
+*Architecture before:* exactly as this document's own prior finding says — `TrustStatus`/`ProjectIdentity`/
+`ProjectTrustStore` (`crates/kernel/src/project/trust.rs`) were fully implemented and read by every real
+consumer (`exec_workspace`, `resolve_project` in `apps/rapid/src/interactive.rs`), but zero production code
+path ever called `ProjectTrustStore::set`. `EXEC_USAGE`'s own help text ("run `rapid` interactively once...
+to approve trust") and the runtime warning both described a grant flow that did not exist.
+
+*What trust gates* (confirmed by reading every consumer, not assumed): workspace file/shell tools
+(`ExecTools::workspace_with_permissions` vs. `ExecTools::noop()`), proactive context retrieval, and
+trusted-project integrations (`web_fetch` allowlist, hooks, MCP servers) — for both headless `rapid exec`
+and the interactive TUI, including autonomous `/goal run` continuation, which reaches the identical
+`SessionLoop::submit_turn`/`trusted` gate as any ordinary human-typed turn (no special case). Confirmed
+distinct from, and left untouched: MCP server trust (`crates/mcp/src/trust.rs::McpTrustStatus`), plugin/
+extension trust (`crates/plugin-host/src/trust.rs::ExtensionTrustStatus`), and the separate persisted
+*permission-grant* store (`apps/rapid/src/permissions.rs`, `project-permissions.json` — individual tool-call
+approvals, a different domain that happens to share the word "grant").
+
+*Trusted-project identity:* unchanged, still the canonical absolute root (`CanonicalRoot`, lexically
+normalized `.`/`..`) plus optional VCS-fingerprint/device-hint/manifest-hash material-identity fields (still
+unpopulated by every real caller, exactly as the prior finding noted — not attempted here; a real fix needs
+a caller that can actually produce a stable VCS fingerprint, out of scope for reachability). The new `rapid
+trust` command resolves identity through the *exact same* `canonicalize_dir` → `detect_project_root` →
+`ProjectIdentity::new` chain every existing trust check already uses, so grant/status/revoke can never
+canonicalize differently than the checks that gate real operations. `detect_project_root` never reports "no
+project found" — it walks to the nearest `.rapidlm`/`.git` marker, or falls back to the canonicalized cwd —
+this is pre-existing, shared behavior, not something introduced or altered here; diverging from it in the
+new command would itself have been the bug. Symlink/macOS-alias handling relies on `fs::canonicalize`
+(`canonicalize_dir`), also pre-existing; a new symlink-grant integration test
+(`grant_via_a_symlink_and_status_via_the_real_path_agree`, `apps/rapid/tests/trust_cli.rs`) confirms it end
+to end on this dev machine's real `/tmp` → `/private/tmp` alias. One honest negative finding from a live
+revert-cycle probe: with `canonicalize_dir`'s `fs::canonicalize` call temporarily replaced by a raw
+passthrough, that same symlink test still passed — on macOS, `current_dir()`/`getcwd()` already resolves a
+symlinked chdir target before this code ever sees it, so this specific probe didn't discriminate the call's
+contribution for *this* attack shape. `canonicalize_dir` is kept as-is regardless (unmodified, pre-existing,
+still the right general-purpose safety net for paths not derived from `getcwd()`, e.g. `InteractiveOptions::
+cwd` injected directly by callers/tests) — this is reported as a transparency note per the task's own
+instruction to report genuine findings, not as grounds to weaken it.
+
+*Production grant workflow:* new `rapid trust grant|status|revoke` (`apps/rapid/src/interactive.rs::
+run_trust_command`, dispatched from `run_subcommand`), chosen after checking existing CLI conventions
+(`rapid goal create|show|...`, `rapid mcp add|remove|...`, `rapid plugins approve|reject|...` — all
+space-separated verb families under one noun, no precedent for a different shape). Operates only on the
+project discovered from the current directory — never a path argument — so the project a human is deciding
+on is always the one the command actually resolves and gates. `rapid trust --help`/`-h` prints dedicated
+usage; `EXEC_USAGE` and the runtime "workspace tools are disabled" warning were both corrected to point at
+the real command instead of the fictional "run `rapid` interactively" flow.
+
+*Confirmation semantics — resolved from direct repository evidence, not invented:* bare invocation is
+sufficient; no confirmation prompt. `apps/rapid/src/p9_commands.rs::run_plugins`'s `approve`/`reject` arms —
+a structurally identical grant/revoke pair in the same CLI, same author, same era of code — perform their
+action immediately on invocation with no prompt, and a workspace-wide grep found zero `--yes`/`--force`/
+confirm convention anywhere in this CLI to be consistent with. Following that established precedent exactly,
+rather than inventing friction with no repository basis for it.
+
+*Status/revoke semantics:* `rapid trust status` resolves identity identically to `grant` (shared code path,
+not just shared logic) and reports `trusted: <root>`/`untrusted: <root>`, exit 0 either way (a query, not a
+gate — mirrors `rapid goal show`'s own convention for a well-defined-but-negative state). `rapid trust
+revoke` wires the store's pre-existing `set(..., Untrusted)` semantics (already covered by `trust.rs`'s own
+`explicit_untrusted_overwrites_grant` test before this task) through a reachable command — no new
+persistence semantics invented, per the task's own instruction not to expand scope there. Both `grant` and
+`revoke` are idempotent (`already trusted: <root>` / `already untrusted: <root>` on a no-op call), proven by
+`grant_is_idempotent_and_creates_no_duplicate_record`/`revoke_after_grant_returns_to_untrusted_and_is_itself_
+idempotent` — idempotency falls directly out of the store being keyed by canonical root in a `BTreeMap`
+(`set` always replaces, never appends), not extra bookkeeping in the CLI layer.
+
+*Persistence — the real fix, in `crates/kernel/src/project/trust.rs`:* corruption safety (temp-file-then-
+rename atomic writes) was already correct and untouched by this task. Lost-update safety was not, and is now
+fixed: new `TrustLock` (private, this file only) mirrors `apps/rapid/src/goal_host.rs::GoalLock`'s design
+exactly — an OS advisory lock (`std::fs::File::lock`, stable since Rust 1.89, no new dependency) on a stable
+**sibling** file (`<catalog>.lock`, derived the same way this file's own pre-existing `part_path` derives
+`<catalog>.part`), never the catalog inode itself (which `persist`'s rename replaces on every write) —
+reimplemented narrowly here rather than shared, because `kernel` sits below `apps/rapid` in the dependency
+graph and cannot import `apps/rapid`'s lock type. New private `ProjectTrustStore::transact`: acquire lock →
+reload fresh from disk *inside* the lock → mutate → atomic write → release; both `get`'s self-heal write and
+`set` now go through it (previously neither was locked at all, and `get`'s self-heal reload happened, then
+an unconditional write — the literal "reload before lock" anti-pattern). New `ProjectTrustError::Lock`
+variant for lock-acquisition I/O failure (never for another holder being slow — the lock blocks).
+
+*Cross-process/lost-update guarantee, verified, not assumed:* `many_concurrent_grants_for_distinct_roots_
+all_survive` — 16 real threads, barrier-released together, each granting a distinct project root — all 16
+survive. `concurrent_set_and_self_healing_get_never_lose_a_fresh_grant` — one thread's `get`-triggered
+stale-identity invalidation races another thread's explicit `set` for the same root's *fresh* identity;
+proven deterministic regardless of which transaction's lock-protected reload runs last (the surviving state
+is always the fresh grant, never regressed to `Untrusted`). `lock_is_released_after_a_successful_set`/
+`_a_domain_error`/`_a_cancelled_transaction` prove the lock is never held past a transaction's end on any
+exit path. All in `crates/kernel/src/project/trust.rs`'s own test module (29 tests total, up from 24).
+
+*Revert cycles actually run, not merely planned* (each: broken, confirmed failing, restored, confirmed
+passing again): **(1) Grant reachability** — temporarily removed `run_trust_command`'s `store.set` call in
+the `grant` arm; 7 of 12 `trust_cli.rs` tests failed immediately, including both security-gate proofs.
+**(2) Lost update / no lock at all** — temporarily restored the exact pre-fix `get`/`set` (reload, then
+unconditional write, no lock); `concurrent_set_and_self_healing_get_never_lose_a_fresh_grant` failed 10/10
+runs. **(3) "Lock only around save()"** — a *distinct* bug from (2): reload before lock, but the lock still
+wraps the write — temporarily reproduced in `set`; `many_concurrent_grants_for_distinct_roots_all_survive`
+failed 5/5 runs (most of the 16 concurrent grants silently vanished, overwritten by whichever writer's
+stale pre-lock snapshot happened to save last). **(4) Security gate** — temporarily forced `exec_workspace`
+to report `Untrusted` unconditionally, disconnecting it from the real store; both `security_gate_*` tests in
+`trust_cli.rs` failed immediately. Every probe was restored and the full suite reconfirmed green before
+moving on; none were kept as permanent code paths or flaky stress tests.
+
+*Model/autonomous security boundary:* structural, not merely policy — `run_trust_command` is reached only
+from `run_subcommand`, reached only from `run()`, the process's own top-level entry (confirmed by grep: one
+caller each, no tool/exec-tools/goal-host code path calls either). No model tool, slash command, or
+`/goal run` continuation can reach it; `continue_or_stop_autonomous_goal` submits turns through the exact
+same `SessionLoop::submit_turn`/`self.trusted` gate as any human-typed message (confirmed no `self.trusted =
+...` assignment exists anywhere in the file — it is set once at construction and never mutated). New
+regression `autonomous_goal_run_in_an_untrusted_project_never_self_grants_trust`
+(`apps/rapid/src/interactive.rs`) drives the real production `run_interactive` entry through
+`/goal start` → `/goal run` → several ticks → `/goal stop` against an untrusted `TempEnv` project, then
+independently re-opens the trust store from disk afterward: no catalog file was even created. (An untrusted
+project's shell-exec tool being withheld in the first place — `ExecTools::noop()` — also forecloses the
+narrower "agent shells out to `rapid trust grant` for its own project" path structurally, before any explicit
+check is needed; noted as an existing property, not something added here.) A trusted project's agent
+shelling out to `rapid trust grant` against some *other*, unrelated repository it can reach is a real,
+accepted residual — inherent to giving any shell access at all (the same as `rm -rf` or `git push --force`
+being reachable once trusted), not specific to the trust subsystem, and explicitly out of scope (general
+permission-policy/sandboxing redesign).
+
+*End-to-end security-gate proof* (`apps/rapid/tests/trust_cli.rs::
+security_gate_exec_workspace_tools_flip_from_denied_to_allowed_after_grant` and its revoke-direction sibling):
+real `rapid exec` against a scripted model — "workspace tools are disabled" on stderr before any grant, the
+real `rapid trust grant` (not a hand-written catalog fixture), then the identical warning is *absent* on a
+second `rapid exec` run; `rapid trust revoke` flips it back closed. This replaces the only reason
+`exec_diagnosability.rs::trusted_project` and `goal_concurrency.rs::trusted_project` existed as hand-written
+JSON fixtures in the first place (their own doc comments said so explicitly) — both are left as-is (still
+valid, still used elsewhere in those files for setup unrelated to proving the grant path itself), not
+migrated, since rewriting passing tests outside this task's diff isn't needed to close the P0.
+
+*Malformed-state / fail-closed:* unchanged, pre-existing, and still correct — `decode_catalog`'s strict
+schema validation (`corrupt_catalog_fails_closed`, `unknown_status_does_not_grant_trust`,
+`extra_catalog_key_fails_closed`, `unsupported_schema_is_rejected`, all pre-existing) already fails closed
+and never silently resets to an empty store. New CLI-level proof
+(`malformed_catalog_fails_closed_for_status_and_leaves_the_file_untouched`): a corrupt catalog makes `rapid
+trust status` exit non-zero with the corrupt file byte-for-byte unchanged afterward — the failure surfaces,
+it is not silently swallowed into "untrusted" or repaired into an empty valid catalog.
+
+*Files changed:* `crates/kernel/src/project/trust.rs` (`TrustLock`, `transact`, `get`/`set` rewritten,
+`ProjectTrustError::Lock`, doc comments); `apps/rapid/src/interactive.rs` (`run_trust_command`,
+`TRUST_USAGE`, `CLI_USAGE`/`EXEC_USAGE` corrections, the runtime warning text, one new autonomous-goal
+regression test); new `apps/rapid/tests/trust_cli.rs` (12 end-to-end CLI tests). *Tests added:* 5 new in
+`trust.rs` (lock release ×3, concurrency ×2 — 29 total, up from 24), 12 new in `trust_cli.rs`, 1 new in
+`interactive.rs`'s own test module (78 total in that module, up from 77). *Verification:* `cargo build
+--workspace --tests` clean; `cargo clippy -p kernel -p rapid --all-targets` introduces zero new warnings
+(56 pre-existing `rapid` warnings before and after this change, all in files this task never touched); full
+`cargo test --workspace` — see the commit for the final pass/fail tally. *Deliberately out of scope, per
+the task's own boundary:* MCP/plugin trust; a general approval-system redesign; a trust slash command (the
+CLI alone is a sufficient reachable path — no disconnected slash-command trust syntax was found to wire);
+device-hint/VCS-fingerprint population for real callers (would give `material_eq`'s existing protection
+teeth, but needs a caller that can actually produce that material — a separate piece of work); the
+shell-exec-can-invoke-the-rapid-binary residual noted above.
+
 **Same sweep, next applied to `apps/rapid/src/web_fetch.rs` — the real, live, model-callable `web_fetch`
 tool. Two real, directly reachable, severe findings; both fixed.**
 
