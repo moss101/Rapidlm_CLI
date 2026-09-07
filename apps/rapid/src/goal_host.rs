@@ -36,6 +36,20 @@ pub const EVIDENCE_FILE: &str = "goal-evidence.json";
 /// own doc comment for why the two files use separate locks.
 pub const EVIDENCE_LOCK_FILE: &str = "goal-evidence.lock";
 
+/// Cross-process autonomous-driver ownership lock, sibling to [`GOAL_FILE`].
+/// Deliberately a *separate* lock file from [`GOAL_LOCK_FILE`], held for a
+/// completely different duration and purpose: `GOAL_LOCK_FILE` is acquired
+/// and released within milliseconds by [`GoalHost::update`] for one
+/// read-modify-write transaction, never held across model execution.
+/// [`GOAL_DRIVER_LOCK_FILE`] is the opposite — acquired once when autonomous
+/// execution starts and held for the entire run (possibly many turns, many
+/// minutes), specifically to stop a *second* autonomous driver (this process
+/// or another) from starting against the same goal while one is already
+/// running. Conflating the two would either make ordinary `/goal pause`
+/// mutations block for the whole autonomous run, or let two drivers run
+/// concurrently — see [`try_acquire_driver_lease`].
+pub const GOAL_DRIVER_LOCK_FILE: &str = "goal-driver.lock";
+
 /// Canonical session ledger db name; evidence citations resolve against it.
 pub const SESSIONS_DB_FILE: &str = "sessions.sqlite";
 
@@ -200,9 +214,51 @@ impl GoalLock {
         Ok(Self { _file: file })
     }
 
+    /// Non-blocking variant: `Err(GoalPersistError::Lock)` immediately if
+    /// another holder already has it, rather than waiting. Used only by
+    /// [`try_acquire_driver_lease`] — a lease meant to be held for a whole
+    /// autonomous run must fail fast with "already running elsewhere," not
+    /// block the caller's event loop for however long that run takes.
+    fn try_acquire(data_path: &Path, lock_file_name: &str) -> Result<Self, GoalPersistError> {
+        let lock_path = Self::lock_path(data_path, lock_file_name);
+        if let Some(parent) = lock_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|_| GoalPersistError::Lock)?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|_| GoalPersistError::Lock)?;
+        file.try_lock().map_err(|_| GoalPersistError::Lock)?;
+        Ok(Self { _file: file })
+    }
+
     fn lock_path(data_path: &Path, lock_file_name: &str) -> PathBuf {
         data_path.with_file_name(lock_file_name)
     }
+}
+
+/// Ownership lease for the sole autonomous driver of one goal. Acquired once
+/// when `/goal run` (or `rapid goal run`) starts and held for the entire
+/// continuation loop; dropping it (an explicit stop, a natural terminal
+/// state, or the holding process exiting/panicking) releases the underlying
+/// OS advisory lock automatically — the same crash-safety [`GoalLock`]
+/// itself already relies on, reused rather than a new PID-file mechanism.
+/// See [`GOAL_DRIVER_LOCK_FILE`]'s own doc comment for why this is a
+/// separate lock from [`GOAL_LOCK_FILE`], not a longer hold of the same one.
+pub struct DriverLease {
+    _lock: GoalLock,
+}
+
+/// Try to become the sole autonomous driver for the goal at `goal_path`.
+/// `Err(GoalPersistError::Lock)` means another driver — this process or a
+/// separate one — already holds the lease; the caller must refuse to start,
+/// never queue behind it or silently proceed anyway.
+pub fn try_acquire_driver_lease(goal_path: &Path) -> Result<DriverLease, GoalPersistError> {
+    GoalLock::try_acquire(goal_path, GOAL_DRIVER_LOCK_FILE).map(|_lock| DriverLease { _lock })
 }
 
 /// Failure from [`GoalHost::update`]'s own transaction machinery (lock
@@ -1792,4 +1848,80 @@ mod tests {
     // write — never itself catches the torn-write case the stress probe
     // did, but does deterministically prove every write's own *result* is
     // always one complete, valid record, never a partial or mixed one.
+
+    // --- Autonomous driver lease (`try_acquire_driver_lease`/`GOAL_DRIVER_LOCK_FILE`) ---
+
+    #[test]
+    fn a_second_driver_lease_is_refused_while_the_first_is_held() {
+        let dir = scratch_dir("driver-lease-refused");
+        let goal_path = dir.join(GOAL_FILE);
+        let first = try_acquire_driver_lease(&goal_path).expect("first lease");
+        let second = try_acquire_driver_lease(&goal_path);
+        assert!(
+            matches!(second, Err(GoalPersistError::Lock)),
+            "a second autonomous driver must never be able to start against the \
+             same goal while the first is still running: {}",
+            second.is_ok()
+        );
+        drop(first);
+    }
+
+    #[test]
+    fn a_driver_lease_becomes_available_again_once_dropped() {
+        let dir = scratch_dir("driver-lease-released");
+        let goal_path = dir.join(GOAL_FILE);
+        let first = try_acquire_driver_lease(&goal_path).expect("first lease");
+        drop(first);
+        let second = try_acquire_driver_lease(&goal_path);
+        assert!(
+            second.is_ok(),
+            "dropping a driver lease (an explicit stop, a natural terminal state, or the \
+             holding process exiting/panicking) must release it for the next run"
+        );
+    }
+
+    #[test]
+    fn driver_lease_and_goal_lock_are_independent_locks() {
+        // The whole point of a *separate* lock file (see GOAL_DRIVER_LOCK_FILE's
+        // own doc comment): an ordinary goal.json transaction must never block
+        // on, or be blocked by, a long-held autonomous driver lease.
+        let dir = scratch_dir("driver-lease-vs-goal-lock");
+        let goal_path = dir.join(GOAL_FILE);
+        let _driver_lease = try_acquire_driver_lease(&goal_path).expect("driver lease");
+        let mut host = GoalHost::new();
+        let result = host.update(&goal_path, |host| {
+            let spec = GoalSpec::new(
+                GoalId::new(),
+                "ship the thing",
+                vec![],
+                GoalBudget::default(),
+                vec![],
+            )
+            .expect("spec");
+            host.apply(GoalCommand::Create(spec), &GoalActor::Human, &CancellationToken::new())
+        });
+        assert!(
+            result.is_ok(),
+            "an ordinary goal.json transaction must not be blocked by a held driver lease: \
+             {result:?}"
+        );
+    }
+
+    #[test]
+    fn driver_lease_file_is_never_read_or_written_as_data() {
+        // Same discipline `GoalLock::acquire`'s own doc comment states for
+        // every lock file it manages: the file's *existence* is the only
+        // thing that matters, never its content.
+        let dir = scratch_dir("driver-lease-no-data");
+        let goal_path = dir.join(GOAL_FILE);
+        let lease = try_acquire_driver_lease(&goal_path).expect("lease");
+        let lock_path = GoalLock::lock_path(&goal_path, GOAL_DRIVER_LOCK_FILE);
+        assert!(lock_path.exists());
+        assert_eq!(
+            fs::read(&lock_path).expect("read lock file").len(),
+            0,
+            "the driver lock file must stay empty — only its existence as a lock target matters"
+        );
+        drop(lease);
+    }
 }

@@ -5369,6 +5369,206 @@ transcript compaction; change-set apply/rollback; execution handoff/takeover; co
 playbook execution; new persistence systems; TUI visual redesign; pricing; sandbox changes; execution-loop
 redesign; filling any of the data-poor panels the prior task already catalogued.
 
+**`agent_runtime::GoalDriver` integration, done 2026-09-07, user-directed.** The prior task's own log entry
+above named this the next open item; framed here against `GoalDriver`'s real design, not an assumption that
+wiring it in was "just call `GoalDriver::run()` from the TUI."
+**Why `GoalDriver` had zero production callers, established by direct investigation before writing any code:**
+`GoalDriver::next()` is a real, well-tested, generic-over-`ModelDriver`/`ToolDriver`/`TurnEventSink` continuation
+loop (`crates/agent-runtime/src/goal/driver.rs`) — but it is tightly coupled to calling `agent_runtime::turn::
+run_turn` directly, with three concrete incompatibilities with `apps/rapid`'s actual, already-shipped turn
+executor: (1) **cost** — `accrue_after_turn` hardcodes `guard.after_model(tokens, 0, cancel)`, since `TurnUsage`
+(the type `run_turn` produces) has no cost field at all; real dollar cost in `apps/rapid` comes from a completely
+separate `SupervisedModel`/`CostAccumulator` wrapper (`apps/rapid/src/host.rs`) around the raw provider call,
+outside `run_turn`'s own bookkeeping entirely. (2) **context recovery** — `apps/rapid`'s real turn path goes
+through `agent_runtime::TurnAgentExecutor::execute_with_context_recovery`, which retries with context compaction
+on `TurnStopReason::ContextBoundExceeded`; `GoalDriver::next()` calls raw `run_turn` with none of that, so an
+autonomous turn that overflows its context window would simply fail where an interactive one recovers
+transparently. (3) **prompt delivery** — `GoalDriver::next()` internally compiles a `PromptBundle` (a structured
+`Vec<agent_runtime::PromptMessage>`) via `compile_boundary_prompt`, but never injects it anywhere `run_turn`'s
+own `ModelStepInput` (which carries no prompt/context field at all) can reach the model — `apps/rapid`'s actual
+model context comes from an entirely separate pipeline (`context_engine::compile::ContextBlock`s, built by
+`build_packet` from `PreservedLiveContext`, which `agent_runtime::prompt`'s types have no conversion to or from
+anywhere in the workspace). `docs/development-ledger.md`'s own P6-CALIBRATION entry had already recorded the
+first half of this finding ("no crate outside agent-runtime invokes ... `GoalDriver::next`") and the intended
+layering decision ("`goal::driver` must use a lower-level turn executor... that also owns context recovery") —
+confirmed still accurate for `GoalDriver::next` specifically, even though the ledger's adjacent claim about
+`run_turn`/`execute_with_context_recovery` having no callers is now stale (`apps/rapid/src/host.rs`'s
+`run_live_exec` calls both).
+**Architectural decision:** per the driving instruction's own explicit sanctioned outcome ("its logic should be
+replaced by a smaller application-level continuation controller") — `GoalDriver::next()` itself is not called in
+production. `crates/agent-runtime` was not modified at all (zero lines touched). Instead, `apps/rapid` composes
+the crate's own *reusable, already-public* primitives directly: `agent_runtime::GoalBudgetGuard` (real budget
+gating, unmodified), `agent_runtime::{GoalCommand, GoalActor, GoalState}` (the same lifecycle-transition API
+`GoalHost::apply`/Task 8's `/goal pause|resume|cancel` already use), and `GoalHost::can_complete` (the same
+evidence gate `GoalDriver`'s own `apply_lifecycle` uses internally, confirmed identical rule by direct
+comparison). The canonical turn executor is **`SessionLoop::submit_turn`** — the exact same kernel `SubmitTurn`/
+`turn_in_flight`/`spawn_interactive_turn`/`finish_turn` machinery a real Enter-press turn already uses,
+unmodified — meaning every autonomous iteration is a genuine kernel turn: real cost, real context recovery, real
+tools, real event-ledger streaming, real transcript visibility, real cancellation, for free.
+**Autonomous-start semantics — Option A, explicit only, confirmed by repository evidence, not assumed:** an
+active goal never runs on its own. `/goal start` already has real lifecycle meaning (Task 8); nothing in the
+existing `GoalCommand`/`GoalState` model ties "Active" to "executing." Two new commands, `/goal run` and
+`/goal stop` (parser, `UiCommand`, `KernelAction`, catalog/help, all in `crates/tui/src/commands.rs`, following
+the exact shape `/goal pause|resume|cancel` already established) are the only way to begin or stop autonomous
+continuation — never a side effect of activating/resuming a goal.
+**Driver/session ownership model:** autonomous iterations run inside the *same* interactive session, never a
+dedicated one — a fresh session per iteration would sever conversation history the compiled prompt (see below)
+still relies on, and a hidden headless session would defeat the whole "same transcript, same turn lease" design.
+Cross-process single-driver ownership — the driving instruction's own candidate for "the most important
+architectural decision" — has a real, new primitive: `apps/rapid::goal_host::{DriverLease, try_acquire_driver_
+lease, GOAL_DRIVER_LOCK_FILE}`, a *separate* OS advisory file lock (`.rapidlm/goal-driver.lock`, sibling to
+`goal.json`, `.gitignore`d) from the existing `goal.lock` (never conflated — see `GOAL_DRIVER_LOCK_FILE`'s own
+doc comment: `goal.lock` is a millisecond-scale per-transaction lock, never held across model execution; the
+driver lease is held for the *entire* autonomous run, by design, and would starve ordinary `/goal pause`
+mutations if it were the same lock). `/goal run` calls `try_acquire_driver_lease` (non-blocking `try_lock`, so a
+second attempt fails fast with "already running" rather than hanging); the lease lives inside `SessionLoop`'s own
+owned `AutonomousGoalState`, so it is released automatically on every exit path — explicit stop, natural terminal
+state, or the holding process crashing/exiting — via `Drop`, the identical crash-safety guarantee `GoalLock`
+itself already relies on, reused rather than a new PID-file mechanism.
+**Iteration lifecycle:** driven entirely by `SessionLoop::run`'s own existing single-threaded main loop — no new
+thread/task management. Each pass calls `step_autonomous_goal()` (a no-op unless autonomous execution is active
+and no turn is currently in flight). Once the previous iteration's turn has actually finished, it inspects
+*only that iteration's own* new `AppState.transcript()` entries — the same structured state the compositor
+itself renders from, never reparsed text — for a context-required stop, an interruption, or a failure, feeding
+every new `Assistant` message to `agent_runtime::MessageLoopDetector` (reused unmodified) along the way. If none
+of those fired, `continue_or_stop_autonomous_goal()` reloads `.rapidlm/goal.json` *fresh from disk* (never
+trusting anything cached from a prior iteration — another process, or a `/goal pause`/`cancel` in this same
+session, may have changed it since), re-validates the goal's identity and `Active` state, checks completion,
+pre-checks the *real* persisted budget, compiles the next boundary prompt, and submits it through
+`SessionLoop::submit_turn` unchanged.
+**Completion behavior:** mechanical and evidence-gated, never based on model prose — after every iteration,
+`GoalHost::can_complete` (the exact same gate `/goal pause|resume|cancel`'s `GoalCommand::Complete` branch
+already enforces) is checked against freshly reloaded evidence (`GoalHost::load` only loads `goal.json`;
+evidence lives in a separate file and is never loaded implicitly — a real bug this task's own revert-cycle
+testing found and fixed: an early draft never called `load_evidence` at all, so `can_complete` always saw an
+empty, freshly-constructed evidence store and could never auto-complete however much real evidence existed).
+When satisfied, `GoalCommand::Complete` is applied through the real `GoalHost::update` transaction (its own
+independent evidence re-check is the fail-closed backstop — never bypassed). The model is told this explicitly in
+the compiled prompt ("completion itself is detected automatically from recorded evidence, not from this
+message") so it understands its own role correctly rather than being asked to call a tool that doesn't exist in
+this integration (see prompt-delivery note below).
+**Context-required behavior, made consistent with the existing interactive-turn precedent, not `GoalDriver`'s own
+prior behavior:** `GoalDriver::next()`'s existing code (unmodified, since `GoalDriver` itself is unused in
+production) treats *any* non-`Completed` turn status — including a context-required stop, which ends with
+`TurnStatus::Failed` and `reason: Some(TurnStopReason::ContextRequired)`, confirmed by reading `run_turn`'s own
+test — identically to a genuine failure, pausing the goal. That would be inconsistent with the established
+interactive-turn precedent (Task 4: a context-required stop never mutates goal state at all). This integration's
+own `step_autonomous_goal` checks for `ToolActivityStatus::ContextRequired` specifically and stops the loop
+*without* touching goal state — the goal stays Active, the model's own question surfaces as ordinary
+`TranscriptEntry::Assistant` text (identical to a regular interactive turn, via the same `execute_interactive_
+turn`/`context_required_question` mapping, unmodified), and a human can either answer normally or re-issue
+`/goal run` to resume. Revert-cycle-verified with a real, non-obvious finding: an early version of the regression
+test for this passed *even with the check removed*, because with only one scripted backing queued, a wrongly-
+attempted second iteration fell through to real (unconfigured-in-tests) model resolution and failed for an
+unrelated reason, landing on the same `autonomous.is_none()` outcome by coincidence — strengthened by asserting
+no second `TurnFailed` ever appears, which only the *specific* context-required check, not a lucky failure,
+can guarantee.
+**Pause/cancel behavior:** `/goal pause` and `/goal cancel` are ordinary, already-wired slash commands (Task 8) —
+never blocked while autonomous execution is running (only *plain text*, which would try to start a new kernel
+turn, is refused with a clear message in `submit_composer`). Pausing/cancelling takes effect at the next
+continuation boundary (the fresh reload in `continue_or_stop_autonomous_goal`), not by killing an in-flight
+turn — an in-flight iteration finishes normally; the *next* one is what's prevented. Verified directly: a test
+pauses mid-run via the real slash-command dispatch path (not a direct field mutation) and confirms exactly one
+of two queued iterations ran.
+**Budget semantics:** `GoalBudgetGuard::before_turn` is checked against the *real* persisted snapshot's usage
+before every iteration is even attempted — an already-exhausted budget never starts another turn. A turn that
+itself crosses a threshold mid-flight is allowed to finish (the driving instruction's own documented acceptable
+semantics — no partial model-call interruption invented). On exhaustion, `GoalCommand::Block{budget_exhausted:
+true}` is applied through the real `GoalHost::update` transaction, exactly mirroring `GoalDriver::budget_before`'s
+own internal shape, just fed real numbers.
+**Real cost / `GoalUsage` behavior — the double-counting risk named explicitly as critical, closed by
+construction, not by discipline alone:** this integration's own orchestration code never calls `GoalBudgetGuard::
+after_model`/`after_turn` (the accrual methods) at all — only the read-only `before_turn` pre-check. The one and
+only place usage is ever recorded is the *existing, unmodified* `accrue_turn_usage` call already inside
+`execute_interactive_turn` (Task 5), which every kernel turn — autonomous or not — already goes through via
+`submit_turn`. Proven, not just reasoned about: a dedicated test runs two real (scripted) autonomous iterations
+against a `max_turns: 2` budget and asserts the persisted `GoalUsage` is *exactly* the sum of both iterations'
+real tokens/cost — never zero, never one iteration's worth, never doubled. Revert-cycle-verified in both
+directions this task's own instructions asked for: temporarily reintroducing a second, redundant `accrue_turn_
+usage` call (the literal "`GoalDriver -> separate GoalUsage increment`" shape warned against) made that same
+test fail on the exact-total assertion; removing it restored the pass.
+**Cross-process ownership behavior:** verified at two levels — 4 dedicated tests in `goal_host.rs` (a second
+lease refused while the first is held; released and re-acquirable once dropped; independent from `goal.lock`,
+provable by a successful ordinary goal mutation while a driver lease is held; the lock file itself carries no
+data) and one at the `interactive.rs` level (`start_autonomous_goal` refuses to begin while a lease is already
+held, rendering a truthful "already running" message). No literal "bypass the check and watch it fail" revert
+cycle was performed for this one specifically — the safety property is enforced by a real OS advisory file lock,
+not application-level logic, so there is no meaningful way to defeat it short of deleting the acquisition call
+outright; the 5 tests above prove the actual mechanism from multiple angles instead.
+**TUI/headless behavior:** all new `TranscriptEntry`/rendering flows entirely through the existing `AppState`/
+`CommandOutput`/`CommandError` structured path Task 8 established — no `println!`, no new panel, no direct
+terminal writes. **Headless `rapid goal run` was investigated and deliberately not implemented, a real scope
+boundary, not an oversight:** headless `exec_turn` builds a *fresh, disposable* kernel session per invocation
+(no persistent interactive session, no `SessionLoop`, no `turn_in_flight`) — a headless continuation loop would
+need its own, separately-designed orchestration shape, not a trivial reuse of `SessionLoop`'s methods, which are
+deeply coupled to kernel-session/renderer state that headless execution doesn't have. The interactive TUI path
+delivered here is the complete, tested, production-ready implementation of every architectural property this
+task cared about (real cost, ownership, budget, completion, context-required, cancellation); a headless
+equivalent is a genuine, separate follow-up.
+**Files changed:** `apps/rapid/src/goal_host.rs` (`GOAL_DRIVER_LOCK_FILE`, `DriverLease`, `try_acquire_driver_
+lease`, a non-blocking `GoalLock::try_acquire`); `apps/rapid/src/interactive.rs` (`AutonomousGoalState`,
+`start_autonomous_goal`/`stop_autonomous_goal`/`step_autonomous_goal`/`continue_or_stop_autonomous_goal`/
+`evidence_path` on `SessionLoop`, `compile_autonomous_prompt`, the `KernelAction::RunGoal`/`StopGoal` dispatch
+arms, the plain-text-blocked-while-autonomous check in `submit_composer`, a test-only scripted-backing seam on
+`submit_turn` mirroring the existing single-turn one); `crates/tui/src/commands.rs` (`UiCommand::GoalRun/GoalStop`,
+`KernelAction::RunGoal/StopGoal`, parser/catalog/help); `.gitignore` (the new lock file).
+**Tests added: 13 (`-p rapid --lib`: 516 total, up from 503) plus 2 parser tests (`-p tui --lib`: 223 total, up
+from 221).** 4 in `goal_host.rs` prove the lease's real OS-level ownership semantics directly. 9 in `interactive.
+rs`, all driving either the real `run_interactive` entry point or a manually constructed `SessionLoop` (the
+established `page_up_and_page_down_...` pattern, extended with the new scripted-backing seam) calling the actual
+production `start_autonomous_goal`/`step_autonomous_goal`/`continue_or_stop_autonomous_goal` methods, never a
+reimplementation: no-active-goal and nothing-running local errors; two real scripted iterations exhausting a
+real turn budget with exact usage accrual; immediate completion when evidence is already satisfied (zero turns
+run); a context-required stop leaving the goal Active with the question surfaced and no second iteration
+attempted; a turn failure stopping the loop without a retry; `/goal pause` mid-run via the real slash-command
+path stopping before the next iteration; a second driver refused while the lease is held; and the critical
+production-wiring proof driving `run_interactive` itself end to end through `/goal start` → `/goal run` →
+`/goal stop` → `/quit` with truthful rendering throughout.
+**Revert-cycle verification, four of the five applicable cases performed as literal bypass-and-restore cycles,
+the fifth (ownership) verified differently for the reason stated above:** (1) *production integration* —
+temporarily made `KernelAction::RunGoal` a no-op; the production-wiring test failed exactly as predicted
+(nothing started); restored, passes again. (2) *continuation* — temporarily forced the loop to stop
+unconditionally after one iteration; the two-iteration budget test failed (`Active` instead of `Blocked`, wrong
+usage); restored, passes again. (3) *context-required* — temporarily removed the context-required check (see
+the "made this test genuinely stronger" note above); the strengthened test failed on the spurious extra
+`TurnFailed`; restored, passes again. (4) *accounting* — temporarily reintroduced a redundant accrual call; the
+exact-total test failed; restored, passes again.
+**Self-review findings:** the evidence-loading bug above (a real, production-affecting fix, not a test-only
+issue — found via the "immediate completion" test failing for a genuinely surprising reason, not a typo).
+Checked directly for every item on the driving instruction's own extensive list: no duplicated model/tool
+execution logic (the canonical `submit_turn`/`execute_interactive_turn`/`run_live_exec` chain is called
+unchanged); no second cost-accounting path (only `before_turn`, a read, is called from the new code; `after_
+model`/`after_turn` never are); no hardcoded zero cost (this integration never constructs a usage value itself);
+no two drivers on one goal (the lease); no `goal.lock` held across model execution (every `GoalHost::update` call
+here is one bounded read-modify-write; turn execution happens entirely outside any lock); no stale goal-state
+checks (fresh reload every continuation boundary, by construction); context-required no longer continues
+autonomously (fixed and revert-cycle-verified); pause/cancel correctly prevent the next iteration (verified);
+completion gate never bypassed (`GoalHost::update`'s own independent evidence check is the backstop); no unsafe
+overlap between a user turn and an autonomous one (`autonomous.is_some()` blocks new plain-text submissions);
+no direct TUI writes (the existing `CommandOutput`/`CommandError` path only); a direct grep of this task's own
+diff for `.unwrap()`/`.expect()` outside test code returned zero hits — no new panic paths in production code;
+no infinite loop without a stopping condition (completion, budget, failure, context-required, message-loop-
+detection, and human pause/cancel all terminate it; an unconfigured/unlimited-budget goal *can* in principle run
+until one of those fires, an existing, unmodified `GoalBudget` semantic — not a new gap this task introduced,
+called out here rather than silently glossed over); no retry storm (a failed turn stops the loop, verified);
+session shutdown cannot leave a driver alive (the lease lives inside `SessionLoop`'s own owned state and is
+`Drop`-released on every exit path, including the existing interrupt-then-quiesce cleanup `run_started_session`
+already performs); `/goal run`/`/goal stop` are truthfully advertised (real, parsed, tested commands, not
+aspirational help text); and no accidental broader agent-runtime redesign — `crates/agent-runtime` has zero
+lines changed by this task.
+**Verification:** `cargo test -p tui --lib` (223 passed, up from 221), `cargo test -p rapid --lib` (516 passed,
+up from 503), `cargo build --workspace --tests` clean, `cargo clippy -p rapid -p tui --all-targets` — zero new
+findings on any file this task touched (confirmed by diff-hunk-range comparison against the pre-existing
+`interactive.rs` `collapsible_if` lints prior tasks already reported by line number). Full `cargo test
+--workspace`: 100% clean, zero failures anywhere.
+**Deliberately not attempted, per the driving instruction's own scope:** calling `GoalDriver::next()` itself in
+production (architectural decision, documented above); modifying `crates/agent-runtime` in any way; headless
+`rapid goal run` (documented above as a genuine, separate follow-up); model-invoked structural completion tools
+(`goal.complete`/`goal.pause`/`goal.block`/`goal.cancel` — completion is evidence-gated and mechanical instead,
+a deliberately safer design than trusting the model to remember to call a tool); a general agent-runtime
+redesign; retrieval/RAG changes; knowledge-store implementation; broad MCP/plugin trust wiring; playbook
+redesign; computer-use integration; provider pricing redesign; goal persistence redesign.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

@@ -18,6 +18,7 @@ coverage/
 # themselves part of the persisted goal or evidence contract.
 .rapidlm/goal.lock
 .rapidlm/goal-evidence.lock
+.rapidlm/goal-driver.lock
 
 # OS / editor
 .DS_Store

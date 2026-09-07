@@ -40,6 +40,15 @@ pub enum UiCommand {
         max_turns: Option<u64>,
         max_tokens: Option<u64>,
     },
+    /// Start (or resume, if one was already in progress) autonomous
+    /// continuation on the active goal. Explicit-only: an active goal never
+    /// runs autonomously on its own — see `KernelAction::RunGoal`'s own doc
+    /// comment for why.
+    GoalRun,
+    /// Request the running autonomous driver to stop after its current
+    /// iteration (or immediately, if none is in flight). Does not pause or
+    /// cancel the goal itself — only the autonomous loop.
+    GoalStop,
     AgentsList,
     AgentsShow {
         id: Option<AgentId>,
@@ -246,6 +255,13 @@ pub enum KernelAction {
         max_turns: Option<u64>,
         max_tokens: Option<u64>,
     },
+    /// Begin (or continue) autonomous execution on the active goal. Never
+    /// triggered by anything but an explicit `/goal run` — activating or
+    /// resuming a goal is metadata/lifecycle only and must never implicitly
+    /// start spending model usage on its own.
+    RunGoal,
+    /// Stop the running autonomous driver after its current iteration.
+    StopGoal,
     PauseAgent {
         id: Option<AgentId>,
     },
@@ -393,8 +409,8 @@ const CATALOG: &[CommandSpec] = &[
     CommandSpec {
         name: "goal",
         aliases: &[],
-        usage: "/goal [show|start <text>|pause|resume|cancel|budget [turns N] [tokens N]]",
-        summary: "inspect or control the active goal",
+        usage: "/goal [show|start <text>|pause|resume|cancel|budget [turns N] [tokens N]|run|stop]",
+        summary: "inspect, control, or autonomously run the active goal",
     },
     CommandSpec {
         name: "diff",
@@ -541,7 +557,7 @@ const CATALOG_HELP: &str = "\
 /quit
 /model [list|select <name>|doctor]
 /agents [list|show|pause|resume|sleep|cancel|terminate] [id]
-/goal [show|start <text>|pause|resume|cancel|budget]
+/goal [show|start <text>|pause|resume|cancel|budget|run|stop]
 /diff [--agent <id>]
 /apply [--agent <id>]
 /rollback [checkpoint]
@@ -644,6 +660,8 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         UiCommand::GoalPause => FrontendAction::Kernel(KernelAction::PauseGoal),
         UiCommand::GoalResume => FrontendAction::Kernel(KernelAction::ResumeGoal),
         UiCommand::GoalCancel => FrontendAction::Kernel(KernelAction::CancelGoal),
+        UiCommand::GoalRun => FrontendAction::Kernel(KernelAction::RunGoal),
+        UiCommand::GoalStop => FrontendAction::Kernel(KernelAction::StopGoal),
         UiCommand::GoalBudget {
             max_turns,
             max_tokens,
@@ -964,6 +982,8 @@ fn parse_goal(args: &[&str]) -> Result<UiCommand, CommandError> {
             statement: join_text("goal", rest)?,
         }),
         ["budget", rest @ ..] => parse_goal_budget(rest),
+        ["run"] => Ok(UiCommand::GoalRun),
+        ["stop"] => Ok(UiCommand::GoalStop),
         _ => Err(invalid("goal")),
     }
 }
@@ -1430,6 +1450,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_goal_run_and_stop_are_typed_commands() {
+        assert_eq!(parse_ok("/goal run"), UiCommand::GoalRun);
+        assert_eq!(
+            dispatch(UiCommand::GoalRun),
+            FrontendAction::Kernel(KernelAction::RunGoal)
+        );
+        assert_eq!(parse_ok("/goal stop"), UiCommand::GoalStop);
+        assert_eq!(
+            dispatch(UiCommand::GoalStop),
+            FrontendAction::Kernel(KernelAction::StopGoal)
+        );
+        // Neither takes arguments.
+        assert_eq!(
+            parse_err("/goal run now"),
+            CommandError::InvalidArgs { command: "goal" }
+        );
+        assert_eq!(
+            parse_err("/goal stop please"),
+            CommandError::InvalidArgs { command: "goal" }
+        );
+    }
+
+    #[test]
     fn unknown_and_invalid_args_produce_inline_help() {
         let unknown = parse_err("/nope");
         assert_eq!(unknown, CommandError::UnknownCommand);
@@ -1440,7 +1483,7 @@ mod tests {
         assert_eq!(invalid, CommandError::InvalidArgs { command: "goal" });
         assert_eq!(
             invalid.help(),
-            "/goal [show|start <text>|pause|resume|cancel|budget [turns N] [tokens N]]"
+            "/goal [show|start <text>|pause|resume|cancel|budget [turns N] [tokens N]|run|stop]"
         );
         assert!(!invalid.to_string().contains("foo"));
 

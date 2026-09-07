@@ -28,15 +28,18 @@ use kernel::{
     SubmitTurn, SubscribeEvents, TrustStatus, config_key_from_env_name, load_config,
 };
 use protocol::{EventId, ProjectId, TraceContext, TraceId};
-use tui::state::{GoalLifecycle, GoalProjection, LocalUiEvent, MAX_COMPOSER_BYTES, UiEvent};
+use tui::state::{
+    GoalLifecycle, GoalProjection, LocalUiEvent, MAX_COMPOSER_BYTES, ToolActivityStatus,
+    TranscriptEntry, UiEvent,
+};
 use tui::{
     AppState, CommandError, FrontendAction, FrontendKind, KernelAction, KernelApi, LocalAction,
     RecordingBackend, TerminalError, TerminalGuard, dispatch, parse_command, reduce,
 };
 
 use crate::goal_host::{
-    EVIDENCE_FILE, GOAL_FILE, GoalHost, GoalTransactionError, SESSIONS_DB_FILE, accrue_turn_usage,
-    active_goal_id,
+    DriverLease, EVIDENCE_FILE, GOAL_FILE, GoalHost, GoalTransactionError, SESSIONS_DB_FILE,
+    accrue_turn_usage, active_goal_id, try_acquire_driver_lease,
 };
 use crate::headless::jsonl::JsonlExitCode;
 use crate::exec_tools::ExecTools;
@@ -48,9 +51,10 @@ use crate::model::{ConfiguredModel, SelectedModel};
 use crate::user_config::ModelSelection;
 use agent_runtime::{
     AgentExecutionRequest, AgentResult, AgentRole, AgentSpec, AgentTerminalStatus,
-    ContextRetryPolicy, EvidenceKind, EvidenceLedgerRef, EvidenceProducer, EvidenceSpec,
-    EvidenceStatus, FailureCause, GoalActor, GoalBudget, GoalCommand, GoalSnapshot, GoalSpec,
-    GoalState, TEST_PASSED, TurnFailureDetail, TurnStopReason,
+    ContextRetryPolicy, ConvergenceHint, EvidenceKind, EvidenceLedgerRef, EvidenceProducer,
+    EvidenceSpec, EvidenceStatus, FailureCause, GoalActor, GoalBudget, GoalBudgetGuard,
+    GoalCommand, GoalSnapshot, GoalSpec, GoalState, MessageLoopDetector, TEST_PASSED,
+    TurnFailureDetail, TurnStopReason,
 };
 
 /// Bound on ancestors inspected while locating `.rapidlm` / `.git`.
@@ -338,6 +342,57 @@ fn map_goal_lifecycle(state: GoalState) -> GoalLifecycle {
         // the goal from the projection on a future variant.
         _ => GoalLifecycle::Blocked,
     }
+}
+
+/// Build the boundary-turn prompt text for one autonomous iteration. A flat
+/// string, not `agent_runtime::prompt::PromptBundle` — `GoalDriver`'s own
+/// `compile_boundary_prompt` produces a structured `Vec<PromptMessage>`
+/// bundle that nothing in `apps/rapid`'s real model-context pipeline
+/// (`context_engine::compile::ContextBlock`s, built by `build_packet` from
+/// `PreservedLiveContext`) can consume — the two prompt representations are
+/// entirely separate and never reconciled anywhere in the workspace. This
+/// is the one adapter piece that gap genuinely requires, not a duplicate of
+/// reusable logic: the *decision* of what to tell the model (goal
+/// statement, its completion criteria, a budget hint) is still driven
+/// entirely by the real `GoalSnapshot`/`ConvergenceHint` values the caller
+/// already computed via `agent_runtime::GoalBudgetGuard`, nothing invented
+/// here. Fed as `apps/rapid`'s own `text` parameter — the exact same single
+/// string every ordinary turn already uses for both its kernel-visible
+/// transcript entry and its model-visible context (see
+/// `build_interactive_turn_context`) — so an autonomous iteration is
+/// maximally transparent in the transcript, not hidden or summarized away.
+fn compile_autonomous_prompt(snapshot: &GoalSnapshot, hint: Option<ConvergenceHint>) -> String {
+    let mut text = format!(
+        "Continue working autonomously toward this goal. When every completion \
+         criterion below is fully satisfied by evidence you have recorded, say so \
+         and stop proposing further changes — completion itself is detected \
+         automatically from recorded evidence, not from this message.\n\ngoal: {}\n",
+        snapshot.statement()
+    );
+    for criterion in snapshot.completion_criteria() {
+        text.push_str(&format!(
+            "- criterion {}: {}\n",
+            criterion.id(),
+            criterion.text()
+        ));
+    }
+    if let Some(hint) = hint.filter(|hint| !hint.is_empty()) {
+        text.push_str("\nbudget note: approaching the configured limit on");
+        if hint.turns() {
+            text.push_str(" turns");
+        }
+        if hint.tokens() {
+            text.push_str(" tokens");
+        }
+        if hint.active_ms() {
+            text.push_str(" time");
+        }
+        if hint.cost() {
+            text.push_str(" cost");
+        }
+        text.push_str(" — wrap up soon if reasonable.\n");
+    }
+    text
 }
 
 /// Run a P9 subcommand, mapping its typed error onto CLI usage output.
@@ -2607,6 +2662,9 @@ fn run_started_session(
         trusted: resolved.trust.is_trusted(),
         turn_in_flight: turn_in_flight.clone(),
         renderer: &mut renderer,
+        autonomous: None,
+        #[cfg(test)]
+        scripted_backings: None,
     }
     .run(&mut inputs);
     let rendered_output = renderer.captured_text();
@@ -2660,6 +2718,63 @@ struct SessionLoop<'a> {
     /// `SessionConflict` this whole feature exists to stop crashing on.
     turn_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     renderer: &'a mut TuiRenderer,
+    /// `Some` for the entire duration of a `/goal run`-started autonomous
+    /// continuation, `None` otherwise. Owned by the loop, not a reference:
+    /// this state changes (starts/stops) across the loop's own lifetime the
+    /// same way `turn_in_flight` does, but — unlike `turn_in_flight` — needs
+    /// no sharing with a spawned thread, since only the main loop itself
+    /// ever reads or decides from it (see `SessionLoop::step_autonomous_goal`).
+    autonomous: Option<AutonomousGoalState>,
+    /// Test-only seam: when set, `submit_turn` runs the next queued scripted
+    /// backing instead of resolving a real model from process env/config —
+    /// the same idea as `run_interactive_turn_with_backing`'s existing
+    /// single-turn seam, extended so a test can drive *multiple* real
+    /// autonomous iterations deterministically (a different `ScriptedModel`
+    /// output per iteration) through the actual production `submit_turn`/
+    /// `step_autonomous_goal`/`continue_or_stop_autonomous_goal` path,
+    /// rather than re-implementing that orchestration in test code.
+    #[cfg(test)]
+    scripted_backings: Option<ScriptedBackingQueue>,
+}
+
+#[cfg(test)]
+type ScriptedBackingQueue = std::sync::Arc<
+    std::sync::Mutex<std::collections::VecDeque<Box<dyn crate::host::LiveModelCall + Send>>>,
+>;
+
+#[cfg(test)]
+impl crate::host::LiveModelCall for Box<dyn crate::host::LiveModelCall + Send> {
+    fn step(
+        &mut self,
+        blocks: &[context_engine::compile::ContextBlock],
+        input: &agent_runtime::ModelStepInput<'_>,
+        cancel: &agent_runtime::CancellationToken,
+    ) -> Result<agent_runtime::ModelStepOutput, agent_runtime::ModelStepError> {
+        (**self).step(blocks, input, cancel)
+    }
+}
+
+/// Everything the main loop needs to keep driving one autonomous goal
+/// continuation across iterations. Deliberately holds no copy of goal
+/// lifecycle/usage state itself — every decision re-reads the real,
+/// persisted `.rapidlm/goal.json` fresh (see `step_autonomous_goal`), so
+/// this struct only carries what genuinely can't be recovered from that
+/// file: the driver-ownership lease, the in-memory repeated-message
+/// detector (reset per autonomous run, not persisted — matching
+/// `GoalDriver`'s own per-driver-instance detector), and the transcript
+/// offset used to inspect *this iteration's own* new entries without
+/// re-scanning or reparsing anything already rendered.
+struct AutonomousGoalState {
+    goal_id: protocol::GoalId,
+    agent_id: protocol::AgentId,
+    _lease: DriverLease,
+    loop_detector: MessageLoopDetector,
+    /// `AppState.transcript().len()` immediately before the current
+    /// iteration's turn was submitted, `None` while no iteration is
+    /// in flight (i.e. between the decision to continue and the next
+    /// `submit_turn` call, which is instantaneous in practice but kept
+    /// `Option` for clarity rather than a sentinel `usize`).
+    transcript_len_before_iteration: Option<usize>,
 }
 
 impl SessionLoop<'_> {
@@ -2669,6 +2784,7 @@ impl SessionLoop<'_> {
                 .check()
                 .map_err(|_| InteractiveError::Cancelled)?;
             self.drain()?;
+            self.step_autonomous_goal()?;
             match next_input(inputs, self.cancel)? {
                 None => continue,
                 Some(InteractiveInput::Eof) => return Ok(InteractiveOutcome::Quit),
@@ -2757,6 +2873,19 @@ impl SessionLoop<'_> {
         if trimmed.starts_with('/') {
             return self.dispatch_slash(trimmed);
         }
+        if self.autonomous.is_some() {
+            // Slash commands (including `/goal pause|cancel|stop`, the real
+            // way to interrupt an autonomous run) still reach dispatch_slash
+            // above unchanged — only a *new* ordinary turn is refused here,
+            // matching submit_turn's own existing turn_in_flight drop
+            // exactly: reject rather than queue, silently rather than an
+            // error, so the session stays responsive without stacking work.
+            self.append_command_error(
+                "autonomous goal execution is running — /goal stop to interrupt it first"
+                    .to_owned(),
+            );
+            return Ok(LoopControl::Continue);
+        }
         let text = trimmed.to_owned();
         self.submit_turn(&text)?;
         Ok(LoopControl::Continue)
@@ -2814,6 +2943,10 @@ impl SessionLoop<'_> {
 
     fn goal_path(&self) -> PathBuf {
         self.root.join(PROJECT_MARKER).join(GOAL_FILE)
+    }
+
+    fn evidence_path(&self) -> PathBuf {
+        self.root.join(PROJECT_MARKER).join(EVIDENCE_FILE)
     }
 
     /// `/goal start <text>` — the only goal mutation the TUI's own grammar
@@ -2933,6 +3066,253 @@ impl SessionLoop<'_> {
         Ok(())
     }
 
+    /// `/goal run` — begin autonomous continuation on the currently active
+    /// goal. Explicit-only: nothing else in this codebase ever sets
+    /// `self.autonomous`, so an active goal never runs on its own (see
+    /// `KernelAction::RunGoal`'s own doc comment for why). Acquires the
+    /// cross-process [`DriverLease`] first — never assumes this session is
+    /// the only place trying to run this goal autonomously — then submits
+    /// the first iteration immediately via the same path every later
+    /// iteration uses.
+    fn start_autonomous_goal(&mut self) -> Result<(), InteractiveError> {
+        if self.autonomous.is_some() {
+            self.append_command_output("autonomous goal execution is already running".to_owned());
+            return Ok(());
+        }
+        let goal_path = self.goal_path();
+        let host = match GoalHost::load(&goal_path) {
+            Ok(Some(host)) => host,
+            Ok(None) => {
+                self.append_command_error("no active goal — /goal start <text> first".to_owned());
+                return Ok(());
+            }
+            Err(err) => {
+                self.append_command_error(format!("goal run: {err}"));
+                return Ok(());
+            }
+        };
+        let Some(snapshot) = host.snapshot() else {
+            self.append_command_error("no active goal — /goal start <text> first".to_owned());
+            return Ok(());
+        };
+        if snapshot.state() != GoalState::Active {
+            self.append_command_error("goal run: the active goal is not Active".to_owned());
+            return Ok(());
+        }
+        let goal_id = snapshot.id();
+        let lease = match try_acquire_driver_lease(&goal_path) {
+            Ok(lease) => lease,
+            Err(_) => {
+                self.append_command_error(
+                    "autonomous execution is already running for this goal — in this session \
+                     or another process"
+                        .to_owned(),
+                );
+                return Ok(());
+            }
+        };
+        self.autonomous = Some(AutonomousGoalState {
+            goal_id,
+            agent_id: protocol::AgentId::new(),
+            _lease: lease,
+            loop_detector: MessageLoopDetector::new(),
+            transcript_len_before_iteration: None,
+        });
+        self.append_command_output("autonomous goal execution started".to_owned());
+        self.continue_or_stop_autonomous_goal()
+    }
+
+    /// Clears autonomous state (releasing the driver lease as `_lease`
+    /// drops) and renders why. A no-op — no message, nothing to release —
+    /// when nothing was running, so callers on both the explicit `/goal
+    /// stop` path and every internal stop condition can call this
+    /// unconditionally.
+    fn stop_autonomous_goal(&mut self, reason: &str) {
+        if self.autonomous.take().is_some() {
+            self.append_command_output(format!("autonomous goal execution stopped: {reason}"));
+        }
+    }
+
+    /// Called every loop pass (see `SessionLoop::run`). A no-op unless
+    /// autonomous execution is active; while an iteration's turn is still
+    /// in flight, also a no-op — there is nothing to decide until it
+    /// finishes. Once it has, inspects *only this iteration's own* new
+    /// transcript entries (never re-scanning earlier ones, never parsing
+    /// rendered text — these are the same structured `TranscriptEntry`
+    /// values the compositor itself renders from) for the three signals
+    /// that must stop autonomous continuation without ever starting another
+    /// turn: a context-required stop, an interruption, or a turn failure.
+    /// `TurnFailed`/`TurnInterrupted` stop rather than retry — a bounded
+    /// iteration/budget cap is not enough on its own to rule out a retry
+    /// storm against a provider that fails fast.
+    fn step_autonomous_goal(&mut self) -> Result<(), InteractiveError> {
+        if self.autonomous.is_none() {
+            return Ok(());
+        }
+        if self.turn_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        let started_at = self
+            .autonomous
+            .as_ref()
+            .and_then(|auto| auto.transcript_len_before_iteration);
+        if let Some(start) = started_at {
+            let start = start.min(self.ui.transcript().len());
+            let new_entries = self.ui.transcript()[start..].to_vec();
+            let mut context_required = false;
+            let mut interrupted = false;
+            let mut failed = false;
+            for entry in &new_entries {
+                match entry {
+                    TranscriptEntry::Assistant { text } => {
+                        if let Some(auto) = &mut self.autonomous {
+                            auto.loop_detector.observe(text);
+                        }
+                    }
+                    TranscriptEntry::ToolActivity {
+                        status: ToolActivityStatus::ContextRequired,
+                        ..
+                    } => context_required = true,
+                    TranscriptEntry::TurnInterrupted => interrupted = true,
+                    TranscriptEntry::TurnFailed { .. } => failed = true,
+                    _ => {}
+                }
+            }
+            if context_required {
+                self.stop_autonomous_goal(
+                    "the goal needs information only you can supply — see the question above; \
+                     answer it, then /goal run to resume",
+                );
+                return Ok(());
+            }
+            if interrupted {
+                self.stop_autonomous_goal("the current iteration was interrupted");
+                return Ok(());
+            }
+            if failed {
+                self.stop_autonomous_goal("the last autonomous turn failed");
+                return Ok(());
+            }
+            let looping = self
+                .autonomous
+                .as_ref()
+                .is_some_and(|auto| auto.loop_detector.is_looping());
+            if looping {
+                self.stop_autonomous_goal("the model repeated itself with no progress");
+                return Ok(());
+            }
+        }
+        self.continue_or_stop_autonomous_goal()
+    }
+
+    /// Reload the real, persisted goal state fresh (never trusting anything
+    /// cached from a prior iteration — another process, or a slash command
+    /// in this same session, may have paused/cancelled/replaced it since),
+    /// then decide: stop if it is no longer the expected goal in an Active
+    /// state, auto-complete it if evidence already satisfies every
+    /// criterion (mechanical, never based on model prose), stop if the real
+    /// (not driver-internal, not zero) accrued usage already exhausts the
+    /// budget, or otherwise compile the next boundary prompt and submit it
+    /// through the existing `submit_turn` — the identical kernel
+    /// `SubmitTurn`/lease/background-thread path an ordinary Enter-press
+    /// turn already uses, just driven by this loop instead of a keypress.
+    fn continue_or_stop_autonomous_goal(&mut self) -> Result<(), InteractiveError> {
+        let Some(auto) = &self.autonomous else {
+            return Ok(());
+        };
+        let goal_id = auto.goal_id;
+        let agent_id = auto.agent_id;
+        let goal_path = self.goal_path();
+        let mut host = match GoalHost::load(&goal_path) {
+            Ok(Some(host)) => host,
+            Ok(None) => {
+                self.stop_autonomous_goal("no active goal");
+                return Ok(());
+            }
+            Err(err) => {
+                self.stop_autonomous_goal(&format!("goal store error: {err}"));
+                return Ok(());
+            }
+        };
+        let Some(snapshot) = host.snapshot().cloned() else {
+            self.stop_autonomous_goal("no active goal");
+            return Ok(());
+        };
+        if snapshot.id() != goal_id {
+            self.stop_autonomous_goal("the goal changed identity");
+            return Ok(());
+        }
+        match snapshot.state() {
+            GoalState::Active => {}
+            GoalState::Paused => {
+                self.stop_autonomous_goal("goal paused");
+                return Ok(());
+            }
+            GoalState::Blocked => {
+                self.stop_autonomous_goal("goal blocked");
+                return Ok(());
+            }
+            // `GoalState` is #[non_exhaustive]; fail conservatively by
+            // stopping rather than assuming a future variant is safe to
+            // continue on (mirrors `map_goal_lifecycle`'s own rule).
+            _ => {
+                self.stop_autonomous_goal("goal is not active");
+                return Ok(());
+            }
+        }
+        // `GoalHost::load` reads only `goal.json` — evidence lives in its
+        // own separate file and is never loaded implicitly. Without this,
+        // `can_complete` below would always see a freshly-constructed,
+        // empty `EvidenceService` and could never auto-complete, however
+        // much real evidence had actually been recorded.
+        let _ = host.load_evidence(&self.evidence_path());
+        let cancel = agent_runtime::CancellationToken::new();
+        if host.can_complete(&cancel) {
+            let result = host.update(&goal_path, |host| {
+                host.apply(
+                    GoalCommand::Complete { goal_id },
+                    &GoalActor::MainAgent { agent_id },
+                    &cancel,
+                )
+            });
+            match result {
+                Ok(_) => self.stop_autonomous_goal("goal complete"),
+                Err(_) => self.stop_autonomous_goal(
+                    "goal ready to complete, but the completion transaction failed",
+                ),
+            }
+            return Ok(());
+        }
+        let mut guard = GoalBudgetGuard::from_snapshot(&snapshot);
+        let outcome = match guard.before_turn(&cancel) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                self.stop_autonomous_goal("cancelled");
+                return Ok(());
+            }
+        };
+        if outcome.is_exhausted() {
+            let _ = host.update(&goal_path, |host| {
+                host.apply(
+                    GoalCommand::Block {
+                        goal_id,
+                        budget_exhausted: true,
+                    },
+                    &GoalActor::MainAgent { agent_id },
+                    &cancel,
+                )
+            });
+            self.stop_autonomous_goal("budget exhausted");
+            return Ok(());
+        }
+        let prompt = compile_autonomous_prompt(&snapshot, outcome.hint());
+        let before_len = self.ui.transcript().len();
+        if let Some(auto) = &mut self.autonomous {
+            auto.transcript_len_before_iteration = Some(before_len);
+        }
+        self.submit_turn(&prompt)
+    }
+
     fn apply_kernel_action(&mut self, action: KernelAction) -> Result<(), InteractiveError> {
         self.cancel
             .check()
@@ -2942,6 +3322,20 @@ impl SessionLoop<'_> {
             KernelAction::PauseGoal => self.goal_lifecycle_command(GoalLifecycleKind::Pause)?,
             KernelAction::ResumeGoal => self.goal_lifecycle_command(GoalLifecycleKind::Resume)?,
             KernelAction::CancelGoal => self.goal_lifecycle_command(GoalLifecycleKind::Cancel)?,
+            KernelAction::RunGoal => self.start_autonomous_goal()?,
+            KernelAction::StopGoal => {
+                if self.autonomous.is_some() {
+                    self.stop_autonomous_goal("stopped by /goal stop");
+                    // Reaches whatever iteration is currently in flight —
+                    // same kernel interrupt path Ctrl-C already uses. A safe
+                    // no-op if nothing is actually running.
+                    self.interrupt()?;
+                } else {
+                    self.append_command_output(
+                        "autonomous goal execution is not running".to_owned(),
+                    );
+                }
+            }
             other => match other.kernel_api() {
                 KernelApi::Interrupt => {
                     self.interrupt()?;
@@ -3049,6 +3443,27 @@ impl SessionLoop<'_> {
             // happen on this thread's own just-issued handle.
             self.turn_in_flight
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(test)]
+            let scripted = self
+                .scripted_backings
+                .as_ref()
+                .and_then(|queue| queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front());
+            #[cfg(test)]
+            if let Some(backing) = scripted {
+                spawn_interactive_turn_with_backing(
+                    self.client.clone(),
+                    self.session_id,
+                    handle.turn_id(),
+                    self.actor.clone(),
+                    self.root.to_path_buf(),
+                    self.trusted,
+                    text.to_owned(),
+                    turn_cancel,
+                    std::sync::Arc::clone(&self.turn_in_flight),
+                    backing,
+                );
+                return self.drain();
+            }
             spawn_interactive_turn(
                 self.client.clone(),
                 self.session_id,
@@ -5168,6 +5583,626 @@ base_url = "http://127.0.0.1:11434/v1"
         assert!(painted.contains("no active goal"), "{painted}");
     }
 
+    // --- Autonomous goal execution (GoalDriver integration) -------------
+
+    #[test]
+    fn slash_goal_run_with_no_active_goal_shows_a_local_error_not_a_crash() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/goal run".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(painted.contains("/goal start"), "{painted}");
+    }
+
+    #[test]
+    fn slash_goal_stop_with_nothing_running_is_a_harmless_local_message() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/goal start ship the thing".to_owned()),
+            InteractiveInput::Submit("/goal stop".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(painted.contains("not running"), "{painted}");
+    }
+
+    /// Test-only helper: an active goal with exactly one completion
+    /// criterion (not `ScriptedSession::create_active_goal`'s empty-criteria
+    /// shape, which `can_complete` would trivially satisfy immediately —
+    /// this file's own tests need a goal that genuinely requires at least
+    /// one real turn/evidence before it can complete).
+    fn create_goal_with_one_criterion(session: &ScriptedSession) -> protocol::GoalId {
+        let mut host = GoalHost::new();
+        let spec = GoalSpec::new(
+            protocol::GoalId::new(),
+            "ship the thing",
+            vec![agent_runtime::Criterion::new("c1", "tests pass").expect("criterion")],
+            GoalBudget::default(),
+            vec![agent_runtime::EvidenceRequirement::new("c1", vec!["test".to_owned()]).expect("req")],
+        )
+        .expect("spec");
+        let effect = host
+            .apply(
+                GoalCommand::Create(spec),
+                &GoalActor::Human,
+                &agent_runtime::CancellationToken::new(),
+            )
+            .expect("create goal");
+        host.save(&session.goal_path()).expect("save goal");
+        effect.goal_id()
+    }
+
+    /// Record one passing test-evidence record satisfying `"c1"`, exactly
+    /// the shape `GoalHost::apply(GoalCommand::Complete)`'s own gate checks
+    /// — mirrors `goal_host.rs`'s own `system_test_record` helper (private
+    /// to that module, so rebuilt here rather than exposed cross-module for
+    /// one shared helper).
+    fn record_passing_evidence(evidence_path: &Path, goal_id: protocol::GoalId) {
+        let mut host = GoalHost::new();
+        let spec = EvidenceSpec::new(
+            protocol::EvidenceId::new(),
+            goal_id,
+            EvidenceKind::Test,
+            TEST_PASSED,
+            EvidenceProducer::System,
+            agent_runtime::EvidenceSource::new(protocol::ArtifactId::from_bytes(
+                b"autonomous-goal-test-evidence",
+            )),
+            EvidenceStatus::Passed,
+            "src/lib.rs",
+        )
+        .expect("spec")
+        .with_criterion_id("c1")
+        .expect("criterion")
+        .with_command("cargo test")
+        .expect("command");
+        host.record_evidence(spec).expect("record");
+        host.save_evidence(evidence_path).expect("save evidence");
+    }
+
+    /// Drive `loop_state`'s autonomous stepping to a terminal state (or a
+    /// generous bound), the same real-time-polling discipline `ScriptedSession::
+    /// run_turn`'s own comment already establishes for this codebase's
+    /// scripted-turn tests: iterations run on their own real (if fast,
+    /// scripted) background thread, so the driving loop must actually wait
+    /// in real wall-clock time between checks, not just retry instantly.
+    fn drive_autonomous_goal(loop_state: &mut SessionLoop) {
+        for _ in 0..300 {
+            // `ScriptedSession::run_turn`'s own comment documents the exact
+            // race this closes: `subscribe`'s replay/live-tail delivery
+            // runs on its own worker thread, so a single `drain()` right
+            // after a turn finishes can race that worker and see stale
+            // state — here specifically a stale `self.ui.snapshot().seq()`,
+            // which `continue_or_stop_autonomous_goal`'s own `submit_turn`
+            // call would then use for the *next* iteration's
+            // `kernel::SubmitTurn`, hitting a real `SessionConflict`
+            // against the kernel's own already-advanced seq. A short,
+            // bounded retry burst — not a single call — closes it exactly
+            // like that helper's own 30x/10ms retry does.
+            for _ in 0..15 {
+                loop_state.drain().expect("drain");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            loop_state.step_autonomous_goal().expect("step");
+            if loop_state.autonomous.is_none() {
+                return;
+            }
+        }
+        panic!("autonomous goal loop did not reach a terminal state in time");
+    }
+
+    fn scripted_backing_queue(
+        models: Vec<ScriptedModel>,
+    ) -> ScriptedBackingQueue {
+        std::sync::Arc::new(std::sync::Mutex::new(
+            models
+                .into_iter()
+                .map(|m| Box::new(m) as Box<dyn crate::host::LiveModelCall + Send>)
+                .collect(),
+        ))
+    }
+
+    /// Builds a `SessionLoop` borrowing from the given locals — the exact
+    /// shape `page_up_and_page_down_reach_the_renderers_viewport_through_
+    /// session_loop_handle_input` already established, extended with
+    /// `scripted_backings` so autonomous iterations run a real (scripted)
+    /// model instead of trying to resolve one from process env.
+    #[allow(clippy::too_many_arguments)]
+    fn autonomous_session_loop<'a>(
+        session: &'a ScriptedSession,
+        stream: &'a mut EventStream,
+        ui: &'a mut AppState,
+        cancel: &'a CancellationToken,
+        interrupt_count: &'a mut u32,
+        saw_ctrl_c: &'a mut bool,
+        renderer: &'a mut TuiRenderer,
+        turn_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        backings: ScriptedBackingQueue,
+    ) -> SessionLoop<'a> {
+        SessionLoop {
+            client: &session.client,
+            stream,
+            ui,
+            session_id: session.session_id,
+            actor: &session.actor,
+            cancel,
+            interrupt_count,
+            saw_ctrl_c,
+            root: &session.root,
+            trusted: true,
+            turn_in_flight,
+            renderer,
+            autonomous: None,
+            scripted_backings: Some(backings),
+        }
+    }
+
+    #[test]
+    fn slash_goal_pause_mid_autonomous_run_stops_the_loop_before_the_next_iteration() {
+        // The exact interaction the driving instruction calls "the real
+        // stop mechanism": `/goal pause` is an ordinary, already-wired
+        // slash command (Task 8), never blocked while autonomous execution
+        // owns the turn slot (only *plain text* is — see
+        // `submit_composer`'s own check) — pausing takes effect at the next
+        // continuation boundary, not by killing an in-flight turn.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        session.create_active_goal();
+
+        let cancel = CancellationToken::new();
+        let snapshot = block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        // Two backings queued, but only the first should ever run: pausing
+        // after it finishes must pre-empt the second entirely.
+        let backings = scripted_backing_queue(vec![
+            ScriptedModel::terminal_with_usage("first pass", 40, 100),
+            ScriptedModel::terminal_with_usage("second pass", 999, 999),
+        ]);
+
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight.clone(),
+            backings,
+        );
+
+        loop_state.start_autonomous_goal().expect("start");
+        assert!(loop_state.autonomous.is_some());
+
+        // Wait for iteration 1 to actually finish, then pause *before* the
+        // driving loop gets another chance to decide whether to continue —
+        // exercising the real slash-command path, not a direct field
+        // mutation.
+        for _ in 0..300 {
+            loop_state.drain().expect("drain");
+            if !turn_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        loop_state
+            .goal_lifecycle_command(GoalLifecycleKind::Pause)
+            .expect("pause");
+
+        drive_autonomous_goal(&mut loop_state);
+
+        assert!(loop_state.autonomous.is_none(), "pausing must stop the autonomous loop");
+        let host = GoalHost::load(&session.goal_path()).expect("load").expect("goal exists");
+        let snapshot = host.snapshot().expect("snapshot");
+        assert_eq!(snapshot.state(), GoalState::Paused);
+        assert_eq!(
+            snapshot.usage().turns(),
+            1,
+            "the second queued backing must never have been reached"
+        );
+    }
+
+    #[test]
+    fn autonomous_goal_runs_two_real_iterations_then_blocks_on_its_own_turn_budget_usage_accrues_once_each()
+     {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        // max_turns=2, no completion criteria to satisfy — the deterministic
+        // stopping condition here is the goal's own budget, not evidence, so
+        // exactly two real scripted iterations must run before a third is
+        // ever attempted (proving `before_turn`'s pre-check, not a lucky
+        // race, is what stops it — see the queue-exhaustion note below).
+        let mut host = GoalHost::new();
+        let spec = GoalSpec::new(
+            protocol::GoalId::new(),
+            "ship the thing",
+            vec![],
+            GoalBudget::new(Some(2), None, None, None),
+            vec![],
+        )
+        .expect("spec");
+        host.apply(
+            GoalCommand::Create(spec),
+            &GoalActor::Human,
+            &agent_runtime::CancellationToken::new(),
+        )
+        .expect("create goal");
+        host.save(&session.goal_path()).expect("save goal");
+
+        let cancel = CancellationToken::new();
+        let snapshot = block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        // Exactly two scripted backings: if the loop wrongly attempted a
+        // third iteration, `submit_turn`'s test-only branch would find the
+        // queue empty and fall through to real (unconfigured-in-tests)
+        // model resolution, which `TurnFailed`-stops the loop instead of
+        // reaching the budget-exhaustion path this test actually asserts —
+        // a real, not merely theoretical, way this test would catch a
+        // budget-check-ordering regression.
+        let backings = scripted_backing_queue(vec![
+            ScriptedModel::terminal_with_usage("still working on it", 50, 200),
+            ScriptedModel::terminal_with_usage("more progress", 60, 300),
+        ]);
+
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight.clone(),
+            backings,
+        );
+
+        loop_state.start_autonomous_goal().expect("start");
+        assert!(loop_state.autonomous.is_some(), "the first iteration must be submitted");
+        drive_autonomous_goal(&mut loop_state);
+
+        assert!(
+            loop_state.autonomous.is_none(),
+            "the loop must have stopped once the turn budget was exhausted"
+        );
+        let host = GoalHost::load(&session.goal_path()).expect("load").expect("goal exists");
+        let snapshot = host.snapshot().expect("snapshot");
+        assert_eq!(snapshot.state(), GoalState::Blocked);
+        assert_eq!(snapshot.stop_reason(), Some(agent_runtime::GoalStopReason::BudgetExhausted));
+        let usage = snapshot.usage();
+        assert_eq!(usage.turns(), 2, "exactly two real iterations, never a third");
+        assert_eq!(usage.tokens(), 110, "50 + 60 — each iteration's real tokens accrued exactly once");
+        assert_eq!(usage.cost(), 500, "200 + 300 — each iteration's real cost accrued exactly once");
+    }
+
+    #[test]
+    fn autonomous_goal_completes_immediately_when_evidence_already_satisfies_it_no_turn_runs() {
+        // A different, complementary property from the budget test above:
+        // if the completion gate is already satisfied the moment autonomous
+        // execution starts, it must complete on the very first continuation
+        // check — before ever submitting a turn at all. Uses zero scripted
+        // backings on purpose: if the implementation wrongly ran a turn
+        // first, `submit_turn`'s test-only branch would find the queue
+        // empty and fail closed (real, unconfigured-in-tests model
+        // resolution), not silently succeed — this test would then fail on
+        // the "no active goal" state divergence instead of passing by luck.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let goal_id = create_goal_with_one_criterion(&session);
+        let evidence_path = session.root.join(PROJECT_MARKER).join(EVIDENCE_FILE);
+        record_passing_evidence(&evidence_path, goal_id);
+
+        let cancel = CancellationToken::new();
+        let snapshot = block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(vec![]);
+
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight,
+            backings,
+        );
+
+        loop_state.start_autonomous_goal().expect("start");
+        assert!(
+            loop_state.autonomous.is_none(),
+            "already-satisfied evidence must complete the goal on the first check, \
+             without ever submitting a turn"
+        );
+        let host = GoalHost::load(&session.goal_path()).expect("load");
+        assert!(
+            host.is_none_or(|h| h.snapshot().is_none()),
+            "the goal must be completed (snapshot cleared)"
+        );
+    }
+
+    #[test]
+    fn autonomous_goal_stops_on_context_required_leaves_goal_active_surfaces_the_question() {
+        // The Task-4 precedent this must stay consistent with: an ordinary
+        // interactive turn that needs context never mutates goal state —
+        // the goal stays whatever it was, and the question becomes normal
+        // assistant-visible text. Autonomous execution must do the same
+        // (leave the goal Active, not Paused/Blocked) while additionally
+        // stopping its own continuation loop — a context-required turn is
+        // not a failure and not grounds to keep guessing.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut host = GoalHost::new();
+        let spec = GoalSpec::new(
+            protocol::GoalId::new(),
+            "ship the thing",
+            vec![],
+            GoalBudget::default(),
+            vec![],
+        )
+        .expect("spec");
+        host.apply(
+            GoalCommand::Create(spec),
+            &GoalActor::Human,
+            &agent_runtime::CancellationToken::new(),
+        )
+        .expect("create goal");
+        host.save(&session.goal_path()).expect("save goal");
+
+        let cancel = CancellationToken::new();
+        let snapshot = block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(vec![ScriptedModel::asks_for_context(
+            "Which environment: staging or production?",
+            &["staging", "production"],
+        )]);
+
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight,
+            backings,
+        );
+
+        loop_state.start_autonomous_goal().expect("start");
+        drive_autonomous_goal(&mut loop_state);
+
+        assert!(loop_state.autonomous.is_none(), "the loop must stop, not keep guessing");
+        assert!(
+            loop_state
+                .ui
+                .transcript()
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::Assistant { text }
+                    if text.contains("Which environment: staging or production?"))),
+            "the model's own question must surface as ordinary turn output: {:?}",
+            loop_state.ui.transcript()
+        );
+        // Specifically rules out the way this test could otherwise pass for
+        // the wrong reason: only one scripted backing was queued, so if the
+        // context-required check were missing, the loop would try a
+        // *second* iteration, find the queue empty, fall through to real
+        // (unconfigured-in-tests) model resolution, and stop on *that*
+        // unrelated `TurnFailed` instead — `loop_state.autonomous.is_none()`
+        // alone cannot tell the two apart, but the presence of a second,
+        // spurious `TurnFailed` can (revert-cycle-verified: an earlier draft
+        // of this test passed even with the context-required check removed,
+        // exactly because of this gap).
+        assert!(
+            !loop_state
+                .ui
+                .transcript()
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::TurnFailed { .. })),
+            "no second iteration should ever have been attempted: {:?}",
+            loop_state.ui.transcript()
+        );
+        let host = GoalHost::load(&session.goal_path()).expect("load").expect("goal exists");
+        assert_eq!(
+            host.snapshot().expect("snapshot").state(),
+            GoalState::Active,
+            "context-required must leave the goal Active, not Paused/Blocked"
+        );
+    }
+
+    #[test]
+    fn autonomous_goal_stops_on_turn_failure_not_a_retry_storm() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let goal_id = session.create_active_goal();
+
+        let cancel = CancellationToken::new();
+        let snapshot = block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        // Exactly one scripted failure: if the loop wrongly retried, the
+        // queue would run dry and `submit_turn` would fall through to real
+        // (unconfigured-in-tests) model resolution — a second, different
+        // failure the test below would not be able to distinguish from a
+        // deliberate stop. `create_active_goal` has no completion criteria,
+        // so vacuous auto-completion is the one other way this test could
+        // pass for the wrong reason — ruled out by asserting the goal is
+        // still the same, still-Active goal afterward, not completed.
+        let backings = scripted_backing_queue(vec![ScriptedModel::failing()]);
+
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight,
+            backings,
+        );
+
+        loop_state.start_autonomous_goal().expect("start");
+        drive_autonomous_goal(&mut loop_state);
+
+        assert!(loop_state.autonomous.is_none(), "a failed turn must stop the loop");
+        let host = GoalHost::load(&session.goal_path()).expect("load").expect("goal exists");
+        let host_snapshot = host.snapshot().expect("snapshot");
+        assert_eq!(host_snapshot.id(), goal_id);
+        assert_eq!(
+            host_snapshot.state(),
+            GoalState::Active,
+            "a turn failure stops the driver, not the goal itself \
+             (distinct from a budget/pause/cancel/complete transition)"
+        );
+    }
+
+    #[test]
+    fn a_second_autonomous_driver_is_refused_while_one_already_owns_the_goal() {
+        // Cross-process ownership: the lease has no notion of "this
+        // session" — it is a real OS-level file lock, so holding it
+        // (simulating a second process, or a second `/goal run` reusing a
+        // stale lease this session forgot to drop) is enough to prove a
+        // second driver is refused, without needing an actual second
+        // process to reproduce.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        session.create_active_goal();
+        let held = try_acquire_driver_lease(&session.goal_path()).expect("first lease");
+
+        let cancel = CancellationToken::new();
+        let snapshot = block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(vec![]);
+
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight,
+            backings,
+        );
+
+        loop_state.start_autonomous_goal().expect("start");
+        assert!(
+            loop_state.autonomous.is_none(),
+            "a second driver must never start while the lease is held elsewhere"
+        );
+        loop_state.drain().expect("drain");
+        let painted = loop_state.renderer.captured_text().expect("captured");
+        assert!(painted.contains("already running"), "{painted}");
+        drop(held);
+    }
+
+    #[test]
+    fn production_run_interactive_goal_run_does_not_crash_and_renders_truthfully() {
+        // The critical production-wiring proof: drives the real
+        // `run_interactive` entry point (not a manually constructed
+        // `SessionLoop`) through `/goal start` → `/goal run` → enough
+        // pass-through ticks for the real (if unconfigured-in-tests, so
+        // fast-failing) background turn to finish → `/goal stop` → `/quit`.
+        // No scripted model is available at this entry point (that seam
+        // only exists on `SessionLoop` directly, used by the tests above) —
+        // this deliberately exercises the real "not configured" failure
+        // path instead, proving the whole stack (parser, dispatch,
+        // autonomous state, real kernel turn submission, real failure
+        // handling, truthful rendering, final input-ready state) survives
+        // it end to end.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let mut inputs = vec![
+            InteractiveInput::Submit("/goal start ship the thing".to_owned()),
+            InteractiveInput::Submit("/goal run".to_owned()),
+        ];
+        inputs.extend((0..80).map(|_| InteractiveInput::Resize { width: 80, height: 24 }));
+        inputs.push(InteractiveInput::Submit("/goal stop".to_owned()));
+        inputs.push(InteractiveInput::Submit("/quit".to_owned()));
+        let report = run_interactive(env.options_capturing_render(inputs)).expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(
+            painted.contains("autonomous goal execution started"),
+            "{painted}"
+        );
+    }
+
     #[test]
     fn unsupported_kernel_commands_render_an_honest_message_and_never_silently_no_op() {
         let _lock = lock_terminal();
@@ -6184,6 +7219,9 @@ base_url = "http://127.0.0.1:11434/v1"
             trusted: true,
             turn_in_flight,
             renderer: &mut renderer,
+            autonomous: None,
+            #[cfg(test)]
+            scripted_backings: None,
         };
         loop_state
             .submit_turn("a message arriving while another turn is in flight")
@@ -6492,6 +7530,9 @@ base_url = "http://127.0.0.1:11434/v1"
                 trusted: true,
                 turn_in_flight: turn_in_flight.clone(),
                 renderer: &mut renderer,
+                autonomous: None,
+                #[cfg(test)]
+                scripted_backings: None,
             };
             loop_state
                 .handle_input(InteractiveInput::PageUp)
@@ -6513,6 +7554,9 @@ base_url = "http://127.0.0.1:11434/v1"
                 trusted: true,
                 turn_in_flight,
                 renderer: &mut renderer,
+                autonomous: None,
+                #[cfg(test)]
+                scripted_backings: None,
             };
             for _ in 0..10 {
                 loop_state
