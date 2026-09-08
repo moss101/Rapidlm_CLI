@@ -247,6 +247,7 @@ Commands:
   rapid trust grant|status|revoke   explicit project-trust control plane
   rapid goal create|replace|show|pause|resume|cancel|complete|claim|export|verify|evidence
   rapid mcp list|get|add|remove|probe   project MCP servers (stdio)
+  rapid permissions list|allow|revoke   persisted per-project tool grants
   rapid doctor                  environment/config/model/trust/sandbox diagnosis
   rapid plugins validate|register|list|approve|reject|hook-test
   rapid agents list|validate|scaffold   project agent definitions
@@ -544,6 +545,12 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         summary: "one supervised external CLI agent turn: <prompt> -- argv...",
         own_help: false,
         handler: SubcommandHandler::P9(crate::p9_commands::run_agent_cli),
+    },
+    Subcommand {
+        name: "permissions",
+        summary: "persisted per-project tool grants (list/allow/revoke)",
+        own_help: true,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_permissions),
     },
     Subcommand {
         name: "doctor",
@@ -1376,8 +1383,9 @@ stacks are in-process constants, and there is no TUI panel over them"
 real sandboxed smoke probe"
         }
         Inspector::Permissions => {
-            "no TUI permission panel yet; rules come from the project settings files and the \
-RAPIDLM_PERMISSION_MODE environment variable"
+            "no TUI permission panel yet; `rapid permissions list` reports this project's \
+persisted grants, and the rest comes from the project settings files and \
+RAPIDLM_PERMISSION_MODE"
         }
         Inspector::Computer => {
             "computer-use is not wired into the interactive session yet, so there is no state \
@@ -1733,7 +1741,7 @@ const PERMISSION_MODE_ENV: &str = "RAPIDLM_PERMISSION_MODE";
 /// precedence order (RapidLM's own first, then the Claude-compat path).
 pub(crate) const PROJECT_SETTINGS_FILES: [&str; 2] = [".rapidlm/settings.json", ".claude/settings.json"];
 /// Persisted per-project allow grants consulted before any ask.
-const PERMISSIONS_STORE_NAME: &str = "project-permissions.json";
+pub(crate) const PERMISSIONS_STORE_NAME: &str = "project-permissions.json";
 /// Maximum rule entries admitted across all settings documents. Each file is
 /// already individually capped at `MAX_RULES` by `parse_settings` (an
 /// over-limit file fails the whole load with `TooManyRules`, never silently
@@ -1801,12 +1809,42 @@ fn merge_settings_rules(
     rules
 }
 
+/// The persisted grants recorded for `root` in the store under `home`.
+///
+/// Split out of [`exec_permission_lattice`] purely so it can be driven with
+/// an explicit home: the lattice builder resolves one from the process
+/// environment via [`exec_user_home`], which a test cannot redirect without
+/// mutating global state this crate forbids (`#![forbid(unsafe_code)]` rules
+/// out `set_var`). Everything security-relevant is here; the caller only
+/// supplies the home.
+///
+/// Fails closed in every failure mode — an absent, unreadable, or corrupt
+/// store yields no grants, never "grant everything". `rapid permissions`
+/// deliberately does *not* share that leniency: it refuses to overwrite a
+/// store it could not parse.
+pub(crate) fn persisted_grants_for(
+    root: &Path,
+    home: &Path,
+) -> Vec<crate::permissions::ToolPattern> {
+    let store_path = home.join(PERMISSIONS_STORE_NAME);
+    let Ok(text) = fs::read_to_string(&store_path) else {
+        return Vec::new();
+    };
+    let Ok(canonical) = fs::canonicalize(root) else {
+        return Vec::new();
+    };
+    let Ok(grants) = crate::permissions::parse_grants(&text) else {
+        return Vec::new();
+    };
+    grants.for_root(&canonical.to_string_lossy())
+}
+
 fn exec_permission_lattice(
     canonical_root: Option<&Path>,
     forced_mode: Option<crate::permissions::PermissionMode>,
 ) -> Result<crate::permissions::PermissionLattice, String> {
     use crate::permissions::{
-        PermissionLattice, PermissionMode, ProjectSettings, ToolPattern, parse_grants,
+        PermissionLattice, PermissionMode, ProjectSettings,
         parse_settings,
     };
     let mut mode: Option<PermissionMode> = match exec_permission_mode() {
@@ -1855,15 +1893,7 @@ fn exec_permission_lattice(
     let mut lattice = PermissionLattice::new(mode).with_rules(rules);
     // Persisted grants, keyed by canonical project root.
     if let (Some(root), Some(home)) = (canonical_root, exec_user_home()) {
-        let store_path = home.join(PERMISSIONS_STORE_NAME);
-        if let Ok(text) = fs::read_to_string(&store_path)
-            && let Ok(canonical) = fs::canonicalize(root)
-            && let Ok(grants) = parse_grants(&text)
-        {
-            let allow = grants.for_root(&canonical.to_string_lossy());
-            let patterns: Vec<ToolPattern> = allow;
-            lattice = lattice.with_grants(patterns);
-        }
+        lattice = lattice.with_grants(persisted_grants_for(root, &home));
     }
     // Managed-policy tool ban (Modbit `CAP-001`, same layer as the mode
     // ceiling above): applied unconditionally, since a pure addition to

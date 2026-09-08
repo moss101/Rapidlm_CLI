@@ -24,6 +24,7 @@ pub mod model;
 pub mod p9_commands;
 pub mod pdf_text;
 pub mod permissions;
+pub mod permissions_cli;
 pub mod preview;
 pub mod sandbox_exec;
 pub mod shadow_diagnostics;

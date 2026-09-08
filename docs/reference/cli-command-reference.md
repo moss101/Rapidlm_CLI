@@ -4,7 +4,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 
 > **What the binary actually dispatches today** (everything else in the table below is
 > roadmap, not shipped behavior): `exec`, `trust`, `goal`, `mcp`, `doctor`, `plugins`,
-> `agents`, `cron`, `scan`, `findings`, `sessions`, `inspect-export`, `insights`,
+> `agents`, `cron`, `scan`, `findings`, `sessions`, `inspect-export`, `insights`, `permissions`,
 > `playbook-compile`, `agent-cli`, `mcp-tools`, `tools`, `release-manifest`,
 > `completions`, `man`. Those names are checked against the one table in source
 > (`interactive::SUBCOMMANDS`) by
@@ -36,6 +36,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 | `rapid sandbox status|doctor` | isolation diagnostics |
 | `rapid mcp list|get|add|remove|probe` | project MCP servers (stdio); see the MCP section below |
 | `rapid plugins validate|register|list|approve|reject|hook-test` | plugin manifest validation, trust ledger (register stores untrusted; only explicit approve grants capabilities), and hook dry-run against a fixture event |
+| `rapid permissions list|allow|revoke` | persisted per-project tool grants; see the permissions section below |
 | `rapid hooks list|test|enable|disable` | lifecycle hooks |
 | `rapid skills list|show|enable|disable` | skills |
 | `rapid eval run|compare|report` | evaluation harness |
@@ -123,6 +124,46 @@ is reported honestly (for example, MCP servers are listed as configured-but-unre
 on an untrusted project, and entries this build cannot run are counted with their
 reasons) and never claimed to be verified. `rapid mcp probe` is the command that
 actually performs an MCP handshake.
+
+## `rapid permissions` — persisted per-project tool grants
+
+`PermissionLattice::evaluate` consults, in order: managed-policy bans and write-scope
+ceilings, plan-mode's write floor, project `permissions` rules, read-only auto-allow,
+**persisted per-project grants**, then the mode table. The grant step was implemented and
+tested but *unreachable in production* — `parse_grants` was a reader with no counterpart,
+so nothing ever created a grant. This command is the writer.
+
+It matters because `PermissionMode::Default` — the out-of-box mode for the interactive
+TUI and headless exec alike — resolves every non-read call to "ask", and no surface in
+this build can prompt for an approval, so the call is denied. Until that gap is closed, a
+grant is the only way to pre-approve one specific tool for one specific project without
+widening the permission mode for everything.
+
+| Command | Behavior |
+|---|---|
+| `list` | Every grant recorded for this project, plus the store path and the project's trust state. |
+| `allow <pattern>...` | Records grants. Idempotent — re-granting reports `already-granted` and writes nothing. |
+| `revoke <pattern>...` | Removes grants. Exits `1` if nothing matched. |
+
+Patterns are `Tool` or `Tool(arg-glob)` — the same grammar the `permissions` rules in
+`.rapidlm/settings.json` use, parsed by the same `ToolPattern::parse`, so this command
+cannot write a pattern the loader would reject.
+
+**Boundaries.** A grant only ever narrows the gap between "ask" and "allow": it cannot
+widen past a managed-policy tool ban, or past a write-scope ceiling for the file-edit
+tools that ceiling governs — both are checked before grants are consulted. (A write-scope
+ceiling classifies only file edits, so it never constrained `shell_exec`, with or without
+a grant.) A grant does nothing in an untrusted project, where every tool call is refused
+outright (the command says so). A pattern naming a tool this build does not provide is
+recorded as intent and never matches; `rapid tools` prints the real names. Writing a grant is a privilege escalation, so the
+command is reachable only from argv — no model tool, slash command, hook, or
+autonomous-goal path dispatches a subcommand. The store lives in the RapidLM home, keyed
+by canonical project root, is never wider than owner-only (`0600`) — a narrower mode the
+user chose is kept, a wider one is tightened on the next write — and the whole
+read-modify-write is held under a sibling `.lock`, so concurrent runs cannot lose each
+other's grants. A store that does not parse is refused, never overwritten — the run-time reader
+treats an unparsable store as "no grants" (fail-closed, correct there), but a writer that
+replaced it would destroy every other project's grants to record one.
 
 ## `rapid mcp` — project MCP servers
 

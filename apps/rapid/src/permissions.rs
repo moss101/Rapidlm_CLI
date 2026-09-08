@@ -158,6 +158,16 @@ impl ToolPattern {
         self.arg_glob.as_deref()
     }
 
+    /// The exact text [`Self::parse`] accepts back. The inverse lives beside
+    /// the parser so no writer re-derives the `Tool` / `Tool(glob)` syntax —
+    /// `render_grants` and `rapid permissions` both go through this.
+    pub fn render(&self) -> String {
+        match &self.arg_glob {
+            Some(glob) => format!("{}({glob})", self.tool),
+            None => self.tool.clone(),
+        }
+    }
+
     fn matches(&self, tool: &str, subject: &str) -> bool {
         if self.tool != tool {
             return false;
@@ -333,7 +343,8 @@ impl DecisionReason {
             Self::DenyRule => "denied by an explicit deny rule",
             Self::AskRule => {
                 "an ask rule requires approval, which no surface in this build can prompt for \
-yet; pre-approve it with a `permissions.allow` entry in .rapidlm/settings.json"
+yet; pre-approve it with `rapid permissions allow <tool>` or a `permissions.allow` entry \
+in .rapidlm/settings.json"
             }
             Self::AllowRule => "allowed by an explicit allow rule",
             Self::PersistedGrant => "allowed by a persisted per-project grant",
@@ -349,8 +360,8 @@ yet; pre-approve it with a `permissions.allow` entry in .rapidlm/settings.json"
             // false half the time it was shown, and named no way forward.
             Self::ModeAsk => {
                 "requires approval, which no surface in this build can prompt for yet; \
-pre-approve this call with a `permissions.allow` entry in .rapidlm/settings.json, or set \
-RAPIDLM_PERMISSION_MODE (acceptEdits allows file edits)"
+pre-approve it with `rapid permissions allow <tool>`, or a `permissions.allow` entry in \
+.rapidlm/settings.json, or set RAPIDLM_PERMISSION_MODE (acceptEdits allows file edits)"
             }
             Self::PlanModeDeny => "plan mode is read-only; this call mutates state",
             Self::DontAskDeny => "dontAsk mode silently refuses calls that are not pre-approved",
@@ -716,6 +727,85 @@ impl PermissionGrants {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// Record `pattern` for `canonical_root`. Returns whether anything
+    /// changed — granting an already-granted pattern is idempotent, the same
+    /// contract `rapid trust grant` has.
+    ///
+    /// Bounded by [`MAX_GRANTS`] per project and [`MAX_GRANT_RECORDS`]
+    /// projects, the same limits [`parse_grants`] enforces on the way in: a
+    /// writer that could produce a document its own reader would reject (or
+    /// silently truncate) is how a grant "disappears" with no diagnostic.
+    pub fn allow(
+        &mut self,
+        canonical_root: &str,
+        pattern: ToolPattern,
+    ) -> Result<bool, GrantsError> {
+        if !self.records.contains_key(canonical_root)
+            && self.records.len() >= MAX_GRANT_RECORDS
+        {
+            return Err(GrantsError::TooManyRecords);
+        }
+        let entry = self.records.entry(canonical_root.to_owned()).or_default();
+        if entry.iter().any(|existing| existing == &pattern) {
+            return Ok(false);
+        }
+        if entry.len() >= MAX_GRANTS {
+            return Err(GrantsError::InvalidGrant);
+        }
+        entry.push(pattern);
+        entry.sort_by_key(ToolPattern::render);
+        Ok(true)
+    }
+
+    /// Remove `pattern` from `canonical_root`. Returns whether anything
+    /// changed. A root left with no grants is dropped entirely rather than
+    /// persisted as an empty record.
+    pub fn revoke(&mut self, canonical_root: &str, pattern: &ToolPattern) -> bool {
+        let Some(entry) = self.records.get_mut(canonical_root) else {
+            return false;
+        };
+        let before = entry.len();
+        entry.retain(|existing| existing != pattern);
+        let changed = entry.len() != before;
+        if entry.is_empty() {
+            self.records.remove(canonical_root);
+        }
+        changed
+    }
+}
+
+/// Serialize the persisted grants document — the exact inverse of
+/// [`parse_grants`], and the only writer of this format.
+///
+/// Nothing wrote this file before: `parse_grants` was a reader with no
+/// counterpart, which made `Decision::PersistedGrant` — step 3 of
+/// [`PermissionLattice::evaluate`], "persisted per-project grants suppress
+/// the ask" — unreachable in production. `rapid permissions` is the writer.
+pub fn render_grants(grants: &PermissionGrants) -> Result<String, GrantsError> {
+    let projects: Vec<serde_json::Value> = grants
+        .records
+        .iter()
+        .map(|(root, allow)| {
+            serde_json::json!({
+                "root": root,
+                "allow": allow.iter().map(ToolPattern::render).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let document = serde_json::json!({ "schema": 1, "projects": projects });
+    let text = serde_json::to_string_pretty(&document)
+        .map_err(|_| GrantsError::InvalidJson)?;
+    // `+ 1` for the trailing newline every writer appends. Bounding the
+    // pre-newline text let a document rendering to exactly
+    // `MAX_SETTINGS_BYTES` be written one byte over the limit its own
+    // loader enforces, at which point `parse_grants` rejects it, the
+    // run-time reader fails closed, and *every* project's grants disappear
+    // with no diagnostic.
+    if text.len() + 1 > MAX_SETTINGS_BYTES {
+        return Err(GrantsError::TooLarge);
+    }
+    Ok(text)
 }
 
 /// Parse the persisted grants document:
@@ -765,6 +855,230 @@ pub fn parse_grants(text: &str) -> Result<PermissionGrants, GrantsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_grant_can_never_widen_past_an_admin_ceiling() {
+        // `rapid permissions` and its help text both claim a grant "can only
+        // narrow the gap between ask and allow" and cannot beat a
+        // managed-policy tool ban or write-scope ceiling. That claim is only
+        // as good as `evaluate`'s ordering, so it is asserted here rather
+        // than trusted.
+        let granted = ToolPattern::parse("workspace_write").expect("pattern");
+
+        // Without a ceiling the grant does what it says.
+        let allowed = PermissionLattice::new(PermissionMode::Default)
+            .with_grants(vec![granted.clone()]);
+        assert_eq!(
+            allowed.evaluate("workspace_write", "a.rs", ToolClass::FileEdit),
+            Decision::Allow(DecisionReason::PersistedGrant)
+        );
+
+        // A managed-policy tool ban beats it.
+        let banned = PermissionLattice::new(PermissionMode::Default)
+            .with_grants(vec![granted.clone()])
+            .with_denied_tools([ToolPattern::parse("workspace_write").expect("pattern")]);
+        assert_eq!(
+            banned.evaluate("workspace_write", "a.rs", ToolClass::FileEdit),
+            Decision::Deny(DecisionReason::AdminToolDenied)
+        );
+
+        // So does a managed write-scope ceiling, for a path outside it.
+        let confined = PermissionLattice::new(PermissionMode::Default)
+            .with_grants(vec![granted])
+            .with_admin_write_scope("src");
+        assert_eq!(
+            confined.evaluate("workspace_write", "elsewhere/a.rs", ToolClass::FileEdit),
+            Decision::Deny(DecisionReason::AdminWriteScopeViolation)
+        );
+    }
+
+    #[test]
+    fn a_rendered_grants_document_parses_back_to_the_same_grants() {
+        // The writer and the reader must agree exactly: a document this
+        // build writes but its own loader rejects would make a grant vanish
+        // silently, which is the whole failure mode `Decision::
+        // PersistedGrant` exists to avoid.
+        let mut grants = PermissionGrants::default();
+        for raw in ["workspace_write", "shell_exec(git *)", "repo_read"] {
+            let pattern = ToolPattern::parse(raw).expect("pattern");
+            assert!(grants.allow("/proj/a", pattern).expect("allow"));
+        }
+        assert!(
+            grants
+                .allow("/proj/b", ToolPattern::parse("workspace_patch").expect("p"))
+                .expect("allow")
+        );
+        let text = render_grants(&grants).expect("render");
+        let parsed = parse_grants(&text).expect("the writer's own output must parse");
+        assert_eq!(parsed, grants);
+        assert_eq!(
+            parsed
+                .for_root("/proj/a")
+                .iter()
+                .map(ToolPattern::render)
+                .collect::<Vec<_>>(),
+            vec![
+                "repo_read".to_owned(),
+                "shell_exec(git *)".to_owned(),
+                "workspace_write".to_owned()
+            ]
+        );
+        assert_eq!(parsed.for_root("/proj/unknown"), Vec::new());
+    }
+
+    #[test]
+    fn granting_is_idempotent_and_revoking_drops_an_emptied_root() {
+        let mut grants = PermissionGrants::default();
+        let pattern = ToolPattern::parse("workspace_write").expect("pattern");
+        assert!(grants.allow("/proj", pattern.clone()).expect("first"));
+        assert!(
+            !grants.allow("/proj", pattern.clone()).expect("second"),
+            "granting an existing pattern must report no change, like `rapid trust grant`"
+        );
+        assert!(grants.revoke("/proj", &pattern));
+        assert!(!grants.revoke("/proj", &pattern), "revoking twice changes nothing");
+        // A root left with no grants is dropped rather than persisted as an
+        // empty record — visible in the rendered document, which is the only
+        // thing that actually reaches disk.
+        let rendered = render_grants(&grants).expect("render");
+        assert!(
+            !rendered.contains("/proj"),
+            "an emptied root must not be persisted: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_writer_enforces_the_same_bounds_the_reader_does() {
+        let mut grants = PermissionGrants::default();
+        for index in 0..MAX_GRANTS {
+            let pattern = ToolPattern::parse(&format!("tool_{index}")).expect("pattern");
+            assert!(grants.allow("/proj", pattern).expect("under the cap"));
+        }
+        let over = ToolPattern::parse("one_too_many").expect("pattern");
+        assert_eq!(
+            grants.allow("/proj", over),
+            Err(GrantsError::InvalidGrant),
+            "the reader silently truncates past MAX_GRANTS, so the writer must refuse"
+        );
+    }
+
+    #[test]
+    fn a_document_that_would_be_one_byte_over_once_written_is_refused() {
+        // Every writer appends a trailing newline, so the bound has to cover
+        // it. A document rendering to exactly `MAX_SETTINGS_BYTES` used to
+        // pass this check and land on disk one byte over the limit its own
+        // loader enforces — bricking the whole store, every other project's
+        // grants included, with no diagnostic.
+        //
+        // The boundary is found byte-exactly: bulk-fill to within a pattern's
+        // length of the limit, then grow one final pattern's name one
+        // character at a time, since each character adds exactly one byte to
+        // the rendered JSON. The largest accepted document is therefore
+        // *exactly* at whatever threshold this function enforces, which is
+        // what makes the off-by-one detectable at all.
+        // Small enough that the fill stops with less free space than one
+        // maximum-length pattern would consume, so the one-character growth
+        // below actually reaches the limit; large enough that appending to
+        // an *existing* root (no per-root JSON overhead) still fits.
+        let headroom = 64usize;
+        let mut grants = PermissionGrants::default();
+        // The root the variable-length pattern is appended to, created up
+        // front so growing it costs only the pattern's own bytes.
+        grants
+            .allow("/final", ToolPattern::parse("seed").expect("pattern"))
+            .expect("seed root");
+        let mut added = 0usize;
+        loop {
+            let mut candidate = grants.clone();
+            let pattern = ToolPattern::parse(&format!("bulk{added:06}")).expect("pattern");
+            // One pattern at a time, rotating roots as each fills, so the
+            // fill stops within a few bytes of the target rather than
+            // overshooting by a whole root.
+            candidate
+                .allow(&format!("/pad/{:06}", added / MAX_GRANTS), pattern)
+                .expect("capacity");
+            match render_grants(&candidate) {
+                Ok(text) if text.len() < MAX_SETTINGS_BYTES - headroom => {
+                    grants = candidate;
+                    added += 1;
+                }
+                _ => break,
+            }
+            assert!(added < 200_000, "the document never approached the limit");
+        }
+
+        // One character at a time: `accepted` ends up holding the largest
+        // document this function will accept.
+        let mut accepted = grants.clone();
+        let mut length = 1usize;
+        while length <= MAX_PATTERN_BYTES {
+            let mut candidate = grants.clone();
+            let pattern =
+                ToolPattern::parse(&format!("p{}", "x".repeat(length - 1))).expect("pattern");
+            candidate.allow("/final", pattern).expect("existing root");
+            match render_grants(&candidate) {
+                Ok(_) => {
+                    accepted = candidate;
+                    length += 1;
+                }
+                Err(GrantsError::TooLarge) => break,
+                Err(other) => panic!("unexpected render failure: {other:?}"),
+            }
+        }
+        assert!(
+            length > 1 && length <= MAX_PATTERN_BYTES,
+            "the fill did not bracket the limit (stopped at {length})"
+        );
+
+        // The invariant: anything this function accepts must still parse
+        // once the trailing newline every writer appends is on it.
+        let rendered = render_grants(&accepted).expect("accepted");
+        let mut written = rendered.into_bytes();
+        written.push(b'\n');
+        assert!(
+            written.len() <= MAX_SETTINGS_BYTES,
+            "an accepted document is {} bytes once written, over the {MAX_SETTINGS_BYTES}-byte \
+limit its own loader enforces",
+            written.len()
+        );
+        parse_grants(&String::from_utf8(written).expect("utf8"))
+            .expect("what the writer accepts must parse back");
+    }
+
+    #[test]
+    fn the_writer_refuses_to_exceed_the_project_record_bound() {
+        let mut grants = PermissionGrants::default();
+        let pattern = || ToolPattern::parse("workspace_write").expect("pattern");
+        for index in 0..MAX_GRANT_RECORDS {
+            assert!(grants.allow(&format!("/proj/{index}"), pattern()).expect("under"));
+        }
+        assert_eq!(
+            grants.allow("/one/too/many", pattern()),
+            Err(GrantsError::TooManyRecords),
+            "the reader rejects a document with too many project records, so the writer \
+must never produce one"
+        );
+        // An existing root is still writable at the bound.
+        assert!(
+            grants
+                .allow("/proj/0", ToolPattern::parse("repo_read").expect("pattern"))
+                .expect("existing root at the record bound")
+        );
+    }
+
+    #[test]
+    fn a_pattern_renders_back_to_exactly_what_parse_accepts() {
+        for raw in [
+            "workspace_write",
+            "shell_exec(git *)",
+            "repo_read(src/**)",
+            "tool-with-dash",
+        ] {
+            let parsed = ToolPattern::parse(raw).expect("parse");
+            assert_eq!(parsed.render(), raw);
+            assert_eq!(ToolPattern::parse(&parsed.render()), Some(parsed));
+        }
+    }
 
     #[test]
     fn mode_names_round_trip_exactly() {

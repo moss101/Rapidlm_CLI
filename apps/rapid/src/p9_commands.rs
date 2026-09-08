@@ -628,6 +628,29 @@ pub fn run_mcp(args: &[String]) -> Result<i32, P9CommandError> {
     }
 }
 
+/// `rapid permissions list|allow|revoke`: the persisted per-project grant
+/// store's only writer (`crate::permissions_cli`).
+///
+/// `PermissionLattice::evaluate`'s "persisted per-project grants suppress the
+/// ask" step was unreachable in production because nothing ever created a
+/// grant. Reachable only from this process's argv, like `rapid trust`.
+pub fn run_permissions(args: &[String]) -> Result<i32, P9CommandError> {
+    match crate::permissions_cli::run(
+        args,
+        &crate::permissions_cli::PermissionsEnv::from_process(),
+    ) {
+        Ok(outcome) => {
+            print!("{}", outcome.text);
+            Ok(outcome.exit)
+        }
+        Err(crate::permissions_cli::PermissionsUsageError(message)) => {
+            eprintln!("{message}");
+            eprint!("{}", crate::permissions_cli::PERMISSIONS_USAGE);
+            Err(P9CommandError::Usage)
+        }
+    }
+}
+
 /// `rapid doctor --help`.
 pub const DOCTOR_USAGE: &str = "\
 usage: rapid doctor

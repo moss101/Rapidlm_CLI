@@ -6503,6 +6503,148 @@ alternatives rather than hand-maintaining a second availability table (which wou
 this pass removed), and that synthesis is real work with its own failure modes: it was not attempted at
 the tail of this session rather than guessed at.
 
+**`rapid permissions list|allow|revoke`: the persisted grant store had a reader and no writer, done
+2026-09-08 immediately after the finding above. This is the piece every option in that open decision
+needs, so it was built rather than left waiting on the fork.**
+
+**The finding.** `PermissionLattice::evaluate`'s step 3 — "persisted per-project grants suppress the ask",
+returning `Decision::PersistedGrant` — is implemented, bounded and unit-tested, and was **unreachable in
+production**. `parse_grants` is a reader; nothing anywhere wrote `project-permissions.json`. So the one
+mechanism that can pre-approve a *specific* tool for a *specific* project, without widening the permission
+mode for everything, could never be used. Combined with the entry above (`Default` mode asks, nothing can
+prompt, so `ExecTools` denies), that left a user with no narrow way to make a fresh project usable at
+all — only the blunt instruments of `RAPIDLM_PERMISSION_MODE` or a hand-written settings rule.
+
+**Why this is not blocked on the open decision.** All three options in that fork (blocking prompt, durable
+suspend/resume, deny-and-grant) need a durable grant store with a writer; option C *is* this plus a
+prompt. Building it now is not thrown away by any choice made later.
+
+**Implementation.** The writer lives beside the reader in `permissions.rs` — `ToolPattern::render` (the
+exact inverse of `parse`, so no writer re-derives the `Tool` / `Tool(glob)` syntax),
+`PermissionGrants::{roots, allow, revoke}`, and `render_grants` (the inverse of `parse_grants`, and the
+only serializer of that format). `apps/rapid/src/permissions_cli.rs` is the command; `p9_commands`
+gets a thin `run_permissions`; the `SUBCOMMANDS` table, `CLI_USAGE` and the reference doc gain an entry
+(the doc tripwire from the previous commit caught the omission before I did). The `/permissions`
+unrouted-inspector message now names `rapid permissions list` instead of only pointing at settings files
+and an environment variable.
+
+`exec_permission_lattice`'s grant-loading block was extracted into
+`interactive::persisted_grants_for(root, home)`. Not a refactor for its own sake: the lattice builder
+resolves the home from the process environment via `exec_user_home`, and a test cannot redirect that
+without `set_var`, which `#![forbid(unsafe_code)]` rules out — so the security-relevant half was
+unreachable from a hermetic test. Everything that matters is in the extracted function; the caller only
+supplies the home. It keeps the original's fail-closed behavior exactly: an absent, unreadable or corrupt
+store yields *no* grants, never "grant everything".
+
+**Boundaries, each asserted rather than asserted-in-prose.** A grant can only narrow the gap between
+"ask" and "allow": `a_grant_can_never_widen_past_an_admin_ceiling` drives the real lattice and proves a
+managed-policy tool ban (`AdminToolDenied`) and a managed write-scope ceiling
+(`AdminWriteScopeViolation`) both still win, because `evaluate` checks them at steps -1 and -0.5, before
+grants at step 3. Writing a grant is a privilege escalation, so the command is argv-only, the same
+argument `run_trust_command` rests on. A grant in an untrusted project is recorded but changes nothing
+(every tool call is refused before the lattice is consulted), and the command says so. The store is
+created `0600` — it names exactly what may run unasked — and an existing mode is preserved. A store that
+does not parse is **refused, never overwritten**: the run-time reader treats an unparsable store as "no
+grants", which is correct fail-closed behavior *there*, but a writer with the same leniency would destroy
+every other project's grants in order to record one.
+
+**Tests: 15 in-crate (5 new in `permissions.rs`, 10 in `permissions_cli.rs`) and 6 end-to-end against the
+compiled binary.** The load-bearing one is
+`a_granted_tool_actually_becomes_allowed_in_the_default_mode`: it drives the exact chain
+`build_interactive_turn_context` builds — `persisted_grants_for` then
+`ExecTools::workspace_with_permissions` — asserts the write is *denied* first, grants it through the real
+command, and asserts the same call then succeeds *and the file is actually written*. That is the whole
+point of the feature in one test, and it is the mirror image of the characterization test in the entry
+above.
+
+**Revert-cycle verification, ten cycles (44-53), five for the feature and five for the review fixes below.** The grant never reaching the lattice reproduced the
+exact denial text from the entry above; an unparsable store being overwritten failed the
+leave-it-alone assertion; dropping other projects' records on write failed the multi-project test;
+keying the store by the raw cwd instead of the canonical root failed both the symlink test and the
+effectiveness test. **One cycle (45) passed under deliberately broken code and is worth recording:**
+`a_grant_is_recorded_under_the_key_a_real_run_looks_up` could not fail, because `resolve_project_root`
+already canonicalizes before the command sees the path, so the canonicalization it claimed to test was
+structurally guaranteed upstream — a vacuous test of a defensive line. It was replaced with
+`a_grant_made_through_a_symlinked_path_is_still_found_by_a_real_run`, which drives the command through a
+symlinked working directory so the two spellings genuinely differ; cycle 48 (writer keys by the raw cwd)
+then failed it as predicted. The defensive `canonicalize` in `resolve` is kept and now documented as
+belt-and-braces rather than a fix for a reachable bug.
+
+**Self-review found six confirmed defects, two of them data-losing, and all six were in the *new* code.
+Every one is fixed and covered.**
+
+1. **No cross-process lock on the store's read-modify-write.** `load` -> mutate -> `save` with nothing
+   between them. Reproduced against the compiled binary: 24 concurrent `rapid permissions allow`, one per
+   project, all exited 0 and printed `allow=workspace_write` — **2 of 24 records survived**. Worse, a
+   `revoke` racing an `allow` printed `revoke=`, exited 0, and left the grant in the store in **10 of 10**
+   rounds: telling a user a dangerous grant is gone when it is not. Fixed with `GrantsLock`, the same
+   sibling-`.lock` shape `kernel::project::trust::TrustLock` and `GoalHost`'s `GoalLock` already use, held
+   across the whole sequence. `concurrent_writers_do_not_lose_each_other_s_grants` runs 12 real threads;
+   the revert cycle failed it on all three attempts.
+2. **`save` appended the trailing newline *after* `render_grants`'s size check**, so a document rendering
+   to exactly `MAX_SETTINGS_BYTES` was written one byte over the limit its own loader enforces —
+   permanently unreadable, at which point `persisted_grants_for` fails closed and **every** project's
+   grants vanish with no message, and the command then refuses to touch the file so the user cannot even
+   revoke. Root-caused in `render_grants` (`text.len() + 1 > MAX`) rather than patched at the call site.
+   The test finds the boundary *byte-exactly* — bulk-fill to within 64 bytes, then grow one pattern's name
+   one character at a time, since each character is exactly one rendered byte — which is what makes an
+   off-by-one detectable at all; the revert cycle reports "an accepted document is 65537 bytes once
+   written".
+3. **`OpenOptions::mode()` is masked by the process umask**, so the "existing mode is preserved" claim was
+   false under `umask 077` and the test's result depended on who ran it. The mode is now applied again
+   after the rename, so it is exact.
+4. **`store_mode` followed symlinks and never clamped.** An existing `0o666` store — or a symlink pointing
+   at one — produced a `0o644` store and was never re-tightened, for a file that enumerates exactly which
+   tools run without being asked. Now `symlink_metadata` and `& 0o600`: never wider than owner-only, and a
+   *narrower* mode the user chose is still kept. The claim in the help, module doc and reference doc was
+   corrected from "keeps its mode" to "never wider than owner-only".
+5. **The denial a user actually hits did not name the command that fixes it.** `ModeAsk`/`AskRule` named
+   only the settings file and the environment variable, so the user who hits the exact denial this feature
+   exists to fix was never told it shipped. Both now name `rapid permissions allow <tool>`. The e2e test
+   that claimed to check this only asserted the command's own help mentioned itself — it could not fail;
+   it now reads the real `explanation()` strings.
+6. **Per-pattern `allow=` lines were printed before the store write**, so a failed save reported grants
+   that do not exist. Now accumulated and emitted only after a successful write.
+
+**Also acted on from the review's lower-confidence list:** `PERMISSIONS_USAGE` and the reference doc
+overstated the write-scope ceiling — both write-scope checks in `evaluate` are gated on
+`class == ToolClass::FileEdit`, so a ceiling never constrained `shell_exec` at all, with or without a
+grant; the claim is now precise. Home/project resolution failures exited 2 with the full pattern-syntax
+help; they are environment failures and now exit 1 with a plain message. `MAX_GRANT_RECORDS` gained the
+bound test it lacked. `PermissionGrants::roots()` was new public API used only by a test and is gone; the
+"emptied root is dropped" property is asserted against the rendered document, which is what reaches disk.
+The module doc's "argv-only" claim keeps its precedent framing but the review's caveat is recorded here:
+`shell_exec`, where allowed, can run `rapid permissions` like any other command — the same property
+`rapid trust grant` has, not a regression.
+
+**Deliberately not changed, with reasons.** A warning for a pattern naming a tool this build does not
+provide would need a list of advertised tool names; there is no single one (the set lives in three
+separate `match` arms in `exec_tools.rs`), so adding a fourth to check against would be exactly the
+drifting list this session keeps deleting. The help and reference doc say instead that such a pattern is
+recorded as intent and never matches, and point at `rapid tools`. A hand-edited store with the same root
+twice is normalized last-wins by `parse_grants`, so a `revoke` can drop the shadowed record's grants —
+only reachable by hand-editing, and the run-time reader already collapses duplicates identically, so the
+effective permission set is unchanged. A `rapid doctor` row reporting this project's grants stays deferred
+(it would have to read through `persisted_grants_for` rather than re-deriving the store path).
+
+**Two revert cycles initially passed under deliberately broken code and had to be redone** — the whole
+point of running them. The failed-write test put a directory where the store belongs, which makes *load*
+fail and return before the loop is ever reached; it now performs one successful run first so the store and
+lock file exist, then makes the home read-only, so the lock acquires, the load succeeds, and only the
+write fails. And the size-boundary test's original growth loop could not land on the exact byte, so it was
+rewritten to grow one character at a time.
+
+**Verification:** `cargo test -p rapid --lib` 635 passed; `--test permissions_cli` 6; `mcp_cli` 14,
+`doctor_cli` 17, `trust_cli` 12, `exec_diagnosability` 11 unchanged; `cargo clippy -p rapid
+--all-targets` 54 warnings, below the 56 baseline, none in a new file; full `cargo test --workspace`
+green. Ten revert cycles (44-53).
+
+**Deliberately not attempted:** the approval prompt itself (that is the open decision above); a `rapid
+doctor` row reporting this project's grants (worth adding, and it would have to read through
+`persisted_grants_for` rather than re-deriving the store path); grant expiry or session-scoped grants
+(`ApprovalScopeId::SessionExact` exists in `capability-broker` and has no persistence story here); and
+any TUI surface for granting, which is approval-gated for the same reason `/mcp remove` is.
+
 ## OPEN DECISION — the interactive TUI cannot ask for approval, so out of the box it can only read
 
 **Found 2026-09-08 while scoping the missing approval broker. This is the largest gap found in this
