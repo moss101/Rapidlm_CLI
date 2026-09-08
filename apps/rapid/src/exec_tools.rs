@@ -4499,7 +4499,7 @@ fn truncate_str(text: &str, cap: usize) -> String {
 /// `JobRegistry::start_sandboxed` (via `SeatbeltBackend`, which does its own
 /// internal profile generation/writing) or falls back to the synchronous
 /// non-macOS `sandbox_exec::run_sandboxed` path.
-fn find_sandbox_exec() -> Option<PathBuf> {
+pub(crate) fn find_sandbox_exec() -> Option<PathBuf> {
     let mut path = PathBuf::from("/usr/bin/sandbox-exec");
     if path.exists() {
         return Some(path);

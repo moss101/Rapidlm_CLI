@@ -3887,7 +3887,11 @@ tested `doctor_exit_code` helper (`Pass` → 0, everything else → 1, mirroring
 {0} else {1})` pattern already used for `run_agent_cli`'s own outcome in the same file). New test
 `doctor_exit_code_is_nonzero_for_every_non_pass_status`: asserts all five `DoctorStatus` variants map
 correctly without needing to force a real host-level doctor failure. Verified via the revert cycle. Full
-`-p rapid --lib` suite and `cargo build --workspace --tests` pass.
+`-p rapid --lib` suite and `cargo build --workspace --tests` pass. *(Superseded 2026-09-08 by the
+`rapid doctor` P0 — see that entry near the end of §0a. `doctor_exit_code` and its unit test are gone;
+`run_doctor` now aggregates `crate::doctor::DoctorReport::exit_code`, which fails only on a `Fail` row so
+that an absent optional integration no longer exits non-zero. The exit-code contract this entry
+established is preserved and end-to-end tested against the real binary.)*
 
 **Found, verified by grepping every one of the crate's exported gate/engine symbols against the entire
 workspace, and left unfixed given the scope: four of the crate's eight modules — `gate.rs`, `redaction.rs`,
@@ -5738,6 +5742,369 @@ production (architectural decision, documented above); modifying `crates/agent-r
 a deliberately safer design than trusting the model to remember to call a tool); a general agent-runtime
 redesign; retrieval/RAG changes; knowledge-store implementation; broad MCP/plugin trust wiring; playbook
 redesign; computer-use integration; provider pricing redesign; goal persistence redesign.
+
+**`rapid doctor` made a real diagnosis, done 2026-09-08, user-directed P0.** The command existed, was
+advertised in `CLI_USAGE`/`RAPID_SUBCOMMANDS`/`docs/reference/cli-command-reference.md`, and returned a
+plausible-looking five-row report — but told a user nothing about whether Rapid could actually run.
+
+**Previous stub behavior, confirmed by running the compiled binary before touching anything:**
+`p9_commands::run_doctor` ignored its arguments entirely, constructed `security::DoctorRequest::default()`
+— i.e. *no* sandbox manager, *no* keychain, *no* project observation, *no* policy document, *no* release
+material — and passed it to `security::evaluate_doctor`. Every one of the five security checks therefore
+took its "observation not provided" arm and reported `Unavailable`, and the command printed exactly this
+on any machine, in any project, in any configuration:
+
+```
+sandbox_availability Unavailable
+policy_parse Unavailable
+credential_store Unavailable
+dangerous_project_config Unavailable
+release_signature Unavailable
+exit=1
+```
+
+Nothing about configuration, model resolution, credentials, context budget, project detection, project
+trust, git, scanners, hooks, MCP, plugins, or filesystem state was checked at all — and the constant
+non-zero exit meant a CI gate could not distinguish "broken" from "doctor is a stub". `crates/security/
+src/doctor.rs` itself (1,926 lines, well-bounded, secret-safe, thoroughly tested) was never the problem:
+it is a real engine that was simply never fed a real observation. This task feeds it real observations
+and adds the operational half around it, rather than rewriting or duplicating it.
+
+**Architecture: one interpretation of "healthy", not two.** The rule driving every decision below was
+*reuse the code production execution depends on*. New module `apps/rapid/src/doctor.rs` produces a
+structured `DoctorReport` (rendering is a separate step — no check writes to stdout itself), and every
+check calls an existing production path:
+
+| Concern | Reused production code |
+|---|---|
+| config location/parse | `user_config::resolve_config_source` + `load_config` |
+| model resolution | `interactive::resolve_model_plan` (extracted from `exec_turn`) |
+| provider construction | `interactive::build_backing_model` → `ConfiguredModel::build` |
+| credential precedence | the `ResolvedCredential` the plan already carries (`resolve_credential`) |
+| context budget | `interactive::context_budget_for` + new `context_budget_source` |
+| RapidLM home | `interactive::user_home_from` (new; `exec_user_home` now delegates to it) |
+| project root | `interactive::canonicalize_dir` → `detect_project_root` |
+| project trust | `kernel::ProjectTrustStore::get` |
+| project integrations | `interactive::load_project_integrations` |
+| scanners | `external_scan::load_scanners_config` |
+| executable resolution | `sandbox_exec::resolve_program` |
+| sandbox backend choice | `exec_tools::find_sandbox_exec` + `sandbox_exec::build_manager{,_seatbelt}` |
+| sandbox execution | `sandbox_exec::run_sandboxed_with` (new split of `run_sandboxed`) |
+| security posture | `security::evaluate_doctor`, fed real observations |
+| redaction | `security::SecretRedactionRegistry` |
+
+`apps/rapid/src/doctor.rs` contains **zero** TOML parsing, zero endpoint parsing, zero context-window or
+output-reserve constants, and zero `println!`/`eprintln!` — verified by direct grep during self-review.
+
+**The one genuine refactor this needed, and why it was worth the risk.** `exec_turn`'s layered model
+selection was ~160 inline lines with early `return`s, interleaved `eprintln!` warnings, and a
+`credential_stores`-borrow ordering constraint. Doctor could not call it, and re-implementing the same
+precedence rules (env override > user config > typed fallback, then `[models] fallback` resolved against
+the same config and gated by the same managed policy) is exactly the "second interpretation of healthy"
+this task forbids. So the block was extracted verbatim into `resolve_model_plan` (resolution, as plain
+data) and `build_backing_model` (construction, borrowing an already-final store slice), plus
+`context_budget_source` for the `--verbose` provenance phrase. Two design choices kept `rapid exec`
+byte-identical rather than merely equivalent: the extracted functions take a `&mut dyn FnMut(&str)`
+warning sink (exec passes a closure that `eprintln!`s the moment each line is produced, so stderr
+ordering cannot drift; doctor passes a collector), and `ModelPlanError`/`BackingModelError`'s `Display`
+reproduces the exact stderr strings the inline code printed for each case ("model configuration error:
+…", "managed policy error: …", "model configuration error: primary model failed to configure").
+
+**Final check inventory — 21 rows, fixed order, always the same set.** `environment`, `home`, `config`,
+`model`, `credentials`, `context-budget`, `project`, `project-trust`, `trust-store`, `workspace-tools`,
+`sandbox`, `sandbox-probe`, `git`, `scanner`, `hooks`, `mcp`, `plugins`, `credential-store`,
+`project-config-exposure`, `security-policy`, `release-signature`. An early draft emitted a conditional
+`config-notes` row when the model resolution produced warnings; that made the row *set* environment-
+dependent, so the notes are folded into the `model` row instead and the set is now invariant (asserted
+end-to-end by `the_rows_render_in_a_stable_order_across_runs`). Ordering is a literal sequence of
+`checks.push` calls — no map iteration, no async completion order.
+
+**Mandatory vs optional classification.** The `Fail`/`Warn` split is decided by exactly one question:
+*is this required for core behavior?*
+
+- **Fail (mandatory):** unresolvable RapidLM home; malformed config; an explicitly named `RAPIDLM_CONFIG`
+  that does not exist; a model that cannot resolve or cannot be constructed; an unresolvable working
+  directory; an unreadable/corrupt project-trust catalog (fails closed — never silently "untrusted, all
+  fine"); a context budget whose output reserve leaves zero input room; a malformed capability-policy
+  document.
+- **Warn (optional/degraded):** untrusted project, and therefore disabled workspace tools and
+  unregistered MCP servers; no sandbox backend, or only weak isolation; a failed sandbox smoke probe;
+  missing git; a configured scanner or hook whose executable is absent; an unavailable platform keychain;
+  project-controlled executable config present.
+- **Skipped:** outside a project; an integration with nothing configured; a dependent check whose
+  prerequisite (config, model) was unavailable.
+
+**Two classification judgements worth recording, because both look wrong at a glance.** (1) The security
+engine grades `dangerous_project_config` as `Fail` when an *untrusted* project carries executable config
+— correct from a pure security-posture stance, but from `rapid doctor`'s stance that is the trust
+boundary working as designed and Rapid runs fine, so the app-level status never exceeds `Warn`. The
+engine's own verdict is printed verbatim in the detail (`security status=fail (…)`) so the softening
+hides nothing; a dedicated unit test asserts both halves. (2) `credential_store` (the platform keychain)
+is `Warn`, not `Fail`, because provider credentials never come from the keychain — `resolve_credential`'s
+precedence is inline `api_key` → first set non-empty `env_key` → keyless — so an unavailable keychain
+removes durable secure storage without stopping a single turn.
+
+**Exit semantics.** `0` unless at least one check is `Fail`; warnings and skips never fail the command.
+The repository had no prior numeric convention to honour here (the stub returned `1` for *any* non-pass,
+which is why it always exited `1`), so this follows the recommended default. An absent optional
+integration must not break a CI gate that only asks "can Rapid run?".
+
+**Network policy: offline, with no opt-in added.** No check contacts a provider or makes a billable
+model call. The investigation looked for an existing `--network`/`--live`/`--check-provider` convention
+to hang a live probe on; there is none anywhere in the CLI, so none was invented. Provider validation is
+genuinely load-bearing but entirely local — `ConfiguredModel::build` parses the endpoint, pins
+capabilities, and seeds the credential into a process-local `InMemoryCredentialStore` — and the model row
+says `connectivity not tested` rather than implying the endpoint was reached. This is enforced by a test,
+not just by intent: `the_default_command_makes_no_network_request_to_the_configured_provider` points a
+configured provider at a loopback listener that counts connections and asserts the count stays zero.
+
+**Structured output: deliberately not added.** The workspace has `--jsonl` on `rapid exec` and `--format`
+on `rapid inspect-export`, but no `--json` convention for diagnostics, and the task's own guidance is not
+to expand scope without one. The core result *is* structured data (`DoctorReport`/`DoctorCheck` with
+accessors) and rendering is a separate `render()` step, so adding `--json` later is a renderer, not a
+rewrite. `rapid doctor --json` is rejected as an unknown option rather than silently ignored.
+
+**Configuration behavior.** An absent config at the *default* path is a `Warn`, not a `Fail`: Rapid
+supports and documents starting with no model configured, and the report says so truthfully with a real
+remediation. An absent config at a path the user *explicitly* named via `RAPIDLM_CONFIG` is a `Fail` —
+they pointed at something that is not there. A malformed config is a `Fail` naming the real path and the
+typed parse error. Unknown config keys are a `Warn` with the count.
+
+**Model-resolution behavior.** The `model` row names the resolved provider, model id, profile id, and
+base URL, plus the full fallback chain (`small -> large`) when one is configured — all from the real
+resolution, including any managed-policy gating. A fallback entry that fails to configure degrades to a
+`Warn` naming it (exactly as `exec_turn` warns and continues), rather than failing the command.
+
+**Context-budget diagnostic.** Reports `context_window`, `output_reserve`, the derived `input_budget`,
+and the provenance phrase, every number coming from `context_budget_for`/`context_budget_source` with no
+independent arithmetic. This doubles as a standing end-to-end regression for the recently fixed
+crossed-fallback safety rule, reachable outside a turn for the first time: a dedicated fixture configures
+backend A at `context_window = 100000, max_tokens = 4096` and backend B at `400000/16384`, and asserts
+doctor reports `100000`/`16384`/`83616` — the *minimum* context limit paired with the *maximum* output
+reserve. The unsafe min/min pairing yields `100000`/`4096` and fails the test (revert-cycle verified).
+
+**Trust diagnostic.** Read through `ProjectTrustStore::get` — the same call every turn makes, resolved
+against the same `canonicalize_dir` → `detect_project_root` → `ProjectIdentity` chain, so doctor can
+never report a different identity than the checks that gate real operations. Untrusted is a `Warn` whose
+remediation names the command that actually exists today (`rapid trust grant`, verified against
+`run_trust_command`, not an invented or stale instruction). `trust-store` separately reports catalog
+readability/parse state, with an absent catalog reported as the ordinary empty-untrusted state rather
+than a fault. Doctor never grants, revokes, prompts for, or auto-fixes trust; an end-to-end test runs
+doctor twice against a fresh isolated home and asserts the catalog never acquires a trusted record.
+
+**Sandbox behavior.** Availability comes from `security::evaluate_doctor` fed the real `SandboxManager`
+— whichever backend this platform's `shell_exec --sandbox` would actually select (`SeatbeltBackend` on
+macOS with `sandbox-exec` present, `HostRestrictedBackend` otherwise), so the row describes the
+production path, not an arbitrary tier. On top of that, `sandbox-probe` is a **real execution**: `echo`
+through `sandbox_exec::run_sandboxed_with`, the identical spec/lease/validator/destroy ceremony
+`run_sandboxed` uses, with the network denied, in a freshly created scratch directory that is removed
+immediately (never the project — the probe mounts its root read-write, so pointing it at anything real
+would be exactly wrong). `run_sandboxed` was split into itself plus `run_sandboxed_with(manager, …)` for
+this; no execution logic was duplicated. A failing probe is a `Warn`, never a command failure.
+
+**Git and scanner behavior.** `git --version` decides availability; missing git is a `Warn` (commit/merge
+gating and `.git` project detection degrade, no turn breaks), and whether the directory is a repository
+is reported as information, not as a verdict. Scanners come from `external_scan::load_scanners_config`;
+a configured scanner whose executable does not resolve is a `Warn` naming it, because the only thing it
+gates is optional commit/merge automation. **No scanner is ever executed** — doctor checks resolvability
+via `sandbox_exec::resolve_program` only.
+
+**Hooks, MCP, plugins — reported honestly, never exercised.** Hooks are counted per stage from the real
+merged `load_project_integrations` and their commands checked for existence; **no hook is executed**,
+because running arbitrary project-controlled commands as a side effect of a diagnosis is exactly the
+surprise this command must not create. MCP servers are reported as configured, and — truthfully —
+as *not registered* while the project is untrusted, which is the real current behavior; nothing claims a
+handshake was performed or that MCP integration is complete. Plugins are read from the project's own
+`ExtensionTrustStore` catalog (record count, how many have executable code enabled); nothing is
+installed, updated, approved, or executed. Absent configuration for any of the three is `Skipped`, never
+a failure.
+
+**`security-policy` and `release-signature` are `Skipped`, and that is the truthful answer.** This build
+ships no user-authored capability-policy document (the only policy stacks that exist are fixed
+in-process constants minted per call site in `sandbox_exec::mint_proc_exec_lease` and
+`p9_commands::agent_cli_policy`) and no locally verifiable signed release manifest (`run_release_manifest`
+*generates* manifests on demand; it verifies nothing at rest). Fabricating an observation to make either
+row "pass" was explicitly rejected; reporting them as `Unavailable`-and-therefore-failing, as the stub
+did, was equally wrong.
+
+**Secret redaction.** Every rendered detail and remediation string goes through
+`security::SecretRedactionRegistry` — the same primitive the live turn path already uses to scrub
+captured `shell_exec` output — seeded with every credential the resolved model configuration actually
+produced. A redaction *failure* replaces the row's text rather than letting raw text through. Credential
+rows report only the source production selected (inline `api_key`, a named `env_key`, or keyless), never
+a value. The end-to-end test configures a key that appears both as `api_key` **and** embedded in the
+`base_url` userinfo, forces the provider-construction path to error (the one place a config value most
+plausibly reaches an error string), and asserts the literal appears on neither stdout nor stderr while
+the failure itself is still reported.
+
+**Files changed:** NEW `apps/rapid/src/doctor.rs` (the engine, status model, renderer, 26 unit tests);
+NEW `apps/rapid/tests/doctor_cli.rs` (13 end-to-end tests against the real compiled binary);
+`apps/rapid/src/interactive.rs` (extraction of `context_budget_source`/`resolve_model_plan`/
+`build_backing_model`, new `user_home_from`, `exec_turn` rewired onto them, `CLI_USAGE` doctor line,
+`pub(crate)` widening); `apps/rapid/src/p9_commands.rs` (stub removed, `run_doctor` rewired, new
+`DOCTOR_USAGE`, subcommand description corrected, stale `doctor_exit_code` test replaced);
+`apps/rapid/src/sandbox_exec.rs` (`run_sandboxed_with` split out, plus a
+prepare-ordering fix closing a sandbox-handle leak); `apps/rapid/src/exec_tools.rs`
+(`find_sandbox_exec` widened); `apps/rapid/src/lib.rs` (module registration);
+`docs/reference/cli-command-reference.md` (truthful row + a full doctor section).
+
+**Tests added: 45 — 26 unit in `doctor.rs` plus 2 in `p9_commands.rs` (`-p rapid --lib`: 550 total, up
+from 516; one stale `doctor_exit_code` test was removed) plus 17 end-to-end in
+`apps/rapid/tests/doctor_cli.rs`.** Unit coverage: exit-code aggregation (pass/warn/skip vs fail),
+failure/warning counting, insertion-order rendering, byte-identical repeated renders, char-boundary-safe
+detail truncation, redaction of a leaked credential in both detail and remediation, redaction no-op when
+no credential resolved, the writability probe leaving nothing behind and failing on a missing directory,
+untrusted/trusted/corrupt/outside-a-project trust classification, absent-vs-explicitly-named missing
+config, malformed config naming the real path, missing home, the context-budget row matching
+`context_budget_for` exactly, the security `Fail`→`Warn` softening still printing the engine verdict,
+absent policy/release material skipping rather than failing, an unavailable keychain warning, an
+unavailable sandbox backend warning, the smoke probe running the platform's real backend and leaving
+no scratch directory, the probe's disabled path skipping, a `base_url`-only credential being treated as a
+secret, a secret long enough to be truncated still being scrubbed, and control characters in a detail not
+being able to forge report rows. End-to-end coverage: healthy configuration reporting all 21 rows, stable
+row order across runs, broken model configuration exiting non-zero without cascading, malformed config
+naming its path, a `RAPIDLM_CONFIG` pointing at a missing file failing with the right wording, an unknown
+config key warning only on the `config` row, untrusted project reporting fully and not mutating trust,
+trusted project (granted through the real `rapid trust grant`), outside-a-project skipping cleanly,
+unconfigured model still reporting a real budget, the crossed fallback chain, secret non-leakage from both
+`api_key` and `base_url`, the no-network tripwire, `--help` running no checks, configured
+hooks/scanners/MCP being reported without a hook ever executing, and the sandbox probe leaving the project
+untouched.
+
+**Revert-cycle verification, seven cycles, each a literal break-and-restore against the real binary:**
+(1) *stub regression* — restored the old `DoctorRequest::default()` stub; **12 of 13** end-to-end tests
+failed (only `--help` survived); restored, all pass. (2) *model resolver disconnected* — replaced the
+`resolve_model_plan` call with a doctor-local constant plan; **7** failed, including the healthy-config,
+broken-model, crossed-chain, and secret tests; restored. (3a) *context budget hardcoded* — pinned
+`(8192, 256)` in the budget row; **3** failed including the crossed-chain test; (3b) *wrong fallback
+arithmetic* — independently derived min-context/**min**-output instead of min-context/max-output; the
+crossed-chain test failed on exactly the unsafe pairing; restored. (4) *trust lookup replaced by a
+constant* — hardcoded `Trusted`; the untrusted-project test failed; restored. (5) *always exit 0* — the
+broken-model, malformed-config, and secret tests failed end-to-end, plus 2 unit tests; restored.
+(6) *redaction removed* (plus a synthetic unredacted credential in the model error) — the secret test
+failed at both levels; restored. (7) *accidental connectivity probe* — added a `TcpStream::connect` to
+the configured provider inside the model check; the no-network tripwire test failed with its own message;
+restored. Four more cycles ran against the self-review fixes: (8) *`base_url` userinfo not registered as a
+secret* — the keyless URL-only e2e test failed with "the URL credential leaked to stdout"; (9) *bounding
+moved back before redaction* — the truncated-secret test failed; (10) *control-character sanitization
+removed* — the row-forgery test failed; (11) *benign notes folded back into the model row* — the
+unknown-config-key test failed. All restored; `grep -rn "REVERT CYCLE" apps/ crates/ docs/` returns
+nothing. Only the deterministic tests are kept permanently.
+
+**Self-review findings, all fixed before commit.** The post-implementation adversarial review (a background
+agent given the diff plus the six focus areas the driving instruction names) confirmed the `exec_turn`
+extraction is behaviorally identical — stderr lines and order, error strings, all four early-return exit
+codes, `child_model_config` still the pre-reminder-floor primary, `base_url`, `policy_version` threading,
+`StepDiag` still `--verbose`-only, credential stores still built before any borrow — and found no network
+I/O and no state mutation. It also found seven real defects, two of them serious. Every one is fixed and
+covered by a test.
+
+**1 (the serious one): truncation ran *before* redaction, so a long secret escaped in the clear.**
+`DoctorCheck::new` applied the 512-byte `bounded()` cap at row construction, while `redact` ran once at the
+end. A secret straddling the cut was split, the registry's full-length needle no longer matched, and the
+surviving prefix printed verbatim — reproduced against the real binary with a ~610-byte `base_url`
+password, `grep -c LEAKMARKER` → 1, *with* the userinfo fix already in place. Fixed by storing detail and
+remediation raw and moving bounding into a new `finalize` step that runs **after** scrubbing. Regression
+test `a_secret_long_enough_to_be_truncated_is_still_scrubbed`; revert-cycle verified.
+
+**2 (the other serious one): a `base_url` credential on a *keyless* entry was never registered for
+redaction at all.** `ModelConfigError::BaseUrl` quotes the raw URL, and the endpoint validator always
+rejects userinfo, so `http://user:pw@host` reliably lands in that error string — with no `api_key` and no
+`env_key`, `secrets` was empty and `redact` returned early. Worse, the original secret test could not have
+caught it: it used the *same* literal as both `api_key` and userinfo password, so the api_key canary masked
+the bug — a textbook vacuous assertion. Fixed with `base_url_userinfo_secrets`, which registers the userinfo
+and its password half for every model entry. New unit test plus a keyless, URL-only e2e test
+(`a_credential_embedded_only_in_the_base_url_is_also_never_printed`); revert-cycle verified.
+
+**3: an external program could forge report rows.** `render` writes a detail straight into a
+`STATUS  id  detail` line and nothing stripped control characters, while `check_git` feeds it a subprocess's
+stdout verbatim. A `git` shim earlier on `$PATH` (an ordinary direnv/devcontainer/repo-`bin` situation)
+printing `git version 9.9.9\nPASS  model  everything is perfectly fine` produced a fabricated `PASS model`
+row above the summary. Fixed: `bounded` now maps every control character to a space, so a detail can only
+ever occupy the line it was given. Test `a_detail_carrying_newlines_cannot_forge_extra_report_rows`;
+revert-cycle verified.
+
+**4: `git --version` was the one unbounded check.** `Command::output()` blocks to EOF with no deadline and
+buffers the whole stream — a `$PATH` shim that never exits hung `rapid doctor` forever, one that streamed
+exhausted it. Replaced with `git_version()`: piped stdout, a reader thread capped at 4 KiB (dropping the
+pipe kills a chatty child), and a 5-second deadline loop that kills a silent one (which releases the
+reader).
+
+**5: the platform keychain probe could block on Linux.** `secret-tool lookup --unlock` can wait on a
+keyring unlock prompt, so a headless CI box would hang. The probe now runs on a worker thread behind a
+5-second deadline (`probe_keychain`), reporting unavailable — a warning, never a failure — on timeout.
+
+**6: a benign config warning misclassified the model row.** All resolution notes were folded into the
+model row's status decision, so a single unknown config key downgraded a perfectly resolved model from
+`PASS` to `WARN` and printed "fix or remove the fallback entries named above" for a config with no fallback
+chain at all — while the `config` row already reported the same key with the correct remediation. Fixed by
+filtering `unknown config key` notes out of the model row (fallback and managed-gate notes still count) and
+rewording the remediation. Test
+`an_unknown_config_key_warns_only_on_the_config_row_and_leaves_the_model_passing`; revert-cycle verified.
+
+**7: `check_config`'s explicit-missing arm was unreachable, and the live path read badly.**
+`load_config` returns `Err(ExplicitConfigMissing)` — never `Ok(None)` — for a `RAPIDLM_CONFIG` pointing at
+nothing, so the guarded `Ok(None)` arm was dead and the real path produced "…is invalid: RAPIDLM_CONFIG
+points at a missing config file: …" (a missing file called invalid, the path twice, remediation about
+parsing). The unit test covering it asserted an unreachable state and passed vacuously. Fixed by matching
+the actual error variant with a clean message, deleting the dead arm and its now-unused `explicit`
+parameter, and adding a real e2e test.
+
+**Smaller fixes from the same pass:** the redaction seed grew two deliberate length floors, because
+scrubbing is exact-substring replacement over the whole rendered report and an over-eager canary destroys
+the diagnosis it is protecting — a bare `http://user@host` userinfo is only treated as a token at 8+
+characters (otherwise `user` would be blanked out of every unrelated row), and a password under 4
+characters is covered only through the full `user:password` form, which contains a colon and so cannot
+collide with prose; `rapid doctor` now rejects *any* argument rather than only unknown flags, so
+`rapid doctor --json` or `rapid doctor sandbox` cannot look like it did something;
+`MAX_REDACTION_CANARIES` was 16 on a stated rationale that did not
+hold (`security::MAX_REGISTERED_SECRETS` is 1024, and 8 models × 3 values = 24 is reachable) — raised to
+128, and `finalize` now applies a literal backstop replacement for *every* secret so a single failed
+canary registration can no longer leak one value silently; `probe_dir` removed its scratch directory when
+`canonicalize` failed instead of leaking it; `run_sandboxed_with` now builds the exec request *before*
+`prepare`, closing a sandbox-handle leak on the `?` paths between prepare and destroy (pre-existing in
+`run_sandboxed`, newly reachable through doctor); `load_project_integrations` is read once and shared
+between the security engine's surface observation and the hooks/MCP rows, so they can no longer describe
+different files; `check_git` lost a dead `marked` parameter; the hooks check now only flags a first token
+in *path* form, since `hooks::run_hook` passes the line to `sh -c` and a bare name may legitimately be a
+builtin or keyword; `Run::row`/`Run::status` in the e2e harness now match only status-prefixed lines so a
+remediation line can never be mistaken for a row; the harness clears `RAPIDLM_MANAGED_CONFIG` too; and the
+two sandbox-probe tests were merged into one that diffs the scratch directories *this* call created rather
+than counting every `rapidlm-doctor-probe-*` in the shared temp dir (which raced with its own sibling).
+
+**Explicitly checked and clean, from the driving instruction's own list:** no doctor-specific config parser,
+model resolver, or context-budget arithmetic (grep for `toml::`/`from_str`/`8192`/`context_limit =` in
+`doctor.rs` returns nothing but the sandbox probe's own output limit); no network or billable call by
+default (tested); no trust mutation (tested twice); no hook execution (tested with a hook that would create
+a marker file); no plugin install/approve/execute; no scanner execution; the sandbox probe never touching
+project files (tested); no optional-feature absence classified fatal and no mandatory failure classified
+warning (each classification is individually tested); no always-zero exit (tested at both levels); no
+cascading errors after a prerequisite fails (`SKIP`, tested); no nondeterministic ordering (tested);
+no direct stdout writes from any check (grep: zero `println!`/`eprintln!` in `doctor.rs`); no stale help
+claiming doctor is stubbed (help, subcommand table, `CLI_USAGE`, and the CLI reference all rewritten); and
+no `unwrap`/`expect`/panic in doctor's non-test code. One residual noted rather than glossed over:
+`build_backing_model` carries three `expect`s on already-validated data, inherited unchanged from
+`exec_turn`; they are unreachable on the doctor path for the same reason they are unreachable on the exec
+path (doctor runs the identical `resolve_model_plan` that establishes the invariant), but doctor's
+no-panic posture is only as strong as those three assertions.
+
+**Verification:** `cargo test -p rapid --lib` 550 passed; `cargo test -p rapid --test doctor_cli` 17
+passed; `cargo test -p sandbox --lib` 102 passed (`sandbox_exec` was touched); `cargo build --workspace
+--tests` clean; `cargo clippy -p rapid --all-targets` — **zero** findings on any file this task touched,
+back to the workspace's pre-existing 56-warning count (the two `interactive.rs` `collapsible_if` warnings
+are the pre-existing ones prior tasks already recorded, at lines outside every hunk of this diff, confirmed
+by reading them); full `cargo test --workspace` green. A live `rapid doctor` run against this repository
+exits 0 with 21 rows, 0 failures, 3 warnings (untrusted project, disabled workspace tools, host-restricted
+isolation strength).
+
+**Deliberately not attempted, per the driving instruction's own scope:** daemon/ACP reachability checks;
+`--json`/`--jsonl` structured output (no CLI convention justifies it — see above); an opt-in live
+provider probe (no `--network`/`--live` convention exists to hang one on); MCP integration or a plugin
+trust redesign; any auto-fix or repair framework; a general diagnostics DAG engine (orchestration is a
+flat sequence of `checks.push` calls with explicit prerequisites, which is all this needs); broad CLI
+truthfulness cleanup for other commands; retrieval/RAG or knowledge-store health; distribution/installer
+work; and `rapid sandbox status|doctor`, which is a separate advertised-but-unimplemented command family
+and was not touched.
 
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 

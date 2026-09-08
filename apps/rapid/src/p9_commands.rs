@@ -438,18 +438,25 @@ mod tests {
     }
 
     #[test]
-    fn doctor_exit_code_is_nonzero_for_every_non_pass_status() {
-        // A CI script gating on `rapid doctor`'s exit code must be able to
-        // see any check that isn't a clean pass — the old code returned 0
-        // unconditionally regardless of status.
-        assert_eq!(doctor_exit_code(security::DoctorStatus::Pass), 0);
-        for status in [
-            security::DoctorStatus::Warn,
-            security::DoctorStatus::Unavailable,
-            security::DoctorStatus::Fail,
-            security::DoctorStatus::Error,
-        ] {
-            assert_eq!(doctor_exit_code(status), 1, "{status:?} must not exit 0");
+    fn doctor_help_is_truthful_about_being_offline_read_only_and_its_exit_codes() {
+        // The command's own help is the contract a scripted caller reads;
+        // it must not advertise behavior the implementation does not have.
+        // (The previous help called this "sandbox/policy/credential
+        // diagnostics" while every check reported `Unavailable`.)
+        for claim in ["Offline", "Read-only", "connectivity not\ntested", "Exit code"] {
+            assert!(DOCTOR_USAGE.contains(claim), "help missing {claim:?}");
+        }
+        let code = run_doctor(&["--help".to_owned()]).expect("help");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn doctor_rejects_any_argument_instead_of_silently_ignoring_it() {
+        for arg in ["--json", "sandbox", "--live"] {
+            assert!(
+                matches!(run_doctor(&[arg.to_owned()]), Err(P9CommandError::Usage)),
+                "`rapid doctor {arg}` must not look like it did something"
+            );
         }
     }
 
@@ -582,31 +589,61 @@ pub const RAPID_SUBCOMMANDS: &[(&str, &str)] = &[
     ("findings", "persisted scanner findings (list/dismiss)"),
     ("agents", "project agent definitions (list/validate/scaffold)"),
     ("plugins", "plugin trust lifecycle (validate/register/list/approve/reject/hook-test)"),
-    ("doctor", "sandbox/policy/credential diagnostics"),
+    ("doctor", "diagnose config/model/trust/sandbox health (offline, read-only)"),
     ("completions", "emit shell completions: bash|zsh|fish"),
     ("man", "print the manual page text"),
 ];
 
-/// `rapid doctor`: sandbox/policy/credential diagnostics via security::doctor.
+/// `rapid doctor`: the real environment/config/model/project/sandbox
+/// diagnosis (`crate::doctor`).
+///
+/// Until this was wired up, the command passed an empty
+/// `security::DoctorRequest::default()` — no sandbox manager, no keychain,
+/// no project observation — so all five security checks reported
+/// `Unavailable` and the command told a user nothing about whether Rapid
+/// could actually run. It now drives the same configuration loader, model
+/// resolution, context-budget derivation, project-root detection, trust
+/// store, and sandbox backends real commands use, and feeds real
+/// observations into `security::evaluate_doctor` for the security-posture
+/// half. Offline by default: no check performs a network request or a
+/// billable model call.
 pub fn run_doctor(args: &[String]) -> Result<i32, P9CommandError> {
-    let _ = args;
-    let cancel = capability_broker::CancellationToken::new();
-    let request = security::DoctorRequest::default();
-    let report =
-        security::evaluate_doctor(&request, &cancel).map_err(|err| P9CommandError::Agent(format!("{err}")))?;
-    for check in report.checks() {
-        println!("{} {:?}", check.id(), check.status());
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{DOCTOR_USAGE}");
+        return Ok(0);
     }
-    Ok(doctor_exit_code(report.status()))
+    // The command takes no arguments at all. Silently ignoring one would let
+    // `rapid doctor --json` or `rapid doctor sandbox` look like it did
+    // something it did not.
+    if let Some(unexpected) = args.first() {
+        eprintln!("rapid doctor: unexpected argument '{unexpected}'");
+        eprint!("{DOCTOR_USAGE}");
+        return Err(P9CommandError::Usage);
+    }
+    let report = crate::doctor::diagnose(&crate::doctor::DoctorEnv::from_process());
+    print!("{}", report.render());
+    Ok(report.exit_code())
 }
 
-// A CI/pre-flight script gating on `rapid doctor`'s exit code needs to see a
-// failing check as non-zero; the caller previously printed each row and
-// returned 0 unconditionally, so nothing scripted against it could ever
-// observe a `Fail`/`Error`/`Unavailable` check.
-fn doctor_exit_code(status: security::DoctorStatus) -> i32 {
-    if status.is_pass() { 0 } else { 1 }
-}
+/// `rapid doctor --help`.
+pub const DOCTOR_USAGE: &str = "\
+usage: rapid doctor
+
+Diagnose whether Rapid can operate in this environment and project. Every
+check drives the same configuration, model resolution, project trust,
+sandbox, and execution dependencies real commands use.
+
+Offline: no check contacts a provider or makes a billable model call. Model
+configuration is validated locally and reported as \"connectivity not
+tested\" rather than as verified.
+
+Read-only: doctor never grants or revokes trust, rewrites configuration,
+installs or approves plugins, or executes hooks or scanners.
+
+Exit code:
+  0   no check failed (warnings and skips do not fail the command)
+  1   at least one check required for core behavior failed
+";
 
 /// `rapid sessions list|search <text> [--db <path>]` over the kernel
 /// session projection (real InProcessKernelClient -> EventLedger query).

@@ -292,7 +292,25 @@ pub fn run_sandboxed(
     timeout: Duration,
     output_limit: u64,
 ) -> Result<SandboxRunOutcome, SandboxRunError> {
-    let manager = build_manager();
+    run_sandboxed_with(&build_manager(), root, argv, timeout, output_limit)
+}
+
+/// [`run_sandboxed`] against a caller-supplied manager. Split out for
+/// `rapid doctor`'s sandbox smoke probe, which must exercise whichever
+/// backend *this platform's* production `shell_exec` would actually pick
+/// ([`build_manager_seatbelt`] on a macOS host with `sandbox-exec` present,
+/// [`build_manager`] everywhere else) rather than always the host-restricted
+/// one this function's own caller hard-codes. Nothing else differs: the same
+/// spec, the same lease-minting ceremony, the same validator, the same
+/// destroy-after-exec cleanup — so a green probe is evidence about the real
+/// execution path, not about a doctor-only reimplementation of it.
+pub fn run_sandboxed_with(
+    manager: &SandboxManager,
+    root: &Path,
+    argv: &[String],
+    timeout: Duration,
+    output_limit: u64,
+) -> Result<SandboxRunOutcome, SandboxRunError> {
     let spec = build_spec(root, timeout, output_limit, SandboxNetwork::None)?;
     let issuer = LeaseIssuer::ephemeral();
     let command_name = argv.first().map(String::as_str).unwrap_or("shell");
@@ -306,12 +324,15 @@ pub fn run_sandboxed(
     let validator = LeaseValidator::new(issuer, revision);
     let cancel = CancellationToken::new();
 
-    let handle = manager
-        .prepare(&spec, &lease, &cancel)
-        .map_err(SandboxRunError::Sandbox)?;
+    // Both fallible steps that do not need a handle happen *before*
+    // `prepare`: a `?` between `prepare` and the `destroy` below would leak a
+    // prepared sandbox handle (an unresolvable `argv[0]` was enough to do it).
     let program = resolve_program(root, command_name)?;
     let resolved_argv = std::iter::once(program).chain(argv.iter().skip(1).cloned());
     let request = SandboxExecRequest::new(resolved_argv, timeout, output_limit)
+        .map_err(SandboxRunError::Sandbox)?;
+    let handle = manager
+        .prepare(&spec, &lease, &cancel)
         .map_err(SandboxRunError::Sandbox)?;
     let result = manager.exec(&spec, &handle, &request, &lease, &validator, &cancel);
     // Best-effort cleanup: a destroy failure after a successful/failed exec

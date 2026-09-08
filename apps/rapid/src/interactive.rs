@@ -67,11 +67,11 @@ pub const MAX_EVENTS_PER_TICK: usize = 64;
 pub const INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 
 const KERNEL_SERVICE_ID: &str = "kernel";
-const PROJECT_MARKER: &str = ".rapidlm";
-const GIT_MARKER: &str = ".git";
+pub(crate) const PROJECT_MARKER: &str = ".rapidlm";
+pub(crate) const GIT_MARKER: &str = ".git";
 const WORKSPACE_CONFIG_NAME: &str = "config.toml";
-const USER_CONFIG_NAME: &str = "config.toml";
-const TRUST_CATALOG_NAME: &str = "project-trust.json";
+pub(crate) const USER_CONFIG_NAME: &str = "config.toml";
+pub(crate) const TRUST_CATALOG_NAME: &str = "project-trust.json";
 const LEDGER_NAME: &str = "ledger.sqlite";
 const HOME_ENV: &str = "HOME";
 const USERPROFILE_ENV: &str = "USERPROFILE";
@@ -244,7 +244,7 @@ usage: rapid [subcommand]
   rapid inspect <session/run>
   rapid cron add|list|remove|poll   durable prompt cron (claim-lease firing)
   rapid export
-  rapid doctor
+  rapid doctor                  environment/config/model/trust/sandbox diagnosis
   rapid update
 ";
 
@@ -1140,7 +1140,7 @@ fn unsupported_command_text(action: &KernelAction) -> String {
 
 /// stderr guidance for the typed no-config fallback (mirrors the Grok Build
 /// onboarding: a small user TOML selects provider, model, and credential).
-const NOT_CONFIGURED_HINT: &str = "no model configured: add a [models] default and a [model.<id>] \
+pub(crate) const NOT_CONFIGURED_HINT: &str = "no model configured: add a [models] default and a [model.<id>] \
 table (provider, model, base_url) to ~/.rapidlm/config.toml or point RAPIDLM_CONFIG at one; \
 see docs/configuration.md";
 
@@ -1303,15 +1303,30 @@ fn exec_workspace(cancel: &CancellationToken) -> Option<(PathBuf, TrustStatus)> 
 /// Resolve the RapidLM home directory from the process environment, mirroring
 /// the interactive `resolve_user_home` precedence: `RAPIDLM_HOME` names the
 /// home itself, `HOME`/`USERPROFILE` its parent.
-fn exec_user_home() -> Option<PathBuf> {
-    if let Ok(home) = std::env::var(RAPIDLM_HOME_ENV)
-        && !home.is_empty()
+pub(crate) fn exec_user_home() -> Option<PathBuf> {
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    user_home_from(&env)
+}
+
+/// [`exec_user_home`] against an explicit environment. Split out so
+/// `rapid doctor` resolves the home directory through this exact precedence
+/// (`RAPIDLM_HOME` names the home itself, `HOME`/`USERPROFILE` its parent)
+/// rather than a doctor-local copy of the same three rules.
+pub(crate) fn user_home_from(env: &[(String, String)]) -> Option<PathBuf> {
+    if let Some(home) = env
+        .iter()
+        .find(|(key, _)| key == RAPIDLM_HOME_ENV)
+        .map(|(_, value)| value)
+        .filter(|value| !value.is_empty())
     {
-        return canonicalize_or_create(Path::new(&home)).ok();
+        return canonicalize_or_create(Path::new(home)).ok();
     }
     for key in [HOME_ENV, USERPROFILE_ENV] {
-        if let Ok(home) = std::env::var(key)
-            && !home.is_empty()
+        if let Some(home) = env
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value)
+            .filter(|value| !value.is_empty())
         {
             return canonicalize_or_create(&PathBuf::from(home).join(".rapidlm")).ok();
         }
@@ -1393,7 +1408,7 @@ fn exec_turn_exit_code(
 const PERMISSION_MODE_ENV: &str = "RAPIDLM_PERMISSION_MODE";
 /// Project settings documents consulted for the permission lattice, in
 /// precedence order (RapidLM's own first, then the Claude-compat path).
-const PROJECT_SETTINGS_FILES: [&str; 2] = [".rapidlm/settings.json", ".claude/settings.json"];
+pub(crate) const PROJECT_SETTINGS_FILES: [&str; 2] = [".rapidlm/settings.json", ".claude/settings.json"];
 /// Persisted per-project allow grants consulted before any ask.
 const PERMISSIONS_STORE_NAME: &str = "project-permissions.json";
 /// Maximum rule entries admitted across all settings documents. Each file is
@@ -1555,11 +1570,11 @@ fn exec_permission_lattice(
 /// servers a `.rapidlm/settings.json` *or* `.claude/settings.json`-only
 /// project can configure, in one place instead of duplicated at both call
 /// sites (the real `exec_turn` path and this struct's own unit test).
-struct ProjectIntegrations {
+pub(crate) struct ProjectIntegrations {
     fetch_allowlist: Vec<String>,
-    hooks: crate::hooks::HooksConfig,
+    pub(crate) hooks: crate::hooks::HooksConfig,
     shadow: Option<crate::shadow_diagnostics::ShadowDiagnosticsConfig>,
-    mcp_servers: Vec<crate::exec_tools::McpServerConfig>,
+    pub(crate) mcp_servers: Vec<crate::exec_tools::McpServerConfig>,
 }
 
 /// Read and merge every `PROJECT_SETTINGS_FILES` entry under `root`. List-
@@ -1572,7 +1587,7 @@ struct ProjectIntegrations {
 /// this block's pre-existing behavior (only permission-rule parsing is
 /// strict enough to refuse the run typed; this integration config was never
 /// that strict even before this function existed).
-fn load_project_integrations(root: &Path) -> ProjectIntegrations {
+pub(crate) fn load_project_integrations(root: &Path) -> ProjectIntegrations {
     let mut fetch_allowlist: Vec<String> = Vec::new();
     let mut hooks = crate::hooks::HooksConfig::default();
     let mut shadow = None;
@@ -1989,7 +2004,7 @@ fn exec_discover_rules(cwd: &Path, root: &Path) -> Option<String> {
 /// backend actually serves it — the same guarantee a full rebuild-on-
 /// fallback would give, without needing to rebuild context after every
 /// fallback.
-fn context_budget_for(backing: &SelectedModel<'_>) -> (u32, u32) {
+pub(crate) fn context_budget_for(backing: &SelectedModel<'_>) -> (u32, u32) {
     match backing {
         SelectedModel::Unconfigured(_) => (
             crate::user_config::DEFAULT_CONTEXT_WINDOW,
@@ -2011,6 +2026,257 @@ fn context_budget_for(backing: &SelectedModel<'_>) -> (u32, u32) {
                 crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS,
             )),
     }
+}
+
+/// How the `(context_limit, output_reserve)` pair [`context_budget_for`]
+/// just returned was arrived at, as one human-readable phrase. Extracted
+/// from `exec_turn`'s `--verbose` line so `rapid doctor`'s own
+/// context-budget check reports the identical provenance instead of
+/// re-deriving "is this the default or a configured value?" a second way.
+///
+/// Keyed off `backing` itself (what actually produced the numbers), not the
+/// *primary's* raw config entry: the primary is not necessarily what backs a
+/// resolved `Configured` model (the `backends.len() < 2`/controller-failure
+/// paths in [`build_backing_model`] can promote a surviving alternate
+/// instead), and a `FallbackChain`'s derived pair is a genuine cross-backend
+/// combination — attributing it to "the primary's config" would misdescribe
+/// where the numbers actually came from either way.
+pub(crate) fn context_budget_source(backing: &SelectedModel<'_>, candidates: usize) -> String {
+    match backing {
+        SelectedModel::Unconfigured(_) => "default (no model configured)".to_owned(),
+        SelectedModel::Configured(model) => {
+            let caps = model.capabilities();
+            if caps.context_limit() == crate::user_config::DEFAULT_CONTEXT_WINDOW
+                && caps.max_output() == crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS
+            {
+                "default (context_window/max_tokens unset in model config)".to_owned()
+            } else {
+                "configured".to_owned()
+            }
+        }
+        SelectedModel::FallbackChain(_) => format!(
+            "chain: minimum context_limit / maximum max_output across {candidates} candidates"
+        ),
+    }
+}
+
+/// The layered model *resolution* half of a turn's setup, as plain data:
+/// env overrides > user config > typed no-config fallback, then the opt-in
+/// `[models] fallback` chain resolved against the same config the primary
+/// came from and narrowed by the same managed policy.
+///
+/// Extracted verbatim out of [`exec_turn`], which was its only caller, so
+/// `rapid doctor` can answer "which model would this environment actually
+/// use, and would it construct?" by running the real thing rather than a
+/// doctor-specific reimplementation of the same precedence rules. Nothing
+/// here performs network I/O or a provider request: `ConfiguredModel::build`
+/// (the construction half, [`build_backing_model`]) validates endpoints and
+/// bounds eagerly and locally.
+///
+/// `warn` receives every non-fatal line this resolution would otherwise
+/// print directly — `exec_turn` passes a sink that `eprintln!`s immediately,
+/// preserving its exact prior stderr ordering; doctor passes a collector.
+pub(crate) struct ModelPlan {
+    /// `[primary, ...fallback alternates]`, empty when unconfigured. The
+    /// primary already carries the reminders' reasoning-effort floor.
+    pub models: Vec<crate::user_config::ActiveModel>,
+    /// The primary exactly as the config resolved it, *before* the reminder
+    /// floor was applied — what a spawned child agent inherits.
+    pub primary_config: Option<crate::user_config::ActiveModel>,
+    /// No model config was found at all; the typed fallback applies.
+    pub unconfigured: bool,
+}
+
+/// Typed failure of [`resolve_model_plan`]. `Display` reproduces the exact
+/// stderr line `exec_turn` printed for each case before this was extracted.
+#[derive(Debug)]
+pub(crate) enum ModelPlanError {
+    Config(String),
+    ManagedPolicy(String),
+}
+
+impl std::fmt::Display for ModelPlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(reason) => write!(f, "model configuration error: {reason}"),
+            Self::ManagedPolicy(reason) => write!(f, "managed policy error: {reason}"),
+        }
+    }
+}
+
+pub(crate) fn resolve_model_plan(
+    process_env: &[(String, String)],
+    reminder_floor: agent_runtime::reminders::ReminderFloor,
+    warn: &mut dyn FnMut(&str),
+) -> Result<ModelPlan, ModelPlanError> {
+    // `models`: [primary, ...fallback alternates] — resolved as plain data
+    // (no borrows yet) so the credential-store count is known upfront.
+    let mut models: Vec<crate::user_config::ActiveModel> = Vec::new();
+    let mut primary_config: Option<crate::user_config::ActiveModel> = None;
+    let mut unconfigured = false;
+    match crate::user_config::select_active_model_gated(process_env) {
+        Ok(ModelSelection::Configured { active, warnings }) => {
+            for warning in warnings {
+                warn(&format!("warning: {warning}"));
+            }
+            primary_config = Some(active.as_ref().clone());
+            let primary = apply_reminder_floor(*active, reminder_floor);
+
+            // Fallback chain: opt-in via `[models] fallback`, resolved
+            // against the same raw config the primary came from, then
+            // narrowed/raised by the same managed policy (if any) the
+            // primary was already gated through — a fallback entry is never
+            // let through a restriction, or under an effort floor, the
+            // primary itself has to honor.
+            if let Some(config) = crate::user_config::load_config(
+                &crate::user_config::resolve_config_source(process_env),
+            )
+            .unwrap_or(None)
+            {
+                let (candidates, warnings) =
+                    crate::user_config::resolve_fallback_chain(process_env, &config, &primary);
+                for warning in warnings {
+                    warn(&format!("warning: {warning}"));
+                }
+                let (gated, warnings) = gate_fallback_candidates(process_env, candidates)
+                    .map_err(|err| ModelPlanError::ManagedPolicy(format!("{err}")))?;
+                for warning in warnings {
+                    warn(&format!("warning: {warning}"));
+                }
+                models.extend(gated);
+            }
+            models.insert(0, primary);
+        }
+        Ok(ModelSelection::Unconfigured { .. }) => {
+            warn(NOT_CONFIGURED_HINT);
+            unconfigured = true;
+        }
+        Err(err) => return Err(ModelPlanError::Config(format!("{err}"))),
+    }
+    Ok(ModelPlan {
+        models,
+        primary_config,
+        unconfigured,
+    })
+}
+
+/// Typed failure of [`build_backing_model`]. `Display` reproduces the exact
+/// stderr line `exec_turn` printed for each case before this was extracted.
+#[derive(Debug)]
+pub(crate) struct BackingModelError(String);
+
+impl std::fmt::Display for BackingModelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "model configuration error: {}", self.0)
+    }
+}
+
+/// The *construction* half: turn a [`ModelPlan`]'s resolved entries into the
+/// one [`SelectedModel`] a turn actually dispatches through, seeding one
+/// already-built credential store per backend. Extracted out of [`exec_turn`]
+/// alongside [`resolve_model_plan`] for the same reason — `rapid doctor` must
+/// exercise the real adapter construction (endpoint parsing, capability
+/// pinning, credential seeding), not assert that a config file "looks right".
+///
+/// `stores` must have exactly one entry per `models` entry and must already
+/// be final: every returned borrow is a plain immutable borrow of it.
+pub(crate) fn build_backing_model<'store>(
+    models: &[crate::user_config::ActiveModel],
+    stores: &'store [auth::InMemoryCredentialStore],
+    unconfigured: bool,
+    diag: Option<StepDiag>,
+    policy_version: Option<String>,
+    warn: &mut dyn FnMut(&str),
+) -> Result<(SelectedModel<'store>, crate::host::RouterDecisionLog), BackingModelError> {
+    // Routing-decision log (Modbit `MOD-005`: "routing must be auditable").
+    // Only the fallback-chain branch below can ever produce a decision; every
+    // other branch keeps an empty log — absence *is* the "no incident"
+    // signal, not a missing feature.
+    let mut router_decisions = crate::host::RouterDecisionLog::new();
+    let backing = if unconfigured {
+        SelectedModel::Unconfigured(UnconfiguredModel)
+    } else if models.len() == 1 {
+        match ConfiguredModel::build(&models[0], &stores[0]) {
+            Ok(model) => SelectedModel::Configured(Box::new(model)),
+            Err(err) => return Err(BackingModelError(format!("{err}"))),
+        }
+    } else {
+        let mut backends = Vec::with_capacity(models.len());
+        for (active, store) in models.iter().zip(stores.iter()) {
+            // Tracking identity for FallbackController only — distinct from
+            // whatever ModelRef ConfiguredModel builds internally for the
+            // real wire request. Two profiles can legitimately name the
+            // same underlying provider+model (a paid vs. free tier of the
+            // same model, or — as a real-provider live check for this
+            // wiring found — two entries that only differ by base_url), so
+            // `entry.model` alone is not a safe uniqueness key here;
+            // `profile_id` always is, since it's a `[model.<id>]` TOML
+            // table key and BTreeMap-unique by construction. Already
+            // validated against the (stricter) llm-router profile alphabet
+            // in `resolve_active`/`resolve_fallback_chain`, so this can
+            // never fail ModelId's looser alphabet.
+            let model_ref = llm_router::provider::ModelRef::new(
+                llm_router::provider::ProviderId::parse(active.entry.provider.as_str())
+                    .expect("provider id already validated by user_config parsing"),
+                llm_router::provider::ModelId::parse(&active.profile_id)
+                    .expect("profile id already validated against the stricter llm-router alphabet"),
+            );
+            match ConfiguredModel::build(active, store) {
+                Ok(model) => backends.push((model_ref, model)),
+                Err(err) => {
+                    warn(&format!(
+                        "warning: fallback entry '{}' failed to configure ({err}); skipped",
+                        active.profile_id
+                    ));
+                }
+            }
+        }
+        if backends.len() < 2 {
+            // Every alternate failed to configure — fall back to the plain,
+            // single-model path rather than a chain of one.
+            match backends.into_iter().next() {
+                Some((_, model)) => SelectedModel::Configured(Box::new(model)),
+                None => {
+                    return Err(BackingModelError(
+                        "primary model failed to configure".to_owned(),
+                    ));
+                }
+            }
+        } else {
+            let primary_ref = backends[0].0.clone();
+            let alternate_refs: Vec<_> = backends[1..].iter().map(|(model_ref, _)| model_ref.clone()).collect();
+            let policy = llm_router::fallback::FallbackPolicy::standard();
+            let router_cancel = llm_router::provider::CancellationToken::new();
+            match llm_router::fallback::FallbackController::from_explicit_chain(
+                primary_ref,
+                alternate_refs,
+                policy,
+                &router_cancel,
+            ) {
+                Ok(controller) => {
+                    let mut chain = FallbackChainModel::new(backends, controller, diag);
+                    // Reuses the single read captured by the caller (disk/
+                    // network ceiling narrowing) rather than loading a third
+                    // time — see that read's own doc comment for why: a third
+                    // independent read could see a different file than the
+                    // one that actually gated this turn's permission mode,
+                    // and would make the recorded version describe a
+                    // policy that wasn't the one actually applied.
+                    chain.set_policy_version(policy_version);
+                    router_decisions = chain.decisions();
+                    SelectedModel::FallbackChain(Box::new(chain))
+                }
+                Err(err) => {
+                    warn(&format!(
+                        "warning: fallback chain configuration failed ({err}); using the primary model only"
+                    ));
+                    let (_, model) = backends.into_iter().next().expect("checked len >= 2 above");
+                    SelectedModel::Configured(Box::new(model))
+                }
+            }
+        }
+    };
+    Ok((backing, router_decisions))
 }
 
 /// project instructions discovered under `root`/`cwd`, and the
@@ -2233,67 +2499,34 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         }
     }
 
-    // Layered model selection (env overrides > user config > typed fallback).
-    // Resolved before context construction below — not after, as it was
-    // before this fix — so the context budget (`context_budget_for`) is
-    // derived from the model that will actually run this turn, never a
-    // hard-coded placeholder sized before the model was even known.
+    // Layered model selection (env overrides > user config > typed fallback),
+    // driven through the shared `resolve_model_plan`/`build_backing_model`
+    // pair `rapid doctor` also runs — one interpretation of "which model
+    // would this environment actually use", not two. Resolved before context
+    // construction below — not after, as it was before this fix — so the
+    // context budget (`context_budget_for`) is derived from the model that
+    // will actually run this turn, never a hard-coded placeholder sized
+    // before the model was even known.
     let process_env: Vec<(String, String)> = std::env::vars().collect();
-    let mut base_url = String::from("unconfigured");
-    let mut child_model_config: Option<crate::user_config::ActiveModel> = None;
-    // `models`: [primary, ...fallback alternates] — resolved as plain data
-    // (no borrows yet) so the credential-store count is known upfront.
-    let mut models: Vec<crate::user_config::ActiveModel> = Vec::new();
-    let mut unconfigured = false;
-    match crate::user_config::select_from_process_env_gated() {
-        Ok(ModelSelection::Configured { active, warnings }) => {
-            for warning in warnings {
-                eprintln!("warning: {warning}");
-            }
-            base_url = active.entry.base_url.clone();
-            child_model_config = Some(active.as_ref().clone());
-            let primary = apply_reminder_floor(*active, reminder_floor);
-
-            // Fallback chain: opt-in via `[models] fallback`, resolved
-            // against the same raw config the primary came from, then
-            // narrowed/raised by the same managed policy (if any) the
-            // primary was already gated through — a fallback entry is never
-            // let through a restriction, or under an effort floor, the
-            // primary itself has to honor.
-            if let Some(config) = crate::user_config::load_config(
-                &crate::user_config::resolve_config_source(&process_env),
-            )
-            .unwrap_or(None)
-            {
-                let (candidates, warnings) =
-                    crate::user_config::resolve_fallback_chain(&process_env, &config, &primary);
-                for warning in warnings {
-                    eprintln!("warning: {warning}");
-                }
-                match gate_fallback_candidates(&process_env, candidates) {
-                    Ok((gated, warnings)) => {
-                        for warning in warnings {
-                            eprintln!("warning: {warning}");
-                        }
-                        models.extend(gated);
-                    }
-                    Err(err) => {
-                        eprintln!("managed policy error: {err}");
-                        return Ok(JsonlExitCode::Usage.as_i32());
-                    }
-                }
-            }
-            models.insert(0, primary);
-        }
-        Ok(ModelSelection::Unconfigured { .. }) => {
-            eprintln!("{NOT_CONFIGURED_HINT}");
-            unconfigured = true;
-        }
+    // Printed the moment each line is produced, exactly as when this block
+    // was inline: the extraction must not reorder exec's stderr. Doctor
+    // passes a collector into this same seam instead.
+    let mut warn = |line: &str| eprintln!("{line}");
+    let plan = match resolve_model_plan(&process_env, reminder_floor, &mut warn) {
+        Ok(plan) => plan,
         Err(err) => {
-            eprintln!("model configuration error: {err}");
+            eprintln!("{err}");
             return Ok(JsonlExitCode::Usage.as_i32());
         }
-    }
+    };
+    let base_url = plan
+        .primary_config
+        .as_ref()
+        .map(|active| active.entry.base_url.clone())
+        .unwrap_or_else(|| String::from("unconfigured"));
+    let child_model_config = plan.primary_config;
+    let models = plan.models;
+    let unconfigured = plan.unconfigured;
     // One store per backend, fully built before any ConfiguredModel borrows
     // from it — every borrow below is a plain, compiler-checked immutable
     // borrow of an already-final Vec, not touched again afterward.
@@ -2301,93 +2534,19 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         .iter()
         .map(|_| auth::InMemoryCredentialStore::new())
         .collect();
-    // Routing-decision log (Modbit `MOD-005`: "routing must be auditable").
-    // Only the fallback-chain branch below can ever produce a decision; every
-    // other branch keeps an empty log — absence *is* the "no incident"
-    // signal, not a missing feature.
-    let mut router_decisions = crate::host::RouterDecisionLog::new();
-    let backing = if unconfigured {
-        SelectedModel::Unconfigured(UnconfiguredModel)
-    } else if models.len() == 1 {
-        match ConfiguredModel::build(&models[0], &credential_stores[0]) {
-            Ok(model) => SelectedModel::Configured(Box::new(model)),
-            Err(err) => {
-                eprintln!("model configuration error: {err}");
-                return Ok(JsonlExitCode::Usage.as_i32());
-            }
-        }
-    } else {
-        let mut backends = Vec::with_capacity(models.len());
-        for (active, store) in models.iter().zip(credential_stores.iter()) {
-            // Tracking identity for FallbackController only — distinct from
-            // whatever ModelRef ConfiguredModel builds internally for the
-            // real wire request. Two profiles can legitimately name the
-            // same underlying provider+model (a paid vs. free tier of the
-            // same model, or — as a real-provider live check for this
-            // wiring found — two entries that only differ by base_url), so
-            // `entry.model` alone is not a safe uniqueness key here;
-            // `profile_id` always is, since it's a `[model.<id>]` TOML
-            // table key and BTreeMap-unique by construction. Already
-            // validated against the (stricter) llm-router profile alphabet
-            // in `resolve_active`/`resolve_fallback_chain`, so this can
-            // never fail ModelId's looser alphabet.
-            let model_ref = llm_router::provider::ModelRef::new(
-                llm_router::provider::ProviderId::parse(active.entry.provider.as_str())
-                    .expect("provider id already validated by user_config parsing"),
-                llm_router::provider::ModelId::parse(&active.profile_id)
-                    .expect("profile id already validated against the stricter llm-router alphabet"),
-            );
-            match ConfiguredModel::build(active, store) {
-                Ok(model) => backends.push((model_ref, model)),
-                Err(err) => {
-                    eprintln!(
-                        "warning: fallback entry '{}' failed to configure ({err}); skipped",
-                        active.profile_id
-                    );
-                }
-            }
-        }
-        if backends.len() < 2 {
-            // Every alternate failed to configure — fall back to the plain,
-            // single-model path rather than a chain of one.
-            match backends.into_iter().next() {
-                Some((_, model)) => SelectedModel::Configured(Box::new(model)),
-                None => {
-                    eprintln!("model configuration error: primary model failed to configure");
-                    return Ok(JsonlExitCode::Usage.as_i32());
-                }
-            }
-        } else {
-            let primary_ref = backends[0].0.clone();
-            let alternate_refs: Vec<_> = backends[1..].iter().map(|(model_ref, _)| model_ref.clone()).collect();
-            let policy = llm_router::fallback::FallbackPolicy::standard();
-            let router_cancel = llm_router::provider::CancellationToken::new();
-            match llm_router::fallback::FallbackController::from_explicit_chain(
-                primary_ref,
-                alternate_refs,
-                policy,
-                &router_cancel,
-            ) {
-                Ok(controller) => {
-                    let diag = parsed.verbose.then(|| StepDiag::stderr(&base_url));
-                    let mut chain = FallbackChainModel::new(backends, controller, diag);
-                    // Reuses the single read captured above (disk/network
-                    // ceiling narrowing) rather than loading a third time —
-                    // see that read's own doc comment for why: a third
-                    // independent read could see a different file than the
-                    // one that actually gated this turn's permission mode,
-                    // and would make the recorded version describe a
-                    // policy that wasn't the one actually applied.
-                    chain.set_policy_version(policy_version.clone());
-                    router_decisions = chain.decisions();
-                    SelectedModel::FallbackChain(Box::new(chain))
-                }
-                Err(err) => {
-                    eprintln!("warning: fallback chain configuration failed ({err}); using the primary model only");
-                    let (_, model) = backends.into_iter().next().expect("checked len >= 2 above");
-                    SelectedModel::Configured(Box::new(model))
-                }
-            }
+    let diag = parsed.verbose.then(|| StepDiag::stderr(&base_url));
+    let (backing, router_decisions) = match build_backing_model(
+        &models,
+        &credential_stores,
+        unconfigured,
+        diag,
+        policy_version.clone(),
+        &mut warn,
+    ) {
+        Ok(built) => built,
+        Err(err) => {
+            eprintln!("{err}");
+            return Ok(JsonlExitCode::Usage.as_i32());
         }
     };
 
@@ -2397,32 +2556,11 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     // just resolved above, never a fixed placeholder.
     let (context_limit, output_reserve) = context_budget_for(&backing);
     if parsed.verbose {
-        // Keyed off `backing` itself (what actually produced the numbers
-        // above), not `child_model_config` (the *primary's* raw config
-        // entry): the primary is not necessarily what backs a resolved
-        // `Configured` model (the `backends.len() < 2`/controller-failure
-        // paths above can promote a surviving alternate instead), and a
-        // `FallbackChain`'s derived pair is a genuine cross-backend
-        // combination — attributing it to "the primary's config" would
-        // misdescribe where the printed numbers actually came from either
-        // way.
-        let source = match &backing {
-            SelectedModel::Unconfigured(_) => "default (no model configured)".to_owned(),
-            SelectedModel::Configured(model) => {
-                let caps = model.capabilities();
-                if caps.context_limit() == crate::user_config::DEFAULT_CONTEXT_WINDOW
-                    && caps.max_output() == crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS
-                {
-                    "default (context_window/max_tokens unset in model config)".to_owned()
-                } else {
-                    "configured".to_owned()
-                }
-            }
-            SelectedModel::FallbackChain(_) => format!(
-                "chain: minimum context_limit / maximum max_output across {} candidates",
-                models.len()
-            ),
-        };
+        // Provenance comes from `context_budget_source`, keyed off
+        // `backing` itself (what actually produced the numbers above) —
+        // shared with `rapid doctor`'s own context-budget check so both
+        // describe the same resolution the same way.
+        let source = context_budget_source(&backing, models.len());
         eprintln!(
             "context budget: context_window={context_limit} output_reserve={output_reserve} source={source}"
         );
@@ -4717,7 +4855,7 @@ fn resolve_project(options: &InteractiveOptions) -> Result<ResolvedProject, Inte
     })
 }
 
-fn detect_project_root(
+pub(crate) fn detect_project_root(
     cwd: &Path,
     cancel: &CancellationToken,
 ) -> Result<PathBuf, InteractiveError> {
@@ -4851,7 +4989,7 @@ fn resolve_user_home(options: &InteractiveOptions) -> Result<PathBuf, Interactiv
     Err(InteractiveError::UserHomeMissing)
 }
 
-fn canonicalize_dir(path: &Path) -> Result<PathBuf, InteractiveError> {
+pub(crate) fn canonicalize_dir(path: &Path) -> Result<PathBuf, InteractiveError> {
     let canonical = fs::canonicalize(path).map_err(|_| InteractiveError::InvalidProjectRoot)?;
     if !canonical.is_absolute() {
         return Err(InteractiveError::InvalidProjectRoot);

@@ -1,0 +1,657 @@
+//! End-to-end coverage for `rapid doctor` against the **real compiled
+//! binary**, driven with isolated homes, projects, and configuration.
+//!
+//! What these prove, beyond "the command exits 0":
+//!
+//!   - a healthy controlled configuration reports every mandatory check;
+//!   - a broken model configuration exits non-zero and names the fault;
+//!   - an untrusted project still produces a full report, warns with the
+//!     real `rapid trust grant` remediation, and does **not** mutate trust;
+//!   - outside a project, project-scoped checks skip rather than crash;
+//!   - a secret-bearing configuration never leaks the key on stdout or
+//!     stderr, even when the provider entry is malformed enough to error;
+//!   - the default command performs **no network access**: a provider is
+//!     configured pointing at a listener that would record any connection,
+//!     and the listener must stay untouched;
+//!   - the crossed fallback chain reports the same safe `(minimum
+//!     context_limit, maximum max_output)` pair execution derives.
+
+use std::io::Read;
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+static SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn temp_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "rapidlm-doctor-{name}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}
+
+/// An isolated home + project pair. `home` is the parent of `.rapidlm`, so
+/// `HOME=<home>` makes the binary resolve `<home>/.rapidlm` exactly as it
+/// does for a real user.
+struct Fixture {
+    home: PathBuf,
+    project: PathBuf,
+}
+
+fn fixture(name: &str) -> Fixture {
+    let root = temp_dir(name);
+    let home = root.join("home");
+    let project = root.join("project");
+    std::fs::create_dir_all(home.join(".rapidlm")).expect("home");
+    std::fs::create_dir_all(project.join(".rapidlm")).expect("project");
+    Fixture { home, project }
+}
+
+fn write_config(fixture: &Fixture, body: &str) -> PathBuf {
+    let path = fixture.home.join(".rapidlm").join("config.toml");
+    std::fs::write(&path, body).expect("write config");
+    path
+}
+
+struct Run {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+impl Run {
+    fn row(&self, id: &str) -> String {
+        self.stdout
+            .lines()
+            // Only status-prefixed lines are rows; an indented `-> …`
+            // remediation line must never be mistaken for one.
+            .filter(|line| {
+                ["PASS", "FAIL", "WARN", "SKIP"]
+                    .iter()
+                    .any(|label| line.starts_with(label))
+            })
+            .find(|line| line.split_whitespace().nth(1) == Some(id))
+            .unwrap_or_else(|| panic!("no `{id}` row in:\n{}", self.stdout))
+            .to_owned()
+    }
+
+    fn status(&self, id: &str) -> String {
+        self.row(id)
+            .split_whitespace()
+            .next()
+            .expect("status")
+            .to_owned()
+    }
+}
+
+fn run_doctor_in(cwd: &Path, home: &Path, config: Option<&Path>) -> Run {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rapid"));
+    command
+        .arg("doctor")
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env_remove("RAPIDLM_HOME")
+        .env_remove("RAPIDLM_MODEL")
+        .env_remove("RAPIDLM_CONFIG")
+        // A managed policy inherited from the developer's own environment
+        // would rewrite the resolved model and add `managed gate:` notes,
+        // failing these tests for a reason that has nothing to do with them.
+        .env_remove("RAPIDLM_MANAGED_CONFIG");
+    if let Some(config) = config {
+        command.env("RAPIDLM_CONFIG", config);
+    }
+    let output = command.output().expect("run rapid doctor");
+    Run {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+fn healthy_config(base_url: &str) -> String {
+    format!(
+        "[models]\ndefault = \"local\"\n\n\
+         [model.local]\n\
+         provider = \"openai-compatible\"\n\
+         model = \"test-model\"\n\
+         base_url = \"{base_url}\"\n\
+         api_key = \"doctor-e2e-secret-key\"\n\
+         context_window = 200000\n\
+         max_tokens = 8192\n"
+    )
+}
+
+/// A listener that accepts nothing and only records whether anything ever
+/// connected. Used to prove the default command performs no network I/O.
+struct Tripwire {
+    addr: std::net::SocketAddr,
+    connections: Arc<Mutex<usize>>,
+}
+
+fn tripwire() -> Tripwire {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("addr");
+    let connections = Arc::new(Mutex::new(0usize));
+    let counter = Arc::clone(&connections);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            *counter.lock().expect("lock") += 1;
+            // Drain a little so a client that did connect is definitely
+            // recorded before the connection drops.
+            let mut sink = [0u8; 64];
+            let _ = stream.read(&mut sink);
+        }
+    });
+    Tripwire { addr, connections }
+}
+
+/// Every row the report always carries, in the order it renders them. Not
+/// all of these are *mandatory* checks — several are optional integrations
+/// that skip — but the set and its order are invariant, which is what makes
+/// the output diffable and scriptable.
+const EXPECTED_CHECKS: [&str; 21] = [
+    "environment",
+    "home",
+    "config",
+    "model",
+    "credentials",
+    "context-budget",
+    "project",
+    "project-trust",
+    "trust-store",
+    "workspace-tools",
+    "sandbox",
+    "sandbox-probe",
+    "git",
+    "scanner",
+    "hooks",
+    "mcp",
+    "plugins",
+    "credential-store",
+    "project-config-exposure",
+    "security-policy",
+    "release-signature",
+];
+
+#[test]
+fn a_healthy_controlled_configuration_succeeds_and_reports_every_check() {
+    let fixture = fixture("healthy");
+    let config = write_config(&fixture, &healthy_config("http://127.0.0.1:9/v1"));
+    let run = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
+
+    assert_eq!(run.code, Some(0), "stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+    for id in EXPECTED_CHECKS {
+        assert!(
+            run.stdout
+                .lines()
+                .any(|line| line.split_whitespace().nth(1) == Some(id)),
+            "missing `{id}` row in:\n{}",
+            run.stdout
+        );
+    }
+    assert_eq!(run.status("config"), "PASS");
+    assert_eq!(run.status("model"), "PASS");
+    assert_eq!(run.status("credentials"), "PASS");
+    assert_eq!(run.status("context-budget"), "PASS");
+    // The model row must describe the real resolved provider, not a guess.
+    assert!(run.row("model").contains("openai-compatible"));
+    assert!(run.row("model").contains("test-model"));
+    // Connectivity was never tested, and the report says so rather than
+    // implying the endpoint was reached.
+    assert!(run.row("model").contains("connectivity not tested"));
+    // Budget comes from this config's own explicit capabilities.
+    assert!(run.row("context-budget").contains("context_window=200000"));
+    assert!(run.row("context-budget").contains("output_reserve=8192"));
+    assert!(run.row("context-budget").contains("input_budget=191808"));
+}
+
+#[test]
+fn the_rows_render_in_a_stable_order_across_runs() {
+    let fixture = fixture("order");
+    let config = write_config(&fixture, &healthy_config("http://127.0.0.1:9/v1"));
+    let first = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
+    let second = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
+    let ids = |run: &Run| -> Vec<String> {
+        run.stdout
+            .lines()
+            .filter(|line| {
+                ["PASS", "FAIL", "WARN", "SKIP"]
+                    .iter()
+                    .any(|label| line.starts_with(label))
+            })
+            .filter_map(|line| line.split_whitespace().nth(1).map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(ids(&first), ids(&second));
+    assert_eq!(ids(&first), EXPECTED_CHECKS.to_vec());
+}
+
+#[test]
+fn a_broken_model_configuration_exits_nonzero_and_names_the_failure() {
+    let fixture = fixture("broken-model");
+    // `base_url` is not an http(s) origin: `ConfiguredModel::build` rejects
+    // it eagerly and locally, the same way a real turn would.
+    let config = write_config(
+        &fixture,
+        "[models]\ndefault = \"local\"\n\n\
+         [model.local]\n\
+         provider = \"openai-compatible\"\n\
+         model = \"test-model\"\n\
+         base_url = \"not-a-url\"\n\
+         api_key = \"doctor-e2e-secret-key\"\n",
+    );
+    let run = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
+
+    assert_eq!(run.code, Some(1), "stdout:\n{}", run.stdout);
+    assert_eq!(run.status("model"), "FAIL");
+    assert!(
+        run.row("model").contains("base_url"),
+        "the failure must name what is wrong: {}",
+        run.row("model")
+    );
+    // A prerequisite failure must not cascade into fake failures.
+    assert_eq!(run.status("context-budget"), "SKIP");
+    // Unrelated checks still ran.
+    assert_eq!(run.status("environment"), "PASS");
+    assert!(run.stdout.contains("1 failed"));
+}
+
+#[test]
+fn a_malformed_config_file_fails_with_the_real_path_and_skips_nothing_else() {
+    let fixture = fixture("malformed");
+    let config = write_config(&fixture, "this is not = = toml [[[");
+    let run = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
+
+    assert_eq!(run.code, Some(1));
+    assert_eq!(run.status("config"), "FAIL");
+    assert!(
+        run.row("config").contains(&config.display().to_string()),
+        "the failing config path must be named: {}",
+        run.row("config")
+    );
+    assert_eq!(run.status("model"), "FAIL");
+    assert_eq!(run.status("project"), "PASS");
+}
+
+#[test]
+fn a_rapidlm_config_pointing_at_a_missing_file_fails_and_says_it_is_missing() {
+    let fixture = fixture("explicit-missing");
+    let absent = fixture.home.join("does-not-exist.toml");
+    let run = run_doctor_in(&fixture.project, &fixture.home, Some(&absent));
+
+    assert_eq!(run.code, Some(1));
+    assert_eq!(run.status("config"), "FAIL");
+    let row = run.row("config");
+    assert!(row.contains("does not exist"), "{row}");
+    assert!(
+        !row.contains("is invalid"),
+        "a missing file must not be described as invalid: {row}"
+    );
+}
+
+#[test]
+fn an_unknown_config_key_warns_only_on_the_config_row_and_leaves_the_model_passing() {
+    // The `config` row already reports unrecognized keys with the right
+    // remediation; repeating it on the `model` row cost that row its PASS
+    // and pointed the user at fallback entries that do not exist here.
+    let fixture = fixture("unknown-key");
+    let mut body = healthy_config("http://127.0.0.1:9/v1");
+    body.push_str("typo_key = \"oops\"\n");
+    let config = write_config(&fixture, &body);
+    let run = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
+
+    assert_eq!(run.code, Some(0));
+    assert_eq!(run.status("config"), "WARN", "{}", run.row("config"));
+    assert!(run.row("config").contains("unknown key"));
+    assert_eq!(
+        run.status("model"),
+        "PASS",
+        "the model resolved and constructed: {}",
+        run.row("model")
+    );
+    assert!(!run.row("model").contains("unknown config key"));
+}
+
+#[test]
+fn an_untrusted_project_reports_fully_warns_with_the_real_command_and_never_grants_trust() {
+    let fixture = fixture("untrusted");
+    let config = write_config(&fixture, &healthy_config("http://127.0.0.1:9/v1"));
+    let catalog = fixture.home.join(".rapidlm").join("project-trust.json");
+    assert!(!catalog.exists());
+
+    let run = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
+
+    assert_eq!(run.code, Some(0), "an untrusted project is not a failure");
+    assert_eq!(run.status("project-trust"), "WARN");
+    assert!(run.stdout.contains("rapid trust grant"));
+    assert_eq!(run.status("workspace-tools"), "WARN");
+
+    // The mandatory read-only guarantee: doctor must not have granted trust.
+    let granted = std::fs::read_to_string(&catalog).unwrap_or_default();
+    assert!(
+        !granted.contains("\"trusted\"") && !granted.contains("Trusted"),
+        "doctor must never grant trust; catalog now reads: {granted}"
+    );
+    let after = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
+    assert_eq!(
+        after.status("project-trust"),
+        "WARN",
+        "a second run must still see an untrusted project"
+    );
+}
+
+#[test]
+fn a_trusted_project_reports_trusted_and_enables_workspace_tools() {
+    let fixture = fixture("trusted");
+    let config = write_config(&fixture, &healthy_config("http://127.0.0.1:9/v1"));
+    // Grant through the real, human-only control plane, not by hand.
+    let grant = Command::new(env!("CARGO_BIN_EXE_rapid"))
+        .args(["trust", "grant"])
+        .current_dir(&fixture.project)
+        .env("HOME", &fixture.home)
+        .env_remove("RAPIDLM_HOME")
+        .output()
+        .expect("rapid trust grant");
+    assert!(grant.status.success(), "{}", String::from_utf8_lossy(&grant.stderr));
+
+    let run = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
+    assert_eq!(run.status("project-trust"), "PASS");
+    assert_eq!(run.status("workspace-tools"), "PASS");
+    assert_eq!(run.code, Some(0));
+}
+
+#[test]
+fn outside_a_project_the_global_checks_still_run_and_project_checks_skip_cleanly() {
+    let root = temp_dir("outside");
+    let home = root.join("home");
+    // A bare directory: no `.rapidlm`, no `.git`, and nothing above it
+    // inside the temp tree.
+    let bare = root.join("bare");
+    std::fs::create_dir_all(home.join(".rapidlm")).expect("home");
+    std::fs::create_dir_all(&bare).expect("bare");
+    let config = home.join(".rapidlm").join("config.toml");
+    std::fs::write(&config, healthy_config("http://127.0.0.1:9/v1")).expect("config");
+
+    let run = run_doctor_in(&bare, &home, Some(&config));
+
+    // Global checks still ran.
+    assert_eq!(run.status("environment"), "PASS");
+    assert_eq!(run.status("config"), "PASS");
+    assert_eq!(run.status("model"), "PASS");
+    assert_eq!(run.status("context-budget"), "PASS");
+    // Project-scoped integrations skip rather than fail or crash. (The
+    // system temp directory may itself sit under a marker on some hosts, so
+    // this asserts the checks are non-fatal, which is the actual contract.)
+    for id in ["scanner", "hooks", "mcp", "plugins"] {
+        let status = run.status(id);
+        assert!(
+            status == "SKIP" || status == "PASS" || status == "WARN",
+            "`{id}` must never fail outside a project, got {status}"
+        );
+    }
+    assert_eq!(run.code, Some(0), "stdout:\n{}", run.stdout);
+}
+
+#[test]
+fn no_configured_model_warns_but_still_reports_a_real_context_budget() {
+    let fixture = fixture("unconfigured");
+    // No config file at all: the documented, supported default state.
+    let run = run_doctor_in(&fixture.project, &fixture.home, None);
+
+    assert_eq!(run.code, Some(0), "an absent config is not a failure");
+    assert_eq!(run.status("config"), "WARN");
+    assert_eq!(run.status("model"), "WARN");
+    assert_eq!(run.status("credentials"), "SKIP");
+    // The typed no-model fallback still has a real, production-derived
+    // budget — `context_budget_for`'s own Unconfigured arm.
+    assert_eq!(run.status("context-budget"), "PASS");
+    assert!(run.row("context-budget").contains("context_window=32768"));
+    assert!(run.row("context-budget").contains("output_reserve=4096"));
+    assert!(run.row("context-budget").contains("source=default (no model configured)"));
+}
+
+#[test]
+fn a_crossed_fallback_chain_reports_the_same_safe_budget_execution_derives() {
+    // The regression fixture for the context-budget safety rule: backend A
+    // has the smaller context window but the smaller output cap, backend B
+    // the larger of both. The safe pair is the *minimum* context_limit with
+    // the *maximum* max_output — 100000 and 16384 — never (100000, 4096),
+    // which would under-reserve headroom for whichever backend actually
+    // serves the turn.
+    let fixture = fixture("crossed-chain");
+    let config = write_config(
+        &fixture,
+        "[models]\ndefault = \"small\"\nfallback = [\"large\"]\n\n\
+         [model.small]\n\
+         provider = \"openai-compatible\"\n\
+         model = \"small-model\"\n\
+         base_url = \"http://127.0.0.1:9/v1\"\n\
+         api_key = \"doctor-e2e-secret-key\"\n\
+         context_window = 100000\n\
+         max_tokens = 4096\n\n\
+         [model.large]\n\
+         provider = \"openai-compatible\"\n\
+         model = \"large-model\"\n\
+         base_url = \"http://127.0.0.1:9/v1\"\n\
+         api_key = \"doctor-e2e-secret-key\"\n\
+         context_window = 400000\n\
+         max_tokens = 16384\n",
+    );
+    let run = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
+
+    assert_eq!(run.code, Some(0), "stdout:\n{}", run.stdout);
+    let row = run.row("context-budget");
+    assert!(row.contains("context_window=100000"), "{row}");
+    assert!(row.contains("output_reserve=16384"), "{row}");
+    assert!(row.contains("input_budget=83616"), "{row}");
+    assert!(row.contains("chain: minimum context_limit / maximum max_output"), "{row}");
+    // And the model row must show the chain it actually resolved.
+    assert!(run.row("model").contains("small -> large"), "{}", run.row("model"));
+}
+
+#[test]
+fn a_secret_bearing_configuration_never_leaks_the_key_on_stdout_or_stderr() {
+    const SECRET: &str = "sk-doctor-must-never-print-this-0123456789";
+    let fixture = fixture("secret");
+    // Deliberately malformed enough that the provider construction path
+    // errors while still carrying the key: the error-formatting path is
+    // exactly where a leak would happen.
+    let config = write_config(
+        &fixture,
+        &format!(
+            "[models]\ndefault = \"local\"\n\n\
+             [model.local]\n\
+             provider = \"openai-compatible\"\n\
+             model = \"test-model\"\n\
+             base_url = \"http://user:{SECRET}@example.invalid/v1\"\n\
+             api_key = \"{SECRET}\"\n"
+        ),
+    );
+    let run = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
+
+    assert!(
+        !run.stdout.contains(SECRET),
+        "the credential leaked to stdout:\n{}",
+        run.stdout
+    );
+    assert!(
+        !run.stderr.contains(SECRET),
+        "the credential leaked to stderr:\n{}",
+        run.stderr
+    );
+    // The failure itself must still be reported — redaction must not hide
+    // the diagnosis, only the secret.
+    assert_eq!(run.status("model"), "FAIL");
+    assert_eq!(run.code, Some(1));
+}
+
+#[test]
+fn a_credential_embedded_only_in_the_base_url_is_also_never_printed() {
+    // The harder case than the one above: the entry is *keyless*, so the
+    // resolved-credential list is empty and the naive "scrub the resolved
+    // key" approach would print this verbatim on the model row and in the
+    // provider-construction error that quotes the URL.
+    const SECRET: &str = "pw-doctor-url-only-must-never-print-4242";
+    let fixture = fixture("secret-url");
+    let config = write_config(
+        &fixture,
+        &format!(
+            "[models]\ndefault = \"local\"\n\n\
+             [model.local]\n\
+             provider = \"openai-compatible\"\n\
+             model = \"test-model\"\n\
+             base_url = \"http://svc:{SECRET}@example.invalid/v1\"\n"
+        ),
+    );
+    let run = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
+
+    assert!(
+        !run.stdout.contains(SECRET),
+        "the URL credential leaked to stdout:\n{}",
+        run.stdout
+    );
+    assert!(
+        !run.stderr.contains(SECRET),
+        "the URL credential leaked to stderr:\n{}",
+        run.stderr
+    );
+    assert_eq!(run.status("model"), "FAIL");
+}
+
+#[test]
+fn the_default_command_makes_no_network_request_to_the_configured_provider() {
+    // A future change that made doctor "verify connectivity" by contacting
+    // the provider — a potentially billable request — would trip this.
+    let wire = tripwire();
+    let fixture = fixture("offline");
+    let config = write_config(
+        &fixture,
+        &healthy_config(&format!("http://{}/v1", wire.addr)),
+    );
+    let run = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
+
+    assert_eq!(run.code, Some(0), "stdout:\n{}", run.stdout);
+    assert_eq!(run.status("model"), "PASS");
+    // Give a stray connection a moment to be recorded before asserting.
+    thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(
+        *wire.connections.lock().expect("lock"),
+        0,
+        "rapid doctor contacted the configured provider; it must stay offline by default"
+    );
+}
+
+#[test]
+fn help_is_printed_without_running_any_check_and_exits_zero() {
+    let fixture = fixture("help");
+    let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
+        .args(["doctor", "--help"])
+        .current_dir(&fixture.project)
+        .env("HOME", &fixture.home)
+        .env_remove("RAPIDLM_HOME")
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("usage: rapid doctor"));
+    assert!(!stdout.contains("PASS "), "help must not run checks:\n{stdout}");
+}
+
+#[test]
+fn configured_hooks_scanners_mcp_and_plugins_are_reported_without_being_executed() {
+    let fixture = fixture("integrations");
+    let config = write_config(&fixture, &healthy_config("http://127.0.0.1:9/v1"));
+
+    // A hook whose script would create a marker file if it ever ran, plus
+    // one whose path does not exist at all.
+    let marker = fixture.project.join("HOOK-RAN");
+    let script = fixture.project.join("hook.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch {}\n", marker.display()),
+    )
+    .expect("hook script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+    }
+    std::fs::write(
+        fixture.project.join(".rapidlm").join("settings.json"),
+        format!(
+            r#"{{"hooks":{{"pre_tool_use":["{}","./definitely-absent-hook.sh"]}},
+                "mcpServers":{{"demo":{{"command":"/bin/echo","args":["hi"]}}}}}}"#,
+            script.display()
+        ),
+    )
+    .expect("settings");
+
+    // A scanner whose executable does not exist.
+    std::fs::write(
+        fixture.project.join(".rapidlm").join("scanners.json"),
+        r#"{"scanners":[{"id":"absent-scanner","kind":"sast","argv":["definitely-not-a-real-scanner-xyz","."]}]}"#,
+    )
+    .expect("scanners");
+
+    let run = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
+
+    // Reported, not fatal — these gate optional capabilities only.
+    assert_eq!(run.code, Some(0), "stdout:\n{}", run.stdout);
+    assert_eq!(run.status("hooks"), "WARN", "{}", run.row("hooks"));
+    assert!(run.row("hooks").contains("definitely-absent-hook.sh"));
+    assert_eq!(run.status("scanner"), "WARN", "{}", run.row("scanner"));
+    assert!(run.row("scanner").contains("absent-scanner"));
+    // MCP is configured but the project is untrusted, so it is truthfully
+    // reported as not registered rather than as working.
+    assert_eq!(run.status("mcp"), "WARN", "{}", run.row("mcp"));
+    assert!(run.row("mcp").contains("demo"));
+    assert!(run.row("mcp").contains("untrusted"));
+
+    // The mandatory guarantee: nothing was executed.
+    assert!(
+        !marker.exists(),
+        "doctor executed a project hook; it must never do that"
+    );
+}
+
+#[test]
+fn the_sandbox_probe_executes_the_real_backend_and_leaves_the_project_untouched() {
+    let fixture = fixture("sandbox");
+    let config = write_config(&fixture, &healthy_config("http://127.0.0.1:9/v1"));
+    let marker = fixture.project.join("source.txt");
+    std::fs::write(&marker, b"untouched").expect("marker");
+    let before: Vec<_> = std::fs::read_dir(&fixture.project)
+        .expect("read")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
+
+    let run = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
+
+    let status = run.status("sandbox-probe");
+    assert!(
+        status == "PASS" || status == "WARN",
+        "the probe must never fail the command: {}",
+        run.row("sandbox-probe")
+    );
+    // The probe runs in a scratch directory, never the project.
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("marker"),
+        "untouched"
+    );
+    let after: Vec<_> = std::fs::read_dir(&fixture.project)
+        .expect("read")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
+    assert_eq!(before.len(), after.len(), "the project gained or lost files");
+}
