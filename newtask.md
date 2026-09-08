@@ -6503,6 +6503,116 @@ alternatives rather than hand-maintaining a second availability table (which wou
 this pass removed), and that synthesis is real work with its own failure modes: it was not attempted at
 the tail of this session rather than guessed at.
 
+## OPEN DECISION — the interactive TUI cannot ask for approval, so out of the box it can only read
+
+**Found 2026-09-08 while scoping the missing approval broker. This is the largest gap found in this
+document's history and it needs a product/architecture decision before it can be fixed. Per the driving
+instruction's own rule, the options and a recommendation are recorded here and the item is stopped for
+user direction. The honest, non-forked parts of it shipped; the fix itself did not.**
+
+### The finding, verified by running the real production composition
+
+`PermissionMode::Default` is the out-of-box mode for the interactive TUI *and* for headless
+`rapid exec` (`exec_permission_lattice(root, None)`; `build_interactive_turn_context` passes
+`forced_mode: None` in production). In that mode `PermissionLattice::evaluate` returns
+`Decision::Ask(ModeAsk)` for every non-`ReadOnly` call, and
+`ExecTools::execute_call_traced` begins `if !decision.is_allowed() { return Denied }` — `Ask` is not
+`Allow`. Verified by driving the exact production chain with no model involved:
+
+```
+mode   = Default
+result = Denied { detail: "workspace_write denied: requires interactive approval; headless exec cannot ask" }
+file exists = false
+```
+
+**So a fresh `rapid` session in a fully trusted project can read files and do nothing else** — no write,
+no `shell_exec` — and the message it shows says "headless exec cannot ask" *inside an interactive
+session*. A user has to discover `RAPIDLM_PERMISSION_MODE` or hand-write a `permissions.allow` rule
+before the agent can act at all.
+
+### Why no test caught it
+
+Both halves are separately tested and separately correct. `permissions.rs` proves `Default` asks;
+`exec_tools.rs` proves a non-allowed decision is denied. The composition was untested — and *could not*
+be caught by the interactive turn suite, because `run_interactive_turn_inner_with_backing` hardcodes
+`forced_mode = Some(PermissionMode::BypassPermissions)` so its tests can be hermetic, with a comment
+saying the permission gate "has its own dedicated test suite". Two correct components, green suites, a
+broken product.
+
+### The machinery that already exists, and is entirely unwired
+
+The request half is built end to end and works: `ToolStepResult::ApprovalRequired` ->
+`TurnEvent::ToolApprovalRequired` (`agent-runtime/src/turn.rs:1620`) -> `EventKind::ToolApprovalRequired`
+-> `tui::state`'s `upsert_approval`/`push_approval_modal` -> `Modal::Approval { id }` -> a compositor
+notice reading *"resolve from the CLI/host approval surface"*. `crates/tui/src/panels/approval.rs` is
+1,586 lines with 12 tests (`ApprovalViewModel`, `ApprovalPrompt`, risk/policy/scope specs, `ApprovalClock`,
+`ApprovalModalChoice`, `ApprovalSubmitIntent`), and `UiRoute::Approvals` exists.
+
+**Three things are missing:** (1) nothing ever *produces* `ToolStepResult::ApprovalRequired` — the gate
+short-circuits to `Denied` first, so the request half never fires; (2) there is no response path at all —
+the session loop reads `modal_stack()` only to compute layout, and no key mapping, channel, or kernel API
+resolves an approval; (3) the "CLI/host approval surface" that notice points at does not exist.
+
+### The fork
+
+`docs/PRD.md`'s **FR-GRAPH-008** states: *"process, approval, user-input and external-condition nodes MUST
+suspend durably without LLM polling."* `docs/V3-CHANGELOG.md` lists "Durable Approval/AskUser/
+external-condition graph waiting nodes", and `docs/development-ledger.md` P2-020 records
+"Approval/AskUser wait token host resume" as VERIFIED. So the specified model is **durable suspension of a
+graph node**. But the interactive turn path is not graph-driven: it runs `run_live_exec` ->
+`agent_runtime::run_turn`, and `rapid run <goal/playbook>` — the graph runner — does not exist. The
+specified design therefore applies to a subsystem that is not wired to the path where the problem is.
+
+**Option A — blocking prompt.** The `Ask` decision calls a synchronous approval source that surfaces a
+modal and blocks until answered, mirroring `ExecTools::set_ask_source`, the existing seam `ask_user`
+already uses (itself production-unwired — a second, related gap). *Cost:* smallest by far; no resumption
+machinery. *Consequences:* the turn thread and the kernel's exclusive turn lease are held across unbounded
+human latency, which collides with `turn_in_flight`, `spawn_wall_time_watchdog` (it would cancel a turn
+that is merely waiting for a person), and Ctrl-C; nothing survives a crash. Contradicts FR-GRAPH-008.
+
+**Option B — durable suspend and resume.** What the spec, the event types, `ApprovalLifecycle` and the
+modal were all designed for. *Cost:* highest; needs turn resumption that exists nowhere, since
+`agent_runtime`'s turn loop has no re-entry point, plus replay of the pending tool call. *Consequences:*
+no lease held across human latency, survives restarts, and is the only option that also serves
+`rapid run`'s graph nodes when that lands.
+
+**Option C — deny now, grant for next time.** Keep the denial, but surface the pending request and let the
+user approve into a persisted `PermissionGrants` entry, which `evaluate` already honours at step 3. *Cost:*
+lowest of all; reuses shipped, tested machinery; no concurrency work. *Consequences:* the current call
+still fails and the model must retry, which is a materially worse UX than any mature CLI, but it is
+durable, crash-safe, and compatible with either A or B later.
+
+**Recommendation: C now, B as the real answer.** C is a small, safe, fully-reusing increment that makes
+the default mode usable and is not thrown away by B. A is the tempting middle and is the one to avoid: it
+buys a good UX by holding a kernel lease across human latency in the product's most safety-critical path,
+and it contradicts a stated requirement. **Not started, pending direction on whether to accept C's retry
+UX, invest in B's resumption machinery, or accept A's lease-holding trade-off.**
+
+### What did ship, being non-forked and true regardless of which option is chosen
+
+- **The denial message was false half the time it was shown and named no way forward.** `ModeAsk` said
+  "requires interactive approval; headless exec cannot ask" — shown verbatim to a user in an interactive
+  session. It now says approval is required, that no surface in this build can prompt for one yet, and
+  names the two things that actually work: a `permissions.allow` entry in `.rapidlm/settings.json`
+  (verified against `parse_settings`/`ToolPattern::parse`) or `RAPIDLM_PERMISSION_MODE`. `AskRule` carried
+  the same false implication and got the same treatment.
+- **A characterization test pinning the composition**,
+  `default_mode_denies_every_write_because_nothing_can_prompt_for_approval`, driving
+  `exec_permission_lattice(root, None)` -> `ExecTools::workspace_with_permissions` — production's own
+  chain, with production's own `forced_mode: None`. It asserts today's behavior, is labelled as
+  characterizing an open gap, asserts the mode really is `Default` first (so an exported
+  `RAPIDLM_PERMISSION_MODE` cannot make it assert something else), and its failure message says that a
+  success means the gap closed and the test should be rewritten. Two revert cycles (42-43): restoring the
+  old wording fails it on "the denial still claims to be headless-only"; making `Default` allow writes
+  fails it with the gap-closed message.
+- `exec_tools`'s existing `permission_gate_denies_calls_as_typed_model_visible_results` asserted on the
+  old wording; it now asserts on the remediation the message names, which is the property worth pinning.
+
+**Deliberately not changed:** the default mode itself. Making the interactive default `AcceptEdits` would
+make the product work by silently widening a permission boundary, which is precisely what must not happen.
+The gap is that Rapid cannot ask, not that it asks too much.
+
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

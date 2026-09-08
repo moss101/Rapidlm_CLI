@@ -5989,6 +5989,93 @@ base_url = "http://127.0.0.1:11434/v1"
         assert!(cancel.is_cancelled(), "stays cancelled, no panic or double-fire");
     }
 
+    /// **Characterization test for a known, open gap — it asserts what the
+    /// product does today, not what it should do.**
+    ///
+    /// In `PermissionMode::Default` — the out-of-box mode for the
+    /// interactive TUI *and* headless exec — every non-read tool call is
+    /// `Decision::Ask`, and `ExecTools` turns any non-`Allow` decision into
+    /// a denial because no surface in this build can prompt for an approval.
+    /// So a fresh `rapid` session in a trusted project can read files and
+    /// nothing else: no write, no shell command.
+    ///
+    /// Each half of that is separately tested and separately correct
+    /// (`permissions.rs` proves `Default` asks; `exec_tools.rs` proves a
+    /// non-allowed decision is denied). The *composition* was untested, and
+    /// could not be caught by the interactive turn suite either, because
+    /// `run_interactive_turn_inner_with_backing` forces
+    /// `BypassPermissions` so its tests can be hermetic.
+    ///
+    /// This drives the exact chain `build_interactive_turn_context` builds
+    /// in production — `exec_permission_lattice(root, None)` then
+    /// `ExecTools::workspace_with_permissions` — so when the approval path
+    /// is built (see `newtask.md`'s "the interactive TUI cannot ask" entry
+    /// and the architecture fork recorded with it), this test failing is the
+    /// intended signal that the gap closed, and it should be rewritten to
+    /// assert the new behavior.
+    #[test]
+    fn default_mode_denies_every_write_because_nothing_can_prompt_for_approval() {
+        use agent_runtime::ToolDriver;
+
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-default-mode-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let root = fs::canonicalize(&dir).expect("canonicalize");
+
+        // Exactly what the interactive turn builds, with production's own
+        // `forced_mode: None`.
+        let lattice = exec_permission_lattice(Some(&root), None).expect("lattice");
+        // A developer machine with RAPIDLM_PERMISSION_MODE exported would
+        // otherwise make this assert something else entirely.
+        assert_eq!(
+            lattice.mode(),
+            crate::permissions::PermissionMode::Default,
+            "this test characterizes the *default* mode; unset RAPIDLM_PERMISSION_MODE to run it"
+        );
+        let mut tools =
+            crate::exec_tools::ExecTools::workspace_with_permissions(&root, lattice)
+                .expect("workspace tools");
+
+        let call = agent_runtime::ProposedToolCall::new(
+            "c1",
+            crate::exec_tools::WORKSPACE_WRITE_TOOL,
+            r#"{"path":"note.md","content":"hello"}"#,
+        )
+        .expect("call");
+        let cancel = agent_runtime::CancellationToken::new();
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            agent_runtime::ToolStepResult::Denied { detail, .. } => {
+                let detail = detail.expect("a denial names its reason");
+                // The message must at least be *true* and actionable while
+                // the gap is open: it used to say "headless exec cannot
+                // ask", which is false in the interactive TUI, where this
+                // same denial is what a user actually hits.
+                assert!(
+                    !detail.contains("headless exec cannot ask"),
+                    "the denial still claims to be headless-only: {detail}"
+                );
+                assert!(
+                    detail.contains("permissions.allow"),
+                    "the denial must name a way forward: {detail}"
+                );
+            }
+            other => panic!(
+                "default mode is expected to deny a write today; if this now succeeds the \
+approval gap has been closed and this characterization test should be rewritten: {other:?}"
+            ),
+        }
+        assert!(
+            !root.join("note.md").exists(),
+            "a denied write must not touch the workspace"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn project_integrations_merge_across_rapidlm_and_claude_settings() {
         let dir = std::env::temp_dir().join(format!(

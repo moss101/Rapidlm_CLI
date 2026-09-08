@@ -8680,8 +8680,11 @@ use std::sync::{Arc, Mutex};
         let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default);
         let mut tools =
             ExecTools::workspace_with_permissions(&root.0, lattice).expect("tools");
-        // File edits in default mode ask; headless exec renders that as a
-        // typed denial with the reason, and nothing is written.
+        // File edits in default mode ask, and *every* surface in this build
+        // renders that as a typed denial with the reason — the interactive
+        // TUI included, because nothing can prompt for an approval yet (see
+        // `interactive::tests::default_mode_denies_every_write_because_
+        // nothing_can_prompt_for_approval`). Nothing is written.
         let calls = vec![
             make_call(
                 "c1",
@@ -8693,9 +8696,13 @@ use std::sync::{Arc, Mutex};
             make_call("c3", REPO_READ_TOOL, r#"{"path":"a.rs"}"#),
         ];
         let results = run_batch(&mut tools, &calls);
+        // Asserted on the remediation the message names rather than on the
+        // old "headless exec cannot ask" wording, which was false wherever
+        // this same denial reached an interactive user.
         assert!(matches!(
             results[0],
-            Ok(ToolStepResult::Denied { ref detail, .. }) if detail.as_deref().unwrap_or("").contains("headless exec cannot ask")
+            Ok(ToolStepResult::Denied { ref detail, .. })
+                if detail.as_deref().unwrap_or("").contains("permissions.allow")
         ));
         assert!(matches!(results[1], Ok(ToolStepResult::Denied { .. })));
         assert!(matches!(results[2], Ok(ToolStepResult::Succeeded { .. })));

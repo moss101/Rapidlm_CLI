@@ -331,13 +331,27 @@ impl DecisionReason {
     pub const fn explanation(self) -> &'static str {
         match self {
             Self::DenyRule => "denied by an explicit deny rule",
-            Self::AskRule => "an ask rule requires interactive approval",
+            Self::AskRule => {
+                "an ask rule requires approval, which no surface in this build can prompt for \
+yet; pre-approve it with a `permissions.allow` entry in .rapidlm/settings.json"
+            }
             Self::AllowRule => "allowed by an explicit allow rule",
             Self::PersistedGrant => "allowed by a persisted per-project grant",
             Self::ReadOnlyAutoAllow => "allowed: read-only calls run without approval",
             Self::EditModeAllow => "allowed: the current mode auto-approves workspace edits",
             Self::BypassAllow => "allowed by bypassPermissions mode",
-            Self::ModeAsk => "requires interactive approval; headless exec cannot ask",
+            // Reached in the *interactive* TUI as well as headless exec —
+            // `PermissionMode::Default` is the out-of-box mode for both, and
+            // `ExecTools` turns any non-`Allow` decision into a denial
+            // because nothing anywhere can prompt for an approval yet (see
+            // `newtask.md`'s "the interactive TUI cannot ask" entry). The
+            // previous wording, "headless exec cannot ask", was therefore
+            // false half the time it was shown, and named no way forward.
+            Self::ModeAsk => {
+                "requires approval, which no surface in this build can prompt for yet; \
+pre-approve this call with a `permissions.allow` entry in .rapidlm/settings.json, or set \
+RAPIDLM_PERMISSION_MODE (acceptEdits allows file edits)"
+            }
             Self::PlanModeDeny => "plan mode is read-only; this call mutates state",
             Self::DontAskDeny => "dontAsk mode silently refuses calls that are not pre-approved",
             Self::UntrustedProject => "the project is not trusted; every tool call is refused",
