@@ -41,9 +41,9 @@ use std::time::Duration;
 use kernel::{CancellationToken, ProjectIdentity, ProjectTrustStore, TrustStatus};
 
 use crate::interactive::{
-    GIT_MARKER, PROJECT_MARKER, TRUST_CATALOG_NAME, build_backing_model,
-    canonicalize_dir, context_budget_for, context_budget_source, detect_project_root,
-    load_project_integrations, resolve_model_plan, user_home_from,
+    FoundProject, GIT_MARKER, PROJECT_MARKER, TRUST_CATALOG_NAME, build_backing_model, context_budget_for,
+    context_budget_source, load_project_integrations, resolve_model_plan, resolve_project_root,
+    user_home_from,
 };
 use crate::user_config::{ConfigSource, CredentialSource};
 
@@ -712,30 +712,6 @@ fn check_context_budget(
     DoctorCheck::pass("context-budget", detail)
 }
 
-/// A resolved project root plus which marker (if any) selected it.
-struct FoundProject {
-    root: PathBuf,
-    marker: Option<&'static str>,
-}
-
-/// The exact chain every real command uses: `canonicalize_dir` then
-/// `detect_project_root`. `detect_project_root` never reports "no project" —
-/// it walks up to the nearest `.rapidlm`/`.git` marker or falls back to the
-/// canonicalized cwd — so the marker is recorded separately to tell a real
-/// project apart from a bare directory.
-fn resolve_project_root(cwd: &Path, cancel: &CancellationToken) -> Result<FoundProject, String> {
-    let cwd = canonicalize_dir(cwd).map_err(|err| format!("{err}"))?;
-    let root = detect_project_root(&cwd, cancel).map_err(|err| format!("{err}"))?;
-    let marker = if root.join(PROJECT_MARKER).exists() {
-        Some(PROJECT_MARKER)
-    } else if root.join(GIT_MARKER).exists() {
-        Some(GIT_MARKER)
-    } else {
-        None
-    };
-    Ok(FoundProject { root, marker })
-}
-
 fn check_project(project: &Result<FoundProject, String>) -> DoctorCheck {
     match project {
         Ok(found) => match found.marker {
@@ -1003,23 +979,66 @@ fn check_mcp(
     integrations: &crate::interactive::ProjectIntegrations,
     trust: Option<&Result<TrustStatus, kernel::ProjectTrustError>>,
 ) -> DoctorCheck {
-    let servers = &integrations.mcp_servers;
-    if servers.is_empty() {
+    let loaded = &integrations.mcp;
+    let servers = loaded.servers();
+    let rejections = loaded.rejections();
+    if servers.is_empty() && rejections.is_empty() {
         return DoctorCheck::skipped("mcp", "no mcpServers configured in project settings");
     }
-    let names: Vec<&str> = servers.iter().map(|server| server.name.as_str()).collect();
+    let names: Vec<&str> = servers
+        .iter()
+        .map(|entry| entry.config.name.as_str())
+        .collect();
     let trusted = matches!(trust, Some(Ok(TrustStatus::Trusted)));
-    if !trusted {
-        return DoctorCheck::warn(
-            "mcp",
+    // A rejected entry is a configured server that will never run — the
+    // single most common reason a user's MCP server "just does not show up"
+    // — so it warns whatever the trust state. Both facts go in one detail:
+    // an earlier version returned on the rejection branch alone and dropped
+    // the untrusted signal, which made an accepted-but-unregistered server
+    // read as "usable".
+    if !rejections.is_empty() || !trusted {
+        let accepted = if names.is_empty() {
+            "none".to_owned()
+        } else {
+            names.join(", ")
+        };
+        let mut detail = if trusted {
+            format!("{} server(s) registered ({accepted})", servers.len())
+        } else {
             format!(
-                "{} server(s) configured ({}) but not registered: the project is untrusted",
-                servers.len(),
-                names.join(", ")
-            ),
-            "run `rapid trust grant` in this project to let configured MCP servers register",
-        );
+                "{} server(s) configured ({accepted}) but not registered: the project is untrusted",
+                servers.len()
+            )
+        };
+        if !rejections.is_empty() {
+            detail.push_str(&format!(
+                "; {} entry/entries rejected — {}",
+                loaded.rejections_total(),
+                rejections
+                    .iter()
+                    .map(|rejection| format!(
+                        "{} in {}: {}",
+                        rejection.name, rejection.file, rejection.issue
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+        let remediation = match (trusted, rejections.is_empty()) {
+            (true, _) => {
+                "run `rapid mcp list` for the full report, then fix or remove the rejected entries"
+            }
+            (false, true) => {
+                "run `rapid trust grant` in this project to let configured MCP servers register"
+            }
+            (false, false) => {
+                "run `rapid trust grant` to register the usable servers, and `rapid mcp list` \
+for the rejected ones"
+            }
+        };
+        return DoctorCheck::warn("mcp", detail, remediation);
     }
+
     DoctorCheck::pass(
         "mcp",
         format!(
@@ -1223,7 +1242,11 @@ fn executable_surfaces(
     if !integrations.hooks.is_empty() {
         surfaces.push(security::ExecutableConfigClass::Hooks);
     }
-    if !integrations.mcp_servers.is_empty() {
+    // Any `mcpServers` entry at all is project-controlled executable
+    // configuration, including one this build rejects: the security
+    // engine's question is what the settings file *declares*, not what
+    // Rapid would run.
+    if !integrations.mcp.servers().is_empty() || !integrations.mcp.rejections().is_empty() {
         surfaces.push(security::ExecutableConfigClass::ProjectMcp);
     }
     if root

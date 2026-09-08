@@ -932,40 +932,53 @@ impl WorkspaceTools {
     }
 
     /// Register configured stdio MCP servers: spawn, initialize, list tools,
-    /// and record `mcp__<server>__<tool>` names on the surface. Servers that
-    /// fail to start or handshake are recorded as offline (calls to them
-    /// fail with a typed handled error) rather than skipped silently.
+    /// and record `mcp__<server>__<tool>` names on the surface.
+    ///
+    /// Every server that does not come up is recorded as offline with a
+    /// marker tool carrying the real reason, so a call to it fails with a
+    /// typed handled error naming the cause. Nothing is skipped silently: a
+    /// server that failed to *handshake* used to be pushed as `online` with
+    /// zero tools, which meant it contributed no surface entry and no
+    /// diagnostic — indistinguishable, from the outside, from never having
+    /// been configured.
+    ///
+    /// The connection itself is [`connect_mcp_server`], shared with
+    /// `rapid mcp probe` so the CLI's report describes the same spawn,
+    /// environment, and handshake a real turn performs.
     pub fn register_mcp_servers(&mut self, servers: &[McpServerConfig]) {
-        use mcp::transport::{
-            ClientCapabilities, ImplementationInfo, IoBounds, McpSession, StdioTransport,
-        };
-        let bounds = IoBounds::new(64 * 1024, Duration::from_secs(30))
-            .expect("standard io bounds");
         for server in servers {
-            let mut command = std::process::Command::new(&server.command);
-            command
-                .args(&server.args)
-                .env_clear();
-            for key in ["PATH", "HOME", "LANG", "TMPDIR"] {
-                if let Ok(value) = std::env::var(key) {
-                    let _ = command.env(key, value);
+            match connect_mcp_server(server) {
+                Ok(connected) => {
+                    // Take ownership first: until the child is inside an
+                    // `McpConnection`, `ConnectedMcpServer`'s own `Drop` is
+                    // what would reap it on a panic below.
+                    let tools = connected.tools.clone();
+                    let (session, child) = connected.into_connection();
+                    self.mcp.lock().expect("mcp").push(McpConnection {
+                        server: server.name.clone(),
+                        online: true,
+                        offline_reason: None,
+                        session: Some(Mutex::new(session)),
+                        child: Some(child),
+                    });
+                    let mut surface = self.mcp_surface.lock().expect("mcp surface");
+                    for tool in &tools {
+                        surface.push((
+                            format!("mcp__{}__{}", server.name, tool.name),
+                            server.name.clone(),
+                            tool.clone(),
+                        ));
+                    }
                 }
-            }
-            let spawn = command
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-            let mut child = match spawn {
-                Ok(child) => child,
-                Err(_) => {
+                Err(err) => {
+                    let reason = err.to_string();
                     self.mcp_surface.lock().expect("mcp surface").push((
                         format!("mcp__{}__offline", server.name),
                         server.name.clone(),
                         mcp::transport::McpToolDescriptor {
                             name: "offline".to_owned(),
                             description: Some(format!(
-                                "server {} failed to start",
+                                "server {} is unavailable: {reason}",
                                 server.name
                             )),
                             input_schema: serde_json::json!({}),
@@ -974,43 +987,12 @@ impl WorkspaceTools {
                     self.mcp.lock().expect("mcp").push(McpConnection {
                         server: server.name.clone(),
                         online: false,
+                        offline_reason: Some(reason),
                         session: None,
                         child: None,
                     });
-                    continue;
-                }
-            };
-            let stdout = child.stdout.take().expect("stdout piped");
-            let stdin = child.stdin.take().expect("stdin piped");
-            let mut session = McpSession::new(
-                StdioTransport::from_pipes(stdout, stdin, None, bounds.clone()),
-                ImplementationInfo::rapidlm(),
-                ClientCapabilities::new(true),
-            );
-            let cancel = capability_broker::CancellationToken::new();
-            let tools = match session.initialize(&cancel) {
-                Ok(_) => match session.tools_list(&capability_broker::CancellationToken::new()) {
-                    Ok(tools) => tools,
-                    Err(_) => Vec::new(),
-                },
-                Err(_) => Vec::new(),
-            };
-            {
-                let mut surface = self.mcp_surface.lock().expect("mcp surface");
-                for tool in &tools {
-                    surface.push((
-                        format!("mcp__{}__{}", server.name, tool.name),
-                        server.name.clone(),
-                        tool.clone(),
-                    ));
                 }
             }
-            self.mcp.lock().expect("mcp").push(McpConnection {
-                server: server.name.clone(),
-                online: true,
-                session: Some(Mutex::new(session)),
-                child: Some(child),
-            });
         }
     }
 
@@ -2706,11 +2688,15 @@ impl WorkspaceTools {
             });
         };
         if !connection.online {
+            let reason = connection
+                .offline_reason
+                .clone()
+                .unwrap_or_else(|| "failed to start".to_owned());
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
                 detail: Some(bounded_detail(&format!(
-                    "MCP server {server_name:?} failed to start"
+                    "MCP server {server_name:?} {reason}"
                 ))),
             });
         }
@@ -3244,6 +3230,25 @@ fn bounded_text(bytes: &[u8], cap: usize) -> String {
 static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write_with_mode(target, bytes, None)
+}
+
+/// [`atomic_write`], plus an explicit Unix file mode applied to the temp file
+/// *before* the rename.
+///
+/// The rename means the target's own mode is not preserved — a fresh temp
+/// file is created with the process umask and takes the target's place. For
+/// most callers that is irrelevant, but a file that carries secrets (an MCP
+/// server's `env`, written by `rapid mcp add`) must not silently become
+/// world-readable, and a mode the user already tightened must not be
+/// relaxed. Setting the mode before the rename leaves no window in which the
+/// content exists at the wrong mode.
+pub(crate) fn atomic_write_with_mode(
+    target: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+) -> std::io::Result<()> {
+    let _ = mode;
     let parent = target.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no parent")
     })?;
@@ -3257,10 +3262,14 @@ pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
         ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let result = (|| -> std::io::Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        let mut file = options.open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
@@ -4411,47 +4420,21 @@ fn parse_ask_user_args(raw: &str) -> Result<(String, Vec<String>), ToolStepError
 }
 
 /// One configured stdio MCP server (Claude `mcpServers` schema subset).
+///
+/// Built only by [`crate::mcp_config`], which owns every validation rule and
+/// bound: by the time one of these exists its name is already known to be a
+/// legal `mcp__<server>__<tool>` component, and its argv and environment are
+/// already bounded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpServerConfig {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
-}
-
-/// Parse `mcpServers` from project settings. Names must be short
-/// identifiers so the wire tool name `mcp__<server>__<tool>` stays bounded.
-pub fn parse_mcp_servers(value: &serde_json::Value) -> Vec<McpServerConfig> {
-    let Some(servers) = value.get("mcpServers").and_then(serde_json::Value::as_object) else {
-        return Vec::new();
-    };
-    let mut configs = Vec::new();
-    for (name, spec) in servers {
-        if configs.len() >= 8 || name.len() > 32 || name.is_empty() {
-            continue;
-        }
-        let Some(spec) = spec.as_object() else {
-            continue;
-        };
-        let Some(command) = spec.get("command").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let args: Vec<String> = spec
-            .get("args")
-            .and_then(serde_json::Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|entry| entry.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
-        configs.push(McpServerConfig {
-            name: name.clone(),
-            command: command.to_owned(),
-            args,
-        });
-    }
-    configs
+    /// Extra environment for the child, applied on top of the inherited
+    /// base set. `register_mcp_servers` calls `env_clear()`, so without this
+    /// a server needing an API key in its environment — most real ones —
+    /// could not be configured at all.
+    pub env: Vec<(String, String)>,
 }
 
 /// A live stdio MCP connection: the supervised child, its JSON-RPC session,
@@ -4459,8 +4442,154 @@ pub fn parse_mcp_servers(value: &serde_json::Value) -> Vec<McpServerConfig> {
 struct McpConnection {
     server: String,
     online: bool,
+    /// Why this server is not usable, when `online` is false. Reported
+    /// verbatim by `execute_mcp_tool` so a model calling the offline marker
+    /// tool learns the actual cause instead of a fixed string.
+    offline_reason: Option<String>,
     session: Option<Mutex<mcp_session_box::SessionBox>>,
     child: Option<std::process::Child>,
+}
+
+/// A configured MCP server that came up: its supervised child, its
+/// initialized JSON-RPC session, and the tools it advertised.
+pub(crate) struct ConnectedMcpServer {
+    pub(crate) tools: Vec<mcp::transport::McpToolDescriptor>,
+    /// `Option` only so [`Self::into_connection`] can hand ownership to a
+    /// caller that takes over teardown; both are always `Some` on the way
+    /// out of [`connect_mcp_server`].
+    session: Option<mcp_session_box::SessionBox>,
+    child: Option<std::process::Child>,
+}
+
+impl Drop for ConnectedMcpServer {
+    /// `std::process::Child` neither kills nor reaps on drop, so without
+    /// this a panic anywhere between a successful connect and the caller
+    /// taking ownership would orphan a live MCP server — the exact failure
+    /// [`McpConnection`]'s own `Drop` exists to prevent. Dropping the
+    /// session first closes the child's stdin, which is how a well-behaved
+    /// server exits on its own.
+    fn drop(&mut self) {
+        drop(self.session.take());
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Why a configured MCP server did not come up.
+#[derive(Debug)]
+pub(crate) enum McpConnectError {
+    /// The child process could not be started at all — a missing or
+    /// non-executable `command` is the overwhelmingly common case.
+    Spawn(std::io::Error),
+    /// The process started but the `initialize` handshake failed.
+    Handshake(String),
+    /// Handshake succeeded but `tools/list` did not.
+    ToolsList(String),
+}
+
+impl std::fmt::Display for McpConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Kept verbatim: `mcp__<server>__offline`'s failure detail has
+            // said "failed to start" since this path existed, and a test
+            // asserts on it.
+            Self::Spawn(err) => write!(f, "failed to start ({err})"),
+            Self::Handshake(err) => write!(f, "handshake failed ({err})"),
+            Self::ToolsList(err) => write!(f, "tools/list failed ({err})"),
+        }
+    }
+}
+
+/// Environment the MCP child always inherits from this process, on top of
+/// which the server's own configured `env` is applied. `env_clear()` first:
+/// a project-declared server is trusted to run, not trusted with this
+/// process's whole environment (API keys for the model provider included).
+const MCP_INHERITED_ENV: [&str; 4] = ["PATH", "HOME", "LANG", "TMPDIR"];
+
+/// Bring one configured MCP server up: spawn it with the bounded
+/// environment, run the `initialize` handshake, and list its tools.
+///
+/// The single place this happens. `ExecTools::register_mcp_servers` uses it
+/// to build the model-facing tool surface, and `rapid mcp probe` uses it to
+/// report whether a configured server actually works — so the CLI can never
+/// report a server healthy under a spawn or handshake this binary would not
+/// really perform.
+pub(crate) fn connect_mcp_server(
+    server: &McpServerConfig,
+) -> Result<ConnectedMcpServer, McpConnectError> {
+    use mcp::transport::{
+        ClientCapabilities, ImplementationInfo, IoBounds, McpSession, StdioTransport,
+    };
+    let bounds = IoBounds::new(64 * 1024, Duration::from_secs(30)).expect("standard io bounds");
+    let mut command = std::process::Command::new(&server.command);
+    command.args(&server.args).env_clear();
+    for key in MCP_INHERITED_ENV {
+        if let Ok(value) = std::env::var(key) {
+            let _ = command.env(key, value);
+        }
+    }
+    // Configured env last, so a server may deliberately override an
+    // inherited variable (e.g. a scoped HOME) rather than being unable to.
+    for (key, value) in &server.env {
+        let _ = command.env(key, value);
+    }
+    let mut child = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(McpConnectError::Spawn)?;
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stdin = child.stdin.take().expect("stdin piped");
+    let mut session = McpSession::new(
+        StdioTransport::from_pipes(stdout, stdin, None, bounds),
+        ImplementationInfo::rapidlm(),
+        ClientCapabilities::new(true),
+    );
+    let cancel = capability_broker::CancellationToken::new();
+    if let Err(err) = session.initialize(&cancel) {
+        // The child owns a pipe this process is about to drop; kill it
+        // rather than leaving a half-initialized server running.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(McpConnectError::Handshake(err.to_string()));
+    }
+    let tools = match session.tools_list(&capability_broker::CancellationToken::new()) {
+        Ok(tools) => tools,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(McpConnectError::ToolsList(err.to_string()));
+        }
+    };
+    Ok(ConnectedMcpServer {
+        tools,
+        session: Some(session),
+        child: Some(child),
+    })
+}
+
+impl ConnectedMcpServer {
+    /// Hand the live session and child to a caller that takes over teardown
+    /// — `ExecTools::register_mcp_servers`, which keeps them for the whole
+    /// turn behind [`McpConnection`]'s own `Drop`. This type's `Drop` then
+    /// has nothing left to reap.
+    pub(crate) fn into_connection(
+        mut self,
+    ) -> (mcp_session_box::SessionBox, std::process::Child) {
+        let session = self.session.take().expect("session taken once");
+        let child = self.child.take().expect("child taken once");
+        (session, child)
+    }
+
+    /// Close the session and reap the child — what a one-shot caller like
+    /// `rapid mcp probe` wants. Teardown itself lives in `Drop`, so an early
+    /// return or a panic gets the same treatment as this explicit call.
+    pub(crate) fn shutdown(self) {
+        drop(self);
+    }
 }
 
 impl Drop for McpConnection {
@@ -4475,7 +4604,7 @@ impl Drop for McpConnection {
     }
 }
 
-mod mcp_session_box {
+pub(crate) mod mcp_session_box {
     use mcp::transport::{McpSession, StdioTransport};
     use std::process::{ChildStdin, ChildStdout};
 
@@ -10643,6 +10772,7 @@ for line in sys.stdin:
             name: "demo".to_owned(),
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
+            env: Vec::new(),
         }];
 
         // Registration: surface gains mcp__demo__echo.
@@ -10664,6 +10794,7 @@ for line in sys.stdin:
             name: "dead".to_owned(),
             command: "/nonexistent/mcp-binary".to_owned(),
             args: vec![],
+            env: Vec::new(),
         }];
         tools.register_mcp_servers(&dead);
         let surface: Vec<String> = tools
@@ -10697,6 +10828,103 @@ for line in sys.stdin:
                 assert!(summary.contains("echo: ping"), "{summary}");
             }
             other => panic!("expected MCP success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_configured_env_reaches_the_mcp_child() {
+        // `connect_mcp_server` calls `env_clear()` and then re-adds a fixed
+        // base set, so before `McpServerConfig::env` existed an MCP server
+        // that needs an API key in its environment could not be configured at
+        // all. The server names its tool after what it actually received, so
+        // this asserts on the real child's environment rather than on the
+        // config struct. The complementary guarantee — that *nothing else*
+        // crosses — is `mcp_server_process_does_not_inherit_ambient_
+        // environment` below, which enumerates the child's whole environment.
+        const SERVER_SCRIPT: &str = r#"#!/usr/bin/env python3
+import sys, json, os
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "envcheck", "version": "1.0"}}})
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": "got_" + os.environ.get("MCP_TEST_TOKEN", "MISSING"),
+             "inputSchema": {"type": "object"}}]}})
+"#;
+        let root = TempRoot::new("mcpenv");
+        let script_path = root.0.join("env-server.py");
+        fs::write(&script_path, SERVER_SCRIPT).expect("write server");
+        let servers = vec![McpServerConfig {
+            name: "envcheck".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script_path.display().to_string()],
+            env: vec![("MCP_TEST_TOKEN".to_owned(), "delivered".to_owned())],
+        }];
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(&servers);
+        let surface: Vec<String> = tools
+            .tool_surface()
+            .iter()
+            .map(|tool| tool.name().to_owned())
+            .collect();
+
+        assert!(
+            surface.iter().any(|name| name == "mcp__envcheck__got_delivered"),
+            "configured env did not reach the child: {surface:?}"
+        );
+    }
+
+    #[test]
+    fn a_server_that_starts_but_fails_the_handshake_is_reported_not_swallowed() {
+        // It used to be pushed as `online` with an empty tool list: no
+        // surface entry, no marker, no diagnostic — indistinguishable from
+        // never having been configured at all.
+        const SERVER_SCRIPT: &str = "#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n";
+        let root = TempRoot::new("mcphandshake");
+        let script_path = root.0.join("quit-server.py");
+        fs::write(&script_path, SERVER_SCRIPT).expect("write server");
+        let servers = vec![McpServerConfig {
+            name: "quitter".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script_path.display().to_string()],
+            env: Vec::new(),
+        }];
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(&servers);
+        let surface: Vec<String> = tools
+            .tool_surface()
+            .iter()
+            .map(|tool| tool.name().to_owned())
+            .collect();
+        assert!(
+            surface.iter().any(|name| name == "mcp__quitter__offline"),
+            "a server that failed the handshake must still be visible: {surface:?}"
+        );
+        let call = make_call("h1", "mcp__quitter__offline", "{}");
+        let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
+        match tools.execute(&validated, &CancellationToken::new()).expect("e") {
+            ToolStepResult::Failed { handled, detail, .. } => {
+                assert!(handled);
+                let detail = detail.expect("detail");
+                assert!(
+                    detail.contains("handshake failed"),
+                    "the real cause must be named, not a generic one: {detail}"
+                );
+            }
+            other => panic!("expected a handled offline failure, got {other:?}"),
         }
     }
 
@@ -10745,6 +10973,7 @@ for line in sys.stdin:
             name: "leaky".to_owned(),
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
+            env: Vec::new(),
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -10809,6 +11038,7 @@ for line in sys.stdin:
             name: "envcheck".to_owned(),
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
+            env: Vec::new(),
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -10892,6 +11122,7 @@ time.sleep(30)
                 script_path.display().to_string(),
                 pid_path.display().to_string(),
             ],
+            env: Vec::new(),
         }];
 
         let mut tools = permissive_workspace(&root.0);
@@ -10935,6 +11166,94 @@ time.sleep(30)
     }
 
     #[test]
+    fn a_connected_server_nobody_took_ownership_of_is_reaped_on_drop() {
+        // `std::process::Child` neither kills nor reaps on drop, so a
+        // `ConnectedMcpServer` that is dropped without `into_connection` —
+        // an early return, an error branch, a panic between connecting and
+        // pushing the `McpConnection` — would orphan a live MCP server.
+        // `McpConnection` has had this guard since it existed; the
+        // intermediate type introduced by sharing the spawn with
+        // `rapid mcp probe` needs the same one.
+        const SERVER_SCRIPT: &str = r#"#!/usr/bin/env python3
+import sys, json, os, time
+with open(sys.argv[1], "w") as f:
+    f.write(str(os.getpid()))
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "sticky", "version": "1.0"}}})
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": []}})
+# A hostile/non-conforming server does not exit on stdin EOF.
+time.sleep(30)
+"#;
+        let root = TempRoot::new("mcp-dropguard");
+        let script_path = root.0.join("sticky.py");
+        fs::write(&script_path, SERVER_SCRIPT).expect("write server");
+        let pid_path = root.0.join("server.pid");
+        let server = McpServerConfig {
+            name: "sticky".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![
+                script_path.display().to_string(),
+                pid_path.display().to_string(),
+            ],
+            env: Vec::new(),
+        };
+
+        fn alive(pid: i32) -> bool {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        }
+
+        let connected = connect_mcp_server(&server).expect("server comes up");
+        let mut pid = None;
+        for _ in 0..100 {
+            if let Ok(contents) = fs::read_to_string(&pid_path)
+                && let Ok(parsed) = contents.trim().parse::<i32>()
+            {
+                pid = Some(parsed);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = pid.expect("server wrote its pid");
+        assert!(alive(pid), "server must be running before the drop");
+
+        // No `into_connection`, no `shutdown` — exactly what a panic or an
+        // early return would leave behind.
+        drop(connected);
+
+        let mut still_alive = true;
+        for _ in 0..100 {
+            if !alive(pid) {
+                still_alive = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !still_alive,
+            "a connected MCP server nobody took ownership of was orphaned"
+        );
+    }
+
+    #[test]
     fn mcp_tool_call_honors_the_callers_real_cancellation_token() {
         const SERVER_SCRIPT: &str = r#"#!/usr/bin/env python3
 import sys, json, time
@@ -10974,6 +11293,7 @@ for line in sys.stdin:
             name: "hang".to_owned(),
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
+            env: Vec::new(),
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);

@@ -6106,6 +6106,197 @@ truthfulness cleanup for other commands; retrieval/RAG or knowledge-store health
 work; and `rapid sandbox status|doctor`, which is a separate advertised-but-unimplemented command family
 and was not touched.
 
+**`rapid mcp` given a real implementation, and project MCP configuration made bounded and honest, done
+2026-09-08.** Two halves of one gap: an advertised command family that did not exist, and a silent
+configuration loader behind it.
+
+**Prior behavior, confirmed by running the compiled binary before touching anything.** `CLI_USAGE`
+advertised `rapid mcp list|add|remove|auth|refresh`, but `run_subcommand` had no `mcp` arm: the command
+printed the generic top-level usage on stderr and exited 2 — byte-identical to what a typo produces.
+**Eighteen other advertised families are in the same state and were deliberately not touched here:**
+`daemon`, `acp`, `sandbox`, `hooks`, `skills`, `context`, `evidence`, `process`, `graph`, `run`, `resume`,
+`fork`, `rewind`, `eval`, `inspect`, `export`, `update`, `computer`. They are the obvious next
+CLI-truthfulness work; `mcp` was chosen first because its *runtime* half is already real and mature
+(`crates/mcp`, 9.3k lines) while its management half was absent, so the win was integration parity rather
+than new subsystem work.
+
+**The runtime half was real, and its loader was the actual problem.** `interactive::load_project_integrations`
+-> `exec_tools::parse_mcp_servers` -> `ExecTools::register_mcp_servers` (spawn, `initialize`, `tools/list`)
+-> `execute_mcp_tool` is a working stdio MCP client, gated on `TrustStatus::Trusted`, proven by
+`mcp_stdio_servers_register_and_dispatch_through_the_session`. `parse_mcp_servers` (36 lines, **zero
+tests**) was where it fell down. Six defects, all with the same single symptom — a configured server that
+simply never appears, with no diagnostic anywhere:
+
+1. **The 8-server cap was applied per file.** `load_project_integrations` called the parser once per entry
+   in `PROJECT_SETTINGS_FILES` and `extend`ed the results, so a project with both `.rapidlm/settings.json`
+   and `.claude/settings.json` could register 16 children — and *adding a settings file silently doubled
+   the ceiling* of a bound whose entire purpose is to stop a project spawning unbounded processes.
+2. **Duplicate names across files each spawned a child.** `execute_mcp_tool` resolves a server with
+   `.find(|c| c.server == name)`, so the second was a live, unreachable process (alive until `Drop`) plus
+   a set of duplicate `mcp__<name>__<tool>` entries on the model-facing surface.
+3. **A name containing `__` produced permanently unroutable tools.** `execute_mcp_tool` splits on the
+   *first* `__`: server `a__b`'s tool `t` is advertised as `mcp__a__b__t` and resolves as server `a`,
+   tool `b__t` -> "is not configured". Nothing validated the name charset at all.
+4. **Every rejection was silent.** No `command`, an over-long name, an entry past the cap, a malformed
+   `args` — all `continue`d with no output on any channel.
+5. **No `env` support, while `register_mcp_servers` calls `env_clear()`.** An MCP server that needs an API
+   key in its environment — most real ones — could not be configured at all.
+6. **A server that started but failed the `initialize` handshake was recorded `online: true` with zero
+   tools:** no surface entry, no offline marker, no diagnostic. Indistinguishable from never having been
+   configured.
+
+**Architecture: one loader, one spawn, shared by every consumer.** New `apps/rapid/src/mcp_config.rs` is
+the single parser/merger, returning admitted servers *and* typed `McpConfigRejection`s.
+`load_project_integrations` calls it (its `mcp_servers: Vec<McpServerConfig>` field became
+`mcp: McpProjectConfig`), `doctor::check_mcp` reads the same value, and `rapid mcp` reads it too — so the
+turn path, the diagnosis, and the management command cannot disagree about which servers will run.
+`exec_tools::parse_mcp_servers` is deleted, not wrapped. The spawn/handshake was extracted out of
+`register_mcp_servers` into `exec_tools::connect_mcp_server`, which `rapid mcp probe` also calls: the CLI
+cannot report a server healthy under a spawn this binary would not really perform.
+`doctor::resolve_project_root`/`FoundProject` moved to `interactive.rs` so `doctor` and `mcp` cannot drift
+into resolving different projects from the same directory.
+
+**Rules the loader now enforces, once, over the merged project view:** at most 8 servers per *project*;
+name non-empty, <= 32 bytes, `[A-Za-z0-9_-]` only, and no `__`; bounded argv (64 x 4 KiB) and env
+(32 x 4 KiB, POSIX-shaped keys); `env` supported and applied *after* the inherited base set (`PATH`,
+`HOME`, `LANG`, `TMPDIR`) so a server may deliberately override one; first settings file wins a name
+collision and the loser is reported as `Shadowed`; a `type`/`url` entry is reported as an unsupported
+*remote transport* rather than as "no command", which is true but useless. A settings file that exists but
+does not parse still contributes nothing (long-standing precedent — a broken settings file has never
+failed a run) but is now *reported* rather than skipped in silence.
+
+**`rapid mcp list|get|add|remove|probe`** (`apps/rapid/src/mcp_admin.rs`, thin `run_mcp` in
+`p9_commands.rs` following `run_doctor`'s precedent; a structured `McpOutcome { text, exit }` so every
+behavior is assertable without capturing a stream). `list` prints usable servers and every rejection with
+its reason, exit 0 — listing is not a diagnosis. `get` reports a *rejected* name as rejected rather than
+absent. `add` writes `.rapidlm/settings.json` through `atomic_write`, refuses to overwrite without
+`--force`, refuses a name/argv/env the loader would reject, refuses to rewrite a settings file it could
+not parse, and re-reads through the real loader afterwards to warn when the entry still would not run.
+`remove` deletes from every settings file that defines it, naming each. `probe` starts the servers for
+real and lists their tools.
+
+**Two boundary decisions worth recording.** (1) `probe` executes project-declared commands, so it is
+gated on `TrustStatus::Trusted` exactly as registration is, and fails closed on an unreadable trust
+catalog — the untrusted case is tested by pointing the configured `command` at `/usr/bin/touch <marker>`
+and asserting the marker does not exist. (2) `add`/`remove` write executable configuration, which is
+acceptable only because subcommands are reachable from this process's argv alone — no model tool, slash
+command, or autonomous-goal path dispatches one, the same argument `run_trust_command` already rests on.
+`auth`/`refresh` were dropped from `CLI_USAGE` rather than stubbed: there is no remote transport wired
+(`crates/mcp`'s `StreamableHttpTransport` exists but nothing constructs it), so advertising them would
+re-create the exact defect this task closes.
+
+**Tests: 47 new in-crate (19 `mcp_config`, 24 `mcp_admin`, 3 `exec_tools`, 1 `interactive`) and 14
+end-to-end against the compiled binary** (`apps/rapid/tests/mcp_cli.rs`). The e2e set
+includes a truthfulness tripwire that parses the `rapid mcp` line out of `rapid --help` and asserts every
+subcommand it advertises actually dispatches (with a negative control, so it can fail), a test that the
+`rapid doctor` mcp row counts the same rejections `rapid mcp list` prints, and one that a real
+`rapid exec` turn warns on stderr about an entry it skipped.
+
+**Revert-cycle verification, twenty-three cycles, each a literal break-and-restore:** (1) project-wide cap
+removed -> `the_server_cap_is_project_wide_not_per_file` failed; (2) cross-file dedupe removed -> the
+shadowing test *and* the `interactive` merged-view test failed; (3) `__` name validation removed -> 3
+failed across two modules; (4) configured `env` dropped on the way to the child -> the child reported
+`got_MISSING`; (5) `probe`'s trust gate removed -> the e2e test failed on *"an untrusted project's
+configured command was executed"*, i.e. the marker file really was created; (6) env values printed by
+`list`/`get` -> the secret tests failed at both levels; (7) `add`'s name validation removed; (8) `add`
+allowed to overwrite an unparsable settings file; (9) handshake failure swallowed (the old behavior) ->
+the server vanished from the surface entirely; (10) the `mcp` dispatch arm removed -> 8 of 11 e2e tests
+failed; (11) `doctor`'s mcp row ignoring rejections; (12) the turn-path stderr warning removed; (13)
+`label()` neutered -> both row-forgery and unbounded-output tests failed; (14) the rejection log unbounded
+-> 96 reported instead of 32; (15) `add`'s argv/env bounds removed; and, for the self-review fixes below,
+(16) the settings write dropping the file mode -> a secret-bearing file came out `0o644`; (17) `add`
+matching rejections by name alone; (18) `probe` no longer escaping server-supplied tool names -> a second,
+fabricated `ok=forged` row appeared in the parsed row list; (19) an unreadable settings file silently
+dropped again; (20) `remove` failing on an unrelated unparsable file; (21) the `--env` usage error echoing
+its operand; (22) `doctor`'s mcp row losing the untrusted signal; (23) `ConnectedMcpServer`'s `Drop` guard
+removed -> the sticky server was orphaned. Cycle 22 is worth recording specifically: on its **first**
+attempt the existing doctor test passed under the broken code, which is what a revert cycle is for — the
+test was strengthened to assert the trust verdict in both directions before the cycle was re-run and
+failed as predicted. All restored and byte-compared against pre-cycle copies; `grep -rn "REVERT
+CYCLE\|if false {" apps/rapid/src` returns nothing.
+
+**Self-review, two passes. The first was my own read of the diff; the second was an adversarial background
+review that reproduced most of its findings against the compiled binary. Fifteen real defects between
+them, all fixed.**
+
+*From the first pass:* (a) **Row forgery and unbounded output.** Settings-derived strings — the
+`mcpServers` key, the `type` value, serde's error text, the `command` path inside a spawn error — were
+interpolated straight into `key=value` report lines. A repository could ship
+`"evil\nserver=fake file=nowhere command=totally-fine"` as a server name and fabricate a `rapid mcp list`
+row, or a 50 KB `type` value and blow out the line. Fixed with `mcp_config::label()` (96-byte cap on a
+char boundary, control characters mapped to spaces, visible `...`), applied at construction so every
+consumer inherits it — the same defense `doctor::bounded` already applies to its own details. (b) **The
+rejection list was unbounded, and every rejection is an `eprintln!` on *every turn*** — a regression this
+change would have introduced, since the old code was silent. Fixed with `MAX_REPORTED_REJECTIONS` (32)
+plus a preserved count of the rest. (c) `McpEnv::allow_spawn` was dead configuration no caller ever set to
+`false`; removed. (d) `add` bounded only per-value length, not argv/env *counts*. (e) An early
+`add_warns_...` test asserted on `list`, not `add`.
+
+*From the adversarial pass, most severe first:* (f) **`rapid mcp add --env` wrote secrets world-readable
+and downgraded a mode the user had tightened.** `atomic_write` renames a fresh temp file into place, so
+the target's mode is replaced, not preserved: a `0600` settings file came out `0644` *containing an API
+token*, and a new one defaulted to the umask. Reproduced against the binary. Fixed by giving
+`atomic_write` an `atomic_write_with_mode` variant that sets the mode on the temp file **before** the
+rename (no window at the wrong mode), with `rapid mcp` preserving an existing file's mode and creating a
+new one `0600`. (g) **`add` reported a working server as broken.** The post-write re-read matched
+rejections by name alone, so a name the *other* settings file also defines produced a `Shadowed` rejection
+that matched — `add` warned that the entry it had just written (and which wins) would not run, naming the
+file it had just written as the shadower, and the `else if` chain swallowed the untrusted note too. Now
+keyed on "did this name end up usable". (h) **`rapid doctor`'s mcp row lost the untrusted signal**: the new
+rejection branch returned before the trust check, so an accepted-but-unregistered server on an untrusted
+project read as "usable". Both facts now go in one detail with a remediation chosen from both. (i)
+**`probe` printed server-supplied tool names unescaped and unbounded** — the one foreign string on a report
+line that skipped `label()`/`quoted()`. A trusted server advertising a tool whose name contains newlines
+printed a fabricated `ok=forged …` row; one advertising thousands put them all on one line. Now
+`quoted(&label(name))` per name, capped at 24 listed with an exact count and a `(+N more)` tail. (j)
+**`remove` exited 1 after a fully successful removal** because an *unrelated* settings file was unparsable
+— a commented `.claude/settings.json` is legal for the tool that owns it, so `rapid mcp remove x || die`
+broke on any such project. Unusable files are now a warning; only a real write failure, or nothing being
+removed anywhere, exits 1. (k) **A settings file that exists but cannot be *read* was silently dropped, and
+`list` then affirmatively denied it existed** ("no `mcpServers` entry in …" for a `chmod 000` file) —
+exactly the silence this module exists to remove. `FileUnreadable` now covers I/O errors too, with only
+`NotFound` treated as absence. (l) **A compatibility break I introduced:** the new name charset was
+`[A-Za-z0-9_-]`, but the old parser validated only length, so a dotted or namespaced name (common in
+`.claude/settings.json`, which this loader reads *for* compatibility) did work. Widened to exactly
+`agent_runtime::turn::valid_ident`'s alphabet (`[A-Za-z0-9._:-]`), which is what the composed
+`mcp__<server>__<tool>` actually has to satisfy — still forbidding `__`. (m) **The `--env` usage error
+echoed its operand**, contradicting the stated guarantee: the typo it catches (a bare value with no
+`KEY=`) is precisely the case where the operand is the secret, and the error lands in shell history and CI
+logs. (n) **`ConnectedMcpServer` had no `Drop` guard.** `std::process::Child` neither kills nor reaps on
+drop, so a panic between a successful connect and the caller taking ownership — e.g. a poisoned
+`mcp_surface` mutex — orphaned a live MCP server. The type now owns teardown in `Drop`, `register_mcp_servers`
+takes ownership via `into_connection` *before* touching any lock, and `shutdown()` is just an explicit drop.
+(o) Three misnamed or vacuous tests were rewritten: `an_env_value_is_never_part_of_an_issue_message` never
+constructed an issue that *could* contain a value (it now parses entries that really carry a secret);
+`probe_fails_closed_when_the_trust_catalog_cannot_be_read` asserted only `exit == 1` and `contains("error:")`,
+both of which also hold for the ordinary untrusted refusal (it now asserts the `trust=unreadable` wording
+and the *absence* of the untrusted wording); and `help_is_available_and_exits_zero` looped asserting
+`MCP_USAGE.contains("list")`, which restates the constant (dropped — the genuine tripwire is in
+`tests/mcp_cli.rs`). `add_writes_a_loadable_entry_and_preserves_unrelated_settings` also had its
+"preserves" claim narrowed to what is actually promised (every unrelated key's *value* survives; key order
+and indentation do not), checked by re-parsing the rewritten file.
+
+**Reported and deliberately not changed, recorded rather than silently dropped:** a symlinked settings file
+is replaced by a regular file rather than written through (a property of `atomic_write`, and the safer
+direction); the read-modify-write in `add`/`remove` is unlocked, so two concurrent `add`s in the same
+project can lose one (a human-invoked command; documented in the CLI reference rather than fixed); a
+usage error prints three usage banners (`MCP_USAGE`, `p9`'s, and `main`'s) — noisy, but exactly what
+`rapid doctor` and every other p9 command already do, so consistency won; and a model with `shell_exec`
+in a trusted project can run `rapid mcp add` itself, which is a durability step beyond a single shell
+call but crosses no boundary it could not already cross by writing `settings.json` directly.
+
+**Verification:** `cargo test -p rapid --lib` 597 passed (up from 550); `cargo test -p rapid --test mcp_cli`
+14 passed; `cargo test -p rapid --test doctor_cli` 17 passed; `cargo clippy -p rapid --all-targets` at or
+below the 56-warning `HEAD` baseline (measured by stashing) with zero findings in any new file or touched
+hunk; full `cargo test --workspace` green.
+
+**Deliberately not attempted:** remote (HTTP/SSE) MCP transports and therefore `rapid mcp auth`; the MCP
+*catalog* subsystem (`crates/mcp/src/catalog.rs`'s `McpCatalogCache`/`ServerCatalog`, still entirely
+unwired) and therefore `rapid mcp refresh`; user- or global-scope MCP configuration (only project scope
+exists); `--json` output (no CLI convention justifies one — same reasoning `rapid doctor` recorded);
+per-server tool allow/deny filtering; MCP resources and prompts (only `tools/*` is wired); OAuth; and the
+eighteen other advertised-but-undispatched command families listed at the top of this entry.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

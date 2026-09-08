@@ -590,6 +590,7 @@ pub const RAPID_SUBCOMMANDS: &[(&str, &str)] = &[
     ("agents", "project agent definitions (list/validate/scaffold)"),
     ("plugins", "plugin trust lifecycle (validate/register/list/approve/reject/hook-test)"),
     ("doctor", "diagnose config/model/trust/sandbox health (offline, read-only)"),
+    ("mcp", "project MCP servers (list/get/add/remove/probe)"),
     ("completions", "emit shell completions: bash|zsh|fish"),
     ("man", "print the manual page text"),
 ];
@@ -623,6 +624,28 @@ pub fn run_doctor(args: &[String]) -> Result<i32, P9CommandError> {
     let report = crate::doctor::diagnose(&crate::doctor::DoctorEnv::from_process());
     print!("{}", report.render());
     Ok(report.exit_code())
+}
+
+/// `rapid mcp list|get|add|remove|probe`: the project MCP server management
+/// control plane (`crate::mcp_admin`).
+///
+/// `CLI_USAGE` advertised `rapid mcp ...` while `run_subcommand` had no arm
+/// for it, so the command printed the generic top-level usage on stderr and
+/// exited 2 — indistinguishable from a typo. Reachable only from this
+/// process's argv, like `rapid trust`: no model tool, slash command, or
+/// autonomous-goal path can add, remove, or probe an MCP server.
+pub fn run_mcp(args: &[String]) -> Result<i32, P9CommandError> {
+    match crate::mcp_admin::run(args, &crate::mcp_admin::McpEnv::from_process()) {
+        Ok(outcome) => {
+            print!("{}", outcome.text);
+            Ok(outcome.exit)
+        }
+        Err(crate::mcp_admin::McpUsageError(message)) => {
+            eprintln!("{message}");
+            eprint!("{}", crate::mcp_admin::MCP_USAGE);
+            Err(P9CommandError::Usage)
+        }
+    }
 }
 
 /// `rapid doctor --help`.

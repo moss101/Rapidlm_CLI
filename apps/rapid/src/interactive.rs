@@ -236,7 +236,7 @@ usage: rapid [subcommand]
   rapid process list|logs|input|cancel|monitor
   rapid computer ...            computer/browser/mobile
   rapid sandbox status|doctor
-  rapid mcp list|add|remove|auth|refresh
+  rapid mcp list|get|add|remove|probe   project MCP servers (stdio)
   rapid plugins validate|register|list|approve|reject|hook-test
   rapid hooks list|test|enable|disable
   rapid skills list|show|enable|disable
@@ -448,6 +448,7 @@ fn run_subcommand(args: &[String]) -> Result<i32, InteractiveError> {
         Some("tools") => p9(&args[1..], crate::p9_commands::run_tools_schema),
         Some("agent-cli") => p9(&args[1..], crate::p9_commands::run_agent_cli),
         Some("doctor") => p9(&args[1..], crate::p9_commands::run_doctor),
+        Some("mcp") => p9(&args[1..], crate::p9_commands::run_mcp),
         Some("sessions") => p9(&args[1..], crate::p9_commands::run_sessions),
         Some("inspect-export") => p9(&args[1..], crate::p9_commands::run_inspect_export),
         Some("cron") => p9(&args[1..], crate::p9_commands::run_cron),
@@ -1565,6 +1566,37 @@ fn exec_permission_lattice(
     Ok(lattice)
 }
 
+/// A resolved project root plus which marker (if any) selected it.
+pub(crate) struct FoundProject {
+    pub(crate) root: PathBuf,
+    pub(crate) marker: Option<&'static str>,
+}
+
+/// The exact chain every real command uses: `canonicalize_dir` then
+/// `detect_project_root`. `detect_project_root` never reports "no project" —
+/// it walks up to the nearest `.rapidlm`/`.git` marker or falls back to the
+/// canonicalized cwd — so the marker is recorded separately to tell a real
+/// project apart from a bare directory.
+///
+/// Lives here rather than in one command's own module so `rapid doctor` and
+/// `rapid mcp` cannot drift into resolving different projects from the same
+/// working directory.
+pub(crate) fn resolve_project_root(
+    cwd: &Path,
+    cancel: &CancellationToken,
+) -> Result<FoundProject, String> {
+    let cwd = canonicalize_dir(cwd).map_err(|err| format!("{err}"))?;
+    let root = detect_project_root(&cwd, cancel).map_err(|err| format!("{err}"))?;
+    let marker = if root.join(PROJECT_MARKER).exists() {
+        Some(PROJECT_MARKER)
+    } else if root.join(GIT_MARKER).exists() {
+        Some(GIT_MARKER)
+    } else {
+        None
+    };
+    Ok(FoundProject { root, marker })
+}
+
 /// Trusted-project config merged from every file in `PROJECT_SETTINGS_FILES`
 /// — the `web_fetch` allowlist, hooks, shadow-diagnostics config, and MCP
 /// servers a `.rapidlm/settings.json` *or* `.claude/settings.json`-only
@@ -1574,7 +1606,14 @@ pub(crate) struct ProjectIntegrations {
     fetch_allowlist: Vec<String>,
     pub(crate) hooks: crate::hooks::HooksConfig,
     shadow: Option<crate::shadow_diagnostics::ShadowDiagnosticsConfig>,
-    pub(crate) mcp_servers: Vec<crate::exec_tools::McpServerConfig>,
+    /// Merged, deduplicated, project-wide-capped MCP configuration plus the
+    /// entries that were *rejected* and why — see [`crate::mcp_config`],
+    /// which owns every rule. This used to be a bare `Vec<McpServerConfig>`
+    /// built by `extend`ing a per-file parse, which applied the server cap
+    /// once per file, let two files each spawn a server of the same name
+    /// (only the first of which was reachable), and dropped every invalid
+    /// entry without a word.
+    pub(crate) mcp: crate::mcp_config::McpProjectConfig,
 }
 
 /// Read and merge every `PROJECT_SETTINGS_FILES` entry under `root`. List-
@@ -1591,7 +1630,6 @@ pub(crate) fn load_project_integrations(root: &Path) -> ProjectIntegrations {
     let mut fetch_allowlist: Vec<String> = Vec::new();
     let mut hooks = crate::hooks::HooksConfig::default();
     let mut shadow = None;
-    let mut mcp_servers = Vec::new();
     for file_name in PROJECT_SETTINGS_FILES {
         let settings_path = root.join(file_name);
         let Ok(text) = fs::read_to_string(&settings_path) else {
@@ -1614,7 +1652,6 @@ pub(crate) fn load_project_integrations(root: &Path) -> ProjectIntegrations {
         if shadow.is_none() {
             shadow = crate::shadow_diagnostics::ShadowDiagnosticsConfig::parse(&value);
         }
-        mcp_servers.extend(crate::exec_tools::parse_mcp_servers(&value));
     }
     // Each file's own HooksConfig::parse already capped itself at
     // MAX_HOOKS_PER_STAGE; re-cap after merging two files' worth so the
@@ -1633,7 +1670,11 @@ pub(crate) fn load_project_integrations(root: &Path) -> ProjectIntegrations {
         fetch_allowlist,
         hooks,
         shadow,
-        mcp_servers,
+        // Its own loader: MCP config is the one integration whose bounds
+        // are project-wide rather than per-file, so it cannot be merged by
+        // the `extend`-per-file loop above without re-introducing exactly
+        // the defects `mcp_config` exists to fix.
+        mcp: crate::mcp_config::load_project_mcp(root),
     }
 }
 
@@ -2449,7 +2490,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             fetch_allowlist: allowlist,
             hooks: merged_hooks,
             shadow: shadow_config,
-            mcp_servers,
+            mcp: mcp_config,
         } = load_project_integrations(root);
         tools.set_fetch_allowlist(allowlist);
         if !merged_hooks.session_start.is_empty() {
@@ -2472,6 +2513,24 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         if let Some(shadow) = shadow_config {
             tools.set_shadow_diagnostics(shadow);
         }
+        for rejection in mcp_config.rejections() {
+            // Never a silent drop: a configured server that will not run is
+            // reported on stderr the same way a broken reminder roster or a
+            // failed fallback model is. Bounded — see
+            // `mcp_config::MAX_REPORTED_REJECTIONS`: nothing limits how many
+            // entries a settings file declares, and this runs on every turn.
+            eprintln!(
+                "warning: MCP server {:?} in {} not registered: {}",
+                rejection.name, rejection.file, rejection.issue
+            );
+        }
+        if mcp_config.rejections_omitted() > 0 {
+            eprintln!(
+                "warning: {} further MCP server(s) not registered; run `rapid mcp list` for the full report",
+                mcp_config.rejections_omitted()
+            );
+        }
+        let mcp_servers = mcp_config.configs();
         if !mcp_servers.is_empty() {
             tools.register_mcp_servers(&mcp_servers);
         }
@@ -5597,6 +5656,71 @@ base_url = "http://127.0.0.1:11434/v1"
             crate::hooks::MAX_HOOKS_PER_STAGE,
             "merged session_start must stay capped at MAX_HOOKS_PER_STAGE"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_integrations_expose_the_merged_capped_mcp_view_the_turn_registers() {
+        // The turn path hands `integrations.mcp.configs()` straight to
+        // `register_mcp_servers`, so this is the exact list that becomes
+        // child processes. It used to be a per-file `extend`, which meant a
+        // name defined in both files spawned twice (only the first
+        // reachable) and the server cap applied once per file.
+        let dir = std::env::temp_dir().join(format!(
+            "project-integrations-mcp-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("rapidlm dir");
+        std::fs::create_dir_all(dir.join(".claude")).expect("claude dir");
+        std::fs::write(
+            dir.join(".rapidlm/settings.json"),
+            r#"{"mcpServers": {"shared": {"command": "native"}, "only-native": {"command": "a"}}}"#,
+        )
+        .expect("rapidlm settings");
+        std::fs::write(
+            dir.join(".claude/settings.json"),
+            r#"{"mcpServers": {"shared": {"command": "compat"},
+                                "only-compat": {"command": "b"},
+                                "broken": {"url": "https://example.com"}}}"#,
+        )
+        .expect("claude settings");
+
+        let integrations = load_project_integrations(&dir);
+        let names: Vec<String> = integrations
+            .mcp
+            .configs()
+            .into_iter()
+            .map(|config| config.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "only-native".to_owned(),
+                "shared".to_owned(),
+                "only-compat".to_owned()
+            ],
+            "one entry per name, first file winning"
+        );
+        assert_eq!(
+            integrations
+                .mcp
+                .get("shared")
+                .expect("shared")
+                .config
+                .command,
+            "native",
+            "the earlier settings file wins a name collision"
+        );
+        // And the entries that will not run are reported rather than dropped.
+        let rejected: Vec<&str> = integrations
+            .mcp
+            .rejections()
+            .iter()
+            .map(|rejection| rejection.name.as_str())
+            .collect();
+        assert_eq!(rejected, vec!["broken", "shared"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

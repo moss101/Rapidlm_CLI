@@ -22,7 +22,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 | `rapid process list|logs|input|cancel|monitor` | supervised tasks |
 | `rapid computer ...` | computer/browser/mobile actions |
 | `rapid sandbox status|doctor` | isolation diagnostics |
-| `rapid mcp list|add|remove|auth|refresh` | MCP integration |
+| `rapid mcp list|get|add|remove|probe` | project MCP servers (stdio); see the MCP section below |
 | `rapid plugins validate|register|list|approve|reject|hook-test` | plugin manifest validation, trust ledger (register stores untrusted; only explicit approve grants capabilities), and hook dry-run against a fixture event |
 | `rapid hooks list|test|enable|disable` | lifecycle hooks |
 | `rapid skills list|show|enable|disable` | skills |
@@ -108,4 +108,56 @@ cannot print it. Credential rows report the *source* production selected (inline
 **Not covered.** Daemon/ACP reachability, MCP server handshakes, plugin execution, and
 retrieval/index health are outside this command; where the state is knowable locally it
 is reported honestly (for example, MCP servers are listed as configured-but-unregistered
-on an untrusted project) and never claimed to be verified.
+on an untrusted project, and entries this build cannot run are counted with their
+reasons) and never claimed to be verified. `rapid mcp probe` is the command that
+actually performs an MCP handshake.
+
+## `rapid mcp` — project MCP servers
+
+Manages the servers a project declares under `mcpServers` in `.rapidlm/settings.json`
+(and `.claude/settings.json`, which is **read** for compatibility; `add` only ever
+creates entries in `.rapidlm/settings.json`, but `remove` deletes from whichever files
+define the server — a `remove` that left the server running would be worse than one that
+edits a shared file). Every command reads through the same loader the turn path uses, so
+this can never report a server a turn would not register, or hide one it would.
+
+| Command | Behavior |
+|---|---|
+| `list` | Every usable server (name, source file, command, arg count, env *key* names) and every rejected entry with its reason. Read-only; starts nothing. Exits `0` even when entries were rejected — listing is not a diagnosis. |
+| `get <name>` | One server's full configuration plus the `mcp__<server>__*` prefix its tools appear under. A name that is configured but rejected reports the rejection, not "not configured". Exits `1` for an unusable or unknown name. |
+| `add <name> --command <program> [--arg <v>]... [--env KEY=VALUE]... [--force]` | Writes a stdio entry into `.rapidlm/settings.json` (temp-file-then-rename). Refuses to overwrite an existing entry without `--force`, refuses a name the loader would reject, and refuses to rewrite a settings file it could not parse. Re-reads through the loader afterwards and warns if the new entry still would not run. |
+| `remove <name>` | Removes the entry from every project settings file that defines it, naming each. Exits `1` if no file defined it. A settings file it could not read is a warning, not a failure — a commented `.claude/settings.json` must not break `rapid mcp remove`. |
+| `probe [<name>]` | Starts the configured server(s) for real — the same spawn, environment, and `initialize`/`tools/list` handshake a turn performs — and reports the tools each advertises. Servers are probed one at a time and one that never answers costs up to 30 seconds each. Exits `1` if any probed server did not come up. |
+
+**Trust.** `probe` executes project-declared commands, so it requires the project to be
+trusted, exactly as registration does, and fails closed on an unreadable trust catalog.
+`list`/`get` are read-only. `add`/`remove` edit settings files and are reachable only
+from this process's argv — no model tool, slash command, or autonomous-goal path
+dispatches a subcommand.
+
+**Secrets.** An `env` value is never printed by any command; only its key name is —
+including by the `--env` usage error, whose operand *is* the secret in the case it
+catches. A settings file this command creates is owner-only (`0600`), because an `env`
+value is usually a token; one that already exists keeps whatever mode it has.
+
+**Writes.** `add`/`remove` rewrite the settings file as pretty-printed JSON through a
+temp-file-then-rename. Every other key's value is preserved; object key order and
+original indentation are not. A settings file that does not parse is refused, never
+rewritten. The read-modify-write is not locked, so two concurrent `add`s in the same
+project can lose one — an accepted limitation for a human-invoked command.
+
+**Supported transports.** stdio only. An entry with `type`/`url` and no `command` is
+reported as an unsupported remote transport rather than being silently ignored.
+
+**Bounds, applied to the merged project view rather than per file.** At most 8 servers
+per project; a name must be non-empty, at most 32 bytes, and inside
+`agent_runtime::turn::valid_ident`'s alphabet (`[A-Za-z0-9._:-]` — the same set the
+composed tool name has to satisfy), and must not contain `__` (the
+`mcp__<server>__<tool>` separator — a name containing it would make every one of that
+server's tools unroutable). When more than 8 are configured, the ones that fit are chosen
+by settings-file order and then by ascending server name, *not* by the order they appear
+in the file, and the rest are reported as rejected. A name defined in both settings files
+resolves to the first file's entry, and the second is reported as shadowed rather than
+being spawned as an unreachable duplicate. Every rejection appears in `rapid mcp list`,
+in the `mcp` row of `rapid doctor`, and as a stderr warning on the turn that skipped it;
+the per-turn warning is capped at 32 lines plus a count of the rest.
