@@ -32,7 +32,7 @@ pub mod transcript;
 
 pub use commands::{
     CommandError, FrontendAction, HandoffDest, InlineHelp, Inspector, KernelAction, KernelApi,
-    LocalAction, PaletteEntry, TakeoverSurface, UiCommand, dispatch, parse_command, suggest,
+    LocalAction, PermissionsIntent, PaletteEntry, TakeoverSurface, UiCommand, dispatch, parse_command, suggest,
 };
 pub use composer::{
     ComposerCommand, ComposerError, ComposerEvent, ComposerModel, ComposerView, Motion,

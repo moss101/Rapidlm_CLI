@@ -74,6 +74,18 @@ pub enum UiCommand {
     },
     OpenMemory,
     OpenPermissions,
+    /// Grant control plane. Not a [`KernelAction`], and deliberately not
+    /// approval-gated: a grant *is* the user's approval, so requiring an
+    /// approval to record one would be circular. This is the same reason
+    /// `rapid trust grant` is not gated either — and the opposite of
+    /// `/mcp remove`, which asks the agent's control plane to mutate
+    /// project configuration and therefore stays gated.
+    PermissionsAllow {
+        pattern: String,
+    },
+    PermissionsRevoke {
+        pattern: String,
+    },
     ContextStatus,
     ContextSearch {
         query: String,
@@ -219,6 +231,18 @@ pub enum FrontendAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalAction {
     Open(Inspector),
+    /// Record or remove a persisted per-project tool grant. Local because it
+    /// is a host-level file the frontend owns, not kernel/session state — and
+    /// because a grant is the user's own approval, it carries no approval
+    /// gate of its own (see [`UiCommand::PermissionsAllow`]).
+    Permissions(PermissionsIntent),
+}
+
+/// Which way a [`LocalAction::Permissions`] goes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PermissionsIntent {
+    Allow { pattern: String },
+    Revoke { pattern: String },
 }
 
 /// Inspector the TUI can focus. Mapping onto [`UiRoute`] is best-effort.
@@ -506,8 +530,8 @@ const CATALOG: &[CommandSpec] = &[
     CommandSpec {
         name: "permissions",
         aliases: &[],
-        usage: "/permissions",
-        summary: "open the permission inspector",
+        usage: "/permissions [list|allow <pattern>|revoke <pattern>]",
+        summary: "list or record this project's tool grants",
     },
     CommandSpec {
         name: "plugins",
@@ -628,7 +652,7 @@ pub fn parse_command(input: &str) -> Result<UiCommand, CommandError> {
         Some("computer") => parse_computer(&args),
         Some("jobs") => parse_jobs(&args),
         Some("mcp") => parse_mcp(&args),
-        Some("permissions") => expect_none("permissions", &args, UiCommand::OpenPermissions),
+        Some("permissions") => parse_permissions(&args),
         Some("plugins") => parse_plugins(&args),
         Some("policy") => parse_policy(&args),
         Some("sandbox") => parse_sandbox(&args),
@@ -737,6 +761,12 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         UiCommand::McpAdd { target } => FrontendAction::Kernel(KernelAction::AddMcp { target }),
         UiCommand::McpRemove { name } => FrontendAction::Kernel(KernelAction::RemoveMcp { name }),
         UiCommand::McpAuth { name } => FrontendAction::Kernel(KernelAction::AuthMcp { name }),
+        UiCommand::PermissionsAllow { pattern } => {
+            FrontendAction::Local(LocalAction::Permissions(PermissionsIntent::Allow { pattern }))
+        }
+        UiCommand::PermissionsRevoke { pattern } => {
+            FrontendAction::Local(LocalAction::Permissions(PermissionsIntent::Revoke { pattern }))
+        }
         UiCommand::PluginList => FrontendAction::Local(LocalAction::Open(Inspector::Plugins)),
         UiCommand::PluginInstall { spec } => {
             FrontendAction::Kernel(KernelAction::InstallPlugin { spec })
@@ -1207,6 +1237,41 @@ fn parse_mcp(args: &[&str]) -> Result<UiCommand, CommandError> {
         }),
         _ => Err(invalid("mcp")),
     }
+}
+
+/// `/permissions [list|allow <pattern>|revoke <pattern>]`.
+///
+/// Bare `/permissions` and `list` both open the inspector, which renders the
+/// project's real grants; `allow`/`revoke` write them.
+fn parse_permissions(args: &[&str]) -> Result<UiCommand, CommandError> {
+    match args {
+        [] | ["list"] => Ok(UiCommand::OpenPermissions),
+        ["allow", rest @ ..] => Ok(UiCommand::PermissionsAllow {
+            pattern: require_pattern("permissions", rest)?,
+        }),
+        ["revoke", rest @ ..] => Ok(UiCommand::PermissionsRevoke {
+            pattern: require_pattern("permissions", rest)?,
+        }),
+        _ => Err(invalid("permissions")),
+    }
+}
+
+/// A tool-permission pattern operand: `Tool` or `Tool(arg-glob)`.
+///
+/// Joined rather than requiring one shell word, because the glob half is
+/// routinely written with spaces (`shell_exec(git *)`) and a composer line is
+/// split on whitespace. Validated only for shape here — the authority on the
+/// grammar is `permissions::ToolPattern::parse`, which the host runs before
+/// anything is written, so this never becomes a second parser.
+fn require_pattern(command: &'static str, args: &[&str]) -> Result<String, CommandError> {
+    if args.is_empty() {
+        return Err(invalid(command));
+    }
+    let joined = args.join(" ");
+    if joined.len() > MAX_COMMAND_BYTES {
+        return Err(CommandError::TooLong);
+    }
+    Ok(joined)
 }
 
 fn parse_plugins(args: &[&str]) -> Result<UiCommand, CommandError> {

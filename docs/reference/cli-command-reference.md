@@ -149,6 +149,12 @@ Patterns are `Tool` or `Tool(arg-glob)` — the same grammar the `permissions` r
 `.rapidlm/settings.json` use, parsed by the same `ToolPattern::parse`, so this command
 cannot write a pattern the loader would reject.
 
+**In the TUI.** `/permissions` prints the same report and names any tool this session
+already saw denied; `/permissions allow <pattern>` and `/permissions revoke <pattern>`
+write through the very same code path, so there is one writer and one grammar. A grant is
+the user's own approval, so — unlike `/mcp remove` — it carries no approval gate of its
+own, for the same reason `rapid trust grant` does not.
+
 **Boundaries.** A grant only ever narrows the gap between "ask" and "allow": it cannot
 widen past a managed-policy tool ban, or past a write-scope ceiling for the file-edit
 tools that ceiling governs — both are checked before grants are consulted. (A write-scope

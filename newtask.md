@@ -6645,7 +6645,59 @@ doctor` row reporting this project's grants (worth adding, and it would have to 
 (`ApprovalScopeId::SessionExact` exists in `capability-broker` and has no persistence story here); and
 any TUI surface for granting, which is approval-gated for the same reason `/mcp remove` is.
 
-## OPEN DECISION — the interactive TUI cannot ask for approval, so out of the box it can only read
+**Option C chosen and its first half built: the TUI can now grant what it just denied, done 2026-09-08.**
+The user picked **C (deny + grant)** from the open decision above — keep the denial, surface the pending
+request, let the user approve it into a persisted grant — over B (durable suspend/resume) and A (blocking
+modal). The decision is recorded; the entry above stays as the record of the options and why A was the
+one to avoid.
+
+**What shipped.** `/permissions` in the TUI is real. The slash grammar grew from a bare
+`/permissions` (which opened a route-less inspector, i.e. did nothing) to
+`/permissions [list|allow <pattern>|revoke <pattern>]`, dispatched through a new
+`LocalAction::Permissions(PermissionsIntent)` and handled by `apps/rapid` calling
+`permissions_cli::run` — *the same entry point* `rapid permissions` uses, with this session's own
+project root and RapidLM home. One writer, one pattern grammar, one store format. Bare `/permissions`
+now prints the real grant report instead of a "no panel yet" note, and appends the tools this session
+already saw denied, so a user does not have to reconstruct them from the transcript.
+
+**Why this one is not approval-gated, when `/mcp remove` is.** `KernelAction::requires_approval`
+classifies every MCP mutation as needing approval, which is why `/mcp remove` reports that it cannot run.
+A grant is categorically different: it *is* the user's approval. Gating it on an approval would be
+circular, and it is the only way in this build to act on the denial the default permission mode produces.
+That is also why it is a `LocalAction` — a host-owned file, not kernel or session state — and it matches
+`rapid trust grant`, which is likewise not gated. Recorded here because "add a mutating `LocalAction`"
+is exactly the move that would be wrong for an agent-requested privileged operation.
+
+**A grammar detail worth recording:** a composer line is split on whitespace, but the glob half of a
+pattern is routinely written with spaces (`shell_exec(git *)`). The operand is therefore rejoined rather
+than requiring one shell word. It is *not* validated in `crates/tui` beyond length — the authority on the
+grammar stays `permissions::ToolPattern::parse`, which the host runs before anything is written, so this
+never becomes a second parser. Revert cycle 55 (taking only the first word) fails
+`permissions_slash_command_accepts_a_pattern_with_a_glob`.
+
+**What is deliberately still missing from C, and it is the honest gap:** the denial's *reason* never
+reaches the UI. `TurnEvent::ToolDenied` carries `turn_id`, `call_id` and `tool` — the `detail` from
+`ToolStepResult::Denied` (which does name the remedy) goes only to the model as a tool result. So the
+transcript shows `workspace_write: denied` with no reason, and `/permissions` deliberately does *not*
+claim a grant would help: a call denied by a deny rule, plan mode, or a managed-policy ban stays denied
+whatever is granted, and guessing would be worse than saying nothing. Closing that means adding a reason
+field to `TurnEvent::ToolDenied`, its ledger payload, and `tui::state`'s fold — a contained, additive
+cross-crate change, and the obvious next step for C.
+
+**Tests: 5 new, driving the real interactive session.** The load-bearing one grants through
+`/permissions allow` in a scripted TUI session and then reads the store back with
+`persisted_grants_for` — the production reader — asserting the grant reached the place a real run looks.
+Three revert cycles (54-56): routing `allow` to `list` fails the store read-back; taking only the first
+operand word loses the glob; restoring the route-less no-op for `Inspector::Permissions` fails the
+real-report test. Two pre-existing tests were updated rather than worked around —
+`an_inspector_with_no_tui_route_says_something_instead_of_silently_doing_nothing` and the unrouted-message
+tests no longer list `/permissions`, because it is no longer unrouted; both now say so in a comment.
+
+**Verification:** `cargo test -p rapid --lib` 640 passed; `cargo test -p tui` 225 + 9; every `apps/rapid`
+integration suite unchanged; `cargo clippy -p rapid -p tui --all-targets` 54 warnings, below the 56
+baseline, none in a touched hunk; full `cargo test --workspace` green.
+
+## DECIDED (2026-09-08, option C) — the interactive TUI cannot ask for approval, so out of the box it can only read
 
 **Found 2026-09-08 while scoping the missing approval broker. This is the largest gap found in this
 document's history and it needs a product/architecture decision before it can be fixed. Per the driving

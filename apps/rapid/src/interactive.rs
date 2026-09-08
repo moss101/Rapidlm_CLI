@@ -34,7 +34,7 @@ use tui::state::{
 };
 use tui::{
     AppState, CommandError, FrontendAction, FrontendKind, Inspector, KernelAction, KernelApi,
-    LocalAction,
+    LocalAction, PermissionsIntent,
     RecordingBackend, TerminalError, TerminalGuard, dispatch, parse_command, reduce,
 };
 
@@ -1382,10 +1382,9 @@ stacks are in-process constants, and there is no TUI panel over them"
             "no TUI sandbox panel yet; `rapid doctor` reports the selected backend and runs a \
 real sandboxed smoke probe"
         }
+        // Handled by `open_unrouted_inspector` with the real grant report.
         Inspector::Permissions => {
-            "no TUI permission panel yet; `rapid permissions list` reports this project's \
-persisted grants, and the rest comes from the project settings files and \
-RAPIDLM_PERMISSION_MODE"
+            "permissions are reported inline and should not reach this message"
         }
         Inspector::Computer => {
             "computer-use is not wired into the interactive session yet, so there is no state \
@@ -3715,6 +3714,10 @@ impl SessionLoop<'_> {
                     }
                     Ok(LoopControl::Continue)
                 }
+                FrontendAction::Local(LocalAction::Permissions(intent)) => {
+                    self.apply_permissions_intent(intent);
+                    Ok(LoopControl::Continue)
+                }
                 FrontendAction::InlineHelp(help) => {
                     self.append_command_output(help.usage().to_owned());
                     Ok(LoopControl::Continue)
@@ -3747,6 +3750,75 @@ impl SessionLoop<'_> {
         }
     }
 
+    /// Tools this session already saw denied, so `/permissions` can name
+    /// candidates rather than making a user reconstruct them from the
+    /// transcript.
+    ///
+    /// Read from the transcript the production event fold built, which is
+    /// the only record of it the frontend has: `TurnEvent::ToolDenied`
+    /// carries the tool name but *not* the reason, so this deliberately does
+    /// not claim a grant would help — a call denied by a deny rule, plan
+    /// mode, or a managed-policy ban stays denied whatever is granted.
+    fn denied_this_session(&self) -> String {
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for entry in self.ui.transcript() {
+            if let tui::state::TranscriptEntry::ToolActivity { tool, status } = entry
+                && *status == tui::state::ToolActivityStatus::Denied
+            {
+                seen.insert(tool.as_str());
+            }
+        }
+        if seen.is_empty() {
+            return String::new();
+        }
+        format!(
+            "denied-this-session={}\nnote: `/permissions allow <tool>` pre-approves a call \
+that was denied for approval; one denied by a rule, plan mode, or managed policy stays \
+denied\n",
+            seen.into_iter().collect::<Vec<_>>().join(",")
+        )
+    }
+
+    /// `/permissions allow|revoke <pattern>` through the production
+    /// `rapid permissions` path.
+    ///
+    /// The same `permissions_cli::run` the subcommand uses, with this
+    /// session's own project and RapidLM home — no second writer, and no
+    /// second interpretation of the pattern grammar or the store format.
+    ///
+    /// Not approval-gated, unlike `/mcp remove`: a grant *is* the user's
+    /// approval, so gating it on an approval would be circular. It is also
+    /// the only way, in this build, for a user to act on the denial the
+    /// default permission mode produces — see `newtask.md`'s open decision.
+    fn apply_permissions_intent(&mut self, intent: PermissionsIntent) {
+        let (verb, pattern) = match intent {
+            PermissionsIntent::Allow { pattern } => ("allow", pattern),
+            PermissionsIntent::Revoke { pattern } => ("revoke", pattern),
+        };
+        let outcome = crate::permissions_cli::run(
+            &[verb.to_owned(), pattern],
+            &self.permissions_env(),
+        );
+        match outcome {
+            Ok(outcome) if outcome.exit == 0 => self.append_command_output(outcome.text),
+            Ok(outcome) => self.append_command_error(outcome.text),
+            Err(crate::permissions_cli::PermissionsUsageError(message)) => {
+                self.append_command_error(message)
+            }
+        }
+    }
+
+    /// The project and RapidLM home *this session* resolved, for
+    /// `rapid permissions`' own entry point — the same reasoning as
+    /// [`Self::mcp_env`].
+    fn permissions_env(&self) -> crate::permissions_cli::PermissionsEnv {
+        crate::permissions_cli::PermissionsEnv {
+            cwd: self.root.to_path_buf(),
+            env: Vec::new(),
+            home: Some(self.user_home.to_path_buf()),
+        }
+    }
+
     /// An inspector the TUI has no route for: render whatever real report
     /// this build can produce, or say precisely why it cannot.
     ///
@@ -3755,6 +3827,24 @@ impl SessionLoop<'_> {
     /// `run_subcommand`'s dispatch table by
     /// `every_command_an_unrouted_inspector_message_names_actually_exists`.
     fn open_unrouted_inspector(&mut self, inspector: Inspector) {
+        if matches!(inspector, Inspector::Permissions) {
+            // The real report `rapid permissions list` prints, from the same
+            // store a real run reads — not a note saying there is no panel.
+            match crate::permissions_cli::run(
+                &["list".to_owned()],
+                &self.permissions_env(),
+            ) {
+                Ok(outcome) => {
+                    let mut text = outcome.text;
+                    text.push_str(&self.denied_this_session());
+                    self.append_command_output(text);
+                }
+                Err(crate::permissions_cli::PermissionsUsageError(message)) => {
+                    self.append_command_error(message);
+                }
+            }
+            return;
+        }
         if matches!(inspector, Inspector::Mcp) {
             // `/mcp list` and `/mcp doctor` both land here. The report is
             // the one `rapid mcp list` prints, from the same loader the
@@ -7847,8 +7937,12 @@ approval gap has been closed and this characterization test should be rewritten:
             "/playbook list",
             "/trace show",
             "/insights show",
-            "/permissions",
             "/computer status",
+            // `/mcp list` and `/permissions` were in this list too, until
+            // they were given real backends. They are now covered by
+            // `mcp_list_renders_the_real_project_report_inline` and
+            // `bare_permissions_renders_the_real_grant_list_not_a_no_panel_note`,
+            // which assert real content rather than an honest refusal.
         ] {
             let env = TempEnv::create();
             let report = run_interactive(env.options_capturing_render(vec![
@@ -7870,6 +7964,9 @@ approval gap has been closed and this characterization test should be rewritten:
         // The value of these messages is that they differ. A table of
         // identical "not available" strings would satisfy the test above
         // while telling a user nothing.
+        // `Inspector::Mcp` and `Inspector::Permissions` are absent: both are
+        // handled with a real report before `unrouted_inspector_text` is
+        // reached, so their entries there are unreachable placeholders.
         let messages: Vec<String> = [
             Inspector::Knowledge,
             Inspector::Playbook,
@@ -7879,7 +7976,6 @@ approval gap has been closed and this characterization test should be rewritten:
             Inspector::Plugins,
             Inspector::Policy,
             Inspector::Sandbox,
-            Inspector::Permissions,
             Inspector::Computer,
         ]
         .iter()
@@ -7916,7 +8012,6 @@ approval gap has been closed and this characterization test should be rewritten:
             Inspector::Plugins,
             Inspector::Policy,
             Inspector::Sandbox,
-            Inspector::Permissions,
             Inspector::Computer,
         ]
         .iter()
@@ -7942,6 +8037,112 @@ subcommand"
             rest = &rest[end..];
         }
         assert!(named >= 4, "expected several messages to point at a real command");
+    }
+
+    #[test]
+    fn permissions_slash_command_grants_through_the_real_store() {
+        // Option C's whole point: a user who sees a call denied can approve
+        // it from inside the session, and the next run really allows it.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/permissions allow workspace_write".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(painted.contains("allow=workspace_write"), "{painted}");
+
+        // Read back the way a real run does: the production reader, against
+        // the home this session used.
+        let canonical = fs::canonicalize(&env.project).expect("canonicalize");
+        let grants = persisted_grants_for(&canonical, &env.user_home);
+        assert_eq!(
+            grants
+                .iter()
+                .map(crate::permissions::ToolPattern::render)
+                .collect::<Vec<_>>(),
+            vec!["workspace_write".to_owned()],
+            "the slash command did not reach the store a real run reads"
+        );
+    }
+
+    #[test]
+    fn permissions_slash_command_accepts_a_pattern_with_a_glob() {
+        // A composer line is split on whitespace, and the glob half is
+        // routinely written with spaces (`shell_exec(git *)`), so the
+        // operand is rejoined rather than requiring one shell word.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options(vec![
+            InteractiveInput::Submit("/permissions allow shell_exec(git *)".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let canonical = fs::canonicalize(&env.project).expect("canonicalize");
+        assert_eq!(
+            persisted_grants_for(&canonical, &env.user_home)
+                .iter()
+                .map(crate::permissions::ToolPattern::render)
+                .collect::<Vec<_>>(),
+            vec!["shell_exec(git *)".to_owned()]
+        );
+    }
+
+    #[test]
+    fn bare_permissions_renders_the_real_grant_list_not_a_no_panel_note() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/permissions allow repo_read".to_owned()),
+            InteractiveInput::Submit("/permissions".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(painted.contains("grants=1"), "{painted}");
+        assert!(painted.contains("allow=repo_read"), "{painted}");
+        assert!(
+            !painted.contains("no TUI permission panel"),
+            "the route-less placeholder is gone: {painted}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_permission_pattern_is_refused_and_writes_nothing() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/permissions allow not/a/pattern".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(painted.contains("not a valid pattern"), "{painted}");
+        let canonical = fs::canonicalize(&env.project).expect("canonicalize");
+        assert!(
+            persisted_grants_for(&canonical, &env.user_home).is_empty(),
+            "a refused pattern must not be written"
+        );
+    }
+
+    #[test]
+    fn permissions_revoke_removes_what_allow_recorded() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options(vec![
+            InteractiveInput::Submit("/permissions allow workspace_write".to_owned()),
+            InteractiveInput::Submit("/permissions revoke workspace_write".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let canonical = fs::canonicalize(&env.project).expect("canonicalize");
+        assert!(persisted_grants_for(&canonical, &env.user_home).is_empty());
     }
 
     #[test]
