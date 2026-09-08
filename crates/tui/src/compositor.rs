@@ -329,6 +329,40 @@ mod tests {
         CancellationToken::new()
     }
 
+    /// One kernel event envelope, for tests that drive the real
+    /// `reduce` fold. Hoisted out of `modal_open_shows_a_pending_approval_
+    /// notice`, which defined it inline, so the denial tests can use the
+    /// same construction rather than a second copy.
+    fn kernel_event(
+        seq: u64,
+        kind: event_ledger::event::EventKind,
+        payload: serde_json::Value,
+    ) -> event_ledger::event::ErasedEventEnvelope {
+        use event_ledger::event::{ActorKind, ActorRef, EventEnvelope, RecordedAt};
+        use protocol::{EventId, RedactionClass, SessionId, TraceId};
+
+        let session: SessionId = "019c0000-0000-7000-8000-000000000010"
+            .parse()
+            .expect("session");
+        let actor = ActorRef::new(ActorKind::System, "019c0000-0000-7000-8000-000000000016")
+            .expect("actor");
+        EventEnvelope::new(
+            format!("019c0000-0000-7000-8000-{seq:012x}")
+                .parse::<EventId>()
+                .expect("event id"),
+            session,
+            seq,
+            "2026-08-14T15:20:04.123Z"
+                .parse::<RecordedAt>()
+                .expect("recorded_at"),
+            actor,
+            TraceId::new(),
+            kind,
+            RedactionClass::Project,
+            payload,
+        )
+    }
+
     fn routed(route: UiRoute, width: u16, height: u16) -> AppState {
         let state = reduce(
             AppState::new(),
@@ -370,10 +404,12 @@ mod tests {
         transcript.push_entry(&TranscriptEntry::ToolActivity {
             tool: "shell_exec".to_owned(),
             status: crate::state::ToolActivityStatus::Failed,
+            detail: None,
         });
         transcript.push_entry(&TranscriptEntry::ToolActivity {
             tool: "ask_user".to_owned(),
             status: crate::state::ToolActivityStatus::ContextRequired,
+            detail: None,
         });
         transcript.push_entry(&TranscriptEntry::TurnFailed {
             reason: "model_failed".to_owned(),
@@ -509,6 +545,95 @@ mod tests {
             assert_eq!(screen.width(), size.width());
             assert_eq!(screen.height(), size.height());
         }
+    }
+
+    #[test]
+    fn a_denied_tool_call_shows_the_user_why_and_not_just_that_it_was_denied() {
+        // The reason existed all along and went only to the model, as the
+        // tool result: `TurnEvent::ToolDenied` carried `turn_id`, `call_id`
+        // and `tool` and dropped the detail, so the transcript read
+        // `⛔ workspace_write` — a refusal with no cause and no remedy, in
+        // the one mode the product ships in by default.
+        const REASON: &str = "workspace_write denied: requires approval; \
+pre-approve it with `rapid permissions allow <tool>`";
+        let mut state = reduce(
+            AppState::new(),
+            &UiEvent::Kernel(kernel_event(
+                1,
+                event_ledger::event::EventKind::SessionCreated,
+                serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
+            )),
+        );
+        state = reduce(
+            state,
+            &UiEvent::Kernel(kernel_event(
+                2,
+                event_ledger::event::EventKind::ToolDenied,
+                serde_json::json!({
+                    "turn_id": "019c0000-0000-7000-8000-000000000012",
+                    "call_id": "call-1",
+                    "tool": "workspace_write",
+                    "detail": REASON,
+                }),
+            )),
+        );
+
+        let entry = state
+            .transcript()
+            .iter()
+            .find(|entry| {
+                matches!(
+                    entry,
+                    crate::state::TranscriptEntry::ToolActivity {
+                        status: crate::state::ToolActivityStatus::Denied,
+                        ..
+                    }
+                )
+            })
+            .expect("a denial reaches the transcript");
+        let (_, line) = crate::transcript::render_block_parts(entry);
+        assert!(
+            line.contains("workspace_write"),
+            "the tool must still be named: {line}"
+        );
+        assert!(
+            line.contains("rapid permissions allow"),
+            "the reason, which names the remedy, must reach the user: {line}"
+        );
+    }
+
+    #[test]
+    fn a_tool_event_with_no_reason_renders_exactly_as_it_did_before() {
+        // `detail` is optional and every other tool event omits it; adding
+        // the field must not change how a completion or a plain failure
+        // reads.
+        let mut state = reduce(
+            AppState::new(),
+            &UiEvent::Kernel(kernel_event(
+                1,
+                event_ledger::event::EventKind::SessionCreated,
+                serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
+            )),
+        );
+        state = reduce(
+            state,
+            &UiEvent::Kernel(kernel_event(
+                2,
+                event_ledger::event::EventKind::ToolCompleted,
+                serde_json::json!({
+                    "turn_id": "019c0000-0000-7000-8000-000000000012",
+                    "call_id": "call-1",
+                    "tool": "repo_read",
+                }),
+            )),
+        );
+        let entry = state
+            .transcript()
+            .iter()
+            .find(|entry| matches!(entry, crate::state::TranscriptEntry::ToolActivity { .. }))
+            .expect("entry");
+        let (_, line) = crate::transcript::render_block_parts(entry);
+        assert_eq!(line, "✓ repo_read");
     }
 
     #[test]

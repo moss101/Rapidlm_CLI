@@ -6697,6 +6697,48 @@ tests no longer list `/permissions`, because it is no longer unrouted; both now 
 integration suite unchanged; `cargo clippy -p rapid -p tui --all-targets` 54 warnings, below the 56
 baseline, none in a touched hunk; full `cargo test --workspace` green.
 
+**Option C completed: the denial now tells the user why, done 2026-09-08 straight after the half above.**
+The previous entry recorded the honest gap — `/permissions` could grant, but the transcript still read
+`⛔ workspace_write` with no cause and no remedy, because the reason reached only the model. That is now
+closed, and it was a four-link chain in which every link dropped it.
+
+**The chain, and what each link now does.** `ToolStepResult::Denied { detail }` (the driver's reason) ->
+`TurnEvent::ToolDenied` gained `reason: Option<String>` -> `InteractiveTurnSink::emit` folds it into the
+ledger payload as `detail` -> `tui::state`'s `push_tool_activity` reads it back through
+`optional_display`, the same bounded, redaction-aware accessor `tool` already used -> `TranscriptEntry::
+ToolActivity` gained `detail: Option<String>` -> `render_block_parts` renders `⛔ tool: reason` when it is
+present and the bare `⛔ tool` when it is not. Additive at every step: the field is `Option`, every other
+tool event omits it, and `#[serde(skip_serializing_if)]` keeps the serialized shape unchanged when absent.
+
+**Each link has its own revert cycle (57-60), because each could drop the reason invisibly:** neutering
+the `agent-runtime` mapping fails `a_denial_carries_its_reason_onto_the_event_not_just_into_the_tool_
+result`; dropping it from the ledger payload fails `the_denial_reason_survives_the_ledger_payload_bridge`
+(which drives the real `InteractiveTurnSink` against a real kernel client and reads the event back out of
+the ledger); making the fold stop reading `detail`, or the renderer ignore it, both fail
+`a_denied_tool_call_shows_the_user_why_and_not_just_that_it_was_denied`. **Cycles 57 and 60 initially did
+not reproduce** — the mapping and the bridge had no test at all — which is exactly what the cycle is for;
+both tests were written before the cycles were re-run and failed as predicted.
+
+**Two guarantees pinned rather than assumed.** `a_tool_event_with_no_reason_renders_exactly_as_it_did_
+before` asserts a completion still renders `✓ repo_read` exactly, so adding the field changed nothing for
+the events that do not carry one. And `a_denial_detail_can_never_be_too_long_for_the_transcript_to_accept`
+asserts `exec_tools::MAX_RESULT_DETAIL_BYTES` (256) stays within `tui::state::MAX_DISPLAY_TEXT_BYTES`
+(16 KiB): the fold *errors* on an over-long field rather than truncating — the same treatment `tool` gets
+— so raising the detail cap past the display bound would stop rendering long refusals and start failing
+the fold, i.e. breaking the session. Safe today only because of that relationship, so the relationship is
+now a test.
+
+**A note on where this stops.** `/permissions` still does not claim a grant would help for a particular
+denial, and that restraint is deliberate even now that the reason is visible: the reason is *rendered*,
+but nothing parses it, and a call refused by a deny rule, plan mode, or a managed-policy ban stays refused
+whatever is granted. The user reads the reason and decides; the tool does not guess. Making the
+suggestion machine-checkable would mean classifying `DecisionReason` on the event too, which is a further
+additive step and was not taken here.
+
+**Verification:** `cargo test -p rapid --lib` 641 passed; `cargo test -p tui` 227 + 9; `cargo test -p
+agent-runtime --lib` 280; `cargo clippy -p rapid -p tui -p agent-runtime --all-targets` 54 warnings,
+below the 56 baseline; full `cargo test --workspace` green.
+
 ## DECIDED (2026-09-08, option C) — the interactive TUI cannot ask for approval, so out of the box it can only read
 
 **Found 2026-09-08 while scoping the missing approval broker. This is the largest gap found in this

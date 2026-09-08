@@ -3762,7 +3762,7 @@ impl SessionLoop<'_> {
     fn denied_this_session(&self) -> String {
         let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for entry in self.ui.transcript() {
-            if let tui::state::TranscriptEntry::ToolActivity { tool, status } = entry
+            if let tui::state::TranscriptEntry::ToolActivity { tool, status, .. } = entry
                 && *status == tui::state::ToolActivityStatus::Denied
             {
                 seen.insert(tool.as_str());
@@ -4469,6 +4469,9 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
     fn emit(&mut self, event: agent_runtime::TurnEvent) -> Result<(), agent_runtime::TurnError> {
         use agent_runtime::TurnEvent;
         use event_ledger::event::EventKind;
+        // Set by the one arm that carries one; folded into the payload below
+        // rather than widening the tuple every other arm would have to pad.
+        let mut denial_reason: Option<String> = None;
         let (kind, turn_id, call_id, tool, request_id, step, tokens) = match event {
             TurnEvent::Started { .. }
             | TurnEvent::Completed { .. }
@@ -4521,7 +4524,11 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
             TurnEvent::ToolFailed { turn_id, call_id, tool } => {
                 (EventKind::ToolFailed, turn_id, Some(call_id), Some(tool), None, None, None)
             }
-            TurnEvent::ToolDenied { turn_id, call_id, tool } => {
+            // The only tool event that carries a reason: it is what tells a
+            // user *why* a call was refused and what to do about it, and it
+            // reached only the model before this.
+            TurnEvent::ToolDenied { turn_id, call_id, tool, reason } => {
+                denial_reason = reason;
                 (EventKind::ToolDenied, turn_id, Some(call_id), Some(tool), None, None, None)
             }
             TurnEvent::ToolApprovalRequired { turn_id, call_id, tool } => (
@@ -4550,6 +4557,9 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
             "request_id": request_id,
             "step": step,
             "tokens": tokens,
+            // Read back by `tui::state`'s fold through the same bounded,
+            // redaction-aware accessor as `tool`.
+            "detail": denial_reason,
         });
         self.client
             .append_turn_progress(self.session_id, self.actor, TraceId::new(), kind, payload)
@@ -8839,6 +8849,93 @@ subcommand"
     }
 
     #[test]
+    fn a_denial_detail_can_never_be_too_long_for_the_transcript_to_accept() {
+        // The transcript fold reads the reason through `optional_display`,
+        // which *errors* on a field over `MAX_DISPLAY_TEXT_BYTES` — the same
+        // treatment `tool` gets. That is only safe because every denial
+        // detail this binary produces went through `bounded_detail` first.
+        // If that cap were ever raised past the display bound, a long
+        // refusal would stop being rendered and start failing the fold, i.e.
+        // breaking the session. Pinned rather than assumed.
+        assert!(
+            crate::exec_tools::MAX_RESULT_DETAIL_BYTES <= tui::state::MAX_DISPLAY_TEXT_BYTES,
+            "a bounded tool detail ({}) must always fit the transcript's display bound ({})",
+            crate::exec_tools::MAX_RESULT_DETAIL_BYTES,
+            tui::state::MAX_DISPLAY_TEXT_BYTES
+        );
+    }
+
+    #[test]
+    fn the_denial_reason_survives_the_ledger_payload_bridge() {
+        // The last link in the chain that carries a refusal's reason to the
+        // user: `agent-runtime` puts it on `TurnEvent::ToolDenied`, this sink
+        // must put it in the ledger payload, and `tui::state`'s fold reads it
+        // back under the key written here. Each of the other links has its
+        // own test; without this one, dropping the field here would be
+        // invisible.
+        const REASON: &str = "workspace_write denied: requires approval; \
+pre-approve it with `rapid permissions allow <tool>`";
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let cancel = CancellationToken::new();
+        let expected_seq = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        let handle = block_on(
+            session.client.submit_turn(SubmitTurn::new(
+                session.session_id,
+                expected_seq,
+                session.actor.clone(),
+                TraceId::new(),
+                "denied turn",
+            )),
+            &cancel,
+        )
+        .expect("submit turn");
+
+        {
+            let mut sink = InteractiveTurnSink {
+                client: &session.client,
+                session_id: session.session_id,
+                actor: &session.actor,
+            };
+            agent_runtime::TurnEventSink::emit(
+                &mut sink,
+                agent_runtime::TurnEvent::ToolDenied {
+                    turn_id: handle.turn_id(),
+                    call_id: "c1".to_owned(),
+                    tool: crate::exec_tools::WORKSPACE_WRITE_TOOL.to_owned(),
+                    reason: Some(REASON.to_owned()),
+                },
+            )
+            .expect("emit");
+        }
+
+        let events = session
+            .client
+            .export_events(session.session_id, &CancellationToken::new())
+            .expect("export");
+        let denial = events
+            .iter()
+            .find(|event| event.kind == event_ledger::event::EventKind::ToolDenied.as_str())
+            .unwrap_or_else(|| {
+                panic!(
+                    "a ToolDenied event was recorded: {:?}",
+                    events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+                )
+            });
+        let payload: serde_json::Value =
+            serde_json::from_str(&denial.payload_json).expect("payload json");
+        assert_eq!(
+            payload.get("detail").and_then(serde_json::Value::as_str),
+            Some(REASON),
+            "the reason was dropped on the way to the ledger: {payload}"
+        );
+        // Under the key `tui::state`'s fold actually reads.
+        assert!(payload.get("tool").is_some());
+    }
+
+    #[test]
     fn interactive_turn_completes_and_propagates_tool_and_assistant_output() {
         // Successful completion + output propagation + tool-call/result
         // continuation + no lost final output, all in one coherent scripted
@@ -8859,7 +8956,7 @@ subcommand"
         assert!(
             transcript.iter().any(|entry| matches!(
                 entry,
-                TranscriptEntry::ToolActivity { tool, status: ToolActivityStatus::Completed }
+                TranscriptEntry::ToolActivity { tool, status: ToolActivityStatus::Completed, .. }
                     if tool == crate::exec_tools::WORKSPACE_WRITE_TOOL
             )),
             "expected a completed workspace_write tool-activity entry: {transcript:?}"
@@ -9250,7 +9347,7 @@ subcommand"
         assert!(
             transcript.iter().any(|entry| matches!(
                 entry,
-                TranscriptEntry::ToolActivity { tool, status: ToolActivityStatus::Completed }
+                TranscriptEntry::ToolActivity { tool, status: ToolActivityStatus::Completed, .. }
                     if tool == crate::exec_tools::WORKSPACE_WRITE_TOOL
             )),
             "the second turn's own tool call must have really executed, proving no stuck \

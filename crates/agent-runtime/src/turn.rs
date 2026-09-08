@@ -450,6 +450,13 @@ pub enum TurnEvent {
         turn_id: TurnId,
         call_id: String,
         tool: String,
+        /// Why the call was refused, when the driver supplied a reason.
+        ///
+        /// Carried because the same text is the *user's* only guide to what
+        /// to do next — for a permission denial it names the remedy — and it
+        /// previously reached only the model, as the tool result. Optional:
+        /// a `ToolDriver` is not obliged to explain itself.
+        reason: Option<String>,
     },
     ToolApprovalRequired {
         turn_id: TurnId,
@@ -1612,10 +1619,11 @@ fn emit_tool_result<E: TurnEventSink>(
             call_id: call.call_id.clone(),
             tool: call.tool.clone(),
         },
-        ToolStepResult::Denied { .. } => TurnEvent::ToolDenied {
+        ToolStepResult::Denied { detail, .. } => TurnEvent::ToolDenied {
             turn_id: state.turn_id,
             call_id: call.call_id.clone(),
             tool: call.tool.clone(),
+            reason: detail.clone(),
         },
         ToolStepResult::ApprovalRequired { .. } => TurnEvent::ToolApprovalRequired {
             turn_id: state.turn_id,
@@ -2101,6 +2109,75 @@ mod tests {
         let detail = result.failure_detail().expect("tool detail");
         assert_eq!(detail.tool(), "workspace.write");
         assert_eq!(detail.error(), "write refused: outside the workspace root");
+    }
+
+    #[test]
+    fn a_denial_carries_its_reason_onto_the_event_not_just_into_the_tool_result() {
+        // `TurnEvent::ToolDenied` carried only `turn_id`/`call_id`/`tool`,
+        // so a refusal's reason reached the *model* as the tool result and
+        // nothing else. Every frontend therefore showed "this tool was
+        // denied" with no cause and no remedy — which matters most in the
+        // permission mode the product ships in by default, where the reason
+        // is the only thing naming the way forward.
+        const REASON: &str = "workspace.write denied: requires approval; pre-approve it with `rapid permissions allow <tool>`";
+        let mut model = ScriptedModel::new(vec![
+            tools_out(vec![call("c1", "workspace.write")], 1),
+            terminal("done", 1),
+        ]);
+        let mut tools = ScriptedTools::new(vec![Ok(ToolStepResult::Denied {
+            call_id: "c1".to_owned(),
+            detail: Some(REASON.to_owned()),
+        })]);
+        let mut events = Vec::new();
+        run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+
+        let reason = events
+            .iter()
+            .find_map(|event| match event {
+                TurnEvent::ToolDenied { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("a denial emits its event");
+        assert_eq!(
+            reason.as_deref(),
+            Some(REASON),
+            "the denial reason must ride the event, not only the tool result"
+        );
+    }
+
+    #[test]
+    fn a_denial_with_no_reason_emits_none_rather_than_an_empty_string() {
+        // A `ToolDriver` is not obliged to explain itself; "no reason" must
+        // stay distinguishable from "an empty reason" so a frontend renders
+        // the bare form rather than a stray separator.
+        let mut model = ScriptedModel::new(vec![
+            tools_out(vec![call("c1", "workspace.write")], 1),
+            terminal("done", 1),
+        ]);
+        let mut tools = ScriptedTools::new(vec![Ok(ToolStepResult::Denied {
+            call_id: "c1".to_owned(),
+            detail: None,
+        })]);
+        let mut events = Vec::new();
+        run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TurnEvent::ToolDenied { reason: None, .. }
+        )));
     }
 
     #[test]

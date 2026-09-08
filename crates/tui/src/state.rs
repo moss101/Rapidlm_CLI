@@ -301,6 +301,12 @@ pub enum TranscriptEntry {
     ToolActivity {
         tool: String,
         status: ToolActivityStatus,
+        /// Why, when the producing event carried a reason. Populated today
+        /// only for [`ToolActivityStatus::Denied`]: without it the user saw
+        /// `⛔ workspace_write` and nothing else, while the reason — which
+        /// names the remedy — went only to the model as a tool result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     TurnFailed { reason: String },
     TurnInterrupted,
@@ -529,6 +535,7 @@ fn apply_kernel(
                     TranscriptEntry::ToolActivity {
                         tool,
                         status: ToolActivityStatus::ApprovalRequired,
+                        detail: None,
                     },
                 );
             }
@@ -603,7 +610,18 @@ fn push_tool_activity(
     status: ToolActivityStatus,
 ) -> Result<(), UiStateError> {
     if let Some(tool) = optional_display(event, event.payload(), "tool")? {
-        push_transcript(state, TranscriptEntry::ToolActivity { tool, status });
+        // Through the same bounded, redaction-aware accessor as `tool`, so a
+        // reason can neither exceed the display bound nor survive a
+        // secret-classified event.
+        let detail = optional_display(event, event.payload(), "detail")?;
+        push_transcript(
+            state,
+            TranscriptEntry::ToolActivity {
+                tool,
+                status,
+                detail,
+            },
+        );
     }
     Ok(())
 }

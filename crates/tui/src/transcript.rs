@@ -160,7 +160,11 @@ pub fn render_block_parts(entry: &crate::state::TranscriptEntry) -> (RenderBlock
     match entry {
         TranscriptEntry::User { text } => (RenderBlockKind::User, format!("> {text}")),
         TranscriptEntry::Assistant { text } => (RenderBlockKind::Assistant, text.clone()),
-        TranscriptEntry::ToolActivity { tool, status } => {
+        TranscriptEntry::ToolActivity {
+            tool,
+            status,
+            detail,
+        } => {
             let marker = match status {
                 ToolActivityStatus::Started => "→",
                 ToolActivityStatus::Completed => "✓",
@@ -169,7 +173,14 @@ pub fn render_block_parts(entry: &crate::state::TranscriptEntry) -> (RenderBlock
                 ToolActivityStatus::ApprovalRequired => "⏸",
                 ToolActivityStatus::ContextRequired => "❓",
             };
-            (RenderBlockKind::Tool, format!("{marker} {tool}"))
+            // A denial used to render as `⛔ workspace_write` alone, so the
+            // user was told a call was refused but never why or what to do —
+            // the reason existed, and went only to the model.
+            let line = match detail {
+                Some(detail) => format!("{marker} {tool}: {detail}"),
+                None => format!("{marker} {tool}"),
+            };
+            (RenderBlockKind::Tool, line)
         }
         TranscriptEntry::TurnFailed { reason } => {
             (RenderBlockKind::Error, format!("(turn failed: {reason})"))
