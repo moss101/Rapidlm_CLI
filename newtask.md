@@ -6467,6 +6467,42 @@ build them; an approval broker (which is what `/mcp remove`, `/plugins install` 
 approval-gated slash command actually need); TUI routes/panels for the eleven unrouted inspectors; and
 per-subcommand *option* documentation beyond the one-line summary the central `--help` now gives.
 
+**The TUI's slash-command catalog was two lists too, and its "golden" test was a tautology, done
+2026-09-08 as a small third pass immediately after the CLI truthfulness commit.** Found while checking
+whether `/help` tells the truth about which of its 28 command families this build can actually perform.
+
+**`CATALOG` (28 `CommandSpec`s with `name`/`aliases`/`usage`/`summary`) and `CATALOG_HELP` (a hand-written
+literal listing the same 28 usages) were separate**, and had already drifted for four commands. `/help mcp`
+reads `CATALOG` and printed `/mcp [list|add <target>|remove|auth|doctor] [name]`; bare `/help` read the
+literal and printed `/mcp [list|add|remove|auth|doctor]`. Same for `/goal` (the literal omitted
+`budget [turns N] [tokens N]`), `/knowledge` (omitted `suggest`'s `<text>`) and `/plugins` (omitted
+`install`'s `<spec>`). So the catalog listing — the screen a user reads first — quietly under-documented
+four commands' operands, and a user following it would type an invocation the parser rejects.
+
+**The test that existed to catch exactly this could not fail.** `const GOLDEN_HELP: &str = CATALOG_HELP;`
+followed by `assert_eq!(GOLDEN_HELP, CATALOG_HELP)` compares a constant to itself. It had been green
+across the entire drift.
+
+**Fix:** `CATALOG_HELP` is now a `LazyLock<String>` built from `CATALOG`, so there is one list; the four
+usages come out precise by construction. `catalog_help()` returns `&'static str` (sound because the
+`LazyLock` is a `static`), keeping `CommandError::help`'s existing signature and every call site
+unchanged. The tautology is replaced by `the_catalog_listing_is_the_catalog`, which asserts the rendered
+lines are exactly `CATALOG`'s usages *and* that every command's own `/help <name>` line appears verbatim
+in the bare listing — the specific property that had broken — plus
+`every_catalog_entry_is_parseable_and_uniquely_named` (no duplicate name or alias, every usage starts with
+its own command, every summary non-empty). Two revert cycles (40-41): reintroducing the old `/mcp` literal
+fails the listing test; renaming `/permissions`'s usage to `/perms` fails the shape test. `cargo test -p
+tui` 225 lib + 9 snapshot tests pass; clippy on `-p tui` stays at **zero** warnings, unchanged.
+
+**Deliberately not attempted here, and recorded as the obvious next step:** `/help` still does not say
+*which* of the 28 families this build can perform. After the previous commit every one of them reports a
+specific reason when run — a routeless inspector says what is missing and a `KernelAction` with no backend
+names its gap — so the information exists per command; what is missing is a listing-level annotation. The
+honest way to build it is to drive the real parser and dispatcher over each catalog entry's own `usage`
+alternatives rather than hand-maintaining a second availability table (which would be precisely the defect
+this pass removed), and that synthesis is real work with its own failure modes: it was not attempted at
+the tail of this session rather than guessed at.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

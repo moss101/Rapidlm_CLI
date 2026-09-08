@@ -7,6 +7,7 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use protocol::{AgentId, IdParseError, JobId, KnowledgeId, SessionId};
 
@@ -552,35 +553,32 @@ const CATALOG: &[CommandSpec] = &[
     },
 ];
 
-const CATALOG_HELP: &str = "\
-/help [command]
-/quit
-/model [list|select <name>|doctor]
-/agents [list|show|pause|resume|sleep|cancel|terminate] [id]
-/goal [show|start <text>|pause|resume|cancel|budget|run|stop]
-/diff [--agent <id>]
-/apply [--agent <id>]
-/rollback [checkpoint]
-/context [status|search <query>|reindex|inspect]
-/memory
-/knowledge [list|show|suggest|approve|reject|edit] [id]
-/playbook [list|show|run|validate] [name]
-/trace [show|export]
-/insights [show|analyze|proposals]
-/handoff local|daemon|remote [target]
-/takeover terminal|browser|desktop|mobile
-/control-return
-/computer [status|observe|record|test]
-/jobs [list|show|cancel|logs] [id]
-/mcp [list|add|remove|auth|doctor]
-/permissions
-/plugins [list|install|remove|permissions]
-/policy [explain|check]
-/sandbox [doctor]
-/resume [session]
-/fork
-/rewind [seq]
-/compact";
+/// The full slash-command catalog, one `usage` line per [`CommandSpec`].
+///
+/// Derived from [`CATALOG`] rather than written out beside it. The two were
+/// separate lists and had already drifted for four commands — `/goal`,
+/// `/knowledge`, `/mcp` and `/plugins` each showed a *more precise* usage
+/// from `/help <name>` (which reads `CATALOG`) than from bare `/help` (which
+/// read the literal), so the catalog listing quietly under-documented four
+/// commands' arguments. The test that was supposed to catch that compared
+/// `const GOLDEN_HELP: &str = CATALOG_HELP;` against `CATALOG_HELP`, which
+/// is a tautology and could never fail.
+static CATALOG_HELP: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::new();
+    for (index, spec) in CATALOG.iter().enumerate() {
+        if index > 0 {
+            text.push('\n');
+        }
+        text.push_str(spec.usage);
+    }
+    text
+});
+
+/// [`CATALOG_HELP`] as a `&'static str`. Sound because the `LazyLock` is a
+/// `static`, so the `String` it yields lives for the program.
+fn catalog_help() -> &'static str {
+    CATALOG_HELP.as_str()
+}
 
 /// Parse a composer line into a typed command.
 ///
@@ -808,9 +806,11 @@ impl CommandError {
     /// Inline usage for the failed command, or the catalog for unknown names.
     pub fn help(&self) -> &'static str {
         match self {
-            Self::Empty | Self::TooLong | Self::NotACommand | Self::UnknownCommand => CATALOG_HELP,
+            Self::Empty | Self::TooLong | Self::NotACommand | Self::UnknownCommand => {
+                catalog_help()
+            }
             Self::InvalidArgs { command } | Self::InvalidId { field: command } => {
-                usage_for(command).unwrap_or(CATALOG_HELP)
+                usage_for(command).unwrap_or_else(catalog_help)
             }
         }
     }
@@ -1299,7 +1299,7 @@ fn resolve_name(name: &str) -> Option<&'static str> {
 
 fn usage_for(name: &str) -> Option<&'static str> {
     if name == "slash" {
-        return Some(CATALOG_HELP);
+        return Some(catalog_help());
     }
     CATALOG
         .iter()
@@ -1308,7 +1308,7 @@ fn usage_for(name: &str) -> Option<&'static str> {
 }
 
 fn help_for(topic: Option<&str>) -> InlineHelp {
-    let usage = topic.and_then(usage_for).unwrap_or(CATALOG_HELP).to_owned();
+    let usage = topic.and_then(usage_for).unwrap_or_else(catalog_help).to_owned();
     InlineHelp {
         topic: topic.map(str::to_owned),
         usage,
@@ -1430,7 +1430,6 @@ mod tests {
     use super::*;
 
     const AGENT: &str = "01234567-89ab-7cde-89ab-0123456789ab";
-    const GOLDEN_HELP: &str = CATALOG_HELP;
 
     fn parse_ok(input: &str) -> UiCommand {
         parse_command(input).expect("command")
@@ -1629,8 +1628,49 @@ mod tests {
                 .any(|row| row.usage().starts_with("/goal"))
         );
         assert_eq!(suggest("", 0).len(), 0);
-        assert_eq!(GOLDEN_HELP, CATALOG_HELP);
-        assert!(GOLDEN_HELP.contains("/control-return"));
+        assert!(catalog_help().contains("/control-return"));
+    }
+
+    #[test]
+    fn the_catalog_listing_is_the_catalog() {
+        // Replaces a "golden" test that read `const GOLDEN_HELP: &str =
+        // CATALOG_HELP;` and then asserted `GOLDEN_HELP == CATALOG_HELP` —
+        // a tautology that could never fail, and did not, while the two
+        // lists drifted for four commands.
+        let listed: Vec<&str> = catalog_help().lines().collect();
+        let expected: Vec<&str> = CATALOG.iter().map(|spec| spec.usage).collect();
+        assert_eq!(listed, expected);
+
+        // Bare `/help` and `/help <name>` must agree about a command's
+        // arguments: that is exactly what had drifted. `/goal`,
+        // `/knowledge`, `/mcp` and `/plugins` each documented fewer operands
+        // in the catalog listing than in their own usage.
+        for spec in CATALOG {
+            let own = usage_for(spec.name).expect("every catalog command has its own usage");
+            assert!(
+                catalog_help().lines().any(|line| line == own),
+                "`/help {}` shows {own:?}, which is not the line bare `/help` lists",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_catalog_entry_is_parseable_and_uniquely_named() {
+        let mut seen = std::collections::BTreeSet::new();
+        for spec in CATALOG {
+            assert!(seen.insert(spec.name), "duplicate command: {}", spec.name);
+            for alias in spec.aliases {
+                assert!(seen.insert(alias), "duplicate alias: {alias}");
+            }
+            assert!(
+                spec.usage.starts_with(&format!("/{}", spec.name)),
+                "`{}`'s usage does not start with its own name: {:?}",
+                spec.name,
+                spec.usage
+            );
+            assert!(!spec.summary.is_empty(), "{} has no summary", spec.name);
+        }
     }
 
     #[test]
