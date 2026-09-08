@@ -2,6 +2,18 @@
 
 This is the target public command grammar; Phase 0 reconciles it with current source before breaking/renaming existing commands.
 
+> **What the binary actually dispatches today** (everything else in the table below is
+> roadmap, not shipped behavior): `exec`, `trust`, `goal`, `mcp`, `doctor`, `plugins`,
+> `agents`, `cron`, `scan`, `findings`, `sessions`, `inspect-export`, `insights`,
+> `playbook-compile`, `agent-cli`, `mcp-tools`, `tools`, `release-manifest`,
+> `completions`, `man`. Those names are checked against the one table in source
+> (`interactive::SUBCOMMANDS`) by
+> `the_reference_doc_lists_exactly_the_dispatched_subcommands`, which is the same
+> table `rapid --help`, `rapid completions` and `rapid man` print from — so this
+> paragraph cannot drift from the dispatcher without failing the build. A subcommand
+> this reference lists but that table does not carry exits 2 with
+> "rapid: unknown subcommand", and `rapid --help` does not advertise it.
+
 | Command | Purpose |
 |---|---|
 | `rapid` | interactive TUI |

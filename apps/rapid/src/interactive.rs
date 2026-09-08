@@ -33,7 +33,8 @@ use tui::state::{
     TranscriptEntry, UiEvent,
 };
 use tui::{
-    AppState, CommandError, FrontendAction, FrontendKind, KernelAction, KernelApi, LocalAction,
+    AppState, CommandError, FrontendAction, FrontendKind, Inspector, KernelAction, KernelApi,
+    LocalAction,
     RecordingBackend, TerminalError, TerminalGuard, dispatch, parse_command, reduce,
 };
 
@@ -173,6 +174,12 @@ struct ResolvedProject {
     config: ConfigLoadResult,
     ledger_path: PathBuf,
     root: PathBuf,
+    /// The RapidLM home this session resolved (`InteractiveOptions::
+    /// user_home`, else its injected environment). Carried so a slash
+    /// command cannot re-derive a *different* one from the process
+    /// environment and then report trust from a catalog this session never
+    /// consulted.
+    user_home: PathBuf,
 }
 
 struct KernelRuntime {
@@ -216,36 +223,49 @@ pub fn classify_launch<S: AsRef<str>>(args: &[S]) -> LaunchMode {
 }
 
 /// Target V3 command surface from `docs/reference/cli-command-reference.md`.
+/// `rapid --help`.
+///
+/// Lists **only** subcommands [`SUBCOMMANDS`] actually dispatches. It used
+/// to advertise eighteen further families — `run`, `resume`, `fork`,
+/// `rewind`, `daemon`, `acp`, `graph`, `context`, `evidence`, `process`,
+/// `computer`, `sandbox`, `hooks`, `skills`, `eval`, `inspect`, `export`,
+/// `update` — that no dispatch arm ever matched, so typing one produced the
+/// single line `usage: rapid [subcommand]` (`InteractiveError::Usage`'s own
+/// `Display`, via `main`) and exit 2: byte-identical to a typo, with nothing
+/// to say the command does not exist. They are a roadmap, and
+/// `docs/reference/cli-command-reference.md` is where a roadmap belongs; a
+/// `--help` that names a command the binary cannot run is simply wrong.
+/// `cli_usage_lists_exactly_the_dispatched_subcommands` keeps this list and
+/// the table in step in both directions.
 pub const CLI_USAGE: &str = "\
 usage: rapid [subcommand]
 
-  rapid                         interactive TUI
-  rapid exec <prompt>           one-shot/headless task
-  rapid run <goal/playbook>     durable graph run
+With no subcommand, rapid starts the interactive TUI in the current project.
+
+Commands:
+  rapid exec <prompt>           one-shot/headless agent turn
   rapid trust grant|status|revoke   explicit project-trust control plane
-  rapid goal create|show|pause|resume|cancel|budget|verify
-  rapid resume [session/run]    resume durable session/run
-  rapid fork [checkpoint]       non-destructive branch
-  rapid rewind                  restore/fork checkpoint
-  rapid daemon                  durable local kernel service
-  rapid acp                     ACP stdio server
-  rapid graph show|watch|diff|why-ready|why-blocked|retry|export
-  rapid context show|explain|compact|search
-  rapid evidence show|verify|export
-  rapid agents list|inspect|cancel
-  rapid process list|logs|input|cancel|monitor
-  rapid computer ...            computer/browser/mobile
-  rapid sandbox status|doctor
+  rapid goal create|replace|show|pause|resume|cancel|complete|claim|export|verify|evidence
   rapid mcp list|get|add|remove|probe   project MCP servers (stdio)
-  rapid plugins validate|register|list|approve|reject|hook-test
-  rapid hooks list|test|enable|disable
-  rapid skills list|show|enable|disable
-  rapid eval run|compare|report
-  rapid inspect <session/run>
-  rapid cron add|list|remove|poll   durable prompt cron (claim-lease firing)
-  rapid export
   rapid doctor                  environment/config/model/trust/sandbox diagnosis
-  rapid update
+  rapid plugins validate|register|list|approve|reject|hook-test
+  rapid agents list|validate|scaffold   project agent definitions
+  rapid cron add|list|remove|poll   durable prompt cron (claim-lease firing)
+  rapid scan                    run the configured external scanners
+  rapid findings list|dismiss   persisted scanner findings
+  rapid sessions list|search    session projection over the event ledger
+  rapid inspect-export <session>   export a session's event ledger
+  rapid insights <session>      session insights projection
+  rapid playbook-compile <file.json>   compile a playbook into a graph
+  rapid agent-cli <prompt> -- argv...   one supervised external CLI agent turn
+  rapid mcp-tools               published RapidLM MCP server surface
+  rapid tools                   model-facing tool surface as typed JSON schemas
+  rapid release-manifest <version> <artifact>...   emit a release manifest of digests
+  rapid completions bash|zsh|fish
+  rapid man
+
+Every command above answers `--help`; four of them (exec, trust, mcp, doctor)
+with full usage, the rest with a one-line summary.
 ";
 
 /// Exec-specific usage, printed by `rapid exec --help` and on exec usage
@@ -438,29 +458,219 @@ fn p9(
     })
 }
 
+/// How a subcommand's handler reports failure. The two families exist
+/// because `exec`/`trust`/`goal` are composition-root commands that already
+/// speak [`InteractiveError`], while the `p9_commands` family speaks
+/// [`crate::p9_commands::P9CommandError`] and is adapted by [`p9`].
+enum SubcommandHandler {
+    Native(fn(&[String]) -> Result<i32, InteractiveError>),
+    P9(fn(&[String]) -> Result<i32, crate::p9_commands::P9CommandError>),
+}
+
+/// One dispatched subcommand: the name, the one-line summary `rapid --help`,
+/// `rapid completions` and `rapid man` print, and the handler that runs it.
+pub(crate) struct Subcommand {
+    pub(crate) name: &'static str,
+    pub(crate) summary: &'static str,
+    /// Whether the handler recognises `--help`/`-h` itself. For the rest,
+    /// [`run_subcommand`] answers centrally with the summary — `CLI_USAGE`
+    /// tells the user to run `rapid <subcommand> --help`, and thirteen of
+    /// these used to answer that with ``usage: see `rapid --help` `` and
+    /// exit 2 (a literal loop), while `rapid playbook-compile --help` tried
+    /// to read a *file* named `--help` and `rapid sessions --help` ignored
+    /// the flag and ran.
+    own_help: bool,
+    handler: SubcommandHandler,
+}
+
+/// **The** subcommand table: dispatch and documentation from one list.
+///
+/// Previously these were two lists — a `match` in [`run_subcommand`] and a
+/// separate `RAPID_SUBCOMMANDS` const — and they had drifted apart in both
+/// directions: `trust`, `scan`, `insights` and `release-manifest` were
+/// dispatched but absent from the help and the shell completions, while
+/// `CLI_USAGE` advertised eighteen families (`daemon`, `acp`, `graph`,
+/// `context`, `evidence`, `process`, `computer`, `sandbox`, `hooks`,
+/// `skills`, `eval`, `inspect`, `export`, `update`, `run`, `resume`, `fork`,
+/// `rewind`) that no arm ever matched, so each exited 2 with the single line
+/// `usage: rapid [subcommand]` — output identical to a typo. A single table
+/// makes the first class of drift impossible;
+/// `cli_usage_lists_exactly_the_dispatched_subcommands` closes the second.
+pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
+    Subcommand {
+        name: "exec",
+        summary: "run one agent turn",
+        own_help: true,
+        handler: SubcommandHandler::Native(exec_subcommand),
+    },
+    Subcommand {
+        name: "trust",
+        summary: "explicit project-trust control plane (grant/status/revoke)",
+        own_help: true,
+        handler: SubcommandHandler::Native(run_trust_command),
+    },
+    Subcommand {
+        name: "goal",
+        summary: "durable goal lifecycle: create/replace/show/pause/resume/cancel/complete/claim/export/verify/evidence",
+        own_help: false,
+        handler: SubcommandHandler::Native(run_goal_command),
+    },
+    Subcommand {
+        name: "playbook-compile",
+        summary: "compile a playbook JSON template into an initial graph",
+        own_help: false,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_playbook_compile),
+    },
+    Subcommand {
+        name: "mcp",
+        summary: "project MCP servers (list/get/add/remove/probe)",
+        own_help: true,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_mcp),
+    },
+    Subcommand {
+        name: "mcp-tools",
+        summary: "print the published RapidLM MCP server surface",
+        own_help: false,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_mcp_tools),
+    },
+    Subcommand {
+        name: "tools",
+        summary: "dump the model-facing tool surface's typed JSON schemas",
+        own_help: false,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_tools_schema),
+    },
+    Subcommand {
+        name: "agent-cli",
+        summary: "one supervised external CLI agent turn: <prompt> -- argv...",
+        own_help: false,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_agent_cli),
+    },
+    Subcommand {
+        name: "doctor",
+        summary: "diagnose config/model/trust/sandbox health (offline, read-only)",
+        own_help: true,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_doctor),
+    },
+    Subcommand {
+        name: "sessions",
+        summary: "list or search sessions",
+        own_help: false,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_sessions),
+    },
+    Subcommand {
+        name: "inspect-export",
+        summary: "export a session's event ledger (--format jsonl|md|html)",
+        own_help: false,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_inspect_export),
+    },
+    Subcommand {
+        name: "insights",
+        summary: "report a session's insights projection",
+        own_help: false,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_insights),
+    },
+    Subcommand {
+        name: "cron",
+        summary: "durable prompt cron (add/list/remove/poll)",
+        own_help: false,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_cron),
+    },
+    Subcommand {
+        name: "scan",
+        summary: "run the configured external scanners over the project",
+        own_help: false,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_scan),
+    },
+    Subcommand {
+        name: "findings",
+        summary: "persisted scanner findings (list/dismiss)",
+        own_help: false,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_findings),
+    },
+    Subcommand {
+        name: "agents",
+        summary: "project agent definitions (list/validate/scaffold)",
+        own_help: false,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_agents),
+    },
+    Subcommand {
+        name: "plugins",
+        summary: "plugin trust lifecycle (validate/register/list/approve/reject/hook-test)",
+        own_help: false,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_plugins),
+    },
+    Subcommand {
+        name: "release-manifest",
+        summary: "emit a release manifest of artifact digests (does not sign or verify)",
+        own_help: false,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_release_manifest),
+    },
+    Subcommand {
+        name: "completions",
+        summary: "emit shell completions: bash|zsh|fish",
+        own_help: false,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_completions),
+    },
+    Subcommand {
+        name: "man",
+        summary: "print the manual page text",
+        own_help: false,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_man),
+    },
+];
+
+/// What `rapid <not-a-command>` says. Split out because the only assertion a
+/// test can make about `run_subcommand` itself is on its return value, which
+/// is `Err(InteractiveError::Usage)` both before and after this message
+/// existed — so a test that called it would pass whether or not the message
+/// is emitted.
+fn unknown_subcommand_text(name: &str) -> String {
+    format!("rapid: unknown subcommand '{name}'")
+}
+
+/// `rapid exec` needs the extra `None` the other native handlers do not, so
+/// it gets the table's one adapter rather than the table growing a shape for
+/// a single entry.
+fn exec_subcommand(args: &[String]) -> Result<i32, InteractiveError> {
+    exec_turn(args, None)
+}
+
 fn run_subcommand(args: &[String]) -> Result<i32, InteractiveError> {
-    match args.first().map(String::as_str) {
-        Some("exec") => exec_turn(&args[1..], None),
-        Some("trust") => run_trust_command(&args[1..]),
-        Some("goal") => run_goal_command(&args[1..]),
-        Some("playbook-compile") => p9(&args[1..], crate::p9_commands::run_playbook_compile),
-        Some("mcp-tools") => p9(&args[1..], crate::p9_commands::run_mcp_tools),
-        Some("tools") => p9(&args[1..], crate::p9_commands::run_tools_schema),
-        Some("agent-cli") => p9(&args[1..], crate::p9_commands::run_agent_cli),
-        Some("doctor") => p9(&args[1..], crate::p9_commands::run_doctor),
-        Some("mcp") => p9(&args[1..], crate::p9_commands::run_mcp),
-        Some("sessions") => p9(&args[1..], crate::p9_commands::run_sessions),
-        Some("inspect-export") => p9(&args[1..], crate::p9_commands::run_inspect_export),
-        Some("cron") => p9(&args[1..], crate::p9_commands::run_cron),
-        Some("findings") => p9(&args[1..], crate::p9_commands::run_findings),
-        Some("scan") => p9(&args[1..], crate::p9_commands::run_scan),
-        Some("agents") => p9(&args[1..], crate::p9_commands::run_agents),
-        Some("plugins") => p9(&args[1..], crate::p9_commands::run_plugins),
-        Some("completions") => p9(&args[1..], crate::p9_commands::run_completions),
-        Some("man") => p9(&args[1..], crate::p9_commands::run_man),
-        Some("insights") => p9(&args[1..], crate::p9_commands::run_insights),
-        Some("release-manifest") => p9(&args[1..], crate::p9_commands::run_release_manifest),
-        _ => Err(InteractiveError::Usage),
+    // `classify_launch` deliberately looks past leading flags to decide
+    // this is a subcommand launch at all (`rapid --jsonl exec hi`), so the
+    // name is the first *non-flag* word. Reading `args.first()` blindly
+    // reported `--jsonl` — and, worse, `--help` — as an unknown subcommand.
+    let Some(index) = args.iter().position(|arg| !arg.starts_with('-')) else {
+        return Err(InteractiveError::Usage);
+    };
+    let args = &args[index..];
+    let name = args[0].as_str();
+    let Some(entry) = SUBCOMMANDS.iter().find(|entry| entry.name == name) else {
+        // Naming the offending word matters: the previous behavior emitted
+        // only `usage: rapid [subcommand]` (`InteractiveError::Usage`'s
+        // `Display`, printed by `main`), so a real typo and one of the
+        // eighteen advertised-but-absent families were indistinguishable.
+        eprintln!("{}", unknown_subcommand_text(name));
+        return Err(InteractiveError::Usage);
+    };
+    let operands = &args[1..];
+    if !entry.own_help
+        && operands
+            .iter()
+            .any(|arg| arg == "--help" || arg == "-h")
+    {
+        // Answered here rather than left to the handler: `CLI_USAGE`
+        // promises `rapid <subcommand> --help` works, and these handlers
+        // either reject the flag as a usage error, ignore it, or treat it as
+        // an operand. A one-line summary is thin help, but it is true and it
+        // exits 0.
+        println!("rapid {}: {}", entry.name, entry.summary);
+        println!("see `rapid --help` for the full command list");
+        return Ok(0);
+    }
+    match entry.handler {
+        SubcommandHandler::Native(handler) => handler(operands),
+        SubcommandHandler::P9(handler) => p9(operands, handler),
     }
 }
 
@@ -545,13 +755,39 @@ fn run_trust_command(args: &[String]) -> Result<i32, InteractiveError> {
     }
 }
 
+/// Every `rapid goal` subcommand [`run_goal_command`] accepts.
+///
+/// Exists for the same reason [`SUBCOMMANDS`] does, one level down:
+/// `CLI_USAGE` advertised `rapid goal … budget …`, which no arm has ever
+/// matched, while omitting `replace` and `complete`, which do.
+/// `cli_usage_lists_exactly_the_goal_subcommands` keeps the two in step.
+pub(crate) const GOAL_SUBCOMMANDS: &[&str] = &[
+    "create", "replace", "show", "pause", "resume", "cancel", "complete", "claim", "export",
+    "verify", "evidence",
+];
+
 /// Durable host-owned goal contract: `goal create|show|pause|resume|cancel`.
 /// The goal is persisted under `.rapidlm/goal.json` so lifecycle commands work
 /// across invocations; completion still requires the evidence gate.
 fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
     let Some(sub) = args.first().map(String::as_str) else {
+        eprintln!(
+            "usage: rapid goal <{}> ...",
+            GOAL_SUBCOMMANDS.join("|")
+        );
         return Err(InteractiveError::Usage);
     };
+    // Checked before any file or ledger is opened, and against the same list
+    // `CLI_USAGE` advertises, so an unknown name is named as unknown rather
+    // than reaching the match's fallback and looking like bad arguments to a
+    // real subcommand.
+    if !GOAL_SUBCOMMANDS.contains(&sub) {
+        eprintln!(
+            "rapid goal: unknown subcommand '{sub}' (expected one of: {})",
+            GOAL_SUBCOMMANDS.join(", ")
+        );
+        return Err(InteractiveError::Usage);
+    }
     let cancel = agent_runtime::CancellationToken::new();
     let path = Path::new(PROJECT_MARKER).join(GOAL_FILE);
     let evidence_path = Path::new(PROJECT_MARKER).join(EVIDENCE_FILE);
@@ -812,6 +1048,10 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
                 _ => Err(InteractiveError::Usage),
             }
         }
+        // Unreachable for any name in `GOAL_SUBCOMMANDS`, which the guard
+        // above already required; kept so adding a name to the const without
+        // an arm degrades to a usage error rather than failing to compile
+        // into a panic.
         _ => Err(InteractiveError::Usage),
     }?;
 
@@ -1083,6 +1323,70 @@ fn command_error_text(err: &CommandError) -> String {
     }
 }
 
+/// Local-error text for an [`Inspector`] the TUI has no route to open.
+///
+/// Same contract as [`unsupported_command_text`]: name the actual, specific
+/// gap, and where a headless command already answers the question, name it
+/// rather than leaving the user with "not available". Every command named
+/// here is asserted to exist by
+/// `every_command_an_unrouted_inspector_message_names_actually_exists`.
+fn unrouted_inspector_text(inspector: &Inspector) -> String {
+    let reason = match inspector {
+        // Routed: handled by `dispatch_slash` before reaching this function.
+        Inspector::Agents
+        | Inspector::Diff { .. }
+        | Inspector::Goal
+        | Inspector::Context
+        | Inspector::Memory
+        | Inspector::Jobs => "this inspector has a TUI route and should not reach this message",
+        // Handled by `open_unrouted_inspector` with a real report.
+        Inspector::Mcp => "MCP configuration is reported inline and should not reach this message",
+        Inspector::Knowledge => {
+            "no knowledge-candidate store exists yet, so there is nothing to inspect"
+        }
+        Inspector::Playbook => {
+            "playbooks compile (`rapid playbook-compile <file.json>`) but there is no \
+name-addressable store to list them from"
+        }
+        Inspector::Trace => {
+            "no TUI trace panel yet; export a session's event ledger with \
+`rapid inspect-export <session> --format jsonl|md|html`"
+        }
+        Inspector::Insights => {
+            "no TUI insights panel yet; `rapid insights <session>` runs the same \
+`insights::analyze` over that session's events"
+        }
+        Inspector::Models => {
+            "no TUI model panel yet; `rapid doctor` reports the resolved provider, model, \
+fallback chain, credential source, and context budget"
+        }
+        Inspector::Plugins => {
+            "no TUI plugin panel yet; `rapid plugins list` reports the trust catalog"
+        }
+        Inspector::Policy => {
+            // `doctor::evaluate_security` never populates `policies`, so
+            // doctor's own `security-policy` row is always `SKIP` with this
+            // same reason — pointing a user at it would send them to a
+            // command that reports the thing does not exist.
+            "no user-authored capability-policy document exists in this build; the only policy \
+stacks are in-process constants, and there is no TUI panel over them"
+        }
+        Inspector::Sandbox => {
+            "no TUI sandbox panel yet; `rapid doctor` reports the selected backend and runs a \
+real sandboxed smoke probe"
+        }
+        Inspector::Permissions => {
+            "no TUI permission panel yet; rules come from the project settings files and the \
+RAPIDLM_PERMISSION_MODE environment variable"
+        }
+        Inspector::Computer => {
+            "computer-use is not wired into the interactive session yet, so there is no state \
+to inspect"
+        }
+    };
+    format!("not available: {reason}")
+}
+
 /// Local-error text for a `KernelAction` that parsed correctly but has no
 /// production backend anywhere in the workspace today — investigated and
 /// recorded in `newtask.md`'s command inventory, not guessed. Each reason
@@ -1115,8 +1419,26 @@ fn unsupported_command_text(action: &KernelAction) -> String {
         KernelAction::SelectModel { .. } => {
             "mid-session model switching is not wired yet; set RAPIDLM_MODEL or edit config.toml"
         }
-        KernelAction::AddMcp { .. } | KernelAction::RemoveMcp { .. } | KernelAction::AuthMcp { .. } => {
-            "external MCP server trust management is not wired into the interactive session yet"
+        KernelAction::AddMcp { .. } => {
+            "adding a server needs a program and its arguments, which `/mcp add` has no \
+grammar for: run `rapid mcp add <name> --command <program>` (see `rapid mcp --help`)"
+        }
+        // Deliberately *not* wired, though `rapid mcp remove` exists and
+        // would fit this grammar exactly. `KernelAction::requires_approval`
+        // classifies every MCP mutation as approval-gated, and this build
+        // has no approval broker — every other approval-gated action here
+        // reports it is unavailable rather than acting. Wiring this one
+        // would make it the first approval-classified action in the binary
+        // that silently mutates the filesystem, and it edits
+        // `.claude/settings.json`, a file another tool owns, from a
+        // two-word slash command with no confirmation.
+        KernelAction::RemoveMcp { .. } => {
+            "removing a server is approval-gated and this build has no approval broker: run \
+`rapid mcp remove <name>`, which is an explicit, argv-only command"
+        }
+        KernelAction::AuthMcp { .. } => {
+            "no remote MCP transport is wired in this build — only stdio `command` servers \
+are supported, and they have no auth step"
         }
         KernelAction::InstallPlugin { .. }
         | KernelAction::RemovePlugin { .. }
@@ -3093,6 +3415,7 @@ fn run_started_session(
         interrupt_count: &mut interrupt_count,
         saw_ctrl_c: &mut saw_ctrl_c,
         root: &resolved.root,
+        user_home: &resolved.user_home,
         trusted: resolved.trust.is_trusted(),
         turn_in_flight: turn_in_flight.clone(),
         renderer: &mut renderer,
@@ -3145,6 +3468,10 @@ struct SessionLoop<'a> {
     interrupt_count: &'a mut u32,
     saw_ctrl_c: &'a mut bool,
     root: &'a Path,
+    /// The session's own resolved RapidLM home — see
+    /// [`ResolvedProject::user_home`]. Slash commands that consult project
+    /// trust must read the catalog *this* session read.
+    user_home: &'a Path,
     trusted: bool,
     /// Set while a turn spawned by `submit_turn` is executing on its own
     /// thread; a new plain-text submission is a no-op while this is set,
@@ -3336,11 +3663,25 @@ impl SessionLoop<'_> {
             Ok(parsed) => match dispatch(parsed) {
                 FrontendAction::Quit => Ok(LoopControl::Quit(InteractiveOutcome::Quit)),
                 FrontendAction::Local(LocalAction::Open(inspector)) => {
-                    if let Some(route) = inspector.route() {
-                        *self.ui = reduce(
-                            self.ui.clone(),
-                            &UiEvent::Local(LocalUiEvent::SetRoute(route)),
-                        );
+                    match inspector.route() {
+                        Some(route) => {
+                            *self.ui = reduce(
+                                self.ui.clone(),
+                                &UiEvent::Local(LocalUiEvent::SetRoute(route)),
+                            );
+                        }
+                        // Eleven of the seventeen inspectors have no TUI
+                        // route. This arm used to be an empty `if let`, so
+                        // `/mcp list`, `/sandbox doctor`, `/model list`,
+                        // `/plugins list`, `/policy explain`, `/knowledge
+                        // list`, `/playbook list`, `/trace show`, `/insights
+                        // show`, `/permissions` and `/computer status` each
+                        // parsed successfully, dispatched successfully, and
+                        // then did *nothing at all* — no panel, no output,
+                        // no error. That is a worse failure than the
+                        // `KernelAction` path next to it, which has named
+                        // its specific gap since it existed.
+                        None => self.open_unrouted_inspector(inspector),
                     }
                     Ok(LoopControl::Continue)
                 }
@@ -3359,6 +3700,56 @@ impl SessionLoop<'_> {
                 Ok(LoopControl::Continue)
             }
         }
+    }
+
+    /// The project and RapidLM home *this session* resolved, handed to
+    /// `rapid mcp`'s own entry point.
+    ///
+    /// Deliberately not `std::env::vars()`: a session started with an
+    /// explicit `user_home` (every test, and any embedder) would otherwise
+    /// have `/mcp list` report trust from `$HOME/.rapidlm` — a catalog the
+    /// session itself never read.
+    fn mcp_env(&self) -> crate::mcp_admin::McpEnv {
+        crate::mcp_admin::McpEnv {
+            cwd: self.root.to_path_buf(),
+            env: Vec::new(),
+            home: Some(self.user_home.to_path_buf()),
+        }
+    }
+
+    /// An inspector the TUI has no route for: render whatever real report
+    /// this build can produce, or say precisely why it cannot.
+    ///
+    /// Never silent. Where a headless command already answers the same
+    /// question, the message names it — those are verified to exist in
+    /// `run_subcommand`'s dispatch table by
+    /// `every_command_an_unrouted_inspector_message_names_actually_exists`.
+    fn open_unrouted_inspector(&mut self, inspector: Inspector) {
+        if matches!(inspector, Inspector::Mcp) {
+            // `/mcp list` and `/mcp doctor` both land here. The report is
+            // the one `rapid mcp list` prints, from the same loader the
+            // turn path registers from — not a second view of the same
+            // settings files.
+            let outcome = crate::mcp_admin::run(&["list".to_owned()], &self.mcp_env());
+            match outcome {
+                Ok(outcome) => {
+                    let mut text = outcome.text;
+                    // Deliberately not probing from inside the event loop:
+                    // a server that never answers costs 30 seconds each,
+                    // which would freeze the session.
+                    text.push_str(
+                        "run `rapid mcp probe` for a live handshake against each server \
+(it starts them, so it needs a trusted project)\n",
+                    );
+                    self.append_command_output(text);
+                }
+                Err(crate::mcp_admin::McpUsageError(message)) => {
+                    self.append_command_error(message);
+                }
+            }
+            return;
+        }
+        self.append_command_error(unrouted_inspector_text(&inspector));
     }
 
     fn append_command_output(&mut self, text: String) {
@@ -4911,6 +5302,7 @@ fn resolve_project(options: &InteractiveOptions) -> Result<ResolvedProject, Inte
         config,
         ledger_path: project_root.join(PROJECT_MARKER).join(LEDGER_NAME),
         root: project_root,
+        user_home,
     })
 }
 
@@ -5033,19 +5425,22 @@ fn env_overrides(
     Ok(out)
 }
 
+/// The RapidLM home for an interactive session: an explicit
+/// `InteractiveOptions::user_home` if given, otherwise the same resolution
+/// every other command uses.
+///
+/// The environment branch used to iterate `options.env` and return on the
+/// *first* of `RAPIDLM_HOME`/`HOME`/`USERPROFILE` it happened to encounter —
+/// i.e. `environ` order, not a precedence — while [`user_home_from`], which
+/// `rapid exec`, `rapid trust`, `rapid doctor` and `rapid mcp` all use,
+/// checks `RAPIDLM_HOME` first unconditionally. With `RAPIDLM_HOME` set, a
+/// TUI session and a headless command in the same project could therefore
+/// resolve different homes and report different trust. It now delegates.
 fn resolve_user_home(options: &InteractiveOptions) -> Result<PathBuf, InteractiveError> {
     if let Some(home) = options.user_home.as_ref() {
         return canonicalize_or_create(home);
     }
-    for (key, value) in &options.env {
-        if key == RAPIDLM_HOME_ENV || key == HOME_ENV || key == USERPROFILE_ENV {
-            if key == HOME_ENV || key == USERPROFILE_ENV {
-                return canonicalize_or_create(&PathBuf::from(value).join(".rapidlm"));
-            }
-            return canonicalize_or_create(Path::new(value));
-        }
-    }
-    Err(InteractiveError::UserHomeMissing)
+    user_home_from(&options.env).ok_or(InteractiveError::UserHomeMissing)
 }
 
 pub(crate) fn canonicalize_dir(path: &Path) -> Result<PathBuf, InteractiveError> {
@@ -5869,19 +6264,268 @@ base_url = "http://127.0.0.1:11434/v1"
     }
 
     #[test]
-    fn help_usage_lists_documented_command_surface() {
-        for cmd in [
-            "rapid exec",
-            "rapid run",
-            "rapid goal",
-            "rapid graph",
-            "rapid context",
-            "rapid evidence",
-            "rapid daemon",
-            "rapid acp",
-            "rapid doctor",
-        ] {
-            assert!(CLI_USAGE.contains(cmd), "usage missing {cmd}");
+    fn cli_usage_lists_exactly_the_dispatched_subcommands() {
+        // Both directions. A command the binary runs but never mentions is
+        // undiscoverable; a command `--help` names but cannot run is a lie
+        // that reads, to a user, exactly like a typo. `CLI_USAGE` had both
+        // faults at once: `trust`, `scan`, `insights` and `release-manifest`
+        // were dispatched but undocumented in the subcommand table, and
+        // eighteen families were advertised with no dispatch arm at all.
+        // Every indented line under `Commands:` must be a real command
+        // line — asserted by *shape*, not by filtering. A `filter_map` that
+        // silently drops non-matching lines would let any prose line
+        // (`  see also: rapid daemon`, or an entry written `rapid
+        // interactive`) sit in the block unchecked.
+        let block: Vec<&str> = CLI_USAGE
+            .lines()
+            .skip_while(|line| !line.starts_with("Commands:"))
+            .skip(1)
+            .take_while(|line| !line.trim().is_empty())
+            .collect();
+        assert!(block.len() > 15, "the Commands block did not parse: {block:?}");
+        let mut advertised: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for line in &block {
+            let rest = line.strip_prefix("  rapid ").unwrap_or_else(|| {
+                panic!("every line under `Commands:` must be `  rapid <name> ...`: {line:?}")
+            });
+            let word = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or_else(|| panic!("no command name on: {line:?}"));
+            assert!(
+                !word.starts_with('<') && !word.starts_with('-'),
+                "the first word after `rapid` must be the subcommand name: {line:?}"
+            );
+            advertised.insert(word.to_owned());
+        }
+        let dispatched: std::collections::BTreeSet<String> = SUBCOMMANDS
+            .iter()
+            .map(|entry| entry.name.to_owned())
+            .collect();
+        let undocumented: Vec<&String> = dispatched.difference(&advertised).collect();
+        assert!(
+            undocumented.is_empty(),
+            "dispatched but missing from `rapid --help`: {undocumented:?}"
+        );
+        let unrunnable: Vec<&String> = advertised.difference(&dispatched).collect();
+        assert!(
+            unrunnable.is_empty(),
+            "advertised by `rapid --help` but not dispatched: {unrunnable:?}"
+        );
+    }
+
+    #[test]
+    fn cli_usage_lists_exactly_the_goal_subcommands() {
+        // Same defect class as the top-level table, one level down, and it
+        // had a live instance: `CLI_USAGE` advertised `rapid goal … budget
+        // …`, which no arm has ever matched, while omitting `replace` and
+        // `complete`, which do.
+        let line = CLI_USAGE
+            .lines()
+            .find(|line| line.trim_start().starts_with("rapid goal "))
+            .expect("a `rapid goal` line");
+        let advertised: std::collections::BTreeSet<&str> = line
+            .split_whitespace()
+            .nth(2)
+            .expect("the alternatives")
+            .split('|')
+            .collect();
+        let dispatched: std::collections::BTreeSet<&str> =
+            GOAL_SUBCOMMANDS.iter().copied().collect();
+        assert_eq!(
+            advertised, dispatched,
+            "`rapid goal`'s advertised subcommands and its dispatched ones disagree"
+        );
+    }
+
+    #[test]
+    fn the_goal_subcommand_list_is_the_set_the_dispatcher_really_carries() {
+        // `rapid goal budget` was advertised by `CLI_USAGE` and matched no
+        // arm, while `replace` and `complete` were dispatched and never
+        // advertised. `cli_usage_lists_exactly_the_goal_subcommands` ties
+        // the usage line to this list; this ties the list to the three
+        // specific facts that were wrong.
+        //
+        // Deliberately does *not* call `run_goal_command`: an unknown name
+        // and a real name with missing operands both return
+        // `InteractiveError::Usage`, so such a call would pass whether or
+        // not the guard exists — a vacuous assertion. The guard's own input
+        // is this list, which is what is checked here.
+        let unique: std::collections::BTreeSet<&&str> = GOAL_SUBCOMMANDS.iter().collect();
+        assert_eq!(unique.len(), GOAL_SUBCOMMANDS.len(), "duplicate goal subcommand");
+        assert!(
+            !GOAL_SUBCOMMANDS.contains(&"budget"),
+            "`budget` has no arm in run_goal_command"
+        );
+        assert!(GOAL_SUBCOMMANDS.contains(&"replace"));
+        assert!(GOAL_SUBCOMMANDS.contains(&"complete"));
+    }
+
+    #[test]
+    fn every_emitted_completion_script_is_well_formed_for_its_shell() {
+        // All three emitters were broken and nothing checked them: bash put
+        // the command name before `-W` (a fish flag order), zsh called
+        // `compdef` before defining the function, and fish interpolated
+        // summaries containing an apostrophe straight into single quotes,
+        // unbalancing the quoting and aborting the whole file.
+        let bash = crate::p9_commands::completions_script("bash").expect("bash");
+        assert!(bash.trim_end().ends_with(" rapid"), "{bash}");
+        assert!(bash.contains("-W \""), "{bash}");
+
+        let zsh = crate::p9_commands::completions_script("zsh").expect("zsh");
+        let define = zsh.find("_rapid()").expect("the function is defined");
+        let compdef = zsh.find("compdef").expect("compdef is called");
+        assert!(define < compdef, "compdef must come after the definition:\n{zsh}");
+
+        let fish = crate::p9_commands::completions_script("fish").expect("fish");
+        for line in fish.lines() {
+            // Count single quotes that are not backslash-escaped.
+            let mut quotes = 0usize;
+            let mut chars = line.chars();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '\\' => {
+                        let _ = chars.next();
+                    }
+                    '\'' => quotes += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!(quotes % 2, 0, "unbalanced quoting in fish line: {line}");
+        }
+        for entry in SUBCOMMANDS {
+            assert!(
+                fish.contains(entry.name),
+                "fish completions omit {}",
+                entry.name
+            );
+        }
+        assert!(crate::p9_commands::completions_script("tcsh").is_none());
+    }
+
+    #[test]
+    fn the_reference_doc_lists_exactly_the_dispatched_subcommands() {
+        // `docs/reference/cli-command-reference.md` is deliberately a
+        // *target surface* document, so most of its table is roadmap. The
+        // one paragraph that claims to describe what ships must actually
+        // do so — it asserted it was "generated from one table in source",
+        // which it is not; it is hand-typed markdown. This is the check
+        // that makes the claim true.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/reference/cli-command-reference.md");
+        let doc = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        let start = doc
+            .find("> **What the binary actually dispatches today**")
+            .expect("the shipped-commands paragraph");
+        let end = doc[start..]
+            .find("\n\n")
+            .map(|offset| start + offset)
+            .expect("the paragraph ends");
+        let paragraph = &doc[start..end];
+        let mut listed: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut rest = paragraph;
+        while let Some(open) = rest.find('`') {
+            rest = &rest[open + 1..];
+            let Some(close) = rest.find('`') else { break };
+            let word = &rest[..close];
+            rest = &rest[close + 1..];
+            // The paragraph also cites `interactive::SUBCOMMANDS` and the
+            // literal `rapid --help` output shape; only bare names count.
+            if word
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+            {
+                listed.insert(word.to_owned());
+            }
+        }
+        let dispatched: std::collections::BTreeSet<String> = SUBCOMMANDS
+            .iter()
+            .map(|entry| entry.name.to_owned())
+            .collect();
+        assert_eq!(
+            listed, dispatched,
+            "the reference doc's shipped-commands paragraph disagrees with SUBCOMMANDS"
+        );
+    }
+
+    #[test]
+    fn every_dispatched_subcommand_carries_a_summary_and_a_unique_name() {
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in SUBCOMMANDS {
+            assert!(
+                seen.insert(entry.name),
+                "duplicate subcommand name: {}",
+                entry.name
+            );
+            assert!(!entry.name.is_empty());
+            assert!(
+                entry.summary.len() > 10,
+                "`{}` has no real summary; it is printed by `rapid --help`, \
+`rapid completions fish` and `rapid man`",
+                entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_subcommand_is_named_rather_than_answered_with_a_bare_usage_dump() {
+        // Asserted on the *message*, not on `run_subcommand`'s return value:
+        // that is `Err(InteractiveError::Usage)` both before and after this
+        // change, so a test that only called it would pass with the message
+        // deleted.
+        let text = unknown_subcommand_text("daemon");
+        assert!(text.contains("daemon"), "{text}");
+        assert!(text.contains("unknown subcommand"), "{text}");
+        assert_ne!(
+            text,
+            InteractiveError::Usage.to_string(),
+            "the point is that it differs from the bare usage line a typo used to get"
+        );
+    }
+
+    #[test]
+    fn a_leading_flag_is_not_reported_as_an_unknown_subcommand() {
+        // `classify_launch` looks past leading flags to decide this is a
+        // subcommand launch at all, so `run_subcommand` has to as well.
+        // Reading `args.first()` blindly told a user that `--help` and
+        // `--jsonl` were unknown subcommands.
+        assert_eq!(
+            classify_launch(&["--jsonl", "man"]),
+            LaunchMode::Subcommand,
+            "precondition: a leading flag still selects subcommand mode"
+        );
+        assert!(matches!(
+            run_subcommand(&["--jsonl".to_owned(), "man".to_owned()]),
+            Ok(0)
+        ));
+        // A flag-only argv has no subcommand at all, and must not name one.
+        assert!(matches!(
+            run_subcommand(&["--jsonl".to_owned()]),
+            Err(InteractiveError::Usage)
+        ));
+    }
+
+    #[test]
+    fn every_subcommand_answers_help_because_the_usage_text_promises_it_does() {
+        // `CLI_USAGE` says every command answers `--help`. Thirteen of them
+        // used to answer with ``usage: see `rapid --help` `` and exit 2 — a
+        // literal loop — `playbook-compile` tried to open a file named
+        // `--help`, and `sessions`/`mcp-tools`/`man` ignored the flag and
+        // ran. Commands that handle it themselves are exercised by their own
+        // suites; this covers the centrally-answered ones.
+        for entry in SUBCOMMANDS {
+            if entry.own_help {
+                continue;
+            }
+            let result = run_subcommand(&[entry.name.to_owned(), "--help".to_owned()]);
+            assert!(
+                matches!(result, Ok(0)),
+                "`rapid {} --help` did not answer: {result:?}",
+                entry.name
+            );
         }
     }
 
@@ -6430,6 +7074,7 @@ base_url = "http://127.0.0.1:11434/v1"
             interrupt_count,
             saw_ctrl_c,
             root: &session.root,
+            user_home: &session.user_home,
             trusted: true,
             turn_in_flight,
             renderer,
@@ -7063,7 +7708,247 @@ base_url = "http://127.0.0.1:11434/v1"
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
         let painted = report.rendered_output.expect("capture_render was requested");
         assert!(painted.contains("not available"), "{painted}");
-        assert!(painted.contains("MCP"), "{painted}");
+        // Not just "MCP": the message must send the user to the command
+        // that can actually do it, which now exists.
+        assert!(painted.contains("rapid mcp add"), "{painted}");
+    }
+
+    #[test]
+    fn an_inspector_with_no_tui_route_says_something_instead_of_silently_doing_nothing() {
+        // Eleven of the seventeen inspectors have no route. Their dispatch
+        // arm used to be an empty `if let Some(route)`, so each of these
+        // commands parsed, dispatched, and produced no panel, no output and
+        // no error — worse than the `KernelAction` path beside it, which has
+        // named its specific gap since it existed.
+        let _lock = lock_terminal();
+        for command in [
+            "/sandbox doctor",
+            "/model list",
+            "/plugins list",
+            "/policy explain",
+            "/knowledge list",
+            "/playbook list",
+            "/trace show",
+            "/insights show",
+            "/permissions",
+            "/computer status",
+        ] {
+            let env = TempEnv::create();
+            let report = run_interactive(env.options_capturing_render(vec![
+                InteractiveInput::Submit(command.to_owned()),
+                InteractiveInput::Submit("/quit".to_owned()),
+            ]))
+            .expect("run");
+            assert_eq!(report.outcome, InteractiveOutcome::Quit);
+            let painted = report.rendered_output.expect("capture_render was requested");
+            assert!(
+                painted.contains("not available"),
+                "`{command}` produced no output at all:\n{painted}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_unrouted_inspector_message_names_a_specific_gap_not_a_generic_one() {
+        // The value of these messages is that they differ. A table of
+        // identical "not available" strings would satisfy the test above
+        // while telling a user nothing.
+        let messages: Vec<String> = [
+            Inspector::Knowledge,
+            Inspector::Playbook,
+            Inspector::Trace,
+            Inspector::Insights,
+            Inspector::Models,
+            Inspector::Plugins,
+            Inspector::Policy,
+            Inspector::Sandbox,
+            Inspector::Permissions,
+            Inspector::Computer,
+        ]
+        .iter()
+        .map(unrouted_inspector_text)
+        .collect();
+        let unique: std::collections::BTreeSet<&String> = messages.iter().collect();
+        assert_eq!(
+            unique.len(),
+            messages.len(),
+            "unrouted inspector messages collapsed into duplicates: {messages:?}"
+        );
+        for message in &messages {
+            assert!(message.starts_with("not available: "), "{message}");
+            assert!(
+                message.len() > "not available: ".len() + 20,
+                "message is too short to name a real gap: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_command_an_unrouted_inspector_message_names_actually_exists() {
+        // These messages send a user somewhere else. A message naming a
+        // command this binary does not dispatch would be worse than saying
+        // nothing — it is the same class of untruth the whole pass exists to
+        // remove.
+        let dispatched: Vec<&str> = SUBCOMMANDS.iter().map(|entry| entry.name).collect();
+        let all = [
+            Inspector::Knowledge,
+            Inspector::Playbook,
+            Inspector::Trace,
+            Inspector::Insights,
+            Inspector::Models,
+            Inspector::Plugins,
+            Inspector::Policy,
+            Inspector::Sandbox,
+            Inspector::Permissions,
+            Inspector::Computer,
+        ]
+        .iter()
+        .map(unrouted_inspector_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let mut named = 0usize;
+        let mut rest = all.as_str();
+        while let Some(start) = rest.find("`rapid ") {
+            rest = &rest[start + "`rapid ".len()..];
+            let end = rest.find('`').expect("an opened backtick is closed");
+            let subcommand = rest[..end]
+                .split_whitespace()
+                .next()
+                .expect("a named command is not empty");
+            assert!(
+                dispatched.contains(&subcommand),
+                "`rapid {subcommand}` is named as the way to do this but is not a dispatched \
+subcommand"
+            );
+            named += 1;
+            rest = &rest[end..];
+        }
+        assert!(named >= 4, "expected several messages to point at a real command");
+    }
+
+    #[test]
+    fn mcp_list_renders_the_real_project_report_inline() {
+        // `/mcp list` and `/mcp doctor` used to open a routeless inspector,
+        // i.e. do nothing. They now print the report `rapid mcp list`
+        // prints, from the same loader the turn path registers from.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        fs::create_dir_all(env.project.join(PROJECT_MARKER)).expect("marker");
+        fs::write(
+            env.project.join(PROJECT_MARKER).join("settings.json"),
+            r#"{"mcpServers": {"good": {"command": "true"},
+                                "remote": {"type": "http", "url": "https://example.com"}}}"#,
+        )
+        .expect("settings");
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/mcp list".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(painted.contains("servers="), "{painted}");
+        assert!(
+            painted.contains("good"),
+            "the usable server must be listed:\n{painted}"
+        );
+        // Not `contains("rejected")`: `list` always prints `rejected=<n>`,
+        // so that would hold with zero rejections.
+        assert!(
+            painted.contains("rejected=remote"),
+            "the rejected entry must be reported by name:\n{painted}"
+        );
+        assert!(
+            painted.contains("stdio only"),
+            "with its real reason:\n{painted}"
+        );
+    }
+
+    #[test]
+    fn mcp_list_reports_trust_from_the_catalog_this_session_actually_read() {
+        // The session resolves its RapidLM home from `InteractiveOptions`,
+        // not from the process environment. A slash command that re-derived
+        // one from `std::env::vars()` would report trust out of
+        // `$HOME/.rapidlm` — a catalog this session never consulted, and on
+        // a developer machine very likely a *different* answer.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        fs::create_dir_all(env.project.join(PROJECT_MARKER)).expect("marker");
+        fs::write(
+            env.project.join(PROJECT_MARKER).join("settings.json"),
+            r#"{"mcpServers": {"srv": {"command": "true"}}}"#,
+        )
+        .expect("settings");
+        // Grant in *this session's* home only.
+        let canonical = fs::canonicalize(&env.project).expect("canonicalize");
+        let identity = ProjectIdentity::new(&canonical, None).expect("identity");
+        ProjectTrustStore::open(env.user_home.join(TRUST_CATALOG_NAME))
+            .set(&identity, TrustStatus::Trusted, &CancellationToken::new())
+            .expect("grant");
+
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/mcp list".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(
+            painted.contains("trust=trusted"),
+            "the grant in this session's own home was not observed:\n{painted}"
+        );
+    }
+
+    #[test]
+    fn mcp_remove_from_the_tui_respects_the_approval_classification_and_writes_nothing() {
+        // `rapid mcp remove` exists and `/mcp remove <name>` fits its
+        // grammar exactly, so wiring it was tempting — but
+        // `KernelAction::requires_approval` classifies every MCP mutation as
+        // approval-gated and this build has no approval broker. Wiring it
+        // would have made it the first approval-classified action in the
+        // binary that silently mutates the filesystem, and it deletes from
+        // `.claude/settings.json`, a file another tool owns, from a two-word
+        // slash command with no confirmation.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        fs::create_dir_all(env.project.join(PROJECT_MARKER)).expect("marker");
+        let settings = env.project.join(PROJECT_MARKER).join("settings.json");
+        let before = r#"{"mcpServers": {"gone": {"command": "true"}}}"#;
+        fs::write(&settings, before).expect("settings");
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/mcp remove gone".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        assert_eq!(
+            fs::read_to_string(&settings).expect("settings still readable"),
+            before,
+            "an approval-gated action mutated project settings with no approval"
+        );
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(
+            painted.contains("rapid mcp remove"),
+            "it must name the argv-only command that can do this:\n{painted}"
+        );
+    }
+
+    #[test]
+    fn mcp_add_names_the_command_that_can_actually_do_it() {
+        // `/mcp add <target>` has nowhere to put a program and its
+        // arguments, so it stays unsupported — but the message must send the
+        // user to `rapid mcp add`, which now exists, rather than claim MCP
+        // management is unwired anywhere.
+        let text = unsupported_command_text(&KernelAction::AddMcp {
+            target: "x".to_owned(),
+        });
+        assert!(text.contains("rapid mcp add"), "{text}");
+        let auth = unsupported_command_text(&KernelAction::AuthMcp {
+            name: "x".to_owned(),
+        });
+        assert!(auth.contains("stdio"), "{auth}");
+        assert_ne!(text, auth, "add and auth fail for different reasons");
     }
 
     #[test]
@@ -7111,7 +7996,7 @@ base_url = "http://127.0.0.1:11434/v1"
         let mcp_text = unsupported_command_text(&KernelAction::AddMcp {
             target: "x".to_owned(),
         });
-        assert!(mcp_text.contains("MCP"), "{mcp_text}");
+        assert!(mcp_text.contains("rapid mcp add"), "{mcp_text}");
         assert_ne!(
             agent_text, mcp_text,
             "different unsupported command families must not collapse into one generic string"
@@ -7439,6 +8324,10 @@ base_url = "http://127.0.0.1:11434/v1"
         session_id: protocol::SessionId,
         actor: ActorRef,
         root: PathBuf,
+        /// Mirrors `ResolvedProject::user_home`: the home a real session
+        /// resolved, so a scripted `SessionLoop` reads the same trust
+        /// catalog production would.
+        user_home: PathBuf,
         stream: EventStream,
         ui: AppState,
     }
@@ -7468,6 +8357,7 @@ base_url = "http://127.0.0.1:11434/v1"
                 session_id,
                 actor,
                 root: env.project.clone(),
+                user_home: env.user_home.clone(),
                 stream,
                 ui,
             }
@@ -8165,6 +9055,7 @@ base_url = "http://127.0.0.1:11434/v1"
             interrupt_count: &mut interrupt_count,
             saw_ctrl_c: &mut saw_ctrl_c,
             root: &session.root,
+            user_home: &session.user_home,
             trusted: true,
             turn_in_flight,
             renderer: &mut renderer,
@@ -8476,6 +9367,7 @@ base_url = "http://127.0.0.1:11434/v1"
                 interrupt_count: &mut interrupt_count,
                 saw_ctrl_c: &mut saw_ctrl_c,
                 root: &session.root,
+                user_home: &session.user_home,
                 trusted: true,
                 turn_in_flight: turn_in_flight.clone(),
                 renderer: &mut renderer,
@@ -8500,6 +9392,7 @@ base_url = "http://127.0.0.1:11434/v1"
                 interrupt_count: &mut interrupt_count,
                 saw_ctrl_c: &mut saw_ctrl_c,
                 root: &session.root,
+                user_home: &session.user_home,
                 trusted: true,
                 turn_in_flight,
                 renderer: &mut renderer,

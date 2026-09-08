@@ -6297,6 +6297,176 @@ exists); `--json` output (no CLI convention justifies one — same reasoning `ra
 per-server tool allow/deny filtering; MCP resources and prompts (only `tools/*` is wired); OAuth; and the
 eighteen other advertised-but-undispatched command families listed at the top of this entry.
 
+**A parsing command that does nothing is worse than one that fails: the slash-command and subcommand
+truthfulness pass, done 2026-09-08, immediately after the `rapid mcp` commit above.** Three defects found
+while inventorying what `CLI_USAGE` advertises.
+
+**1. Eleven TUI slash commands were complete silent no-ops.** `dispatch_slash`'s
+`FrontendAction::Local(LocalAction::Open(inspector))` arm was
+`if let Some(route) = inspector.route() { ...SetRoute... }` — and eleven of the seventeen
+`tui::commands::Inspector` variants return `None`. So `/mcp list`, `/mcp doctor`, `/sandbox doctor`,
+`/model list`, `/plugins list`, `/policy explain`, `/knowledge list`, `/playbook list`, `/trace show`,
+`/insights show`, `/permissions` and `/computer status` each parsed successfully, dispatched
+successfully, and then produced **no panel, no output, and no error**. This is strictly worse than the
+`KernelAction` arm sitting next to it, which has printed a specific, named gap
+(`unsupported_command_text`) since it existed — and the test guarding that arm is even called
+`unsupported_kernel_commands_render_an_honest_message_and_never_silently_no_op`, so the guarantee its name
+claims was exactly the one the neighbouring arm violated. New `open_unrouted_inspector` +
+`unrouted_inspector_text`: every one now says something specific, and where a headless command already
+answers the same question it names it (`rapid doctor` for models/policy/sandbox, `rapid plugins list`,
+`rapid inspect-export`, `rapid insights`, `rapid playbook-compile`). A test asserts those messages are all
+*different* from one another (a table of identical "not available" strings would satisfy the first test
+and tell a user nothing), and another parses every `` `rapid <x>` `` out of them and fails if `x` is not in
+the dispatch table — which is how the next defect was found.
+
+**2. `RAPID_SUBCOMMANDS`, documented as the "single source of truth for rapid subcommands (help,
+completions)", was missing four commands the binary dispatches:** `trust`, `scan`, `insights` and
+`release-manifest`. They ran, but `rapid --help`'s table, `rapid completions bash|zsh|fish` and
+`rapid man` all omitted them. Two lists, drifted.
+
+**3. `CLI_USAGE` advertised eighteen command families with no dispatch arm at all:** `run`, `resume`,
+`fork`, `rewind`, `daemon`, `acp`, `graph`, `context`, `evidence`, `process`, `computer`, `sandbox`,
+`hooks`, `skills`, `eval`, `inspect`, `export`, `update`. Typing one printed the same generic usage a typo
+produces, with nothing to say the command does not exist. Confirmed by running the compiled binary
+against all eighteen before touching anything. Worse, the existing test
+`help_usage_lists_documented_command_surface` *asserted* six of those untruths (`rapid run`,
+`rapid graph`, `rapid context`, `rapid evidence`, `rapid daemon`, `rapid acp`) — a test locking the lie in.
+
+**Fix: one table.** `interactive::SUBCOMMANDS` is now `&[Subcommand { name, summary, handler }]` with a
+two-variant `SubcommandHandler` (`Native` for `exec`/`trust`/`goal`, which already speak
+`InteractiveError`; `P9` for the family adapted by `p9`). `run_subcommand` looks up in it,
+`run_completions`/`run_man` iterate it, and `RAPID_SUBCOMMANDS` is deleted — the first class of drift is
+now structurally impossible rather than test-enforced. `CLI_USAGE` was rewritten to list exactly the
+twenty dispatched commands, with `cli_usage_lists_exactly_the_dispatched_subcommands` checking **both**
+directions (dispatched-but-undocumented, and advertised-but-unrunnable). The eighteen roadmap families
+moved to `docs/reference/cli-command-reference.md`, which is explicitly a target-surface document and now
+carries a generated-from-source list of what actually ships. An unknown subcommand now prints
+`rapid: unknown subcommand '<name>'` before the usage, so a typo and a not-yet-built command are no longer
+the same output.
+
+**And `/mcp` in the TUI became real,** since the commit before this one gave it a backend. `/mcp list` and
+`/mcp doctor` render the report `rapid mcp list` prints — the same `mcp_admin::run` entry point, from the
+same loader the turn path registers from — with a pointer to `rapid mcp probe` for a live handshake
+(deliberately not probing inside the event loop: a server that never answers costs 30 seconds each, which
+would freeze the session). `/mcp add`, `/mcp remove` and `/mcp auth` stay unsupported — see the reversed
+design decision below for why `remove` is not wired despite fitting the grammar — but each now names the
+argv-only command that can do it, or states that only stdio servers exist, instead of claiming MCP
+management is unwired anywhere. Reachability is
+unchanged in substance: `submit_composer` is fed by human keystrokes or a scripted `InteractiveInput`,
+never by model output.
+
+**Self-review, two passes, and this one found more in the fix than in the original code — fourteen real
+defects, all fixed.** That is worth recording plainly: a truthfulness commit is exactly the kind of change
+that ships new untruths.
+
+*My own pass, before any agent review, caught three.* (a) **`/mcp` built its `McpEnv` from
+`std::env::vars()`**, but a session resolves its RapidLM home from `InteractiveOptions::user_home` first —
+so `/mcp list` would have reported project trust out of `$HOME/.rapidlm`, a catalog the session never read
+and on a developer machine very likely a different answer from the one gating its own tools. Fixed by
+carrying the resolved home on `ResolvedProject` -> `SessionLoop` -> `mcp_env()`. (b) **The new
+`release-manifest` summary said "emit or verify a signed release manifest"; `run_release_manifest` neither
+signs nor verifies** — it prints a JSON document of artifact digests. (c) **`CLI_USAGE` advertised
+`rapid goal … budget …`, which no arm has ever matched**, while omitting `replace` and `complete`, which
+do. Fixed with `GOAL_SUBCOMMANDS`, an up-front guard that names the valid set before any file or ledger is
+opened, and `cli_usage_lists_exactly_the_goal_subcommands`.
+
+*The adversarial pass then found eleven more, most severe first.* (d) **The new closing line of
+`CLI_USAGE` — "Run `rapid <subcommand> --help`" — was itself the exact untruth this change exists to
+remove.** Only `exec`, `trust`, `mcp` and `doctor` honoured `--help`; thirteen answered with
+``usage: see `rapid --help` `` and exit 2, a literal loop, `rapid playbook-compile --help` tried to
+`fs::read` a file named `--help`, and `sessions`/`mcp-tools`/`man` ignored the flag and ran. Fixed with an
+`own_help` column on the table and a central answer for the rest: every command now answers `--help` with
+either its own usage or a one-line summary, exit 0, asserted for all of them by
+`every_subcommand_answers_help_because_the_usage_text_promises_it_does`. (e) **The
+`cli_usage_lists_exactly_the_dispatched_subcommands` test silently skipped any line not starting with
+`rapid ` — including (d).** It also carried its own escape hatch (`*word != "interactive"`), which would
+have accepted a plausible `rapid interactive` entry. Rewritten to assert the *shape* of every line under
+`Commands:`, and the bare-TUI line moved into prose above the block so no exception is needed. (f)
+**`/policy explain` pointed at a `rapid doctor` capability that does not exist**:
+`doctor::evaluate_security` never populates `policies`, so doctor's own `security-policy` row is always
+`SKIP`. The message now says what is true — this build ships no user-authored policy document. (g)
+**`rapid completions` emitted a broken script for all three shells, and nothing checked any of them.**
+bash got `complete -c rapid -W "..."` — `-c` is a *fish* flag and bash takes the name last, so the word
+list was silently dropped; zsh called `compdef` before defining `_rapid`; fish interpolated summaries into
+single quotes and three summaries contain an apostrophe (`a session's event ledger`), unbalancing the
+quoting and aborting the whole file — and this change *added a third* such summary. All three fixed and
+`completions_script` split out so the text is assertable; verified by actually sourcing the bash and zsh
+scripts and quote-parity-scanning the fish one. (h) **`an_unknown_subcommand_is_named_…` was vacuous**: it
+asserted `Err(InteractiveError::Usage)`, which is the *pre-change* behavior, so deleting the new message
+left it green. Fixed by extracting `unknown_subcommand_text` and asserting on it — the identical flaw I
+had already caught and fixed one level down for the goal guard, and missed here. (i) **`rapid --jsonl exec
+hi` and `rapid --help exec` began reporting a *flag* as an unknown subcommand.** `classify_launch`
+deliberately looks past leading flags; `run_subcommand` read `args.first()` blindly. A new untruth in a
+truthfulness commit; fixed by taking the first non-flag word. (j) **`mcp_list_renders_…`'s
+"rejected entry" assertion could never fail** (`contains("rejected")` matches the unconditional
+`rejected=<n>` header); now asserts `rejected=remote` and its reason. (k) **Three doc comments overstated
+the original bug**: `rapid daemon` printed the single line `usage: rapid [subcommand]`, not `CLI_USAGE`.
+(l) **The new reference-doc paragraph claimed to be "generated from source" and drift-proof; it is
+hand-typed markdown.** Now actually checked, by
+`the_reference_doc_lists_exactly_the_dispatched_subcommands`. (m) **`mcp_env()` round-tripped a `PathBuf`
+through `display().to_string()`**, and the receiver *creates* whatever it decodes — a non-UTF-8 home would
+have had a read-only slash command silently create a junk directory and report the project untrusted.
+`McpEnv` now carries a typed `home: Option<PathBuf>`. (n) **`resolve_user_home` returned on the *first* of
+`RAPIDLM_HOME`/`HOME`/`USERPROFILE` it met while iterating the environment — `environ` order, not a
+precedence** — while every other consumer checks `RAPIDLM_HOME` first, and its own doc comment asserted
+that precedence. With `RAPIDLM_HOME` set, a TUI session and a headless command in the same project could
+resolve different homes. It now delegates to `user_home_from`, the one implementation.
+
+**And one design decision reversed on review.** My first draft wired `/mcp remove <name>` to the real
+`mcp_admin` removal, reasoning that it was strictly de-privileging and a human keystroke. But
+`KernelAction::requires_approval` classifies **every** MCP mutation as approval-gated, and this build has
+no approval broker — every other approval-gated action reports it is unavailable rather than acting.
+Wiring it would have made it the first approval-classified action in the binary that silently mutates the
+filesystem, and it deletes from `.claude/settings.json`, a file another tool owns, from a two-word slash
+command with no confirmation. **Reverted**: `/mcp remove` now names `rapid mcp remove`, and
+`mcp_remove_from_the_tui_respects_the_approval_classification_and_writes_nothing` asserts the settings
+file is byte-identical afterwards. `/mcp list` and `/mcp doctor` stay real — they are read-only and
+correctly not approval-classified.
+
+**One more defect the review surfaced in an adjacent command, fixed here because this pass rewrote its
+usage line:** `rapid sessions list|search` advertised a distinction that did not exist —
+`run_sessions` read the mode into `_mode` and discarded it, so `rapid sessions definitely-not-a-mode`
+listed every session and exited 0. Both modes are now real and validated.
+
+**Revert-cycle verification, sixteen further cycles (24-39), each a literal break-and-restore:** the
+route-less inspector back to a silent no-op (`/sandbox doctor` produced no output at all); `/mcp remove`
+no longer reaching the writer; `CLI_USAGE` re-advertising `daemon`; a dispatched command dropped from the
+table; the unrouted messages collapsed to one generic string; `/mcp` re-deriving the home from the process
+environment (**"the grant in this session's own home was not observed"**); `CLI_USAGE` re-advertising
+`goal budget`; the goal guard removed; the central `--help` removed (`rapid goal --help` stopped
+answering); the leading-flag skip removed; a prose line smuggled into the `Commands:` block; the fish
+emitter's escaping removed (**the unbalanced `tools` line reproduced verbatim**); the bash emitter back to
+the fish flag order; the typed `McpEnv` home ignored; the reference-doc paragraph dropping `scan`; and the
+sessions mode discarded again. Two cycles are worth recording specifically: the **goal-guard** cycle
+*passed* under the broken code, which is what a revert cycle is for — the assertion was on
+`run_goal_command`'s return value, which is `Err(Usage)` either way, so the test was rewritten to assert
+on the list itself rather than on a call that could not distinguish the two; and the first **doctor-row**
+cycle (22) likewise passed until the test was strengthened to assert the trust verdict in both directions.
+All restored and byte-compared against pre-cycle copies; `grep -rn "REVERT CYCLE\|if false"
+apps/rapid/src` returns nothing.
+
+**Verification:** `cargo test -p rapid --lib` 613 passed (up from 593 at the previous commit); every
+`apps/rapid` integration suite green (`mcp_cli` 14, `doctor_cli` 17, `trust_cli` 12, `context_budget_cli`
+4, `exec_diagnosability` 11, `goal_concurrency` 1, `goal_evidence_concurrency` 1,
+`configured_model_integration` 13); `cargo clippy -p rapid --all-targets` 54 warnings, below the
+56-warning `HEAD` baseline, none in a touched hunk; full `cargo test --workspace` green.
+
+**A note on test flakiness, recorded rather than glossed over.** One `cargo test -p rapid --lib` run
+during this session reported three `context_retrieval` failures and, in another, one `goal_host` lease
+failure. Both were runs made *while a `cargo test --workspace` was still executing in the background* (and
+an unrelated project's `cargo test` was running elsewhere on the machine). Each failing test passes in
+isolation, in its own module group, and in a clean serial full run, on both this tree and `HEAD` — the
+same resource-contention pattern this document already recorded for `computer-use`'s fixtures. The
+practical rule this session confirms: do not run two suites at once, and re-run serially before believing
+a failure.
+
+**Deliberately not attempted:** implementing any of the eighteen roadmap families (`daemon`, `acp`,
+`graph`, `context`, `evidence`, `process`, `computer`, `sandbox`, `hooks`, `skills`, `eval`, `inspect`,
+`export`, `update`, `run`, `resume`, `fork`, `rewind`) — this pass makes the CLI stop claiming them, not
+build them; an approval broker (which is what `/mcp remove`, `/plugins install` and every other
+approval-gated slash command actually need); TUI routes/panels for the eleven unrouted inspectors; and
+per-subcommand *option* documentation beyond the one-line summary the central `--help` now gives.
+
 ## 0. Where RapidLM actually stands today (read this before the tables below)
 
 `gaps.md` is a living document and parts of it are now stale. Commit `ac66e8a` ("Wire the gaps.md parity

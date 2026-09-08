@@ -20,6 +20,14 @@ coverage/
 .rapidlm/goal-evidence.lock
 .rapidlm/goal-driver.lock
 
+# Local event-ledger database. Written wherever a command runs — including
+# `apps/rapid/` when `cargo test -p rapid --lib` exercises a command that
+# opens `.rapidlm/sessions.sqlite` relative to the process cwd — and never
+# part of the repository's content.
+**/.rapidlm/sessions.sqlite
+**/.rapidlm/sessions.sqlite-wal
+**/.rapidlm/sessions.sqlite-shm
+
 # OS / editor
 .DS_Store
 .idea/

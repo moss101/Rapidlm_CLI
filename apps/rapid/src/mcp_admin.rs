@@ -65,6 +65,15 @@ const NEW_SETTINGS_MODE: u32 = 0o600;
 pub struct McpEnv {
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
+    /// The RapidLM home to read the trust catalog from, when the caller has
+    /// already resolved one. `None` falls back to `env`.
+    ///
+    /// Typed rather than pushed back through `env` as a `RAPIDLM_HOME`
+    /// string: `Path::display()` substitutes U+FFFD for non-UTF-8 bytes, and
+    /// `user_home_from` *creates* whatever it is handed — so a home under a
+    /// non-UTF-8 path would have this command silently create a junk
+    /// directory beside the real one and then report the project untrusted.
+    pub home: Option<PathBuf>,
 }
 
 impl McpEnv {
@@ -72,6 +81,7 @@ impl McpEnv {
         Self {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             env: std::env::vars().collect(),
+            home: None,
         }
     }
 }
@@ -208,7 +218,7 @@ fn resolve(env: &McpEnv) -> Result<Project, McpUsageError> {
     let cancel = CancellationToken::new();
     let found = resolve_project_root(&env.cwd, &cancel)
         .map_err(|reason| McpUsageError(format!("rapid mcp: {reason}")))?;
-    let trust = trust_of(&found.root, &env.env, &cancel);
+    let trust = trust_of(&found.root, env, &cancel);
     let config = load_project_mcp(&found.root);
     Ok(Project {
         root: found.root,
@@ -219,11 +229,15 @@ fn resolve(env: &McpEnv) -> Result<Project, McpUsageError> {
 
 fn trust_of(
     root: &Path,
-    env: &[(String, String)],
+    env: &McpEnv,
     cancel: &CancellationToken,
 ) -> Result<TrustStatus, String> {
-    let Some(home) = user_home_from(env) else {
-        return Err("no RapidLM home directory could be resolved".to_owned());
+    let home = match env.home.clone() {
+        Some(home) => home,
+        None => match user_home_from(&env.env) {
+            Some(home) => home,
+            None => return Err("no RapidLM home directory could be resolved".to_owned()),
+        },
     };
     let identity = ProjectIdentity::new(root, None)
         .map_err(|err| format!("project identity could not be derived: {err}"))?;
@@ -886,10 +900,8 @@ mod tests {
         fn env(&self) -> McpEnv {
             McpEnv {
                 cwd: self.project.clone(),
-                env: vec![(
-                    "RAPIDLM_HOME".to_owned(),
-                    self.home.display().to_string(),
-                )],
+                env: Vec::new(),
+                home: Some(self.home.clone()),
             }
         }
 

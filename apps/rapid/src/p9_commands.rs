@@ -575,26 +575,6 @@ mod tests {
     }
 }
 
-/// Single source of truth for rapid subcommands (help, completions).
-pub const RAPID_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("exec", "run one agent turn"),
-    ("goal", "durable goal lifecycle (create/show/pause/resume/cancel/export/verify)"),
-    ("playbook-compile", "compile a playbook JSON template into an initial graph"),
-    ("mcp-tools", "print the published RapidLM MCP server surface"),
-    ("tools", "dump the model-facing tool surface's typed JSON schemas"),
-    ("agent-cli", "one supervised external CLI agent turn: <prompt> -- argv..."),
-    ("sessions", "list or search sessions"),
-    ("inspect-export", "export a session's event ledger (--format jsonl|md|html)"),
-    ("cron", "durable prompt cron (add/list/remove/poll)"),
-    ("findings", "persisted scanner findings (list/dismiss)"),
-    ("agents", "project agent definitions (list/validate/scaffold)"),
-    ("plugins", "plugin trust lifecycle (validate/register/list/approve/reject/hook-test)"),
-    ("doctor", "diagnose config/model/trust/sandbox health (offline, read-only)"),
-    ("mcp", "project MCP servers (list/get/add/remove/probe)"),
-    ("completions", "emit shell completions: bash|zsh|fish"),
-    ("man", "print the manual page text"),
-];
-
 /// `rapid doctor`: the real environment/config/model/project/sandbox
 /// diagnosis (`crate::doctor`).
 ///
@@ -683,8 +663,36 @@ pub fn run_sessions(args: &[String]) -> Result<i32, P9CommandError> {
         }
         i += 1;
     }
-    let _mode = rest.first().ok_or(P9CommandError::Usage)?;
-    let needle = rest.get(1).cloned();
+    // `CLI_USAGE` advertises `rapid sessions list|search`, and the mode used
+    // to be read into `_mode` and discarded: `rapid sessions
+    // definitely-not-a-mode` listed every session and exited 0, so the
+    // advertised distinction did not exist. Both modes are now real —
+    // `search` requires its text, `list` refuses one.
+    let mode = rest.first().map(|s| s.as_str()).ok_or(P9CommandError::Usage)?;
+    let needle = match mode {
+        "list" => {
+            if rest.len() > 1 {
+                eprintln!("rapid sessions list: unexpected argument '{}'", rest[1]);
+                return Err(P9CommandError::Usage);
+            }
+            None
+        }
+        "search" => {
+            let Some(text) = rest.get(1) else {
+                eprintln!("usage: rapid sessions search <text>");
+                return Err(P9CommandError::Usage);
+            };
+            if rest.len() > 2 {
+                eprintln!("rapid sessions search: unexpected argument '{}'", rest[2]);
+                return Err(P9CommandError::Usage);
+            }
+            Some((*text).clone())
+        }
+        other => {
+            eprintln!("rapid sessions: unknown mode '{other}' (expected list or search)");
+            return Err(P9CommandError::Usage);
+        }
+    };
     let db_path = db.unwrap_or_else(|| {
         PathBuf::from(".rapidlm").join("sessions.sqlite")
     });
@@ -1998,25 +2006,60 @@ pub fn run_inspect_export(args: &[String]) -> Result<i32, P9CommandError> {
 /// Single source of truth for rapid subcommands (help, completions).
 pub fn run_completions(args: &[String]) -> Result<i32, P9CommandError> {
     let shell = args.first().map(String::as_str).ok_or(P9CommandError::Usage)?;
-    let names: Vec<&str> = RAPID_SUBCOMMANDS.iter().map(|(n, _)| *n).collect();
-    match shell {
-        "bash" => println!("complete -c rapid -W \"{}\"", names.join(" ")),
-        "zsh" => println!("compdef _rapid rapid\n_rapid() {{ _values 'subcommand' {} }}", names.join(" ")),
-        "fish" => {
-            for (name, desc) in RAPID_SUBCOMMANDS {
-                println!("complete -c rapid -n '__fish_use_subcommand' -a '{name}' -d '{desc}'");
-            }
-        }
-        _ => return Err(P9CommandError::Usage),
-    }
+    print!("{}", completions_script(shell).ok_or(P9CommandError::Usage)?);
     Ok(0)
+}
+
+/// The completion script for `shell`, or `None` for a shell this does not
+/// emit. Split out from [`run_completions`] so the emitted text is
+/// assertable — the three scripts had gone unchecked and all three were
+/// broken:
+///
+/// * **bash** emitted `complete -c rapid -W "..."`. `-c` is a *fish* flag;
+///   bash's `complete` takes the name last, so bash parsed `rapid` as an
+///   argument to `-c` and registered a completion with no word list.
+/// * **zsh** called `compdef _rapid rapid` *before* defining `_rapid`.
+/// * **fish** interpolated each summary into single quotes, and three
+///   summaries contain an apostrophe (`a session's event ledger`), so the
+///   quoting became unbalanced and fish aborted the whole file.
+pub fn completions_script(shell: &str) -> Option<String> {
+    let names: Vec<&str> = crate::interactive::SUBCOMMANDS
+        .iter()
+        .map(|entry| entry.name)
+        .collect();
+    match shell {
+        "bash" => Some(format!("complete -W \"{}\" rapid\n", names.join(" "))),
+        "zsh" => Some(format!(
+            "_rapid() {{ _values 'subcommand' {} }}\ncompdef _rapid rapid\n",
+            names.join(" ")
+        )),
+        "fish" => Some(
+            crate::interactive::SUBCOMMANDS
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "complete -c rapid -n '__fish_use_subcommand' -a '{}' -d '{}'\n",
+                        fish_quote(entry.name),
+                        fish_quote(entry.summary)
+                    )
+                })
+                .collect::<String>(),
+        ),
+        _ => None,
+    }
+}
+
+/// Escape for a fish single-quoted string: only `\` and `'` are special
+/// there, and both are escaped with a backslash.
+fn fish_quote(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
 /// `rapid man`: manual text generated from the catalog.
 pub fn run_man(_args: &[String]) -> Result<i32, P9CommandError> {
     println!("RAPID(1) — RapidLM CLI");
-    for (name, desc) in RAPID_SUBCOMMANDS {
-        println!("  rapid {name}\t{desc}");
+    for entry in crate::interactive::SUBCOMMANDS {
+        println!("  rapid {}\t{}", entry.name, entry.summary);
     }
     Ok(0)
 }
@@ -2056,6 +2099,44 @@ mod sessions_tests {
         ];
         let code = run_sessions(&args).expect("list command");
         assert_eq!(code, 0);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn sessions_modes_are_real_rather_than_an_advertised_distinction_that_is_ignored() {
+        // `CLI_USAGE` advertises `rapid sessions list|search`, and the mode
+        // used to be read into `_mode` and discarded — so `rapid sessions
+        // definitely-not-a-mode` listed every session and exited 0, and
+        // `search` with no text did the same.
+        let db = temp_db("modes");
+        let _ = seed_session(&db);
+        let db_arg = db.to_string_lossy().into_owned();
+        let with_db = |mut args: Vec<String>| {
+            args.push("--db".to_owned());
+            args.push(db_arg.clone());
+            args
+        };
+
+        assert!(matches!(
+            run_sessions(&with_db(vec!["list".to_owned()])),
+            Ok(0)
+        ));
+        assert!(matches!(
+            run_sessions(&with_db(vec!["search".to_owned(), "abc".to_owned()])),
+            Ok(0)
+        ));
+        for bad in [
+            vec!["definitely-not-a-mode".to_owned()],
+            vec!["search".to_owned()],
+            vec!["list".to_owned(), "unexpected".to_owned()],
+            vec!["search".to_owned(), "a".to_owned(), "b".to_owned()],
+        ] {
+            assert!(
+                matches!(run_sessions(&with_db(bad.clone())), Err(P9CommandError::Usage)),
+                "`rapid sessions {}` should be a usage error",
+                bad.join(" ")
+            );
+        }
         let _ = std::fs::remove_file(&db);
     }
 
