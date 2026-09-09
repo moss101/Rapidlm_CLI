@@ -9513,6 +9513,42 @@ that is no longer there"
     }
 
     #[test]
+    fn a_job_stopped_at_the_end_of_its_turn_says_so_rather_than_reporting_an_exit_code() {
+        // A background job does not outlive the turn that started it: the
+        // registry is per-turn and its `Drop` kills the children. That is
+        // the current, deliberate lifetime — but the *report* was wrong.
+        // `kill_all` sets `cancelled` and then kills, so the supervisor saw
+        // an ordinary signalled exit and recorded "completed exit -1",
+        // which a model reads as a build that failed and the panel showed
+        // the same way. A job we stopped must say it was stopped.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "start a slow one",
+            ScriptedModel::background_job_then_answer(&["/bin/sleep", "30"], "started"),
+        );
+        session.drain_until("the stopped job to be reported", |state| {
+            state
+                .jobs()
+                .values()
+                .any(|job| !matches!(job.state(), tui::state::JobLifecycle::Started))
+        });
+
+        let jobs = session.state().jobs();
+        let job = jobs.values().next().expect("the job is projected");
+        assert_eq!(
+            job.state(),
+            tui::state::JobLifecycle::Cancelled,
+            "a job stopped with the turn must be reported as cancelled, not as an exit: {job:?}"
+        );
+        assert_eq!(
+            job.exit_status(),
+            None,
+            "and must not carry an exit status it never really had"
+        );
+    }
+
+    #[test]
     fn a_background_job_reaches_the_jobs_panel() {
         // `shell_exec` with `background: true` has always started a real
         // supervised child, but the registry is in-process and journaled

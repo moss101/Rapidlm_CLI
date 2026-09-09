@@ -7098,6 +7098,54 @@ tests). The panel is correct and will populate if an approval-requesting path is
 reads "no approvals" honestly. `/help` marks both commands available because both open a working panel,
 which is what that marker measures.
 
+**A job stopped at the end of its turn reported an exit code it never had, done 2026-09-10.**
+
+**Found with the observability built an hour earlier**, which is the point of building it: a probe started
+`/bin/sleep 30` in a scripted turn and read the ledger. The job was dead in under a second, reported as
+`completed exit -1`.
+
+Two separate facts, and only one of them is a bug.
+
+**The lifetime is real and was undocumented.** `JobRegistry` is built per *turn*
+(`build_interactive_turn_context`) and its `Drop` kills the children, so a background job lives until the
+end of the turn that started it. A model can start a build and poll it across steps of the same turn; it
+cannot poll it in a later one. The registry's own doc comment claimed children outlive nothing shorter
+than "the CLI run", which is not what the code does, and the tool's summary told the model to "poll with
+job_status / read with job_output" without saying until when. Both now say what is true. **Not changed
+unilaterally:** extending the lifetime to the session is a genuine product change — a job would outlive
+the turn a user can see, and a crashed TUI could strand processes — so it is recorded below rather than
+assumed.
+
+**The report was a bug.** `kill_all` sets `cancelled` and *then* kills the child, so by the time the
+supervisor loop noticed, the job looked like an ordinary exit; killed children are signalled, `code()` is
+`None`, and the old `unwrap_or(-1)` turned "we stopped it" into "it failed with exit -1" — for the model
+reading `job_status`, and for the `/jobs` panel.
+
+**The first fix was wrong in the other direction, and the test caught it.** Reporting `cancelled` whenever
+the flag was set meant a fast command that had genuinely finished a moment before teardown was relabelled
+as cancelled — `a_background_job_reaches_the_jobs_panel` started failing intermittently, which is exactly
+what a racy rule looks like. The distinguishing fact is not the flag but *how the child ended*: one that
+exited on its own carries a real exit code, one we killed was signalled and carries none. So the rule is
+`status.code().is_none() && cancelled`, which keeps a finished job's true result and reports only a job
+actually stopped mid-run. Five consecutive runs of both tests pass.
+
+**Tests.** One new: a background `sleep` stopped with its turn is projected as `Cancelled` with no exit
+status. Two revert cycles (96-97) — removing the branch restores `Completed exit -1`, and the racy first
+version was caught by an existing test rather than by a new one.
+
+684 `rapid` lib tests, clippy identical to baseline, full workspace green.
+
+### Recommended next, on this thread
+
+**Extend the background-job lifetime from the turn to the session.** A user who asks for a build and then
+sends another message reasonably expects it to still be running; mature CLIs keep background commands
+alive for the session. The mechanics are known: the registry moves from per-turn `ExecTools` to the
+interactive session, shared into each turn the way `share_write_locks`/`share_job_budget` already share
+per-turn state, and `Drop` must move to an inner `Arc` so a per-turn clone going out of scope no longer
+kills every job. The safety half is the reason it has not been done here: something must still guarantee
+no process outlives the CLI, including on a crash. `/jobs cancel <id>` becomes meaningful at the same
+time, and the registry's `cancelled` flag is already the mechanism it would use.
+
 ## Session boundary, 2026-09-09 — durable state for the next session
 
 Eight commits, `dbeb2c2`..`1e516cb`, all pushed to `origin/main`. Baseline before them was `598c6fd`.

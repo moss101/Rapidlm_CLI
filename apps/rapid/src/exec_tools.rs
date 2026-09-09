@@ -262,8 +262,17 @@ pub(crate) trait JobEvents: Send + Sync {
 }
 
 /// Registry of background commands started by `shell.exec` with
-/// `background: true`. Children are killed when the registry drops, so no
-/// command outlives the CLI run.
+/// `background: true`.
+///
+/// Children are killed when the registry drops. The registry is built per
+/// *turn* (`build_interactive_turn_context`), so a background job lives
+/// until the end of the turn that started it — not, as this comment used to
+/// say, until the end of the CLI run. A model can start a build and poll it
+/// across steps of the same turn; it cannot poll it in a later one, and
+/// `start`'s own summary now tells it so. Extending the lifetime to the
+/// session is a real product change (a job would then outlive the turn a
+/// user can see, and a crashed TUI could strand processes) and is recorded
+/// in `newtask.md` rather than assumed here.
 #[derive(Clone, Default)]
 pub struct JobRegistry {
     jobs: Arc<Mutex<BTreeMap<String, JobShared>>>,
@@ -441,6 +450,29 @@ impl JobRegistry {
                             .flatten()
                     };
                     if let Some(status) = done {
+                        // `kill_all` sets `cancelled` and *then* kills the
+                        // child, so by the time this loop notices, a job we
+                        // stopped looks like an ordinary exit — and the old
+                        // `unwrap_or(-1)` reported it as "completed exit
+                        // -1", which a model reads as a build that failed
+                        // and the panel showed the same way.
+                        //
+                        // The distinguishing fact is *how* it ended, not
+                        // merely that `cancelled` is set: a child that
+                        // exited on its own carries a real exit code, while
+                        // one we killed was signalled and carries none. So a
+                        // fast command that finished a moment before
+                        // teardown keeps its true result, and only a job
+                        // actually stopped mid-run is reported as cancelled.
+                        if status.code().is_none() && worker.cancelled.load(Ordering::SeqCst) {
+                            if let Ok(mut state) = worker.state.lock() {
+                                *state = JobState::Failed("cancelled".to_owned());
+                            }
+                            if let Some(events) = finish.as_ref() {
+                                events.finished(ledger_id, "cancelled", None);
+                            }
+                            break;
+                        }
                         let code = status.code().unwrap_or(-1);
                         if let Ok(mut state) = worker.state.lock() {
                             *state = JobState::Completed(code);
@@ -2139,7 +2171,8 @@ impl WorkspaceTools {
                     MAX_JOB_OUTPUT_BYTES as u64,
                 )?;
                 let mut summary = format!(
-                    "started sandboxed job {job_id}: {} (timeout {}s); poll with job_status",
+                    "started sandboxed job {job_id}: {} (timeout {}s); poll with job_status \
+within this turn — the job is stopped when the turn ends",
                     args.argv.join(" "),
                     args.timeout.as_secs()
                 );
@@ -2193,7 +2226,8 @@ impl WorkspaceTools {
         if args.background {
             let job_id = self.jobs.start(&args.argv, self.root(), args.timeout)?;
             let mut summary = format!(
-                "started background job {job_id}: {} (timeout {}s); poll with job_status / read with job_output",
+                "started background job {job_id}: {} (timeout {}s); poll with job_status / \
+read with job_output, both within this turn — the job is stopped when the turn ends",
                 args.argv.join(" "),
                 args.timeout.as_secs()
             );
