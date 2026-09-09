@@ -1407,6 +1407,18 @@ fn unsupported_command_text(action: &KernelAction) -> String {
         | KernelAction::SleepAgent { .. } => {
             "no running-agent registry exists yet to pause, resume, or sleep a specific agent"
         }
+        // Reached only for the id-carrying form: the sole `KernelApi::
+        // Interrupt` implementation is a session-wide interrupt that takes
+        // no id, so honouring one of these would mean killing the current
+        // turn and calling it a cancellation of the thing named.
+        KernelAction::CancelAgent { .. } | KernelAction::TerminateAgent { .. } => {
+            "no running-agent registry exists yet to cancel or terminate an agent; press \
+Ctrl-C to interrupt the turn that is running"
+        }
+        KernelAction::CancelJob { .. } => {
+            "no per-job cancellation backend exists yet; press Ctrl-C to interrupt the turn \
+that is running"
+        }
         KernelAction::ShowGoalBudget { .. } => {
             "goal budget has no display or mutation backend yet, in the TUI or the headless CLI"
         }
@@ -3719,7 +3731,15 @@ impl SessionLoop<'_> {
                     Ok(LoopControl::Continue)
                 }
                 FrontendAction::InlineHelp(help) => {
-                    self.append_command_output(help.usage().to_owned());
+                    // Bare `/help` listed 28 command families with nothing
+                    // to say that roughly half report "not available" the
+                    // moment they run. `/help <command>` keeps its own
+                    // usage text unchanged.
+                    let text = match help.topic() {
+                        None => crate::command_help::annotated_catalog_help(),
+                        Some(_) => help.usage().to_owned(),
+                    };
+                    self.append_command_output(text);
                     Ok(LoopControl::Continue)
                 }
                 FrontendAction::Kernel(action) => {
@@ -4262,6 +4282,15 @@ denied\n",
         self.cancel
             .check()
             .map_err(|_| InteractiveError::Cancelled)?;
+        // One gate, consulted here *and* by `/help`'s availability
+        // annotation, so what the listing claims and what this function does
+        // cannot disagree. Previously the two were hand-mirrored: deleting an
+        // arm below would have left `/help` still reporting the command as
+        // working, with no compile error.
+        if !crate::command_help::kernel_action_is_supported(&action) {
+            self.append_command_error(unsupported_command_text(&action));
+            return self.drain();
+        }
         match action {
             KernelAction::StartGoal { statement } => self.start_goal(statement)?,
             KernelAction::PauseGoal => self.goal_lifecycle_command(GoalLifecycleKind::Pause)?,
@@ -4283,6 +4312,20 @@ denied\n",
             }
             other => match other.kernel_api() {
                 KernelApi::Interrupt => {
+                    // `CancelJob`/`CancelAgent`/`TerminateAgent` all map to
+                    // `KernelApi::Interrupt`, whose only implementation is a
+                    // *session-wide* interrupt that takes no id. Naming one
+                    // therefore killed the current turn instead of the thing
+                    // named — worse than a no-op, because it did something
+                    // destructive and different from what the command says.
+                    // The bare form is refused too: there is no per-job or
+                    // per-agent backend either way, and silently turning
+                    // `/jobs cancel` into "kill the turn" under a command
+                    // summarised "inspect or cancel supervised jobs" is the
+                    // same untruth without the id.
+                    // The gate above already refused every cancellation
+                    // that names a job or agent, so anything reaching here
+                    // is a genuine session-wide interrupt.
                     self.interrupt()?;
                 }
                 KernelApi::SubmitTurn => {
@@ -4299,31 +4342,73 @@ denied\n",
                         )),
                         self.cancel,
                     )?;
-                    *self.ui = reduce(self.ui.clone(), &UiEvent::Snapshot(child));
+                    // The fork is real and durable, but this session is not
+                    // switched onto it: `self.session_id` and the subscribed
+                    // event stream both still point at the parent, so the
+                    // next `drain()` re-fetches the parent snapshot and
+                    // overwrites the child's. Reducing the child snapshot in
+                    // and saying nothing therefore *looked* like a switch
+                    // for one frame and then silently reverted — so say what
+                    // actually happened instead. Switching the live session
+                    // would mean re-subscribing the stream, which is a
+                    // separate piece of work.
+                    let child_id = child.id();
+                    self.append_command_output(format!(
+                        "forked at seq {seq}: child session {child_id}\nthis session continues on the parent; there is no way to switch to a fork yet\n"
+                    ));
                 }
                 KernelApi::Rewind => {
                     let to_seq = match &other {
                         KernelAction::RewindSession { to_seq } => *to_seq,
                         _ => None,
                     };
+                    // Unreachable now that `parse_rewind` requires the
+                    // sequence — kept as a local error rather than the
+                    // previous bare `return Ok(())`, which did nothing,
+                    // printed nothing, and skipped the trailing `drain()`
+                    // so the frame was not even repainted.
                     let Some(to_seq) = to_seq else {
-                        return Ok(());
+                        self.append_command_error(
+                            "rewind needs a sequence number: /rewind <seq>".to_owned(),
+                        );
+                        return self.drain();
                     };
-                    let result = block_on(
+                    // A rejected sequence (0, or past the session's last) is
+                    // the *ordinary* mistake here, and `?` used to propagate
+                    // the kernel's `SessionNotFound` all the way out of
+                    // `run`, ending the whole interactive session — the same
+                    // failure `command_error_text`'s own doc comment
+                    // describes fixing for parse errors, still live on this
+                    // path. It is a local command error like any other.
+                    let rewound = block_on(
                         self.client
                             .rewind(RewindSession::new(self.session_id, to_seq)),
                         self.cancel,
-                    )?;
-                    *self.ui = reduce(
-                        self.ui.clone(),
-                        &UiEvent::Snapshot(result.snapshot().clone()),
                     );
+                    match rewound {
+                        Ok(result) => {
+                            *self.ui = reduce(
+                                self.ui.clone(),
+                                &UiEvent::Snapshot(result.snapshot().clone()),
+                            );
+                        }
+                        // A cancelled block_on is the session shutting down,
+                        // not a bad sequence: that one still propagates.
+                        Err(InteractiveError::Cancelled) => {
+                            return Err(InteractiveError::Cancelled);
+                        }
+                        Err(err) => {
+                            self.append_command_error(format!(
+                                "rewind to {to_seq} failed: {err}"
+                            ));
+                        }
+                    }
                 }
-                // Every other parsed command: investigated and confirmed to
-                // have no real production backend anywhere in the workspace
-                // today (see `newtask.md`'s command inventory) — rendered
-                // as an honest, specific "not available" result instead of
-                // the silent no-op this used to be.
+                // Unreachable: `kernel_action_is_supported` refuses every
+                // `Approve`/`Dispatch` action before the match is entered.
+                // Kept as the same honest message rather than a panic, so a
+                // predicate that ever disagreed with this match degrades to
+                // "not available" instead of killing the session.
                 KernelApi::Approve | KernelApi::Dispatch => {
                     self.append_command_error(unsupported_command_text(&other));
                 }
@@ -6457,6 +6542,34 @@ approval gap has been closed and this characterization test should be rewritten:
         }
     }
 
+    /// Rows of a captured frame.
+    ///
+    /// The renderer positions the cursor per row (`ESC [ <n> ; 1 H`) rather
+    /// than emitting newlines, so `str::lines()` on captured output yields
+    /// the *whole frame* as a single line — which quietly turns any
+    /// per-line assertion into a frame-wide `contains`.
+    fn painted_rows(painted: &str) -> Vec<String> {
+        painted
+            .split('\u{1b}')
+            .filter_map(|chunk| {
+                // Strictly `[ <digits> ; <digits> H`; anything else (`[2J`,
+                // `[?25l`, …) is not a row start. A looser match returned
+                // fragments of other escapes as if they were rows.
+                let rest = chunk.strip_prefix('[')?;
+                let (row, rest) = rest.split_once(';')?;
+                if row.is_empty() || !row.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                let (col, body) = rest.split_once('H')?;
+                if col.is_empty() || !col.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                Some(body.trim_end().to_owned())
+            })
+            .filter(|row| !row.is_empty())
+            .collect()
+    }
+
     fn lock_terminal() -> std::sync::MutexGuard<'static, ()> {
         let guard = TERMINAL_LOCK
             .lock()
@@ -8047,6 +8160,214 @@ subcommand"
             rest = &rest[end..];
         }
         assert!(named >= 4, "expected several messages to point at a real command");
+    }
+
+    #[test]
+    fn bare_help_marks_the_commands_this_build_cannot_perform() {
+        // `/help` listed 28 families with nothing to say that about half
+        // report "not available" the moment they run. `/help <command>`
+        // keeps its own usage text unchanged.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/help".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(
+            painted.contains("run a marked command"),
+            "bare /help must say where the specific reason lives:\n{painted}"
+        );
+        // Specific commands with their specific markers, not just the
+        // substring "unavailable" appearing somewhere. Chosen from the tail
+        // of the catalog because 28 lines plus a footer overflow a 24-row
+        // test terminal and the head scrolls out of the captured frame; the
+        // per-command verdicts for the whole catalog are asserted directly
+        // in `command_help`'s own `the_rendered_help_marks_only_what_is_
+        // missing`.
+        let rows = painted_rows(&painted);
+        // Marked rows begin with the marker, not the command, so match on
+        // the command anywhere in the row and assert the prefix separately.
+        let row_for = |command: &str| {
+            rows.iter()
+                .find(|row| row.contains(command))
+                .unwrap_or_else(|| panic!("`{command}` is missing from /help:\n{rows:#?}"))
+                .clone()
+        };
+        // The marker is a leading, fixed-width prefix precisely so it stays
+        // visible: several usage lines are long enough that a trailing
+        // marker wrapped onto the next terminal row. Commands are chosen
+        // from the tail of the catalog because it is longer than a 24-row
+        // test terminal and the head scrolls out of the captured frame; the
+        // whole catalog's verdicts are asserted directly by `command_help`'s
+        // own `the_rendered_help_marks_only_what_is_missing`.
+        for command in ["/playbook ", "/plugins "] {
+            let row = row_for(command);
+            assert!(
+                row.trim_start().starts_with('!'),
+                "`{command}` should be marked unavailable: {row}"
+            );
+        }
+        let mcp = row_for("/mcp ");
+        assert!(
+            mcp.trim_start().starts_with('~'),
+            "`/mcp` should be marked partly unavailable: {mcp}"
+        );
+        // A fully working command is unmarked.
+        let permissions = row_for("/permissions ");
+        assert!(
+            permissions.trim_start().starts_with('/'),
+            "a fully working command must carry no marker: {permissions}"
+        );
+    }
+
+    #[test]
+    fn help_for_one_command_is_its_own_usage_not_the_annotated_catalog() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/help quit".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(
+            !painted.contains("run a marked command"),
+            "per-command help must not become the whole catalog:\n{painted}"
+        );
+        // And it must actually show the command's own usage — asserting
+        // only the footer's absence would pass if it printed nothing at all.
+        assert!(
+            painted.contains("/quit"),
+            "`/help quit` must print `/quit`'s own usage:\n{painted}"
+        );
+    }
+
+    #[test]
+    fn fork_says_it_branched_rather_than_appearing_to_switch_and_reverting() {
+        // `/fork` reduced the child snapshot into the UI and printed
+        // nothing. `self.session_id` and the subscribed event stream both
+        // still point at the parent, so the very next `drain()` re-fetched
+        // the parent and overwrote it — the command looked like a switch for
+        // one frame and then silently reverted, with no way to tell it had
+        // done anything at all.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/fork".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(
+            painted.contains("child session"),
+            "the fork it really created must be named:\n{painted}"
+        );
+        assert!(
+            painted.contains("continues on the parent"),
+            "and it must not leave the user thinking they switched:\n{painted}"
+        );
+    }
+
+    #[test]
+    fn a_rewind_to_an_impossible_sequence_is_a_command_error_not_the_end_of_the_session() {
+        // `block_on(...)?` propagated the kernel's rejection out of
+        // `dispatch_slash` -> `submit_composer` -> `run`, ending the whole
+        // interactive session. Sequence 0 and any sequence past the
+        // session's last are the *ordinary* mistakes on this command, and
+        // `command_error_text`'s own doc comment describes fixing exactly
+        // this failure mode for parse errors — the kernel-action path still
+        // had it.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/rewind 999999".to_owned()),
+            // Reached only if the session survived the line above.
+            InteractiveInput::Submit("/permissions allow repo_read".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("the session must survive a rejected rewind");
+        assert_eq!(
+            report.outcome,
+            InteractiveOutcome::Quit,
+            "a rejected rewind must not end the session"
+        );
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(
+            painted.contains("rewind to 999999 failed"),
+            "the rejection must be reported as a command error:\n{painted}"
+        );
+        // Proof the session really kept going: the command after it ran.
+        let canonical = fs::canonicalize(&env.project).expect("canonicalize");
+        assert_eq!(
+            persisted_grants_for(&canonical, &env.user_home)
+                .iter()
+                .map(crate::permissions::ToolPattern::render)
+                .collect::<Vec<_>>(),
+            vec!["repo_read".to_owned()],
+            "the command after the failed rewind never ran, so the session did end"
+        );
+    }
+
+    #[test]
+    fn cancelling_a_named_job_does_not_silently_interrupt_the_turn_instead() {
+        // The end-to-end shape of the defect: `/jobs cancel <id>` reached
+        // `KernelApi::Interrupt`, whose only implementation is a
+        // session-wide interrupt taking no id, so it killed whatever was
+        // running and reported nothing about the job the user named.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit(
+                "/jobs cancel 01234567-89ab-7cde-89ab-0123456789ab".to_owned(),
+            ),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        // The name's actual claim: no interrupt happened. Without this the
+        // test passed on the message alone and would have stayed green if
+        // the refusal were printed *and* the session interrupted anyway.
+        assert_eq!(
+            report.interrupt_count, 0,
+            "the turn was interrupted despite the command being refused"
+        );
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(
+            painted.contains("not available"),
+            "naming a job must be refused, not silently turned into a turn interrupt:\n{painted}"
+        );
+        assert!(
+            painted.contains("per-job cancellation"),
+            "the refusal must name the real gap:\n{painted}"
+        );
+    }
+
+    #[test]
+    fn a_bare_jobs_cancel_is_refused_too_and_interrupts_nothing() {
+        // The first pass refused only the id-carrying form, leaving
+        // `/jobs cancel` routed to a session-wide interrupt under a command
+        // summarised "inspect or cancel supervised jobs" — the same untruth
+        // without the id, and `/help` reported `/jobs` as fully working.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/jobs cancel".to_owned()),
+            InteractiveInput::Submit("/agents cancel".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        assert_eq!(
+            report.interrupt_count, 0,
+            "a bare cancel must not interrupt the turn either"
+        );
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(painted.contains("not available"), "{painted}");
     }
 
     #[test]

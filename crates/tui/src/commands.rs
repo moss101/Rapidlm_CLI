@@ -470,13 +470,13 @@ const CATALOG: &[CommandSpec] = &[
     CommandSpec {
         name: "knowledge",
         aliases: &[],
-        usage: "/knowledge [list|show|suggest <text>|approve|reject|edit] [id]",
+        usage: "/knowledge [list|show [id]|suggest <text>|approve <id>|reject <id>|edit <id>]",
         summary: "browse or govern knowledge candidates",
     },
     CommandSpec {
         name: "playbook",
         aliases: &[],
-        usage: "/playbook [list|show|run|validate] [name]",
+        usage: "/playbook [list|show <name>|run <name>|validate <name>]",
         summary: "inspect or request a playbook run",
     },
     CommandSpec {
@@ -494,7 +494,7 @@ const CATALOG: &[CommandSpec] = &[
     CommandSpec {
         name: "handoff",
         aliases: &[],
-        usage: "/handoff local|daemon|remote [target]",
+        usage: "/handoff local|daemon|remote <target>",
         summary: "request a fenced execution handoff",
     },
     CommandSpec {
@@ -524,7 +524,7 @@ const CATALOG: &[CommandSpec] = &[
     CommandSpec {
         name: "mcp",
         aliases: &[],
-        usage: "/mcp [list|add <target>|remove|auth|doctor] [name]",
+        usage: "/mcp [list|add <target>|remove <name>|auth <name>|doctor]",
         summary: "inspect or request MCP changes",
     },
     CommandSpec {
@@ -536,7 +536,7 @@ const CATALOG: &[CommandSpec] = &[
     CommandSpec {
         name: "plugins",
         aliases: &[],
-        usage: "/plugins [list|install <spec>|remove|permissions] [name]",
+        usage: "/plugins [list|install <spec>|remove <name>|permissions <name>]",
         summary: "inspect or request plugin changes",
     },
     CommandSpec {
@@ -561,12 +561,12 @@ const CATALOG: &[CommandSpec] = &[
         name: "fork",
         aliases: &[],
         usage: "/fork",
-        summary: "fork the session through the kernel",
+        summary: "branch a child session at this point (this session stays on the parent)",
     },
     CommandSpec {
         name: "rewind",
         aliases: &[],
-        usage: "/rewind [seq]",
+        usage: "/rewind <seq>",
         summary: "rewind the session through the kernel",
     },
     CommandSpec {
@@ -576,6 +576,25 @@ const CATALOG: &[CommandSpec] = &[
         summary: "request kernel transcript compaction",
     },
 ];
+
+/// One catalog entry, exposed so a frontend can reason about the command
+/// surface it renders — in particular whether this build can actually perform
+/// each command — without a second copy of the list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommandInfo {
+    pub name: &'static str,
+    pub usage: &'static str,
+    pub summary: &'static str,
+}
+
+/// Every slash command, in the order bare `/help` lists them.
+pub fn catalog() -> impl Iterator<Item = CommandInfo> {
+    CATALOG.iter().map(|spec| CommandInfo {
+        name: spec.name,
+        usage: spec.usage,
+        summary: spec.summary,
+    })
+}
 
 /// The full slash-command catalog, one `usage` line per [`CommandSpec`].
 ///
@@ -1322,9 +1341,11 @@ fn parse_resume(args: &[&str]) -> Result<UiCommand, CommandError> {
     })
 }
 
+/// `/rewind <seq>`. The sequence is required: the host's rewind path early-
+/// returns on `None`, so a bare `/rewind` parsed successfully and then did
+/// nothing at all, silently — the usage even advertised it as optional.
 fn parse_rewind(args: &[&str]) -> Result<UiCommand, CommandError> {
     match args {
-        [] => Ok(UiCommand::Rewind { to_seq: None }),
         [raw] => Ok(UiCommand::Rewind {
             to_seq: Some(parse_u64("rewind", raw)?),
         }),

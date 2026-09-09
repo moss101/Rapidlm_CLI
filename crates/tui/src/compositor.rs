@@ -173,6 +173,34 @@ pub fn sidebar_lines(
     }
 }
 
+/// Whether [`sidebar_lines`] can produce content for `route`, as opposed to
+/// switching to a panel that paints nothing.
+///
+/// The authority on this deliberately lives *here*, beside the match that
+/// decides it, and mirrors that match arm for arm — adding a `UiRoute`
+/// variant fails to compile in both places at once. It exists because
+/// "`Inspector::route()` returns `Some`" is emphatically **not** the same
+/// fact: nine of the twelve routes resolve to a panel with no content, and a
+/// frontend that treated a route as evidence of a working command told users
+/// `/diff`, `/memory` and `/jobs` were fine when they open an empty sidebar
+/// — on a narrow terminal, one that takes the whole transcript rect.
+pub const fn route_renders_content(route: UiRoute) -> bool {
+    match route {
+        // The transcript is the default view, not an inspector panel.
+        UiRoute::Transcript => false,
+        UiRoute::Agents | UiRoute::Goals => true,
+        UiRoute::Diff
+        | UiRoute::Context
+        | UiRoute::Memory
+        | UiRoute::Jobs
+        | UiRoute::Approvals
+        | UiRoute::Graph
+        | UiRoute::Computer
+        | UiRoute::Resources
+        | UiRoute::Models => false,
+    }
+}
+
 /// One line per goal: statement, lifecycle, turns/tokens against budget.
 /// `GoalViewModel` (unlike its sibling panels) has no `.render()`/`Frame`
 /// of its own yet — this is a deliberately minimal, local formatting of its

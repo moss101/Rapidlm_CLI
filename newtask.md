@@ -6739,6 +6739,118 @@ additive step and was not taken here.
 agent-runtime --lib` 280; `cargo clippy -p rapid -p tui -p agent-runtime --all-targets` 54 warnings,
 below the 56 baseline; full `cargo test --workspace` green.
 
+**`/help` now marks which of its 28 command families this build can actually perform — and building it
+found six commands doing something other than what they say, done 2026-09-09.**
+
+**The gap.** Bare `/help` listed 28 families with nothing to say that roughly half report "not available"
+the moment they run. Every one of them *is* honest when invoked (the previous commits saw to that), so
+the information existed per command; what was missing was the listing-level answer, which is what a user
+reads first.
+
+**The approach, chosen to avoid the defect this document keeps recording.** A second list of "these ones
+work" is exactly what `CLI_USAGE`-vs-dispatch, `CATALOG`-vs-`CATALOG_HELP` and `parse_mcp_servers`-vs-its-
+own-bounds each were. So new `apps/rapid/src/command_help.rs` derives the answer instead: each catalog
+entry's **own usage string** is turned into concrete invocations (one per alternative), each is run
+through the real `tui::parse_command` and `tui::dispatch`, and the resulting `FrontendAction` is
+classified. There is no availability table. A command that gains a backend is reported the same day, and
+a usage line whose shape the synthesis cannot read fails `every_synthesized_invocation_parses` rather
+than being silently skipped.
+
+**The marker is a fixed-width *leading* prefix** (`!` unavailable, `~` partly, blank otherwise) with a
+legend. It started as a trailing `(unavailable)` and that was wrong: several usage lines are already 70+
+characters, so on an ordinary terminal the marker wrapped onto the next row — precisely where a reader is
+least likely to see it. A constant-width prefix keeps the names aligned and survives wrapping;
+`every_marker_is_the_same_width_so_the_command_names_stay_aligned` pins it.
+
+**Six real defects surfaced by building it, all fixed.**
+
+1. **Five usage lines disagreed with their own parsers.** `/knowledge`, `/playbook`, `/mcp`, `/plugins`
+   advertised `[id]` / `[name]` as optional where `require_id`/`require_ident` demand them, and
+   `/handoff` advertised `[target]` as optional where `remote` requires one. Eleven synthesized
+   invocations across five commands failed to parse; every usage line is now exact.
+2. **`/handoff`'s first correction was itself wrong.** Wrapping the whole destination in `[...]` made a
+   *required* destination look optional — and `/handoff` alone is a parse error whose message prints the
+   usage back, telling the user the thing they just typed is legal. Now
+   `/handoff local|daemon|remote <target>`, and a general tripwire,
+   `a_usage_line_never_presents_a_required_operand_as_optional`, asserts for every catalog entry that a
+   fully-bracketed operand section implies the bare command parses.
+3. **`/jobs cancel`, `/agents cancel`, `/agents terminate` ignored their id and interrupted the whole
+   turn.** All three map to `KernelApi::Interrupt`, whose only implementation is a session-wide
+   `interrupt_session` that takes no id. Worse than a no-op: destructive and different from what the
+   command says. A first pass refused only the id-carrying form, which left `/jobs cancel` killing a turn
+   with no explanation while `/help` still reported `/jobs` as fully working — **both** forms are now
+   refused, naming Ctrl-C as the real way to interrupt a turn.
+4. **`/rewind` was a silent no-op in one form and a session-killer in the other.** Bare `/rewind` parsed,
+   hit `let Some(to_seq) = to_seq else { return Ok(()) }`, did nothing, printed nothing and skipped the
+   trailing `drain()` so the frame was not even repainted; the seq is now required. And a rejected
+   sequence (0, or past the session's last) propagated the kernel's `SessionNotFound` out through
+   `dispatch_slash` -> `submit_composer` -> `run`, **ending the whole interactive session** — the same
+   failure `command_error_text`'s own doc comment describes fixing for parse errors, still live on the
+   kernel-action path. It is a local command error now, with a test that runs a command *after* the
+   failed rewind and asserts it took effect.
+5. **`/fork` looked like a switch for one frame and then silently reverted.** It reduced the child
+   snapshot into the UI and printed nothing, but `session_id` and the subscribed event stream both still
+   point at the parent, so the next `drain()` overwrote it. It now reports the child session it really
+   created and says the session continues on the parent; the catalog summary says so too. Switching a
+   live session onto a fork needs re-subscribing the stream and was not attempted.
+6. **The predicate and the dispatcher were hand-mirrored.** `kernel_action_is_supported` copied
+   `apply_kernel_action`'s six explicit goal arms, so deleting one would have left `/help` reporting it as
+   working with no compile error. `apply_kernel_action` now *consults* the predicate as its first step, so
+   there is one gate; the `Approve | Dispatch` arm below it is unreachable and kept only so a future
+   disagreement degrades to "not available" rather than killing the session.
+
+**The adversarial review's most important finding was against this change's own thesis, and is worth
+recording in full.** `inspector_is_supported` asked `Inspector::route().is_some()` — which is **not** the
+same fact as "the compositor paints anything for that route". Nine of the twelve `UiRoute`s resolve to
+`Vec::new()`, so `/diff`, `/memory` and `/jobs` were reported as *fully working* while opening an empty
+sidebar — and because an empty route takes the whole transcript rect on a narrow terminal, the most
+visible effect of `/memory` was blanking the screen. A false "available" is worse than the original
+silence. `Inspector::route()` was itself the hand-maintained availability table this module exists to
+avoid. The authority now lives beside the match that decides it, as
+`tui::route_renders_content`, mirroring `sidebar_lines` arm for arm so a new `UiRoute` fails to compile in
+both places; and `a_route_is_only_called_available_if_it_actually_paints_something` cross-checks the
+claim against `sidebar_lines` itself rather than against a belief about it.
+
+**Also from the review:** the synthesis degraded silently on four usage shapes (an unmatched `[`, a group
+after another token, a second group, a flag-first alternative list), three of which produced an invocation
+that *parsed* — so the fallback masked the tripwire it was supposed to back up. `alternative_group` now
+returns a typed `Operands` with an explicit `Unrecognized`, which synthesizes into something that cannot
+parse. Two test fixtures asserted against pre-correction usage strings that no longer exist and reached
+the right verdict for the wrong reason; they read `tui::catalog()` now. Three tests were weaker than their
+names: the job-cancel test never checked that no interrupt happened (`interrupt_count` now asserted), the
+per-command help test asserted only the *absence* of the footer (it would have passed printing nothing),
+and the bare-`/help` test checked only that "unavailable" appeared somewhere — it now asserts specific
+commands carry specific markers, via a `painted_rows` helper, because the renderer positions the cursor
+per row instead of emitting newlines and `str::lines()` on a captured frame silently returns the whole
+frame as one line.
+
+**Revert cycles 65-71, seven, each break-and-restore:** `route().is_some()` restored → the memory
+verdict flips to `Full` and the route cross-check fails; `/handoff` re-bracketed → the optionality
+tripwire names it; `/rewind [seq]` with the parser still requiring one → same tripwire; the bare cancel
+un-refused → `interrupt_count` came back **2**, one per command; the rewind error re-propagated → the
+session ended mid-test; `/fork` silenced → its test fails; the synthesis swallowing a malformed shape →
+`/mcp [list|add <target>` synthesized to a parseable `/mcp`. Two initially did not reproduce — one
+because the edit's indentation did not match and nothing changed, one because reverting the usage *and*
+the parser together is self-consistent — and both were redone precisely.
+
+**Deliberately not attempted:** switching a live session onto a fork; a per-job/per-agent cancellation
+backend; rendering the nine empty inspector panels (the point here was to stop claiming they work);
+`KernelApi::SubmitTurn` is now dead in both the predicate and the dispatcher, since only `StartGoal` maps
+to it and that has an explicit arm — noted rather than removed, because removing a `KernelApi` variant is
+a wire-relevant change with no benefit today.
+
+**Verification:** `cargo test -p rapid --lib` 658 passed; `cargo test -p tui` 227 + 9; `cargo clippy
+-p rapid -p tui --all-targets` 55 warnings, unchanged from the same-scope baseline; full `cargo test
+--workspace` green (80 binaries).
+
+**One more flake, recorded because the rule keeps earning its place.** A workspace run reported
+`llm-router`'s `split_no_content_length_sse_is_rejected` failing. `llm-router` is untouched by this
+change; the test spawns a real loopback socket server and asserts on which `ProviderError` variant comes
+back, so it is load-sensitive by construction, and `pgrep` showed an unrelated project's `cargo test`
+running on the same machine at the time. It passes in isolation, as a whole crate, and in a clean serial
+workspace re-run. Same pattern as the `context_retrieval`/`goal_host` flakes already recorded above — the
+practical rule stands: re-run serially before believing a failure.
+
 ## DECIDED (2026-09-08, option C) — the interactive TUI cannot ask for approval, so out of the box it can only read
 
 **Found 2026-09-08 while scoping the missing approval broker. This is the largest gap found in this

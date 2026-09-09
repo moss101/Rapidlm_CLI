@@ -32,12 +32,15 @@ pub mod transcript;
 
 pub use commands::{
     CommandError, FrontendAction, HandoffDest, InlineHelp, Inspector, KernelAction, KernelApi,
-    LocalAction, PermissionsIntent, PaletteEntry, TakeoverSurface, UiCommand, dispatch, parse_command, suggest,
+    CommandInfo, LocalAction, PermissionsIntent, PaletteEntry, TakeoverSurface, UiCommand, catalog, dispatch, parse_command, suggest,
 };
 pub use composer::{
     ComposerCommand, ComposerError, ComposerEvent, ComposerModel, ComposerView, Motion,
 };
-pub use compositor::{Screen, compute_screen_layout, paint_screen, sidebar_lines, ui_mode_for};
+pub use compositor::{
+    Screen, compute_screen_layout, paint_screen, route_renders_content, sidebar_lines,
+    ui_mode_for,
+};
 pub use layout::{LayoutRects, Rect, UiMode, compute_layout, compute_layout_with_composer};
 pub use panels::agents::{
     AgentCancelIntent, AgentHandoffObservation, AgentInspectIntent, AgentMergeIntent,
