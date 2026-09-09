@@ -7044,6 +7044,56 @@ to, and the test asserts that difference in both directions.
 Verified with the built binary as well as in tests: three listings in a fresh directory now leave
 `find .rapidlm` empty, and `cron add` still creates the store.
 
+## Session boundary, 2026-09-09 — durable state for the next session
+
+Eight commits, `dbeb2c2`..`1e516cb`, all pushed to `origin/main`. Baseline before them was `598c6fd`.
+Each has its own entry above; this is the short version plus what is left.
+
+`rapid resume`; every command resolving the same project as the TUI; listing no longer creating what it
+lists; one event ledger per project (option C, with the WAL correction that followed self-review);
+`rapid --help` no longer documenting an invocation the parser rejects; `rapid insights` given a test that
+can fail; `/jobs` and `/approvals` rendering the projections they already had.
+
+**The through-line, and the thing worth carrying forward.** Every one of these was the same defect: two
+representations of one fact, with nothing spanning them — help text against a parser, one database name
+against another, a route table against the compositor, a documented operand count against a positional
+count, a test's seeds against the analysis it claimed to exercise. The fix that held each time was to
+*derive* the second from the first (`CLI_USAGE` from `SUBCOMMANDS`, availability from
+`route_renders_content`, the resume hint and the resume default from one `recorded_sessions`), and the
+test that held was one asserting the property rather than the instance. Where a hand-written list
+survived — the nine dead routes in `command_help`'s own test — it went stale within the day.
+
+**Verification that earned its place.** Nineteen revert cycles (72-92) this session. Five initially
+passed under deliberately broken code and each forced a better test: the replay race caught only 1 run in
+8 until the fixture grew past the subscription's live bound; a `#[test]` attribute had been lost in an
+edit so the test had never run at all; a data-loss assertion ordered after a message assertion failed on
+the message instead of the loss; a fabricated sidecar could not stage the race it claimed to; and one
+break substituted a fresh id rather than reproducing the defect. One revert cycle failed to *compile*,
+which is a stronger coupling than any test and is recorded as such.
+
+**Self-review found a wrong fact in already-pushed code** (the ledger's journal mode), which is why
+`af67657` exists. The claim came from a grep that covered three files and missed `migrations.rs`. Check
+`PRAGMA journal_mode` on a real file before reasoning about SQLite file moves.
+
+### Highest-value work remaining, in the order I would take it
+
+1. **Seven inspector panels still render nothing** — `/diff`, `/context`, `/memory`, `/graph`,
+   `/computer`, `/resources`, `/models`. Unlike jobs/approvals these have no projection in `AppState`, so
+   each needs its data collected first; they are honestly marked unavailable in `/help` meanwhile. `/diff`
+   is probably the most valuable to a developer and the most self-contained (the workspace view already
+   tracks mutations).
+2. **No per-job or per-agent cancellation backend.** `/jobs cancel`, `/agents cancel` and
+   `/agents terminate` are refused outright because `KernelApi::Interrupt` is session-wide and takes no
+   id. Making them real is kernel work, not UI work.
+3. **No way to switch a live session onto a fork.** `/fork` reports the child it created and stays on the
+   parent; switching needs the event stream re-subscribed.
+4. **Eighteen roadmap subcommand families are unbuilt** (`daemon`, `run`, `rewind`, `handoff`, …). They
+   are listed as roadmap in `docs/reference/cli-command-reference.md` and absent from `SUBCOMMANDS`, so
+   nothing lies about them today.
+5. **The both-ledgers case still strands rows** behind a printed notice (option C's accepted cost). If
+   real installs turn out to have both files, option D's merge is the follow-up, and the notice is what
+   would tell a user to ask for it.
+
 **`/jobs` and `/approvals` now show the rows the projection already had, done 2026-09-09.**
 
 Two of the nine inspector routes that `/help` honestly marks unavailable were not missing *data* — they
