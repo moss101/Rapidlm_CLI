@@ -7026,6 +7026,85 @@ sees the other's roster. Two revert cycles (81-82), one of which forced the test
 `rapid` lib tests, clippy byte-identical to the pre-change baseline for both touched files, full
 `cargo test --workspace` green.
 
+**Reading a project's state no longer creates it, done 2026-09-09.**
+
+`rapid sessions list`, `rapid sessions search` and `rapid cron list` each opened the store before reading
+it, and `EventLedger::open` / `PromptCron::open` create the file and apply every migration. So a bare
+`rapid sessions list` in a directory that had never run anything wrote a full database there. Two
+consequences, both observed: it is one of the ways a project ends up holding two ledgers (see the decision
+below), and in an *unmarked* directory it creates the `.rapidlm` marker that from then on decides where
+every later command looks — a read-only command permanently changing project resolution.
+
+Listing now reads only if there is something to read. Both paths print through the same printer — the
+sessions listing already had one, and `print_cron_jobs` was extracted so the cron listing does too — so
+"no store" and "empty store" produce identical output rather than a second "nothing here" message that
+could drift from the real one. Writes are untouched: `rapid cron add` still creates the store it writes
+to, and the test asserts that difference in both directions.
+
+Verified with the built binary as well as in tests: three listings in a fresh directory now leave
+`find .rapidlm` empty, and `cron add` still creates the store.
+
+## DECIDED (2026-09-09, option C) — a project has two event ledgers, and the commands that read sessions read the one the TUI never writes
+
+**Raised for user direction because the fix requires choosing what happens to existing user data, and
+`v3.0.0-rc1` is tagged. Answered the same day: option C. Everything that did *not* depend on the answer
+shipped first (the listing fix above, and `rapid resume` guiding users itself rather than pointing at a
+command that cannot help them); the implementation of C follows in its own entry below.**
+
+**The finding.** `.rapidlm/` holds two SQLite databases with the *same schema* — one migration set, in
+`crates/event-ledger/src/migrations.rs` — under two names:
+
+- `ledger.sqlite` (`interactive::LEDGER_NAME`) is written by exactly one place, `KernelRuntime::new`,
+  which is the interactive TUI. Every transcript lives here: turns, tool calls, results.
+- `sessions.sqlite` (`goal_host::SESSIONS_DB_FILE`, whose doc comment already calls it the "canonical
+  session ledger db name") is used by `rapid sessions`, `rapid cron`, `rapid agents`,
+  `rapid inspect-export`, `rapid insights`, and `rapid goal`'s evidence-citation resolver and
+  `goal claim` audit appends.
+
+So `rapid sessions list`, `rapid inspect-export` and `rapid insights` — the three commands whose entire
+job is to read session data — read a file the TUI never writes. A user who has only ever used `rapid`
+interactively sees `count=0` from all three. This is not a schema or design split; it is two filenames.
+
+**What is *not* broken, checked rather than assumed.** `goal claim` appends its `tool.completed` audit
+event to the same ledger it then cites, so its own citations resolve. Only a *hand-supplied* citation
+(`rapid goal evidence record --session S --seq N --event-id E`) naming an interactive session's tool call
+fails, because the resolver reads the other file and the gate is fail-closed. That is the documented way
+to back agent evidence with a real tool result, so it is reachable, but it is not silently wrong for
+`goal claim`.
+
+**The decision.** Which file is the project's one ledger, and what happens to the rows in the other.
+
+**Option A — canonical `sessions.sqlite`; the TUI moves to it.** Matches the name source already calls
+canonical and the six command families already using it; one constant changes. For an existing project
+that has both files, every interactive transcript becomes unreachable — including by the `rapid resume`
+just shipped.
+
+**Option B — canonical `ledger.sqlite`; the readers move to it.** Preserves transcripts, which are the
+larger and less reconstructible dataset. For an existing project that has both, cron schedules stop being
+listed or fired until re-added, and `goal claim`'s prior audit rows stop resolving. Contradicts the
+"canonical" doc comment, which would be corrected.
+
+**Option C — one canonical name plus a rename migration when only the legacy file exists.** Strictly
+better than A or B for the single-file case (nothing is lost, and the TUI's history becomes visible to
+every command), and identical to whichever of A/B is chosen for the both-files case. The rename must move
+`-wal`/`-shm` alongside the main file or commit-but-uncheckpointed transactions are lost. Note the
+both-files case is common precisely because of the defect fixed above: a single `rapid sessions list` used
+to create `sessions.sqlite` even in a TUI-only project.
+
+**Option D — one canonical name plus a real merge of the other.** Loses nothing in any case. It is a
+genuine data migration across 20+ tables into a live user database, with no migration precedent in this
+repo to follow, and a bug in it corrupts the canonical ledger rather than merely hiding rows.
+
+**Recommendation: C over `sessions.sqlite`, with a loud notice (never a silent choice) when both files
+exist**, and D only if merging turns out to matter to real installs. C fixes every new project and every
+single-file project — which after the listing fix above is most of them — costs one constant, one rename
+helper and one message, and never destroys data. The residual both-files case is then visible to the user
+rather than a silent split, which is the property this whole document keeps arguing for.
+
+**Answer received: option C.** Canonical `sessions.sqlite`; rename the legacy `ledger.sqlite` (with its
+`-wal`/`-shm`) when it is the only one present; when both exist, use the canonical file and say so loudly
+rather than choosing silently. D's merge is not to be built now.
+
 ## DECIDED (2026-09-08, option C) — the interactive TUI cannot ask for approval, so out of the box it can only read
 
 **Found 2026-09-08 while scoping the missing approval broker. This is the largest gap found in this

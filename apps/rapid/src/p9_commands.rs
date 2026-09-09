@@ -719,18 +719,22 @@ pub fn run_sessions(args: &[String]) -> Result<i32, P9CommandError> {
     let db_path = db.unwrap_or_else(|| {
         crate::interactive::project_path("sessions.sqlite")
     });
-    std::fs::create_dir_all(
-        db_path
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(".")),
-    )
-    .map_err(P9CommandError::Io)?;
-    let client = kernel::InProcessKernelClient::open(&db_path)
-        .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
-    let sessions = client
-        .list_sessions(&kernel::CancellationToken::new())
-        .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
+    // Listing must not *create* what it is listing. Opening the ledger
+    // applies migrations and writes a full database, so a bare `rapid
+    // sessions list` used to leave a store behind in whatever directory it
+    // ran in — which is also how a project ends up with two of them. A
+    // project with no ledger has no sessions, and says so through the same
+    // printer as a project with an empty one, so the two are indistinguishable
+    // rather than a second "nothing here" message that could drift.
+    let sessions = if db_path.exists() {
+        let client = kernel::InProcessKernelClient::open(&db_path)
+            .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
+        client
+            .list_sessions(&kernel::CancellationToken::new())
+            .map_err(|err| P9CommandError::Agent(format!("{err}")))?
+    } else {
+        Vec::new()
+    };
     println!("schema=rapidlm.sessions count={}", sessions.len());
     for summary in &sessions {
         if let Some(text) = &needle
@@ -752,6 +756,26 @@ pub fn run_sessions(args: &[String]) -> Result<i32, P9CommandError> {
 /// claim-lease: each poll atomically claims due rows, quarantines rows whose
 /// schedule no longer parses (kept, not loaded), and requeues claims older
 /// than the lease timeout so a crashed poller cannot strand a job.
+/// The one `rapid cron list` printer, shared by the real store and the
+/// "this project has no cron store" path so the two can never disagree.
+fn print_cron_jobs(jobs: &[event_ledger::cron::CronJob]) {
+    println!(
+        "schema={} count={}",
+        scheduler::CRON_FACADE_SCHEMA,
+        jobs.len()
+    );
+    for job in jobs {
+        println!(
+            "id={} status={} next_fire_at_ms={} schedule={} prompt={}",
+            job.id,
+            job.status.as_str(),
+            job.next_fire_at_ms,
+            job.schedule,
+            elide_prompt(&job.prompt),
+        );
+    }
+}
+
 pub fn run_cron(args: &[String]) -> Result<i32, P9CommandError> {
     let mut db: Option<PathBuf> = None;
     let mut rest: Vec<&String> = Vec::new();
@@ -768,6 +792,15 @@ pub fn run_cron(args: &[String]) -> Result<i32, P9CommandError> {
     let mode = rest.first().map(|s| s.as_str()).ok_or(P9CommandError::Usage)?;
     let operands: Vec<&String> = rest[1..].to_vec();
     let db_path = db.unwrap_or_else(|| crate::interactive::project_path("sessions.sqlite"));
+    // As in `run_sessions`: listing must not create the store it lists.
+    // `PromptCron::open` writes a migrated database, so `rapid cron list` in a
+    // project that has never scheduled anything used to leave one behind.
+    // Both paths print through `print_cron_jobs`, so "no store" and "empty
+    // store" are the same output rather than two messages that can drift.
+    if mode == "list" && !db_path.exists() {
+        print_cron_jobs(&[]);
+        return Ok(0);
+    }
     let cron = scheduler::PromptCron::open(&db_path)
         .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
     let cancel = capability_broker::CancellationToken::new();
@@ -811,22 +844,7 @@ pub fn run_cron(args: &[String]) -> Result<i32, P9CommandError> {
             Ok(0)
         }
         "list" => {
-            let jobs = cron.list().map_err(store_err)?;
-            println!(
-                "schema={} count={}",
-                scheduler::CRON_FACADE_SCHEMA,
-                jobs.len()
-            );
-            for job in &jobs {
-                println!(
-                    "id={} status={} next_fire_at_ms={} schedule={} prompt={}",
-                    job.id,
-                    job.status.as_str(),
-                    job.next_fire_at_ms,
-                    job.schedule,
-                    elide_prompt(&job.prompt),
-                );
-            }
+            print_cron_jobs(&cron.list().map_err(store_err)?);
             Ok(0)
         }
         "remove" => {
@@ -2109,6 +2127,66 @@ mod sessions_tests {
         ));
         std::fs::create_dir_all(&dir).expect("dir");
         dir.join("sessions.sqlite")
+    }
+
+    #[test]
+    fn listing_a_project_that_has_no_store_does_not_create_one() {
+        // Opening the ledger applies migrations and writes a full database,
+        // so `rapid sessions list` / `rapid cron list` used to leave a store
+        // behind in whatever directory they ran in — which is one of the ways
+        // a project ends up with two of them, and (in an unmarked directory)
+        // how a read-only command creates the `.rapidlm` marker that decides
+        // where every later command looks.
+        let db = temp_db("absent");
+        assert!(!db.exists(), "the fixture must start with no store");
+        let db_arg = db.to_string_lossy().into_owned();
+
+        for args in [
+            vec!["list".to_owned(), "--db".to_owned(), db_arg.clone()],
+            vec![
+                "search".to_owned(),
+                "anything".to_owned(),
+                "--db".to_owned(),
+                db_arg.clone(),
+            ],
+        ] {
+            assert_eq!(
+                run_sessions(&args).expect("listing a project with no store is not an error"),
+                0
+            );
+            assert!(
+                !db.exists(),
+                "reading a project's sessions must not create its ledger: {args:?}"
+            );
+        }
+
+        assert_eq!(
+            run_cron(&[
+                "list".to_owned(),
+                "--db".to_owned(),
+                db_arg.clone()
+            ])
+            .expect("listing cron in a project with no store is not an error"),
+            0
+        );
+        assert!(
+            !db.exists(),
+            "reading a project's cron jobs must not create its store"
+        );
+
+        // A write still creates it — that is the difference being drawn.
+        let added = run_cron(&[
+            "add".to_owned(),
+            "--prompt".to_owned(),
+            "tidy up".to_owned(),
+            "--schedule".to_owned(),
+            "0 9 * * *".to_owned(),
+            "--db".to_owned(),
+            db_arg,
+        ]);
+        assert!(added.is_ok(), "adding a cron job must still work: {added:?}");
+        assert!(db.exists(), "a write creates the store it writes to");
+        let _ = std::fs::remove_file(&db);
     }
 
     #[test]
