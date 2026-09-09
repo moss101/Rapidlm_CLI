@@ -7055,23 +7055,42 @@ before anything is renamed and whether or not the rename ever succeeds. Proven w
 against a legacy-named ledger holding a real session row: `count=1` where the same command reported
 `count=0` before, and nothing new was created by the listing.
 
-**`adopt_legacy_ledger` is the tidy-up, and it runs only from the writer.** The TUI calls it once at
-startup. Renaming is safe because the ledger runs in SQLite's default rollback-journal mode (no
-`journal_mode = WAL` anywhere in `event-ledger`), so a committed database is a single file. Three cases
-it refuses to guess at:
+**`adopt_legacy_ledger` is the tidy-up, and it runs only from the writer** (`resolve_project`, whose only
+two callers are `run_interactive` and `rapid resume`, which launches it). Three cases it refuses to guess
+at:
 
 - **Both files exist** — the canonical one is already what resolution returns; the legacy file is left
   exactly as it was and named in a notice that says nothing has been deleted. `fs::rename` overwrites its
   destination, so an unguarded adoption here would destroy the canonical ledger outright; the test
   asserts the *contents* of both files before it asserts the notice, so the revert cycle fails on the
   data loss rather than on a missing string.
-- **A `-journal` sibling exists** — an in-flight or crashed transaction, whose rollback journal must stay
-  beside the database it can undo. Reported, not moved.
+- **The legacy file cannot be opened as a ledger** — reported, and never renamed onto the path every
+  command will then treat as the project's ledger.
 - **The rename fails** — reported, and the legacy file keeps being read, because resolution never
   depended on the rename.
 
-`-wal`/`-shm` are moved alongside if some future journal mode leaves them, and their absence is not an
-error. Nothing is ever merged or deleted.
+Nothing is ever merged or deleted.
+
+**Self-review caught a wrong fact in the first version of this, in code already pushed.** It claimed the
+ledger runs in SQLite's default rollback-journal mode and therefore that a committed database is one
+file — so it checked only for a `-journal` sibling and moved `-wal`/`-shm` *after* the main file. The
+ledger is in **WAL** mode: `event_ledger::migrations` sets `journal_mode = WAL` and verifies it (the
+first grep looked at `ledger.rs`, `checkpoint.rs` and `journal.rs` and missed it), and a freshly created
+ledger's header bytes read `02 02`. That makes the original order the dangerous one — a `-wal` can hold
+committed transactions the main file does not have yet, so renaming the main file alone silently rolls
+the ledger back to its last checkpoint, and a crash between the two renames orphans the WAL beside a
+database that is no longer there. Adoption now **checkpoints first**: `EventLedger` holds no persistent
+connection (it connects per operation), so opening it and letting the handle drop checkpoints the WAL and
+removes the sidecars, after which one complete file is renamed. Any sidecar still present after that
+means another process holds the database, and adoption reports rather than forcing it.
+
+**Which also invalidated a test.** The `-journal` test fabricated a sidecar file and asserted adoption
+refused — but the checkpointing open makes SQLite delete a stray sidecar, so the fabricated race cannot
+be staged. It is replaced by the two properties that are real: a stray `-wal` costs nothing (the session
+recorded before the move is still listable from the adopted ledger afterwards, and no sidecar is orphaned
+at the old name), and a legacy file that is not a database is reported rather than renamed onto the
+canonical path. The adoption tests now build *real* ledgers through `EventLedger`/`InProcessKernelClient`
+rather than writing opaque bytes, because a byte fixture cannot exercise WAL behavior at all.
 
 **The notice goes in the transcript, not to stderr.** Anything written before the alt screen opens is
 wiped before a user can read it, so `ResolvedProject` carries it and the TUI appends it as command output
@@ -7082,12 +7101,13 @@ document keeps recording — and its remaining users were tests that would have 
 product no longer creates. They resolve through `project_ledger_path` now, so the tests and production
 agree by construction.
 
-**Tests.** Four new: a TUI-only project's ledger is read where it is and then adopted losslessly (the
-rename is byte-preserving, asserted); two ledgers are never merged or deleted and the user is told; a
-ledger with an open rollback journal is reported rather than moved; a fresh project uses the canonical
-name. Three revert cycles (83-85), two of which were rewritten so the broken code fails on the *harm*
-(a clobbered canonical ledger, a database moved away from its journal) rather than on a missing message.
-678 `rapid` lib tests, clippy identical to the pre-session baseline, full `cargo test --workspace` green.
+**Tests.** Five new: a TUI-only project's ledger is read where it is and then adopted with the session
+recorded before the move still listable after it; two ledgers are never merged or deleted and the user is
+told; a stray `-wal` costs none of the transactions it may hold; a legacy file that is not a ledger is
+reported rather than moved; a fresh project uses the canonical name. Four revert cycles (83-86), three of
+which were rewritten so the broken code fails on the *harm* — a clobbered canonical ledger, an orphaned
+WAL beside a database that has moved — rather than on a missing message. 679 `rapid` lib tests, clippy
+identical to the pre-session baseline, full `cargo test --workspace` green.
 
 **Still open after this.** `rapid sessions list` shows sessions but no way to act on them beyond
 `rapid resume <id>`; `inspect-export` and `insights` were verified only to the extent that they now open

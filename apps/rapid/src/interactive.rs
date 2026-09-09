@@ -2210,12 +2210,16 @@ pub(crate) fn project_ledger_path(marker_dir: &Path) -> PathBuf {
 /// named in the notice, because merging two ledgers is a real migration and
 /// choosing silently — in either direction — would hide data the user has.
 ///
-/// The ledger runs in SQLite's default rollback-journal mode, so a committed
-/// database is one file and renaming it is lossless. A `-journal` sibling
-/// means a transaction is in flight or crashed, and its rollback journal must
-/// stay beside the database it belongs to — so that case is reported, not
-/// renamed. `-wal`/`-shm` are moved too if some future journal mode leaves
-/// them, and their absence is not an error.
+/// The ledger runs in WAL mode (`event_ledger::migrations` sets
+/// `journal_mode = WAL` and verifies it), so a database with a live `-wal`
+/// beside it is *not* one file: the sidecar can hold committed transactions
+/// the main file does not have yet, and renaming the main file alone would
+/// silently roll the ledger back to its last checkpoint. `EventLedger` holds
+/// no persistent connection — it connects per operation — so opening it here
+/// and letting the handle drop checkpoints the WAL and removes the sidecars,
+/// after which the rename moves a complete database. Any sidecar still
+/// present after that means someone else has the file open, and the adoption
+/// is reported rather than forced.
 pub(crate) fn adopt_legacy_ledger(marker_dir: &Path) -> Option<String> {
     let canonical = marker_dir.join(SESSIONS_DB_FILE);
     let legacy = marker_dir.join(LEGACY_LEDGER_NAME);
@@ -2231,13 +2235,24 @@ and its sessions are not listed. Nothing has been deleted.",
             legacy.display()
         ));
     }
-    let journal = marker_dir.join(format!("{LEGACY_LEDGER_NAME}-journal"));
-    if journal.exists() {
+    // Checkpoint first: see this function's own note on WAL.
+    if let Err(err) = event_ledger::ledger::EventLedger::open(&legacy) {
         return Some(format!(
-            "note: {} still has an open rollback journal, so it was left where it is; \
-its sessions are still readable.",
+            "note: {} could not be opened ({err}), so it was left where it is.",
             legacy.display()
         ));
+    }
+    for suffix in ["-wal", "-shm", "-journal"] {
+        if marker_dir
+            .join(format!("{LEGACY_LEDGER_NAME}{suffix}"))
+            .exists()
+        {
+            return Some(format!(
+                "note: {} still has a {suffix} sidecar, so another process may have it \
+open; it was left where it is and its sessions are still readable.",
+                legacy.display()
+            ));
+        }
     }
     if let Err(err) = fs::rename(&legacy, &canonical) {
         return Some(format!(
@@ -2245,12 +2260,6 @@ its sessions are still readable.",
             legacy.display(),
             canonical.display()
         ));
-    }
-    for suffix in ["-wal", "-shm"] {
-        let from = marker_dir.join(format!("{LEGACY_LEDGER_NAME}{suffix}"));
-        if from.exists() {
-            let _ = fs::rename(&from, marker_dir.join(format!("{SESSIONS_DB_FILE}{suffix}")));
-        }
     }
     None
 }
@@ -9016,8 +9025,26 @@ subcommand"
         let env = TempEnv::create();
         let marker = env.project.join(PROJECT_MARKER);
         fs::create_dir_all(&marker).expect("marker");
+
+        // A *real* ledger at the legacy name, with a real session in it —
+        // the ledger runs in WAL mode, so a fixture of opaque bytes would
+        // not exercise the sidecar handling this function exists for.
         let legacy = marker.join(LEGACY_LEDGER_NAME);
-        fs::write(&legacy, b"not really a database, but it exists").expect("legacy");
+        let recorded = {
+            let ledger = event_ledger::ledger::EventLedger::open(&legacy).expect("legacy ledger");
+            let client = InProcessKernelClient::open(&legacy).expect("client");
+            let snapshot = block_on(
+                client.create_session(CreateSession::new(
+                    ProjectId::new(),
+                    human_actor().expect("actor"),
+                    TraceId::new(),
+                )),
+                &CancellationToken::new(),
+            )
+            .expect("session");
+            drop(ledger);
+            snapshot.id()
+        };
 
         assert_eq!(
             project_ledger_path(&marker),
@@ -9025,19 +9052,34 @@ subcommand"
             "a project whose only ledger is the legacy one must be read from it"
         );
 
-        // Once adopted, the same project resolves to the canonical name and
-        // nothing has been lost.
         let notice = adopt_legacy_ledger(&marker);
         assert!(notice.is_none(), "a clean adoption is silent: {notice:?}");
         let canonical = marker.join(SESSIONS_DB_FILE);
         assert!(canonical.exists(), "the ledger moved to the canonical name");
         assert!(!legacy.exists(), "and is no longer at the old one");
-        assert_eq!(
-            fs::read(&canonical).expect("read"),
-            b"not really a database, but it exists",
-            "adoption is a rename, not a rewrite"
-        );
         assert_eq!(project_ledger_path(&marker), canonical);
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(
+                !marker
+                    .join(format!("{LEGACY_LEDGER_NAME}{suffix}"))
+                    .exists(),
+                "no {suffix} may be orphaned at the old name"
+            );
+        }
+
+        // The moved database is still a working ledger holding the same
+        // session — the property a byte comparison cannot establish, and the
+        // one that actually matters after a WAL-mode file is moved.
+        let moved = event_ledger::ledger::EventLedger::open(&canonical).expect("moved ledger");
+        let sessions = moved
+            .list_sessions(&event_ledger::ledger::CancellationToken::new())
+            .expect("list");
+        assert!(
+            sessions
+                .iter()
+                .any(|summary| summary.session_id == recorded.to_string()),
+            "the session recorded before the move must still be there: {sessions:?}"
+        );
     }
 
     #[test]
@@ -9076,42 +9118,86 @@ subcommand"
     }
 
     #[test]
-    fn a_ledger_with_an_open_journal_is_reported_rather_than_moved() {
-        // A `-journal` sibling is SQLite's rollback journal for an in-flight
-        // or crashed transaction, and it must stay beside the database it
-        // belongs to. Renaming the database out from under it risks the
-        // corruption this whole change exists to avoid.
+    fn a_stray_sidecar_does_not_cost_the_transactions_it_may_hold() {
+        // The ledger runs in WAL mode, so a `-wal` beside the database can
+        // hold committed transactions the main file does not have yet:
+        // renaming the main file alone would roll the ledger back to its last
+        // checkpoint, silently. Adoption therefore checkpoints first, by
+        // opening the ledger and letting the handle drop (`EventLedger` keeps
+        // no persistent connection), and only then moves one complete file.
         let env = TempEnv::create();
         let marker = env.project.join(PROJECT_MARKER);
         fs::create_dir_all(&marker).expect("marker");
         let legacy = marker.join(LEGACY_LEDGER_NAME);
-        fs::write(&legacy, b"mid-transaction").expect("legacy");
+        let recorded = {
+            let client = InProcessKernelClient::open(&legacy).expect("client");
+            block_on(
+                client.create_session(CreateSession::new(
+                    ProjectId::new(),
+                    human_actor().expect("actor"),
+                    TraceId::new(),
+                )),
+                &CancellationToken::new(),
+            )
+            .expect("session")
+            .id()
+        };
         fs::write(
-            marker.join(format!("{LEGACY_LEDGER_NAME}-journal")),
-            b"rollback",
+            marker.join(format!("{LEGACY_LEDGER_NAME}-wal")),
+            b"a sidecar left lying around",
         )
-        .expect("journal");
+        .expect("sidecar");
+
+        adopt_legacy_ledger(&marker);
+        let canonical = marker.join(SESSIONS_DB_FILE);
+        assert_eq!(
+            project_ledger_path(&marker),
+            canonical,
+            "the project must end up on exactly one ledger"
+        );
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(
+                !marker
+                    .join(format!("{LEGACY_LEDGER_NAME}{suffix}"))
+                    .exists(),
+                "no {suffix} may be orphaned at the old name, pointing at a database \
+that is no longer there"
+            );
+        }
+        let sessions = event_ledger::ledger::EventLedger::open(&canonical)
+            .expect("the adopted ledger still opens")
+            .list_sessions(&event_ledger::ledger::CancellationToken::new())
+            .expect("list");
+        assert!(
+            sessions
+                .iter()
+                .any(|summary| summary.session_id == recorded.to_string()),
+            "and every session recorded before the move is still in it: {sessions:?}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_file_that_is_not_a_ledger_is_reported_rather_than_moved() {
+        // Adoption never moves something it could not open: a file at the
+        // legacy name that is not a database stays exactly where it is, named
+        // in a notice, rather than being renamed onto the path every command
+        // will then try to use as the project's ledger.
+        let env = TempEnv::create();
+        let marker = env.project.join(PROJECT_MARKER);
+        fs::create_dir_all(&marker).expect("marker");
+        let legacy = marker.join(LEGACY_LEDGER_NAME);
+        fs::write(&legacy, b"this is not a sqlite database at all").expect("legacy");
 
         let notice = adopt_legacy_ledger(&marker);
+        assert!(legacy.exists(), "the file stays where it is");
         assert!(
-            legacy.exists(),
-            "the database must stay beside the rollback journal that can undo its \
-last transaction; moving it out from under one risks the corruption this \
-whole change exists to avoid"
+            !marker.join(SESSIONS_DB_FILE).exists(),
+            "and is not renamed onto the canonical path"
         );
         let notice = notice.expect("the user must be told");
         assert!(
-            notice.contains("rollback journal"),
-            "the notice must say why it was left: {notice}"
-        );
-        assert!(
-            !marker.join(SESSIONS_DB_FILE).exists(),
-            "and nothing was created in its place"
-        );
-        assert_eq!(
-            project_ledger_path(&marker),
-            legacy,
-            "which is still the ledger this project reads"
+            notice.contains("could not be opened"),
+            "the notice must say why: {notice}"
         );
     }
 
