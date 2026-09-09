@@ -2449,17 +2449,35 @@ pub fn run_insights(args: &[String]) -> Result<i32, P9CommandError> {
     let session: protocol::SessionId =
         positional[0].parse().map_err(|_| P9CommandError::Usage)?;
     let db_path = db.unwrap_or_else(crate::interactive::current_project_ledger_path);
-    let client = kernel::InProcessKernelClient::open(&db_path)
+    for insight in session_insights(&db_path, session)? {
+        println!("{}: {}", insight.kind, insight.detail);
+    }
+    Ok(0)
+}
+
+/// One session's insights, read through the same export path the command
+/// uses.
+///
+/// Split out so a test can assert on *what is reported* rather than on the
+/// command's exit code: the previous test seeded three `session.created`
+/// events (its own comments say it meant to seed tool and goal events, and
+/// that it could not), then asserted only `code == 0` — which holds when
+/// nothing at all is reported, and so would have held if `analyze` returned
+/// an empty list for every session.
+fn session_insights(
+    db_path: &std::path::Path,
+    session: protocol::SessionId,
+) -> Result<Vec<insights::Insight>, P9CommandError> {
+    let client = kernel::InProcessKernelClient::open(db_path)
         .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
     let events = client
         .export_events(session, &kernel::CancellationToken::new())
         .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
-    let summaries: Vec<insights::EventSummary> =
-        events.iter().map(|e| insights::EventSummary::new(&e.kind)).collect();
-    for insight in insights::analyze(&summaries) {
-        println!("{}: {}", insight.kind, insight.detail);
-    }
-    Ok(0)
+    let summaries: Vec<insights::EventSummary> = events
+        .iter()
+        .map(|event| insights::EventSummary::new(&event.kind))
+        .collect();
+    Ok(insights::analyze(&summaries))
 }
 
 #[cfg(test)]
@@ -2470,7 +2488,10 @@ mod insights_tests {
     #[test]
     fn insights_command_analyzes_real_exported_ledger_events() {
         use event_ledger::ledger::{AppendOptions, EventLedger};
-        use event_ledger::{event::{ActorKind, ActorRef, EventKind}, ledger::CancellationToken as LedCancel};
+        use event_ledger::{
+            event::{ActorKind, ActorRef, EventKind},
+            ledger::CancellationToken as LedCancel,
+        };
         let dir = std::env::temp_dir().join(format!(
             "rapidlm-p11-insights-{}-{}",
             std::process::id(),
@@ -2481,28 +2502,63 @@ mod insights_tests {
         let cancel = LedCancel::new();
         let ledger = EventLedger::open(&db).expect("open");
         let session = protocol::SessionId::new();
-        ledger.create_session(session, protocol::ProjectId::new(), &cancel).unwrap();
-        for kind in ["tool.completed", "tool.denied", "goal.completed"] {
+        ledger
+            .create_session(session, protocol::ProjectId::new(), &cancel)
+            .unwrap();
+        // The kinds the analysis actually keys on. The previous version of
+        // this test appended `EventKind::SessionCreated` three times with the
+        // intended kind only in the *payload*, so it exercised none of the
+        // branches below.
+        for kind in [
+            EventKind::ToolCompleted,
+            EventKind::ToolDenied,
+            EventKind::GoalCompleted,
+        ] {
             ledger
                 .append(
                     session,
                     ActorRef::new(ActorKind::Human, &protocol::EventId::new().to_string()).unwrap(),
-                    EventKind::SessionCreated, // kind string below overrides payload only
-                    serde_json::json!({"seed": kind}),
-                    &AppendOptions { redaction: protocol::RedactionClass::Project, trace_id: protocol::TraceId::new(), expected_seq: None },
+                    kind,
+                    serde_json::json!({}),
+                    &AppendOptions {
+                        redaction: protocol::RedactionClass::Project,
+                        trace_id: protocol::TraceId::new(),
+                        expected_seq: None,
+                    },
                     &cancel,
                 )
-                .unwrap_or_else(|_| panic!("append"));
+                .unwrap_or_else(|_| panic!("append {kind:?}"));
         }
-        // Overwrite kinds by direct export check instead: export uses stored kinds.
         drop(ledger);
+
+        let reported = session_insights(&db, session).expect("insights");
+        let detail = |kind: &str| {
+            reported
+                .iter()
+                .find(|insight| insight.kind == kind)
+                .unwrap_or_else(|| panic!("no {kind} insight in {reported:?}"))
+                .detail
+                .clone()
+        };
+        assert_eq!(
+            detail("tool_usage"),
+            "2 tool events",
+            "both tool events must be counted: {reported:?}"
+        );
+        assert_eq!(
+            detail("denials"),
+            "1 denied tool calls",
+            "the denial must be reported separately: {reported:?}"
+        );
+        assert_eq!(detail("goal_completion"), "at least one goal completed");
+
+        // And the command itself still runs over the same path.
         let args: Vec<String> = vec![
             session.to_string(),
             "--db".to_owned(),
             db.to_string_lossy().into_owned(),
         ];
-        let code = run_insights(&args).expect("insights command");
-        assert_eq!(code, 0);
+        assert_eq!(run_insights(&args).expect("insights command"), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

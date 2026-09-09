@@ -7044,6 +7044,32 @@ to, and the test asserts that difference in both directions.
 Verified with the built binary as well as in tests: three listings in a fresh directory now leave
 `find .rapidlm` empty, and `cron add` still creates the store.
 
+**`rapid insights` was covered by a test that could not fail, done 2026-09-09.**
+
+Found while confirming — rather than assuming — that a `storage.corrupt` from `rapid insights` during the
+help audit above was my hand-built fixture's fault and not the command's. It was: rows written by hand
+into `events` do not deserialize, and reporting them as corrupt is right. But checking it surfaced the
+real problem, which is the test.
+
+`insights_command_analyzes_real_exported_ledger_events` seeded three events with
+`EventKind::SessionCreated`, putting the kind it *meant* to seed in the payload instead, under its own
+comments "kind string below overrides payload only" and "Overwrite kinds by direct export check instead".
+`insights::analyze` keys on nothing but `kind`, so none of its four branches ran. The test then asserted
+`code == 0` and nothing else — which holds when the command reports nothing at all, and would still hold
+if `analyze` returned an empty list for every session on earth.
+
+`session_insights` is split out of `run_insights` so the test can assert on *what is reported* instead of
+on an exit code, and the seeds are now the kinds the analysis actually reads (`tool.completed`,
+`tool.denied`, `goal.completed` — appended as real `EventKind` values through the ledger API, which was
+always possible). It asserts the counts: two tool events, one denial reported separately, and the goal
+completion. The command itself is still exercised over the same path afterwards, so the wiring stays
+covered too.
+
+The revert cycle mapped every exported event to a constant kind — the blindness the old test had — and
+the new one fails with `no tool_usage insight in []`.
+
+One revert cycle (90). 682 `rapid` lib tests, clippy unchanged, full workspace green.
+
 **`rapid --help` documented an invocation the parser rejects, and now it cannot, done 2026-09-09.**
 
 **The gap.** `rapid --help` advertised `rapid inspect-export <session>`. The parser requires *two*
@@ -7159,8 +7185,10 @@ WAL beside a database that has moved — rather than on a missing message. 679 `
 identical to the pre-session baseline, full `cargo test --workspace` green.
 
 **Still open after this.** `rapid sessions list` shows sessions but no way to act on them beyond
-`rapid resume <id>`; `inspect-export` and `insights` were verified only to the extent that they now open
-the same file, not that their own output is complete.
+`rapid resume <id>`. (`inspect-export` and `insights` were followed up on the same day — see the two
+entries above: the help lied about `inspect-export`'s operands, and `insights`' only test could not
+fail. Both commands' own output is now covered: `inspect-export --format md` asserts on the rendered
+transcript, and `insights` asserts on the insights reported.)
 
 ## DECIDED (2026-09-09, option C) — a project has two event ledgers, and the commands that read sessions read the one the TUI never writes
 
