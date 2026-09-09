@@ -993,8 +993,8 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
         return Err(InteractiveError::Usage);
     }
     let cancel = agent_runtime::CancellationToken::new();
-    let path = Path::new(PROJECT_MARKER).join(GOAL_FILE);
-    let evidence_path = Path::new(PROJECT_MARKER).join(EVIDENCE_FILE);
+    let path = project_path(GOAL_FILE);
+    let evidence_path = project_path(EVIDENCE_FILE);
     let mut host = match GoalHost::load(&path) {
         Ok(host) => host.unwrap_or_else(GoalHost::new),
         Err(err) => {
@@ -1007,8 +1007,7 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
     // system records are unaffected. The handle is kept for `goal claim`,
     // which appends its own audit events.
     let claim_ledger =
-        match event_ledger::ledger::EventLedger::open(Path::new(PROJECT_MARKER).join(SESSIONS_DB_FILE))
-        {
+        match event_ledger::ledger::EventLedger::open(project_path(SESSIONS_DB_FILE)) {
             Ok(ledger) => {
                 host.install_backing(ledger.clone());
                 Some(ledger)
@@ -1686,10 +1685,21 @@ see docs/configuration.md";
 /// Load `.rapidlm/reminders.toml` and admit the always-on feeds. Returns the
 /// rendered block plus the strongest reminder floor, or `None` when there is
 /// no roster or nothing was admitted.
+///
+/// Takes the root the caller already resolved rather than resolving one of
+/// its own: `exec_turn` passes the same `workspace` root it gives
+/// `exec_permission_lattice`, so the reminders a turn honors always belong to
+/// the project that turn is running in. `None` — the root did not resolve at
+/// all, so there is no project — means no reminders, matching how every other
+/// project-scoped input behaves on that path.
 fn load_active_reminders(
+    root: Option<&Path>,
 ) -> Result<Option<(String, agent_runtime::reminders::ReminderFloor)>, agent_runtime::reminders::ReminderError>
 {
-    let path = std::path::Path::new(".rapidlm").join("reminders.toml");
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    let path = root.join(PROJECT_MARKER).join("reminders.toml");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Ok(None);
     };
@@ -2155,6 +2165,38 @@ pub(crate) fn resolve_project_root(
         None
     };
     Ok(FoundProject { root, marker })
+}
+
+/// A path inside the current project's `.rapidlm`, resolved the way the TUI
+/// resolves it.
+///
+/// Every non-TUI command used to build these from the *working directory*
+/// (`Path::new(".rapidlm").join(...)`) while `rapid` itself walked up to the
+/// nearest marker. The two disagreed the moment a developer ran a command
+/// from a subdirectory: `rapid goal show` in `src/` reported "no active
+/// goal" for a project that had one, `rapid plugins` consulted a different
+/// trust catalog than the one governing the project, and each such call left
+/// a stray `.rapidlm/` behind in whatever directory it happened to run in.
+/// `resolve_project_root`'s own doc comment already said it exists so
+/// commands "cannot drift into resolving different projects from the same
+/// working directory" — this is that guarantee applied to the rest of them.
+///
+/// Falls back to the cwd-relative path when the root cannot be resolved,
+/// which is what every one of these call sites did unconditionally before,
+/// so an unreadable cwd degrades to the old behavior rather than failing.
+pub(crate) fn project_path(relative: impl AsRef<Path>) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    project_path_in(&cwd, relative)
+}
+
+/// [`project_path`] with an explicit working directory, so the resolution
+/// rule is testable without `chdir` (which is process-global and would race
+/// every other test in this binary).
+pub(crate) fn project_path_in(cwd: &Path, relative: impl AsRef<Path>) -> PathBuf {
+    let root = resolve_project_root(cwd, &CancellationToken::new())
+        .map(|found| found.root)
+        .unwrap_or_else(|_| cwd.to_path_buf());
+    root.join(PROJECT_MARKER).join(relative)
 }
 
 /// Trusted-project config merged from every file in `PROJECT_SETTINGS_FILES`
@@ -3107,7 +3149,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     // reasoning effort.
     let mut reminder_floor = agent_runtime::reminders::ReminderFloor::Baseline;
     let mut reminder_block: Option<String> = None;
-    match load_active_reminders() {
+    match load_active_reminders(workspace.as_ref().map(|(root, _)| root.as_path())) {
         Ok(Some((block, floor))) => {
             reminder_floor = floor;
             reminder_block = Some(block);
@@ -8781,6 +8823,136 @@ subcommand"
              would paint a truncated transcript",
             stream.cursor()
         );
+    }
+
+    #[test]
+    fn reminders_come_from_the_turn_s_own_project_root() {
+        // A turn's reminder roster must be the one belonging to the project
+        // the turn runs in — not whatever `.rapidlm/reminders.toml` the
+        // process happens to be standing next to.
+        let env = TempEnv::create();
+        let root = fs::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        fs::write(
+            root.join(PROJECT_MARKER).join("reminders.toml"),
+            "schema = \"rapidlm.reminders.v1\"\n\
+             [[feed]]\n\
+             name = \"house-style\"\n\
+             [[feed.reminder]]\n\
+             id = \"surrounding-code\"\n\
+             text = \"match the surrounding code\"\n",
+        )
+        .expect("roster");
+
+        let loaded = load_active_reminders(Some(&root)).expect("a readable roster");
+        let (block, _floor) = loaded.expect("an always-on feed is admitted");
+        assert!(
+            block.contains("match the surrounding code"),
+            "the project's own roster must be the one loaded: {block}"
+        );
+
+        // The root argument is what decides, not the process's location: a
+        // second project with its own roster gets its own, and neither can
+        // see the other's.
+        let other = TempEnv::create();
+        let other_root = fs::canonicalize(&other.project).expect("canonicalize");
+        fs::create_dir_all(other_root.join(PROJECT_MARKER)).expect("marker");
+        fs::write(
+            other_root.join(PROJECT_MARKER).join("reminders.toml"),
+            "schema = \"rapidlm.reminders.v1\"\n\
+             [[feed]]\n\
+             name = \"house-style\"\n\
+             [[feed.reminder]]\n\
+             id = \"other-project\"\n\
+             text = \"a different project entirely\"\n",
+        )
+        .expect("roster");
+        let (other_block, _) = load_active_reminders(Some(&other_root))
+            .expect("readable")
+            .expect("admitted");
+        assert!(
+            other_block.contains("a different project entirely")
+                && !other_block.contains("match the surrounding code"),
+            "each root loads its own roster and only its own: {other_block}"
+        );
+        assert!(
+            !block.contains("a different project entirely"),
+            "and the first root never saw the second's: {block}"
+        );
+
+        // A project without a roster is simply quiet, and no resolved root
+        // means no project at all. (Contract, not a regression guard: with
+        // no roster anywhere above the test binary's own directory, a
+        // fallback would answer `None` here too.)
+        let bare = root.join("elsewhere");
+        fs::create_dir_all(bare.join(PROJECT_MARKER)).expect("bare");
+        assert!(load_active_reminders(Some(&bare)).expect("no roster").is_none());
+        assert!(load_active_reminders(None).expect("no root").is_none());
+    }
+
+    #[test]
+    fn every_command_resolves_the_same_project_from_any_subdirectory() {
+        // `rapid goal show` run in `src/` must read the project's goal, not
+        // report "no active goal" and leave a stray `.rapidlm/` behind. The
+        // TUI already walked up to the nearest marker; this is the same rule
+        // for everything else.
+        let env = TempEnv::create();
+        let root = fs::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let nested = root.join("crates").join("deep").join("src");
+        fs::create_dir_all(&nested).expect("nested dirs");
+
+        let from_root = project_path_in(&root, GOAL_FILE);
+        let from_nested = project_path_in(&nested, GOAL_FILE);
+        assert_eq!(
+            from_root, from_nested,
+            "a subdirectory must resolve the same project file as the root"
+        );
+        assert_eq!(from_root, root.join(PROJECT_MARKER).join(GOAL_FILE));
+        assert!(
+            !from_nested.starts_with(&nested),
+            "no command may create a second project store inside a subdirectory: {}",
+            from_nested.display()
+        );
+    }
+
+    #[test]
+    fn a_git_checkout_without_a_rapidlm_directory_still_resolves_to_its_root() {
+        // A first run in a fresh clone has no `.rapidlm` yet. The git marker
+        // is what makes `rapid goal create` from a subdirectory put the
+        // project store at the repository root rather than beside whatever
+        // file the developer happened to be editing.
+        let env = TempEnv::create();
+        let root = fs::canonicalize(&env.project).expect("canonicalize");
+        fs::remove_dir_all(root.join(PROJECT_MARKER)).ok();
+        fs::create_dir_all(root.join(GIT_MARKER)).expect("git marker");
+        let nested = root.join("src");
+        fs::create_dir_all(&nested).expect("nested");
+        assert_eq!(
+            project_path_in(&nested, GOAL_FILE),
+            root.join(PROJECT_MARKER).join(GOAL_FILE)
+        );
+    }
+
+    #[test]
+    fn a_bare_directory_still_resolves_beneath_itself() {
+        // No marker anywhere: the fallback must stay exactly what every one
+        // of these call sites did before — a `.rapidlm` in the working
+        // directory — so `rapid goal create` in a scratch directory keeps
+        // working.
+        let dir = TempEnv::create();
+        let bare = fs::canonicalize(&dir.project)
+            .expect("canonicalize")
+            .join("scratch");
+        fs::create_dir_all(&bare).expect("scratch");
+        fs::remove_dir_all(dir.project.join(PROJECT_MARKER)).ok();
+        let resolved = project_path_in(&bare, GOAL_FILE);
+        assert!(
+            resolved.starts_with(&bare) || resolved.starts_with(fs::canonicalize(&dir.project).expect("c")),
+            "an unmarked directory falls back to itself or its nearest marker: {}",
+            resolved.display()
+        );
+        assert!(resolved.ends_with(Path::new(PROJECT_MARKER).join(GOAL_FILE)));
     }
 
     #[test]

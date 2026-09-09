@@ -6967,6 +6967,65 @@ stored one — redone precisely so the broken code actually reproduced the defec
 `cargo clippy -p rapid -p event-ledger --all-targets` produces a byte-identical warning set to the
 pre-change baseline; full `cargo test --workspace` green.
 
+**Every command now resolves the same project the TUI does — `rapid goal show` in a subdirectory read a
+different project than `rapid` did, done 2026-09-09.**
+
+**The gap, reproduced with the built binary before anything was changed.** In a project with an active
+goal: `rapid goal show` at the root printed the goal; the same command in `sub/` printed `no active
+goal` — and left a stray `.rapidlm/sessions.sqlite` in that subdirectory. The TUI resolves its project by
+walking up to the nearest `.rapidlm`/`.git` marker (`resolve_project_root` -> `detect_project_root`);
+every non-TUI command built its paths from the *working directory* with `Path::new(".rapidlm").join(...)`.
+Two rules for one question, and the wrong one on the commands a developer runs most often from wherever
+they happen to be standing.
+
+`resolve_project_root`'s own doc comment already said it lives in `interactive.rs` "so `rapid doctor` and
+`rapid mcp` cannot drift into resolving different projects from the same working directory". The
+abstraction was right and simply had not been applied to the rest.
+
+**What was affected.** `rapid goal *` (`goal.json`, `evidence.json`, and the `sessions.sqlite` its
+evidence-citation resolver reads), `rapid sessions`, `rapid cron`, `rapid agents`, `rapid inspect-export`,
+`rapid insights`, `rapid plugins`, and the reminder roster an `exec` turn honors. The `plugins` one is a
+trust boundary: the plugin trust catalog is project state, so running `rapid plugins` one directory down
+consulted — and created — a *different* catalog than the one governing the project.
+
+**The fix is one function, `project_path`, beside the resolver it delegates to**, with `project_path_in`
+taking an explicit cwd so the rule is testable without `chdir` (process-global, and it would race every
+other test in the binary). The fallback when no marker is found anywhere is the canonicalized cwd, which
+is exactly what these call sites did unconditionally before — so `rapid goal create` in a scratch
+directory keeps working, and an unreadable cwd degrades to the old behavior instead of failing.
+
+**Reminders got the stronger treatment: the root is passed, not resolved.** `load_active_reminders()`
+took no arguments and read `./.rapidlm/reminders.toml`. Simply pointing it at `project_path` would have
+been the same hidden global lookup with a better address; `exec_turn` already resolves a root and already
+hands it to `exec_permission_lattice`, so reminders now take that same root. A turn's reminders belong to
+the project the turn runs in, and `None` — the root did not resolve, so there is no project — means no
+reminders, matching how every other project-scoped input behaves on that path.
+
+**Verified end-to-end with the real binary, not only in tests.** In a project with a marker, `goal show`,
+`plugins list` and `cron list` from `sub/` now all resolve the root's state, and `find . -name .rapidlm`
+shows one directory where there used to be several.
+
+**A revert cycle rejected the first version of the reminders test.** It asserted that `None` yields no
+reminders — which holds whether or not the root argument is honored, because the test machine has no
+roster above the test binary either. Rewritten to give two temp projects their own rosters and assert
+each root loads its own and only its own, the broken version fails immediately. The `None` case is still
+asserted, but labelled in the test as a contract rather than a regression guard, because it cannot fail
+here.
+
+**Noted, not fixed: a read-only command creates the marker that changes future resolution.** `rapid
+plugins list` and `rapid sessions list` `create_dir_all` their store, so running either in an unmarked
+directory creates a `.rapidlm` there — after which the resolver legitimately treats that directory as its
+own project forever after. That is the fallback path, unchanged by this work, and narrowing it would
+change the bare-directory semantics `a_bare_directory_still_resolves_beneath_itself` pins. It belongs
+with the `sessions.sqlite`/`ledger.sqlite` unification recorded above.
+
+**Tests.** Four new: the same file resolves from root and from a nested subdirectory, and never beneath
+the subdirectory; a git checkout with no `.rapidlm` yet resolves to the repository root; a bare directory
+still falls back to itself; and reminders come from the caller's root, with two projects proving neither
+sees the other's roster. Two revert cycles (81-82), one of which forced the test rewrite above. 673
+`rapid` lib tests, clippy byte-identical to the pre-change baseline for both touched files, full
+`cargo test --workspace` green.
+
 ## DECIDED (2026-09-08, option C) — the interactive TUI cannot ask for approval, so out of the box it can only read
 
 **Found 2026-09-08 while scoping the missing approval broker. This is the largest gap found in this

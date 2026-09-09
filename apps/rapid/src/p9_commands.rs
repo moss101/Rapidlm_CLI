@@ -717,7 +717,7 @@ pub fn run_sessions(args: &[String]) -> Result<i32, P9CommandError> {
         }
     };
     let db_path = db.unwrap_or_else(|| {
-        PathBuf::from(".rapidlm").join("sessions.sqlite")
+        crate::interactive::project_path("sessions.sqlite")
     });
     std::fs::create_dir_all(
         db_path
@@ -767,7 +767,7 @@ pub fn run_cron(args: &[String]) -> Result<i32, P9CommandError> {
     }
     let mode = rest.first().map(|s| s.as_str()).ok_or(P9CommandError::Usage)?;
     let operands: Vec<&String> = rest[1..].to_vec();
-    let db_path = db.unwrap_or_else(|| PathBuf::from(".rapidlm").join("sessions.sqlite"));
+    let db_path = db.unwrap_or_else(|| crate::interactive::project_path("sessions.sqlite"));
     let cron = scheduler::PromptCron::open(&db_path)
         .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
     let cancel = capability_broker::CancellationToken::new();
@@ -1322,7 +1322,7 @@ pub fn run_agents(args: &[String]) -> Result<i32, P9CommandError> {
         i += 1;
     }
     let mode = rest.first().map(|s| s.as_str()).ok_or(P9CommandError::Usage)?;
-    let defs_dir = dir.unwrap_or_else(|| PathBuf::from(".rapidlm").join("agents"));
+    let defs_dir = dir.unwrap_or_else(|| crate::interactive::project_path("agents"));
     let registry = cli_implementation_registry();
     match mode {
         "list" => {
@@ -1675,9 +1675,9 @@ const MAX_CLI_RESOURCE_BYTES: usize = 4096;
 
 /// Default trust catalog location, matching the install layout root.
 fn default_trust_catalog() -> PathBuf {
-    PathBuf::from(".rapidlm")
-        .join("plugins")
-        .join(plugin_host::TRUST_CATALOG_FILE)
+    crate::interactive::project_path(
+        PathBuf::from("plugins").join(plugin_host::TRUST_CATALOG_FILE),
+    )
 }
 
 /// Reads a file, rejecting it once its content exceeds `max_bytes`. Reads
@@ -1950,7 +1950,7 @@ pub fn run_inspect_export(args: &[String]) -> Result<i32, P9CommandError> {
     }
     let session: protocol::SessionId =
         positional[0].parse().map_err(|_| P9CommandError::Usage)?;
-    let db_path = db.unwrap_or_else(|| PathBuf::from(".rapidlm").join("sessions.sqlite"));
+    let db_path = db.unwrap_or_else(|| crate::interactive::project_path("sessions.sqlite"));
     let client = kernel::InProcessKernelClient::open(&db_path)
         .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
     let events = client
@@ -2308,7 +2308,7 @@ pub fn run_insights(args: &[String]) -> Result<i32, P9CommandError> {
     }
     let session: protocol::SessionId =
         positional[0].parse().map_err(|_| P9CommandError::Usage)?;
-    let db_path = db.unwrap_or_else(|| PathBuf::from(".rapidlm").join("sessions.sqlite"));
+    let db_path = db.unwrap_or_else(|| crate::interactive::project_path("sessions.sqlite"));
     let client = kernel::InProcessKernelClient::open(&db_path)
         .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
     let events = client
