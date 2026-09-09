@@ -73,7 +73,6 @@ pub(crate) const GIT_MARKER: &str = ".git";
 const WORKSPACE_CONFIG_NAME: &str = "config.toml";
 pub(crate) const USER_CONFIG_NAME: &str = "config.toml";
 pub(crate) const TRUST_CATALOG_NAME: &str = "project-trust.json";
-const LEDGER_NAME: &str = "ledger.sqlite";
 const HOME_ENV: &str = "HOME";
 const USERPROFILE_ENV: &str = "USERPROFILE";
 const RAPIDLM_HOME_ENV: &str = "RAPIDLM_HOME";
@@ -187,6 +186,10 @@ struct ResolvedProject {
     executable_config_active: bool,
     config: ConfigLoadResult,
     ledger_path: PathBuf,
+    /// What [`adopt_legacy_ledger`] had to say, if anything — surfaced in
+    /// the transcript rather than printed to stderr, which the alt-screen
+    /// switch would wipe before the user could read it.
+    ledger_notice: Option<String>,
     root: PathBuf,
     /// The RapidLM home this session resolved (`InteractiveOptions::
     /// user_home`, else its injected environment). Carried so a slash
@@ -1007,7 +1010,7 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
     // system records are unaffected. The handle is kept for `goal claim`,
     // which appends its own audit events.
     let claim_ledger =
-        match event_ledger::ledger::EventLedger::open(project_path(SESSIONS_DB_FILE)) {
+        match event_ledger::ledger::EventLedger::open(current_project_ledger_path()) {
             Ok(ledger) => {
                 host.install_backing(ledger.clone());
                 Some(ledger)
@@ -2167,7 +2170,101 @@ pub(crate) fn resolve_project_root(
     Ok(FoundProject { root, marker })
 }
 
+/// The legacy name of the project event ledger, written only by the
+/// interactive TUI before the two were unified.
+const LEGACY_LEDGER_NAME: &str = "ledger.sqlite";
+
+/// The project's one event ledger.
+///
+/// A project used to hold two SQLite databases with the *same* schema: the
+/// TUI wrote `.rapidlm/ledger.sqlite` while every command that reads session
+/// data (`rapid sessions`, `inspect-export`, `insights`) read
+/// `.rapidlm/sessions.sqlite` — so `rapid sessions list` could never show an
+/// interactive session, in the project that had just created one.
+/// `sessions.sqlite` ([`SESSIONS_DB_FILE`]) is canonical: source already
+/// documented it as such, and six command families already used it.
+///
+/// Resolution is pure and has no side effects, so a *reader* sees a
+/// TUI-only project's history immediately, before anything is renamed:
+/// canonical if it exists, else the legacy file if it exists, else canonical
+/// (which is then created by whoever writes first). [`adopt_legacy_ledger`]
+/// does the one-time tidy-up, and only from the writer.
+pub(crate) fn project_ledger_path(marker_dir: &Path) -> PathBuf {
+    let canonical = marker_dir.join(SESSIONS_DB_FILE);
+    if canonical.exists() {
+        return canonical;
+    }
+    let legacy = marker_dir.join(LEGACY_LEDGER_NAME);
+    if legacy.exists() {
+        return legacy;
+    }
+    canonical
+}
+
+/// Move a TUI-only project's ledger to the canonical name, once.
+///
+/// Returns a notice to show the user when anything happened worth telling
+/// them, and `None` when there is nothing to say. Never merges and never
+/// deletes: when *both* files exist the canonical one is already what
+/// [`project_ledger_path`] returns, and the legacy file is left untouched and
+/// named in the notice, because merging two ledgers is a real migration and
+/// choosing silently — in either direction — would hide data the user has.
+///
+/// The ledger runs in SQLite's default rollback-journal mode, so a committed
+/// database is one file and renaming it is lossless. A `-journal` sibling
+/// means a transaction is in flight or crashed, and its rollback journal must
+/// stay beside the database it belongs to — so that case is reported, not
+/// renamed. `-wal`/`-shm` are moved too if some future journal mode leaves
+/// them, and their absence is not an error.
+pub(crate) fn adopt_legacy_ledger(marker_dir: &Path) -> Option<String> {
+    let canonical = marker_dir.join(SESSIONS_DB_FILE);
+    let legacy = marker_dir.join(LEGACY_LEDGER_NAME);
+    if !legacy.exists() {
+        return None;
+    }
+
+    if canonical.exists() {
+        return Some(format!(
+            "note: this project has two event ledgers. Using {}; {} is left untouched \
+and its sessions are not listed. Nothing has been deleted.",
+            canonical.display(),
+            legacy.display()
+        ));
+    }
+    let journal = marker_dir.join(format!("{LEGACY_LEDGER_NAME}-journal"));
+    if journal.exists() {
+        return Some(format!(
+            "note: {} still has an open rollback journal, so it was left where it is; \
+its sessions are still readable.",
+            legacy.display()
+        ));
+    }
+    if let Err(err) = fs::rename(&legacy, &canonical) {
+        return Some(format!(
+            "note: {} could not be moved to {} ({err}); its sessions are still readable.",
+            legacy.display(),
+            canonical.display()
+        ));
+    }
+    for suffix in ["-wal", "-shm"] {
+        let from = marker_dir.join(format!("{LEGACY_LEDGER_NAME}{suffix}"));
+        if from.exists() {
+            let _ = fs::rename(&from, marker_dir.join(format!("{SESSIONS_DB_FILE}{suffix}")));
+        }
+    }
+    None
+}
+
+/// [`project_ledger_path`] for the project the working directory is in — the
+/// one accessor every command that reads or writes session events uses, so
+/// none of them can look in a different file than the TUI wrote.
+pub(crate) fn current_project_ledger_path() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    project_ledger_path(&project_marker_dir_in(&cwd))
+}
+
 /// A path inside the current project's `.rapidlm`, resolved the way the TUI
+/// resolves it./// A path inside the current project's `.rapidlm`, resolved the way the TUI
 /// resolves it.
 ///
 /// Every non-TUI command used to build these from the *working directory*
@@ -2193,10 +2290,15 @@ pub(crate) fn project_path(relative: impl AsRef<Path>) -> PathBuf {
 /// rule is testable without `chdir` (which is process-global and would race
 /// every other test in this binary).
 pub(crate) fn project_path_in(cwd: &Path, relative: impl AsRef<Path>) -> PathBuf {
+    project_marker_dir_in(cwd).join(relative)
+}
+
+/// The `.rapidlm` directory of the project `cwd` is in, by the same rule.
+pub(crate) fn project_marker_dir_in(cwd: &Path) -> PathBuf {
     let root = resolve_project_root(cwd, &CancellationToken::new())
         .map(|found| found.root)
         .unwrap_or_else(|_| cwd.to_path_buf());
-    root.join(PROJECT_MARKER).join(relative)
+    root.join(PROJECT_MARKER)
 }
 
 /// Trusted-project config merged from every file in `PROJECT_SETTINGS_FILES`
@@ -3692,6 +3794,12 @@ fn run_started_session(
     // Project the persisted composition-root goal into the interactive TUI so
     // the Goals route shows it (the TUI is a projection of runtime state).
     sync_persisted_goal(&mut ui, &resolved.ledger_path);
+    // Anything the ledger unification had to say goes in the transcript: it
+    // is addressed to the user, and stderr written before the alt screen
+    // opens is wiped before it can be read.
+    if let Some(notice) = resolved.ledger_notice.clone() {
+        ui = reduce(ui, &UiEvent::Local(LocalUiEvent::AppendCommandOutput(notice)));
+    }
     let mut interrupt_count = 0;
     let mut saw_ctrl_c = false;
 
@@ -5852,11 +5960,19 @@ fn resolve_project(options: &InteractiveOptions) -> Result<ResolvedProject, Inte
     let sources = gather_config_sources(options, &project_root, &user_home)?;
     let config = load_config(&sources).map_err(InteractiveError::Config)?;
 
+    // One-time tidy-up of the pre-unification split, from the writer only:
+    // `project_ledger_path` already *reads* the legacy file where it is, so
+    // nothing depends on this succeeding.
+    let marker_dir = project_root.join(PROJECT_MARKER);
+    let ledger_notice = adopt_legacy_ledger(&marker_dir);
+    let ledger_path = project_ledger_path(&marker_dir);
+
     Ok(ResolvedProject {
         trust,
         executable_config_active: trust.is_trusted(),
         config,
-        ledger_path: project_root.join(PROJECT_MARKER).join(LEDGER_NAME),
+        ledger_path,
+        ledger_notice,
         root: project_root,
         user_home,
     })
@@ -8601,7 +8717,7 @@ subcommand"
         .expect("first session");
         let session = first.session_id.expect("session id");
 
-        let ledger_path = env.project.join(PROJECT_MARKER).join(LEDGER_NAME);
+        let ledger_path = project_ledger_path(&env.project.join(PROJECT_MARKER));
         let sessions_after_first = recorded_sessions(&ledger_path);
         assert_eq!(sessions_after_first, 1);
 
@@ -8733,7 +8849,7 @@ subcommand"
         // recorded in — so resume answers the question itself.
         let _lock = lock_terminal();
         let env = TempEnv::create();
-        let ledger_path = env.project.join(PROJECT_MARKER).join(LEDGER_NAME);
+        let ledger_path = project_ledger_path(&env.project.join(PROJECT_MARKER));
         assert!(
             known_sessions_hint(&ledger_path).is_none(),
             "a project with nothing recorded has nothing to offer"
@@ -8774,7 +8890,7 @@ subcommand"
         let env = TempEnv::create();
         let session = ScriptedSession::create(&env);
         let session_id = session.session_id;
-        let ledger_path = env.project.join(PROJECT_MARKER).join(LEDGER_NAME);
+        let ledger_path = project_ledger_path(&env.project.join(PROJECT_MARKER));
         let actor = human_actor().expect("actor");
 
         let ledger = event_ledger::ledger::EventLedger::open(&ledger_path).expect("open ledger");
@@ -8891,6 +9007,124 @@ subcommand"
     }
 
     #[test]
+    fn a_tui_only_project_s_history_is_visible_to_every_command() {
+        // The defect: the TUI wrote `ledger.sqlite` and every command that
+        // reads session data read `sessions.sqlite`, so `rapid sessions list`
+        // showed nothing in a project that had just recorded a session.
+        // Resolution is pure, so a reader sees that history *before* anything
+        // is renamed.
+        let env = TempEnv::create();
+        let marker = env.project.join(PROJECT_MARKER);
+        fs::create_dir_all(&marker).expect("marker");
+        let legacy = marker.join(LEGACY_LEDGER_NAME);
+        fs::write(&legacy, b"not really a database, but it exists").expect("legacy");
+
+        assert_eq!(
+            project_ledger_path(&marker),
+            legacy,
+            "a project whose only ledger is the legacy one must be read from it"
+        );
+
+        // Once adopted, the same project resolves to the canonical name and
+        // nothing has been lost.
+        let notice = adopt_legacy_ledger(&marker);
+        assert!(notice.is_none(), "a clean adoption is silent: {notice:?}");
+        let canonical = marker.join(SESSIONS_DB_FILE);
+        assert!(canonical.exists(), "the ledger moved to the canonical name");
+        assert!(!legacy.exists(), "and is no longer at the old one");
+        assert_eq!(
+            fs::read(&canonical).expect("read"),
+            b"not really a database, but it exists",
+            "adoption is a rename, not a rewrite"
+        );
+        assert_eq!(project_ledger_path(&marker), canonical);
+    }
+
+    #[test]
+    fn two_ledgers_are_never_merged_or_deleted_silently() {
+        // The case option C deliberately does not resolve on its own: both
+        // files exist, the canonical one wins, and the user is told rather
+        // than having either file quietly chosen or destroyed.
+        let env = TempEnv::create();
+        let marker = env.project.join(PROJECT_MARKER);
+        fs::create_dir_all(&marker).expect("marker");
+        let legacy = marker.join(LEGACY_LEDGER_NAME);
+        let canonical = marker.join(SESSIONS_DB_FILE);
+        fs::write(&legacy, b"older transcripts").expect("legacy");
+        fs::write(&canonical, b"canonical rows").expect("canonical");
+
+        let notice = adopt_legacy_ledger(&marker);
+        // Data first: `fs::rename` overwrites its destination, so an
+        // unguarded adoption here destroys the canonical ledger outright.
+        assert_eq!(
+            fs::read(&canonical).expect("the canonical ledger must still be there"),
+            b"canonical rows",
+            "adoption must never overwrite an existing canonical ledger"
+        );
+        assert_eq!(
+            fs::read(&legacy).expect("the legacy ledger must still be there"),
+            b"older transcripts",
+            "and must never consume the legacy one"
+        );
+        assert_eq!(project_ledger_path(&marker), canonical);
+        let notice = notice.expect("the user must be told which one is in use");
+        assert!(
+            notice.contains(&legacy.display().to_string())
+                && notice.contains("Nothing has been deleted"),
+            "the notice must name the untouched file and say it survives: {notice}"
+        );
+    }
+
+    #[test]
+    fn a_ledger_with_an_open_journal_is_reported_rather_than_moved() {
+        // A `-journal` sibling is SQLite's rollback journal for an in-flight
+        // or crashed transaction, and it must stay beside the database it
+        // belongs to. Renaming the database out from under it risks the
+        // corruption this whole change exists to avoid.
+        let env = TempEnv::create();
+        let marker = env.project.join(PROJECT_MARKER);
+        fs::create_dir_all(&marker).expect("marker");
+        let legacy = marker.join(LEGACY_LEDGER_NAME);
+        fs::write(&legacy, b"mid-transaction").expect("legacy");
+        fs::write(
+            marker.join(format!("{LEGACY_LEDGER_NAME}-journal")),
+            b"rollback",
+        )
+        .expect("journal");
+
+        let notice = adopt_legacy_ledger(&marker);
+        assert!(
+            legacy.exists(),
+            "the database must stay beside the rollback journal that can undo its \
+last transaction; moving it out from under one risks the corruption this \
+whole change exists to avoid"
+        );
+        let notice = notice.expect("the user must be told");
+        assert!(
+            notice.contains("rollback journal"),
+            "the notice must say why it was left: {notice}"
+        );
+        assert!(
+            !marker.join(SESSIONS_DB_FILE).exists(),
+            "and nothing was created in its place"
+        );
+        assert_eq!(
+            project_ledger_path(&marker),
+            legacy,
+            "which is still the ledger this project reads"
+        );
+    }
+
+    #[test]
+    fn a_fresh_project_uses_the_canonical_name() {
+        let env = TempEnv::create();
+        let marker = env.project.join(PROJECT_MARKER);
+        fs::create_dir_all(&marker).expect("marker");
+        assert!(adopt_legacy_ledger(&marker).is_none());
+        assert_eq!(project_ledger_path(&marker), marker.join(SESSIONS_DB_FILE));
+    }
+
+    #[test]
     fn every_command_resolves_the_same_project_from_any_subdirectory() {
         // `rapid goal show` run in `src/` must read the project's goal, not
         // report "no active goal" and leave a stray `.rapidlm/` behind. The
@@ -8987,7 +9221,7 @@ subcommand"
         // opened: resuming a session to look at it writes nothing to the
         // ledger, so reading history never rewrites it.
         let env = TempEnv::create();
-        let ledger_path = env.project.join(PROJECT_MARKER).join(LEDGER_NAME);
+        let ledger_path = project_ledger_path(&env.project.join(PROJECT_MARKER));
         assert!(
             most_recent_session(&ledger_path)
                 .expect("no ledger is not an error")
@@ -9557,7 +9791,7 @@ subcommand"
         // comment) so Ctrl-C stays responsive during a real in-flight
         // turn — poll briefly for the background thread(s) to finish
         // releasing their lease rather than asserting immediately.
-        let ledger_path = env.project.join(PROJECT_MARKER).join(LEDGER_NAME);
+        let ledger_path = project_ledger_path(&env.project.join(PROJECT_MARKER));
         let mut seq_after = 0;
         let mut turn_still_active = true;
         for _ in 0..80 {
@@ -9846,7 +10080,7 @@ subcommand"
 
     impl ScriptedSession {
         fn create(env: &TempEnv) -> Self {
-            let ledger_path = env.project.join(PROJECT_MARKER).join(LEDGER_NAME);
+            let ledger_path = project_ledger_path(&env.project.join(PROJECT_MARKER));
             fs::create_dir_all(ledger_path.parent().expect("ledger has a parent"))
                 .expect("ledger dir");
             let client = InProcessKernelClient::open(&ledger_path).expect("open ledger");

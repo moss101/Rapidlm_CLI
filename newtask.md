@@ -7044,6 +7044,55 @@ to, and the test asserts that difference in both directions.
 Verified with the built binary as well as in tests: three listings in a fresh directory now leave
 `find .rapidlm` empty, and `cron add` still creates the store.
 
+**Option C implemented: a project has one event ledger, done 2026-09-09.**
+
+**Resolution is pure, and that is what actually fixes the defect.** `project_ledger_path(marker_dir)`
+returns the canonical `sessions.sqlite` if it exists, else the legacy `ledger.sqlite` if it exists, else
+the canonical name — with no side effects. Every command that reads or writes session events now goes
+through it (`current_project_ledger_path` for the cwd-resolved case), so a project that had only ever run
+the TUI has its history visible to `rapid sessions`, `inspect-export` and `insights` *immediately*,
+before anything is renamed and whether or not the rename ever succeeds. Proven with the built binary
+against a legacy-named ledger holding a real session row: `count=1` where the same command reported
+`count=0` before, and nothing new was created by the listing.
+
+**`adopt_legacy_ledger` is the tidy-up, and it runs only from the writer.** The TUI calls it once at
+startup. Renaming is safe because the ledger runs in SQLite's default rollback-journal mode (no
+`journal_mode = WAL` anywhere in `event-ledger`), so a committed database is a single file. Three cases
+it refuses to guess at:
+
+- **Both files exist** — the canonical one is already what resolution returns; the legacy file is left
+  exactly as it was and named in a notice that says nothing has been deleted. `fs::rename` overwrites its
+  destination, so an unguarded adoption here would destroy the canonical ledger outright; the test
+  asserts the *contents* of both files before it asserts the notice, so the revert cycle fails on the
+  data loss rather than on a missing string.
+- **A `-journal` sibling exists** — an in-flight or crashed transaction, whose rollback journal must stay
+  beside the database it can undo. Reported, not moved.
+- **The rename fails** — reported, and the legacy file keeps being read, because resolution never
+  depended on the rename.
+
+`-wal`/`-shm` are moved alongside if some future journal mode leaves them, and their absence is not an
+error. Nothing is ever merged or deleted.
+
+**The notice goes in the transcript, not to stderr.** Anything written before the alt screen opens is
+wiped before a user can read it, so `ResolvedProject` carries it and the TUI appends it as command output
+through the existing `LocalUiEvent::AppendCommandOutput` path.
+
+**`LEDGER_NAME` is gone.** It had become a second name for a resolved thing — the exact drift this
+document keeps recording — and its remaining users were tests that would have pointed at a file the
+product no longer creates. They resolve through `project_ledger_path` now, so the tests and production
+agree by construction.
+
+**Tests.** Four new: a TUI-only project's ledger is read where it is and then adopted losslessly (the
+rename is byte-preserving, asserted); two ledgers are never merged or deleted and the user is told; a
+ledger with an open rollback journal is reported rather than moved; a fresh project uses the canonical
+name. Three revert cycles (83-85), two of which were rewritten so the broken code fails on the *harm*
+(a clobbered canonical ledger, a database moved away from its journal) rather than on a missing message.
+678 `rapid` lib tests, clippy identical to the pre-session baseline, full `cargo test --workspace` green.
+
+**Still open after this.** `rapid sessions list` shows sessions but no way to act on them beyond
+`rapid resume <id>`; `inspect-export` and `insights` were verified only to the extent that they now open
+the same file, not that their own output is complete.
+
 ## DECIDED (2026-09-09, option C) — a project has two event ledgers, and the commands that read sessions read the one the TUI never writes
 
 **Raised for user direction because the fix requires choosing what happens to existing user data, and

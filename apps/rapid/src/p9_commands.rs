@@ -716,9 +716,7 @@ pub fn run_sessions(args: &[String]) -> Result<i32, P9CommandError> {
             return Err(P9CommandError::Usage);
         }
     };
-    let db_path = db.unwrap_or_else(|| {
-        crate::interactive::project_path("sessions.sqlite")
-    });
+    let db_path = db.unwrap_or_else(crate::interactive::current_project_ledger_path);
     // Listing must not *create* what it is listing. Opening the ledger
     // applies migrations and writes a full database, so a bare `rapid
     // sessions list` used to leave a store behind in whatever directory it
@@ -791,7 +789,7 @@ pub fn run_cron(args: &[String]) -> Result<i32, P9CommandError> {
     }
     let mode = rest.first().map(|s| s.as_str()).ok_or(P9CommandError::Usage)?;
     let operands: Vec<&String> = rest[1..].to_vec();
-    let db_path = db.unwrap_or_else(|| crate::interactive::project_path("sessions.sqlite"));
+    let db_path = db.unwrap_or_else(crate::interactive::current_project_ledger_path);
     // As in `run_sessions`: listing must not create the store it lists.
     // `PromptCron::open` writes a migrated database, so `rapid cron list` in a
     // project that has never scheduled anything used to leave one behind.
@@ -1968,7 +1966,7 @@ pub fn run_inspect_export(args: &[String]) -> Result<i32, P9CommandError> {
     }
     let session: protocol::SessionId =
         positional[0].parse().map_err(|_| P9CommandError::Usage)?;
-    let db_path = db.unwrap_or_else(|| crate::interactive::project_path("sessions.sqlite"));
+    let db_path = db.unwrap_or_else(crate::interactive::current_project_ledger_path);
     let client = kernel::InProcessKernelClient::open(&db_path)
         .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
     let events = client
@@ -2386,7 +2384,7 @@ pub fn run_insights(args: &[String]) -> Result<i32, P9CommandError> {
     }
     let session: protocol::SessionId =
         positional[0].parse().map_err(|_| P9CommandError::Usage)?;
-    let db_path = db.unwrap_or_else(|| crate::interactive::project_path("sessions.sqlite"));
+    let db_path = db.unwrap_or_else(crate::interactive::current_project_ledger_path);
     let client = kernel::InProcessKernelClient::open(&db_path)
         .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
     let events = client
