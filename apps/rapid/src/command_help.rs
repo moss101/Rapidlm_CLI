@@ -549,35 +549,21 @@ parser about which operands are required",
         ] {
             let paints_now = !tui::sidebar_lines(route, &state, 80, 24, &cancel).is_empty();
             let claims = tui::route_renders_content(route);
-            // An empty *projection* can still be a real panel (`/agents` on
-            // a session with no agents renders a header), so the check is
-            // one-directional and exact where it can be: a route that paints
-            // something must never be claimed dead.
-            assert!(
-                !(paints_now && !claims),
-                "{route:?} paints content but `route_renders_content` says it does not"
+            // Every live panel renders a placeholder for an empty projection
+            // (`/agents` a header, `/goals` "no goal", `/jobs` "no jobs",
+            // `/approvals` "no approvals") and every dead route renders
+            // nothing at all, so the two facts are exactly equivalent on an
+            // empty state and the check runs in both directions. It used to
+            // be one-directional, with a hand-listed set of dead routes
+            // beside it — the second list this module exists to avoid, and
+            // one that went stale the moment `/jobs` and `/approvals` were
+            // given renderers.
+            assert_eq!(
+                paints_now, claims,
+                "{route:?}: the compositor paints {paints_now} for an empty state \
+while `route_renders_content` claims {claims}"
             );
         }
-        // And the routes the compositor's own match sends to `Vec::new()`
-        // unconditionally must be claimed dead.
-        for route in [
-            UiRoute::Diff,
-            UiRoute::Context,
-            UiRoute::Memory,
-            UiRoute::Jobs,
-            UiRoute::Approvals,
-            UiRoute::Graph,
-            UiRoute::Computer,
-            UiRoute::Resources,
-            UiRoute::Models,
-        ] {
-            assert!(
-                !tui::route_renders_content(route),
-                "{route:?} renders nothing but is claimed available"
-            );
-        }
-        assert!(tui::route_renders_content(UiRoute::Agents));
-        assert!(tui::route_renders_content(UiRoute::Goals));
     }
 
     #[test]

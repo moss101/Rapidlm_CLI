@@ -161,11 +161,11 @@ pub fn sidebar_lines(
             .map(|model| model.render(width, height).lines().to_vec())
             .unwrap_or_default(),
         UiRoute::Goals => goal_lines(state, width, height),
+        UiRoute::Jobs => job_lines(state, width, height),
+        UiRoute::Approvals => approval_lines(state, width, height),
         UiRoute::Diff
         | UiRoute::Context
         | UiRoute::Memory
-        | UiRoute::Jobs
-        | UiRoute::Approvals
         | UiRoute::Graph
         | UiRoute::Computer
         | UiRoute::Resources
@@ -188,12 +188,10 @@ pub const fn route_renders_content(route: UiRoute) -> bool {
     match route {
         // The transcript is the default view, not an inspector panel.
         UiRoute::Transcript => false,
-        UiRoute::Agents | UiRoute::Goals => true,
+        UiRoute::Agents | UiRoute::Goals | UiRoute::Jobs | UiRoute::Approvals => true,
         UiRoute::Diff
         | UiRoute::Context
         | UiRoute::Memory
-        | UiRoute::Jobs
-        | UiRoute::Approvals
         | UiRoute::Graph
         | UiRoute::Computer
         | UiRoute::Resources
@@ -233,6 +231,66 @@ fn goal_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
         .collect();
     if lines.is_empty() {
         lines.push("no goal".to_owned());
+    }
+    lines.truncate(usize::from(height));
+    for line in &mut lines {
+        *line = fit_width(line, usize::from(width));
+    }
+    lines
+}
+
+/// The `/jobs` panel: the job rows `reduce` already keeps.
+///
+/// The projection was populated from `job.*` events all along
+/// (`upsert_job`); only the rendering was missing, so the route switched to a
+/// panel that painted nothing — and on a narrow terminal an empty panel takes
+/// the whole transcript rect. Rows are ordered by id (the `BTreeMap`'s own
+/// order) so a redraw never reshuffles them under the reader.
+fn job_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
+    let mut lines: Vec<String> = state
+        .jobs()
+        .values()
+        .map(|job| {
+            let lifecycle = format!("{:?}", job.state()).to_lowercase();
+            match job.exit_status() {
+                Some(status) => format!("{} [{lifecycle}] exit:{status}", job.id()),
+                None => format!("{} [{lifecycle}]", job.id()),
+            }
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push("no jobs".to_owned());
+    }
+    lines.truncate(usize::from(height));
+    for line in &mut lines {
+        *line = fit_width(line, usize::from(width));
+    }
+    lines
+}
+
+/// The `/approvals` panel, on the same footing as [`job_lines`].
+///
+/// A resolved approval shows what it was resolved *as*: "resolved" alone
+/// cannot distinguish an approval that was granted from one that was refused,
+/// which is the single fact a reader opens this panel for.
+fn approval_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
+    let mut lines: Vec<String> = state
+        .approvals()
+        .values()
+        .map(|approval| {
+            let lifecycle = format!("{:?}", approval.state()).to_lowercase();
+            match approval.decision() {
+                Some(decision) => format!(
+                    "{} [{lifecycle}] {}",
+                    approval.id(),
+                    format!("{decision:?}").to_lowercase()
+                ),
+                None => format!("{} [{lifecycle}]", approval.id()),
+            }
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push("no approvals".to_owned());
     }
     lines.truncate(usize::from(height));
     for line in &mut lines {
@@ -662,6 +720,111 @@ pre-approve it with `rapid permissions allow <tool>`";
             .expect("entry");
         let (_, line) = crate::transcript::render_block_parts(entry);
         assert_eq!(line, "✓ repo_read");
+    }
+
+    #[test]
+    fn the_jobs_panel_shows_the_jobs_the_projection_already_had() {
+        // `reduce` has populated `AppState::jobs` from `job.*` events all
+        // along; the route simply painted nothing, so `/jobs` opened an empty
+        // panel — which on a narrow terminal takes the whole transcript rect.
+        use event_ledger::event::EventKind;
+
+        let job = "019c0000-0000-7000-8000-00000000002a";
+        let mut state = reduce(
+            AppState::new(),
+            &UiEvent::Kernel(kernel_event(
+                1,
+                EventKind::SessionCreated,
+                serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
+            )),
+        );
+        assert_eq!(
+            sidebar_lines(UiRoute::Jobs, &state, 40, 6, &cancel()),
+            vec![fit_width("no jobs", 40)],
+            "an empty projection says so rather than painting nothing at all"
+        );
+
+        state = reduce(
+            state,
+            &UiEvent::Kernel(kernel_event(
+                2,
+                EventKind::JobStarted,
+                serde_json::json!({"job_id": job}),
+            )),
+        );
+        let started = sidebar_lines(UiRoute::Jobs, &state, 60, 6, &cancel());
+        assert!(
+            started[0].contains(job) && started[0].contains("started"),
+            "the job and its state must both be shown: {started:?}"
+        );
+
+        state = reduce(
+            state,
+            &UiEvent::Kernel(kernel_event(
+                3,
+                EventKind::JobCompleted,
+                serde_json::json!({"job_id": job, "exit_status": 3}),
+            )),
+        );
+        let done = sidebar_lines(UiRoute::Jobs, &state, 60, 6, &cancel());
+        assert!(
+            done[0].contains("completed") && done[0].contains("exit:3"),
+            "a finished job must show how it finished: {done:?}"
+        );
+        assert!(
+            route_renders_content(UiRoute::Jobs),
+            "and the route must now report itself as one that paints"
+        );
+    }
+
+    #[test]
+    fn the_approvals_panel_distinguishes_granted_from_refused() {
+        // "resolved" alone cannot tell an approval that was granted from one
+        // that was refused, which is the one fact this panel exists for.
+        use event_ledger::event::EventKind;
+
+        let approval = "019c0000-0000-7000-8000-00000000001a";
+        let mut state = reduce(
+            AppState::new(),
+            &UiEvent::Kernel(kernel_event(
+                1,
+                EventKind::SessionCreated,
+                serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
+            )),
+        );
+        assert_eq!(
+            sidebar_lines(UiRoute::Approvals, &state, 40, 6, &cancel()),
+            vec![fit_width("no approvals", 40)]
+        );
+
+        state = reduce(
+            state,
+            &UiEvent::Kernel(kernel_event(
+                2,
+                EventKind::ApprovalRequested,
+                serde_json::json!({"approval_id": approval}),
+            )),
+        );
+        let pending = sidebar_lines(UiRoute::Approvals, &state, 60, 6, &cancel());
+        assert!(
+            pending[0].contains(approval) && pending[0].contains("requested"),
+            "a pending approval must be listed: {pending:?}"
+        );
+
+        state = reduce(
+            state,
+            &UiEvent::Kernel(kernel_event(
+                3,
+                EventKind::ApprovalResolved,
+                serde_json::json!({"approval_id": approval, "decision": "denied"}),
+            )),
+        );
+        let resolved = sidebar_lines(UiRoute::Approvals, &state, 60, 6, &cancel());
+        assert!(
+            resolved[0].contains("denied"),
+            "and a resolved one must say which way it went: {resolved:?}"
+        );
+        assert!(route_renders_content(UiRoute::Approvals));
     }
 
     #[test]

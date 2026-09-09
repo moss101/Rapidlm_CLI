@@ -7044,6 +7044,48 @@ to, and the test asserts that difference in both directions.
 Verified with the built binary as well as in tests: three listings in a fresh directory now leave
 `find .rapidlm` empty, and `cron add` still creates the store.
 
+**`/jobs` and `/approvals` now show the rows the projection already had, done 2026-09-09.**
+
+Two of the nine inspector routes that `/help` honestly marks unavailable were not missing *data* — they
+were missing four lines of rendering. `reduce` has populated `AppState::jobs` and `AppState::approvals`
+from the real `job.*` and `approval.*`/`tool.approval_required` event families all along (`upsert_job`,
+`upsert_approval`, both already tested), and `sidebar_lines` sent both routes to `Vec::new()`. Opening
+either gave an empty panel, which on a narrow terminal takes the whole transcript rect.
+
+`job_lines` and `approval_lines` follow `goal_lines` exactly: `BTreeMap` order so a redraw never
+reshuffles rows, a `no jobs` / `no approvals` placeholder for an empty projection, truncation to the
+panel height, and `fit_width` per line. A finished job shows its exit status, and a resolved approval
+shows *which way it went* — "resolved" alone cannot distinguish a grant from a refusal, which is the one
+fact that panel exists for.
+
+**`/help` needed no change at all**, which is the point of the earlier availability work: it asks
+`tui::route_renders_content`, that mirrors `sidebar_lines` arm for arm, and both commands started
+reporting themselves as working the moment they did.
+
+**The test that had to change was the interesting part.** `a_route_is_only_called_available_if_it_
+actually_paints_something` asserted one direction (a route that paints must not be claimed dead) and then
+carried a *hand-written list* of the nine dead routes — the second list this module exists to avoid,
+which went stale the moment these two got renderers. It is now bidirectional with no list: every live
+panel renders a placeholder for an empty projection and every dead route renders nothing, so
+`paints == claims` exactly, for every route, derived from the compositor itself.
+
+**Two revert cycles, and the first one did not compile — deliberately worth recording.** Deleting the
+`UiRoute::Jobs` arm from `sidebar_lines` makes the match non-exhaustive, so the coupling
+`route_renders_content`'s doc comment promises ("adding a `UiRoute` variant fails to compile in both
+places at once") is real and stronger than any test. The cycle was redone with a break that *does*
+compile — Jobs returned to the dead arm while still claimed alive — and the assertion fires: "the
+compositor paints false for an empty state while `route_renders_content` claims true". A clippy
+`unreachable pattern` warning also caught Jobs/Approvals being left in both arms of
+`route_renders_content` during the edit.
+
+**Tests.** Two new in `tui`, both driving the real `reduce` fold with real event envelopes: a job appears
+with its state and then its exit status; an approval appears as requested and then as denied. Both assert
+`route_renders_content` agrees. 229 `tui` lib tests (up from 227), 682 `rapid`, full workspace green.
+
+**Still empty, and still honestly marked so:** `/diff`, `/context`, `/memory`, `/graph`, `/computer`,
+`/resources`, `/models`. Unlike jobs and approvals, none of those has a projection in `AppState` to
+render — they need the data collected first, which is real work per panel rather than a rendering gap.
+
 **`rapid insights` was covered by a test that could not fail, done 2026-09-09.**
 
 Found while confirming — rather than assuming — that a `storage.corrupt` from `rapid insights` during the
