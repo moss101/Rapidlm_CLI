@@ -114,6 +114,13 @@ pub enum InteractiveInput {
 pub enum InteractiveError {
     Cancelled,
     Usage,
+    /// `--resume <id>` named a session this project's ledger has never seen.
+    ///
+    /// Distinct from a generic kernel error so the caller can name the id
+    /// and offer the ids that *are* here, rather than surfacing a
+    /// trace-id-bearing protocol error for what is almost always a typo or
+    /// an id copied from another project.
+    UnknownSession(protocol::SessionId),
     NotATty,
     AlreadyActive,
     UserHomeMissing,
@@ -166,6 +173,13 @@ pub struct InteractiveOptions {
     /// render path actually painted without corrupting the test process's
     /// own terminal with raw cursor/clear escape sequences.
     pub capture_render: bool,
+    /// Resume this existing session instead of creating a new one.
+    ///
+    /// The kernel already has everything this needs — `get_session` for the
+    /// projection and `subscribe(id, 0)` for a replay-then-tail of the whole
+    /// event history — so a resumed session rebuilds its real transcript
+    /// from the durable ledger rather than from any second store.
+    pub resume: Option<protocol::SessionId>,
 }
 
 struct ResolvedProject {
@@ -244,6 +258,7 @@ With no subcommand, rapid starts the interactive TUI in the current project.
 
 Commands:
   rapid exec <prompt>           one-shot/headless agent turn
+  rapid resume [session-id]     reopen the TUI on an existing session
   rapid trust grant|status|revoke   explicit project-trust control plane
   rapid goal create|replace|show|pause|resume|cancel|complete|claim|export|verify|evidence
   rapid mcp list|get|add|remove|probe   project MCP servers (stdio)
@@ -511,6 +526,12 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         handler: SubcommandHandler::Native(run_trust_command),
     },
     Subcommand {
+        name: "resume",
+        summary: "reopen the TUI on an existing session, rebuilt from the event ledger",
+        own_help: true,
+        handler: SubcommandHandler::Native(run_resume_command),
+    },
+    Subcommand {
         name: "goal",
         summary: "durable goal lifecycle: create/replace/show/pause/resume/cancel/complete/claim/export/verify/evidence",
         own_help: false,
@@ -634,6 +655,182 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
 fn unknown_subcommand_text(name: &str) -> String {
     format!("rapid: unknown subcommand '{name}'")
 }
+
+/// `rapid resume [session-id]`: reopen the TUI on an existing session.
+///
+/// Everything this needs was already built and unwired: the durable
+/// per-project event ledger, `get_session` for the projection, and
+/// `subscribe(id, 0)`'s replay-then-tail for the history. With no id it
+/// picks the session with the most recent *activity* — the one a user means
+/// by "where I left off", which is not necessarily the one created last.
+///
+/// Sessions are keyed inside the project's own `.rapidlm` ledger, so an id
+/// from another project is simply not found here; there is no cross-project
+/// lookup to leak.
+fn run_resume_command(args: &[String]) -> Result<i32, InteractiveError> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{RESUME_USAGE}");
+        return Ok(0);
+    }
+    if args.len() > 1 {
+        eprintln!("rapid resume: unexpected argument '{}'", args[1]);
+        eprint!("{RESUME_USAGE}");
+        return Err(InteractiveError::Usage);
+    }
+    let mut options = InteractiveOptions::from_env()?;
+    let resolved = resolve_project(&options)?;
+    let ledger_path = resolved.ledger_path.clone();
+
+    let session = match args.first() {
+        Some(raw) => raw.parse::<protocol::SessionId>().map_err(|_| {
+            eprintln!("rapid resume: {raw:?} is not a session id");
+            InteractiveError::Usage
+        })?,
+        None => match most_recent_session(&ledger_path)? {
+            Some(session) => session,
+            None => {
+                eprintln!(
+                    "rapid resume: no session has been recorded in this project yet; \
+run `rapid` to start one"
+                );
+                return Err(InteractiveError::Usage);
+            }
+        },
+    };
+    options.resume = Some(session);
+    let report = match run_interactive(options) {
+        Err(err @ InteractiveError::UnknownSession(_)) => {
+            eprintln!("{err}");
+            if let Some(hint) = known_sessions_hint(&ledger_path) {
+                eprint!("{hint}");
+            }
+            return Err(InteractiveError::Usage);
+        }
+        other => other?,
+    };
+    Ok(report.outcome.exit_code())
+}
+
+/// How many session ids an unknown-id failure offers back.
+const MAX_HINTED_SESSIONS: usize = 10;
+
+/// The ids actually recorded in this project, most recent activity first,
+/// for the "you asked for a session that isn't here" path.
+///
+/// This reads the interactive ledger directly rather than deferring to
+/// `rapid sessions list`, which reads a *different* database
+/// (`.rapidlm/sessions.sqlite`, the goal-evidence and cron store) and so
+/// cannot see interactive sessions at all. Pointing a confused user at a
+/// command that will print nothing would be worse than printing nothing
+/// here.
+fn known_sessions_hint(ledger_path: &Path) -> Option<String> {
+    hint_lines(recorded_sessions(ledger_path).ok()?)
+}
+
+/// Render the hint from summaries already read.
+///
+/// Only rows whose id actually parses are offered, and each is printed in
+/// its canonical form: an id this cannot parse is one `rapid resume` could
+/// not accept either, so listing it would send the user in a circle. That
+/// also keeps a ledger row from reaching the terminal verbatim — this writes
+/// to stderr, where an escape sequence in a crafted `.rapidlm/ledger.sqlite`
+/// would otherwise be interpreted rather than shown, and the ledger of a
+/// project is exactly as trustworthy as the project. `last_activity` is a
+/// timestamp string, so it is filtered to printable characters for the same
+/// reason.
+fn hint_lines(mut sessions: Vec<event_ledger::ledger::SessionSummary>) -> Option<String> {
+    sessions.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+    let usable: Vec<(protocol::SessionId, String)> = sessions
+        .into_iter()
+        .filter_map(|summary| {
+            let id = summary.session_id.parse::<protocol::SessionId>().ok()?;
+            Some((id, printable(&summary.last_activity)))
+        })
+        .collect();
+    if usable.is_empty() {
+        return None;
+    }
+    let mut out = String::from("sessions recorded in this project:\n");
+    for (id, last_activity) in usable.iter().take(MAX_HINTED_SESSIONS) {
+        out.push_str(&format!("  {id}  last activity {last_activity}\n"));
+    }
+    if usable.len() > MAX_HINTED_SESSIONS {
+        out.push_str(&format!(
+            "  ... and {} more\n",
+            usable.len() - MAX_HINTED_SESSIONS
+        ));
+    }
+    Some(out)
+}
+
+/// Control characters replaced with spaces, for a stored string on its way
+/// to a terminal. Mirrors `mcp_config::label`'s reasoning.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// Every session this project's ledger has recorded.
+///
+/// One reader, shared by the "resume where I left off" default and the
+/// unknown-id hint, so the two can never disagree about what this project
+/// contains.
+fn recorded_sessions(
+    ledger_path: &Path,
+) -> Result<Vec<event_ledger::ledger::SessionSummary>, InteractiveError> {
+    if !ledger_path.exists() {
+        return Ok(Vec::new());
+    }
+    let ledger =
+        event_ledger::ledger::EventLedger::open(ledger_path).map_err(|_| InteractiveError::Io)?;
+    ledger
+        .list_sessions(&event_ledger::ledger::CancellationToken::new())
+        .map_err(|_| InteractiveError::Io)
+}
+
+/// The session with the most recent event in this project's ledger.
+///
+/// `last_activity`, not `first_seen`: a session created yesterday and worked
+/// in today is the one "resume where I left off" means.
+fn most_recent_session(
+    ledger_path: &Path,
+) -> Result<Option<protocol::SessionId>, InteractiveError> {
+    Ok(newest_usable(recorded_sessions(ledger_path)?))
+}
+
+/// The most recently active session that `rapid resume` could actually
+/// accept.
+///
+/// Parses first and *then* takes the maximum: taking the newest row and
+/// parsing it afterwards would let one corrupt row report "no session
+/// recorded in this project" while several resumable ones sit behind it.
+fn newest_usable(
+    sessions: Vec<event_ledger::ledger::SessionSummary>,
+) -> Option<protocol::SessionId> {
+    sessions
+        .into_iter()
+        .filter_map(|summary| {
+            let id = summary.session_id.parse::<protocol::SessionId>().ok()?;
+            Some((id, summary.last_activity))
+        })
+        .max_by(|a, b| a.1.cmp(&b.1))
+        .map(|(id, _)| id)
+}
+
+/// `rapid resume --help`.
+pub const RESUME_USAGE: &str = "usage: rapid resume [session-id]
+
+Reopen the interactive TUI on an existing session, rebuilding its transcript
+from this project's durable event ledger.
+
+With no id, the session with the most recent activity is resumed. Naming an
+id this project has never recorded lists the ids it does have; a session
+from another project is not among them, since the ledger lives under the
+project root.
+
+  -h, --help  Print this help
+";
 
 /// `rapid exec` needs the extra `None` the other native handlers do not, so
 /// it gets the table's one adapter rather than the table growing a shape for
@@ -3388,21 +3585,68 @@ fn run_started_session(
         .ok_or(InteractiveError::Internal)?;
 
     let actor = human_actor()?;
-    let snapshot = block_on(
-        client.create_session(CreateSession::new(
-            ProjectId::new(),
-            actor.clone(),
-            TraceId::new(),
-        )),
-        &options.cancel,
-    )?;
-    let session_id = snapshot.id();
+    // Resuming subscribes from sequence 0, which the kernel replays before
+    // tailing, so the transcript is rebuilt from the durable event ledger.
+    // A fresh session subscribes from its own tip: there is no history to
+    // replay, and asking for one would re-deliver its `SessionCreated`.
+    let (session_id, mut ui, from_seq, replay_through) = match options.resume {
+        Some(resume) => {
+            let snapshot = block_on(client.get_session(resume), &options.cancel).map_err(|err| match &err {
+                // The common case by far: a typo, or an id from another
+                // project (the ledger is per-project, so a real id from
+                // elsewhere is simply absent here). Every other kernel
+                // failure keeps its own diagnosis.
+                InteractiveError::Kernel(api)
+                    if api.code() == protocol::ErrorCode::SessionNotFound =>
+                {
+                    InteractiveError::UnknownSession(resume)
+                }
+                _ => err,
+            })?;
+            // Deliberately *not* seeded with the snapshot: `reduce`'s kernel
+            // path requires each event's seq to be exactly `snapshot.seq +
+            // 1`, so seeding with the current tip would make every replayed
+            // event out of order and discard the whole history — the
+            // transcript would come back empty. The replay rebuilds the
+            // projection from `SessionCreated` forward, and
+            // `drain_kernel_events`' own snapshot refresh reconciles once
+            // it has caught up.
+            // `snapshot.seq()` is the tip to replay *through*. Anything
+            // committed after this read is not history but live tail, and
+            // arrives through the ordinary drain.
+            (snapshot.id(), AppState::new(), 0, snapshot.seq())
+        }
+        None => {
+            let snapshot = block_on(
+                client.create_session(CreateSession::new(
+                    ProjectId::new(),
+                    actor.clone(),
+                    TraceId::new(),
+                )),
+                &options.cancel,
+            )?;
+            let seq = snapshot.seq();
+            let id = snapshot.id();
+            (id, reduce(AppState::new(), &UiEvent::Snapshot(snapshot)), seq, seq)
+        }
+    };
     let mut stream = block_on(
-        client.subscribe(SubscribeEvents::new(session_id, snapshot.seq())),
+        client.subscribe(SubscribeEvents::new(session_id, from_seq)),
         &options.cancel,
     )?;
-
-    let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+    if options.resume.is_some() {
+        // Fold the replayed history before the first paint, so a resumed
+        // session shows its transcript immediately instead of filling in
+        // over the next few ticks.
+        replay_history(
+            &client,
+            &mut stream,
+            &mut ui,
+            session_id,
+            replay_through,
+            &options.cancel,
+        )?;
+    }
     // Project the persisted composition-root goal into the interactive TUI so
     // the Goals route shows it (the TUI is a projection of runtime state).
     sync_persisted_goal(&mut ui, &resolved.ledger_path);
@@ -5265,6 +5509,61 @@ fn interrupt_session(
     )
 }
 
+/// Ceiling on how many replayed events a resumed session folds before its
+/// first paint.
+///
+/// A long-lived session's ledger is unbounded, and the transcript projection
+/// itself is already bounded (`AppState` caps its own entries), so replaying
+/// everything would spend startup time producing rows that are immediately
+/// dropped. Whatever is not folded here is still delivered by the ordinary
+/// `drain` on later ticks — this only bounds the *pre-paint* work, and drops
+/// nothing: the stream keeps its place, so a history longer than this budget
+/// finishes arriving over the following frames instead of all at once.
+const MAX_REPLAYED_EVENTS: usize = 4096;
+
+/// Fold a resumed session's replayed history into `ui` before the first
+/// paint.
+///
+/// Replays *through a known tip* rather than until the stream goes quiet.
+/// The subscription is fed by a worker thread, so `try_recv() == Ok(None)`
+/// means "nothing queued yet", not "history exhausted" — stopping there
+/// truncates the transcript at whatever point the worker happened to have
+/// reached, which is a race, not a bound. `through` is the session's seq as
+/// read immediately before subscribing, and waiting for it cannot hang: the
+/// ledger is append-only (nothing deletes events — even `rewind` returns a
+/// prefix *projection* without mutating the stream), so `1..=through` is
+/// still there when the worker goes looking, and the durable-gap path waits
+/// for a channel slot rather than declaring the consumer lagged, so none of
+/// those events is dropped on the way to us.
+fn replay_history(
+    client: &InProcessKernelClient,
+    stream: &mut EventStream,
+    ui: &mut AppState,
+    session_id: protocol::SessionId,
+    through: u64,
+    cancel: &CancellationToken,
+) -> Result<(), InteractiveError> {
+    for _ in 0..MAX_REPLAYED_EVENTS {
+        if stream.cursor() >= through {
+            break;
+        }
+        cancel.check().map_err(|_| InteractiveError::Cancelled)?;
+        match stream.recv() {
+            Ok(event) => *ui = reduce(ui.clone(), &UiEvent::Kernel(event)),
+            Err(err) => return Err(InteractiveError::Stream(err)),
+        }
+    }
+    // Reconcile against the authoritative snapshot the same way `drain` does
+    // once caught up — goal/agent rows come from there, not from the
+    // transcript events.
+    if let Ok(snapshot) = block_on(client.get_session(session_id), cancel)
+        && ui.snapshot().map(|current| current.seq()).unwrap_or(0) >= snapshot.seq()
+    {
+        *ui = reduce(ui.clone(), &UiEvent::Snapshot(snapshot));
+    }
+    Ok(())
+}
+
 fn drain_kernel_events(
     client: &InProcessKernelClient,
     stream: &mut EventStream,
@@ -5726,6 +6025,7 @@ impl InteractiveOptions {
             inputs: None,
             terminal: None,
             capture_render: false,
+            resume: None,
         })
     }
 }
@@ -5743,9 +6043,11 @@ impl InteractiveError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Cancelled => JsonlExitCode::Interrupted.as_i32(),
-            Self::Usage | Self::NotATty | Self::UserHomeMissing | Self::InvalidProjectRoot => {
-                JsonlExitCode::Usage.as_i32()
-            }
+            Self::Usage
+            | Self::UnknownSession(_)
+            | Self::NotATty
+            | Self::UserHomeMissing
+            | Self::InvalidProjectRoot => JsonlExitCode::Usage.as_i32(),
             Self::Config(_) => JsonlExitCode::Usage.as_i32(),
             Self::Kernel(err) => JsonlExitCode::from_api_error(err, false).as_i32(),
             Self::AlreadyActive
@@ -5765,6 +6067,9 @@ impl Display for InteractiveError {
         match self {
             Self::Cancelled => f.write_str("interactive session cancelled"),
             Self::Usage => f.write_str("usage: rapid [subcommand]"),
+            Self::UnknownSession(id) => {
+                write!(f, "rapid: no session {id} in this project")
+            }
             Self::NotATty => f.write_str("stdout is not a tty"),
             Self::AlreadyActive => f.write_str("terminal modes are already owned"),
             Self::UserHomeMissing => f.write_str("user data directory is missing"),
@@ -6521,6 +6826,7 @@ approval gap has been closed and this characterization test should be rewritten:
                 inputs: Some(inputs),
                 terminal: Some(RecordingBackend::new()),
                 capture_render: false,
+                resume: None,
             }
         }
 
@@ -8160,6 +8466,391 @@ subcommand"
             rest = &rest[end..];
         }
         assert!(named >= 4, "expected several messages to point at a real command");
+    }
+
+    #[test]
+    fn a_resumed_session_rebuilds_its_transcript_from_the_durable_ledger() {
+        // The point of resume: the work is still there. Everything this
+        // needs already existed and was unwired — `get_session` for the
+        // projection and `subscribe(id, 0)`'s replay-then-tail for the
+        // history — so this drives the real `run_interactive` twice against
+        // the same project and asserts the second run shows the first run's
+        // transcript.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+
+        // Real work, through the real turn loop: a scripted turn writes a
+        // file and answers, producing the kernel events a transcript is made
+        // of. Deliberately *not* a local slash command — `/permissions`,
+        // `/help` and friends render `TranscriptEntry::CommandOutput` from a
+        // `LocalUiEvent`, which never reaches the ledger and so cannot come
+        // back; only kernel events are durable, and that is the distinction
+        // this test exists to hold.
+        let session_id = {
+            let mut session = ScriptedSession::create(&env);
+            session.run_turn(
+                "write a note",
+                ScriptedModel::write_then_answer("resumed.md", "hi", "the earlier answer"),
+            );
+            session.session_id
+        };
+
+        let mut options = env.options_capturing_render(vec![
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]);
+        options.resume = Some(session_id);
+        let resumed = run_interactive(options).expect("resumed session");
+
+        assert_eq!(
+            resumed.session_id,
+            Some(session_id),
+            "a resumed run must stay on the session it was asked for, not create a new one"
+        );
+        let painted = resumed.rendered_output.expect("capture_render was requested");
+        assert!(
+            painted.contains("the earlier answer"),
+            "the resumed session must show the earlier run's assistant output:\n{painted}"
+        );
+        assert!(
+            painted.contains("write a note"),
+            "and the message that produced it:\n{painted}"
+        );
+    }
+
+    #[test]
+    fn a_resumed_session_does_not_replay_local_command_output() {
+        // The honest limit of resume, pinned so it is a documented property
+        // rather than a surprise: a slash command's own output is a
+        // `LocalUiEvent` and never reaches the durable ledger, so it does
+        // not come back. Only kernel events do.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let first = run_interactive(env.options(vec![
+            InteractiveInput::Submit("/permissions allow workspace_write".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("first session");
+        let session = first.session_id.expect("session id");
+
+        let mut options =
+            env.options_capturing_render(vec![InteractiveInput::Submit("/quit".to_owned())]);
+        options.resume = Some(session);
+        let resumed = run_interactive(options).expect("resumed");
+        let painted = resumed.rendered_output.expect("capture_render was requested");
+        assert!(
+            !painted.contains("allow=workspace_write"),
+            "local command output is session-local by design and must not appear to persist:\n{painted}"
+        );
+        // The grant itself is durable — it is the *transcript line* that is not.
+        let canonical = fs::canonicalize(&env.project).expect("canonicalize");
+        assert!(!persisted_grants_for(&canonical, &env.user_home).is_empty());
+    }
+
+    #[test]
+    fn resuming_does_not_create_a_new_session() {
+        // The ledger is the product's memory; a "resume" that quietly
+        // started a fresh session would look like it worked and lose
+        // everything.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let first = run_interactive(env.options(vec![InteractiveInput::Submit(
+            "/quit".to_owned(),
+        )]))
+        .expect("first session");
+        let session = first.session_id.expect("session id");
+
+        let ledger_path = env.project.join(PROJECT_MARKER).join(LEDGER_NAME);
+        let sessions_after_first = recorded_sessions(&ledger_path);
+        assert_eq!(sessions_after_first, 1);
+
+        let mut options = env.options(vec![InteractiveInput::Submit("/quit".to_owned())]);
+        options.resume = Some(session);
+        run_interactive(options).expect("resumed");
+
+        assert_eq!(
+            recorded_sessions(&ledger_path),
+            sessions_after_first,
+            "resuming must not add a session to the ledger"
+        );
+    }
+
+    #[test]
+    fn resuming_an_unknown_session_fails_rather_than_starting_a_fresh_one() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        // Make the ledger exist without the session being in it.
+        run_interactive(env.options(vec![InteractiveInput::Submit("/quit".to_owned())]))
+            .expect("first session");
+
+        let mut options = env.options(vec![InteractiveInput::Submit("/quit".to_owned())]);
+        options.resume = Some("01234567-89ab-7cde-89ab-0123456789ab".parse().expect("id"));
+        let err = run_interactive(options)
+            .expect_err("an unknown session must be an error, never a silent new session");
+        assert!(
+            matches!(err, InteractiveError::UnknownSession(_)),
+            "and must say so in its own terms rather than leaking a protocol error: {err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("no session") && rendered.contains("0123456789ab"),
+            "the message must name the problem and the id asked for: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_ledger_row_is_neither_offered_nor_printed_verbatim() {
+        // `.rapidlm/ledger.sqlite` belongs to the project, and a project is
+        // only as trustworthy as its trust record says. Two properties: a row
+        // whose id `rapid resume` could not accept is not offered as one to
+        // try, and nothing from the row reaches stderr as an escape sequence.
+        use event_ledger::ledger::SessionSummary;
+
+        let good = "01a08600-0000-7000-8000-0123456789ab";
+        let sessions = vec![
+            SessionSummary {
+                session_id: good.to_owned(),
+                last_seq: 3,
+                first_seen: "2026-09-09T10:00:00.000Z".to_owned(),
+                last_activity: "2026-09-09T10:00:00.000Z".to_owned(),
+            },
+            SessionSummary {
+                // Not an id at all, and carrying a cursor-moving escape.
+                session_id: "\u{1b}[2Jnot-an-id".to_owned(),
+                last_seq: 9,
+                first_seen: "2026-09-09T11:00:00.000Z".to_owned(),
+                // Newest, so it sorts first and would print first.
+                last_activity: "2026-09-09T12:00:00.000Z".to_owned(),
+            },
+        ];
+        let hint = hint_lines(sessions).expect("the good row is still offered");
+        assert!(hint.contains(good), "the usable id must be offered: {hint}");
+        assert!(
+            !hint.contains("not-an-id"),
+            "an id resume could not accept must not be offered: {hint}"
+        );
+        assert!(
+            !hint.contains('\u{1b}'),
+            "no escape sequence may reach the terminal: {hint:?}"
+        );
+    }
+
+    #[test]
+    fn a_stored_timestamp_cannot_smuggle_an_escape_sequence_to_the_terminal() {
+        use event_ledger::ledger::SessionSummary;
+
+        let hint = hint_lines(vec![SessionSummary {
+            session_id: "01a08600-0000-7000-8000-0123456789ab".to_owned(),
+            last_seq: 1,
+            first_seen: "2026-09-09T10:00:00.000Z".to_owned(),
+            last_activity: "2026\u{1b}[31m-09-09".to_owned(),
+        }])
+        .expect("a usable row");
+        assert!(
+            !hint.contains('\u{1b}'),
+            "the timestamp is stored data too: {hint:?}"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_newest_row_does_not_hide_a_resumable_older_one() {
+        // Bare `rapid resume` takes the maximum of what it can *use*. Taking
+        // the newest row and parsing afterwards would answer "no session has
+        // been recorded in this project yet" while several resumable ones sit
+        // behind the bad one.
+        use event_ledger::ledger::SessionSummary;
+
+        let good = "01a08600-0000-7000-8000-0123456789ab";
+        let sessions = vec![
+            SessionSummary {
+                session_id: good.to_owned(),
+                last_seq: 3,
+                first_seen: "2026-09-09T10:00:00.000Z".to_owned(),
+                last_activity: "2026-09-09T10:00:00.000Z".to_owned(),
+            },
+            SessionSummary {
+                session_id: "not-an-id".to_owned(),
+                last_seq: 9,
+                first_seen: "2026-09-09T11:00:00.000Z".to_owned(),
+                // Newest by activity, so a parse-last implementation stops here.
+                last_activity: "2026-09-09T12:00:00.000Z".to_owned(),
+            },
+        ];
+        assert_eq!(
+            newest_usable(sessions),
+            Some(good.parse().expect("fixture id")),
+            "the newest *usable* session must win over a newer unusable row"
+        );
+        assert_eq!(newest_usable(Vec::new()), None);
+    }
+
+    #[test]
+    fn an_unknown_session_id_offers_the_ids_this_project_does_have() {
+        // The one thing a user in this position needs is the id they meant.
+        // `rapid sessions list` cannot supply it — it reads a different
+        // database (`.rapidlm/sessions.sqlite`) than interactive sessions are
+        // recorded in — so resume answers the question itself.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let ledger_path = env.project.join(PROJECT_MARKER).join(LEDGER_NAME);
+        assert!(
+            known_sessions_hint(&ledger_path).is_none(),
+            "a project with nothing recorded has nothing to offer"
+        );
+
+        let real = run_interactive(env.options(vec![InteractiveInput::Submit(
+            "/quit".to_owned(),
+        )]))
+        .expect("a session")
+        .session_id
+        .expect("id");
+        let hint = known_sessions_hint(&ledger_path).expect("a recorded session to offer");
+        assert!(
+            hint.contains(&real.to_string()),
+            "the hint must contain the id that is actually here: {hint}"
+        );
+        assert!(
+            hint.contains("last activity"),
+            "and enough context to pick between several: {hint}"
+        );
+    }
+
+    #[test]
+    fn replaying_history_consumes_every_durable_event_before_the_first_paint() {
+        // The subscription is fed by a worker thread, so an empty queue means
+        // "not yet", not "no more". Replay must therefore run to a known tip
+        // rather than until the stream first goes quiet, or a resumed
+        // transcript is silently truncated wherever the worker happened to
+        // be — a race that shows a *plausible* partial history, which is
+        // worse than an obvious failure.
+        //
+        // The history here is deliberately far longer than the subscription's
+        // live bound (`event_ledger::subscription::DEFAULT_LIVE_BOUND`, 64),
+        // so the worker cannot have queued it all before the first poll and
+        // must refill mid-replay.
+        const HISTORY: usize = 512;
+
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let session_id = session.session_id;
+        let ledger_path = env.project.join(PROJECT_MARKER).join(LEDGER_NAME);
+        let actor = human_actor().expect("actor");
+
+        let ledger = event_ledger::ledger::EventLedger::open(&ledger_path).expect("open ledger");
+        let ledger_cancel = event_ledger::ledger::CancellationToken::new();
+        for i in 0..HISTORY {
+            ledger
+                .append(
+                    session_id,
+                    actor.clone(),
+                    // Inert in both the kernel projection and the TUI
+                    // reducer, so this measures replay transport and nothing
+                    // else.
+                    event_ledger::event::EventKind::ModelRequested,
+                    serde_json::json!({"n": i}),
+                    &event_ledger::ledger::AppendOptions {
+                        redaction: protocol::RedactionClass::Public,
+                        trace_id: TraceId::new(),
+                        expected_seq: None,
+                    },
+                    &ledger_cancel,
+                )
+                .expect("append history");
+        }
+
+        let cancel = CancellationToken::new();
+        let client = InProcessKernelClient::open(&ledger_path).expect("client");
+        let tip = block_on(client.get_session(session_id), &cancel)
+            .expect("session")
+            .seq();
+        assert!(
+            tip as usize > HISTORY,
+            "the fixture must actually have a long history"
+        );
+        let mut stream = block_on(
+            client.subscribe(SubscribeEvents::new(session_id, 0)),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = AppState::new();
+        replay_history(&client, &mut stream, &mut ui, session_id, tip, &cancel)
+            .expect("replay");
+
+        assert!(
+            stream.cursor() >= tip,
+            "replay stopped at {} of {tip} durable events — a resumed session \
+             would paint a truncated transcript",
+            stream.cursor()
+        );
+    }
+
+    #[test]
+    fn a_project_can_be_opened_again_after_a_session_ends() {
+        // The most ordinary thing a user does: run `rapid`, quit, run it
+        // again. The second run must get its own session rather than
+        // colliding with the first one's records.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let first = run_interactive(env.options(vec![InteractiveInput::Submit(
+            "/quit".to_owned(),
+        )]))
+        .expect("first run")
+        .session_id
+        .expect("id");
+        let second = run_interactive(env.options(vec![InteractiveInput::Submit(
+            "/quit".to_owned(),
+        )]))
+        .expect("running rapid a second time in the same project must work")
+        .session_id
+        .expect("id");
+        assert_ne!(first, second, "each run gets its own session");
+    }
+
+    #[test]
+    fn the_most_recent_session_is_chosen_by_activity_not_creation() {
+        // `rapid resume` with no id means "where I left off". A session
+        // created yesterday and worked in today is the one a user means, so
+        // the default reads `last_activity`, not creation order.
+        //
+        // "Activity" is deliberately what was *recorded*, not what was
+        // opened: resuming a session to look at it writes nothing to the
+        // ledger, so reading history never rewrites it.
+        let env = TempEnv::create();
+        let ledger_path = env.project.join(PROJECT_MARKER).join(LEDGER_NAME);
+        assert!(
+            most_recent_session(&ledger_path)
+                .expect("no ledger is not an error")
+                .is_none(),
+            "a project with no ledger has no session to resume"
+        );
+
+        let mut older = ScriptedSession::create(&env);
+        older.run_turn("first", ScriptedModel::terminal("in the older session"));
+        let mut newer = ScriptedSession::create(&env);
+        newer.run_turn("second", ScriptedModel::terminal("in the newer session"));
+        assert_ne!(older.session_id, newer.session_id);
+        assert_eq!(
+            most_recent_session(&ledger_path).expect("summaries"),
+            Some(newer.session_id),
+            "with both freshly worked in, the newest activity wins"
+        );
+
+        // Now work in the *older* session again: it becomes the one to
+        // resume, even though the other was created later.
+        older.run_turn("back to the first", ScriptedModel::terminal("later work"));
+        assert_eq!(
+            most_recent_session(&ledger_path).expect("summaries"),
+            Some(older.session_id),
+            "the session most recently worked in must win over the one created last"
+        );
+    }
+
+    /// Sessions recorded in a project's ledger.
+    fn recorded_sessions(ledger_path: &Path) -> usize {
+        event_ledger::ledger::EventLedger::open(ledger_path)
+            .expect("ledger")
+            .list_sessions(&event_ledger::ledger::CancellationToken::new())
+            .expect("summaries")
+            .len()
     }
 
     #[test]
@@ -9854,6 +10545,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             inputs: None,
             terminal: None,
             capture_render: false,
+            resume: None,
         };
         let resolved = resolve_project(&options).expect("resolve");
         assert_eq!(

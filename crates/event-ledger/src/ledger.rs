@@ -119,6 +119,12 @@ pub struct SessionSummary {
     pub session_id: String,
     pub last_seq: u64,
     pub first_seen: String,
+    /// `recorded_at` of this session's most recent event.
+    ///
+    /// Distinct from [`Self::first_seen`], and the one a "resume where I
+    /// left off" default needs: a session created yesterday and worked in
+    /// today is the one a user means, not whichever was created last.
+    pub last_activity: String,
 }
 
 impl EventLedger {
@@ -279,7 +285,10 @@ impl EventLedger {
         cancel.check()?;
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT session_id, COALESCE(MAX(seq),0), MIN(recorded_at)
+            // Ordering is unchanged (`MIN(recorded_at)`, oldest first) so
+            // `rapid sessions list` reads the same; `last_activity` is a new
+            // column, not a new sort.
+            "SELECT session_id, COALESCE(MAX(seq),0), MIN(recorded_at), MAX(recorded_at)
              FROM events GROUP BY session_id ORDER BY MIN(recorded_at)",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -287,15 +296,17 @@ impl EventLedger {
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (session_id, last_seq, first_seen) = row?;
+            let (session_id, last_seq, first_seen, last_activity) = row?;
             out.push(SessionSummary {
                 session_id,
                 last_seq: last_seq.max(0) as u64,
                 first_seen,
+                last_activity,
             });
         }
         drop(stmt);

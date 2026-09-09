@@ -5,6 +5,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 > **What the binary actually dispatches today** (everything else in the table below is
 > roadmap, not shipped behavior): `exec`, `trust`, `goal`, `mcp`, `doctor`, `plugins`,
 > `agents`, `cron`, `scan`, `findings`, `sessions`, `inspect-export`, `insights`, `permissions`,
+> `resume`,
 > `playbook-compile`, `agent-cli`, `mcp-tools`, `tools`, `release-manifest`,
 > `completions`, `man`. Those names are checked against the one table in source
 > (`interactive::SUBCOMMANDS`) by
@@ -20,7 +21,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 | `rapid exec [--verbose] <prompt>` | one-shot/headless task (uses the configured model; workspace file tools behind project trust, cause-classified failures; see [model-configuration.md](model-configuration.md) and the exec section below) |
 | `rapid run <goal/playbook>` | durable graph run |
 | `rapid goal create|show|pause|resume|cancel|complete|budget|verify|evidence|claim` | goal lifecycle; `goal evidence record` citations resolve against the session ledger; `goal complete` is gated on the evidence store; `goal claim --summary S --check crit=cmd [--timeout-secs N]` runs deterministic checks for real, cites each run in the ledger, and only accepts when the host supervisor verifies every criterion |
-| `rapid resume [session/run]` | resume durable session/run |
+| `rapid resume [session-id]` | reopen the TUI on an existing session, rebuilt from this project's event ledger; with no id, the session with the most recent activity |
 | `rapid fork [checkpoint]` | non-destructive branch |
 | `rapid rewind` | restore/fork conversation/graph/workspace checkpoint |
 | `rapid daemon` | durable local kernel service |

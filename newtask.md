@@ -6851,6 +6851,122 @@ running on the same machine at the time. It passes in isolation, as a whole crat
 workspace re-run. Same pattern as the `context_retrieval`/`goal_host` flakes already recorded above — the
 practical rule stands: re-run serially before believing a failure.
 
+**`rapid resume` — the roadmap's "resume durable session/run" is real for interactive sessions, done
+2026-09-09.**
+
+**The gap.** Every interactive session's events were already durable — `KernelRuntime` writes
+`.rapidlm/ledger.sqlite` and the kernel's own `subscribe(session, from_seq)` replays a session's history
+before tailing live commits — but nothing ever asked for that replay. Quitting the TUI abandoned the
+transcript: the ledger kept every event and no command could reopen one. `docs/reference/cli-command-
+reference.md` listed `rapid resume [session/run]` as target grammar, and `interactive::SUBCOMMANDS` had
+no `resume` entry, so the binary answered `rapid: unknown subcommand 'resume'`.
+
+**What shipped.** `rapid resume [session-id]` reopens the TUI on an existing session. `InteractiveOptions`
+gains `resume: Option<SessionId>`; the bootstrap in `run_started_session` branches on it, and the two
+halves differ in exactly one way — a fresh session creates and subscribes from its own tip, a resumed one
+reads `get_session(id)` and subscribes from 0 so the kernel replays. Everything downstream (the drain
+loop, snapshot reconciliation, `sync_persisted_goal`, the terminal guard, the whole `SessionLoop`) is
+shared, not duplicated.
+
+**Two things the implementation had to get right, both of which the first attempt got wrong.**
+
+1. **`AppState` must *not* be seeded with the snapshot on the resume path.** `reduce`'s kernel arm folds
+   through `kernel::session::projection::apply_next`, which requires each event's seq to be exactly
+   `snapshot.seq + 1`. Seeding with the session's current tip and then replaying from 1 makes every
+   replayed event a `SeqGap`, each swallowed by `reduce`'s `record_error` — the transcript comes back
+   empty and nothing reports a failure. The resumed state therefore starts at `AppState::new()` and is
+   rebuilt from `SessionCreated` forward, which is also why replay must start at seq 0 and cannot be
+   windowed to the last N events: `apply_first` rejects any first event that is not seq 1.
+2. **`try_recv() == Ok(None)` does not mean "history exhausted".** `EventStream` is fed by a worker
+   thread (`ledger-sub-<session>`); `try_recv` is a non-blocking poll of a `sync_channel(64)`, so an
+   empty queue means "nothing queued *yet*". The first `replay_history` polled until the first gap, which
+   truncated the resumed transcript at whatever point the worker happened to have reached — a race that
+   paints a *plausible* partial history, which is worse than an obvious failure. Replay now runs to a
+   known tip (`get_session(id).seq()`, read before subscribing) with the blocking `recv`, which is safe
+   because the durable-gap path (`enqueue_replay`) waits for a channel slot rather than declaring the
+   consumer lagged: every event in `1..=through` is guaranteed to arrive, so `recv` cannot block on one
+   that never will. `MAX_REPLAYED_EVENTS` bounds only pre-paint work and drops nothing — the stream keeps
+   its place, so a longer history finishes arriving over the following frames.
+
+**The test for that race had to be rebuilt to be worth anything.** The end-to-end resume test caught the
+truncation on its first run, but the revert cycle showed the broken implementation passing **7 of 8
+runs**: a 12%-effective guard is not a guard. `replaying_history_consumes_every_durable_event_before_the_
+first_paint` now appends 512 events directly to the ledger — far more than the 64-slot live bound, so the
+worker cannot have queued them before the first poll and must refill mid-replay — and asserts
+`stream.cursor() >= tip`. Against the broken version it reports `replay stopped at 0 of 513`, every run.
+
+**Two supporting changes.**
+
+- `SessionSummary` gains `last_activity` (`MAX(recorded_at)` beside the existing `MIN(recorded_at)`
+  `first_seen`). Bare `rapid resume` means "where I left off", and a session created yesterday and worked
+  in today is the one a user means. The listing's own `ORDER BY MIN(recorded_at)` is deliberately
+  unchanged so `rapid sessions list` reads exactly as before — a new column, not a new sort.
+- An unknown id is `InteractiveError::UnknownSession(id)`, not a raw `ApiError` with a trace id, and
+  `run_resume_command` answers it by listing the ids that *are* recorded here (most recent first, capped
+  at 10). Only `SessionNotFound` is mapped; every other kernel failure keeps its own diagnosis.
+
+**Self-review found two more, both in the code that reads those rows back.** The hint printed
+`summary.session_id` and `summary.last_activity` straight to stderr — stored strings from
+`.rapidlm/ledger.sqlite`, which belongs to the project and is therefore exactly as trustworthy as the
+project. An escape sequence in a crafted ledger would have been interpreted by the terminal rather than
+shown. `hint_lines` now offers only rows whose id actually parses (an id `rapid resume` could not accept
+is not one to suggest) and renders each in canonical form, with the timestamp filtered through
+`printable` on `mcp_config::label`'s precedent. Separately, `most_recent_session` took the newest row and
+parsed it *afterwards*, so one corrupt row would report "no session has been recorded in this project
+yet" with resumable sessions sitting behind it; `newest_usable` parses first and takes the maximum of
+what is usable. Both rendering decisions were pulled into pure functions over `Vec<SessionSummary>`
+precisely so a corrupt row could be tested at all — the ledger API is typed and cannot write one.
+
+**Found while writing that message, and deliberately not fixed here: `rapid sessions list` cannot see
+interactive sessions.** It reads `.rapidlm/sessions.sqlite` (`p9_commands.rs:720`, also cron's store and
+the goal-evidence ledger `SESSIONS_DB_FILE`), while every interactive session is written to
+`.rapidlm/ledger.sqlite` (`LEDGER_NAME`, the only path `KernelRuntime::new` is ever given). Two databases
+under one directory, and the command named after sessions reads the one sessions are not in. This is the
+same defect class as the rest of this document — two things that drifted with no test spanning them —
+and it is why `resume`'s guidance does not point at `rapid sessions list`: sending a confused user to a
+command that will print nothing is worse than printing nothing. Unifying them is the next task and is
+larger than it looks: it touches cron rows, goal-claim audit appends and evidence citations, and needs a
+decision about existing `.rapidlm/ledger.sqlite` data.
+
+**Two more things this found, both fixed.**
+
+- `the_most_recent_session_is_chosen_by_activity_not_creation` had **lost its `#[test]` attribute** during
+  an edit and had been silently not running. A revert cycle caught it (the deliberately broken code
+  "passed"); a workspace-wide audit for no-argument test-module functions with no attribute above them
+  found no others.
+- The first draft of the activity test asserted that *opening* a session bumps its activity. It does not,
+  by design: resuming records nothing, so reading history never rewrites it. The test now does real work
+  through `ScriptedSession` in each session instead — which is also the honest statement of the property.
+
+**Deliberate limits, both pinned by tests rather than left as surprises.** A slash command's own output
+(`/permissions`, `/help`) is a `LocalUiEvent` and never reaches the ledger, so it does not come back on
+resume — only kernel events do (`a_resumed_session_does_not_replay_local_command_output` asserts the
+grant itself *is* durable while the transcript line is not). And `resume` covers sessions, not the
+roadmap's "run" half; the reference doc now says `rapid resume [session-id]` rather than
+`[session/run]`, so the row describes what the binary does.
+
+**A papercut confirmed pre-existing and left alone.** Every usage error prints its own precise message and
+then `usage: rapid [subcommand]`, because `main` renders the returned `InteractiveError::Usage` after the
+handler has already said something specific. Verified identical for `mcp`, `trust` and `permissions`, so
+it is not something `resume` introduced. The fix is not a one-liner — `Usage` is also returned from paths
+that print nothing, so suppressing its Display needs an audit of every producer — and it is unrelated to
+this change.
+
+**Tests.** Seven new: transcript rebuilt from the ledger through the real `run_interactive`; local output
+not replayed; the resumed run stays on the session it was given; an unknown id fails rather than starting
+a fresh session, with a message naming the id; the hint lists ids actually present; most-recent-activity
+ordering; complete-replay-to-tip with a 512-event history; plus
+`a_project_can_be_opened_again_after_a_session_ends`, which pins the most ordinary thing a user does
+(run `rapid`, quit, run it again) after an `AlreadyActive` failure during development turned out to be a
+missing terminal lock in the test rather than a product defect; and three for the self-review findings
+(a corrupt row is neither offered nor printed verbatim, a stored timestamp cannot smuggle an escape
+sequence, a corrupt newest row does not hide a resumable older one). 669 `rapid` lib tests, up from 658.
+Nine revert cycles (72-80). One forced the test rewrite described above; one exposed the missing
+`#[test]`; and one initially "passed" because the break substituted a fresh id rather than printing the
+stored one — redone precisely so the broken code actually reproduced the defect.
+`cargo clippy -p rapid -p event-ledger --all-targets` produces a byte-identical warning set to the
+pre-change baseline; full `cargo test --workspace` green.
+
 ## DECIDED (2026-09-08, option C) — the interactive TUI cannot ask for approval, so out of the box it can only read
 
 **Found 2026-09-08 while scoping the missing approval broker. This is the largest gap found in this
