@@ -7044,6 +7044,55 @@ to, and the test asserts that difference in both directions.
 Verified with the built binary as well as in tests: three listings in a fresh directory now leave
 `find .rapidlm` empty, and `cron add` still creates the store.
 
+**`rapid --help` documented an invocation the parser rejects, and now it cannot, done 2026-09-09.**
+
+**The gap.** `rapid --help` advertised `rapid inspect-export <session>`. The parser requires *two*
+positionals (`<session> <out-path>`), so the documented invocation could only ever fail — with
+``usage: see `rapid --help` ``, sending the reader back to the help they had just followed. `rapid man`
+was worse: it prints name and summary only, so it never mentioned operands at all. Found while checking
+whether `inspect-export` and `insights` produce real output after the ledger unification; both do, and
+the existing tests always passed two positionals, so the defect had no behavioral symptom — the *help*
+was the only thing that was wrong, and nothing checked it.
+
+**Same defect class as the rest of this document, one surface further out.** Operand text lived only
+inside a hand-typed `CLI_USAGE` string, beside a `SUBCOMMANDS` table holding names and summaries — and
+the two summaries had already drifted apart (the table said "run one agent turn" where the help said
+"one-shot/headless agent turn"). Three renderings of one fact, one of them wrong.
+
+**`Subcommand` gains `operands`, and all three surfaces are rendered from it.** `CLI_USAGE` is now a
+`LazyLock<String>` built from `SUBCOMMANDS` (the `CATALOG`/`CATALOG_HELP` precedent, applied to the CLI),
+`rapid <name> --help` prints `usage: rapid <name> <operands>` followed by the summary, and `rapid man`
+includes the operands. There is no second list left to drift, and the thirteen summaries that duplicated
+their own operand alternatives ("...(list/get/add/remove/probe)") were trimmed, since the alternatives
+are now printed beside them.
+
+**Rendering rules, both learned from the `/help` work.** Summaries align at a fixed column, and an
+invocation too long for it (`rapid goal`'s eleven alternatives) carries its summary on the next line
+rather than pushing it past the terminal width, where wrapping would break the alignment of everything
+below. An entry that reaches within one column of the summary wraps too, because a single space reads as
+part of the invocation. Seven summaries were shortened to fit inside 80 columns.
+
+**Tests.** Four new. Two are tripwires that hold the property rather than the instance: no summary may be
+what pushes a line past 80 columns (stated as a rule about *placement*, so a genuinely long invocation
+needs no exemption — there is no named-command allowlist), and every entry's operand text must actually
+reach the help. One pins the specific defect: the help must name both positionals. The fourth is
+behavioral and binds the two together — it reads the *published* operand text, asserts it declares two
+positionals, runs exactly that invocation through `run_inspect_export` and requires it to succeed, then
+runs the one-positional form the help used to advertise and requires it to be a usage error.
+
+The existing `cli_usage_lists_exactly_the_dispatched_subcommands` needed teaching about wrapped summary
+lines, and was extended rather than loosened: a non-entry line must be fully indented to the summary
+column *and* follow an entry, so prose still cannot hide in the block. A revert cycle injected
+`  see also: rapid daemon` into the rendered help and confirmed it is still caught.
+
+Three revert cycles (87-89). 682 `rapid` lib tests, clippy identical to the pre-session baseline, full
+`cargo test --workspace` green. Verified with the built binary on all three surfaces.
+
+**Checked and found accurate, so left alone:** `insights <session>`, `playbook-compile <file.json>` and
+`release-manifest <version> <artifact>...` all match their parsers' operand counts. The mode-list entries
+(`trust`, `cron`, `findings`, ...) name their modes but not each mode's own operands, which is what the
+help's own closing sentence promises ("the rest with a one-line summary") rather than a false claim.
+
 **Option C implemented: a project has one event ledger, done 2026-09-09.**
 
 **Resolution is pure, and that is what actually fixes the defect.** `project_ledger_path(marker_dir)`

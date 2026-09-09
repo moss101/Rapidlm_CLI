@@ -9,6 +9,7 @@ use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -254,38 +255,61 @@ pub fn classify_launch<S: AsRef<str>>(args: &[S]) -> LaunchMode {
 /// `--help` that names a command the binary cannot run is simply wrong.
 /// `cli_usage_lists_exactly_the_dispatched_subcommands` keeps this list and
 /// the table in step in both directions.
-pub const CLI_USAGE: &str = "\
-usage: rapid [subcommand]
+/// `rapid --help`.
+///
+/// The command list is *derived* from [`SUBCOMMANDS`], not typed beside it.
+/// It used to be a hand-written block, and it drifted from the table it
+/// describes in every way a second list can: names that were dispatched but
+/// undocumented, a `rapid goal … budget …` arm that never existed, and an
+/// operand count (`rapid inspect-export <session>`) that documented an
+/// invocation the parser rejects. Rendering removes the class of defect
+/// rather than the instances.
+pub static CLI_USAGE: LazyLock<String> = LazyLock::new(|| {
+    let mut out = String::from(
+        "usage: rapid [subcommand]\n\n\
+         With no subcommand, rapid starts the interactive TUI in the current project.\n\n\
+         Commands:\n",
+    );
+    for entry in SUBCOMMANDS {
+        out.push_str(&render_subcommand_line(entry));
+    }
+    out.push_str(
+        "\nEvery command above answers `--help`; four of them (exec, trust, mcp, doctor)\n\
+         with full usage, the rest with a one-line summary.\n",
+    );
+    out
+});
 
-With no subcommand, rapid starts the interactive TUI in the current project.
+/// Column the summaries start at in [`CLI_USAGE`], chosen so the common
+/// entries align inside an 80-column terminal.
+const SUBCOMMAND_SUMMARY_COLUMN: usize = 34;
 
-Commands:
-  rapid exec <prompt>           one-shot/headless agent turn
-  rapid resume [session-id]     reopen the TUI on an existing session
-  rapid trust grant|status|revoke   explicit project-trust control plane
-  rapid goal create|replace|show|pause|resume|cancel|complete|claim|export|verify|evidence
-  rapid mcp list|get|add|remove|probe   project MCP servers (stdio)
-  rapid permissions list|allow|revoke   persisted per-project tool grants
-  rapid doctor                  environment/config/model/trust/sandbox diagnosis
-  rapid plugins validate|register|list|approve|reject|hook-test
-  rapid agents list|validate|scaffold   project agent definitions
-  rapid cron add|list|remove|poll   durable prompt cron (claim-lease firing)
-  rapid scan                    run the configured external scanners
-  rapid findings list|dismiss   persisted scanner findings
-  rapid sessions list|search    session projection over the event ledger
-  rapid inspect-export <session>   export a session's event ledger
-  rapid insights <session>      session insights projection
-  rapid playbook-compile <file.json>   compile a playbook into a graph
-  rapid agent-cli <prompt> -- argv...   one supervised external CLI agent turn
-  rapid mcp-tools               published RapidLM MCP server surface
-  rapid tools                   model-facing tool surface as typed JSON schemas
-  rapid release-manifest <version> <artifact>...   emit a release manifest of digests
-  rapid completions bash|zsh|fish
-  rapid man
-
-Every command above answers `--help`; four of them (exec, trust, mcp, doctor)
-with full usage, the rest with a one-line summary.
-";
+/// One `rapid --help` line: `  rapid <name> <operands>` padded to
+/// [`SUBCOMMAND_SUMMARY_COLUMN`], then the summary.
+///
+/// An invocation too long for the column (`rapid goal`'s eleven
+/// alternatives) puts its summary on the following line rather than pushing
+/// it past the terminal's width, where wrapping would break the alignment
+/// for everything after it — the same reason `/help`'s availability marker
+/// is a leading prefix rather than a trailing one.
+fn render_subcommand_line(entry: &Subcommand) -> String {
+    let invocation = if entry.operands.is_empty() {
+        format!("  rapid {}", entry.name)
+    } else {
+        format!("  rapid {} {}", entry.name, entry.operands)
+    };
+    // A single space would read as part of the invocation, so an entry that
+    // reaches within one column of the summary wraps instead.
+    if invocation.len() + 2 <= SUBCOMMAND_SUMMARY_COLUMN {
+        let padding = SUBCOMMAND_SUMMARY_COLUMN - invocation.len();
+        format!("{invocation}{:padding$}{}\n", "", entry.summary)
+    } else {
+        format!(
+            "{invocation}\n{:SUBCOMMAND_SUMMARY_COLUMN$}{}\n",
+            "", entry.summary
+        )
+    }
+}
 
 /// Exec-specific usage, printed by `rapid exec --help` and on exec usage
 /// errors. Documents the prompt argument, the exec flags, and the env vars
@@ -362,7 +386,7 @@ pub fn run() -> Result<i32, InteractiveError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match classify_launch(&args) {
         LaunchMode::Help => {
-            print!("{CLI_USAGE}");
+            print!("{}", *CLI_USAGE);
             Ok(0)
         }
         LaunchMode::Interactive => {
@@ -490,6 +514,16 @@ enum SubcommandHandler {
 /// `rapid completions` and `rapid man` print, and the handler that runs it.
 pub(crate) struct Subcommand {
     pub(crate) name: &'static str,
+    /// What this command takes after its name, exactly as a user must type
+    /// it: `<required>`, `[optional]`, `a|b|c` alternatives, or empty.
+    ///
+    /// Lives in the table because it was previously typed by hand into
+    /// `CLI_USAGE` alone, and drifted: the help advertised `rapid
+    /// inspect-export <session>` while the parser required a second
+    /// positional, so the documented invocation could only ever fail — with
+    /// an error pointing back at the same help. `CLI_USAGE`, `rapid
+    /// <name> --help` and `rapid man` are all rendered from this now.
+    pub(crate) operands: &'static str,
     pub(crate) summary: &'static str,
     /// Whether the handler recognises `--help`/`-h` itself. For the rest,
     /// [`run_subcommand`] answers centrally with the summary — `CLI_USAGE`
@@ -518,132 +552,154 @@ pub(crate) struct Subcommand {
 pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
     Subcommand {
         name: "exec",
-        summary: "run one agent turn",
+        operands: "<prompt>",
+        summary: "one-shot/headless agent turn",
         own_help: true,
         handler: SubcommandHandler::Native(exec_subcommand),
     },
     Subcommand {
         name: "trust",
-        summary: "explicit project-trust control plane (grant/status/revoke)",
+        operands: "grant|status|revoke",
+        summary: "explicit project-trust control plane",
         own_help: true,
         handler: SubcommandHandler::Native(run_trust_command),
     },
     Subcommand {
         name: "resume",
-        summary: "reopen the TUI on an existing session, rebuilt from the event ledger",
+        operands: "[session-id]",
+        summary: "reopen the TUI on an existing session",
         own_help: true,
         handler: SubcommandHandler::Native(run_resume_command),
     },
     Subcommand {
         name: "goal",
-        summary: "durable goal lifecycle: create/replace/show/pause/resume/cancel/complete/claim/export/verify/evidence",
+        operands: "create|replace|show|pause|resume|cancel|complete|claim|export|verify|evidence",
+        summary: "durable goal lifecycle",
         own_help: false,
         handler: SubcommandHandler::Native(run_goal_command),
     },
     Subcommand {
         name: "playbook-compile",
-        summary: "compile a playbook JSON template into an initial graph",
+        operands: "<file.json>",
+        summary: "compile a playbook into a graph",
         own_help: false,
         handler: SubcommandHandler::P9(crate::p9_commands::run_playbook_compile),
     },
     Subcommand {
         name: "mcp",
-        summary: "project MCP servers (list/get/add/remove/probe)",
+        operands: "list|get|add|remove|probe",
+        summary: "project MCP servers (stdio)",
         own_help: true,
         handler: SubcommandHandler::P9(crate::p9_commands::run_mcp),
     },
     Subcommand {
         name: "mcp-tools",
-        summary: "print the published RapidLM MCP server surface",
+        operands: "",
+        summary: "the published RapidLM MCP server surface",
         own_help: false,
         handler: SubcommandHandler::P9(crate::p9_commands::run_mcp_tools),
     },
     Subcommand {
         name: "tools",
-        summary: "dump the model-facing tool surface's typed JSON schemas",
+        operands: "",
+        summary: "model-facing tool surface as JSON schemas",
         own_help: false,
         handler: SubcommandHandler::P9(crate::p9_commands::run_tools_schema),
     },
     Subcommand {
         name: "agent-cli",
-        summary: "one supervised external CLI agent turn: <prompt> -- argv...",
+        operands: "<prompt> -- argv...",
+        summary: "one supervised external CLI agent turn",
         own_help: false,
         handler: SubcommandHandler::P9(crate::p9_commands::run_agent_cli),
     },
     Subcommand {
         name: "permissions",
-        summary: "persisted per-project tool grants (list/allow/revoke)",
+        operands: "list|allow|revoke",
+        summary: "persisted per-project tool grants",
         own_help: true,
         handler: SubcommandHandler::P9(crate::p9_commands::run_permissions),
     },
     Subcommand {
         name: "doctor",
-        summary: "diagnose config/model/trust/sandbox health (offline, read-only)",
+        operands: "",
+        summary: "config/model/trust/sandbox diagnosis (offline)",
         own_help: true,
         handler: SubcommandHandler::P9(crate::p9_commands::run_doctor),
     },
     Subcommand {
         name: "sessions",
-        summary: "list or search sessions",
+        operands: "list|search",
+        summary: "session projection over the event ledger",
         own_help: false,
         handler: SubcommandHandler::P9(crate::p9_commands::run_sessions),
     },
     Subcommand {
         name: "inspect-export",
-        summary: "export a session's event ledger (--format jsonl|md|html)",
+        operands: "<session> <out-path> [--format jsonl|md|html]",
+        summary: "export a session's event ledger",
         own_help: false,
         handler: SubcommandHandler::P9(crate::p9_commands::run_inspect_export),
     },
     Subcommand {
         name: "insights",
+        operands: "<session>",
         summary: "report a session's insights projection",
         own_help: false,
         handler: SubcommandHandler::P9(crate::p9_commands::run_insights),
     },
     Subcommand {
         name: "cron",
-        summary: "durable prompt cron (add/list/remove/poll)",
+        operands: "add|list|remove|poll",
+        summary: "durable prompt cron (claim-lease firing)",
         own_help: false,
         handler: SubcommandHandler::P9(crate::p9_commands::run_cron),
     },
     Subcommand {
         name: "scan",
-        summary: "run the configured external scanners over the project",
+        operands: "",
+        summary: "run the configured external scanners",
         own_help: false,
         handler: SubcommandHandler::P9(crate::p9_commands::run_scan),
     },
     Subcommand {
         name: "findings",
-        summary: "persisted scanner findings (list/dismiss)",
+        operands: "list|dismiss",
+        summary: "persisted scanner findings",
         own_help: false,
         handler: SubcommandHandler::P9(crate::p9_commands::run_findings),
     },
     Subcommand {
         name: "agents",
-        summary: "project agent definitions (list/validate/scaffold)",
+        operands: "list|validate|scaffold",
+        summary: "project agent definitions",
         own_help: false,
         handler: SubcommandHandler::P9(crate::p9_commands::run_agents),
     },
     Subcommand {
         name: "plugins",
-        summary: "plugin trust lifecycle (validate/register/list/approve/reject/hook-test)",
+        operands: "validate|register|list|approve|reject|hook-test",
+        summary: "plugin trust lifecycle",
         own_help: false,
         handler: SubcommandHandler::P9(crate::p9_commands::run_plugins),
     },
     Subcommand {
         name: "release-manifest",
-        summary: "emit a release manifest of artifact digests (does not sign or verify)",
+        operands: "<version> <artifact>...",
+        summary: "emit a release manifest of artifact digests",
         own_help: false,
         handler: SubcommandHandler::P9(crate::p9_commands::run_release_manifest),
     },
     Subcommand {
         name: "completions",
-        summary: "emit shell completions: bash|zsh|fish",
+        operands: "bash|zsh|fish",
+        summary: "emit shell completions",
         own_help: false,
         handler: SubcommandHandler::P9(crate::p9_commands::run_completions),
     },
     Subcommand {
         name: "man",
+        operands: "",
         summary: "print the manual page text",
         own_help: false,
         handler: SubcommandHandler::P9(crate::p9_commands::run_man),
@@ -871,7 +927,16 @@ fn run_subcommand(args: &[String]) -> Result<i32, InteractiveError> {
         // either reject the flag as a usage error, ignore it, or treat it as
         // an operand. A one-line summary is thin help, but it is true and it
         // exits 0.
-        println!("rapid {}: {}", entry.name, entry.summary);
+        // The operands come from the same field `rapid --help` renders, so
+        // a command's two help surfaces cannot disagree about what it takes.
+        if entry.operands.is_empty() {
+            println!("rapid {}: {}", entry.name, entry.summary);
+        } else {
+            println!(
+                "usage: rapid {} {}\n\n{}",
+                entry.name, entry.operands, entry.summary
+            );
+        }
         println!("see `rapid --help` for the full command list");
         return Ok(0);
     }
@@ -7088,7 +7153,24 @@ approval gap has been closed and this characterization test should be rewritten:
         assert!(block.len() > 15, "the Commands block did not parse: {block:?}");
         let mut advertised: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
+        let mut previous_was_an_entry = false;
         for line in &block {
+            // An entry whose invocation reaches the summary column carries
+            // its summary on a following, fully-indented line. That is the
+            // *only* line shape allowed besides an entry, and it may never
+            // start the block — so prose still cannot hide here.
+            if !line.starts_with("  rapid ") {
+                assert!(
+                    previous_was_an_entry
+                        && line.starts_with(&" ".repeat(SUBCOMMAND_SUMMARY_COLUMN))
+                        && !line.trim().is_empty(),
+                    "a line under `Commands:` is neither a command nor the wrapped \
+summary of the one above it: {line:?}"
+                );
+                previous_was_an_entry = false;
+                continue;
+            }
+            previous_was_an_entry = true;
             let rest = line.strip_prefix("  rapid ").unwrap_or_else(|| {
                 panic!("every line under `Commands:` must be `  rapid <name> ...`: {line:?}")
             });
@@ -7116,6 +7198,67 @@ approval gap has been closed and this characterization test should be rewritten:
             unrunnable.is_empty(),
             "advertised by `rapid --help` but not dispatched: {unrunnable:?}"
         );
+    }
+
+    #[test]
+    fn no_subcommand_summary_is_pushed_past_the_terminal_s_width() {
+        // The rule is about *placement*, not about entries: a summary must
+        // never be what makes a line too wide, because a wrapped summary
+        // breaks the alignment of every line after it. An invocation that is
+        // itself long (`rapid goal`'s eleven alternatives) is allowed to be
+        // as long as its operands require — there is nothing to trim but the
+        // truth — and its summary moves to the next line, which this asserts
+        // by construction rather than by exempting a named command.
+        const WIDTH: usize = 80;
+        for entry in SUBCOMMANDS {
+            let rendered = render_subcommand_line(entry);
+            let lines: Vec<&str> = rendered.lines().collect();
+            for line in &lines {
+                if line.trim_start().starts_with("rapid ") && lines.len() == 2 {
+                    // The invocation-only line of a wrapped entry.
+                    continue;
+                }
+                assert!(
+                    line.chars().count() <= WIDTH,
+                    "`{}` renders a {}-column line, which wraps and breaks the \
+alignment below it: {line:?}",
+                    entry.name,
+                    line.chars().count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_subcommand_line_states_what_that_command_takes() {
+        // The defect this table's `operands` field exists for: `rapid --help`
+        // advertised `rapid inspect-export <session>` while the parser
+        // required a second positional, so the *documented* invocation could
+        // only fail — with an error telling the reader to consult the help
+        // they had just followed. Help, `rapid <name> --help` and `rapid man`
+        // all render this one field now.
+        let usage = CLI_USAGE.as_str();
+        let line = usage
+            .lines()
+            .find(|line| line.trim_start().starts_with("rapid inspect-export"))
+            .expect("an inspect-export line");
+        assert!(
+            line.contains("<session>") && line.contains("<out-path>"),
+            "the help must name both positionals the parser requires: {line}"
+        );
+
+        // And every entry's operand text actually reaches the help, so a new
+        // command cannot be added with operands that are never shown.
+        for entry in SUBCOMMANDS {
+            if entry.operands.is_empty() {
+                continue;
+            }
+            assert!(
+                usage.contains(&format!("rapid {} {}", entry.name, entry.operands)),
+                "`rapid {}`'s operands never reach the help",
+                entry.name
+            );
+        }
     }
 
     #[test]

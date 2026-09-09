@@ -2098,7 +2098,16 @@ fn fish_quote(raw: &str) -> String {
 pub fn run_man(_args: &[String]) -> Result<i32, P9CommandError> {
     println!("RAPID(1) — RapidLM CLI");
     for entry in crate::interactive::SUBCOMMANDS {
-        println!("  rapid {}\t{}", entry.name, entry.summary);
+        // Operands included: a manual page that omits what a command takes
+        // sends the reader back to `--help` for the one thing they came for.
+        if entry.operands.is_empty() {
+            println!("  rapid {}\t{}", entry.name, entry.summary);
+        } else {
+            println!(
+                "  rapid {} {}\t{}",
+                entry.name, entry.operands, entry.summary
+            );
+        }
     }
     Ok(0)
 }
@@ -2237,6 +2246,61 @@ mod sessions_tests {
             );
         }
         let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn the_documented_inspect_export_invocation_is_the_one_the_parser_accepts() {
+        // The bug was a documentation bug with no behavioral symptom in the
+        // tests: `inspect-export` always required two positionals and the
+        // tests always passed two, while `rapid --help` advertised one. This
+        // builds the invocation *from the published operand text* and runs
+        // it, so the help and the parser are checked against each other
+        // rather than each against a hand-written expectation.
+        let entry = crate::interactive::SUBCOMMANDS
+            .iter()
+            .find(|entry| entry.name == "inspect-export")
+            .expect("the table must still have inspect-export");
+        let required: Vec<&str> = entry
+            .operands
+            .split_whitespace()
+            .filter(|token| token.starts_with('<'))
+            .collect();
+        assert_eq!(
+            required.len(),
+            2,
+            "the published operands are {:?}; update this test deliberately if that changes",
+            entry.operands
+        );
+
+        let db = temp_db("documented");
+        let out = db.with_extension("jsonl");
+        let seeded = seed_session(&db);
+        let db_arg = db.to_string_lossy().into_owned();
+        let documented = vec![
+            seeded.to_string(),
+            out.to_string_lossy().into_owned(),
+            "--db".to_owned(),
+            db_arg.clone(),
+        ];
+        assert_eq!(
+            run_inspect_export(&documented).expect("the documented invocation must run"),
+            0
+        );
+        assert!(out.exists(), "and must produce the export it promises");
+
+        // One fewer positional — the invocation the help used to advertise —
+        // is a usage error, which is what made the old help unusable.
+        let short = vec![
+            seeded.to_string(),
+            "--db".to_owned(),
+            db_arg,
+        ];
+        assert!(
+            matches!(run_inspect_export(&short), Err(P9CommandError::Usage)),
+            "one positional is not enough, which is exactly what the help used to claim"
+        );
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(&out);
     }
 
     #[test]
