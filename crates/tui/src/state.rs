@@ -342,6 +342,14 @@ pub struct JobProjection {
     id: JobId,
     state: JobLifecycle,
     exit_status: Option<i32>,
+    /// What the job is running, for a reader who needs to recognise it.
+    ///
+    /// A `JobId` is a UUID; a panel listing four of them tells the user
+    /// nothing about which is the test run they are waiting on. Carried
+    /// through the same bounded, redaction-aware accessor as every other
+    /// display string, so it can neither exceed the display bound nor
+    /// survive a secret-classified event.
+    command: Option<String>,
 }
 
 /// Job lifecycle copied from job event kinds / optional payload state.
@@ -351,6 +359,12 @@ pub enum JobLifecycle {
     Started,
     Output,
     Completed,
+    /// Exited non-zero, or never started.
+    Failed,
+    /// Stopped on request, or at shutdown.
+    Cancelled,
+    /// Ran past its deadline and was stopped.
+    TimedOut,
     OrphanReconciled,
 }
 
@@ -817,6 +831,7 @@ fn upsert_job(
                 id,
                 state: lifecycle,
                 exit_status: None,
+                command: None,
             },
         )?;
     }
@@ -832,6 +847,11 @@ fn upsert_job(
     }
     if let Some(status) = optional_i32(payload, "exit_status")? {
         job.exit_status = Some(status);
+    }
+    // Only `job.started` carries it; a later event for the same job must not
+    // blank out what the panel is already showing.
+    if let Some(command) = optional_display(event, payload, "command")? {
+        job.command = Some(command);
     }
     Ok(())
 }
@@ -1400,6 +1420,10 @@ impl JobProjection {
     pub fn exit_status(&self) -> Option<i32> {
         self.exit_status
     }
+
+    pub fn command(&self) -> Option<&str> {
+        self.command.as_deref()
+    }
 }
 
 impl ApprovalProjection {
@@ -1477,12 +1501,22 @@ impl WorkerClass {
 }
 
 impl JobLifecycle {
+    /// The wire vocabulary is `process_supervisor::JobState::as_str`'s, so
+    /// one payload shape serves every producer of `job.*` events.
+    ///
+    /// A state this cannot parse is an `InvalidField` error, and `reduce`
+    /// answers those by blocking every later action and raising a
+    /// protocol-error modal — so a job merely *timing out* used to be enough
+    /// to freeze the session, once anything actually reported one.
     fn parse(raw: &str) -> Option<Self> {
         Some(match raw {
-            "started" => Self::Started,
+            "started" | "queued" | "running" | "sleeping" => Self::Started,
             "output" => Self::Output,
             "completed" => Self::Completed,
-            "orphan_reconciled" => Self::OrphanReconciled,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            "timed_out" => Self::TimedOut,
+            "orphaned" | "orphan_reconciled" => Self::OrphanReconciled,
             _ => return None,
         })
     }

@@ -1161,6 +1161,9 @@ fn job_state_str(state: JobLifecycle) -> &'static str {
         JobLifecycle::Started => "started",
         JobLifecycle::Output => "output",
         JobLifecycle::Completed => "completed",
+        JobLifecycle::Failed => "failed",
+        JobLifecycle::Cancelled => "cancelled",
+        JobLifecycle::TimedOut => "timed_out",
         JobLifecycle::OrphanReconciled => "orphan_reconciled",
     }
 }

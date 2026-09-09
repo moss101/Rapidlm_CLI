@@ -237,6 +237,30 @@ impl JobState {
     }
 }
 
+/// Where a background job's lifecycle is reported, beyond the model-facing
+/// `job_status`/`job_output` tools.
+///
+/// Background jobs have always *run* — `shell_exec` with `background: true`
+/// spawns a real supervised child — but nothing outside the model could see
+/// them: the registry is in-process and journals nothing, so the TUI's
+/// `/jobs` panel (which projects `job.*` ledger events) was permanently
+/// empty for a feature that was working the whole time. An implementation of
+/// this appends those events; `None` keeps the previous behavior exactly,
+/// which is what the headless `rapid exec` path (no kernel session to append
+/// to) still uses.
+///
+/// Called from the job's own supervisor thread, so implementations must be
+/// `Send + Sync` and must not block for long.
+pub(crate) trait JobEvents: Send + Sync {
+    /// A job has been spawned. `handle` is the id the model was given
+    /// (`job-3`), `command` the argv it is running.
+    fn started(&self, job: protocol::JobId, handle: &str, command: &str);
+
+    /// A job reached a terminal state: `exit_status` when it exited on its
+    /// own, `None` when it was cancelled or timed out (`state` says which).
+    fn finished(&self, job: protocol::JobId, state: &str, exit_status: Option<i32>);
+}
+
 /// Registry of background commands started by `shell.exec` with
 /// `background: true`. Children are killed when the registry drops, so no
 /// command outlives the CLI run.
@@ -253,9 +277,16 @@ pub struct JobRegistry {
     /// per-instance-instead-of-per-turn shape `WriteLocks` already closed
     /// for file writes.
     started_this_turn: Arc<AtomicU64>,
+    /// See [`JobEvents`]. `None` outside a kernel session.
+    events: Option<Arc<dyn JobEvents>>,
 }
 
 impl JobRegistry {
+    /// Report this registry's jobs to `events` as well as to the model.
+    pub(crate) fn set_events(&mut self, events: Arc<dyn JobEvents>) {
+        self.events = Some(events);
+    }
+
     /// Clone the shared per-turn job-start counter, for a caller propagating
     /// it to a subagent child alongside `WriteLocks`/the turn budgets.
     pub(crate) fn job_budget_handle(&self) -> Arc<AtomicU64> {
@@ -282,6 +313,16 @@ impl JobRegistry {
             return Err(ToolStepError::Failed);
         }
         let id = format!("job-{}", self.seq.fetch_add(1, Ordering::SeqCst) + 1);
+        // The ledger keys jobs by a typed `JobId`; the model keeps the short
+        // `job-N` handle it already uses for `job_status`/`job_output`, and
+        // the event carries both so a reader can correlate the panel row
+        // with what the transcript said.
+        let ledger_id = protocol::JobId::new();
+        let command = argv.join(" ");
+        if let Some(events) = self.events.as_ref() {
+            events.started(ledger_id, &id, &command);
+        }
+        let finish = self.events.clone();
         let shared = JobShared {
             cancelled: Arc::new(AtomicBool::new(false)),
             output: Arc::new(Mutex::new(Vec::new())),
@@ -338,6 +379,9 @@ impl JobRegistry {
                     None => {
                         if let Ok(mut state) = worker.state.lock() {
                             *state = JobState::Failed("spawn failed".to_owned());
+                        }
+                        if let Some(events) = finish.as_ref() {
+                            events.finished(ledger_id, "failed", None);
                         }
                         return;
                     }
@@ -397,8 +441,12 @@ impl JobRegistry {
                             .flatten()
                     };
                     if let Some(status) = done {
+                        let code = status.code().unwrap_or(-1);
                         if let Ok(mut state) = worker.state.lock() {
-                            *state = JobState::Completed(status.code().unwrap_or(-1));
+                            *state = JobState::Completed(code);
+                        }
+                        if let Some(events) = finish.as_ref() {
+                            events.finished(ledger_id, "completed", Some(code));
                         }
                         break;
                     }
@@ -412,6 +460,9 @@ impl JobRegistry {
                         if let Ok(mut state) = worker.state.lock() {
                             *state = JobState::Failed("cancelled at shutdown".to_owned());
                         }
+                        if let Some(events) = finish.as_ref() {
+                            events.finished(ledger_id, "cancelled", None);
+                        }
                         break;
                     }
                     if started.elapsed() > timeout {
@@ -423,6 +474,9 @@ impl JobRegistry {
                         }
                         if let Ok(mut state) = worker.state.lock() {
                             *state = JobState::Failed("timed out".to_owned());
+                        }
+                        if let Some(events) = finish.as_ref() {
+                            events.finished(ledger_id, "timed_out", None);
                         }
                         break;
                     }
@@ -1180,6 +1234,20 @@ impl WorkspaceTools {
     }
 
     /// Replace this instance's job registry's own counter with the
+    /// Report this surface's background jobs to `events`. See
+    /// [`JobEvents`].
+    pub(crate) fn set_job_events(&mut self, events: Arc<dyn JobEvents>) {
+        self.jobs.set_events(events);
+    }
+
+    /// The sink this surface reports jobs to, for propagating to a subagent
+    /// child alongside the shared job budget — a child's jobs are this
+    /// turn's jobs, and a panel that showed only the parent's would be
+    /// telling a half-truth about what is running.
+    pub(crate) fn job_events(&self) -> Option<Arc<dyn JobEvents>> {
+        self.jobs.events.clone()
+    }
+
     /// parent's. See `JobRegistry::share_job_budget`.
     pub(crate) fn share_job_budget(&mut self, handle: Arc<AtomicU64>) {
         self.jobs.share_job_budget(handle);
@@ -4992,6 +5060,22 @@ impl ExecTools {
             root,
             permissions,
         )?))
+    }
+
+    /// This surface's job-event sink, if any — for propagating to a
+    /// subagent child. `None` on the no-op surface.
+    pub(crate) fn job_events(&self) -> Option<Arc<dyn JobEvents>> {
+        match self {
+            Self::Workspace(tools) => tools.job_events(),
+            _ => None,
+        }
+    }
+
+    /// Report background jobs to `events` (no-op on the no-op surface).
+    pub(crate) fn set_job_events(&mut self, events: Arc<dyn JobEvents>) {
+        if let Self::Workspace(tools) = self {
+            tools.set_job_events(events);
+        }
     }
 
     /// Attach the subagent runner (no-op on the fail-closed no-op surface).

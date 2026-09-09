@@ -252,9 +252,18 @@ fn job_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
         .values()
         .map(|job| {
             let lifecycle = format!("{:?}", job.state()).to_lowercase();
+            // The command, when the producer recorded one: a list of UUIDs
+            // cannot tell a reader which row is the test run they are
+            // waiting on.
+            let what = job.command().unwrap_or("");
+            let head = if what.is_empty() {
+                job.id().to_string()
+            } else {
+                what.to_owned()
+            };
             match job.exit_status() {
-                Some(status) => format!("{} [{lifecycle}] exit:{status}", job.id()),
-                None => format!("{} [{lifecycle}]", job.id()),
+                Some(status) => format!("{head} [{lifecycle}] exit:{status}"),
+                None => format!("{head} [{lifecycle}]"),
             }
         })
         .collect();
@@ -775,6 +784,51 @@ pre-approve it with `rapid permissions allow <tool>`";
             route_renders_content(UiRoute::Jobs),
             "and the route must now report itself as one that paints"
         );
+    }
+
+    #[test]
+    fn a_job_that_timed_out_or_was_cancelled_does_not_freeze_the_session() {
+        // `reduce` answers an unparseable field by blocking every later
+        // action and raising a protocol-error modal. `JobLifecycle::parse`
+        // knew four states while `process_supervisor::JobState` speaks seven,
+        // so a background job merely *timing out* was enough to freeze the
+        // session the moment anything actually reported one.
+        use crate::state::JobLifecycle;
+        use event_ledger::event::EventKind;
+
+        for (state, expected) in [
+            ("completed", JobLifecycle::Completed),
+            ("failed", JobLifecycle::Failed),
+            ("cancelled", JobLifecycle::Cancelled),
+            ("timed_out", JobLifecycle::TimedOut),
+            ("orphaned", JobLifecycle::OrphanReconciled),
+            ("running", JobLifecycle::Started),
+        ] {
+            let job = "019c0000-0000-7000-8000-00000000002a";
+            let mut ui = reduce(
+                AppState::new(),
+                &UiEvent::Kernel(kernel_event(
+                    1,
+                    EventKind::SessionCreated,
+                    serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
+                )),
+            );
+            ui = reduce(
+                ui,
+                &UiEvent::Kernel(kernel_event(
+                    2,
+                    EventKind::JobCompleted,
+                    serde_json::json!({"job_id": job, "state": state}),
+                )),
+            );
+            assert!(
+                !ui.actions_blocked(),
+                "a job reported as {state:?} must not block the session: {:?}",
+                ui.protocol_error()
+            );
+            let projected = ui.jobs().values().next().expect("the job is projected");
+            assert_eq!(projected.state(), expected, "state {state:?}");
+        }
     }
 
     #[test]

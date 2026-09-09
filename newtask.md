@@ -7044,6 +7044,60 @@ to, and the test asserts that difference in both directions.
 Verified with the built binary as well as in tests: three listings in a fresh directory now leave
 `find .rapidlm` empty, and `cron add` still creates the store.
 
+**Background jobs were running and invisible; `/jobs` now shows them, done 2026-09-10.**
+
+**Found by checking whether yesterday's `/jobs` panel had anything to show.** It did not, and the reason
+was not that jobs are unimplemented: `shell_exec` with `background: true` spawns a real supervised child
+with a timeout, output spooling, cancellation and a `job-N` handle the model polls through `job_status` /
+`job_output`. All of that works. But `JobRegistry` is in-process and journaled nothing, so the panel —
+which projects `job.*` ledger events — was permanently empty for a feature that had been working the
+whole time. Yesterday's commit shipped a renderer for a projection with no producer, which this closes.
+
+**The design.** `JobEvents` is a small sink trait on the registry: `started(job_id, handle, command)` and
+`finished(job_id, state, exit_status)`, called from the job's own supervisor thread at all four terminal
+points (exit, timeout, cancel-at-shutdown, spawn failure). `LedgerJobEvents` in the composition root
+implements it over `InProcessKernelClient::append_turn_progress` — the same call the turn's own event
+sink uses, which appends at the session tip with no optimistic check precisely because it races the
+turn's writers. The events reach the panel through the ordinary subscription, not a second channel.
+`None` (the headless `rapid exec` path, which has no kernel session) keeps the previous behavior exactly.
+
+Two identities, deliberately: the ledger keys jobs by a typed `JobId`, while the model keeps the short
+`job-N` handle its tools already take. The event carries both, plus the argv — a panel row reading
+`cargo build [running]` is something a user can act on, where four UUIDs are not. `JobProjection` gained
+`command`, read through the same bounded, redaction-aware accessor as every other display string.
+
+**A subagent's jobs are this turn's jobs**, so the sink propagates to children at the same call site as
+the per-turn job *budget* (`share_job_budget`), which exists for exactly the same reason. A panel showing
+only the parent's would be a half-truth about what is running.
+
+**Self-review caught a session-freezing bug before it shipped.** The sink reported `"cancelled"`,
+`"timed_out"` and `"failed"` — none of which `JobLifecycle::parse` knew, since it accepted four states
+while `process_supervisor::JobState` speaks seven. An unparseable field is `UiStateError::InvalidField`,
+and `reduce` answers those by setting `actions_blocked` *and* raising a protocol-error modal: a background
+job merely timing out would have frozen the session. `JobLifecycle` now covers the supervisor's own
+vocabulary (`failed`, `cancelled`, `timed_out`, `orphaned`, and the `queued`/`running`/`sleeping` states
+that mean "started"), so one payload shape serves every producer of `job.*` events. The compiler found the
+one other match that needed the new variants. This was a *pre-existing* latent gap — anything that ever
+reported a real job state would have hit it — that wiring a producer finally made reachable.
+
+**Tests.** Three new. `a_background_job_reaches_the_jobs_panel` runs a real scripted turn whose model
+calls `shell_exec` with `background: true`, then asserts the job is projected with its command, renders
+through the real panel, and — after waiting for the supervisor thread's own event rather than assuming
+timing — carries `exit_status: 0`. `ScriptedSession::drain_until` was added for that wait, reusing the
+production `drain_kernel_events` rather than a test-only fold. `a_job_that_timed_out_or_was_cancelled_
+does_not_freeze_the_session` walks all six wire states and asserts none blocks the session. Three revert
+cycles (93-95): unwiring the sink empties the panel; dropping the completion event times out the wait;
+narrowing the vocabulary reproduces the freeze.
+
+683 `rapid` lib tests, 230 `tui`, clippy identical to the pre-change baseline, full workspace green.
+
+**Still true, and recorded rather than papered over:** `/approvals` has no producer either, and unlike
+jobs that is *by design* — the option C decision made the tool gate deny-and-grant rather than
+request-and-wait, so `ToolStepResult::ApprovalRequired` is never constructed in production (only in
+tests). The panel is correct and will populate if an approval-requesting path is ever added; today it
+reads "no approvals" honestly. `/help` marks both commands available because both open a working panel,
+which is what that marker measures.
+
 ## Session boundary, 2026-09-09 — durable state for the next session
 
 Eight commits, `dbeb2c2`..`1e516cb`, all pushed to `origin/main`. Baseline before them was `598c6fd`.

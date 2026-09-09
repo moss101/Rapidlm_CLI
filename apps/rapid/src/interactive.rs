@@ -2533,6 +2533,11 @@ struct LiveSubagentRunner {
     /// budget of its own. See `JobRegistry::started_this_turn`'s own doc
     /// comment.
     job_budget: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The parent's job-event sink, propagated for the same reason the job
+    /// *budget* is: a subagent's background jobs are this turn's jobs, and a
+    /// `/jobs` panel showing only the parent's would be a half-truth about
+    /// what is running.
+    job_events: Option<std::sync::Arc<dyn crate::exec_tools::JobEvents>>,
     /// The parent's configured project hooks, cloned into every child so a
     /// `pre_tool_use`/`post_tool_use` policy hook that gates the parent's
     /// own tool calls also gates its subagents' — without this, delegating
@@ -2608,6 +2613,9 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // Same reasoning for the per-turn background-job budget — see
         // `job_budget`'s own doc comment.
         tools.share_job_budget(self.job_budget.clone());
+        if let Some(events) = self.job_events.clone() {
+            tools.set_job_events(events);
+        }
         // Scrub the same known secrets from this child's own shell_exec
         // output as the parent's — see `redaction`'s own doc comment.
         tools.share_redaction(self.redaction.clone());
@@ -3497,6 +3505,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                 turn_budgets,
                 write_locks,
                 job_budget,
+                job_events: tools.job_events(),
                 hooks,
                 shadow_diagnostics,
                 trace_calls,
@@ -5120,6 +5129,61 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
     }
 }
 
+/// Reports a turn's background jobs into the session ledger, so the `/jobs`
+/// panel shows what `shell_exec background=true` actually started.
+///
+/// Owns its handles rather than borrowing: a job outlives the tool call that
+/// started it (that is the point of a background job), and its supervisor
+/// thread reports completion long after `execute_interactive_turn` has
+/// returned. `InProcessKernelClient` is `Clone` and appends through the
+/// ledger's own serialized transaction, and `append_turn_progress` writes at
+/// the session tip with no optimistic check — which is exactly right for a
+/// writer racing the turn's own events, and is why the same call is what the
+/// turn sink uses.
+///
+/// A failed append is dropped: the job itself is real work that must not be
+/// disturbed by the ledger, and the model-facing `job_status`/`job_output`
+/// tools remain the authority either way.
+struct LedgerJobEvents {
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: ActorRef,
+}
+
+impl crate::exec_tools::JobEvents for LedgerJobEvents {
+    fn started(&self, job: protocol::JobId, handle: &str, command: &str) {
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::JobStarted,
+            serde_json::json!({
+                "job_id": job.to_string(),
+                "state": "started",
+                // The short id the model was given, so a reader can match a
+                // panel row to what the transcript said, and the argv, so
+                // the row means something without either.
+                "handle": handle,
+                "command": command,
+            }),
+        );
+    }
+
+    fn finished(&self, job: protocol::JobId, state: &str, exit_status: Option<i32>) {
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::JobCompleted,
+            serde_json::json!({
+                "job_id": job.to_string(),
+                "state": state,
+                "exit_status": exit_status,
+            }),
+        );
+    }
+}
+
 /// Run `f`, converting a panic into a `Failed` outcome instead of letting it
 /// unwind past whatever the caller does afterward — `spawn_interactive_
 /// turn`'s cleanup (releasing the turn's lease, clearing `turn_in_flight`)
@@ -5598,6 +5662,14 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
             };
         }
     };
+    // Background jobs report into the same ledger the turn writes to, so
+    // they reach the `/jobs` panel through the ordinary subscription rather
+    // than a second channel.
+    tools.set_job_events(std::sync::Arc::new(LedgerJobEvents {
+        client: client.clone(),
+        session_id,
+        actor: actor.clone(),
+    }));
     let request = AgentExecutionRequest::new(spec, session_id);
     let mut sink = InteractiveTurnSink {
         client,
@@ -9441,6 +9513,63 @@ that is no longer there"
     }
 
     #[test]
+    fn a_background_job_reaches_the_jobs_panel() {
+        // `shell_exec` with `background: true` has always started a real
+        // supervised child, but the registry is in-process and journaled
+        // nothing, so `/jobs` — which projects `job.*` ledger events — was
+        // permanently empty for a feature that was working the whole time.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "start the build",
+            ScriptedModel::background_job_then_answer(
+                &["/bin/echo", "building"],
+                "started it",
+            ),
+        );
+
+        // `job.started` is appended by the tool call itself, so it is in the
+        // ledger by the time the turn completes.
+        let jobs = session.state().jobs();
+        assert_eq!(jobs.len(), 1, "the started job must be projected: {jobs:?}");
+        let job = jobs.values().next().expect("one job");
+        assert_eq!(
+            job.command(),
+            Some("/bin/echo building"),
+            "the panel needs to say what is running, not just a uuid"
+        );
+        // Completion is reported by the job's own supervisor thread, which
+        // can land before or after the turn returns — so wait for the real
+        // event rather than asserting on whichever happened to win.
+        session.drain_until("the job to complete", |state| {
+            state
+                .jobs()
+                .values()
+                .all(|job| matches!(job.state(), tui::state::JobLifecycle::Completed))
+        });
+        let jobs = session.state().jobs();
+        let job = jobs.values().next().expect("one job");
+        assert_eq!(
+            job.exit_status(),
+            Some(0),
+            "a completed job must carry how it exited: {job:?}"
+        );
+
+        // And it renders, through the real panel.
+        let painted = tui::sidebar_lines(
+            tui::state::UiRoute::Jobs,
+            session.state(),
+            60,
+            6,
+            &tui::state::CancellationToken::new(),
+        );
+        assert!(
+            painted[0].contains("/bin/echo building"),
+            "the jobs panel must show the command: {painted:?}"
+        );
+    }
+
+    #[test]
     fn the_most_recent_session_is_chosen_by_activity_not_creation() {
         // `rapid resume` with no id means "where I left off". A session
         // created yesterday and worked in today is the one a user means, so
@@ -10127,6 +10256,33 @@ that is no longer there"
             }
         }
 
+        /// Start a background `shell_exec` job, then answer — the shape a
+        /// model uses to kick off a long build and keep working.
+        fn background_job_then_answer(argv: &[&str], answer: &str) -> Self {
+            let argv_json = serde_json::to_string(argv).expect("argv");
+            let call = ProposedToolCall::new(
+                "c1",
+                crate::exec_tools::SHELL_EXEC_TOOL,
+                format!(r#"{{"argv":{argv_json},"background":true}}"#),
+            )
+            .expect("call");
+            Self {
+                outputs: VecDeque::from(vec![
+                    Ok(ModelStepOutput::ToolCalls {
+                        calls: vec![call],
+                        tokens: 1,
+                        cost_usd_micros: None,
+                    }),
+                    Ok(ModelStepOutput::Terminal {
+                        text: answer.to_owned(),
+                        tokens: 1,
+                        cost_usd_micros: None,
+                    }),
+                ]),
+                ..Default::default()
+            }
+        }
+
         fn write_then_answer(path: &str, content: &str, answer: &str) -> Self {
             let call = ProposedToolCall::new(
                 "c1",
@@ -10445,6 +10601,29 @@ that is no longer there"
                 .expect("drain");
                 std::thread::sleep(Duration::from_millis(10));
             }
+        }
+
+        /// Keep draining the real subscription until `done` holds or the
+        /// budget runs out. For facts a *background* thread produces after
+        /// the turn returns — a job's completion — where asserting
+        /// immediately would race the supervisor's own poll interval.
+        fn drain_until(&mut self, what: &str, done: impl Fn(&AppState) -> bool) {
+            let cancel = CancellationToken::new();
+            for _ in 0..200 {
+                drain_kernel_events(
+                    &self.client,
+                    &mut self.stream,
+                    &mut self.ui,
+                    self.session_id,
+                    &cancel,
+                )
+                .expect("drain");
+                if done(&self.ui) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("timed out waiting for {what}");
         }
 
         fn goal_path(&self) -> PathBuf {
