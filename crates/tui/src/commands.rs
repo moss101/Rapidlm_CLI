@@ -248,7 +248,14 @@ pub enum PermissionsIntent {
 /// Inspector the TUI can focus. Mapping onto [`UiRoute`] is best-effort.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Inspector {
-    Agents,
+    /// `id` is the agent `/agents show` named.
+    ///
+    /// Carried for the same reason [`Inspector::Jobs`] carries one: the
+    /// panel has resolved `AppState::selected_agent` into its selected row
+    /// since it existed (`panels::agents::resolve_selection`), and nothing
+    /// ever set the field — so `/agents show <id>` parsed an id, dropped
+    /// it, and painted the detail block of whichever agent sorted first.
+    Agents { id: Option<AgentId> },
     Diff { agent: Option<AgentId> },
     Goal,
     Context,
@@ -716,8 +723,11 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
             max_turns,
             max_tokens,
         }),
-        UiCommand::AgentsList | UiCommand::AgentsShow { .. } => {
-            FrontendAction::Local(LocalAction::Open(Inspector::Agents))
+        UiCommand::AgentsList => {
+            FrontendAction::Local(LocalAction::Open(Inspector::Agents { id: None }))
+        }
+        UiCommand::AgentsShow { id } => {
+            FrontendAction::Local(LocalAction::Open(Inspector::Agents { id }))
         }
         UiCommand::AgentsPause { id } => FrontendAction::Kernel(KernelAction::PauseAgent { id }),
         UiCommand::AgentsResume { id } => FrontendAction::Kernel(KernelAction::ResumeAgent { id }),
@@ -938,7 +948,7 @@ impl Inspector {
     /// Existing reducer route, when the inspector already has one.
     pub fn route(&self) -> Option<UiRoute> {
         match self {
-            Self::Agents => Some(UiRoute::Agents),
+            Self::Agents { .. } => Some(UiRoute::Agents),
             Self::Diff { .. } => Some(UiRoute::Diff),
             Self::Context => Some(UiRoute::Context),
             Self::Memory => Some(UiRoute::Memory),
@@ -1644,9 +1654,22 @@ mod tests {
     fn inspectors_are_local_chrome() {
         assert_eq!(
             dispatch(parse_ok("/agents")),
-            FrontendAction::Local(LocalAction::Open(Inspector::Agents))
+            FrontendAction::Local(LocalAction::Open(Inspector::Agents { id: None }))
         );
-        assert_eq!(Inspector::Agents.route(), Some(UiRoute::Agents));
+        assert_eq!(
+            Inspector::Agents { id: None }.route(),
+            Some(UiRoute::Agents)
+        );
+        // The id `/agents show` parses has to survive dispatch: it used to
+        // be discarded here, so the panel could not tell which agent was
+        // asked about.
+        let named = "019c0000-0000-7000-8000-0000000000a7";
+        assert_eq!(
+            dispatch(parse_ok(&format!("/agents show {named}"))),
+            FrontendAction::Local(LocalAction::Open(Inspector::Agents {
+                id: Some(named.parse().expect("agent id")),
+            }))
+        );
         assert_eq!(parse_ok("/models"), UiCommand::ModelList);
         assert_eq!(parse_ok("/memory"), UiCommand::OpenMemory);
         assert_eq!(parse_ok("/quit"), UiCommand::Quit);

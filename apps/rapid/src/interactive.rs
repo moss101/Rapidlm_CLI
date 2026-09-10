@@ -1604,7 +1604,7 @@ fn command_error_text(err: &CommandError) -> String {
 fn unrouted_inspector_text(inspector: &Inspector) -> String {
     let reason = match inspector {
         // Routed: handled by `dispatch_slash` before reaching this function.
-        Inspector::Agents
+        Inspector::Agents { .. }
         | Inspector::Diff { .. }
         | Inspector::Goal
         | Inspector::Context
@@ -4274,8 +4274,22 @@ impl SessionLoop<'_> {
     /// selection, and it reuses `AppState`'s existing `selected_job` rather
     /// than adding a second place to record which job is in view.
     fn focus_inspector(&mut self, inspector: &Inspector) {
-        let Inspector::Jobs { id, logs } = inspector else {
-            return;
+        let (id, logs) = match inspector {
+            // `/agents show <id>`: the panel resolves `selected_agent` into
+            // its selected row and paints that row's detail block, so this
+            // is the whole fix — the field simply had no writer.
+            Inspector::Agents { id } => {
+                *self.ui = reduce(
+                    self.ui.clone(),
+                    &UiEvent::Local(LocalUiEvent::SelectAgent(*id)),
+                );
+                return;
+            }
+            Inspector::Jobs { id, logs } => (id, logs),
+            // `Inspector::Diff { agent }` still drops its operand here:
+            // `ChangedFile` records no agent, so there is nothing to select
+            // it by. Every other inspector names no entity to focus.
+            _ => return,
         };
         let target = match (id, logs) {
             (Some(id), _) => Some(*id),
@@ -10899,6 +10913,66 @@ was already finished"
         assert!(
             followed,
             "an open logs view must follow output written after it was opened"
+        );
+    }
+
+    #[test]
+    fn agents_show_selects_the_agent_that_was_named() {
+        // The same dropped operand as `/jobs show`, at the same boundary.
+        // The agents panel has resolved `AppState::selected_agent` into its
+        // selected row since it existed — `resolve_selection` falls back to
+        // the caller's row index only when the field is unset — and the
+        // panel paints a `>` marker plus that row's detail block. Nothing
+        // ever wrote the field, so `/agents show <id>` parsed an id and
+        // then described whichever agent happened to sort first.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = session.state().clone();
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(Vec::new());
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight.clone(),
+            backings,
+        );
+
+        let named = "019c0000-0000-7000-8000-0000000000a7";
+        loop_state
+            .dispatch_slash(&format!("/agents show {named}"))
+            .expect("dispatch");
+        assert_eq!(
+            loop_state.ui.selected_agent().map(|id| id.to_string()),
+            Some(named.to_owned()),
+            "the agent named on the command line must become the selected one"
+        );
+
+        // And opening the list again clears it, so the panel goes back to
+        // describing nothing in particular rather than keeping a stale
+        // agent selected.
+        loop_state.dispatch_slash("/agents").expect("dispatch");
+        assert_eq!(
+            loop_state.ui.selected_agent(),
+            None,
+            "the list view must not keep the previous selection"
         );
     }
 

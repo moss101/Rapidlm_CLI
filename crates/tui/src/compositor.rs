@@ -1070,6 +1070,76 @@ pre-approve it with `rapid permissions allow <tool>`";
     }
 
     #[test]
+    fn the_agents_panel_describes_the_agent_that_was_selected() {
+        // Why `/agents show <id>` setting `selected_agent` matters: the
+        // panel resolves that field into its selected row and paints both a
+        // `>` marker and that row's detail block. With the field unset it
+        // falls back to row 0, so before the command wrote it the panel
+        // described whichever agent sorted first no matter which one was
+        // named.
+        use event_ledger::event::EventKind;
+
+        let first = "019c0000-0000-7000-8000-0000000000a1";
+        let second = "019c0000-0000-7000-8000-0000000000a2";
+        let mut state = reduce(
+            AppState::new(),
+            &UiEvent::Kernel(kernel_event(
+                1,
+                EventKind::SessionCreated,
+                serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
+            )),
+        );
+        for (seq, id, role) in [(2u64, first, "planner"), (3, second, "reviewer")] {
+            state = reduce(
+                state,
+                &UiEvent::Kernel(kernel_event(
+                    seq,
+                    EventKind::AgentSpawned,
+                    serde_json::json!({"agent_id": id, "role": role, "state": "running"}),
+                )),
+            );
+        }
+
+        // With nothing selected the panel falls back to row 0 and describes
+        // it — which is exactly why a dropped `/agents show <id>` was worse
+        // than inert: it confidently detailed the wrong agent.
+        let unselected = sidebar_lines(UiRoute::Agents, &state, 70, 12, &cancel());
+        assert!(
+            unselected
+                .iter()
+                .any(|line| line.contains("selected:0000000000a1")),
+            "with nothing selected the panel describes the first row: {unselected:?}"
+        );
+
+        let chosen: protocol::AgentId = second.parse().expect("agent id");
+        let state = reduce(
+            state,
+            &UiEvent::Local(crate::state::LocalUiEvent::SelectAgent(Some(chosen))),
+        );
+        let painted = sidebar_lines(UiRoute::Agents, &state, 70, 12, &cancel());
+        assert!(
+            painted
+                .iter()
+                .any(|line| line.contains("selected:0000000000a2")),
+            "the detail block must describe the agent that was named: {painted:?}"
+        );
+        assert!(
+            !painted
+                .iter()
+                .any(|line| line.contains("selected:0000000000a1")),
+            "and not the one that merely sorted first: {painted:?}"
+        );
+        let marker_row = painted
+            .iter()
+            .find(|line| line.trim_start().starts_with('>'))
+            .expect("some row carries the selection marker");
+        assert!(
+            marker_row.contains("0000000000a2"),
+            "and the row marker moves with it: {painted:?}"
+        );
+    }
+
+    #[test]
     fn a_logs_page_never_paints_under_a_different_jobs_selection() {
         // The page carries the job it was synced for precisely so this
         // cannot happen: a user who runs `/jobs logs A` and then `/jobs

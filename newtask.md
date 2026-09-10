@@ -7621,6 +7621,28 @@ jobs, not solved — `/jobs show <id>` and `/jobs cancel <id>` still require a f
 prints. The general fix is prefix matching in the shared typed-id parser (`optional_id`/`require_id`),
 which would serve jobs, agents and knowledge at once.
 
+**`/agents show <id>` selects the agent it names, done 2026-09-10.**
+
+The second command in the family `/jobs show|logs` opened, and the smallest fix of the session: the
+agents panel has resolved `AppState::selected_agent` into its selected row since it existed
+(`panels::agents::resolve_selection` falls back to the caller's row index *only* when the field is
+unset), and `render` paints both a `>` marker and that row's detail block. Nothing ever wrote the field.
+
+**This one was worse than inert.** With the field unset the panel falls back to row 0 and confidently
+describes it, so `/agents show <id>` did not merely ignore the id — it printed a detail block for
+whichever agent sorted first, under a command the user had aimed at a different one. Revert cycle 122
+captures it exactly: `selected:0000000000a1` while `a2` was named.
+
+So the whole change is `Inspector::Agents { id }` plus one `LocalUiEvent::SelectAgent` in
+`focus_inspector`. `focus_inspector` became a `match` in the process, whose fallthrough arm names the one
+inspector still dropping an operand — `Inspector::Diff { agent }` — at the exact place a fix would go.
+
+**Revert cycles 121-122.** 121 stops emitting the event (the command stops selecting); 122 makes
+`resolve_selection` ignore the field (the panel stops honoring it). Two tests because the chain has two
+halves that were built years apart and never met: the `apps/rapid` test drives the real `dispatch_slash`
+and asserts the state changed, the `tui` test proves that state change is what moves the marker and the
+detail block. Only 121 is a regression test for this commit; 122 locks the contract the fix depends on.
+
 ## Session boundary, 2026-09-10 — durable state for the next session
 
 Twenty-three commits across two days, `dbeb2c2`..`bccf629`, all pushed to `origin/main`. Baseline before
@@ -7652,12 +7674,13 @@ actually failed them.
 
 ### What is actually left, in the order I would take it
 
-1. **The rest of the dropped operands.** `/diff --agent <id>`, `/agents show <id>`, `/context search
-   <query>`, `/knowledge show <id>` and `/playbook show <name>` all die at the same boundary
-   (`Inspector::route()` returning a bare `UiRoute`) that `/jobs show|logs` just stopped dying at.
-   `/agents show` is now a one-line addition to `focus_inspector` using the existing `selected_agent`;
-   the others are not wiring — `/context search` needs a search over the compiled context, and
-   knowledge/playbook have no store behind them.
+1. **The rest of the dropped operands.** `/agents show <id>` is done (see its entry above). Still
+   dropping theirs: `/context search <query>`, `/diff --agent <id>`, `/knowledge show <id>` and
+   `/playbook show <name>`. These are no longer uniform — `/context search` has a real backend already
+   (`apps/rapid/src/context_retrieval.rs::retrieve(root, query, budget)` is production code the turn
+   path uses, so the query has somewhere to go); `/diff --agent` cannot be honored at all until
+   `ChangedFile` records which agent wrote a file, so the honest move there is to *say* attribution is
+   not recorded rather than keep ignoring the flag; and knowledge/playbook have no store behind them.
 2. **Typed-id prefixes.** `/jobs show <id>`, `/jobs cancel <id>` and every other id-taking command
    require a full UUID that nothing prints — the panels deliberately show a job's *command* instead. A
    bare `/jobs logs` works around this for one case; the general fix is prefix matching in
