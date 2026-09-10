@@ -408,17 +408,28 @@ mod tests {
 
     #[test]
     fn timeout_watcher_is_stopped_even_when_retrieve_inner_errors_early() {
-        // Mirrors retrieve()'s own spawn/call/stop structure with a short
-        // timeout: build_manifest fails immediately on a nonexistent root,
-        // so if stop() isn't reached on that path, the watcher keeps
-        // sleeping and fires cancel.cancel() once the timeout elapses.
+        // Mirrors retrieve()'s own spawn/call/stop structure: build_manifest
+        // fails immediately on a nonexistent root, so if stop() isn't
+        // reached on that path, the watcher keeps sleeping and fires
+        // cancel.cancel() once the timeout elapses.
+        //
+        // The margins are deliberate. This test's power comes from sleeping
+        // *past* the watcher's deadline and finding it never fired, so the
+        // timeout has to stay shorter than the final sleep. But it also has
+        // to be comfortably longer than the spawn->stop window, and that
+        // window contains real work on a machine that may be running thirty
+        // other test binaries: at the original 30ms this failed inside a
+        // full `cargo test --workspace` while passing every time on its own,
+        // because the watcher won the race, not because stop() was skipped.
+        // 300ms against a 900ms sleep keeps the same assertion with ten
+        // times the headroom.
         let root = std::env::temp_dir().join("rapidlm-ctxretrieve-does-not-exist-watcher");
         let cancel = CancellationToken::new();
-        let watcher = spawn_timeout_watcher(cancel.clone(), Duration::from_millis(30));
+        let watcher = spawn_timeout_watcher(cancel.clone(), Duration::from_millis(300));
         let result = retrieve_inner(&root, "anything", 4096, &cancel);
         watcher.stop();
         assert!(result.is_err(), "nonexistent root must fail retrieve_inner");
-        std::thread::sleep(Duration::from_millis(90));
+        std::thread::sleep(Duration::from_millis(900));
         assert!(
             !cancel.is_cancelled(),
             "stop() must run on the error path, or the leaked watcher thread \
