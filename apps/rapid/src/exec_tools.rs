@@ -265,6 +265,25 @@ pub(crate) trait JobEvents: Send + Sync {
     fn finished(&self, job: protocol::JobId, state: &str, exit_status: Option<i32>);
 }
 
+/// Where a workspace mutation is reported, beyond the tool result the model
+/// sees.
+///
+/// The `/diff` panel projects `workspace.*` ledger events; nothing emitted
+/// any, because `apps/rapid` writes through `atomic_write` and never touches
+/// the `workspace` crate's journal. This reports what a turn changed without
+/// altering how it changes it — an observer on the write path, not a second
+/// write path.
+///
+/// Line counts, not a diff: there is no LCS implementation in this tree and
+/// inventing one to render `+n/-m` would be claiming a computation that did
+/// not happen. Before/after counts are true and answer the question a
+/// reader has ("what did it touch, and did it grow").
+pub(crate) trait WorkspaceChanges: Send + Sync {
+    /// `path` is workspace-relative. `before` is `None` when the file did
+    /// not exist.
+    fn wrote(&self, path: &str, before: Option<u64>, after: u64);
+}
+
 /// Registry of background commands started by `shell.exec` with
 /// `background: true`.
 ///
@@ -1023,6 +1042,8 @@ pub struct WorkspaceTools {
     /// default; headless `exec` turns it on so runs are diagnosable.
     trace_calls: bool,
     subagents: Option<Arc<dyn SubagentRunner>>,
+    /// See [`WorkspaceChanges`]. `None` outside a kernel session.
+    changes: Option<Arc<dyn WorkspaceChanges>>,
     fetch_allowlist: Vec<String>,
     hooks: crate::hooks::HooksConfig,
     shadow_diagnostics: Option<crate::shadow_diagnostics::ShadowDiagnosticsConfig>,
@@ -1101,6 +1122,7 @@ impl WorkspaceTools {
             read_only: false,
             trace_calls: false,
             subagents: None,
+            changes: None,
             fetch_allowlist: Vec::new(),
             hooks: crate::hooks::HooksConfig::default(),
             shadow_diagnostics: None,
@@ -1393,6 +1415,20 @@ impl WorkspaceTools {
     /// [`JobRegistry::share_table`].
     pub(crate) fn share_job_table(&mut self, session: &JobRegistry) {
         self.jobs.share_table(session);
+    }
+
+    /// Report this surface's workspace writes to `changes`. See
+    /// [`WorkspaceChanges`].
+    pub(crate) fn set_workspace_changes(&mut self, changes: Arc<dyn WorkspaceChanges>) {
+        self.changes = Some(changes);
+    }
+
+    /// The sink this surface reports writes to, for propagating to a
+    /// subagent child — a child's writes are this turn's writes, and a
+    /// `/diff` showing only the parent's would be a half-truth about what
+    /// changed.
+    pub(crate) fn workspace_changes(&self) -> Option<Arc<dyn WorkspaceChanges>> {
+        self.changes.clone()
     }
 
     /// The sink this surface reports jobs to, for propagating to a subagent
@@ -1778,6 +1814,28 @@ impl WorkspaceTools {
         Ok(result)
     }
 
+    /// Write `bytes` to `target` and report the change.
+    ///
+    /// The single place a workspace file is written by a tool:
+    /// `execute_write` has three exits (shadow-verified, shadow-skipped,
+    /// plain) and `execute_patch` two, and a recorder repeated at each is the
+    /// "every call site must remember" shape this codebase keeps removing.
+    /// The read of the previous size happens before the write, because after
+    /// it there is nothing left to compare against.
+    fn write_workspace_file(
+        &self,
+        target: &Path,
+        relative: &str,
+        bytes: &[u8],
+    ) -> Result<(), ToolStepError> {
+        let before = std::fs::read(target).ok().map(|old| line_count(&old));
+        atomic_write(target, bytes).map_err(|_| ToolStepError::Failed)?;
+        if let Some(changes) = self.changes.as_ref() {
+            changes.wrote(relative, before, line_count(bytes));
+        }
+        Ok(())
+    }
+
     fn execute_write(
         &self,
         call: &ValidatedToolCall,
@@ -1845,7 +1903,7 @@ impl WorkspaceTools {
                     });
                 }
                 ShadowVerifyOutcome::Passed { diagnostics_tail } => {
-                    atomic_write(&target, args.content.as_bytes()).map_err(|_| ToolStepError::Failed)?;
+                    self.write_workspace_file(&target, &args.path, args.content.as_bytes())?;
                     let mut summary = format!(
                         "wrote {} bytes to {} (shadow diagnostics: ok)\n{diagnostics_tail}",
                         args.content.len(),
@@ -1862,8 +1920,7 @@ impl WorkspaceTools {
                     // setup must never block a normal write. Falls through
                     // to the direct write below, noting the skip so it is
                     // not silently invisible.
-                    atomic_write(&target, args.content.as_bytes())
-                        .map_err(|_| ToolStepError::Failed)?;
+                    self.write_workspace_file(&target, &args.path, args.content.as_bytes())?;
                     let mut summary = format!(
                         "wrote {} bytes to {} (shadow diagnostics skipped: {reason})",
                         args.content.len(),
@@ -1877,7 +1934,7 @@ impl WorkspaceTools {
                 }
             }
         }
-        atomic_write(&target, args.content.as_bytes()).map_err(|_| ToolStepError::Failed)?;
+        self.write_workspace_file(&target, &args.path, args.content.as_bytes())?;
         let mut summary = format!("wrote {} bytes to {}", args.content.len(), args.path);
         append_write_advisories(&mut summary, self.root(), &args.path, args.content.as_bytes());
         Ok(ToolStepResult::Succeeded {
@@ -2173,7 +2230,7 @@ impl WorkspaceTools {
                     detail: Some(bounded_detail(&detail)),
                 });
             }
-            atomic_write(&target, updated.as_bytes()).map_err(|_| ToolStepError::Failed)?;
+            self.write_workspace_file(&target, &args.path, updated.as_bytes())?;
             let mut summary = format!("replaced {exact_occurrences} occurrence(s) in {}", args.path);
             append_write_advisories(&mut summary, self.root(), &args.path, updated.as_bytes());
             return Ok(ToolStepResult::Succeeded {
@@ -2233,7 +2290,7 @@ impl WorkspaceTools {
                 detail: Some(bounded_detail(&detail)),
             });
         }
-        atomic_write(&target, updated.as_bytes()).map_err(|_| ToolStepError::Failed)?;
+        self.write_workspace_file(&target, &args.path, updated.as_bytes())?;
         let mut summary = format!(
             "replaced {} occurrence(s) in {} (whitespace-insensitive match)",
             selected.len(),
@@ -3453,6 +3510,18 @@ fn bounded_text(bytes: &[u8], cap: usize) -> String {
 /// still-in-flight temp file out from under it. Mirrors
 /// `workspace::backends::direct::write_confined`'s `TMP_SEQ`.
 static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Lines in `bytes`, counting a trailing newline as terminating the last
+/// line rather than starting an empty one — so a normal file's count matches
+/// what an editor shows.
+fn line_count(bytes: &[u8]) -> u64 {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let trailing = u64::from(bytes.last() == Some(&b'\n'));
+    u64::try_from(bytes.iter().filter(|byte| **byte == b'\n').count()).unwrap_or(u64::MAX) + 1
+        - trailing
+}
 
 pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     atomic_write_with_mode(target, bytes, None)
@@ -5240,6 +5309,21 @@ impl ExecTools {
     pub(crate) fn share_job_table(&mut self, session: &JobRegistry) {
         if let Self::Workspace(tools) = self {
             tools.share_job_table(session);
+        }
+    }
+
+    /// Report workspace writes to `changes` (no-op on the no-op surface).
+    pub(crate) fn set_workspace_changes(&mut self, changes: Arc<dyn WorkspaceChanges>) {
+        if let Self::Workspace(tools) = self {
+            tools.set_workspace_changes(changes);
+        }
+    }
+
+    /// This surface's workspace-change sink, for propagating to a subagent.
+    pub(crate) fn workspace_changes(&self) -> Option<Arc<dyn WorkspaceChanges>> {
+        match self {
+            Self::Workspace(tools) => tools.workspace_changes(),
+            _ => None,
         }
     }
 

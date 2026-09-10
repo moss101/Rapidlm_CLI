@@ -605,15 +605,41 @@ while `route_renders_content` claims {claims}"
         assert_eq!(availability_of(usage("permissions")), Availability::Full);
         // No knowledge-candidate store exists at all.
         assert_eq!(availability_of(usage("knowledge")), Availability::None);
-        // `/memory` opens a panel that now renders the project memory index,
-        // so its single alternative is real. This assertion said `None` until
-        // that panel was given a renderer — which is the derivation working:
-        // availability follows the compositor, and a hardcoded answer here is
-        // what goes stale.
+        // `/memory` opens a panel that renders the project memory index, so
+        // its single alternative is real. This said `None` until that panel
+        // was given a renderer — the derivation working: availability follows
+        // the compositor, and a hardcoded answer is what goes stale.
         assert_eq!(availability_of(usage("memory")), Availability::Full);
-        // `/diff` still opens a panel that paints nothing, so it keeps this
-        // test's coverage of the `None` case.
-        assert_eq!(availability_of(usage("diff")), Availability::None);
+        // Coverage of the `None` case for a panel-only command, *derived*
+        // rather than named. `/memory` and then `/diff` each held this spot
+        // and each had to be edited when its panel became real — three edits
+        // to keep asserting one unchanged property. Asking the compositor
+        // which route still paints nothing keeps the coverage without the
+        // churn, and when the last empty panel is filled this simply finds
+        // nothing to check and says so.
+        let dead_panel_command = tui::catalog().find(|entry| {
+            let Ok(command) = tui::parse_command(&format!("/{}", entry.name)) else {
+                return false;
+            };
+            match tui::dispatch(command) {
+                tui::FrontendAction::Local(tui::LocalAction::Open(inspector)) => inspector
+                    .route()
+                    .is_some_and(|route| !tui::route_renders_content(route)),
+                _ => false,
+            }
+        });
+        match dead_panel_command {
+            Some(entry) => assert_eq!(
+                availability_of(entry.usage),
+                Availability::None,
+                "`/{}` opens a panel that paints nothing and must read as unavailable",
+                entry.name
+            ),
+            None => {
+                // Every panel-only command now renders something. Nothing to
+                // assert, and nothing stale left behind.
+            }
+        }
         // Goal lifecycle is real; only `budget` has no backend.
         assert_eq!(availability_of(usage("goal")), Availability::Partial);
     }

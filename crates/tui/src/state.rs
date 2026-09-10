@@ -172,6 +172,9 @@ pub struct AppState {
     /// Per-class breakdown from the same `context.compiled` event — which
     /// class is consuming the window, which the totals cannot answer.
     context_partitions: Vec<ContextPartition>,
+    /// Files this session's turns wrote, keyed by workspace-relative path so
+    /// repeated writes to one file collapse into one row.
+    changed_files: BTreeMap<String, ChangedFile>,
     approvals: BTreeMap<ApprovalKey, ApprovalProjection>,
     selected_agent: Option<AgentId>,
     selected_goal: Option<GoalId>,
@@ -375,6 +378,23 @@ pub struct JobProjection {
     /// display string, so it can neither exceed the display bound nor
     /// survive a secret-classified event.
     command: Option<String>,
+}
+
+/// One file this session changed, as the `/diff` panel shows it.
+///
+/// Line counts rather than added/removed: nothing in this tree computes a
+/// line diff, and rendering `+n/-m` from a net change would claim a
+/// computation that did not happen. `before` is `None` for a file that did
+/// not exist.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangedFile {
+    pub path: String,
+    pub lines_before: Option<u64>,
+    pub lines_after: u64,
+    /// How many times this session wrote it — a file rewritten repeatedly is
+    /// a different situation from one touched once, and the last write's
+    /// counts alone cannot say which happened.
+    pub writes: u64,
 }
 
 /// One hard context partition, as the `/context` panel shows it.
@@ -581,6 +601,31 @@ fn apply_kernel(
         }
         EventKind::JobStarted => {
             upsert_job(&mut state, event, JobLifecycle::Started)?;
+        }
+        EventKind::WorkspaceMutationDetected => {
+            // The path is workspace-relative text from a tool call, so it
+            // goes through the same bounded, redaction-aware accessor as
+            // every other display string.
+            if let (Some(path), Some(after)) = (
+                optional_display(event, event.payload(), "path")?,
+                optional_u64(event.payload(), "lines_after")?,
+            ) {
+                let before = optional_u64(event.payload(), "lines_before")?;
+                let entry = state
+                    .changed_files
+                    .entry(path.clone())
+                    .or_insert(ChangedFile {
+                        path,
+                        // Only the *first* write's "before" describes what
+                        // the session started from; a later write's before is
+                        // this session's own earlier output.
+                        lines_before: before,
+                        lines_after: after,
+                        writes: 0,
+                    });
+                entry.lines_after = after;
+                entry.writes = entry.writes.saturating_add(1);
+            }
         }
         EventKind::ContextCompiled => {
             // Both fields or neither: a limit without a usage (or the
@@ -1189,6 +1234,7 @@ impl AppState {
             memory: Vec::new(),
             context_usage: None,
             context_partitions: Vec::new(),
+            changed_files: BTreeMap::new(),
             approvals: BTreeMap::new(),
             selected_agent: None,
             selected_goal: None,
@@ -1262,6 +1308,10 @@ impl AppState {
 
     pub fn context_partitions(&self) -> &[ContextPartition] {
         &self.context_partitions
+    }
+
+    pub fn changed_files(&self) -> &BTreeMap<String, ChangedFile> {
+        &self.changed_files
     }
 
     pub fn jobs(&self) -> &BTreeMap<JobId, JobProjection> {

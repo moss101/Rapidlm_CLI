@@ -2534,6 +2534,10 @@ struct LiveSubagentRunner {
     /// `/jobs` panel showing only the parent's would be a half-truth about
     /// what is running.
     job_events: Option<std::sync::Arc<dyn crate::exec_tools::JobEvents>>,
+    /// The parent's workspace-change sink, propagated for the same reason:
+    /// a subagent's writes are this turn's writes, and a `/diff` showing
+    /// only the parent's would be a half-truth about what changed.
+    workspace_changes: Option<std::sync::Arc<dyn crate::exec_tools::WorkspaceChanges>>,
     /// The parent's configured project hooks, cloned into every child so a
     /// `pre_tool_use`/`post_tool_use` policy hook that gates the parent's
     /// own tool calls also gates its subagents' — without this, delegating
@@ -2611,6 +2615,9 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         tools.share_job_budget(self.job_budget.clone());
         if let Some(events) = self.job_events.clone() {
             tools.set_job_events(events);
+        }
+        if let Some(changes) = self.workspace_changes.clone() {
+            tools.set_workspace_changes(changes);
         }
         // Scrub the same known secrets from this child's own shell_exec
         // output as the parent's — see `redaction`'s own doc comment.
@@ -3502,6 +3509,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                 write_locks,
                 job_budget,
                 job_events: tools.job_events(),
+                workspace_changes: tools.workspace_changes(),
                 hooks,
                 shadow_diagnostics,
                 trace_calls,
@@ -5226,6 +5234,39 @@ impl crate::exec_tools::JobEvents for LedgerJobEvents {
     }
 }
 
+/// Reports a turn's workspace writes into the session ledger, so `/diff`
+/// shows what the agent changed.
+///
+/// Owns its handles for the same reason [`LedgerJobEvents`] does — a
+/// subagent's writes come from a different call stack — and appends through
+/// the same `append_turn_progress`, at the session tip, racing the turn's own
+/// events safely. A failed append is dropped: the write already happened and
+/// is the real work; the ledger not hearing about it must not turn a
+/// successful edit into a tool failure.
+struct LedgerWorkspaceChanges {
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: ActorRef,
+}
+
+impl crate::exec_tools::WorkspaceChanges for LedgerWorkspaceChanges {
+    fn wrote(&self, path: &str, before: Option<u64>, after: u64) {
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::WorkspaceMutationDetected,
+            serde_json::json!({
+                "path": path,
+                // Absent means the file did not exist, which the panel shows
+                // as "new" rather than as a change from zero lines.
+                "lines_before": before,
+                "lines_after": after,
+            }),
+        );
+    }
+}
+
 /// Run `f`, converting a panic into a `Failed` outcome instead of letting it
 /// unwind past whatever the caller does afterward — `spawn_interactive_
 /// turn`'s cleanup (releasing the turn's lease, clearing `turn_in_flight`)
@@ -5743,6 +5784,13 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
     // they reach the `/jobs` panel through the ordinary subscription rather
     // than a second channel.
     tools.set_job_events(std::sync::Arc::new(LedgerJobEvents {
+        client: client.clone(),
+        session_id,
+        actor: actor.clone(),
+    }));
+    // Workspace writes reach `/diff` the same way: through the ledger, not a
+    // second channel.
+    tools.set_workspace_changes(std::sync::Arc::new(LedgerWorkspaceChanges {
         client: client.clone(),
         session_id,
         actor: actor.clone(),
@@ -9875,6 +9923,69 @@ question the panel answers"
     }
 
     #[test]
+    fn a_turn_s_workspace_writes_reach_the_diff_panel() {
+        // `/diff` opened an empty panel for the most basic question a coding
+        // CLI answers: what did the agent change? `apps/rapid` writes through
+        // `atomic_write` and never touched the `workspace` crate's journal,
+        // so nothing recorded a mutation for the panel to project.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        assert!(
+            session.state().changed_files().is_empty(),
+            "a session that has written nothing has nothing to show"
+        );
+
+        session.run_turn(
+            "write a note",
+            ScriptedModel::write_then_answer("notes.md", "hello", "wrote it"),
+        );
+
+        let changed = session.state().changed_files();
+        let file = changed
+            .get("notes.md")
+            .unwrap_or_else(|| panic!("the written file must be listed: {changed:?}"));
+        assert_eq!(
+            file.lines_before, None,
+            "a file that did not exist is new, not a change from zero lines"
+        );
+        assert_eq!(file.lines_after, 1);
+        assert_eq!(file.writes, 1);
+
+        // Writing it again updates the same row rather than adding a second,
+        // and the *original* before-state is what the session started from.
+        session.run_turn(
+            "extend it",
+            ScriptedModel::write_then_answer("notes.md", "hello\nagain", "extended"),
+        );
+        let changed = session.state().changed_files();
+        assert_eq!(changed.len(), 1, "one row per file: {changed:?}");
+        let file = &changed["notes.md"];
+        assert_eq!(
+            file.lines_before, None,
+            "the first write's before-state is the session's starting point, \
+not this session's own earlier output"
+        );
+        assert_eq!(file.lines_after, 2);
+        assert_eq!(file.writes, 2);
+
+        let panel = tui::sidebar_lines(
+            tui::state::UiRoute::Diff,
+            session.state(),
+            70,
+            8,
+            &tui::state::CancellationToken::new(),
+        );
+        assert!(
+            panel[0].contains("notes.md") && panel[0].contains("new, 2 lines"),
+            "the panel must name the file and what became of it: {panel:?}"
+        );
+        assert!(
+            panel[0].contains("2 writes"),
+            "a file rewritten twice is a different situation from one touched once: {panel:?}"
+        );
+    }
+
+    #[test]
     fn a_finished_turn_reports_the_context_it_actually_used() {
         // The `ctx:` item read a dash for every session: the compiler
         // computes `included_tokens` against `context_limit` on every turn
@@ -10926,10 +11037,18 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         }
 
         fn write_then_answer(path: &str, content: &str, answer: &str) -> Self {
+            // Serialized, not interpolated: a `content` containing a
+            // newline or a quote produced invalid JSON and surfaced as an
+            // opaque `InvalidToolCall` from the tool layer, which reads like
+            // a production bug rather than a broken fixture.
             let call = ProposedToolCall::new(
                 "c1",
                 crate::exec_tools::WORKSPACE_WRITE_TOOL,
-                format!(r#"{{"path":"{path}","content":"{content}"}}"#),
+                serde_json::to_string(&serde_json::json!({
+                    "path": path,
+                    "content": content,
+                }))
+                .expect("encode write args"),
             )
             .expect("call");
             Self {

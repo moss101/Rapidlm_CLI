@@ -7449,6 +7449,58 @@ breakdown empty and the test says which classes consumed the window is missing.
 change set to project. That is a wiring task on the *write* path, not a rendering one, and it is the
 largest remaining item in this family.
 
+**`/diff` answers what the agent changed, done 2026-09-10.**
+
+The most basic question a coding CLI answers, and the panel was empty because nothing recorded it:
+`apps/rapid` writes through `atomic_write` and never touches the `workspace` crate's journal,
+transaction or patch machinery, so there was no change set to project. This adds an *observer* on the
+write path, not a second write path.
+
+**Line counts, not a diff — and that is a deliberate limit, not an oversight.** There is no LCS
+implementation in this tree and no diff dependency. Rendering `+n/-m` from a net line change would claim
+a computation that did not happen, so the panel shows `140 -> 152 lines`, or `new, 23 lines` for a file
+that did not exist. That is true, and it answers what a reader opens the panel for: what did it touch,
+and did it grow. Real hunks need a diff implementation and are a separate task.
+
+**One place writes and records.** `execute_write` has three exits (shadow-verified, shadow-skipped,
+plain) and `execute_patch` two; a recorder repeated at each is the "every call site must remember" shape
+this document keeps recording. `write_workspace_file` is the single path, and it reads the previous size
+*before* writing, because afterwards there is nothing left to compare against. `atomic_write` itself is
+untouched — it also writes config files (`rapid mcp add`, `permissions`), which are not workspace
+mutations.
+
+**A subagent's writes are this turn's writes**, so the sink propagates to children beside the job sink
+and the job budget, for the same reason.
+
+**One row per file, and the first write's before-state is what the session started from.** A later write
+to the same file compares against this session's *own* earlier output, so overwriting `lines_before`
+would make a file the agent created look like a file it merely edited. The row carries a write count
+because a file rewritten five times is a different situation from one touched once, and the last write's
+counts alone cannot distinguish them.
+
+**A test-harness bug fixed on the way.** `ScriptedModel::write_then_answer` built its tool arguments by
+string interpolation, so content containing a newline produced invalid JSON and surfaced as an opaque
+`InvalidToolCall` from the tool layer — which reads like a production defect rather than a broken
+fixture. It serializes properly now.
+
+**The stale-anchor churn is over.** `availability_reflects_what_the_dispatcher_really_does` needed a
+command whose panel paints nothing to cover the `None` case. `/memory` held that spot, then `/diff`, and
+each had to be edited when its panel became real — three edits to keep asserting one unchanged property.
+The test now *asks the compositor* which panel-only command still paints nothing, so filling the next
+panel needs no edit here, and when the last one is filled it finds nothing to check and says so.
+
+**Tests.** One new, through a real scripted turn: a written file appears with its line count and is
+marked new; a second write updates the same row, keeps the original before-state and increments the write
+count; and the panel names the file and what became of it. Two revert cycles (111-112) — not recording
+leaves the panel empty, and letting a later write overwrite the before-state makes a created file look
+edited.
+
+695 `rapid` lib tests, 233 `tui`, clippy identical to baseline, full workspace green.
+
+**Three panels still empty and still honestly marked:** `/graph`, `/computer`, `/resources` — all
+backed by subsystems the binary does not run (graph execution, computer-use, resource pools), so each
+needs its feature before its panel. That is scope, not a rendering gap.
+
 ## Session boundary, 2026-09-10 — durable state for the next session
 
 Eighteen commits across two days, `dbeb2c2`..`9c0a450`, all pushed to `origin/main`. Baseline before them
@@ -7479,12 +7531,12 @@ actually failed them.
 
 ### What is actually left, in the order I would take it
 
-1. **`/diff` — the largest remaining item in the panel family, and the only one with no data source at
-   all.** `apps/rapid` writes through `atomic_write` and never touches the `workspace` crate's journal,
-   transaction or patch machinery (`JournalEntry`/`JournalOp`, `patch::model`, `transaction`), all of
-   which is mature and unwired. This is a change on the *write* path, not a rendering one: something has
-   to record what a turn changed before anything can show it. `/graph`, `/computer` and `/resources` are
-   the same shape with less value.
+1. ~~`/diff`~~ — **done the same day, see the entry above.** A `WorkspaceChanges` observer on the write
+   path records what each turn wrote; the panel shows files and line counts. What remains here is *real
+   hunks*, which need a diff implementation (no LCS in tree, no diff dependency) — a separate task, and
+   the `workspace` crate's journal/transaction machinery is still unwired if a richer change set is ever
+   wanted. `/graph`, `/computer` and `/resources` are backed by subsystems the binary does not run, so
+   each needs its feature before its panel.
 2. **`/agents cancel` and `/agents terminate`.** Still refused honestly. `KernelApi::Interrupt` is
    session-wide and takes no id, and there is no running-agent registry — subagents run *inside* the
    parent turn, and `host_runtime`/`agent-pool` (which would give background agents) is not used by the

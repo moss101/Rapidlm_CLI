@@ -167,10 +167,8 @@ pub fn sidebar_lines(
         UiRoute::Models => model_lines(state, width, height),
         UiRoute::Memory => memory_lines(state, width, height),
         UiRoute::Context => context_lines(state, width, height),
-        UiRoute::Diff
-        | UiRoute::Graph
-        | UiRoute::Computer
-        | UiRoute::Resources => Vec::new(),
+        UiRoute::Diff => diff_lines(state, width, height),
+        UiRoute::Graph | UiRoute::Computer | UiRoute::Resources => Vec::new(),
     }
 }
 
@@ -195,8 +193,9 @@ pub const fn route_renders_content(route: UiRoute) -> bool {
         | UiRoute::Approvals
         | UiRoute::Models
         | UiRoute::Memory
-        | UiRoute::Context => true,
-        UiRoute::Diff | UiRoute::Graph | UiRoute::Computer | UiRoute::Resources => false,
+        | UiRoute::Context
+        | UiRoute::Diff => true,
+        UiRoute::Graph | UiRoute::Computer | UiRoute::Resources => false,
     }
 }
 
@@ -391,6 +390,43 @@ fn context_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
             "  {} {}/{}",
             partition.class, partition.used, partition.cap
         ));
+    }
+    lines.truncate(usize::from(height));
+    for line in &mut lines {
+        *line = fit_width(line, usize::from(width));
+    }
+    lines
+}
+
+/// The `/diff` panel: which files this session changed.
+///
+/// **Line counts, not a diff.** Nothing in this tree computes a line diff —
+/// there is no LCS implementation and no diff dependency — so rendering
+/// `+n/-m` would claim a computation that did not happen. `140 -> 152 lines`
+/// is true, and answers what a reader opens this panel for: what did the
+/// agent touch, and did it grow or shrink.
+///
+/// Paths are workspace-relative and come from tool calls, so they render
+/// through `sanitize_untrusted` like every other untrusted string.
+fn diff_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
+    let mut lines: Vec<String> = state
+        .changed_files()
+        .values()
+        .map(|file| {
+            let path = sanitize_untrusted(&file.path);
+            let change = match file.lines_before {
+                None => format!("new, {} lines", file.lines_after),
+                Some(before) => format!("{before} -> {} lines", file.lines_after),
+            };
+            if file.writes > 1 {
+                format!("{path}  {change} ({} writes)", file.writes)
+            } else {
+                format!("{path}  {change}")
+            }
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push("no files changed in this session".to_owned());
     }
     lines.truncate(usize::from(height));
     for line in &mut lines {
