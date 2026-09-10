@@ -7501,6 +7501,52 @@ edited.
 backed by subsystems the binary does not run (graph execution, computer-use, resource pools), so each
 needs its feature before its panel. That is scope, not a rendering gap.
 
+**`/fork` now moves the session onto the branch it created, done 2026-09-10.**
+
+The fork was always real and durable; only the switch was missing. The command reduced the child snapshot
+into the UI and said nothing, so it *looked* like a switch for one frame and reverted on the next drain —
+that was made honest earlier by reporting "this session continues on the parent", and this closes the
+capability itself. Forking and then staying put is not what a user means by it: the branch exists to be
+worked in.
+
+**`switch_to_session` is `rapid resume`'s procedure, reused.** Read the tip, subscribe from 0 so the
+kernel replays, fold into a *fresh* `AppState` — seeding one with the tip makes every replayed event
+violate `apply_next`'s seq-continuity rule and discards the whole history, which is the trap resume
+already documented. Replacing `*self.stream` drops the old subscription, which stops its worker.
+Host-owned chrome (models, memory index, the persisted goal) is re-synced rather than carried across: it
+is read from files and belongs to the *project*, not to either session.
+
+**Refused while a turn or an autonomous goal is running.** A fork mid-turn would branch from a sequence
+the turn is still writing to, and the switch would move the session out from under a thread still
+emitting into it.
+
+**A revert cycle passed twice before the test was right, and each failure taught something.** Leaving the
+stream on the parent while switching the id *looked* harmless: `drain` reconciles against
+`self.session_id`, so the parent's events do not leak into the child and no mismatch is recorded. Making
+the parent emit after the fork did not catch it either — the subscription is worker-fed, so one drain can
+run before the event is queued (the same race that truncated replayed transcripts). The observable
+consequence of a half-switch is neither of those: it is that **the child's own events never arrive**,
+because the subscription is still tailing the parent. The test now has the child emit and requires the UI
+to see it, and against the broken version it reports `left: None, right: Some((7, 9))`.
+
+**An older test had to be retargeted for the third time, and its comment now says so.**
+`fork_says_it_branched_rather_than_appearing_to_switch_and_reverting` asserted the command says it did
+*not* switch — true until this change. It is now
+`fork_reports_the_branch_it_moved_onto_and_how_to_get_back`, asserting what has to stay true across all
+three behaviours: a user can tell which session they are in and how to reach the other one. The message
+names the child and gives `rapid resume <parent>`, which works because the parent is a durable session
+like any other.
+
+**Tests.** One new (the switch survives drains and the child's events arrive) and one retargeted. Two
+revert cycles (113-114) — not switching leaves the session on the parent; switching the id without the
+stream starves the child.
+
+696 `rapid` lib tests, clippy identical to baseline, full workspace green.
+
+**Not done, and worth knowing:** there is no `/fork --list` or way back other than `rapid resume <id>`,
+and the fork point is always the session's current tip (`/fork [checkpoint]`'s optional operand is still
+unused — `parse_fork` accepts none). Both are ordinary follow-ups now that switching works.
+
 ## Session boundary, 2026-09-10 — durable state for the next session
 
 Eighteen commits across two days, `dbeb2c2`..`9c0a450`, all pushed to `origin/main`. Baseline before them
@@ -7541,8 +7587,8 @@ actually failed them.
    session-wide and takes no id, and there is no running-agent registry — subagents run *inside* the
    parent turn, and `host_runtime`/`agent-pool` (which would give background agents) is not used by the
    binary at all. Making this real means background agents first, which is a feature, not wiring.
-3. **Switching a live session onto a fork.** `/fork` reports the child it created and stays on the
-   parent; switching needs the event stream re-subscribed.
+3. ~~Switching a live session onto a fork~~ — **done the same day, see the entry above.** What remains
+   is choosing a fork point (`/fork [checkpoint]`'s operand is still unused) and a way to list branches.
 4. **Integration breadth**: daemon/ACP/SDK server, the MCP catalog subsystem and remote transports,
    knowledge/playbooks, distribution and installability. All are honestly absent today (roadmap in
    `docs/reference/cli-command-reference.md`, absent from `SUBCOMMANDS`), so none of them lies — they are

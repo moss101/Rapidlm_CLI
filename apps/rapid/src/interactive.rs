@@ -4783,6 +4783,52 @@ denied\n",
         self.submit_turn(&prompt)
     }
 
+    /// Move this live session onto `target`, rebuilding its transcript from
+    /// the durable ledger.
+    ///
+    /// The same three steps `rapid resume` performs, for the same reasons:
+    /// read the tip, subscribe from 0 so the kernel replays, and fold into a
+    /// *fresh* `AppState` — seeding one with the tip would make every
+    /// replayed event violate `apply_next`'s seq-continuity rule and discard
+    /// the whole history. Replacing `*self.stream` drops the old
+    /// subscription, which stops its worker thread.
+    ///
+    /// Host-owned chrome (the configured models, the memory index) is
+    /// re-synced rather than carried across, because it is read from files
+    /// and environment and belongs to the *project*, not to either session —
+    /// re-reading it is both simpler and correct if it changed.
+    fn switch_to_session(
+        &mut self,
+        target: protocol::SessionId,
+    ) -> Result<(), InteractiveError> {
+        let snapshot = block_on(self.client.get_session(target), self.cancel)?;
+        let mut fresh = AppState::new();
+        let mut stream = block_on(
+            self.client.subscribe(SubscribeEvents::new(target, 0)),
+            self.cancel,
+        )?;
+        replay_history(
+            self.client,
+            &mut stream,
+            &mut fresh,
+            target,
+            snapshot.seq(),
+            self.cancel,
+        )?;
+        // `sync_persisted_goal` takes the ledger path and reads the goal
+        // beside it, so hand it the project's resolved ledger.
+        sync_persisted_goal(
+            &mut fresh,
+            &project_ledger_path(&self.root.join(PROJECT_MARKER)),
+        );
+        sync_configured_models(&mut fresh);
+        sync_memory_index(&mut fresh, self.root);
+        *self.stream = stream;
+        *self.ui = fresh;
+        self.session_id = target;
+        Ok(())
+    }
+
     /// `/jobs cancel [id]`: stop one background job, or every running one.
     ///
     /// Reports what actually happened rather than acknowledging blindly — a
@@ -4857,6 +4903,23 @@ denied\n",
                     self.submit_turn("")?;
                 }
                 KernelApi::ForkSession => {
+                    // A fork mid-turn would branch from a sequence the turn
+                    // is still writing to, and the switch below would move
+                    // the session out from under a thread still emitting
+                    // into it.
+                    if self.turn_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+                        self.append_command_error(
+                            "a turn is running; wait for it to finish before forking".to_owned(),
+                        );
+                        return self.drain();
+                    }
+                    if self.autonomous.is_some() {
+                        self.append_command_error(
+                            "an autonomous goal is running; stop it with /goal stop before forking"
+                                .to_owned(),
+                        );
+                        return self.drain();
+                    }
                     let seq = self.ui.snapshot().map(|s| s.seq()).unwrap_or(0);
                     let child = block_on(
                         self.client.fork_session(ForkSession::new(
@@ -4867,19 +4930,18 @@ denied\n",
                         )),
                         self.cancel,
                     )?;
-                    // The fork is real and durable, but this session is not
-                    // switched onto it: `self.session_id` and the subscribed
-                    // event stream both still point at the parent, so the
-                    // next `drain()` re-fetches the parent snapshot and
-                    // overwrites the child's. Reducing the child snapshot in
-                    // and saying nothing therefore *looked* like a switch
-                    // for one frame and then silently reverted — so say what
-                    // actually happened instead. Switching the live session
-                    // would mean re-subscribing the stream, which is a
-                    // separate piece of work.
                     let child_id = child.id();
+                    let parent_id = self.session_id;
+                    // Forking and then staying on the parent is not what a
+                    // user means by it: the branch exists to be worked in.
+                    // This used to reduce the child snapshot into the UI and
+                    // say nothing, which *looked* like a switch for one frame
+                    // and then silently reverted, because the id and the
+                    // subscribed stream both still pointed at the parent.
+                    self.switch_to_session(child_id)?;
                     self.append_command_output(format!(
-                        "forked at seq {seq}: child session {child_id}\nthis session continues on the parent; there is no way to switch to a fork yet\n"
+                        "forked at seq {seq}: now on child session {child_id}\n\
+the parent is unchanged; `rapid resume {parent_id}` reopens it\n"
                     ));
                 }
                 KernelApi::Rewind => {
@@ -9923,6 +9985,99 @@ question the panel answers"
     }
 
     #[test]
+    fn forking_moves_the_session_onto_the_child() {
+        // `/fork` created a real, durable child and then stayed on the
+        // parent: the id and the subscribed stream both still pointed at it,
+        // so reducing the child snapshot in *looked* like a switch for one
+        // frame and the next drain overwrote it. A branch exists to be
+        // worked in.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let parent_id = session.session_id;
+
+        let cancel = CancellationToken::new();
+        let snapshot = block_on(session.client.get_session(parent_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(parent_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let mut renderer = TuiRenderer::new(true);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            scripted_backing_queue(Vec::new()),
+        );
+
+        loop_state.dispatch_slash("/fork").expect("fork");
+        let child_id = loop_state.session_id;
+        assert_ne!(
+            child_id, parent_id,
+            "the session must be on the child, not the parent it forked from"
+        );
+
+        // The switch must survive a drain. Asserting that alone is not
+        // enough: with an idle parent a stale subscription delivers nothing
+        // and the revert cannot be observed. So the *parent* emits after the
+        // fork — a subscription still pointing at it would feed that event
+        // into a session it does not belong to.
+        // The observable consequence of a half-switch is not that the parent
+        // leaks in — `drain` reconciles by id, so it does not — but that the
+        // *child's* own events never arrive, because the subscription is
+        // still tailing the parent. So the child emits, and the UI must see
+        // it.
+        session
+            .client
+            .append_turn_progress(
+                child_id,
+                &session.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::ContextCompiled,
+                serde_json::json!({"included_tokens": 7, "context_limit": 9}),
+            )
+            .expect("the child accepts its own events");
+        // The subscription is worker-fed, so one drain can run before the
+        // event is queued — the same race that made `replay_history` truncate
+        // transcripts. Drain repeatedly so a stale stream has every chance to
+        // deliver what it should not have.
+        for _ in 0..30 {
+            loop_state.drain().expect("drain");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            loop_state.session_id, child_id,
+            "and must still be there after the next drain"
+        );
+        assert_eq!(
+            loop_state.ui.snapshot().map(|s| s.id()),
+            Some(child_id),
+            "the projected snapshot must be the child's, not the parent's"
+        );
+        assert!(
+            !loop_state.ui.actions_blocked(),
+            "the switched session must be usable: {:?}",
+            loop_state.ui.protocol_error()
+        );
+        assert_eq!(
+            loop_state.ui.context_usage(),
+            Some((7, 9)),
+            "the child's own events must reach the UI — a subscription left on \
+the parent delivers nothing for the session the user is now in"
+        );
+    }
+
+    #[test]
     fn a_turn_s_workspace_writes_reach_the_diff_panel() {
         // `/diff` opened an empty panel for the most basic question a coding
         // CLI answers: what did the agent change? `apps/rapid` writes through
@@ -10458,13 +10613,13 @@ was already finished"
     }
 
     #[test]
-    fn fork_says_it_branched_rather_than_appearing_to_switch_and_reverting() {
-        // `/fork` reduced the child snapshot into the UI and printed
-        // nothing. `self.session_id` and the subscribed event stream both
-        // still point at the parent, so the very next `drain()` re-fetched
-        // the parent and overwrote it — the command looked like a switch for
-        // one frame and then silently reverted, with no way to tell it had
-        // done anything at all.
+    fn fork_reports_the_branch_it_moved_onto_and_how_to_get_back() {
+        // History of this test: `/fork` originally reduced the child snapshot
+        // into the UI and printed nothing, so it looked like a switch for one
+        // frame and then silently reverted; it was then made to say it had
+        // *not* switched; and now it really does switch. What has to stay
+        // true throughout is that a user can tell which session they are in
+        // and how to reach the other one.
         let _lock = lock_terminal();
         let env = TempEnv::create();
         let report = run_interactive(env.options_capturing_render(vec![
@@ -10475,12 +10630,19 @@ was already finished"
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
         let painted = report.rendered_output.expect("capture_render was requested");
         assert!(
-            painted.contains("child session"),
-            "the fork it really created must be named:\n{painted}"
+            painted.contains("now on child session"),
+            "the branch it moved onto must be named:\n{painted}"
         );
         assert!(
-            painted.contains("continues on the parent"),
-            "and it must not leave the user thinking they switched:\n{painted}"
+            painted.contains("rapid resume"),
+            "and the way back to the parent must be given, since the session \
+the user was in is no longer the one they are in:\n{painted}"
+        );
+        // The reported session is the child, not the parent it forked from.
+        let parent = report.session_id.expect("a session id");
+        assert!(
+            !painted.contains(&format!("now on child session {parent}")),
+            "the child must be a different session than the one that forked:\n{painted}"
         );
     }
 
