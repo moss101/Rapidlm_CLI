@@ -3918,6 +3918,14 @@ fn run_started_session(
     }
 
     let mut renderer = TuiRenderer::new(options.capture_render);
+    // The status bar's session-level facts, resolved through the same call
+    // the turn itself makes, so the bar shows the mode that will actually
+    // govern tool calls rather than a second guess at it. A resolution
+    // failure leaves the dash: the bar never asserts a posture it could not
+    // confirm.
+    if let Ok(lattice) = exec_permission_lattice(Some(&resolved.root), None) {
+        renderer.chrome = session_status_chrome(lattice.mode());
+    }
     let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // One job table for the whole session: background jobs outlive the turn
     // that started them, and dropping this at the end of `run_started_session`
@@ -6011,11 +6019,68 @@ impl io::Write for RenderSink {
 /// only the parts `AppState` itself declines to own (see `crate::tui::
 /// transcript`'s own doc comment on why the viewport lives with the
 /// caller).
+/// The status line's session-level chrome: which model this session resolved
+/// and how its permission mode answers by default.
+///
+/// Deliberately **not** everything the bar can show. `sandbox` stays
+/// `Unknown` because sandboxing here is per *call* (`shell_exec` takes
+/// `"sandbox": true`), so a session-wide "host-restricted" would tell a user
+/// their commands are confined when most are not — the dangerous direction
+/// for a security indicator. `context` stays `Unknown` because the compiled
+/// context size is a per-turn fact that nothing projects into `AppState`;
+/// showing the model's window with a `used` of zero would be wrong the
+/// moment a turn ran.
+fn session_status_chrome(mode: crate::permissions::PermissionMode) -> tui::StatusChrome {
+    let chrome = tui::StatusChrome::default().with_policy(policy_mode_for(mode));
+    match crate::user_config::select_from_process_env_gated() {
+        Ok(crate::user_config::ModelSelection::Configured { active, .. }) => {
+            let label = active
+                .entry
+                .name
+                .clone()
+                .unwrap_or_else(|| active.entry.model.clone());
+            chrome
+                .with_model(&label)
+                .with_provider(active.entry.provider.as_str())
+        }
+        // No model configured, or a managed policy refused it: the bar keeps
+        // its dash, which is what "no model resolved" honestly looks like.
+        _ => chrome,
+    }
+}
+
+/// How `mode` answers a tool call by default, read off
+/// `PermissionLattice`'s own mode table rather than inferred from the mode's
+/// name — `dontAsk` **denies** rather than allowing without prompting, which
+/// a name-based guess gets backwards.
+///
+/// `AcceptEdits`/`Auto` allow edits and ask for everything else, which three
+/// values cannot express; they report `Allow`, because overstating how
+/// permissive the session is keeps a user cautious while understating it
+/// would not.
+fn policy_mode_for(mode: crate::permissions::PermissionMode) -> tui::PolicyMode {
+    use crate::permissions::PermissionMode as Mode;
+    match mode {
+        Mode::Default => tui::PolicyMode::Ask,
+        Mode::Plan | Mode::DontAsk => tui::PolicyMode::Deny,
+        Mode::AcceptEdits | Mode::Auto | Mode::BypassPermissions => tui::PolicyMode::Allow,
+    }
+}
+
 struct TuiRenderer {
     transcript: tui::Transcript,
     viewport: tui::TranscriptViewport,
     rendered_entries: usize,
     sink: RenderSink,
+    /// Session-level facts the status line shows that `AppState` does not
+    /// carry: which model this session resolved, and how the permission mode
+    /// answers by default.
+    ///
+    /// Every frame used to pass `StatusChrome::default()`, so the bar read
+    /// `model:-  sandbox:-  policy:-  ctx:-` for the whole session — a
+    /// complete widget (labels, compaction, drop-order) fed nothing, on the
+    /// one surface that is always on screen.
+    chrome: tui::StatusChrome,
 }
 
 impl TuiRenderer {
@@ -6024,6 +6089,7 @@ impl TuiRenderer {
             transcript: tui::Transcript::new(),
             viewport: tui::TranscriptViewport::new(80, 24),
             rendered_entries: 0,
+            chrome: tui::StatusChrome::default(),
             sink: if capture {
                 RenderSink::Captured(Vec::new())
             } else {
@@ -6087,13 +6153,12 @@ impl TuiRenderer {
 
         self.viewport.resize_rect(layout.transcript());
 
-        let chrome = tui::StatusChrome::default();
         let screen = tui::paint_screen(
             ui,
             &self.transcript,
             &self.viewport,
             composer_view.lines(),
-            &chrome,
+            &self.chrome,
             size,
             modal_open,
             &tui::CancellationToken::new(),
@@ -9578,6 +9643,70 @@ that is no longer there"
         .session_id
         .expect("id");
         assert_ne!(first, second, "each run gets its own session");
+    }
+
+    #[test]
+    fn the_status_bar_shows_the_model_and_policy_this_session_resolved() {
+        // Every frame passed `StatusChrome::default()`, so the bar read
+        // `model:-  sandbox:-  policy:-  ctx:-` for the whole session: a
+        // complete widget fed nothing, on the one surface always on screen.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        let painted = report.rendered_output.expect("capture_render was requested");
+
+        // Only the policy item is asserted: the model shown is whatever the
+        // *process environment* configures, which is a property of the
+        // machine running the test, not of this code. The permission mode is
+        // resolved for every session either way.
+        //
+        // Either label style counts — the bar compacts `policy:` to `pol:`
+        // when a long model name crowds the line, which is the widget's own
+        // fitting behaviour and not something this test should pin.
+        assert!(
+            !painted.contains("policy:-") && !painted.contains("pol:-"),
+            "the bar must show the mode that governs tool calls:\n{painted}"
+        );
+        assert!(
+            painted.contains("policy:ask") || painted.contains("pol:ask"),
+            "an unconfigured project runs in default mode, which asks:\n{painted}"
+        );
+    }
+
+    #[test]
+    fn the_policy_item_reads_the_mode_table_rather_than_the_mode_s_name() {
+        // `dontAsk` **denies**; a name-based guess reads it as "allow
+        // without prompting", which would tell a user their session is
+        // permissive when it refuses everything. Every mapping here is the
+        // decision `PermissionLattice`'s own mode table returns.
+        use crate::permissions::PermissionMode as Mode;
+        assert_eq!(policy_mode_for(Mode::Default), tui::PolicyMode::Ask);
+        assert_eq!(policy_mode_for(Mode::Plan), tui::PolicyMode::Deny);
+        assert_eq!(policy_mode_for(Mode::DontAsk), tui::PolicyMode::Deny);
+        assert_eq!(
+            policy_mode_for(Mode::BypassPermissions),
+            tui::PolicyMode::Allow
+        );
+        // Mixed modes report the more permissive of the two answers they
+        // give: overstating permissiveness keeps a user cautious, while
+        // understating it would not.
+        assert_eq!(policy_mode_for(Mode::AcceptEdits), tui::PolicyMode::Allow);
+        assert_eq!(policy_mode_for(Mode::Auto), tui::PolicyMode::Allow);
+    }
+
+    #[test]
+    fn the_status_bar_never_claims_a_sandbox_or_context_it_cannot_confirm() {
+        // Both are deliberately left unset: `shell_exec` takes `sandbox` per
+        // *call*, so a session-wide posture would tell a user their commands
+        // are confined when most are not; and nothing projects the compiled
+        // context size, so a window with a zero `used` would be wrong the
+        // moment a turn ran. The dash is the honest reading.
+        let chrome = session_status_chrome(crate::permissions::PermissionMode::Default);
+        assert_eq!(chrome.sandbox(), tui::SandboxMode::Unknown);
+        assert_eq!(chrome.context(), tui::ContextUsage::default());
     }
 
     #[test]

@@ -7245,6 +7245,55 @@ job running and the wait times out.
 session-wide and takes no id, and there is no running-agent registry to name one in — the same shape this
 entry just closed for jobs, one layer down, and it needs kernel work rather than composition-root work.
 
+**The status bar showed `model:-  sandbox:-  policy:-  ctx:-` for the whole session, done 2026-09-10.**
+
+Every frame passed `StatusChrome::default()`. The widget behind it is complete — full and compact label
+styles, a priority drop-order that sheds items as the terminal narrows, a `StatusSnapshot` that already
+pulls goal, agent count, cost and connectivity out of `AppState` — and it was fed nothing for the four
+items that come from chrome rather than state. This is the same mature-but-unwired shape as the MCP
+client and the approval UI, on the one surface that is on screen in every single frame.
+
+**Two items wired, two deliberately left as dashes.** That split is the whole point of the change.
+
+- **model** and **provider** come from `select_from_process_env_gated` — the same resolution the turn
+  itself performs — so the bar names the model that will actually run. A failure to resolve leaves the
+  dash rather than asserting something unconfirmed.
+- **policy** comes from `exec_permission_lattice(root, None).mode()`, again the same call the turn makes,
+  so the bar reports the mode that will really govern tool calls rather than a second guess at it.
+- **sandbox** stays `Unknown` because sandboxing here is per *call* — `shell_exec` takes
+  `"sandbox": true` — so a session-wide "host-restricted" would tell a user their commands are confined
+  when most of them are not. For a security indicator that is the dangerous direction to be wrong in.
+- **ctx** stays `Unknown` because the compiled context size is a per-turn fact nothing projects into
+  `AppState`. Showing the model's window with a `used` of zero would be wrong the moment a turn ran.
+
+**Reading the mode table beat guessing at the names.** Mapping six `PermissionMode`s onto three display
+values needed the real decisions, and `PermissionMode::DontAsk` returns `Decision::Deny` — "don't ask"
+means *refuse*, not "allow without prompting", which is what a name-based reading gives. That single
+misreading would have told a user their session was permissive while it refused everything.
+`AcceptEdits`/`Auto` allow edits and ask for the rest, which three values cannot express; they report
+`Allow`, because overstating permissiveness keeps a user cautious and understating it does not. A test
+pins each mapping against the table's own answer, and a revert cycle that guesses `DontAsk` as `Allow`
+fails it.
+
+**A test had to be weakened to be correct.** The first version asserted the painted bar contained
+`policy:ask`, and it failed against a real run showing `pol:ask` — the widget compacts its labels when a
+long model name crowds the line, which is its own fitting behaviour and not something this test should
+pin. It also tried to assert the model name, which comes from the *process environment* and is a property
+of the machine, not of this code (the run that caught this showed a `deepseek-v4-flash-vision-exp` from
+the developer's own environment). It now accepts either label style and asserts only the policy item.
+
+**Tests.** Three new: the painted bar shows a real policy item rather than a dash; every mode maps to the
+decision its table returns; and the two unconfirmable items stay unset. Two revert cycles (102-103) —
+never filling the chrome restores the dash, and guessing `DontAsk` by name inverts a security-relevant
+display.
+
+691 `rapid` lib tests, clippy identical for the touched file, full workspace green.
+
+**The rest of the bar, honestly:** `ctx` needs a per-turn context projection into `AppState` (the turn
+computes `context_limit`/`output_reserve` and the model returns usage; neither is projected). `sandbox`
+needs a per-call display or a session-level posture that is actually true. Both are real work, not
+wiring.
+
 ## Session boundary, 2026-09-09 — durable state for the next session
 
 Eight commits, `dbeb2c2`..`1e516cb`, all pushed to `origin/main`. Baseline before them was `598c6fd`.
