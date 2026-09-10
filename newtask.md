@@ -7674,6 +7674,35 @@ be given if I asked this" rather than describing a separate index.
 context yet", the exact old behavior); 124 removes the trust gate. A panel test covers locator
 sanitization — repository paths are clone-controlled, filename included — and the empty-result case.
 
+**`/diff --agent <id>` says it cannot narrow, done 2026-09-10.**
+
+The last operand in the family, and the only one that cannot be honored. `workspace.mutation_detected`
+carries `path`/`lines_before`/`lines_after` and no agent, and subagents write through the *parent* turn's
+`WorkspaceChanges` sink, so nothing in the projection could tell one agent's writes from another's.
+Attributing them means recording an agent at the write site — a feature, not wiring.
+
+Until then the flag says so, in the panel. Silently painting every change under a flag that asked for one
+agent's is exactly the failure this whole family was about, and it is the worst of them: the user gets a
+confident, complete-looking answer to a question that was never asked.
+
+**Two real defects the test caught, both about where a true statement is visible:**
+
+1. **The first version printed the notice to the transcript** via `append_command_output`, which is what
+   every other honest-gap message in this file does. Opening an inspector *replaces* the transcript, so
+   the message was invisible precisely when it applied. It moved into the panel, which needed
+   `AppState::diff_agent` — deliberately not a filter, just a record of what was asked, so the panel can
+   answer where the user is looking.
+2. **The second version was one line and got cut mid-sentence.** An `AgentId` is 36 characters, so
+   `fit_width` truncated an 80-column panel to "writes are not attributed to an ag" — a notice that loses
+   the thing it exists to say. Now two lines: the flag, then the explanation.
+
+Both were found by the end-to-end test asserting on real painted output rather than on state, which is
+the argument for that style: neither defect is visible from the reducer.
+
+**Revert cycle 125.** Emitting `SelectDiffAgent(None)` instead of the named agent; the notice disappears
+and the panel goes back to claiming a filtered view. The test also asserts a bare `/diff` carries no such
+notice, so the message belongs to the flag rather than to the panel.
+
 ## Session boundary, 2026-09-10 — durable state for the next session
 
 Twenty-three commits across two days, `dbeb2c2`..`bccf629`, all pushed to `origin/main`. Baseline before
@@ -7707,13 +7736,16 @@ actually failed them.
 
 1. **The last of the dropped operands.** `/agents show <id>` and `/context search <query>` are done
    (entries above). Three remain, and none is wiring:
-   - `/diff --agent <id>` cannot be honored at all — `ChangedFile` records no agent, and subagents write
-     inside the parent turn, so there is nothing to attribute by. The honest move is to *say*
-     attribution is not recorded rather than keep silently ignoring the flag; `focus_inspector`'s
-     fallthrough arm names this at the exact place a fix would go.
+   - `/diff --agent <id>` is done as far as it can be (entry above): it *reports* that writes are not
+     attributed. Actually honoring it means recording an agent at the write site so `ChangedFile` can
+     carry one — a feature, and the natural companion to real diff hunks.
    - `/knowledge show <id>` and `/playbook show <name>` have no store behind them at all, so their
      panels have nothing to select from. Both already report that honestly through
      `unrouted_inspector_text`.
+
+   **The family is closed**: every slash command that parses an operand now either uses it or says why
+   it cannot. `focus_inspector` is the one place that applies a named selection, and its arms are the
+   inventory.
 2. **Typed-id prefixes.** `/jobs show <id>`, `/jobs cancel <id>` and every other id-taking command
    require a full UUID that nothing prints — the panels deliberately show a job's *command* instead. A
    bare `/jobs logs` works around this for one case; the general fix is prefix matching in

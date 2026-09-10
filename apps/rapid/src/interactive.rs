@@ -4302,9 +4302,23 @@ impl SessionLoop<'_> {
                 );
                 return;
             }
-            // `Inspector::Diff { agent }` still drops its operand here:
-            // `ChangedFile` records no agent, so there is nothing to select
-            // it by. Every other inspector names no entity to focus.
+            Inspector::Diff { agent } => {
+                // The one operand in this family that cannot be honored.
+                // `workspace.mutation_detected` carries `path`/`lines_before`
+                // /`lines_after` and no agent, and subagents write through
+                // the *parent* turn's sink, so nothing in the projection
+                // could tell one agent's writes from another's. Attributing
+                // them means recording an agent at the write site — a
+                // feature, not wiring. Until then the flag says so rather
+                // than quietly showing every change as though it had
+                // filtered them.
+                *self.ui = reduce(
+                    self.ui.clone(),
+                    &UiEvent::Local(LocalUiEvent::SelectDiffAgent(*agent)),
+                );
+                return;
+            }
+            // Every other inspector names no entity to focus.
             _ => return,
         };
         let target = match (id, logs) {
@@ -11168,6 +11182,44 @@ was already finished"
         assert!(
             !env.project.join(".rapidlm/index").exists(),
             "an untrusted project must not be indexed by a slash command"
+        );
+    }
+
+    #[test]
+    fn diff_agent_says_it_cannot_narrow_rather_than_pretending_to() {
+        // The last operand in the family, and the only one that cannot be
+        // honored: `workspace.mutation_detected` records a path and line
+        // counts and no agent, and subagents write through the parent
+        // turn's sink. Silently painting every change under a flag that
+        // asked for one agent's is the failure mode this whole family was
+        // about — so it says what it is doing instead.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit(
+                "/diff --agent 019c0000-0000-7000-8000-0000000000a7".to_owned(),
+            ),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(
+            painted.contains("no per-agent attribution"),
+            "a flag that cannot narrow anything must say so:\n{painted}"
+        );
+
+        // And a bare `/diff` says nothing of the kind — the notice belongs
+        // to the flag, not to the panel.
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/diff".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        let painted = report.rendered_output.expect("capture_render was requested");
+        assert!(
+            !painted.contains("no per-agent attribution"),
+            "a bare /diff must not carry the flag's notice:\n{painted}"
         );
     }
 

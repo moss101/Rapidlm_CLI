@@ -115,6 +115,9 @@ pub enum LocalUiEvent {
     SyncJobLogs(Option<JobLogView>),
     /// Results for a `/context search`, or `None` to leave the search view.
     SyncContextSearch(Option<ContextSearchView>),
+    /// The agent `/diff --agent` named, recorded so the panel can say it
+    /// cannot narrow by one. `None` clears it.
+    SelectDiffAgent(Option<AgentId>),
     /// Drop a host-owned goal projection that no longer has a snapshot to
     /// project from — completion/cancel clear the host's own snapshot (see
     /// `agent_runtime::GoalState`'s own doc comment), so without this a
@@ -184,6 +187,13 @@ pub struct AppState {
     /// What `/context search` last retrieved — see
     /// [`LocalUiEvent::SyncContextSearch`]. `None` whenever no search is open.
     context_search: Option<ContextSearchView>,
+    /// The agent `/diff --agent` asked to narrow to.
+    ///
+    /// Deliberately *not* a filter: `workspace.mutation_detected` carries no
+    /// agent, so nothing here could narrow by one. It is recorded so the
+    /// panel can say that, where the user is looking, instead of painting
+    /// every change as though the flag had been applied.
+    diff_agent: Option<AgentId>,
     /// Compiled-context usage from the last `context.compiled` event: tokens
     /// included in the packet the model was given, against the hard limit.
     /// `None` until a turn has reported one — there is no honest figure to
@@ -820,6 +830,9 @@ fn apply_local(mut state: AppState, event: &LocalUiEvent) -> Result<AppState, Ui
         LocalUiEvent::SyncContextSearch(found) => {
             state.context_search = found.clone();
         }
+        LocalUiEvent::SelectDiffAgent(agent) => {
+            state.diff_agent = *agent;
+        }
         LocalUiEvent::SyncGoal(goal) => {
             insert_goal(&mut state, goal.clone())?;
             state.selected_goal = Some(goal.id);
@@ -1369,6 +1382,7 @@ impl AppState {
             selected_goal: None,
             job_logs: None,
             context_search: None,
+            diff_agent: None,
             selected_job: None,
             selected_approval: None,
             control_holder: ControlHolder::Agent,
@@ -1477,6 +1491,11 @@ impl AppState {
     /// Results synced for an open `/context search`.
     pub fn context_search(&self) -> Option<&ContextSearchView> {
         self.context_search.as_ref()
+    }
+
+    /// The agent `/diff --agent` named, if any.
+    pub fn diff_agent(&self) -> Option<AgentId> {
+        self.diff_agent
     }
 
     pub fn selected_approval(&self) -> Option<&ApprovalKey> {

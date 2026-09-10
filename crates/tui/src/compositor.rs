@@ -521,7 +521,19 @@ fn context_search_lines(
 /// Paths are workspace-relative and come from tool calls, so they render
 /// through `sanitize_untrusted` like every other untrusted string.
 fn diff_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
-    let mut lines: Vec<String> = state
+    let mut lines: Vec<String> = Vec::new();
+    // The notice belongs here, not in the transcript: opening this panel
+    // replaces the transcript, so a message printed there would be
+    // invisible exactly when it matters.
+    if let Some(agent) = state.diff_agent() {
+        // Two lines because one is not survivable: an `AgentId` is 36
+        // characters, so a combined notice is cut mid-sentence by
+        // `fit_width` on an 80-column panel and loses the very thing it
+        // exists to say.
+        lines.push(format!("--agent {agent}"));
+        lines.push("  no per-agent attribution; showing every change".to_owned());
+    }
+    let files: Vec<String> = state
         .changed_files()
         .values()
         .map(|file| {
@@ -537,8 +549,10 @@ fn diff_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
             }
         })
         .collect();
-    if lines.is_empty() {
+    if files.is_empty() {
         lines.push("no files changed in this session".to_owned());
+    } else {
+        lines.extend(files);
     }
     lines.truncate(usize::from(height));
     for line in &mut lines {
