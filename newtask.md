@@ -7705,7 +7705,7 @@ notice, so the message belongs to the flag rather than to the panel.
 
 ## Session boundary, 2026-09-10 — durable state for the next session
 
-Twenty-three commits across two days, `dbeb2c2`..`bccf629`, all pushed to `origin/main`. Baseline before
+Twenty-seven commits across two days, `dbeb2c2`..`4b28b59`, all pushed to `origin/main`. Baseline before
 them was `598c6fd`. Each has its own entry above; this is the current state and what is actually left.
 
 **2026-09-09** (`dbeb2c2`..`b967d0a`): `rapid resume`; every command resolving the same project as the
@@ -7714,19 +7714,24 @@ correction self-review caught in already-pushed code); `rapid --help` no longer 
 the parser rejects; `rapid insights` given a test that can fail; `/jobs` and `/approvals` rendering the
 projections they already had.
 
-**2026-09-10** (`81674b0`..`bccf629`): background jobs journaled, session-lived, and cancellable; the
+**2026-09-10** (`81674b0`..`4b28b59`): background jobs journaled, session-lived, and cancellable; the
 status bar showing model, policy and compiled context instead of dashes; `/models`, `/memory` and
 `/context` made real; `/diff` answering what the agent changed; `/fork` moving the session onto the
-branch it created; `/jobs show|logs` honoring the job you name, with a live-following log view.
+branch it created; and then the whole **dropped-operand family** — `/jobs show|logs`, `/agents show`,
+`/context search`, `/diff --agent` — every command that parses an operand now either uses it or says
+why it cannot.
 
 **The through-line has not changed and is the most useful thing to carry forward.** Every one of these
 was two representations of one fact with nothing spanning them, and the fix that held each time was to
-*derive* the second from the first rather than add a parallel list. The corollary showed up twice more
+*derive* the second from the first rather than add a parallel list. The dropped-operand family sharpened
+it: in three of four cases the *receiving* side was already built and correct — `resolve_selection`,
+`TraceJobsViewModel::from_app_state` and `retrieve` all did the right thing with a selection or a query —
+and the only missing piece was a writer. Look for the field nobody sets before building a mechanism. The corollary showed up twice more
 today: a test that hardcoded a derived answer (`/memory` is `None`) went stale the moment the underlying
 fact changed — which is the design working — and a draft that added a `LocalUiEvent` beside a kernel
 event for the same value was caught and removed before it shipped.
 
-**Verification.** Revert cycles 72-120 across the two days. The pattern that keeps earning its keep: a
+**Verification.** Revert cycles 72-125 across the two days. The pattern that keeps earning its keep: a
 cycle that *passes* means the test is wrong, not the code. Five did on 2026-09-09; two more did today —
 a fixture too small for the bound it was meant to prove (one line against a 200-line cap), and a state
 read taken before the supervisor thread could notice a kill. Both were rewritten until the broken code
