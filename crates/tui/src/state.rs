@@ -90,6 +90,12 @@ pub enum LocalUiEvent {
     /// into the frontend without a kernel event. Local chrome, not a mutation
     /// of business authority.
     SyncGoal(GoalProjection),
+    /// Project the session's configured models — which one is active, which
+    /// are fallbacks — into the frontend without a kernel event, the same way
+    /// [`Self::SyncGoal`] projects a host-owned goal. Model configuration is
+    /// host state read from files and environment, not session history, so
+    /// there is no kernel event to carry it.
+    SyncModels(Vec<ModelRow>),
     /// Drop a host-owned goal projection that no longer has a snapshot to
     /// project from — completion/cancel clear the host's own snapshot (see
     /// `agent_runtime::GoalState`'s own doc comment), so without this a
@@ -147,6 +153,9 @@ pub struct AppState {
     agents: BTreeMap<AgentId, AgentProjection>,
     goals: BTreeMap<GoalId, GoalProjection>,
     jobs: BTreeMap<JobId, JobProjection>,
+    /// Configured models, projected by the host — see
+    /// [`LocalUiEvent::SyncModels`].
+    models: Vec<ModelRow>,
     approvals: BTreeMap<ApprovalKey, ApprovalProjection>,
     selected_agent: Option<AgentId>,
     selected_goal: Option<GoalId>,
@@ -350,6 +359,26 @@ pub struct JobProjection {
     /// display string, so it can neither exceed the display bound nor
     /// survive a secret-classified event.
     command: Option<String>,
+}
+
+/// One configured model, as the `/models` panel shows it.
+///
+/// Carries no credential and has nowhere to put one: `[model.<id>]` tables
+/// hold `api_key`/`env_key`, and the way to guarantee those never reach a
+/// rendered frame is for the projected type to be unable to hold them, not
+/// for every construction site to remember to leave them out.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ModelRow {
+    /// The `[model.<id>]` table id the user configured it under.
+    pub id: String,
+    pub provider: String,
+    /// Provider-side model id sent on the wire.
+    pub model: String,
+    /// Whether this is the model the session resolved.
+    pub active: bool,
+    /// Position in the explicit `[models] fallback` chain, when it is in one.
+    pub fallback_rank: Option<usize>,
+    pub context_window: Option<u32>,
 }
 
 /// Job lifecycle copied from job event kinds / optional payload state.
@@ -661,6 +690,9 @@ fn apply_local(mut state: AppState, event: &LocalUiEvent) -> Result<AppState, Ui
         LocalUiEvent::SelectGoal(id) => state.selected_goal = *id,
         LocalUiEvent::SelectJob(id) => state.selected_job = *id,
         LocalUiEvent::SelectApproval(id) => state.selected_approval = id.clone(),
+        LocalUiEvent::SyncModels(rows) => {
+            state.models = rows.clone();
+        }
         LocalUiEvent::SyncGoal(goal) => {
             insert_goal(&mut state, goal.clone())?;
             state.selected_goal = Some(goal.id);
@@ -1097,6 +1129,7 @@ impl AppState {
             agents: BTreeMap::new(),
             goals: BTreeMap::new(),
             jobs: BTreeMap::new(),
+            models: Vec::new(),
             approvals: BTreeMap::new(),
             selected_agent: None,
             selected_goal: None,
@@ -1153,6 +1186,10 @@ impl AppState {
 
     pub fn goals(&self) -> &BTreeMap<GoalId, GoalProjection> {
         &self.goals
+    }
+
+    pub fn models(&self) -> &[ModelRow] {
+        &self.models
     }
 
     pub fn jobs(&self) -> &BTreeMap<JobId, JobProjection> {

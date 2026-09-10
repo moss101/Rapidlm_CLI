@@ -7294,6 +7294,48 @@ computes `context_limit`/`output_reserve` and the model returns usage; neither i
 needs a per-call display or a session-level posture that is actually true. Both are real work, not
 wiring.
 
+**`/models` shows the configuration that was there all along, done 2026-09-10.**
+
+The third of the nine empty inspector panels to become real, and like `/jobs` and `/approvals` the data
+was not missing — `[model.<id>]` tables are read by `rapid doctor` and resolved by every turn, and the
+panel simply had no way to see them. Unlike `/jobs`, though, there is no kernel event to project from:
+model configuration is host state read from files and environment, not session history. So it arrives the
+way the persisted goal already does, through a `LocalUiEvent` — `SyncModels`, beside `SyncGoal`, whose
+own doc comment describes exactly this situation.
+
+**The panel answers the question it exists for:** which model runs (`>` marker, same as `goal_lines`
+marks its selection), what each one is (`provider/model`), its context window when configured, and a
+fallback's *position* in the chain — "what runs if this provider fails, and in what order" being the
+thing a fallback list is for.
+
+**Credentials are excluded by construction, not by care.** `[model.<id>]` tables hold `api_key` and
+`env_key`. `tui::state::ModelRow` has nowhere to put either, so no construction site can leak one by
+forgetting — and the test asserts the *rendered frame* contains neither a configured `api_key` value nor
+an env var name, rather than trusting the type.
+
+**Read through `user_config`'s own loader**, the same source `doctor` reports from and a turn resolves
+through, so the panel cannot describe a configuration different from the one that will actually run. A
+missing or unreadable config projects nothing and the panel says "no models configured"; explaining a
+broken config is `doctor`'s job, not a display's.
+
+`model_rows` is split from the reading of the config so the mapping is testable without depending on the
+machine's own environment and config file — the same reason `hint_lines` and `newest_usable` were split
+out earlier, and the lesson from the status-bar test that met a `deepseek-v4-flash-vision-exp` from the
+developer's environment.
+
+**Tests.** Two new: the panel marks the running model, names it, shows its window and a fallback's rank,
+and says so when nothing is configured; and the projection maps active/fallback correctly while no
+credential reaches the frame. Two revert cycles (104-105): marking nothing active fails the first,
+un-rendering the route fails the second. Clippy's `unreachable pattern` caught `Models` being left in the
+dead arm of `sidebar_lines` after being given a live one — the same coupling that made the earlier
+`/jobs` revert cycle fail to compile.
+
+692 `rapid` lib tests, 231 `tui`, clippy identical to baseline, full workspace green.
+
+**Six panels still empty, and still honestly marked:** `/diff`, `/context`, `/memory`, `/graph`,
+`/computer`, `/resources`. `/memory` is the next cheapest — `.rapidlm/MEMORY.md` is already read by the
+host — and `/diff` the most valuable, needing workspace mutations projected rather than merely rendered.
+
 ## Session boundary, 2026-09-09 — durable state for the next session
 
 Eight commits, `dbeb2c2`..`1e516cb`, all pushed to `origin/main`. Baseline before them was `598c6fd`.

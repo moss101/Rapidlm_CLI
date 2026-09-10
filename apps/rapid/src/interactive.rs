@@ -3873,6 +3873,7 @@ fn run_started_session(
     // Project the persisted composition-root goal into the interactive TUI so
     // the Goals route shows it (the TUI is a projection of runtime state).
     sync_persisted_goal(&mut ui, &resolved.ledger_path);
+    sync_configured_models(&mut ui);
     // Anything the ledger unification had to say goes in the transcript: it
     // is addressed to the user, and stderr written before the alt screen
     // opens is wiped before it can be read.
@@ -6019,6 +6020,64 @@ impl io::Write for RenderSink {
 /// only the parts `AppState` itself declines to own (see `crate::tui::
 /// transcript`'s own doc comment on why the viewport lives with the
 /// caller).
+/// Project the session's configured models into the frontend, so `/models`
+/// shows what is actually configured rather than an empty panel.
+///
+/// Read through `user_config`'s own loader — the same source
+/// `rapid doctor` reports from and the same one a turn resolves its model
+/// through — so the panel cannot describe a different configuration than the
+/// one that will run. A missing or unreadable config projects nothing, and
+/// the panel says so; this is a display, and a config problem is `doctor`'s
+/// job to explain.
+///
+/// Credentials are excluded by construction: [`tui::state::ModelRow`] has
+/// nowhere to put one.
+fn sync_configured_models(ui: &mut AppState) {
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let source = crate::user_config::resolve_config_source(&env);
+    let Ok(Some(config)) = crate::user_config::load_config(&source) else {
+        return;
+    };
+    let active = crate::user_config::select_active_model_gated(&env)
+        .ok()
+        .and_then(|selection| match selection {
+            crate::user_config::ModelSelection::Configured { active, .. } => {
+                Some(active.profile_id)
+            }
+            _ => None,
+        });
+    let rows = model_rows(&config, active.as_deref());
+    if rows.is_empty() {
+        return;
+    }
+    *ui = reduce(
+        ui.clone(),
+        &UiEvent::Local(LocalUiEvent::SyncModels(rows)),
+    );
+}
+
+/// The `/models` rows for a loaded config, split from the reading of it so
+/// the mapping is testable without depending on the machine's own
+/// environment and config file.
+fn model_rows(
+    config: &crate::user_config::UserConfig,
+    active: Option<&str>,
+) -> Vec<tui::state::ModelRow> {
+    config
+        .models
+        .entries
+        .iter()
+        .map(|(id, entry)| tui::state::ModelRow {
+            id: id.clone(),
+            provider: entry.provider.as_str().to_owned(),
+            model: entry.model.clone(),
+            active: active == Some(id.as_str()),
+            fallback_rank: config.models.fallback.iter().position(|name| name == id),
+            context_window: entry.context_window,
+        })
+        .collect()
+}
+
 /// The status line's session-level chrome: which model this session resolved
 /// and how its permission mode answers by default.
 ///
@@ -9643,6 +9702,71 @@ that is no longer there"
         .session_id
         .expect("id");
         assert_ne!(first, second, "each run gets its own session");
+    }
+
+    #[test]
+    fn the_models_panel_marks_the_running_model_and_never_carries_a_credential() {
+        // `/models` opened an empty panel while the configuration it should
+        // describe was sitting in `[model.<id>]` tables the whole time.
+        use crate::user_config::{ConfigProvider, ModelEntry, ModelsSection, UserConfig};
+
+        let entry = |model: &str, window: Option<u32>| ModelEntry {
+            provider: ConfigProvider::Anthropic,
+            model: model.to_owned(),
+            base_url: "https://example.invalid/v1".to_owned(),
+            name: None,
+            // Configured, and it must not survive into the projection.
+            api_key: Some("sk-do-not-render-me".to_owned()),
+            env_key: vec!["SOME_KEY".to_owned()],
+            max_tokens: None,
+            context_window: window,
+            reasoning_effort: None,
+        };
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert("big".to_owned(), entry("claude-opus-5", Some(200_000)));
+        entries.insert("backup".to_owned(), entry("gpt-5", None));
+        let config = UserConfig {
+            models: ModelsSection {
+                default: Some("big".to_owned()),
+                entries,
+                fallback: vec!["backup".to_owned()],
+            },
+            phases: Default::default(),
+            unknown_keys: Vec::new(),
+        };
+
+        let rows = model_rows(&config, Some("big"));
+        let big = rows.iter().find(|row| row.id == "big").expect("big");
+        assert!(big.active, "the resolved model must be marked as the one that runs");
+        assert_eq!(big.context_window, Some(200_000));
+        assert_eq!(big.fallback_rank, None);
+
+        let backup = rows.iter().find(|row| row.id == "backup").expect("backup");
+        assert!(!backup.active);
+        assert_eq!(
+            backup.fallback_rank,
+            Some(0),
+            "a fallback must carry its position in the chain, which is the \
+question the panel answers"
+        );
+
+        // The projection has nowhere to put a credential, and this asserts
+        // the whole rendered surface rather than trusting that.
+        let painted = tui::sidebar_lines(
+            tui::state::UiRoute::Models,
+            &reduce(
+                AppState::new(),
+                &UiEvent::Local(LocalUiEvent::SyncModels(rows)),
+            ),
+            120,
+            8,
+            &tui::state::CancellationToken::new(),
+        )
+        .join("\n");
+        assert!(
+            !painted.contains("sk-do-not-render-me") && !painted.contains("SOME_KEY"),
+            "no credential may reach a rendered frame: {painted}"
+        );
     }
 
     #[test]

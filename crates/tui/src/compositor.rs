@@ -163,13 +163,13 @@ pub fn sidebar_lines(
         UiRoute::Goals => goal_lines(state, width, height),
         UiRoute::Jobs => job_lines(state, width, height),
         UiRoute::Approvals => approval_lines(state, width, height),
+        UiRoute::Models => model_lines(state, width, height),
         UiRoute::Diff
         | UiRoute::Context
         | UiRoute::Memory
         | UiRoute::Graph
         | UiRoute::Computer
-        | UiRoute::Resources
-        | UiRoute::Models => Vec::new(),
+        | UiRoute::Resources => Vec::new(),
     }
 }
 
@@ -188,14 +188,17 @@ pub const fn route_renders_content(route: UiRoute) -> bool {
     match route {
         // The transcript is the default view, not an inspector panel.
         UiRoute::Transcript => false,
-        UiRoute::Agents | UiRoute::Goals | UiRoute::Jobs | UiRoute::Approvals => true,
+        UiRoute::Agents
+        | UiRoute::Goals
+        | UiRoute::Jobs
+        | UiRoute::Approvals
+        | UiRoute::Models => true,
         UiRoute::Diff
         | UiRoute::Context
         | UiRoute::Memory
         | UiRoute::Graph
         | UiRoute::Computer
-        | UiRoute::Resources
-        | UiRoute::Models => false,
+        | UiRoute::Resources => false,
     }
 }
 
@@ -300,6 +303,42 @@ fn approval_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
         .collect();
     if lines.is_empty() {
         lines.push("no approvals".to_owned());
+    }
+    lines.truncate(usize::from(height));
+    for line in &mut lines {
+        *line = fit_width(line, usize::from(width));
+    }
+    lines
+}
+
+/// The `/models` panel: which model this session resolved, and what else is
+/// configured to fall back to.
+///
+/// Rows come from [`AppState::models`], projected by the host from
+/// `[model.<id>]` tables — configuration is read from files and environment,
+/// not from session history, so there is no kernel event to carry it and
+/// `LocalUiEvent::SyncModels` is how it arrives. The active model is marked
+/// the way `goal_lines` marks its selection, and a fallback shows its
+/// position, because "what runs if this provider fails, and in what order"
+/// is the question the panel exists to answer.
+fn model_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
+    let mut lines: Vec<String> = state
+        .models()
+        .iter()
+        .map(|row| {
+            let marker = if row.active { ">" } else { " " };
+            let mut line = format!("{marker} {} {}/{}", row.id, row.provider, row.model);
+            if let Some(window) = row.context_window {
+                line.push_str(&format!(" ctx:{window}"));
+            }
+            if let Some(rank) = row.fallback_rank {
+                line.push_str(&format!(" fallback#{}", rank + 1));
+            }
+            line
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push("no models configured".to_owned());
     }
     lines.truncate(usize::from(height));
     for line in &mut lines {
@@ -729,6 +768,54 @@ pre-approve it with `rapid permissions allow <tool>`";
             .expect("entry");
         let (_, line) = crate::transcript::render_block_parts(entry);
         assert_eq!(line, "✓ repo_read");
+    }
+
+    #[test]
+    fn the_models_panel_shows_which_model_runs_and_what_falls_back() {
+        use crate::state::ModelRow;
+
+        let empty = AppState::new();
+        assert_eq!(
+            sidebar_lines(UiRoute::Models, &empty, 40, 6, &cancel()),
+            vec![fit_width("no models configured", 40)],
+            "a project with no configured models says so rather than painting nothing"
+        );
+
+        let state = reduce(
+            empty,
+            &UiEvent::Local(crate::state::LocalUiEvent::SyncModels(vec![
+                ModelRow {
+                    id: "big".to_owned(),
+                    provider: "anthropic".to_owned(),
+                    model: "claude-opus-5".to_owned(),
+                    active: true,
+                    fallback_rank: None,
+                    context_window: Some(200_000),
+                },
+                ModelRow {
+                    id: "backup".to_owned(),
+                    provider: "openai-compatible".to_owned(),
+                    model: "gpt-5".to_owned(),
+                    active: false,
+                    fallback_rank: Some(0),
+                    context_window: None,
+                },
+            ])),
+        );
+        let painted = sidebar_lines(UiRoute::Models, &state, 70, 6, &cancel());
+        assert!(
+            painted[0].starts_with("> big") && painted[0].contains("anthropic/claude-opus-5"),
+            "the running model must be marked and named: {painted:?}"
+        );
+        assert!(
+            painted[0].contains("ctx:200000"),
+            "with its context window when configured: {painted:?}"
+        );
+        assert!(
+            painted[1].starts_with("  backup") && painted[1].contains("fallback#1"),
+            "and a fallback must show its position in the chain: {painted:?}"
+        );
+        assert!(route_renders_content(UiRoute::Models));
     }
 
     #[test]
