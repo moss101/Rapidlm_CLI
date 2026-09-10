@@ -5783,6 +5783,15 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
             serde_json::json!({
                 "included_tokens": used,
                 "context_limit": limit,
+                // Per-class breakdown for the `/context` panel: the totals
+                // cannot say which class is consuming the window.
+                "partitions": outcome
+                    .context_partitions
+                    .iter()
+                    .map(|(class, used, cap)| {
+                        serde_json::json!({"class": class, "used": used, "cap": cap})
+                    })
+                    .collect::<Vec<_>>(),
             }),
         );
     }
@@ -9895,6 +9904,37 @@ question the panel answers"
             "and the limit must be the one this turn actually ran with"
         );
 
+        // And the breakdown, which is what a nearly-full window needs: the
+        // totals say how full, the classes say what filled it.
+        let partitions = session.state().context_partitions();
+        assert!(
+            !partitions.is_empty(),
+            "a finished turn must report which classes consumed the window"
+        );
+        assert!(
+            partitions.iter().any(|p| p.class == "system" && p.used > 0),
+            "the system prompt alone is never zero tokens: {partitions:?}"
+        );
+        assert!(
+            partitions.iter().map(|p| p.used).sum::<u64>() <= used,
+            "no class may claim more than the whole compiled context: {partitions:?}"
+        );
+        let panel = tui::sidebar_lines(
+            tui::state::UiRoute::Context,
+            session.state(),
+            60,
+            12,
+            &tui::state::CancellationToken::new(),
+        );
+        assert!(
+            panel[0].contains(&format!("{used}/{limit}")),
+            "the panel leads with the totals: {panel:?}"
+        );
+        assert!(
+            panel.iter().any(|line| line.contains("system")),
+            "and lists the classes beneath them: {panel:?}"
+        );
+
         // It reaches the status line, which is where the dash was.
         let rendered = tui::render_status_with(
             session.state(),
@@ -11872,6 +11912,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             tokens: 0,
             cost_usd_micros: None,
             context_tokens: None,
+            context_partitions: Vec::new(),
         }
     }
 

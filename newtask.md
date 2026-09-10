@@ -7415,6 +7415,40 @@ not being projected — each leaving the bar dashed.
 totals are projected today. Adding them is the same event with more fields plus a renderer — no new
 plumbing.
 
+**`/context` shows what filled the window, done 2026-09-10.**
+
+The follow-up the previous entry called cheap, and it was: the same `context.compiled` event gained a
+`partitions` array, so the totals and the breakdown travel together and the panel can never disagree with
+the status bar's `ctx:` item about the same turn.
+
+**The totals answer "how full"; the classes answer the question a reader actually has when it is nearly
+full** — *which* class is consuming it. `TokenPartitions` already tracked seven hard partitions (system,
+user, goal, diff, retrieved, memory, read_set), each with its own used/cap, and none of it left the host.
+
+**Classes render in the compiler's order, not sorted by size**, so a row does not move between redraws
+while a user is reading it — the same reasoning `job_lines` uses for `BTreeMap` order.
+
+**The rows are optional in the projection.** An emitter that reports only the totals leaves the panel
+showing those rather than failing the event: a payload that grew a field must not make an older or
+narrower producer's event invalid.
+
+**The empty state is honest.** Before any turn has compiled a context the panel says exactly that, rather
+than showing a zero against a window — a figure a reader could act on wrongly.
+
+**Tests.** One new plus one extended: the panel's empty state and route availability; and the existing
+end-to-end turn test now asserts the breakdown is reported, that the system class alone is never zero
+tokens, that no class claims more than the whole compiled context, and that the panel leads with the
+totals and lists the classes beneath them. One revert cycle (110) — renaming the emitted field leaves the
+breakdown empty and the test says which classes consumed the window is missing.
+
+694 `rapid` lib tests, 233 `tui`, clippy identical to baseline, full workspace green.
+
+**Four panels still empty and still honestly marked:** `/diff`, `/graph`, `/computer`, `/resources`.
+`/diff` remains the most valuable and is the one with no data source at all — `apps/rapid` writes through
+`atomic_write` and never touches the `workspace` crate's journal or transaction machinery, so there is no
+change set to project. That is a wiring task on the *write* path, not a rendering one, and it is the
+largest remaining item in this family.
+
 ## Session boundary, 2026-09-09 — durable state for the next session
 
 Eight commits, `dbeb2c2`..`1e516cb`, all pushed to `origin/main`. Baseline before them was `598c6fd`.

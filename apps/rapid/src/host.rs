@@ -454,6 +454,27 @@ impl<B: LiveModelCall> LiveContextHost<B> {
         Some((partitions.included_tokens(), partitions.context_limit()))
     }
 
+    /// Per-class usage of the packet the host currently holds. Same timing
+    /// rule as [`Self::context_usage`].
+    pub fn context_partitions(&self) -> Vec<(&'static str, u32, u32)> {
+        let Ok(live) = self.live.try_borrow() else {
+            return Vec::new();
+        };
+        let p = live.packet().partitions();
+        [
+            ("system", p.system()),
+            ("user", p.user()),
+            ("goal", p.goal()),
+            ("diff", p.diff()),
+            ("retrieved", p.retrieved()),
+            ("memory", p.memory()),
+            ("read_set", p.read_set()),
+        ]
+        .into_iter()
+        .map(|(name, budget)| (name, budget.used(), budget.cap()))
+        .collect()
+    }
+
     pub fn from_preserved(
         preserved: PreservedLiveContext,
         backing: B,
@@ -1273,6 +1294,15 @@ pub struct ExecOutcome {
     pub tool_calls: u32,
     pub tokens: u64,
     pub cost_usd_micros: Option<u64>,
+    /// Per-class compiled-context usage as this turn *ended*: `(class,
+    /// used, cap)` for each hard partition, in the order the `/context`
+    /// panel shows them. Empty when nothing reported one.
+    ///
+    /// Carried beside `context_tokens` rather than derived from it because
+    /// the totals cannot answer the question a reader actually has — which
+    /// class is consuming the window — and the compiler already computed
+    /// every class's own used/cap.
+    pub context_partitions: Vec<(&'static str, u32, u32)>,
     /// Compiled-context usage as this turn *ended*: tokens included in the
     /// packet the model was last given, against the hard context limit.
     ///
@@ -1319,6 +1349,7 @@ where
         .map_err(|_| AgentExecutionError::InvalidRequest)?;
     let outcome = host.execute(request, tools, events, cancel)?;
     let context_tokens = host.context_usage();
+    let context_partitions = host.context_partitions();
     let tokens = counter.load(std::sync::atomic::Ordering::Relaxed);
     let cost_usd_micros = cost.total();
     if let Some(diag) = turn_diag {
@@ -1345,6 +1376,7 @@ where
         tokens,
         cost_usd_micros,
         context_tokens,
+        context_partitions,
     })
 }
 

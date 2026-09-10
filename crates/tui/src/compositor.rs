@@ -166,8 +166,8 @@ pub fn sidebar_lines(
         UiRoute::Approvals => approval_lines(state, width, height),
         UiRoute::Models => model_lines(state, width, height),
         UiRoute::Memory => memory_lines(state, width, height),
+        UiRoute::Context => context_lines(state, width, height),
         UiRoute::Diff
-        | UiRoute::Context
         | UiRoute::Graph
         | UiRoute::Computer
         | UiRoute::Resources => Vec::new(),
@@ -194,12 +194,9 @@ pub const fn route_renders_content(route: UiRoute) -> bool {
         | UiRoute::Jobs
         | UiRoute::Approvals
         | UiRoute::Models
-        | UiRoute::Memory => true,
-        UiRoute::Diff
-        | UiRoute::Context
-        | UiRoute::Graph
-        | UiRoute::Computer
-        | UiRoute::Resources => false,
+        | UiRoute::Memory
+        | UiRoute::Context => true,
+        UiRoute::Diff | UiRoute::Graph | UiRoute::Computer | UiRoute::Resources => false,
     }
 }
 
@@ -367,6 +364,33 @@ fn memory_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
         .collect();
     if lines.is_empty() {
         lines.push("no .rapidlm/MEMORY.md in this project".to_owned());
+    }
+    lines.truncate(usize::from(height));
+    for line in &mut lines {
+        *line = fit_width(line, usize::from(width));
+    }
+    lines
+}
+
+/// The `/context` panel: what the last turn's compiled context was made of.
+///
+/// The totals answer "how full is the window"; the per-class rows answer the
+/// question a reader actually has when it is nearly full — *which* class is
+/// consuming it. Both come from the same `context.compiled` event, so the
+/// panel and the status bar's `ctx:` item can never disagree.
+///
+/// Classes are shown in the compiler's own order rather than sorted by size,
+/// so a row does not move between redraws while a user is reading it.
+fn context_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
+    let Some((used, limit)) = state.context_usage() else {
+        return vec![fit_width("no turn has compiled a context yet", usize::from(width))];
+    };
+    let mut lines = vec![format!("total {used}/{limit}")];
+    for partition in state.context_partitions() {
+        lines.push(format!(
+            "  {} {}/{}",
+            partition.class, partition.used, partition.cap
+        ));
     }
     lines.truncate(usize::from(height));
     for line in &mut lines {
@@ -796,6 +820,19 @@ pre-approve it with `rapid permissions allow <tool>`";
             .expect("entry");
         let (_, line) = crate::transcript::render_block_parts(entry);
         assert_eq!(line, "✓ repo_read");
+    }
+
+    #[test]
+    fn the_context_panel_says_so_before_any_turn_has_compiled_one() {
+        // The honest empty state: there is no context to describe until a
+        // turn has compiled one, and inventing a zero-of-a-window would be a
+        // figure the reader could act on wrongly.
+        let painted = sidebar_lines(UiRoute::Context, &AppState::new(), 50, 6, &cancel());
+        assert_eq!(
+            painted,
+            vec![fit_width("no turn has compiled a context yet", 50)]
+        );
+        assert!(route_renders_content(UiRoute::Context));
     }
 
     #[test]

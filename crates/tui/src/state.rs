@@ -169,6 +169,9 @@ pub struct AppState {
     /// `None` until a turn has reported one — there is no honest figure to
     /// show before then.
     context_usage: Option<(u64, u64)>,
+    /// Per-class breakdown from the same `context.compiled` event — which
+    /// class is consuming the window, which the totals cannot answer.
+    context_partitions: Vec<ContextPartition>,
     approvals: BTreeMap<ApprovalKey, ApprovalProjection>,
     selected_agent: Option<AgentId>,
     selected_goal: Option<GoalId>,
@@ -374,6 +377,16 @@ pub struct JobProjection {
     command: Option<String>,
 }
 
+/// One hard context partition, as the `/context` panel shows it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextPartition {
+    /// Partition class: `system`, `user`, `goal`, `diff`, `retrieved`,
+    /// `memory`, `read_set`.
+    pub class: String,
+    pub used: u64,
+    pub cap: u64,
+}
+
 /// One configured model, as the `/models` panel shows it.
 ///
 /// Carries no credential and has nowhere to put one: `[model.<id>]` tables
@@ -577,6 +590,23 @@ fn apply_kernel(
                 optional_u64(event.payload(), "context_limit")?,
             ) {
                 state.context_usage = Some((used, limit));
+            }
+            // Rows are optional: an emitter that reports only the totals
+            // leaves the panel showing those, rather than failing the event.
+            if let Some(rows) = event.payload().get("partitions").and_then(|v| v.as_array()) {
+                let parsed: Vec<ContextPartition> = rows
+                    .iter()
+                    .filter_map(|row| {
+                        Some(ContextPartition {
+                            class: row.get("class")?.as_str()?.to_owned(),
+                            used: row.get("used")?.as_u64()?,
+                            cap: row.get("cap")?.as_u64()?,
+                        })
+                    })
+                    .collect();
+                if !parsed.is_empty() {
+                    state.context_partitions = parsed;
+                }
             }
         }
         EventKind::JobOutput => {
@@ -1158,6 +1188,7 @@ impl AppState {
             models: Vec::new(),
             memory: Vec::new(),
             context_usage: None,
+            context_partitions: Vec::new(),
             approvals: BTreeMap::new(),
             selected_agent: None,
             selected_goal: None,
@@ -1227,6 +1258,10 @@ impl AppState {
     /// `(used, limit)` for the last turn that reported it.
     pub fn context_usage(&self) -> Option<(u64, u64)> {
         self.context_usage
+    }
+
+    pub fn context_partitions(&self) -> &[ContextPartition] {
+        &self.context_partitions
     }
 
     pub fn jobs(&self) -> &BTreeMap<JobId, JobProjection> {
