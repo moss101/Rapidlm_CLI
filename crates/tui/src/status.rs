@@ -298,7 +298,11 @@ impl StatusSnapshot {
             model: compose_model_label(chrome.model.as_deref(), chrome.provider.as_deref()),
             sandbox: chrome.sandbox,
             policy: chrome.policy,
-            context: chrome.context,
+            // State wins when a turn has reported real usage: the chrome's
+            // value is a session-level placeholder, while this is what the
+            // model was actually given. Before any turn has run there is no
+            // honest figure, and the item keeps its dash.
+            context: context_from_state(state).unwrap_or(chrome.context),
             goal: goal_from_state(state),
             agent_count: live_agent_count(state),
             cost: total_cost(state),
@@ -636,6 +640,11 @@ fn is_terminal(state: AgentLifecycle) -> bool {
         state,
         AgentLifecycle::Succeeded | AgentLifecycle::Failed | AgentLifecycle::Cancelled
     )
+}
+
+fn context_from_state(state: &AppState) -> Option<ContextUsage> {
+    let (used, limit) = state.context_usage()?;
+    Some(ContextUsage::new(used, Some(limit)))
 }
 
 fn total_cost(state: &AppState) -> u64 {

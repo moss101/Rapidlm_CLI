@@ -7376,6 +7376,45 @@ model got.
 *projected*, which nothing does today — `apps/rapid` writes through `atomic_write` and never touches the
 `workspace` crate's journal/transaction machinery, so there is no change set to render.
 
+**`ctx:` was the last dash on the status bar with a real source, done 2026-09-10.**
+
+The context compiler has always produced exactly the figure the bar wants: `TokenPartitions` carries
+`included_tokens` against `context_limit` (plus per-class used/cap for system, user, goal, diff,
+retrieved, memory and read-set). It was computed on every turn and never left the host.
+
+**Read *after* execution, not at build time.** The packet is rebuilt by compaction and overflow recovery
+(`LiveRecoveryController`), so the figure taken before the turn ran describes a context the model may no
+longer have been using. `LiveContextHost::context_usage` reads the packet the host currently holds and
+`run_live_exec` captures it once execution returns, so `ExecOutcome::context_tokens` is what actually
+applied.
+
+**It travels as a kernel event, and the first draft got that wrong.** `EventKind::ContextCompiled`
+already exists in the ledger vocabulary, so the composition root appends it through
+`append_turn_progress` — the same call the turn's own sink and the job sink use, at the session tip. My
+first version added a `LocalUiEvent::SyncContextUsage` *as well*, which would have been two paths for one
+fact: exactly the defect this document keeps recording. The local variant was removed before it shipped;
+the projection reads the kernel event, which also means a resumed session replays its context usage like
+everything else.
+
+**Both fields or neither.** The projection sets usage only when `included_tokens` *and* `context_limit`
+are both present — a limit without a usage would render as a ratio with an invented half.
+
+**State wins over chrome in the status snapshot.** The chrome value is a session-level placeholder;
+state's is what a turn actually compiled. Before any turn has run there is no honest figure and the item
+keeps its dash, which is why the test asserts `None` first.
+
+**Tests.** One new, through the real scripted-turn path: no usage before a turn; after one, a non-zero
+usage no greater than the limit, the limit being the one the turn actually ran with, and the figure
+reaching the rendered status line. Two revert cycles (108-109) — the host not reporting, and the event
+not being projected — each leaving the bar dashed.
+
+694 `rapid` lib tests, 232 `tui`, clippy identical to baseline, full workspace green.
+
+**The `/context` panel is now cheap and is the obvious follow-up:** the per-class partitions
+(`TokenPartitions`' seven `PartitionBudget`s) are the "what is eating my context" breakdown, and only the
+totals are projected today. Adding them is the same event with more fields plus a renderer — no new
+plumbing.
+
 ## Session boundary, 2026-09-09 — durable state for the next session
 
 Eight commits, `dbeb2c2`..`1e516cb`, all pushed to `origin/main`. Baseline before them was `598c6fd`.

@@ -164,6 +164,11 @@ pub struct AppState {
     /// The project memory index as the model receives it — see
     /// [`LocalUiEvent::SyncMemory`].
     memory: Vec<String>,
+    /// Compiled-context usage from the last `context.compiled` event: tokens
+    /// included in the packet the model was given, against the hard limit.
+    /// `None` until a turn has reported one — there is no honest figure to
+    /// show before then.
+    context_usage: Option<(u64, u64)>,
     approvals: BTreeMap<ApprovalKey, ApprovalProjection>,
     selected_agent: Option<AgentId>,
     selected_goal: Option<GoalId>,
@@ -563,6 +568,16 @@ fn apply_kernel(
         }
         EventKind::JobStarted => {
             upsert_job(&mut state, event, JobLifecycle::Started)?;
+        }
+        EventKind::ContextCompiled => {
+            // Both fields or neither: a limit without a usage (or the
+            // reverse) would render as a ratio with an invented half.
+            if let (Some(used), Some(limit)) = (
+                optional_u64(event.payload(), "included_tokens")?,
+                optional_u64(event.payload(), "context_limit")?,
+            ) {
+                state.context_usage = Some((used, limit));
+            }
         }
         EventKind::JobOutput => {
             upsert_job(&mut state, event, JobLifecycle::Output)?;
@@ -1142,6 +1157,7 @@ impl AppState {
             jobs: BTreeMap::new(),
             models: Vec::new(),
             memory: Vec::new(),
+            context_usage: None,
             approvals: BTreeMap::new(),
             selected_agent: None,
             selected_goal: None,
@@ -1206,6 +1222,11 @@ impl AppState {
 
     pub fn memory(&self) -> &[String] {
         &self.memory
+    }
+
+    /// `(used, limit)` for the last turn that reported it.
+    pub fn context_usage(&self) -> Option<(u64, u64)> {
+        self.context_usage
     }
 
     pub fn jobs(&self) -> &BTreeMap<JobId, JobProjection> {

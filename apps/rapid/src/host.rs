@@ -445,6 +445,15 @@ pub struct LiveContextHost<B> {
 }
 
 impl<B: LiveModelCall> LiveContextHost<B> {
+    /// Compiled-context usage of the packet the host currently holds:
+    /// `(included_tokens, context_limit)`. See [`ExecOutcome::context_tokens`]
+    /// on why callers read this *after* execution.
+    pub fn context_usage(&self) -> Option<(u32, u32)> {
+        let live = self.live.try_borrow().ok()?;
+        let partitions = live.packet().partitions();
+        Some((partitions.included_tokens(), partitions.context_limit()))
+    }
+
     pub fn from_preserved(
         preserved: PreservedLiveContext,
         backing: B,
@@ -1264,6 +1273,16 @@ pub struct ExecOutcome {
     pub tool_calls: u32,
     pub tokens: u64,
     pub cost_usd_micros: Option<u64>,
+    /// Compiled-context usage as this turn *ended*: tokens included in the
+    /// packet the model was last given, against the hard context limit.
+    ///
+    /// Read after execution rather than at build time on purpose — the
+    /// packet is rebuilt by compaction and overflow recovery
+    /// (`LiveRecoveryController`), so the figure taken before the turn ran
+    /// would describe a context the model may no longer have been using. The
+    /// status line's `ctx:` item and any context panel want the one that
+    /// actually applied.
+    pub context_tokens: Option<(u32, u32)>,
 }
 
 /// Production entry used by the CLI `exec`/`goal` command: build the
@@ -1299,6 +1318,7 @@ where
     let mut host = LiveContextHost::build(preserved, supervised, policy)
         .map_err(|_| AgentExecutionError::InvalidRequest)?;
     let outcome = host.execute(request, tools, events, cancel)?;
+    let context_tokens = host.context_usage();
     let tokens = counter.load(std::sync::atomic::Ordering::Relaxed);
     let cost_usd_micros = cost.total();
     if let Some(diag) = turn_diag {
@@ -1324,6 +1344,7 @@ where
         tool_calls: outcome.tool_calls,
         tokens,
         cost_usd_micros,
+        context_tokens,
     })
 }
 

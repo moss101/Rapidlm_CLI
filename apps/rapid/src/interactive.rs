@@ -5767,6 +5767,25 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
         ContextRetryPolicy::default(),
         None,
     );
+    // Compiled-context usage, appended on the same terms as a background
+    // job's lifecycle: through `append_turn_progress`, at the session tip, so
+    // it reaches the status line by the ordinary subscription rather than a
+    // second channel. Emitted for every completed turn — a failed turn still
+    // filled a context, and the figure is what the model was last given.
+    if let Ok(outcome) = &run_result
+        && let Some((used, limit)) = outcome.context_tokens
+    {
+        let _ = client.append_turn_progress(
+            session_id,
+            actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::ContextCompiled,
+            serde_json::json!({
+                "included_tokens": used,
+                "context_limit": limit,
+            }),
+        );
+    }
     if let (Ok(outcome), Some(goal_id)) = (&run_result, goal_id) {
         let active_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         accrue_turn_usage(
@@ -9847,6 +9866,49 @@ question the panel answers"
     }
 
     #[test]
+    fn a_finished_turn_reports_the_context_it_actually_used() {
+        // The `ctx:` item read a dash for every session: the compiler
+        // computes `included_tokens` against `context_limit` on every turn
+        // (`TokenPartitions`) and nothing carried it out of the host.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        assert_eq!(
+            session.state().context_usage(),
+            None,
+            "before a turn there is no honest figure to show"
+        );
+
+        session.run_turn("do something", ScriptedModel::terminal("done"));
+
+        let (used, limit) = session
+            .state()
+            .context_usage()
+            .expect("a finished turn must report what it compiled");
+        assert!(used > 0, "a real turn compiles a non-empty context");
+        assert!(
+            used <= limit,
+            "usage must be reported against the limit it was compiled under: {used}/{limit}"
+        );
+        assert_eq!(
+            u32::try_from(limit).expect("limit fits"),
+            crate::user_config::DEFAULT_CONTEXT_WINDOW,
+            "and the limit must be the one this turn actually ran with"
+        );
+
+        // It reaches the status line, which is where the dash was.
+        let rendered = tui::render_status_with(
+            session.state(),
+            &tui::StatusChrome::default(),
+            120,
+        );
+        assert!(
+            rendered.content().contains(&format!("{used}")),
+            "the status line must show the compiled usage: {}",
+            rendered.content()
+        );
+    }
+
+    #[test]
     fn the_status_bar_shows_the_model_and_policy_this_session_resolved() {
         // Every frame passed `StatusChrome::default()`, so the bar read
         // `model:-  sandbox:-  policy:-  ctx:-` for the whole session: a
@@ -11809,6 +11871,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             tool_calls: 0,
             tokens: 0,
             cost_usd_micros: None,
+            context_tokens: None,
         }
     }
 
