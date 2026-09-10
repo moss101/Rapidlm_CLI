@@ -253,11 +253,17 @@ pub enum Inspector {
     Goal,
     Context,
     Memory,
+    /// `id` is the job `/jobs show|logs` named, `logs` which view of it.
+    ///
+    /// Carried rather than dropped: `parse_jobs` has always parsed this id,
+    /// and every consumer discarded it at [`Inspector::route`], so `/jobs
+    /// show <id>` and `/jobs logs <id>` opened the same unfiltered list as
+    /// a bare `/jobs` — a parsed operand with no effect.
+    Jobs { id: Option<JobId>, logs: bool },
     Knowledge,
     Playbook,
     Trace,
     Insights,
-    Jobs,
     Models,
     Mcp,
     Plugins,
@@ -764,8 +770,15 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         UiCommand::InsightsShow | UiCommand::InsightsAnalyze | UiCommand::InsightsProposals => {
             FrontendAction::Local(LocalAction::Open(Inspector::Insights))
         }
-        UiCommand::JobsList | UiCommand::JobsShow { .. } | UiCommand::JobsLogs { .. } => {
-            FrontendAction::Local(LocalAction::Open(Inspector::Jobs))
+        UiCommand::JobsList => FrontendAction::Local(LocalAction::Open(Inspector::Jobs {
+            id: None,
+            logs: false,
+        })),
+        UiCommand::JobsShow { id } => {
+            FrontendAction::Local(LocalAction::Open(Inspector::Jobs { id, logs: false }))
+        }
+        UiCommand::JobsLogs { id } => {
+            FrontendAction::Local(LocalAction::Open(Inspector::Jobs { id, logs: true }))
         }
         UiCommand::JobsCancel { id } => FrontendAction::Kernel(KernelAction::CancelJob { id }),
         UiCommand::ModelList | UiCommand::ModelDoctor => {
@@ -929,7 +942,7 @@ impl Inspector {
             Self::Diff { .. } => Some(UiRoute::Diff),
             Self::Context => Some(UiRoute::Context),
             Self::Memory => Some(UiRoute::Memory),
-            Self::Jobs => Some(UiRoute::Jobs),
+            Self::Jobs { .. } => Some(UiRoute::Jobs),
             Self::Goal => Some(UiRoute::Goals),
             Self::Knowledge
             | Self::Playbook

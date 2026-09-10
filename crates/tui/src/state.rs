@@ -41,6 +41,13 @@ pub const MAX_PROJECTED_JOBS: usize = 256;
 /// Maximum approvals retained in the frontend projection.
 pub const MAX_PROJECTED_APPROVALS: usize = 256;
 
+/// Hard cap on the lines of one job's output held for the `/jobs logs` view.
+///
+/// The spool a job writes is capped in bytes by the producer, but a byte cap
+/// still admits an unbounded *line* count; this is what the panel keeps, and
+/// it keeps the tail — the end of a build log is the part a reader wants.
+pub const MAX_JOB_LOG_LINES: usize = 512;
+
 /// Maximum approval/protocol modals on the stack.
 pub const MAX_MODALS: usize = 16;
 
@@ -101,6 +108,8 @@ pub enum LocalUiEvent {
     /// from a file, like [`Self::SyncModels`], so there is no kernel event
     /// to carry it.
     SyncMemory(Vec<String>),
+    /// Output for the selected job, or `None` to leave the logs view.
+    SyncJobLogs(Option<JobLogView>),
     /// Drop a host-owned goal projection that no longer has a snapshot to
     /// project from — completion/cancel clear the host's own snapshot (see
     /// `agent_runtime::GoalState`'s own doc comment), so without this a
@@ -164,6 +173,9 @@ pub struct AppState {
     /// The project memory index as the model receives it — see
     /// [`LocalUiEvent::SyncMemory`].
     memory: Vec<String>,
+    /// Output of the job `/jobs logs` last asked for — see
+    /// [`LocalUiEvent::SyncJobLogs`]. `None` whenever no logs view is open.
+    job_logs: Option<JobLogView>,
     /// Compiled-context usage from the last `context.compiled` event: tokens
     /// included in the packet the model was given, against the hard limit.
     /// `None` until a turn has reported one — there is no honest figure to
@@ -794,6 +806,9 @@ fn apply_local(mut state: AppState, event: &LocalUiEvent) -> Result<AppState, Ui
         LocalUiEvent::SyncMemory(lines) => {
             state.memory = lines.clone();
         }
+        LocalUiEvent::SyncJobLogs(page) => {
+            state.job_logs = page.clone();
+        }
         LocalUiEvent::SyncGoal(goal) => {
             insert_goal(&mut state, goal.clone())?;
             state.selected_goal = Some(goal.id);
@@ -987,6 +1002,50 @@ fn upsert_job(
         job.command = Some(command);
     }
     Ok(())
+}
+
+/// One job's captured output, as the `/jobs logs` view shows it.
+///
+/// Tagged with the job it came from so a page synced for one job can never
+/// be painted under a different selection: the panel renders these lines
+/// only when `job` matches the selected job.
+///
+/// Host-synced rather than ledger-projected, like [`LocalUiEvent::SyncModels`]
+/// and [`LocalUiEvent::SyncMemory`]: a job's bytes are spooled in this
+/// process by the job registry and are not in the event ledger at all.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct JobLogView {
+    job: JobId,
+    lines: Vec<String>,
+    /// The producer cut the output short of what the process actually wrote.
+    truncated: bool,
+}
+
+impl JobLogView {
+    pub fn new(job: JobId, lines: Vec<String>, truncated: bool) -> Self {
+        let mut lines = lines;
+        // Keep the tail: the end of a log is what a reader opened it for.
+        if lines.len() > MAX_JOB_LOG_LINES {
+            lines.drain(..lines.len() - MAX_JOB_LOG_LINES);
+        }
+        Self {
+            job,
+            lines,
+            truncated,
+        }
+    }
+
+    pub const fn job(&self) -> JobId {
+        self.job
+    }
+
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
 }
 
 fn upsert_approval(
@@ -1238,6 +1297,7 @@ impl AppState {
             approvals: BTreeMap::new(),
             selected_agent: None,
             selected_goal: None,
+            job_logs: None,
             selected_job: None,
             selected_approval: None,
             control_holder: ControlHolder::Agent,
@@ -1336,6 +1396,11 @@ impl AppState {
 
     pub fn selected_job(&self) -> Option<JobId> {
         self.selected_job
+    }
+
+    /// Output synced for the selected job, if a logs view is open.
+    pub fn job_logs(&self) -> Option<&JobLogView> {
+        self.job_logs.as_ref()
     }
 
     pub fn selected_approval(&self) -> Option<&ApprovalKey> {
@@ -1660,6 +1725,22 @@ impl WorkerClass {
 }
 
 impl JobLifecycle {
+    /// Whether the job has stopped for good.
+    ///
+    /// A terminal job's captured output never changes again, so a reader of
+    /// that spool — the `/jobs logs` view — knows it has nothing to re-read.
+    /// Classified here rather than at the reader so the two cannot drift.
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed
+                | Self::Failed
+                | Self::Cancelled
+                | Self::TimedOut
+                | Self::OrphanReconciled
+        )
+    }
+
     /// The wire vocabulary is `process_supervisor::JobState::as_str`'s, so
     /// one payload shape serves every producer of `job.*` events.
     ///

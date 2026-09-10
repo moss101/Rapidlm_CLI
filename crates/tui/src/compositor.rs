@@ -38,11 +38,13 @@
 //! routes that turn out to have the same gap, rather than pretending only
 //! four routes have it.
 
+use protocol::JobId;
+
 use crate::layout::{LayoutRects, Rect, UiMode, compute_layout_with_composer};
 use crate::panels::agents::{AgentsSelection, AgentsViewModel};
 use crate::panels::goals::GoalViewModel;
 use crate::sanitize::sanitize_untrusted;
-use crate::state::{AppState, CancellationToken, UiRoute};
+use crate::state::{AppState, CancellationToken, JobLogView, JobProjection, UiRoute};
 use crate::status::{StatusChrome, render_status_with};
 use crate::transcript::{Transcript, TranscriptViewport};
 
@@ -245,36 +247,94 @@ fn goal_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
 /// (`upsert_job`); only the rendering was missing, so the route switched to a
 /// panel that painted nothing — and on a narrow terminal an empty panel takes
 /// the whole transcript rect. Rows are ordered by id (the `BTreeMap`'s own
-/// order) so a redraw never reshuffles them under the reader.
+/// The `/jobs` panel, in the view the command asked for.
+///
+/// Three views, one function, because they answer the same question at
+/// different resolutions: the list ("what is running"), one job ("what is
+/// *that* one doing"), and its output ("what did it print"). `/jobs show
+/// <id>` and `/jobs logs <id>` parsed an id from the beginning and every
+/// consumer dropped it, so both opened the same unfiltered list as a bare
+/// `/jobs` — the panel could not tell it had been asked about one job.
+///
+/// Log text is process output and gets [`sanitize_untrusted`] like every
+/// other untrusted string the compositor paints: a build log is exactly the
+/// kind of content that carries escape sequences, and it must not be able
+/// to repaint the terminal around it.
 fn job_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
-    let mut lines: Vec<String> = state
-        .jobs()
-        .values()
-        .map(|job| {
-            let lifecycle = format!("{:?}", job.state()).to_lowercase();
-            // The command, when the producer recorded one: a list of UUIDs
-            // cannot tell a reader which row is the test run they are
-            // waiting on.
-            let what = job.command().unwrap_or("");
-            let head = if what.is_empty() {
-                job.id().to_string()
-            } else {
-                what.to_owned()
-            };
-            match job.exit_status() {
-                Some(status) => format!("{head} [{lifecycle}] exit:{status}"),
-                None => format!("{head} [{lifecycle}]"),
-            }
-        })
-        .collect();
-    if lines.is_empty() {
-        lines.push("no jobs".to_owned());
-    }
+    let mut lines = match (state.selected_job(), state.job_logs()) {
+        // A logs page belonging to the selected job.
+        (Some(selected), Some(page)) if page.job() == selected => job_log_lines(state, page),
+        // One job, named by `/jobs show <id>`.
+        (Some(selected), _) => job_detail_lines(state, selected),
+        (None, _) => job_list_lines(state),
+    };
     lines.truncate(usize::from(height));
     for line in &mut lines {
         *line = fit_width(line, usize::from(width));
     }
     lines
+}
+
+/// One row per job: what it is, and how it ended if it has.
+fn job_list_lines(state: &AppState) -> Vec<String> {
+    let mut lines: Vec<String> = state.jobs().values().map(job_row).collect();
+    if lines.is_empty() {
+        lines.push("no jobs".to_owned());
+    }
+    lines
+}
+
+/// The row `/jobs show <id>` asked for, or why there is none.
+fn job_detail_lines(state: &AppState, selected: JobId) -> Vec<String> {
+    match state.jobs().get(&selected) {
+        Some(job) => vec![job_row(job), format!("id {selected}")],
+        // Naming a job that is not in this session's projection is a real
+        // outcome (a stale id, another session's job), and saying so beats
+        // silently painting the whole list as though nothing was asked.
+        None => vec![format!("no job {selected} in this session")],
+    }
+}
+
+/// The captured output of the job `/jobs logs <id>` named.
+fn job_log_lines(state: &AppState, page: &JobLogView) -> Vec<String> {
+    let mut lines = Vec::new();
+    match state.jobs().get(&page.job()) {
+        Some(job) => lines.push(job_row(job)),
+        None => lines.push(format!("job {}", page.job())),
+    }
+    if page.truncated() {
+        lines.push("output truncated at the capture limit".to_owned());
+    }
+    if page.lines().is_empty() {
+        // True whether the job printed nothing or was started by an earlier
+        // process whose spool died with it: either way nothing was captured
+        // here, and claiming the job produced no output would not be.
+        lines.push("no output captured in this process".to_owned());
+        return lines;
+    }
+    lines.extend(
+        page.lines()
+            .iter()
+            .map(|line| sanitize_untrusted(line).into_owned()),
+    );
+    lines
+}
+
+/// One job as a row: the command when the producer recorded one, since a
+/// list of UUIDs cannot tell a reader which row is the test run they are
+/// waiting on.
+fn job_row(job: &JobProjection) -> String {
+    let lifecycle = format!("{:?}", job.state()).to_lowercase();
+    let what = job.command().unwrap_or("");
+    let head = if what.is_empty() {
+        job.id().to_string()
+    } else {
+        what.to_owned()
+    };
+    match job.exit_status() {
+        Some(status) => format!("{head} [{lifecycle}] exit:{status}"),
+        None => format!("{head} [{lifecycle}]"),
+    }
 }
 
 /// The `/approvals` panel, on the same footing as [`job_lines`].
@@ -1006,6 +1066,121 @@ pre-approve it with `rapid permissions allow <tool>`";
         assert!(
             route_renders_content(UiRoute::Jobs),
             "and the route must now report itself as one that paints"
+        );
+    }
+
+    #[test]
+    fn a_logs_page_never_paints_under_a_different_jobs_selection() {
+        // The page carries the job it was synced for precisely so this
+        // cannot happen: a user who runs `/jobs logs A` and then `/jobs
+        // show B` must not see A's output labelled as B. Without the tag
+        // the panel would paint whatever page was last synced.
+        use event_ledger::event::EventKind;
+
+        let a = "019c0000-0000-7000-8000-00000000002a";
+        let b = "019c0000-0000-7000-8000-00000000002b";
+        let mut state = reduce(
+            AppState::new(),
+            &UiEvent::Kernel(kernel_event(
+                1,
+                EventKind::SessionCreated,
+                serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
+            )),
+        );
+        for (seq, id) in [(2u64, a), (3, b)] {
+            state = reduce(
+                state,
+                &UiEvent::Kernel(kernel_event(
+                    seq,
+                    EventKind::JobStarted,
+                    serde_json::json!({"job_id": id}),
+                )),
+            );
+        }
+
+        let a_id: JobId = a.parse().expect("job id");
+        let b_id: JobId = b.parse().expect("job id");
+        let state = reduce(
+            state,
+            &UiEvent::Local(crate::state::LocalUiEvent::SyncJobLogs(Some(
+                crate::state::JobLogView::new(a_id, vec!["output-of-a".to_owned()], false),
+            ))),
+        );
+
+        let selected_a = reduce(
+            state.clone(),
+            &UiEvent::Local(crate::state::LocalUiEvent::SelectJob(Some(a_id))),
+        );
+        let painted = sidebar_lines(UiRoute::Jobs, &selected_a, 60, 6, &cancel());
+        assert!(
+            painted.iter().any(|line| line.contains("output-of-a")),
+            "the page must paint for the job it belongs to: {painted:?}"
+        );
+
+        let selected_b = reduce(
+            state,
+            &UiEvent::Local(crate::state::LocalUiEvent::SelectJob(Some(b_id))),
+        );
+        let painted = sidebar_lines(UiRoute::Jobs, &selected_b, 60, 6, &cancel());
+        assert!(
+            !painted.iter().any(|line| line.contains("output-of-a")),
+            "one job's output must never be painted under another's selection: {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|line| line.contains(b)),
+            "and the job that was named is the one shown: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn job_output_cannot_repaint_the_terminal_around_it() {
+        // Log text is whatever a child process wrote to its own stdout —
+        // the most obviously attacker-influenced string the compositor
+        // paints (a build log echoes filenames, test names, and remote
+        // content). It goes through `sanitize_untrusted` like every other
+        // untrusted string.
+        use event_ledger::event::EventKind;
+
+        let job = "019c0000-0000-7000-8000-00000000002a";
+        let mut state = reduce(
+            AppState::new(),
+            &UiEvent::Kernel(kernel_event(
+                1,
+                EventKind::SessionCreated,
+                serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
+            )),
+        );
+        state = reduce(
+            state,
+            &UiEvent::Kernel(kernel_event(
+                2,
+                EventKind::JobStarted,
+                serde_json::json!({"job_id": job}),
+            )),
+        );
+        let id: JobId = job.parse().expect("job id");
+        state = reduce(
+            state,
+            &UiEvent::Local(crate::state::LocalUiEvent::SelectJob(Some(id))),
+        );
+        state = reduce(
+            state,
+            &UiEvent::Local(crate::state::LocalUiEvent::SyncJobLogs(Some(
+                crate::state::JobLogView::new(
+                    id,
+                    vec!["\u{1b}[2J\u{1b}[Hcompiling the payload".to_owned()],
+                    false,
+                ),
+            ))),
+        );
+        let painted = sidebar_lines(UiRoute::Jobs, &state, 60, 6, &cancel());
+        assert!(
+            !painted.iter().any(|line| line.contains('\u{1b}')),
+            "no escape sequence from a job's stdout may reach the terminal: {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|line| line.contains("compiling the payload")),
+            "and the text is still readable, just inert: {painted:?}"
         );
     }
 

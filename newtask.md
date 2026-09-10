@@ -7547,6 +7547,80 @@ stream starves the child.
 and the fork point is always the session's current tip (`/fork [checkpoint]`'s optional operand is still
 unused — `parse_fork` accepts none). Both are ordinary follow-ups now that switching works.
 
+**`/jobs show <id>` and `/jobs logs <id>` honor the id they parse, done 2026-09-10.**
+
+`parse_jobs` has parsed a typed `JobId` for both since they existed, and every consumer dropped it — so
+naming a job opened the same unfiltered list as a bare `/jobs`. The cause is one boundary, not six
+commands: `dispatch` hands the frontend an `Inspector`, and `Inspector::route()` — the only thing that
+reaches a panel — returns a bare `UiRoute` with no room for *which one*. `Inspector::Diff { agent }`
+already carried a selection field and `route()` discarded that too, so `/diff --agent <id>` has the same
+defect and the same cause.
+
+**The selection state already existed.** `AppState` has carried `selected_job`, `selected_agent`,
+`selected_goal` and `selected_approval`, with a `LocalUiEvent::SelectJob` to set them, since before this
+session — and *nothing in the binary ever emitted one*. The first draft of this change added a new
+`PanelFocus` struct beside those fields; that is the session's recurring defect (a second representation
+of one fact) and it was removed before it compiled. What shipped emits the existing event.
+
+**`/jobs logs` had its data all along too.** `JobRegistry` spools each job's combined stdout/stderr,
+capped at `MAX_JOB_OUTPUT_BYTES`, and serves it to the *model* through the `job_output` tool. The user's
+advertised command was the only reader with no path to those bytes. `JobRegistry::logs` reads the same
+buffer — not a second capture — via the same `ledger_id` lookup `cancel` uses, so what the user sees and
+what the model saw cannot drift.
+
+**Two things self-review caught before the commit, both about whether the feature is *real*:**
+
+1. **The id was unobtainable.** The panel paints a job's *command* whenever the producer recorded one —
+   deliberately, since a list of UUIDs cannot tell a reader which row is the test run they are waiting
+   on — so nothing displayed the `JobId` the command demanded. A working command nobody can invoke is
+   not much better than a broken one. A bare `/jobs logs` now reads the most recent job: `JobId` is a
+   UUIDv7, so the projection's key order is start order and the last key is the newest.
+2. **A running job's logs were frozen.** The page was captured once at dispatch, so watching a build —
+   the only reason to open it — would show a stalled page under a header saying `[started]`. `drain`
+   re-reads an open view, and only while the job is live: `JobLifecycle::is_terminal` (added on the type,
+   not at the reader, so the two cannot drift) makes this free on an idle session.
+
+**Job output is the most attacker-influenced string the compositor paints** — a build log echoes
+filenames, test names and remote content — so it goes through `sanitize_untrusted` like every other
+untrusted string. Revert cycle 117 confirms the escape sequence reaches the terminal without it.
+
+**Revert cycles 115-119.** 115 (drop the operand again) is the one that earned its keep: the `/jobs show`
+test failed as predicted, and **the `/jobs logs` test passed with the whole feature reverted.** The
+fixture ran `/bin/echo hello-from-the-job` and asserted the panel showed `hello-from-the-job` — which the
+*list* view already paints as the job's command. The test proved nothing. It now runs a shell computing
+`123456789 * 2` and asserts on `246913578`, a value that appears only in what the process printed, plus a
+negative assertion that leaving the view stops painting it. 116 (paint any page regardless of its job
+tag) and 117 (stop sanitizing) confirm the two panel guards; 118 (bare `/jobs logs` resolves nothing) and
+119 (drop the refresh from `drain`) confirm the two self-review additions.
+
+**Architecture found, and worth carrying forward: `crates/tui/src/panels/` is ~10.7k lines of panel view
+models, tested and exported from `lib.rs`, of which the compositor uses two.** `agents` and `goals` are
+wired; `trace_jobs`, `diff`, `context`, `memory`, `model` and `approval` are not, and the thin `*_lines`
+functions in `compositor.rs` — including the ones added earlier this session — are a parallel, simpler
+implementation of the same panels. This is the session's through-line at its largest scale. Two specific
+findings before anyone acts on it:
+
+- `TraceJobsViewModel::from_app_state` *already* honors `state.selected_job()`. The selection wiring was
+  built; nothing set the field.
+- Its log path cannot be wired as drawn. `LogViewIntent`/`LogPage` are documented "the inspector does not
+  fetch bytes" and address logs by `ArtifactRef` — and **no producer of `ArtifactRef` exists anywhere in
+  the workspace**, only the TUI's own view models and test fixtures. That half of the design needs an
+  artifact store before it can be used.
+- Wiring `trace_jobs` wholesale would also *regress* what `/jobs` shows today: `JobObservation::
+  from_projection` does not read `job.command()`, so rows would go back to bare UUIDs.
+
+So the honest sequencing is: an artifact store (or an explicit decision to feed excerpts inline through
+`JobObservation::with_log`) comes before retiring `compositor::job_lines`, not after.
+
+**Deliberately not done here.** `/diff --agent <id>`, `/agents show <id>`, `/context search <query>`,
+`/knowledge show <id>` and `/playbook show <name>` drop their operands at the same boundary for the same
+reason. `/agents show` is now a one-line addition to `focus_inspector` using `selected_agent`, but the
+rest are not wiring: `/context search` needs a search over the compiled context, and knowledge/playbook
+panels have no store behind them at all. The id-discoverability problem is also only *worked around* for
+jobs, not solved — `/jobs show <id>` and `/jobs cancel <id>` still require a full UUID that nothing
+prints. The general fix is prefix matching in the shared typed-id parser (`optional_id`/`require_id`),
+which would serve jobs, agents and knowledge at once.
+
 ## Session boundary, 2026-09-10 — durable state for the next session
 
 Eighteen commits across two days, `dbeb2c2`..`9c0a450`, all pushed to `origin/main`. Baseline before them

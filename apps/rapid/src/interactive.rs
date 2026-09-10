@@ -1609,7 +1609,7 @@ fn unrouted_inspector_text(inspector: &Inspector) -> String {
         | Inspector::Goal
         | Inspector::Context
         | Inspector::Memory
-        | Inspector::Jobs => "this inspector has a TUI route and should not reach this message",
+        | Inspector::Jobs { .. } => "this inspector has a TUI route and should not reach this message",
         // Handled by `open_unrouted_inspector` with a real report.
         Inspector::Mcp => "MCP configuration is reported inline and should not reach this message",
         Inspector::Knowledge => {
@@ -4215,6 +4215,7 @@ impl SessionLoop<'_> {
                                 self.ui.clone(),
                                 &UiEvent::Local(LocalUiEvent::SetRoute(route)),
                             );
+                            self.focus_inspector(&inspector);
                         }
                         // Eleven of the seventeen inspectors have no TUI
                         // route. This arm used to be an empty `if let`, so
@@ -4257,6 +4258,69 @@ impl SessionLoop<'_> {
                 self.append_command_error(command_error_text(&err));
                 Ok(LoopControl::Continue)
             }
+        }
+    }
+
+    /// Apply the selection an inspector command named, once its route is set.
+    ///
+    /// [`Inspector`] has carried a selection since `/diff --agent` existed,
+    /// but [`Inspector::route`] — the only thing that reached the panel —
+    /// returns a bare [`tui::state::UiRoute`] and dropped it. So `/jobs show
+    /// <id>` and `/jobs logs <id>` parsed an id, dispatched successfully,
+    /// and opened the same unfiltered list as a bare `/jobs`.
+    ///
+    /// The selection is applied in the same dispatch as the route change so
+    /// the panel can never be showing one job's route with another job's
+    /// selection, and it reuses `AppState`'s existing `selected_job` rather
+    /// than adding a second place to record which job is in view.
+    fn focus_inspector(&mut self, inspector: &Inspector) {
+        let Inspector::Jobs { id, logs } = inspector else {
+            return;
+        };
+        let target = match (id, logs) {
+            (Some(id), _) => Some(*id),
+            // A bare `/jobs logs` means the newest job. Without this the
+            // command is answerable only by someone who already knows a
+            // `JobId`, and nothing shows one: the panel paints a job's
+            // *command* whenever the producer recorded one, precisely
+            // because a list of UUIDs cannot tell a reader which row is the
+            // test run they are waiting on. `JobId` is a UUIDv7, so the
+            // projection's key order is start order and the last key is the
+            // most recently started job.
+            (None, true) => self.ui.jobs().keys().next_back().copied(),
+            (None, false) => None,
+        };
+        *self.ui = reduce(
+            self.ui.clone(),
+            &UiEvent::Local(LocalUiEvent::SelectJob(target)),
+        );
+        // A page belongs to exactly one job: `/jobs` and `/jobs show` must
+        // clear whatever `/jobs logs` last painted rather than leave it
+        // under a different selection.
+        let page = match (logs, target) {
+            (true, Some(id)) => Some(self.job_log_page(id)),
+            _ => None,
+        };
+        *self.ui = reduce(
+            self.ui.clone(),
+            &UiEvent::Local(LocalUiEvent::SyncJobLogs(page)),
+        );
+    }
+
+    /// The named job's captured output, as a page for the `/jobs logs` view.
+    ///
+    /// Empty when the job is unknown to this process's job table — a job
+    /// started by an *earlier* process is in the ledger projection (so the
+    /// panel can still name it) while its spooled bytes died with the
+    /// process that captured them. The panel says so rather than implying
+    /// the job printed nothing.
+    fn job_log_page(&self, id: protocol::JobId) -> tui::state::JobLogView {
+        match self.jobs.logs(id) {
+            Some((text, truncated)) => {
+                let lines = text.lines().map(str::to_owned).collect();
+                tui::state::JobLogView::new(id, lines, truncated)
+            }
+            None => tui::state::JobLogView::new(id, Vec::new(), false),
         }
     }
 
@@ -5120,7 +5184,37 @@ the parent is unchanged; `rapid resume {parent_id}` reopens it\n"
             self.session_id,
             self.cancel,
         )?;
+        self.refresh_job_logs();
         self.renderer.render(self.ui).map_err(|_| InteractiveError::Io)
+    }
+
+    /// Re-read an open `/jobs logs` view from the spool before painting.
+    ///
+    /// Without this the view is whatever the command captured at the instant
+    /// it ran, so watching a running build — the reason to open it at all —
+    /// would show a frozen page under a header that says `[started]`. The
+    /// spool is the same buffer `job_output` serves the model from, so the
+    /// two readers stay in step.
+    ///
+    /// Costs nothing on an idle session: a job that has stopped can never
+    /// add to its spool again, so only a live job is re-read.
+    fn refresh_job_logs(&mut self) {
+        let Some(job) = self.ui.job_logs().map(tui::state::JobLogView::job) else {
+            return;
+        };
+        let still_running = self
+            .ui
+            .jobs()
+            .get(&job)
+            .is_some_and(|projected| !projected.state().is_terminal());
+        if !still_running {
+            return;
+        }
+        let refreshed = self.job_log_page(job);
+        *self.ui = reduce(
+            self.ui.clone(),
+            &UiEvent::Local(LocalUiEvent::SyncJobLogs(Some(refreshed))),
+        );
     }
 }
 
@@ -10477,6 +10571,334 @@ was already finished"
         assert!(
             painted[0].contains("/bin/echo building"),
             "the jobs panel must show the command: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn jobs_logs_shows_the_output_the_job_actually_produced() {
+        // `/jobs logs <id>` parsed its id from the beginning and every
+        // consumer dropped it at `Inspector::route`, whose `UiRoute` has no
+        // room for "which one" — so it opened the same unfiltered list as a
+        // bare `/jobs`. The bytes were being spooled the whole time: the
+        // `job_output` tool hands them to the *model*, and the user's own
+        // advertised command was the only reader with no path to them.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "start the build",
+            // The output must be a value the *command text* does not
+            // contain. A first version ran `/bin/echo hello-from-the-job`
+            // and asserted the panel showed "hello-from-the-job" — which
+            // the list view already paints as the job's command, so the
+            // test passed with the whole feature reverted. The product of
+            // the two operands appears only in what the process printed.
+            ScriptedModel::background_job_then_answer(
+                &["/bin/sh", "-c", "echo $((123456789 * 2))"],
+                "started it",
+            ),
+        );
+        // The spool is filled by the job's own supervisor thread, so wait
+        // for the real terminal state rather than racing it.
+        session.drain_until("the job to complete", |state| {
+            state
+                .jobs()
+                .values()
+                .all(|job| matches!(job.state(), tui::state::JobLifecycle::Completed))
+        });
+        let job_id = *session.state().jobs().keys().next().expect("one job");
+
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        // The projection the turn already built — the panel needs the job
+        // rows, and the registry behind `session.jobs` holds the bytes.
+        let mut ui = session.state().clone();
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(Vec::new());
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight.clone(),
+            backings,
+        );
+
+        // The real production path: parse -> dispatch -> focus -> sync.
+        loop_state
+            .dispatch_slash(&format!("/jobs logs {job_id}"))
+            .expect("dispatch");
+
+        let painted = tui::sidebar_lines(
+            tui::state::UiRoute::Jobs,
+            loop_state.ui,
+            60,
+            10,
+            &tui::state::CancellationToken::new(),
+        );
+        assert!(
+            painted.iter().any(|line| line.contains("246913578")),
+            "the logs view must show what the job printed: {painted:?}"
+        );
+
+        // And it is the logs view specifically that shows it: a bare
+        // `/jobs` clears the page rather than leaving it painted.
+        loop_state.dispatch_slash("/jobs").expect("dispatch");
+        let listed = tui::sidebar_lines(
+            tui::state::UiRoute::Jobs,
+            loop_state.ui,
+            60,
+            10,
+            &tui::state::CancellationToken::new(),
+        );
+        assert!(
+            !listed.iter().any(|line| line.contains("246913578")),
+            "leaving the logs view must stop painting its output: {listed:?}"
+        );
+    }
+
+    #[test]
+    fn jobs_show_narrows_the_panel_to_the_job_that_was_named() {
+        // The same dropped operand, at the other resolution: with two jobs
+        // running, `/jobs show <id>` painted both rows exactly like a bare
+        // `/jobs`, so naming one job had no observable effect at all.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "start the first",
+            ScriptedModel::background_job_then_answer(&["/bin/echo", "first-job"], "ok"),
+        );
+        session.run_turn(
+            "start the second",
+            ScriptedModel::background_job_then_answer(&["/bin/echo", "second-job"], "ok"),
+        );
+        let jobs = session.state().jobs().clone();
+        assert_eq!(jobs.len(), 2, "two jobs must be projected: {jobs:?}");
+        let (wanted, wanted_command) = jobs
+            .iter()
+            .find_map(|(id, job)| {
+                job.command()
+                    .filter(|command| command.contains("second-job"))
+                    .map(|command| (*id, command.to_owned()))
+            })
+            .expect("the second job is projected with its command");
+
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = session.state().clone();
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(Vec::new());
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight.clone(),
+            backings,
+        );
+
+        loop_state
+            .dispatch_slash(&format!("/jobs show {wanted}"))
+            .expect("dispatch");
+        let painted = tui::sidebar_lines(
+            tui::state::UiRoute::Jobs,
+            loop_state.ui,
+            80,
+            10,
+            &tui::state::CancellationToken::new(),
+        );
+        let body = painted.join("\n");
+        assert!(
+            body.contains(&wanted_command),
+            "the named job must be shown: {painted:?}"
+        );
+        assert!(
+            !body.contains("first-job"),
+            "naming one job must not paint the other: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_jobs_logs_reads_the_most_recent_job() {
+        // Nothing shows a `JobId`: the panel paints a job's *command* when
+        // the producer recorded one, exactly so a reader can tell which row
+        // is the test run they are waiting on. So a `/jobs logs` that only
+        // answers to a UUID is answerable only by someone who already has
+        // one. Bare means the newest job.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "start the first",
+            ScriptedModel::background_job_then_answer(
+                &["/bin/sh", "-c", "echo $((111 * 3))"],
+                "ok",
+            ),
+        );
+        session.run_turn(
+            "start the second",
+            ScriptedModel::background_job_then_answer(
+                &["/bin/sh", "-c", "echo $((222 * 3))"],
+                "ok",
+            ),
+        );
+        session.drain_until("both jobs to finish", |state| {
+            state.jobs().len() == 2
+                && state
+                    .jobs()
+                    .values()
+                    .all(|job| job.state().is_terminal())
+        });
+
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = session.state().clone();
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(Vec::new());
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight.clone(),
+            backings,
+        );
+
+        loop_state.dispatch_slash("/jobs logs").expect("dispatch");
+        let painted = tui::sidebar_lines(
+            tui::state::UiRoute::Jobs,
+            loop_state.ui,
+            70,
+            10,
+            &tui::state::CancellationToken::new(),
+        );
+        let body = painted.join("\n");
+        assert!(
+            body.contains("666"),
+            "a bare `/jobs logs` must read the most recently started job: {painted:?}"
+        );
+        assert!(
+            !body.contains("333"),
+            "and not an older one's output: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn an_open_logs_view_follows_a_job_that_is_still_writing() {
+        // The reason to open a build log is to watch it. A page captured
+        // once at dispatch would freeze under a header that still says the
+        // job is running, so the view is re-read from the same spool
+        // `job_output` serves the model from.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "start a job that keeps writing",
+            ScriptedModel::background_job_then_answer(
+                &[
+                    "/bin/sh",
+                    "-c",
+                    "echo $((1000 + 1)); sleep 1; echo $((2000 + 2))",
+                ],
+                "started it",
+            ),
+        );
+        // Wait for the first line only — the job is deliberately still
+        // running at this point.
+        session.drain_until("the first line to be spooled", |state| {
+            !state.jobs().is_empty()
+        });
+
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = session.state().clone();
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(Vec::new());
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight.clone(),
+            backings,
+        );
+        loop_state.dispatch_slash("/jobs logs").expect("dispatch");
+
+        // The second line is written a second later, by the job's own
+        // process — so drive the real drain loop in real time and require
+        // the open view to pick it up without the command being re-run.
+        let mut followed = false;
+        for _ in 0..200 {
+            loop_state.drain().expect("drain");
+            let painted = tui::sidebar_lines(
+                tui::state::UiRoute::Jobs,
+                loop_state.ui,
+                70,
+                12,
+                &tui::state::CancellationToken::new(),
+            );
+            if painted.iter().any(|line| line.contains("2002")) {
+                followed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            followed,
+            "an open logs view must follow output written after it was opened"
         );
     }
 

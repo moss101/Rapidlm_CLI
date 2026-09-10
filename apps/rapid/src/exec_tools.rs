@@ -374,6 +374,34 @@ impl JobRegistry {
         Some(stopped)
     }
 
+    /// The captured output of the job the ledger knows as `id`, as the
+    /// `/jobs logs` panel shows it, with whether anything was cut off.
+    ///
+    /// Same `ledger_id` lookup as [`JobRegistry::cancel`], for the same
+    /// reason: the panel addresses a job by the typed `JobId` the ledger
+    /// gave it, while this table is keyed by the `job-N` handle the model
+    /// uses. Returns the *tail* — a reader opening a build log wants its
+    /// end — cut to a character boundary so a multi-byte character split by
+    /// the cap is never painted as U+FFFD.
+    ///
+    /// The bytes were already spooled for `job_output`; this reads the same
+    /// buffer rather than capturing a second copy, so what the user sees and
+    /// what the model saw cannot drift apart.
+    pub(crate) fn logs(&self, id: protocol::JobId) -> Option<(String, bool)> {
+        let jobs = self.table.jobs.lock().ok()?;
+        let job = jobs.values().find(|job| job.ledger_id == id)?;
+        let buffer = job.output.lock().ok()?;
+        let mut start = buffer.len().saturating_sub(MAX_SHELL_OUTPUT_BYTES);
+        while start < buffer.len() && (buffer[start] & 0xC0) == 0x80 {
+            start += 1;
+        }
+        let text = String::from_utf8_lossy(&buffer[start..]).into_owned();
+        // Either the supervisor hit the spool's own cap, or this page is a
+        // tail of what was spooled. Both mean "there was more than this".
+        let truncated = job.overflow.load(Ordering::SeqCst) || start > 0;
+        Some((text, truncated))
+    }
+
     /// Adopt `session`'s job table, so jobs started by this turn live in —
     /// and outlive it in — the session's own table.
     ///
