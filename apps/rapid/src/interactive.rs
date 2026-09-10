@@ -1679,10 +1679,6 @@ fn unsupported_command_text(action: &KernelAction) -> String {
             "no running-agent registry exists yet to cancel or terminate an agent; press \
 Ctrl-C to interrupt the turn that is running"
         }
-        KernelAction::CancelJob { .. } => {
-            "no per-job cancellation backend exists yet; press Ctrl-C to interrupt the turn \
-that is running"
-        }
         KernelAction::ShowGoalBudget { .. } => {
             "goal budget has no display or mutation backend yet, in the TUI or the headless CLI"
         }
@@ -4769,6 +4765,25 @@ denied\n",
         self.submit_turn(&prompt)
     }
 
+    /// `/jobs cancel [id]`: stop one background job, or every running one.
+    ///
+    /// Reports what actually happened rather than acknowledging blindly — a
+    /// handle that is not in the table, or one whose job already finished,
+    /// are different answers from "stopped it", and a user who is told
+    /// "cancelled" believes the command is no longer running.
+    fn cancel_job(&mut self, id: Option<protocol::JobId>) -> Result<(), InteractiveError> {
+        let text = match (id, self.jobs.cancel(id)) {
+            (Some(id), None) => format!("no job {id} in this session"),
+            (Some(id), Some(0)) => format!("job {id} had already finished"),
+            (Some(id), Some(_)) => format!("cancelled job {id}"),
+            (None, Some(0) | None) => "no running jobs to cancel".to_owned(),
+            (None, Some(1)) => "cancelled 1 running job".to_owned(),
+            (None, Some(n)) => format!("cancelled {n} running jobs"),
+        };
+        self.append_command_output(text);
+        self.drain()
+    }
+
     fn apply_kernel_action(&mut self, action: KernelAction) -> Result<(), InteractiveError> {
         self.cancel
             .check()
@@ -4787,6 +4802,7 @@ denied\n",
             KernelAction::PauseGoal => self.goal_lifecycle_command(GoalLifecycleKind::Pause)?,
             KernelAction::ResumeGoal => self.goal_lifecycle_command(GoalLifecycleKind::Resume)?,
             KernelAction::CancelGoal => self.goal_lifecycle_command(GoalLifecycleKind::Cancel)?,
+            KernelAction::CancelJob { id } => self.cancel_job(id)?,
             KernelAction::RunGoal => self.start_autonomous_goal()?,
             KernelAction::StopGoal => {
                 if self.autonomous.is_some() {
@@ -9565,6 +9581,67 @@ that is no longer there"
     }
 
     #[test]
+    fn jobs_cancel_stops_a_running_background_job() {
+        // `/jobs cancel` was refused outright — "no per-job cancellation
+        // backend exists yet" — and that was true while the table lived one
+        // turn: by the time a user could type it, there was nothing left to
+        // cancel. With a session-scoped table there is, and the mechanism is
+        // the `cancelled` flag `kill_all` already sets.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "start a slow one",
+            ScriptedModel::background_job_then_answer(&["/bin/sleep", "30"], "started"),
+        );
+        assert_eq!(
+            session.state().jobs().values().next().expect("job").state(),
+            tui::state::JobLifecycle::Started,
+        );
+
+        // Through the real registry the session holds, exactly as
+        // `SessionLoop::cancel_job` does.
+        assert_eq!(
+            session.jobs.cancel(None),
+            Some(1),
+            "the running job must be the one cancelled"
+        );
+        session.drain_until("the cancelled job to be reported", |state| {
+            state
+                .jobs()
+                .values()
+                .any(|job| !matches!(job.state(), tui::state::JobLifecycle::Started))
+        });
+        let jobs = session.state().jobs();
+        let job = jobs.values().next().expect("job");
+        assert_eq!(
+            job.state(),
+            tui::state::JobLifecycle::Cancelled,
+            "and it must be reported as cancelled: {job:?}"
+        );
+
+        // Cancelling again reports honestly rather than claiming a second
+        // success — the distinction `cancel_job`'s own message relies on.
+        assert_eq!(session.jobs.cancel(None), Some(0));
+    }
+
+    #[test]
+    fn cancelling_an_unknown_job_is_not_reported_as_success() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        assert_eq!(
+            session.jobs.cancel(Some(protocol::JobId::new())),
+            None,
+            "an id this session never had must be distinguishable from one that \
+was already finished"
+        );
+        assert_eq!(
+            session.jobs.cancel(None),
+            Some(0),
+            "and a session with no jobs cancels nothing rather than erroring"
+        );
+    }
+
+    #[test]
     fn a_background_job_outlives_the_turn_that_started_it() {
         // The point of `background: true`: start a build, keep working, come
         // back to it. The registry used to be built per turn and its `Drop`
@@ -9906,10 +9983,13 @@ that is no longer there"
 
     #[test]
     fn cancelling_a_named_job_does_not_silently_interrupt_the_turn_instead() {
-        // The end-to-end shape of the defect: `/jobs cancel <id>` reached
-        // `KernelApi::Interrupt`, whose only implementation is a
-        // session-wide interrupt taking no id, so it killed whatever was
-        // running and reported nothing about the job the user named.
+        // The shape of the original defect: `/jobs cancel <id>` reached
+        // `KernelApi::Interrupt`, whose only implementation is a session-wide
+        // interrupt taking no id, so it killed whatever was running and
+        // reported nothing about the job the user named. The command has a
+        // real backend now, but the property this test exists for is
+        // unchanged — naming a job must never become "interrupt the
+        // session" — and it holds for an id that does not exist either.
         let _lock = lock_terminal();
         let env = TempEnv::create();
         let report = run_interactive(env.options_capturing_render(vec![
@@ -9920,21 +10000,15 @@ that is no longer there"
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        // The name's actual claim: no interrupt happened. Without this the
-        // test passed on the message alone and would have stayed green if
-        // the refusal were printed *and* the session interrupted anyway.
         assert_eq!(
             report.interrupt_count, 0,
-            "the turn was interrupted despite the command being refused"
+            "the session was interrupted by a command that names a job"
         );
         let painted = report.rendered_output.expect("capture_render was requested");
         assert!(
-            painted.contains("not available"),
-            "naming a job must be refused, not silently turned into a turn interrupt:\n{painted}"
-        );
-        assert!(
-            painted.contains("per-job cancellation"),
-            "the refusal must name the real gap:\n{painted}"
+            painted.contains("no job 01234567-89ab-7cde-89ab-0123456789ab in this session"),
+            "an id this session never had must be said so, not acknowledged as \
+cancelled and not turned into a turn interrupt:\n{painted}"
         );
     }
 

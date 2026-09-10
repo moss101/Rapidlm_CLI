@@ -96,11 +96,13 @@ pub(crate) fn kernel_action_is_supported(action: &KernelAction) -> bool {
 /// `apply_kernel_action` and [`kernel_action_is_supported`] both consult
 /// this, so what `/help` reports and what the command does cannot disagree.
 pub(crate) fn cancels_a_specific_target(action: &KernelAction) -> bool {
+    // `CancelJob` was here until background jobs became session-scoped: the
+    // session owns a job table, so `/jobs cancel <id>` now has both a target
+    // to name and a mechanism to stop it. The agent actions still have
+    // neither — `KernelApi::Interrupt` is session-wide and takes no id.
     matches!(
         action,
-        KernelAction::CancelJob { .. }
-            | KernelAction::CancelAgent { .. }
-            | KernelAction::TerminateAgent { .. }
+        KernelAction::CancelAgent { .. } | KernelAction::TerminateAgent { .. }
     )
 }
 
@@ -496,23 +498,37 @@ parser about which operands are required",
             .parse()
             .expect("agent id");
 
-        // Both forms: there is no per-job or per-agent cancellation backend
-        // either way. A first pass refused only the id-carrying form, which
-        // left `/jobs cancel` killing a turn with no explanation while
-        // `/help` reported `/jobs` as fully working.
+        // The agent forms, both with and without an id: there is still no
+        // running-agent registry, so neither can name a target. A first pass
+        // refused only the id-carrying form, which left `/agents cancel`
+        // killing a turn with no explanation while `/help` reported it as
+        // fully working.
         for action in [
-            KernelAction::CancelJob { id: Some(job) },
             KernelAction::CancelAgent { id: Some(agent) },
             KernelAction::TerminateAgent { id: Some(agent) },
-            KernelAction::CancelJob { id: None },
             KernelAction::CancelAgent { id: None },
             KernelAction::TerminateAgent { id: None },
         ] {
             assert!(cancels_a_specific_target(&action), "{action:?}");
             assert!(
                 !kernel_action_is_supported(&action),
-                "cancelling a job or agent must not read as supported: {action:?}"
+                "cancelling an agent must not read as supported: {action:?}"
             );
+        }
+        // `/jobs cancel` is the one that grew a backend: the session owns a
+        // job table, so it has a target to name *and* a way to stop it. It
+        // must read as supported — and, crucially, it must not have become
+        // supported by quietly falling back to the session-wide interrupt,
+        // which is what the rest of this test guards.
+        for action in [
+            KernelAction::CancelJob { id: Some(job) },
+            KernelAction::CancelJob { id: None },
+        ] {
+            assert!(
+                !cancels_a_specific_target(&action),
+                "a job cancel now names a real target: {action:?}"
+            );
+            assert!(kernel_action_is_supported(&action), "{action:?}");
         }
         // The session-wide interrupt itself is still real — it is just not
         // what these commands claim to do.

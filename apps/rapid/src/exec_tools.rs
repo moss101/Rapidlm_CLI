@@ -203,6 +203,10 @@ impl std::fmt::Display for ToolSetupError {
 /// other for long.
 #[derive(Clone)]
 struct JobShared {
+    /// The id this job is recorded under in the ledger, and therefore the
+    /// one `/jobs cancel <id>` names. Distinct from the `job-N` handle the
+    /// model polls with — see `JobRegistry::start`.
+    ledger_id: protocol::JobId,
     cancelled: Arc<AtomicBool>,
     output: Arc<Mutex<Vec<u8>>>,
     overflow: Arc<AtomicBool>,
@@ -320,6 +324,37 @@ impl JobRegistry {
         self.started_this_turn.clone()
     }
 
+    /// Stop one job by its ledger id — the one `/jobs cancel <id>` names and
+    /// the `job.*` events carry — or every running job when `id` is `None`.
+    /// Returns how many were actually stopped, and `None` when a named id is
+    /// not in the table at all —
+    /// which the caller reports as "no such job" rather than as a silent
+    /// success.
+    ///
+    /// Only *running* jobs count: cancelling an already-finished one is a
+    /// no-op, and saying "cancelled 1" for a job that completed ten minutes
+    /// ago would be a lie the user acts on.
+    pub(crate) fn cancel(&self, id: Option<protocol::JobId>) -> Option<usize> {
+        let jobs = self.table.jobs.lock().ok()?;
+        let mut stopped = 0usize;
+        match id {
+            Some(id) => {
+                let job = jobs.values().find(|job| job.ledger_id == id)?;
+                if stop_if_running(job) {
+                    stopped += 1;
+                }
+            }
+            None => {
+                for job in jobs.values() {
+                    if stop_if_running(job) {
+                        stopped += 1;
+                    }
+                }
+            }
+        }
+        Some(stopped)
+    }
+
     /// Adopt `session`'s job table, so jobs started by this turn live in —
     /// and outlive it in — the session's own table.
     ///
@@ -362,6 +397,7 @@ impl JobRegistry {
         }
         let finish = self.events.clone();
         let shared = JobShared {
+            ledger_id,
             cancelled: Arc::new(AtomicBool::new(false)),
             output: Arc::new(Mutex::new(Vec::new())),
             overflow: Arc::new(AtomicBool::new(false)),
@@ -593,8 +629,19 @@ impl JobRegistry {
             return Err(ToolStepError::Failed);
         }
         let id = format!("job-{}", self.table.seq.fetch_add(1, Ordering::SeqCst) + 1);
+        // Same two identities as `start`: a ledger id for `/jobs` and the
+        // `job.*` events, the `job-N` handle for the model. A sandboxed job
+        // is as much a background job as a plain one, and was equally
+        // invisible before.
+        let ledger_id = protocol::JobId::new();
+        let command = argv.join(" ");
+        if let Some(events) = self.events.as_ref() {
+            events.started(ledger_id, &id, &command);
+        }
+        let finish = self.events.clone();
         let sandbox_cancel = capability_broker::CancellationToken::new();
         let shared = JobShared {
+            ledger_id,
             cancelled: Arc::new(AtomicBool::new(false)),
             output: Arc::new(Mutex::new(Vec::new())),
             overflow: Arc::new(AtomicBool::new(false)),
@@ -678,6 +725,22 @@ impl JobRegistry {
                                 outcome.policy_violation,
                             )),
                         };
+                        // Reported on the same terms as a plain job: a
+                        // sandboxed one that finished and was never told
+                        // otherwise must not sit in `/jobs` as permanently
+                        // "started".
+                        if let Some(events) = finish.as_ref() {
+                            match outcome.exit_code {
+                                Some(code) => events.finished(ledger_id, "completed", Some(code)),
+                                None if outcome.timed_out => {
+                                    events.finished(ledger_id, "timed_out", None);
+                                }
+                                None if worker.cancelled.load(Ordering::SeqCst) => {
+                                    events.finished(ledger_id, "cancelled", None);
+                                }
+                                None => events.finished(ledger_id, "failed", None),
+                            }
+                        }
                         if let Ok(mut slot) = worker.state.lock() {
                             *slot = state;
                         }
@@ -685,6 +748,9 @@ impl JobRegistry {
                     Err(err) => {
                         if let Ok(mut slot) = worker.state.lock() {
                             *slot = JobState::Failed(format!("sandboxed exec failed: {err}"));
+                        }
+                        if let Some(events) = finish.as_ref() {
+                            events.finished(ledger_id, "failed", None);
                         }
                     }
                 }
@@ -801,6 +867,29 @@ impl JobRegistry {
     }
 }
 
+/// Cancel one job if it is still running; `false` if it had already
+/// finished. Shared by [`JobRegistry::cancel`] and [`JobTable::kill_all`] so
+/// stopping one job and stopping all of them cannot drift apart.
+fn stop_if_running(job: &JobShared) -> bool {
+    let running = matches!(
+        job.state.lock().as_deref(),
+        Ok(JobState::Running)
+    );
+    if !running {
+        return false;
+    }
+    job.cancelled.store(true, Ordering::SeqCst);
+    if let Some(token) = &job.sandbox_cancel {
+        token.cancel();
+    }
+    if let Ok(mut child) = job.child.try_lock()
+        && let Some(child) = child.as_mut()
+    {
+        let _ = child.kill();
+    }
+    true
+}
+
 impl JobTable {
     /// Stop every job in this table. The single implementation, called by
     /// `Drop` — and the one `/jobs cancel` would reuse per job.
@@ -809,15 +898,7 @@ impl JobTable {
             return;
         };
         for job in jobs.values() {
-            job.cancelled.store(true, Ordering::SeqCst);
-            if let Some(token) = &job.sandbox_cancel {
-                token.cancel();
-            }
-            if let Ok(mut child) = job.child.try_lock()
-                && let Some(child) = child.as_mut()
-            {
-                let _ = child.kill();
-            }
+            stop_if_running(job);
         }
     }
 }

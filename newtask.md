@@ -7193,8 +7193,57 @@ summary and the survival. Three revert cycles (98-100). 686 `rapid` lib tests, 2
 warning *below* the baseline (a nested `if let` in `kill_all` became a let-chain), full workspace green.
 
 **Now unblocked:** `/jobs cancel <id>` has something to cancel and a mechanism to do it with — the
-table's `cancelled` flag, already the thing `kill_all` sets. It is still refused today; making it real is
-the next step on this thread, and `/agents cancel` still needs the kernel work described earlier.
+table's `cancelled` flag, already the thing `kill_all` sets. **Taken the same day — see the entry above.**
+`/agents cancel` still needs the kernel work described earlier.
+
+**`/jobs cancel` is real, done 2026-09-10.**
+
+It was refused outright — "no per-job cancellation backend exists yet; press Ctrl-C to interrupt the turn
+that is running" — and that refusal was correct while the job table lived one turn: by the time a user
+could type the command, there was nothing left to cancel. Session-scoped jobs make it answerable, and the
+mechanism is the `cancelled` flag `kill_all` already sets.
+
+**One stop path, not two.** `stop_if_running` is the single place a job is stopped, used by
+`JobRegistry::cancel` and by `JobTable::kill_all` alike, so cancelling *one* job and stopping *all* of
+them cannot drift. It also encodes the honest part: only a **running** job counts as stopped, because
+reporting "cancelled" for a job that finished ten minutes ago is a lie the user acts on.
+
+**The report distinguishes three outcomes**, which is the whole point of not just acknowledging:
+an id this session never had ("no job X in this session"), a job that had already finished ("job X had
+already finished"), and one actually stopped ("cancelled job X"). Bare `/jobs cancel` stops every running
+job and says how many.
+
+**Two identities, and the discoverability gap that comes with them.** `KernelAction::CancelJob` carries a
+typed `JobId` — the ledger id — while the model polls with the short `job-N` handle, so `JobShared` now
+records the ledger id and `cancel` matches on it. The practical consequence, recorded rather than
+smoothed over: the `/jobs` panel shows a job's *command*, not its ledger id, so the id-carrying form is
+not discoverable from the panel today. Bare `/jobs cancel` is the workflow that works end to end; naming
+one job requires an id from the ledger. Showing an id a user can act on — without a 36-character UUID per
+row — is the follow-up.
+
+**Sandboxed jobs were about to become a new half-truth.** `start_sandboxed` is as much a background job
+as `start`, and it had no ledger id and reported nothing, so once `/jobs` was populated a sandboxed job
+would have sat there permanently "started". It now mints the same two identities and reports its terminal
+state on the same terms, including `timed_out` and `cancelled`.
+
+**Two existing tests encoded the old truth and were updated, not deleted.**
+`cancelling_a_job_or_agent_is_never_treated_as_a_turn_interrupt` asserted that *no* cancel is supported;
+it now splits — the agent forms still have no registry to name a target in, while `CancelJob` must read
+as supported **and** must not have become supported by quietly falling back to the session-wide
+interrupt, which is the property that test exists for. `cancelling_a_named_job_does_not_silently_
+interrupt_the_turn_instead` keeps its name and its point: an id this session never had is now answered
+with "no job X in this session" instead of a refusal, and still must not interrupt anything.
+
+**Tests.** Three new plus two retargeted: cancelling stops a running job and reports it as cancelled;
+cancelling again reports zero rather than a second success; an unknown id is distinguishable from an
+already-finished one. One revert cycle (101): making `cancel` count jobs without stopping them leaves the
+job running and the wait times out.
+
+688 `rapid` lib tests, clippy unchanged, full workspace green.
+
+**Still refused, and still honestly:** `/agents cancel` and `/agents terminate`. `KernelApi::Interrupt` is
+session-wide and takes no id, and there is no running-agent registry to name one in — the same shape this
+entry just closed for jobs, one layer down, and it needs kernel work rather than composition-root work.
 
 ## Session boundary, 2026-09-09 — durable state for the next session
 
