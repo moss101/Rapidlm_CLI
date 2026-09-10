@@ -7449,6 +7449,61 @@ breakdown empty and the test says which classes consumed the window is missing.
 change set to project. That is a wiring task on the *write* path, not a rendering one, and it is the
 largest remaining item in this family.
 
+## Session boundary, 2026-09-10 — durable state for the next session
+
+Eighteen commits across two days, `dbeb2c2`..`9c0a450`, all pushed to `origin/main`. Baseline before them
+was `598c6fd`. Each has its own entry above; this is the current state and what is actually left.
+
+**2026-09-09** (`dbeb2c2`..`b967d0a`): `rapid resume`; every command resolving the same project as the
+TUI; listing no longer creating what it lists; one event ledger per project (option C, with the WAL
+correction self-review caught in already-pushed code); `rapid --help` no longer documenting an invocation
+the parser rejects; `rapid insights` given a test that can fail; `/jobs` and `/approvals` rendering the
+projections they already had.
+
+**2026-09-10** (`81674b0`..`9c0a450`): background jobs journaled, session-lived, and cancellable; the
+status bar showing model, policy and compiled context instead of dashes; `/models`, `/memory` and
+`/context` made real.
+
+**The through-line has not changed and is the most useful thing to carry forward.** Every one of these
+was two representations of one fact with nothing spanning them, and the fix that held each time was to
+*derive* the second from the first rather than add a parallel list. The corollary showed up twice more
+today: a test that hardcoded a derived answer (`/memory` is `None`) went stale the moment the underlying
+fact changed — which is the design working — and a draft that added a `LocalUiEvent` beside a kernel
+event for the same value was caught and removed before it shipped.
+
+**Verification.** Revert cycles 72-110 across the two days. The pattern that keeps earning its keep: a
+cycle that *passes* means the test is wrong, not the code. Five did on 2026-09-09; two more did today —
+a fixture too small for the bound it was meant to prove (one line against a 200-line cap), and a state
+read taken before the supervisor thread could notice a kill. Both were rewritten until the broken code
+actually failed them.
+
+### What is actually left, in the order I would take it
+
+1. **`/diff` — the largest remaining item in the panel family, and the only one with no data source at
+   all.** `apps/rapid` writes through `atomic_write` and never touches the `workspace` crate's journal,
+   transaction or patch machinery (`JournalEntry`/`JournalOp`, `patch::model`, `transaction`), all of
+   which is mature and unwired. This is a change on the *write* path, not a rendering one: something has
+   to record what a turn changed before anything can show it. `/graph`, `/computer` and `/resources` are
+   the same shape with less value.
+2. **`/agents cancel` and `/agents terminate`.** Still refused honestly. `KernelApi::Interrupt` is
+   session-wide and takes no id, and there is no running-agent registry — subagents run *inside* the
+   parent turn, and `host_runtime`/`agent-pool` (which would give background agents) is not used by the
+   binary at all. Making this real means background agents first, which is a feature, not wiring.
+3. **Switching a live session onto a fork.** `/fork` reports the child it created and stays on the
+   parent; switching needs the event stream re-subscribed.
+4. **Integration breadth**: daemon/ACP/SDK server, the MCP catalog subsystem and remote transports,
+   knowledge/playbooks, distribution and installability. All are honestly absent today (roadmap in
+   `docs/reference/cli-command-reference.md`, absent from `SUBCOMMANDS`), so none of them lies — they are
+   scope, not defects.
+5. **The both-ledgers case** still strands rows behind a printed notice (option C's accepted cost).
+   Option D's merge is the follow-up if real installs turn out to hold both files.
+
+**Two things to know before touching this area again.** The event ledger is in **WAL** mode
+(`event_ledger::migrations` sets and verifies it) — check `PRAGMA journal_mode` before reasoning about
+moving database files. And a full `cargo test --workspace` here takes 15-45 minutes because every commit
+touches a ~10k-line file; `cargo test -p rapid --lib` (~37s) and `-p tui` (under a second) are the inner
+loop, and two cargo suites must never run at once in this repo.
+
 ## Session boundary, 2026-09-09 — durable state for the next session
 
 Eight commits, `dbeb2c2`..`1e516cb`, all pushed to `origin/main`. Baseline before them was `598c6fd`.
@@ -7480,16 +7535,16 @@ which is a stronger coupling than any test and is recorded as such.
 `af67657` exists. The claim came from a grep that covered three files and missed `migrations.rs`. Check
 `PRAGMA journal_mode` on a real file before reasoning about SQLite file moves.
 
-### Highest-value work remaining, in the order I would take it
+### Highest-value work remaining — **superseded, see the 2026-09-10 boundary below**
 
-1. **Seven inspector panels still render nothing** — `/diff`, `/context`, `/memory`, `/graph`,
-   `/computer`, `/resources`, `/models`. Unlike jobs/approvals these have no projection in `AppState`, so
-   each needs its data collected first; they are honestly marked unavailable in `/help` meanwhile. `/diff`
-   is probably the most valuable to a developer and the most self-contained (the workspace view already
-   tracks mutations).
-2. **No per-job or per-agent cancellation backend.** `/jobs cancel`, `/agents cancel` and
-   `/agents terminate` are refused outright because `KernelApi::Interrupt` is session-wide and takes no
-   id. Making them real is kernel work, not UI work.
+*Items 1 and 2 were largely closed on 2026-09-10: four of the seven panels became real (`/models`,
+`/memory`, `/context`, plus `/jobs`+`/approvals` the day before), and `/jobs cancel` gained a real
+backend once background jobs became session-scoped. The list as written is kept for its reasoning but is
+no longer the current state; read the 2026-09-10 boundary section instead.*
+
+1. ~~Seven inspector panels~~ — four remain: `/diff`, `/graph`, `/computer`, `/resources`.
+2. ~~No per-job or per-agent cancellation backend~~ — `/jobs cancel` is real; `/agents cancel` still is
+   not, and still needs kernel work (no running-agent registry; subagents run inside the parent turn).
 3. **No way to switch a live session onto a fork.** `/fork` reports the child it created and stays on the
    parent; switching needs the event stream re-subscribed.
 4. **Eighteen roadmap subcommand families are unbuilt** (`daemon`, `run`, `rewind`, `handoff`, …). They
