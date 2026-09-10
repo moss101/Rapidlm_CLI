@@ -7643,6 +7643,37 @@ halves that were built years apart and never met: the `apps/rapid` test drives t
 and asserts the state changed, the `tui` test proves that state change is what moves the marker and the
 detail block. Only 121 is a regression test for this commit; 122 locks the contract the fix depends on.
 
+**`/context search <query>` actually searches, done 2026-09-10.**
+
+Third in the dropped-operand family, and the one with a real backend already in the tree:
+`apps/rapid/src/context_retrieval.rs::retrieve(root, prompt, budget)` is what every trusted turn calls
+to pick proactive context (`interactive.rs`, just before building the `AgentSpec`). The query was parsed
+and dropped at `Inspector::route`, so `/context search <text>` opened the same compiled-context summary
+as a bare `/context` — a search command that never searched, next to a working search engine.
+
+`/context search` now runs the *same* call the turn path runs, so the panel answers "what would the agent
+be given if I asked this" rather than describing a separate index.
+
+**Three things this had to get right, none of them the wiring:**
+
+- **Trust.** `retrieve` walks the tree and writes an incremental index under `.rapidlm/index/`, which is
+  why the turn path runs it only for a trusted project. A slash command must not be a way around that,
+  or typing `/context search` in an untrusted directory would index it on the user's behalf. Gated on
+  `SessionLoop::trusted`, and the untrusted case reports *why* it found nothing rather than rendering an
+  empty result that reads as "no matches". Revert cycle 124 removes the gate and the test catches it
+  indexing the tree.
+- **No invented numbers.** `retrieve` builds its blocks with `CompileInput::new(locator, text)` and sets
+  no token estimate, so the panel reports **bytes**, which is true. Rendering "~N tokens" would have been
+  the same class of claim as `+n/-m` from a net line count, which `/diff` already refused to make.
+- **One budget, not two.** The first draft added a `CONTEXT_SEARCH_BUDGET_TOKENS` constant documented as
+  "the same 2048 the turn path passes" beside the turn path's hardcoded `2048` — a claim held together by
+  nothing. Now one `RETRIEVAL_BUDGET_TOKENS` both use, because the panel's entire claim is that it shows
+  what a real turn would get.
+
+**Revert cycles 123-124.** 123 drops the query again (the panel falls back to "no turn has compiled a
+context yet", the exact old behavior); 124 removes the trust gate. A panel test covers locator
+sanitization — repository paths are clone-controlled, filename included — and the empty-result case.
+
 ## Session boundary, 2026-09-10 — durable state for the next session
 
 Twenty-three commits across two days, `dbeb2c2`..`bccf629`, all pushed to `origin/main`. Baseline before
@@ -7674,13 +7705,15 @@ actually failed them.
 
 ### What is actually left, in the order I would take it
 
-1. **The rest of the dropped operands.** `/agents show <id>` is done (see its entry above). Still
-   dropping theirs: `/context search <query>`, `/diff --agent <id>`, `/knowledge show <id>` and
-   `/playbook show <name>`. These are no longer uniform — `/context search` has a real backend already
-   (`apps/rapid/src/context_retrieval.rs::retrieve(root, query, budget)` is production code the turn
-   path uses, so the query has somewhere to go); `/diff --agent` cannot be honored at all until
-   `ChangedFile` records which agent wrote a file, so the honest move there is to *say* attribution is
-   not recorded rather than keep ignoring the flag; and knowledge/playbook have no store behind them.
+1. **The last of the dropped operands.** `/agents show <id>` and `/context search <query>` are done
+   (entries above). Three remain, and none is wiring:
+   - `/diff --agent <id>` cannot be honored at all — `ChangedFile` records no agent, and subagents write
+     inside the parent turn, so there is nothing to attribute by. The honest move is to *say*
+     attribution is not recorded rather than keep silently ignoring the flag; `focus_inspector`'s
+     fallthrough arm names this at the exact place a fix would go.
+   - `/knowledge show <id>` and `/playbook show <name>` have no store behind them at all, so their
+     panels have nothing to select from. Both already report that honestly through
+     `unrouted_inspector_text`.
 2. **Typed-id prefixes.** `/jobs show <id>`, `/jobs cancel <id>` and every other id-taking command
    require a full UUID that nothing prints — the panels deliberately show a job's *command* instead. A
    bare `/jobs logs` works around this for one case; the general fix is prefix matching in

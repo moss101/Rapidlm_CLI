@@ -258,7 +258,12 @@ pub enum Inspector {
     Agents { id: Option<AgentId> },
     Diff { agent: Option<AgentId> },
     Goal,
-    Context,
+    /// `query` is the text `/context search` named, if any.
+    ///
+    /// Carried for the same reason the other selections are: the query was
+    /// parsed and then dropped, so `/context search <text>` opened the same
+    /// compiled-context summary as a bare `/context` and never searched.
+    Context { query: Option<String> },
     Memory,
     /// `id` is the job `/jobs show|logs` named, `logs` which view of it.
     ///
@@ -744,10 +749,10 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
             FrontendAction::Local(LocalAction::Open(Inspector::Permissions))
         }
         UiCommand::ContextStatus | UiCommand::ContextInspect => {
-            FrontendAction::Local(LocalAction::Open(Inspector::Context))
+            FrontendAction::Local(LocalAction::Open(Inspector::Context { query: None }))
         }
-        UiCommand::ContextSearch { .. } => {
-            FrontendAction::Local(LocalAction::Open(Inspector::Context))
+        UiCommand::ContextSearch { query } => {
+            FrontendAction::Local(LocalAction::Open(Inspector::Context { query: Some(query) }))
         }
         UiCommand::ContextReindex => FrontendAction::Kernel(KernelAction::ReindexContext),
         UiCommand::KnowledgeList | UiCommand::KnowledgeShow { .. } => {
@@ -950,7 +955,7 @@ impl Inspector {
         match self {
             Self::Agents { .. } => Some(UiRoute::Agents),
             Self::Diff { .. } => Some(UiRoute::Diff),
-            Self::Context => Some(UiRoute::Context),
+            Self::Context { .. } => Some(UiRoute::Context),
             Self::Memory => Some(UiRoute::Memory),
             Self::Jobs { .. } => Some(UiRoute::Jobs),
             Self::Goal => Some(UiRoute::Goals),

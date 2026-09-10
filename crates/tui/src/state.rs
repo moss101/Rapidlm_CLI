@@ -48,6 +48,9 @@ pub const MAX_PROJECTED_APPROVALS: usize = 256;
 /// it keeps the tail — the end of a build log is the part a reader wants.
 pub const MAX_JOB_LOG_LINES: usize = 512;
 
+/// Hard cap on retrieved blocks listed by the `/context search` view.
+pub const MAX_CONTEXT_HITS: usize = 64;
+
 /// Maximum approval/protocol modals on the stack.
 pub const MAX_MODALS: usize = 16;
 
@@ -110,6 +113,8 @@ pub enum LocalUiEvent {
     SyncMemory(Vec<String>),
     /// Output for the selected job, or `None` to leave the logs view.
     SyncJobLogs(Option<JobLogView>),
+    /// Results for a `/context search`, or `None` to leave the search view.
+    SyncContextSearch(Option<ContextSearchView>),
     /// Drop a host-owned goal projection that no longer has a snapshot to
     /// project from — completion/cancel clear the host's own snapshot (see
     /// `agent_runtime::GoalState`'s own doc comment), so without this a
@@ -176,6 +181,9 @@ pub struct AppState {
     /// Output of the job `/jobs logs` last asked for — see
     /// [`LocalUiEvent::SyncJobLogs`]. `None` whenever no logs view is open.
     job_logs: Option<JobLogView>,
+    /// What `/context search` last retrieved — see
+    /// [`LocalUiEvent::SyncContextSearch`]. `None` whenever no search is open.
+    context_search: Option<ContextSearchView>,
     /// Compiled-context usage from the last `context.compiled` event: tokens
     /// included in the packet the model was given, against the hard limit.
     /// `None` until a turn has reported one — there is no honest figure to
@@ -809,6 +817,9 @@ fn apply_local(mut state: AppState, event: &LocalUiEvent) -> Result<AppState, Ui
         LocalUiEvent::SyncJobLogs(page) => {
             state.job_logs = page.clone();
         }
+        LocalUiEvent::SyncContextSearch(found) => {
+            state.context_search = found.clone();
+        }
         LocalUiEvent::SyncGoal(goal) => {
             insert_goal(&mut state, goal.clone())?;
             state.selected_goal = Some(goal.id);
@@ -1045,6 +1056,65 @@ impl JobLogView {
 
     pub const fn truncated(&self) -> bool {
         self.truncated
+    }
+}
+
+/// What a `/context search` retrieved, as the panel shows it.
+///
+/// Host-synced like [`JobLogView`]: the retrieval subsystem walks the
+/// project on disk, so there is no kernel event carrying this. `outcome`
+/// exists because "no blocks" has several honest causes — an untrusted
+/// project is never walked at all — and a bare empty list would report a
+/// refusal as though the query simply matched nothing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextSearchView {
+    query: String,
+    hits: Vec<ContextHit>,
+    outcome: ContextSearchOutcome,
+}
+
+/// Why a search has the results it has.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ContextSearchOutcome {
+    /// The retrieval pass ran.
+    Searched,
+    /// The project is not trusted, so nothing was indexed or walked.
+    Untrusted,
+}
+
+/// One block the retrieval pass would put in front of the model.
+///
+/// Bytes, not tokens: `context_retrieval::retrieve` builds its inputs with
+/// `CompileInput::new(locator, text)` and sets no token estimate, so a
+/// token figure here would be a number this tree never computed. The byte
+/// length of the retrieved text is true and answers the same question.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextHit {
+    pub locator: String,
+    pub bytes: u64,
+}
+
+impl ContextSearchView {
+    pub fn new(query: String, hits: Vec<ContextHit>, outcome: ContextSearchOutcome) -> Self {
+        let mut hits = hits;
+        hits.truncate(MAX_CONTEXT_HITS);
+        Self {
+            query,
+            hits,
+            outcome,
+        }
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub fn hits(&self) -> &[ContextHit] {
+        &self.hits
+    }
+
+    pub const fn outcome(&self) -> ContextSearchOutcome {
+        self.outcome
     }
 }
 
@@ -1298,6 +1368,7 @@ impl AppState {
             selected_agent: None,
             selected_goal: None,
             job_logs: None,
+            context_search: None,
             selected_job: None,
             selected_approval: None,
             control_holder: ControlHolder::Agent,
@@ -1401,6 +1472,11 @@ impl AppState {
     /// Output synced for the selected job, if a logs view is open.
     pub fn job_logs(&self) -> Option<&JobLogView> {
         self.job_logs.as_ref()
+    }
+
+    /// Results synced for an open `/context search`.
+    pub fn context_search(&self) -> Option<&ContextSearchView> {
+        self.context_search.as_ref()
     }
 
     pub fn selected_approval(&self) -> Option<&ApprovalKey> {

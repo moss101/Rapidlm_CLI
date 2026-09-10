@@ -1594,6 +1594,14 @@ fn command_error_text(err: &CommandError) -> String {
     }
 }
 
+/// Token budget for a proactive-retrieval pass.
+///
+/// Shared by the turn path and `/context search` rather than written twice:
+/// the panel's whole claim is that it shows the blocks a real turn would be
+/// given for that prompt, and two constants that merely happen to match
+/// today would make that claim quietly false the first time one moved.
+const RETRIEVAL_BUDGET_TOKENS: u32 = 2048;
+
 /// Local-error text for an [`Inspector`] the TUI has no route to open.
 ///
 /// Same contract as [`unsupported_command_text`]: name the actual, specific
@@ -1607,7 +1615,7 @@ fn unrouted_inspector_text(inspector: &Inspector) -> String {
         Inspector::Agents { .. }
         | Inspector::Diff { .. }
         | Inspector::Goal
-        | Inspector::Context
+        | Inspector::Context { .. }
         | Inspector::Memory
         | Inspector::Jobs { .. } => "this inspector has a TUI route and should not reach this message",
         // Handled by `open_unrouted_inspector` with a real report.
@@ -3439,7 +3447,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     // open inside retrieve() itself — an unindexable or slow repo yields no
     // blocks rather than blocking the turn.
     let preserved = if let Some((root, TrustStatus::Trusted)) = &workspace {
-        let retrieved = crate::context_retrieval::retrieve(root, &prompt, 2048);
+        let retrieved = crate::context_retrieval::retrieve(root, &prompt, RETRIEVAL_BUDGET_TOKENS);
         preserved.with_retrieved_context(retrieved)
     } else {
         preserved
@@ -4286,6 +4294,14 @@ impl SessionLoop<'_> {
                 return;
             }
             Inspector::Jobs { id, logs } => (id, logs),
+            Inspector::Context { query } => {
+                let found = query.as_deref().map(|query| self.search_context(query));
+                *self.ui = reduce(
+                    self.ui.clone(),
+                    &UiEvent::Local(LocalUiEvent::SyncContextSearch(found)),
+                );
+                return;
+            }
             // `Inspector::Diff { agent }` still drops its operand here:
             // `ChangedFile` records no agent, so there is nothing to select
             // it by. Every other inspector names no entity to focus.
@@ -4319,6 +4335,43 @@ impl SessionLoop<'_> {
             self.ui.clone(),
             &UiEvent::Local(LocalUiEvent::SyncJobLogs(page)),
         );
+    }
+
+    /// Run proactive retrieval for `query` and project what it found.
+    ///
+    /// The same `context_retrieval::retrieve` call the turn path makes, so
+    /// this answers "what would the agent be given if I asked this" rather
+    /// than describing some separate index.
+    ///
+    /// **Gated on project trust exactly as the turn path is.** Retrieval
+    /// walks the tree and writes an incremental index under
+    /// `.rapidlm/index/`; doing that for an untrusted project because
+    /// someone typed a slash command would be a trust boundary crossed by
+    /// the UI, so an untrusted project reports that instead of searching.
+    fn search_context(&mut self, query: &str) -> tui::state::ContextSearchView {
+        use tui::state::{ContextHit, ContextSearchOutcome, ContextSearchView};
+
+        if !self.trusted {
+            return ContextSearchView::new(
+                query.to_owned(),
+                Vec::new(),
+                ContextSearchOutcome::Untrusted,
+            );
+        }
+        // A first index of a large repo can take up to
+        // `context_retrieval::RETRIEVAL_TIMEOUT`, and this runs on the input
+        // thread. Paint why the session paused before blocking on it, or a
+        // slow repo looks like a hang.
+        self.append_command_output(format!("searching retrieved context for {query}"));
+        let _ = self.renderer.render(self.ui);
+        let hits = crate::context_retrieval::retrieve(self.root, query, RETRIEVAL_BUDGET_TOKENS)
+            .into_iter()
+            .map(|block| ContextHit {
+                locator: block.locator().to_owned(),
+                bytes: block.text().len() as u64,
+            })
+            .collect();
+        ContextSearchView::new(query.to_owned(), hits, ContextSearchOutcome::Searched)
     }
 
     /// The named job's captured output, as a page for the `/jobs logs` view.
@@ -10973,6 +11026,148 @@ was already finished"
             loop_state.ui.selected_agent(),
             None,
             "the list view must not keep the previous selection"
+        );
+    }
+
+    #[test]
+    fn context_search_runs_the_retrieval_the_turn_path_would_run() {
+        // `/context search <query>` parsed a query and dropped it at
+        // `Inspector::route`, opening the same compiled-context summary as
+        // a bare `/context` — a search that never searched. The backend was
+        // there the whole time: `context_retrieval::retrieve` is what every
+        // trusted turn already calls to pick proactive context.
+        let env = TempEnv::create();
+        std::fs::write(
+            env.project.join("lru.py"),
+            "class LRUCache:\n    def get(self, key):\n        return self._data.get(key)\n",
+        )
+        .expect("seed");
+        let session = ScriptedSession::create(&env);
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = session.state().clone();
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(Vec::new());
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight.clone(),
+            backings,
+        );
+
+        loop_state
+            .dispatch_slash("/context search how does LRUCache eviction work")
+            .expect("dispatch");
+        let painted = tui::sidebar_lines(
+            tui::state::UiRoute::Context,
+            loop_state.ui,
+            70,
+            12,
+            &tui::state::CancellationToken::new(),
+        );
+        let body = painted.join("\n");
+        assert!(
+            body.contains("lru.py"),
+            "the search must name the file retrieval found: {painted:?}"
+        );
+
+        // And leaving the search restores the compiled-context summary
+        // rather than leaving stale results painted.
+        loop_state.dispatch_slash("/context").expect("dispatch");
+        let painted = tui::sidebar_lines(
+            tui::state::UiRoute::Context,
+            loop_state.ui,
+            70,
+            12,
+            &tui::state::CancellationToken::new(),
+        );
+        assert!(
+            !painted.iter().any(|line| line.contains("lru.py")),
+            "leaving the search must stop painting its results: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn context_search_never_indexes_an_untrusted_project() {
+        // Retrieval walks the tree and writes an incremental index under
+        // `.rapidlm/index/`, which is why the turn path runs it only for a
+        // trusted project. A slash command must not be a way around that:
+        // typing `/context search` in an untrusted directory would
+        // otherwise index it on the user's behalf.
+        let env = TempEnv::create();
+        std::fs::write(
+            env.project.join("lru.py"),
+            "class LRUCache:\n    def get(self, key):\n        return self._data.get(key)\n",
+        )
+        .expect("seed");
+        let session = ScriptedSession::create(&env);
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = session.state().clone();
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(Vec::new());
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight.clone(),
+            backings,
+        );
+        loop_state.trusted = false;
+
+        loop_state
+            .dispatch_slash("/context search how does LRUCache eviction work")
+            .expect("dispatch");
+        let painted = tui::sidebar_lines(
+            tui::state::UiRoute::Context,
+            loop_state.ui,
+            70,
+            12,
+            &tui::state::CancellationToken::new(),
+        );
+        let body = painted.join("\n");
+        assert!(
+            body.contains("not trusted"),
+            "an untrusted project must say why it found nothing: {painted:?}"
+        );
+        assert!(
+            !body.contains("lru.py"),
+            "and must not have read the tree: {painted:?}"
+        );
+        assert!(
+            !env.project.join(".rapidlm/index").exists(),
+            "an untrusted project must not be indexed by a slash command"
         );
     }
 

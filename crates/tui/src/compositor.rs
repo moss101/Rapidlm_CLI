@@ -441,6 +441,11 @@ fn memory_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
 /// Classes are shown in the compiler's own order rather than sorted by size,
 /// so a row does not move between redraws while a user is reading it.
 fn context_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
+    // A search asked a different question than "how full is the window",
+    // so it gets the panel while it is open.
+    if let Some(found) = state.context_search() {
+        return context_search_lines(found, width, height);
+    }
     let Some((used, limit)) = state.context_usage() else {
         return vec![fit_width("no turn has compiled a context yet", usize::from(width))];
     };
@@ -450,6 +455,53 @@ fn context_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
             "  {} {}/{}",
             partition.class, partition.used, partition.cap
         ));
+    }
+    lines.truncate(usize::from(height));
+    for line in &mut lines {
+        *line = fit_width(line, usize::from(width));
+    }
+    lines
+}
+
+/// The `/context search <query>` view: what proactive retrieval would put
+/// in front of the model for that query.
+///
+/// These are the blocks the *same* `context_retrieval::retrieve` call the
+/// turn path makes would surface, so the panel answers "what would the
+/// agent see if I asked this" rather than describing a separate index.
+///
+/// Locators are repository paths, so they render through
+/// [`sanitize_untrusted`] like every other untrusted string.
+fn context_search_lines(
+    found: &crate::state::ContextSearchView,
+    width: u16,
+    height: u16,
+) -> Vec<String> {
+    let query = sanitize_untrusted(found.query());
+    let mut lines = vec![match found.outcome() {
+        crate::state::ContextSearchOutcome::Searched => {
+            format!("search {query} — {} block(s)", found.hits().len())
+        }
+        // Never reported as "no matches": the project was never walked, and
+        // saying so names the thing the user can actually change.
+        crate::state::ContextSearchOutcome::Untrusted => {
+            format!("search {query} — project is not trusted, nothing indexed")
+        }
+    }];
+    for hit in found.hits() {
+        lines.push(format!(
+            "  {} {} bytes",
+            sanitize_untrusted(&hit.locator),
+            hit.bytes
+        ));
+    }
+    if lines.len() == 1
+        && matches!(
+            found.outcome(),
+            crate::state::ContextSearchOutcome::Searched
+        )
+    {
+        lines.push("  nothing retrieved for this query".to_owned());
     }
     lines.truncate(usize::from(height));
     for line in &mut lines {
@@ -1066,6 +1118,55 @@ pre-approve it with `rapid permissions allow <tool>`";
         assert!(
             route_renders_content(UiRoute::Jobs),
             "and the route must now report itself as one that paints"
+        );
+    }
+
+    #[test]
+    fn context_search_results_cannot_repaint_the_terminal() {
+        // Locators are repository paths — a clone controls them, filename
+        // included — so they are untrusted strings like every other one the
+        // compositor paints.
+        use crate::state::{ContextHit, ContextSearchOutcome, ContextSearchView};
+
+        let state = reduce(
+            AppState::new(),
+            &UiEvent::Local(crate::state::LocalUiEvent::SyncContextSearch(Some(
+                ContextSearchView::new(
+                    "eviction".to_owned(),
+                    vec![ContextHit {
+                        locator: "\u{1b}[2J\u{1b}[Hsrc/lru.py".to_owned(),
+                        bytes: 75,
+                    }],
+                    ContextSearchOutcome::Searched,
+                ),
+            ))),
+        );
+        let painted = sidebar_lines(UiRoute::Context, &state, 60, 8, &cancel());
+        assert!(
+            !painted.iter().any(|line| line.contains('\u{1b}')),
+            "no escape sequence from a repository path may reach the terminal: {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|line| line.contains("src/lru.py")),
+            "and the path is still readable: {painted:?}"
+        );
+
+        // A query that retrieved nothing says so, rather than painting a
+        // bare header that looks like a rendering bug.
+        let empty = reduce(
+            AppState::new(),
+            &UiEvent::Local(crate::state::LocalUiEvent::SyncContextSearch(Some(
+                ContextSearchView::new(
+                    "nothing matches this".to_owned(),
+                    Vec::new(),
+                    ContextSearchOutcome::Searched,
+                ),
+            ))),
+        );
+        let painted = sidebar_lines(UiRoute::Context, &empty, 60, 8, &cancel());
+        assert!(
+            painted.iter().any(|line| line.contains("nothing retrieved")),
+            "an empty result must say so: {painted:?}"
         );
     }
 
