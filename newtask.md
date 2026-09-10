@@ -7623,8 +7623,8 @@ which would serve jobs, agents and knowledge at once.
 
 ## Session boundary, 2026-09-10 — durable state for the next session
 
-Eighteen commits across two days, `dbeb2c2`..`9c0a450`, all pushed to `origin/main`. Baseline before them
-was `598c6fd`. Each has its own entry above; this is the current state and what is actually left.
+Twenty-three commits across two days, `dbeb2c2`..`bccf629`, all pushed to `origin/main`. Baseline before
+them was `598c6fd`. Each has its own entry above; this is the current state and what is actually left.
 
 **2026-09-09** (`dbeb2c2`..`b967d0a`): `rapid resume`; every command resolving the same project as the
 TUI; listing no longer creating what it lists; one event ledger per project (option C, with the WAL
@@ -7632,9 +7632,10 @@ correction self-review caught in already-pushed code); `rapid --help` no longer 
 the parser rejects; `rapid insights` given a test that can fail; `/jobs` and `/approvals` rendering the
 projections they already had.
 
-**2026-09-10** (`81674b0`..`9c0a450`): background jobs journaled, session-lived, and cancellable; the
+**2026-09-10** (`81674b0`..`bccf629`): background jobs journaled, session-lived, and cancellable; the
 status bar showing model, policy and compiled context instead of dashes; `/models`, `/memory` and
-`/context` made real.
+`/context` made real; `/diff` answering what the agent changed; `/fork` moving the session onto the
+branch it created; `/jobs show|logs` honoring the job you name, with a live-following log view.
 
 **The through-line has not changed and is the most useful thing to carry forward.** Every one of these
 was two representations of one fact with nothing spanning them, and the fix that held each time was to
@@ -7643,7 +7644,7 @@ today: a test that hardcoded a derived answer (`/memory` is `None`) went stale t
 fact changed — which is the design working — and a draft that added a `LocalUiEvent` beside a kernel
 event for the same value was caught and removed before it shipped.
 
-**Verification.** Revert cycles 72-110 across the two days. The pattern that keeps earning its keep: a
+**Verification.** Revert cycles 72-120 across the two days. The pattern that keeps earning its keep: a
 cycle that *passes* means the test is wrong, not the code. Five did on 2026-09-09; two more did today —
 a fixture too small for the bound it was meant to prove (one line against a 200-line cap), and a state
 read taken before the supervisor thread could notice a kill. Both were rewritten until the broken code
@@ -7651,30 +7652,42 @@ actually failed them.
 
 ### What is actually left, in the order I would take it
 
-1. ~~`/diff`~~ — **done the same day, see the entry above.** A `WorkspaceChanges` observer on the write
-   path records what each turn wrote; the panel shows files and line counts. What remains here is *real
-   hunks*, which need a diff implementation (no LCS in tree, no diff dependency) — a separate task, and
-   the `workspace` crate's journal/transaction machinery is still unwired if a richer change set is ever
-   wanted. `/graph`, `/computer` and `/resources` are backed by subsystems the binary does not run, so
-   each needs its feature before its panel.
-2. **`/agents cancel` and `/agents terminate`.** Still refused honestly. `KernelApi::Interrupt` is
+1. **The rest of the dropped operands.** `/diff --agent <id>`, `/agents show <id>`, `/context search
+   <query>`, `/knowledge show <id>` and `/playbook show <name>` all die at the same boundary
+   (`Inspector::route()` returning a bare `UiRoute`) that `/jobs show|logs` just stopped dying at.
+   `/agents show` is now a one-line addition to `focus_inspector` using the existing `selected_agent`;
+   the others are not wiring — `/context search` needs a search over the compiled context, and
+   knowledge/playbook have no store behind them.
+2. **Typed-id prefixes.** `/jobs show <id>`, `/jobs cancel <id>` and every other id-taking command
+   require a full UUID that nothing prints — the panels deliberately show a job's *command* instead. A
+   bare `/jobs logs` works around this for one case; the general fix is prefix matching in
+   `optional_id`/`require_id`, which would serve jobs, agents and knowledge at once.
+3. **The unwired panel view models.** `crates/tui/src/panels/` is ~10.7k lines, of which the compositor
+   uses two (`agents`, `goals`). See this session's entry for the two traps: `trace_jobs`'s log path
+   needs an `ArtifactRef` producer that does not exist anywhere in the workspace, and wiring it as-is
+   would regress `/jobs` rows back to bare UUIDs.
+4. **`/agents cancel` and `/agents terminate`.** Still refused honestly. `KernelApi::Interrupt` is
    session-wide and takes no id, and there is no running-agent registry — subagents run *inside* the
-   parent turn, and `host_runtime`/`agent-pool` (which would give background agents) is not used by the
-   binary at all. Making this real means background agents first, which is a feature, not wiring.
-3. ~~Switching a live session onto a fork~~ — **done the same day, see the entry above.** What remains
-   is choosing a fork point (`/fork [checkpoint]`'s operand is still unused) and a way to list branches.
-4. **Integration breadth**: daemon/ACP/SDK server, the MCP catalog subsystem and remote transports,
+   parent turn, and `host_runtime`/`agent-pool` is not used by the binary at all. Background agents are
+   a feature, not wiring.
+5. **Real diff hunks.** `/diff` shows files and line counts; hunks need a diff implementation (no LCS in
+   tree, no diff dependency) and the `workspace` crate's journal/transaction machinery is still unwired.
+   `/graph`, `/computer` and `/resources` are backed by subsystems the binary does not run, so each
+   needs its feature before its panel.
+6. **Integration breadth**: daemon/ACP/SDK server, the MCP catalog subsystem and remote transports,
    knowledge/playbooks, distribution and installability. All are honestly absent today (roadmap in
-   `docs/reference/cli-command-reference.md`, absent from `SUBCOMMANDS`), so none of them lies — they are
-   scope, not defects.
-5. **The both-ledgers case** still strands rows behind a printed notice (option C's accepted cost).
+   `docs/reference/cli-command-reference.md`, absent from `SUBCOMMANDS`), so none of them lies — they
+   are scope, not defects.
+7. **The both-ledgers case** still strands rows behind a printed notice (option C's accepted cost).
    Option D's merge is the follow-up if real installs turn out to hold both files.
 
 **Two things to know before touching this area again.** The event ledger is in **WAL** mode
 (`event_ledger::migrations` sets and verifies it) — check `PRAGMA journal_mode` before reasoning about
 moving database files. And a full `cargo test --workspace` here takes 15-45 minutes because every commit
 touches a ~10k-line file; `cargo test -p rapid --lib` (~37s) and `-p tui` (under a second) are the inner
-loop, and two cargo suites must never run at once in this repo.
+loop, and two cargo suites must never run at once in this repo. A workspace run also loads the machine
+enough to break timing-sensitive tests that pass alone — that is usually the test's fault, not the
+environment's, and `context_retrieval`'s watcher test was fixed rather than excused on 2026-09-10.
 
 ## Session boundary, 2026-09-09 — durable state for the next session
 
