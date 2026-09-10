@@ -264,19 +264,37 @@ pub(crate) trait JobEvents: Send + Sync {
 /// Registry of background commands started by `shell.exec` with
 /// `background: true`.
 ///
-/// Children are killed when the registry drops. The registry is built per
-/// *turn* (`build_interactive_turn_context`), so a background job lives
-/// until the end of the turn that started it — not, as this comment used to
-/// say, until the end of the CLI run. A model can start a build and poll it
-/// across steps of the same turn; it cannot poll it in a later one, and
-/// `start`'s own summary now tells it so. Extending the lifetime to the
-/// session is a real product change (a job would then outlive the turn a
-/// user can see, and a crashed TUI could strand processes) and is recorded
-/// in `newtask.md` rather than assumed here.
+/// Children are killed when the last handle to the [`JobTable`] drops. The
+/// interactive session owns that handle (`SessionLoop::jobs`) and shares the
+/// table into every turn, so a background job outlives the turn that started
+/// it and is stopped when the session ends.
+///
+/// It was per *turn*, which made `background: true` close to useless: the
+/// job died with the turn, so `job_status` in a later turn found nothing and
+/// `/jobs` — only reachable between turns — could never show a live one. The
+/// remaining exposure is unchanged in kind: a process killed outright (no
+/// unwinding, no `Drop`) can strand children, which is what
+/// `process-supervisor`'s orphan reconciliation exists to solve and is not
+/// wired here.
+/// The job table itself, and the thing whose destruction kills the children.
+///
+/// Separate from [`JobRegistry`] so the kill happens when the *last* handle
+/// goes, not when any clone does. `Drop` used to sit on the registry, which
+/// is `Clone`, so a per-turn copy going out of scope killed every job in the
+/// shared table — the reason a background job could not outlive the turn
+/// that started it even in principle.
+#[derive(Default)]
+struct JobTable {
+    jobs: Mutex<BTreeMap<String, JobShared>>,
+    /// Session-scoped, so `job-N` handles stay unique across turns. A
+    /// per-turn counter restarted at 1 every turn, which collides in a table
+    /// that outlives one.
+    seq: AtomicU64,
+}
+
 #[derive(Clone, Default)]
 pub struct JobRegistry {
-    jobs: Arc<Mutex<BTreeMap<String, JobShared>>>,
-    seq: Arc<AtomicU64>,
+    table: Arc<JobTable>,
     /// Total jobs started this turn, shared across the parent and every
     /// subagent's own `JobRegistry` (see `share_job_budget`) — `start`'s own
     /// bound otherwise only ever counted *this* registry's own live jobs,
@@ -302,6 +320,17 @@ impl JobRegistry {
         self.started_this_turn.clone()
     }
 
+    /// Adopt `session`'s job table, so jobs started by this turn live in —
+    /// and outlive it in — the session's own table.
+    ///
+    /// Deliberately shares the *table* and not the per-turn start budget:
+    /// the budget is per turn by design (`started_this_turn`), while the
+    /// table is what a background job has to outlive its turn in, and what
+    /// `job_status` in a *later* turn has to find it in.
+    pub(crate) fn share_table(&mut self, session: &JobRegistry) {
+        self.table = Arc::clone(&session.table);
+    }
+
     /// Replace this instance's own counter with the parent's: without this,
     /// every subagent child starts counting from zero again. See
     /// `started_this_turn`'s own doc comment.
@@ -321,7 +350,7 @@ impl JobRegistry {
         if self.started_this_turn.fetch_add(1, Ordering::SeqCst) >= MAX_BACKGROUND_JOBS as u64 {
             return Err(ToolStepError::Failed);
         }
-        let id = format!("job-{}", self.seq.fetch_add(1, Ordering::SeqCst) + 1);
+        let id = format!("job-{}", self.table.seq.fetch_add(1, Ordering::SeqCst) + 1);
         // The ledger keys jobs by a typed `JobId`; the model keeps the short
         // `job-N` handle it already uses for `job_status`/`job_output`, and
         // the event carries both so a reader can correlate the panel row
@@ -341,7 +370,7 @@ impl JobRegistry {
             reported: Arc::new(AtomicBool::new(false)),
             sandbox_cancel: None,
         };
-        self.jobs
+        self.table.jobs
             .lock()
             .map_err(|_| ToolStepError::Failed)?
             .insert(id.clone(), shared.clone());
@@ -520,7 +549,7 @@ impl JobRegistry {
             });
         if spawned.is_err() {
             // The supervisor thread could not start; retract the job.
-            if let Ok(mut jobs) = self.jobs.lock() {
+            if let Ok(mut jobs) = self.table.jobs.lock() {
                 jobs.remove(&id);
             }
             return Err(ToolStepError::Failed);
@@ -563,7 +592,7 @@ impl JobRegistry {
         if self.started_this_turn.fetch_add(1, Ordering::SeqCst) >= MAX_BACKGROUND_JOBS as u64 {
             return Err(ToolStepError::Failed);
         }
-        let id = format!("job-{}", self.seq.fetch_add(1, Ordering::SeqCst) + 1);
+        let id = format!("job-{}", self.table.seq.fetch_add(1, Ordering::SeqCst) + 1);
         let sandbox_cancel = capability_broker::CancellationToken::new();
         let shared = JobShared {
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -574,7 +603,7 @@ impl JobRegistry {
             reported: Arc::new(AtomicBool::new(false)),
             sandbox_cancel: Some(sandbox_cancel.clone()),
         };
-        self.jobs
+        self.table.jobs
             .lock()
             .map_err(|_| ToolStepError::Failed)?
             .insert(id.clone(), shared.clone());
@@ -661,7 +690,7 @@ impl JobRegistry {
                 }
             });
         if spawned.is_err() {
-            if let Ok(mut jobs) = self.jobs.lock() {
+            if let Ok(mut jobs) = self.table.jobs.lock() {
                 jobs.remove(&id);
             }
             return Err(ToolStepError::Failed);
@@ -671,7 +700,7 @@ impl JobRegistry {
     }
 
     fn snapshot(&self, id: &str) -> Option<String> {
-        let jobs = self.jobs.lock().ok()?;
+        let jobs = self.table.jobs.lock().ok()?;
         jobs.get(id)
             .map(|job| job.state.lock().ok().map(|state| state.as_text()))
             .flatten()
@@ -683,7 +712,7 @@ impl JobRegistry {
     /// off at [`MAX_JOB_OUTPUT_BYTES`] (independent of which page this is —
     /// the real process may have emitted more than was ever spooled).
     fn output(&self, id: &str, offset: usize) -> Option<(String, bool, usize, String, bool)> {
-        let jobs = self.jobs.lock().ok()?;
+        let jobs = self.table.jobs.lock().ok()?;
         let job = jobs.get(id)?;
         let buffer = job.output.lock().ok()?;
         let start = offset.min(buffer.len());
@@ -705,7 +734,7 @@ impl JobRegistry {
     /// summary (job id, terminal state, bounded output). Running jobs stay
     /// pending; each job reports at most once.
     fn drain_notifications(&self) -> Vec<String> {
-        let Ok(jobs) = self.jobs.lock() else {
+        let Ok(jobs) = self.table.jobs.lock() else {
             return Vec::new();
         };
         let mut notices = Vec::new();
@@ -750,26 +779,9 @@ impl JobRegistry {
         notices
     }
 
-    fn kill_all(&self) {
-        let Ok(jobs) = self.jobs.lock() else {
-            return;
-        };
-        for job in jobs.values() {
-            job.cancelled.store(true, Ordering::SeqCst);
-            if let Some(token) = &job.sandbox_cancel {
-                token.cancel();
-            }
-            if let Ok(mut child) = job.child.try_lock() {
-                if let Some(child) = child.as_mut() {
-                    let _ = child.kill();
-                }
-            }
-        }
-    }
-
     /// Retain only live jobs once finished ones exceed the registry bound.
     fn prune(&self) {
-        let Ok(mut jobs) = self.jobs.lock() else {
+        let Ok(mut jobs) = self.table.jobs.lock() else {
             return;
         };
         let finished: Vec<String> = jobs
@@ -789,7 +801,31 @@ impl JobRegistry {
     }
 }
 
-impl Drop for JobRegistry {
+impl JobTable {
+    /// Stop every job in this table. The single implementation, called by
+    /// `Drop` — and the one `/jobs cancel` would reuse per job.
+    fn kill_all(&self) {
+        let Ok(jobs) = self.jobs.lock() else {
+            return;
+        };
+        for job in jobs.values() {
+            job.cancelled.store(true, Ordering::SeqCst);
+            if let Some(token) = &job.sandbox_cancel {
+                token.cancel();
+            }
+            if let Ok(mut child) = job.child.try_lock()
+                && let Some(child) = child.as_mut()
+            {
+                let _ = child.kill();
+            }
+        }
+    }
+}
+
+impl Drop for JobTable {
+    /// Kill every child when the last handle to this table goes — the end of
+    /// the interactive session, or of a headless run. See [`JobTable`] on why
+    /// this is not on the `Clone` handle.
     fn drop(&mut self) {
         self.kill_all();
     }
@@ -1270,6 +1306,12 @@ impl WorkspaceTools {
     /// [`JobEvents`].
     pub(crate) fn set_job_events(&mut self, events: Arc<dyn JobEvents>) {
         self.jobs.set_events(events);
+    }
+
+    /// Run this turn's background jobs in the session's own job table. See
+    /// [`JobRegistry::share_table`].
+    pub(crate) fn share_job_table(&mut self, session: &JobRegistry) {
+        self.jobs.share_table(session);
     }
 
     /// The sink this surface reports jobs to, for propagating to a subagent
@@ -2172,7 +2214,7 @@ impl WorkspaceTools {
                 )?;
                 let mut summary = format!(
                     "started sandboxed job {job_id}: {} (timeout {}s); poll with job_status \
-within this turn — the job is stopped when the turn ends",
+in this turn or a later one — the job is stopped when the session ends",
                     args.argv.join(" "),
                     args.timeout.as_secs()
                 );
@@ -2227,7 +2269,7 @@ within this turn — the job is stopped when the turn ends",
             let job_id = self.jobs.start(&args.argv, self.root(), args.timeout)?;
             let mut summary = format!(
                 "started background job {job_id}: {} (timeout {}s); poll with job_status / \
-read with job_output, both within this turn — the job is stopped when the turn ends",
+read with job_output, in this turn or a later one — the job is stopped when the session ends",
                 args.argv.join(" "),
                 args.timeout.as_secs()
             );
@@ -5112,6 +5154,14 @@ impl ExecTools {
         }
     }
 
+    /// Run background jobs in the session's table (no-op on the no-op
+    /// surface). See [`JobRegistry::share_table`].
+    pub(crate) fn share_job_table(&mut self, session: &JobRegistry) {
+        if let Self::Workspace(tools) = self {
+            tools.share_job_table(session);
+        }
+    }
+
     /// Attach the subagent runner (no-op on the fail-closed no-op surface).
     pub fn set_subagent_runner(&mut self, runner: std::sync::Arc<dyn SubagentRunner>) {
         if let Self::Workspace(tools) = self {
@@ -6337,6 +6387,69 @@ use std::sync::{Arc, Mutex};
         // The refused patch must never have touched the file.
         let contents = fs::read_to_string(root.0.join("code.rs")).expect("read");
         assert_eq!(contents, "fn a() {}\n");
+    }
+
+    #[test]
+    fn a_background_job_survives_its_turn_and_says_so_to_the_model() {
+        // Two halves of one promise. The summary is the model's only
+        // statement of how long a background job lives, and it has been
+        // wrong in both directions: silent while jobs died with the turn,
+        // then "when the turn ends" in the very change that made them live
+        // for the session. And the behaviour it describes is the table
+        // outliving the per-turn tool surface that started the job.
+        let root = TempRoot::new("background-job-lifetime");
+        let session_jobs = JobRegistry::default();
+
+        let summary = {
+            // A turn's tool surface, sharing the session's table.
+            let mut tools = permissive_workspace(&root.0);
+            tools.share_job_table(&session_jobs);
+            let cancel = CancellationToken::new();
+            let call = ProposedToolCall::new(
+                "c1",
+                SHELL_EXEC_TOOL,
+                serde_json::to_string(&serde_json::json!({
+                    "argv": ["/bin/sleep", "30"],
+                    "background": true,
+                }))
+                .expect("encode call")
+                .as_str(),
+            )
+            .expect("call");
+            let validated = tools.validate(&call, &cancel).expect("validate");
+            match tools.execute(&validated, &cancel).expect("execute") {
+                ToolStepResult::Succeeded { summary, .. } => summary,
+                other => panic!("a background job must start: {other:?}"),
+            }
+            // `tools` drops here: the turn is over.
+        };
+
+        assert!(
+            summary.contains("the job is stopped when the session ends"),
+            "the model must be told the real lifetime: {summary}"
+        );
+        assert!(
+            !summary.contains("turn ends"),
+            "and not one that is no longer true: {summary}"
+        );
+
+        // The turn's surface is gone; the session's table still has the job
+        // and it *stays* running. Asserting once immediately would pass even
+        // if the drop had killed it, since the supervisor only notices at its
+        // next poll — so this watches across several of those.
+        for _ in 0..20 {
+            std::thread::sleep(JOB_POLL_INTERVAL);
+            let live = session_jobs
+                .snapshot("job-1")
+                .expect("the session's table still has the job");
+            assert!(
+                live.contains("running"),
+                "the job must outlive the turn's tool surface: {live:?}"
+            );
+        }
+
+        // Dropping the session's own handle is what stops it.
+        drop(session_jobs);
     }
 
     #[test]

@@ -7135,7 +7135,7 @@ version was caught by an existing test rather than by a new one.
 
 684 `rapid` lib tests, clippy identical to baseline, full workspace green.
 
-### Recommended next, on this thread
+### Recommended next, on this thread — **taken the same day, see the entry above**
 
 **Extend the background-job lifetime from the turn to the session.** A user who asks for a build and then
 sends another message reasonably expects it to still be running; mature CLIs keep background commands
@@ -7145,6 +7145,56 @@ per-turn state, and `Drop` must move to an inner `Arc` so a per-turn clone going
 kills every job. The safety half is the reason it has not been done here: something must still guarantee
 no process outlives the CLI, including on a crash. `/jobs cancel <id>` becomes meaningful at the same
 time, and the registry's `cancelled` flag is already the mechanism it would use.
+
+**Background jobs now live for the session, not the turn, done 2026-09-10.**
+
+This is the recommendation recorded an hour earlier, taken. `background: true` was close to useless
+without it: the registry was built per turn and its `Drop` killed the children, so `job_status` in a later
+turn found nothing — and `/jobs`, which a user can only type *between* turns, could never show a live
+job, because by then the table that held it was already gone.
+
+**The reason `Drop` had to move first.** It sat on `JobRegistry`, which is `Clone`. Every per-turn copy
+going out of scope killed every job in the shared table, so sharing a table between turns would not have
+helped by itself. The table is now its own type, `JobTable`, held behind an `Arc`; `Drop` is on the table,
+so children are killed when the *last* handle goes. `kill_all` lives there too, as one implementation
+rather than the copy `Drop` would otherwise carry.
+
+**Session-scoping fixed a latent collision too.** `seq` was per-registry, so every turn restarted its
+handles at `job-1`. In a table that outlives a turn those collide; `seq` is now session-scoped.
+
+**What is shared, and what deliberately is not.** `share_table` shares the job table only. The per-turn
+start budget (`started_this_turn`) stays per turn, which is what its own doc comment always intended and
+what `share_job_budget` already handles separately. `SessionLoop` owns the session handle and passes a
+clone into each turn (both the production and scripted-backing chains), so a scripted test exercises the
+same lifetime a real session has.
+
+**Guarantee kept:** dropping the session's handle at the end of `run_started_session` stops every child,
+and a test asserts it. The remaining exposure is unchanged in kind, not in mechanism: a process killed
+outright runs no `Drop` and can strand children, which is what `process-supervisor`'s orphan
+reconciliation exists for and is still unwired.
+
+**Two documentation corrections, one of them mine from an hour earlier.** The registry's doc comment and
+the model-facing summary both said the job is stopped "when the turn ends" — which I had *just* written to
+replace an older, differently-wrong claim, and which this change made false again. Both now say the
+session, and `a_background_job_survives_its_turn_and_says_so_to_the_model` asserts the summary against the
+behaviour rather than leaving it to review. That test exists because this string has now been wrong in
+both directions.
+
+**A revert cycle rejected the first version of that test.** It read the job's state once immediately after
+the turn's tool surface dropped, which passes even when the drop *did* kill the job: the supervisor only
+notices at its next poll, so the snapshot still said "running". It now watches across twenty poll
+intervals and requires the job to stay running; against the broken version it reports
+`failed: cancelled`.
+
+**Tests.** Three new: a job outlives the turn that started it and is still there a turn later; a job
+stopped when the session ends is reported as cancelled with no exit status (retargeted from the
+turn-end version, whose premise this change removed); and the tool-layer test above covering both the
+summary and the survival. Three revert cycles (98-100). 686 `rapid` lib tests, 230 `tui`, clippy one
+warning *below* the baseline (a nested `if let` in `kill_all` became a let-chain), full workspace green.
+
+**Now unblocked:** `/jobs cancel <id>` has something to cancel and a mechanism to do it with — the
+table's `cancelled` flag, already the thing `kill_all` sets. It is still refused today; making it real is
+the next step on this thread, and `/agents cancel` still needs the kernel work described earlier.
 
 ## Session boundary, 2026-09-09 — durable state for the next session
 

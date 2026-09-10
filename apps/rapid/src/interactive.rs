@@ -3923,6 +3923,10 @@ fn run_started_session(
 
     let mut renderer = TuiRenderer::new(options.capture_render);
     let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // One job table for the whole session: background jobs outlive the turn
+    // that started them, and dropping this at the end of `run_started_session`
+    // is what kills them. See `SessionLoop::jobs`.
+    let session_jobs = crate::exec_tools::JobRegistry::default();
     let loop_result = SessionLoop {
         client: &client,
         stream: &mut stream,
@@ -3936,6 +3940,7 @@ fn run_started_session(
         user_home: &resolved.user_home,
         trusted: resolved.trust.is_trusted(),
         turn_in_flight: turn_in_flight.clone(),
+        jobs: session_jobs.clone(),
         renderer: &mut renderer,
         autonomous: None,
         #[cfg(test)]
@@ -3996,6 +4001,15 @@ struct SessionLoop<'a> {
     /// rather than reaching `kernel::SubmitTurn` and hitting the exact
     /// `SessionConflict` this whole feature exists to stop crashing on.
     turn_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The session's background-job table, shared into every turn.
+    ///
+    /// Owned here rather than per turn because a background job must outlive
+    /// the turn that started it — `shell_exec background=true` tells the
+    /// model to poll it, and a user typing `/jobs` does so between turns,
+    /// when a per-turn table would already have been dropped (and its
+    /// children killed). Dropping this at the end of the session is what
+    /// still guarantees no command outlives the CLI.
+    jobs: crate::exec_tools::JobRegistry,
     renderer: &'a mut TuiRenderer,
     /// `Some` for the entire duration of a `/goal run`-started autonomous
     /// continuation, `None` otherwise. Owned by the loop, not a reference:
@@ -4976,6 +4990,7 @@ denied\n",
                     std::sync::Arc::clone(&self.turn_in_flight),
                     backing,
                     budget,
+                    self.jobs.clone(),
                 );
                 return self.drain();
             }
@@ -4989,6 +5004,7 @@ denied\n",
                 text.to_owned(),
                 turn_cancel,
                 std::sync::Arc::clone(&self.turn_in_flight),
+                self.jobs.clone(),
             );
         }
         self.drain()
@@ -5212,6 +5228,9 @@ fn spawn_interactive_turn(
     text: String,
     kernel_cancel: kernel::CancelToken,
     turn_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // The *session's* job table, so a background job outlives the turn that
+    // started it. See `JobRegistry::share_table`.
+    jobs: crate::exec_tools::JobRegistry,
 ) {
     std::thread::spawn(move || {
         // A panic anywhere in `run_interactive_turn`'s own call chain (model
@@ -5227,7 +5246,16 @@ fn spawn_interactive_turn(
         // reports the panic as a normal `Failed` outcome, it doesn't rely on
         // any invariant broken by unwinding) keeps that guarantee even here.
         let outcome = catching_panics(std::panic::AssertUnwindSafe(|| {
-            run_interactive_turn(&client, session_id, &actor, &root, trusted, &text, &kernel_cancel)
+            run_interactive_turn(
+                &client,
+                session_id,
+                &actor,
+                &root,
+                trusted,
+                &text,
+                &kernel_cancel,
+                &jobs,
+            )
         }));
         let _ = client.finish_turn(kernel::FinishTurn::new(
             session_id,
@@ -5258,6 +5286,8 @@ fn spawn_interactive_turn_with_backing<B: crate::host::LiveModelCall + Send + 's
     turn_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     backing: B,
     budget: (u32, u32),
+    // The session's job table — see `spawn_interactive_turn`'s own parameter.
+    jobs: crate::exec_tools::JobRegistry,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let outcome = catching_panics(std::panic::AssertUnwindSafe(|| {
@@ -5271,6 +5301,7 @@ fn spawn_interactive_turn_with_backing<B: crate::host::LiveModelCall + Send + 's
                 &kernel_cancel,
                 backing,
                 budget,
+                &jobs,
             )
         }));
         let _ = client.finish_turn(kernel::FinishTurn::new(
@@ -5357,6 +5388,7 @@ impl Drop for CancelBridge {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_interactive_turn(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
@@ -5365,10 +5397,19 @@ fn run_interactive_turn(
     trusted: bool,
     text: &str,
     kernel_cancel: &kernel::CancelToken,
+    jobs: &crate::exec_tools::JobRegistry,
 ) -> kernel::TurnOutcome {
     let bridge = CancelBridge::start(kernel_cancel);
-    let outcome =
-        run_interactive_turn_inner(client, session_id, actor, root, trusted, text, &bridge.token);
+    let outcome = run_interactive_turn_inner(
+        client,
+        session_id,
+        actor,
+        root,
+        trusted,
+        text,
+        &bridge.token,
+        jobs,
+    );
     bridge.stop();
     outcome
 }
@@ -5388,6 +5429,7 @@ fn run_interactive_turn_with_backing<B: crate::host::LiveModelCall>(
     kernel_cancel: &kernel::CancelToken,
     backing: B,
     budget: (u32, u32),
+    jobs: &crate::exec_tools::JobRegistry,
 ) -> kernel::TurnOutcome {
     let bridge = CancelBridge::start(kernel_cancel);
     let outcome = run_interactive_turn_inner_with_backing(
@@ -5400,6 +5442,7 @@ fn run_interactive_turn_with_backing<B: crate::host::LiveModelCall>(
         &bridge.token,
         backing,
         budget,
+        jobs,
     );
     bridge.stop();
     outcome
@@ -5492,6 +5535,7 @@ fn build_interactive_turn_context(
 /// omitted here to land working end-to-end turn execution first, not
 /// silently dropped as an oversight. Memory index and todo index (2026-09-05)
 /// are the first of these to be wired in — see `preserve_memory_and_todos`.
+#[allow(clippy::too_many_arguments)]
 fn run_interactive_turn_inner(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
@@ -5500,6 +5544,7 @@ fn run_interactive_turn_inner(
     trusted: bool,
     text: &str,
     cancel: &agent_runtime::CancellationToken,
+    jobs: &crate::exec_tools::JobRegistry,
 ) -> kernel::TurnOutcome {
     // Model resolved *before* context construction below — not after — so
     // the context budget (`context_budget_for`) is derived from the model
@@ -5561,6 +5606,9 @@ fn run_interactive_turn_inner(
     if let Some(snapshot) = redaction_snapshot {
         tools.set_redaction(snapshot);
     }
+    // Background jobs go in the session's table, not this turn's: see
+    // `SessionLoop::jobs`.
+    tools.share_job_table(jobs);
 
     execute_interactive_turn(client, session_id, actor, root, text, preserved, &mut tools, backing, cancel)
 }
@@ -5590,6 +5638,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     cancel: &agent_runtime::CancellationToken,
     backing: B,
     budget: (u32, u32),
+    jobs: &crate::exec_tools::JobRegistry,
 ) -> kernel::TurnOutcome {
     // `BypassPermissions`, not the real env/settings-resolved mode: see
     // `build_interactive_turn_context`'s own doc comment on `forced_mode`
@@ -5612,6 +5661,8 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         Ok(built) => built,
         Err(outcome) => return outcome,
     };
+    // Same session-scoped job table the production path uses.
+    tools.share_job_table(jobs);
     execute_interactive_turn(client, session_id, actor, root, text, preserved, &mut tools, backing, cancel)
 }
 
@@ -8095,6 +8146,7 @@ alignment below it: {line:?}",
             user_home: &session.user_home,
             trusted: true,
             turn_in_flight,
+            jobs: session.jobs.clone(),
             renderer,
             autonomous: None,
             scripted_backings: Some(backings),
@@ -9513,20 +9565,68 @@ that is no longer there"
     }
 
     #[test]
-    fn a_job_stopped_at_the_end_of_its_turn_says_so_rather_than_reporting_an_exit_code() {
-        // A background job does not outlive the turn that started it: the
-        // registry is per-turn and its `Drop` kills the children. That is
-        // the current, deliberate lifetime — but the *report* was wrong.
-        // `kill_all` sets `cancelled` and then kills, so the supervisor saw
-        // an ordinary signalled exit and recorded "completed exit -1",
-        // which a model reads as a build that failed and the panel showed
-        // the same way. A job we stopped must say it was stopped.
+    fn a_background_job_outlives_the_turn_that_started_it() {
+        // The point of `background: true`: start a build, keep working, come
+        // back to it. The registry used to be built per turn and its `Drop`
+        // killed the children, so a job was dead before the user could type
+        // anything — `/jobs` is only reachable *between* turns, so nothing a
+        // user could do would ever have shown a live one.
         let env = TempEnv::create();
         let mut session = ScriptedSession::create(&env);
         session.run_turn(
             "start a slow one",
             ScriptedModel::background_job_then_answer(&["/bin/sleep", "30"], "started"),
         );
+
+        let jobs = session.state().jobs();
+        let job = jobs.values().next().expect("the job is projected");
+        assert_eq!(
+            job.state(),
+            tui::state::JobLifecycle::Started,
+            "the job must still be running after its turn ended: {job:?}"
+        );
+
+        // A second turn runs, and it is still there — same table, same job.
+        session.run_turn("keep working", ScriptedModel::terminal("did something else"));
+        let jobs = session.state().jobs();
+        assert_eq!(jobs.len(), 1, "the same job, not a second one: {jobs:?}");
+        let job = jobs.values().next().expect("the job");
+        assert_eq!(
+            job.state(),
+            tui::state::JobLifecycle::Started,
+            "and still running a turn later: {job:?}"
+        );
+        assert_eq!(job.command(), Some("/bin/sleep 30"));
+    }
+
+    #[test]
+    fn a_job_stopped_when_the_session_ends_says_so_rather_than_reporting_an_exit_code() {
+        // Ending the session is what stops background jobs now, and that is
+        // the guarantee that keeps no command outliving the CLI. The *report*
+        // used to be wrong either way: `kill_all` sets `cancelled` and then
+        // kills, so the supervisor saw an ordinary exit and recorded
+        // "completed exit -1" — which a model reads as a build that failed,
+        // and the panel showed the same way.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "start a slow one",
+            ScriptedModel::background_job_then_answer(&["/bin/sleep", "30"], "started"),
+        );
+        assert_eq!(
+            session
+                .state()
+                .jobs()
+                .values()
+                .next()
+                .expect("the job")
+                .state(),
+            tui::state::JobLifecycle::Started,
+        );
+
+        // End the session: the last handle to the table goes, and its `Drop`
+        // stops every child.
+        session.end_session_jobs();
         session.drain_until("the stopped job to be reported", |state| {
             state
                 .jobs()
@@ -9539,7 +9639,7 @@ that is no longer there"
         assert_eq!(
             job.state(),
             tui::state::JobLifecycle::Cancelled,
-            "a job stopped with the turn must be reported as cancelled, not as an exit: {job:?}"
+            "a job stopped with the session must be reported as cancelled, not as an exit: {job:?}"
         );
         assert_eq!(
             job.exit_status(),
@@ -10488,6 +10588,10 @@ that is no longer there"
     /// new()` and silently produced an empty transcript for every turn.
     struct ScriptedSession {
         client: InProcessKernelClient,
+        /// The session's job table, exactly as `run_started_session` owns
+        /// one — so a scripted turn's background jobs behave the way a real
+        /// session's do, including outliving the turn that started them.
+        jobs: crate::exec_tools::JobRegistry,
         session_id: protocol::SessionId,
         actor: ActorRef,
         root: PathBuf,
@@ -10521,6 +10625,7 @@ that is no longer there"
             let ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
             Self {
                 client,
+                jobs: crate::exec_tools::JobRegistry::default(),
                 session_id,
                 actor,
                 root: env.project.clone(),
@@ -10597,6 +10702,7 @@ that is no longer there"
                 std::sync::Arc::clone(&turn_in_flight),
                 backing,
                 budget,
+                self.jobs.clone(),
             );
             join.join()
                 .expect("the turn thread must not panic (catching_panics wraps its body)");
@@ -10637,6 +10743,13 @@ that is no longer there"
                 .expect("drain");
                 std::thread::sleep(Duration::from_millis(10));
             }
+        }
+
+        /// Drop this session's job-table handle, as leaving
+        /// `run_started_session` does — the moment background jobs are
+        /// stopped.
+        fn end_session_jobs(&mut self) {
+            self.jobs = crate::exec_tools::JobRegistry::default();
         }
 
         /// Keep draining the real subscription until `done` holds or the
@@ -11335,6 +11448,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             user_home: &session.user_home,
             trusted: true,
             turn_in_flight,
+            jobs: crate::exec_tools::JobRegistry::default(),
             renderer: &mut renderer,
             autonomous: None,
             #[cfg(test)]
@@ -11648,6 +11762,7 @@ pre-approve it with `rapid permissions allow <tool>`";
                 user_home: &session.user_home,
                 trusted: true,
                 turn_in_flight: turn_in_flight.clone(),
+                jobs: crate::exec_tools::JobRegistry::default(),
                 renderer: &mut renderer,
                 autonomous: None,
                 #[cfg(test)]
@@ -11673,6 +11788,7 @@ pre-approve it with `rapid permissions allow <tool>`";
                 user_home: &session.user_home,
                 trusted: true,
                 turn_in_flight,
+                jobs: crate::exec_tools::JobRegistry::default(),
                 renderer: &mut renderer,
                 autonomous: None,
                 #[cfg(test)]
