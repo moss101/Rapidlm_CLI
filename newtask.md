@@ -7336,6 +7336,46 @@ dead arm of `sidebar_lines` after being given a live one — the same coupling t
 `/computer`, `/resources`. `/memory` is the next cheapest — `.rapidlm/MEMORY.md` is already read by the
 host — and `/diff` the most valuable, needing workspace mutations projected rather than merely rendered.
 
+**`/memory` shows the project memory index, done 2026-09-10.**
+
+The fourth empty panel made real, and the cheapest: `host::load_memory_index` already reads
+`.rapidlm/MEMORY.md` under a line and byte bound, because that is the text a turn puts in the model's
+context. The panel renders **that** call's output rather than reading the file again with bounds of its
+own — a panel answering "what does the model know" with a different truncation than the model received
+would be worse than no panel.
+
+**`MEMORY.md` is repository content, so the panel treats it as untrusted.** A clone can carry escape
+sequences that move the cursor or repaint the frame, and `fit_width` bounds width, not control
+characters. Every line goes through the tui's own `sanitize_untrusted` — the same neutralisation
+`trace_jobs` already applies to log excerpts — so the text stays readable and inert. The test writes an
+`ESC[2J ESC[H` line into the index and asserts no escape reaches the rendered frame while the words are
+still shown.
+
+**A revert cycle that passed, and the fixture that fixed it.** Swapping `load_memory_index` for a plain
+`read_to_string` left the test green, because a one-line fixture is inside every bound either way — the
+break was real and the test could not see it. The fixture now writes 251 lines against a 200-line bound,
+so a raw read and the bounded read genuinely differ. That failure then dumped both 200-line vectors into
+the output, so the assertion compares *lengths* first: the readable failure is `left: 251, right: 200`.
+
+**An existing anchor went stale, which is the derivation working.**
+`availability_reflects_what_the_dispatcher_really_does` asserted `/memory` was `Availability::None`
+because "its panel paints nothing". That answer is derived from the compositor, so giving the route a
+renderer changed it to `Full` and the hardcoded assertion failed — exactly the signal that design is
+supposed to produce. It now asserts `Full`, and `/diff` takes over as the `None` anchor so the test keeps
+covering that case.
+
+**Tests.** Two new: the panel renders the index and neutralises what a clone can carry; the projection
+and the model are shown the same text, with a fixture that exceeds the bound. Two revert cycles
+(106-107) — dropping the sanitiser leaks escapes, and reading the file directly diverges from what the
+model got.
+
+693 `rapid` lib tests, 232 `tui`, clippy identical to baseline, full workspace green.
+
+**Five panels still empty and still honestly marked:** `/diff`, `/context`, `/graph`, `/computer`,
+`/resources`. `/diff` remains the most valuable and the most work: it needs workspace mutations
+*projected*, which nothing does today — `apps/rapid` writes through `atomic_write` and never touches the
+`workspace` crate's journal/transaction machinery, so there is no change set to render.
+
 ## Session boundary, 2026-09-09 — durable state for the next session
 
 Eight commits, `dbeb2c2`..`1e516cb`, all pushed to `origin/main`. Baseline before them was `598c6fd`.

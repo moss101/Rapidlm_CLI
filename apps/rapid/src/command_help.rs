@@ -605,8 +605,15 @@ while `route_renders_content` claims {claims}"
         assert_eq!(availability_of(usage("permissions")), Availability::Full);
         // No knowledge-candidate store exists at all.
         assert_eq!(availability_of(usage("knowledge")), Availability::None);
-        // Its panel paints nothing, so neither alternative is real.
-        assert_eq!(availability_of(usage("memory")), Availability::None);
+        // `/memory` opens a panel that now renders the project memory index,
+        // so its single alternative is real. This assertion said `None` until
+        // that panel was given a renderer — which is the derivation working:
+        // availability follows the compositor, and a hardcoded answer here is
+        // what goes stale.
+        assert_eq!(availability_of(usage("memory")), Availability::Full);
+        // `/diff` still opens a panel that paints nothing, so it keeps this
+        // test's coverage of the `None` case.
+        assert_eq!(availability_of(usage("diff")), Availability::None);
         // Goal lifecycle is real; only `budget` has no backend.
         assert_eq!(availability_of(usage("goal")), Availability::Partial);
     }

@@ -41,6 +41,7 @@
 use crate::layout::{LayoutRects, Rect, UiMode, compute_layout_with_composer};
 use crate::panels::agents::{AgentsSelection, AgentsViewModel};
 use crate::panels::goals::GoalViewModel;
+use crate::sanitize::sanitize_untrusted;
 use crate::state::{AppState, CancellationToken, UiRoute};
 use crate::status::{StatusChrome, render_status_with};
 use crate::transcript::{Transcript, TranscriptViewport};
@@ -164,9 +165,9 @@ pub fn sidebar_lines(
         UiRoute::Jobs => job_lines(state, width, height),
         UiRoute::Approvals => approval_lines(state, width, height),
         UiRoute::Models => model_lines(state, width, height),
+        UiRoute::Memory => memory_lines(state, width, height),
         UiRoute::Diff
         | UiRoute::Context
-        | UiRoute::Memory
         | UiRoute::Graph
         | UiRoute::Computer
         | UiRoute::Resources => Vec::new(),
@@ -192,10 +193,10 @@ pub const fn route_renders_content(route: UiRoute) -> bool {
         | UiRoute::Goals
         | UiRoute::Jobs
         | UiRoute::Approvals
-        | UiRoute::Models => true,
+        | UiRoute::Models
+        | UiRoute::Memory => true,
         UiRoute::Diff
         | UiRoute::Context
-        | UiRoute::Memory
         | UiRoute::Graph
         | UiRoute::Computer
         | UiRoute::Resources => false,
@@ -339,6 +340,33 @@ fn model_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
         .collect();
     if lines.is_empty() {
         lines.push("no models configured".to_owned());
+    }
+    lines.truncate(usize::from(height));
+    for line in &mut lines {
+        *line = fit_width(line, usize::from(width));
+    }
+    lines
+}
+
+/// The `/memory` panel: the project memory index, exactly as the model
+/// receives it.
+///
+/// Rendered from the same bounded text `host::load_memory_index` hands the
+/// model — not a second read with different bounds — so what a user sees
+/// here is what is actually in the model's context, which is the only
+/// version of this panel worth having.
+///
+/// `MEMORY.md` is repository content and therefore untrusted: a clone can
+/// carry escape sequences that would move the cursor or repaint the frame,
+/// so every line goes through `sanitize_untrusted` before it is fitted.
+fn memory_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
+    let mut lines: Vec<String> = state
+        .memory()
+        .iter()
+        .map(|line| sanitize_untrusted(line).into_owned())
+        .collect();
+    if lines.is_empty() {
+        lines.push("no .rapidlm/MEMORY.md in this project".to_owned());
     }
     lines.truncate(usize::from(height));
     for line in &mut lines {
@@ -768,6 +796,41 @@ pre-approve it with `rapid permissions allow <tool>`";
             .expect("entry");
         let (_, line) = crate::transcript::render_block_parts(entry);
         assert_eq!(line, "✓ repo_read");
+    }
+
+    #[test]
+    fn the_memory_panel_shows_the_index_and_neutralises_what_a_clone_can_carry() {
+        // `MEMORY.md` is repository content: a clone can carry escape
+        // sequences that move the cursor or repaint the frame. The panel is
+        // a rendering of untrusted text and has to treat it as such.
+        let empty = AppState::new();
+        assert_eq!(
+            sidebar_lines(UiRoute::Memory, &empty, 50, 6, &cancel()),
+            vec![fit_width("no .rapidlm/MEMORY.md in this project", 50)],
+            "a project with no memory index says so rather than painting nothing"
+        );
+
+        let state = reduce(
+            empty,
+            &UiEvent::Local(crate::state::LocalUiEvent::SyncMemory(vec![
+                "- [Auth notes](auth.md) — where the tokens live".to_owned(),
+                "\u{1b}[2J\u{1b}[Hcleared your screen".to_owned(),
+            ])),
+        );
+        let painted = sidebar_lines(UiRoute::Memory, &state, 60, 6, &cancel());
+        assert!(
+            painted[0].contains("Auth notes"),
+            "the index must actually be shown: {painted:?}"
+        );
+        assert!(
+            !painted.iter().any(|line| line.contains('\u{1b}')),
+            "no escape sequence from a cloned repository may reach the terminal: {painted:?}"
+        );
+        assert!(
+            painted[1].contains("cleared your screen"),
+            "and the text itself is still readable, just inert: {painted:?}"
+        );
+        assert!(route_renders_content(UiRoute::Memory));
     }
 
     #[test]

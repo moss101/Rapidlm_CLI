@@ -96,6 +96,11 @@ pub enum LocalUiEvent {
     /// host state read from files and environment, not session history, so
     /// there is no kernel event to carry it.
     SyncModels(Vec<ModelRow>),
+    /// Project the project memory index (`.rapidlm/MEMORY.md`) — the same
+    /// bounded text the model is given — into the frontend. Host state read
+    /// from a file, like [`Self::SyncModels`], so there is no kernel event
+    /// to carry it.
+    SyncMemory(Vec<String>),
     /// Drop a host-owned goal projection that no longer has a snapshot to
     /// project from — completion/cancel clear the host's own snapshot (see
     /// `agent_runtime::GoalState`'s own doc comment), so without this a
@@ -156,6 +161,9 @@ pub struct AppState {
     /// Configured models, projected by the host — see
     /// [`LocalUiEvent::SyncModels`].
     models: Vec<ModelRow>,
+    /// The project memory index as the model receives it — see
+    /// [`LocalUiEvent::SyncMemory`].
+    memory: Vec<String>,
     approvals: BTreeMap<ApprovalKey, ApprovalProjection>,
     selected_agent: Option<AgentId>,
     selected_goal: Option<GoalId>,
@@ -693,6 +701,9 @@ fn apply_local(mut state: AppState, event: &LocalUiEvent) -> Result<AppState, Ui
         LocalUiEvent::SyncModels(rows) => {
             state.models = rows.clone();
         }
+        LocalUiEvent::SyncMemory(lines) => {
+            state.memory = lines.clone();
+        }
         LocalUiEvent::SyncGoal(goal) => {
             insert_goal(&mut state, goal.clone())?;
             state.selected_goal = Some(goal.id);
@@ -1130,6 +1141,7 @@ impl AppState {
             goals: BTreeMap::new(),
             jobs: BTreeMap::new(),
             models: Vec::new(),
+            memory: Vec::new(),
             approvals: BTreeMap::new(),
             selected_agent: None,
             selected_goal: None,
@@ -1190,6 +1202,10 @@ impl AppState {
 
     pub fn models(&self) -> &[ModelRow] {
         &self.models
+    }
+
+    pub fn memory(&self) -> &[String] {
+        &self.memory
     }
 
     pub fn jobs(&self) -> &BTreeMap<JobId, JobProjection> {

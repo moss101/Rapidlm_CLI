@@ -3874,6 +3874,7 @@ fn run_started_session(
     // the Goals route shows it (the TUI is a projection of runtime state).
     sync_persisted_goal(&mut ui, &resolved.ledger_path);
     sync_configured_models(&mut ui);
+    sync_memory_index(&mut ui, &resolved.root);
     // Anything the ledger unification had to say goes in the transcript: it
     // is addressed to the user, and stderr written before the alt screen
     // opens is wiped before it can be read.
@@ -6054,6 +6055,25 @@ fn sync_configured_models(ui: &mut AppState) {
         ui.clone(),
         &UiEvent::Local(LocalUiEvent::SyncModels(rows)),
     );
+}
+
+/// Project the project memory index into the frontend, so `/memory` shows
+/// what the model is actually given.
+///
+/// Reuses `host::load_memory_index` — the very call a turn makes to build
+/// the model's context — rather than reading `MEMORY.md` again with its own
+/// bounds. A panel that showed a *different* truncation than the model
+/// received would be worse than no panel: it would answer "what does the
+/// model know" with something the model never saw.
+fn sync_memory_index(ui: &mut AppState, root: &Path) {
+    let Some(text) = crate::host::load_memory_index(root) else {
+        return;
+    };
+    let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    if lines.is_empty() {
+        return;
+    }
+    *ui = reduce(ui.clone(), &UiEvent::Local(LocalUiEvent::SyncMemory(lines)));
 }
 
 /// The `/models` rows for a loaded config, split from the reading of it so
@@ -9702,6 +9722,63 @@ that is no longer there"
         .session_id
         .expect("id");
         assert_ne!(first, second, "each run gets its own session");
+    }
+
+    #[test]
+    fn the_memory_panel_shows_exactly_what_the_model_is_given() {
+        // The panel's only claim is "this is what the model knows", so it
+        // must render the same bounded text `load_memory_index` hands the
+        // turn — not a second read of the file with its own bounds, which
+        // would answer that question with something the model never saw.
+        let env = TempEnv::create();
+        let root = fs::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        // Deliberately past `MAX_MEMORY_INDEX_LINES`, so a raw read of the
+        // file and the bounded read the model gets actually differ — with a
+        // short fixture this test passes even when the panel reads the file
+        // itself, which is exactly the mistake it exists to catch.
+        let mut index = String::from("- [Auth notes](auth.md) — where the tokens live\n");
+        for i in 0..crate::host::MAX_MEMORY_INDEX_LINES + 50 {
+            index.push_str(&format!("- [Note {i}](note{i}.md) — filler\n"));
+        }
+        fs::write(root.join(PROJECT_MARKER).join("MEMORY.md"), &index).expect("memory index");
+
+        let mut ui = AppState::new();
+        sync_memory_index(&mut ui, &root);
+        let given_to_model: Vec<String> = crate::host::load_memory_index(&root)
+            .expect("the index loads")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        // Lengths first: a mismatch here is the whole failure, and comparing
+        // the vectors straight away buries it under two hundred identical
+        // lines of fixture.
+        assert_eq!(
+            ui.memory().len(),
+            given_to_model.len(),
+            "the panel and the model must be shown the same number of lines"
+        );
+        assert_eq!(
+            ui.memory(),
+            given_to_model,
+            "the panel and the model must be shown the same text"
+        );
+
+        assert!(
+            ui.memory().len() <= crate::host::MAX_MEMORY_INDEX_LINES,
+            "the panel must not show more than the model was given: {}",
+            ui.memory().len()
+        );
+        assert!(
+            index.lines().count() > ui.memory().len(),
+            "the fixture must actually exceed the bound, or this test proves nothing"
+        );
+
+        // A project without one projects nothing rather than an empty row.
+        let bare = TempEnv::create();
+        let mut ui = AppState::new();
+        sync_memory_index(&mut ui, &bare.project);
+        assert!(ui.memory().is_empty());
     }
 
     #[test]
