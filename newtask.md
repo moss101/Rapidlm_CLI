@@ -7900,8 +7900,20 @@ The page does not describe `docs/reference/error-codes.md`'s taxonomy, which is 
 
 ## Session boundary, 2026-09-10 — durable state for the next session
 
-Thirty-eight commits across three days, `dbeb2c2`..`f69716a`, all pushed to `origin/main`. Baseline before
-them was `598c6fd`. Each has its own entry above; this is the current state and what is actually left.
+Forty commits across three days, `dbeb2c2`..`eababe4`, all pushed to `origin/main`. Baseline before them
+was `598c6fd`. Each has its own entry above; this is the current state and what is actually left.
+
+**`eababe4` (getting-started) shipped on partial workspace evidence, and here is exactly what.** The
+machine entered a state where every freshly built binary — this repository's test binaries *and* the
+other two projects' — stalled at `_dyld_start` with zero CPU time for twenty-plus minutes; `amfid`, the
+code-signature validator consulted at exec, had restarted at the same moment, and later `rustc` itself
+sat 20 minutes with 0.68s of CPU. That is the operating system, not the tree. Evidence for the commit:
+`cargo test -p rapid --lib` 719/719 with the commit's two new tests in it; `cargo clippy --workspace
+--all-targets --locked -- -D warnings` exit 0; `cargo fmt --all -- --check` clean; 41 of 80 workspace
+binaries green with zero failures before the run was stopped; and the commit touches only `apps/rapid`
+(a constant, two tests, one help-footer line) plus markdown — no exit-code value changed, and no
+integration test carries a golden of the help footer. The next session should run the full workspace
+suite first thing, on a quiet machine, before anything else.
 
 **Gates, exactly.** `f706e59` (real hunks): a clean single run, 80/80. `4534588` (fmt): a clean single
 run, 80/80. The four-commit CI-readiness batch ending `f69716a`: 78/80 in a run during which two other
@@ -7932,9 +7944,10 @@ projections they already had.
 **2026-09-11** (`6b1d928`..`f69716a`): the commands accept the short ids the panels show — `job-3`, an
 id's random tail — with ambiguity refused by count; `/resume [session]` works inside the TUI through the
 mechanism `/fork` already had; `/diff` shows real hunks from an in-tree Myers diff computed at the write
-site; and the tree made CI-ready — `cargo fmt --all` (163 files), clippy `-D warnings` clean, a release
+site; the tree made CI-ready — `cargo fmt --all` (163 files), clippy `-D warnings` clean, a release
 smoke test that can fail plus a GitHub Release a user can download, and the binary's dead documentation
-pointer fixed with a test that keeps every pointer live.
+pointer fixed with a test that keeps every pointer live; and `docs/getting-started.md`, with its exit-code
+table checked against source.
 
 **2026-09-10** (`81674b0`..`4b28b59`): background jobs journaled, session-lived, and cancellable; the
 status bar showing model, policy and compiled context instead of dashes; `/models`, `/memory` and
