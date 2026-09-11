@@ -1,32 +1,112 @@
+# Release build for the three supported targets. On a `v*` tag this also
+# publishes a GitHub Release carrying each binary and its checksum, which is
+# the only way a user without repository access can obtain one — workflow
+# artifacts expire and are not downloadable anonymously.
+#
+# Toolchain pinned the same way ci.yml pins it (rust-toolchain.toml, 1.97.1)
+# and built `--locked`, so a release is built from exactly the lockfile that
+# was tested. This workflow uses only the automatic `github.token`; it never
+# maps `secrets.*`.
 name: release-matrix
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+
+permissions:
+  # Creating the release and uploading its assets. Nothing else.
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.97.1"
+
 jobs:
   keychain-and-build:
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - { os: macos-14, target: aarch64-apple-darwin }
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: macos-14, target: aarch64-apple-darwin, ext: "" }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: "" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: ".exe" }
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal --no-self-update
+          rustup override set "${RUST_TOOLCHAIN}"
+          rustc --version
+          cargo --version
+
       - name: Linux Secret Service facility
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-0 gnome-keyring dbus-x11
-      - run: cargo check --workspace
-      - run: cargo test -p auth --lib -- --nocapture
-      - run: cargo build --release -p rapid
+
+      - run: cargo check --workspace --locked
+      - run: cargo test -p auth --lib --locked -- --nocapture
+      - run: cargo build --release -p rapid --locked
+
+      # A smoke test that can fail. The previous version ended every command
+      # with `|| true`, so it passed with a binary that crashed on startup —
+      # the same defect as a test with no failing branch.
+      #
+      # `rapid doctor` exits 1 when any check fails, and a fresh runner with
+      # no model configured is *expected* to fail those checks; that is the
+      # command's documented contract ("a CI gate that only wants to know
+      # whether Rapid can run at all"). So 0 and 1 both mean "it ran to its
+      # report"; anything else — a panic is 101 — is a crash and fails here.
       - name: binary smoke
         run: |
-          ./target/release/rapid --help >/dev/null || ./target/debug/rapid --help >/dev/null 2>&1 || true
-          ./target/release/rapid doctor || true
-          ./target/release/rapid sessions list || true
+          set -euo pipefail
+          BIN="target/release/rapid${{ matrix.ext }}"
+          test -x "$BIN"
+          "$BIN" --help >/dev/null
+          set +e
+          "$BIN" doctor
+          rc=$?
+          set -e
+          echo "doctor exit: $rc"
+          test "$rc" -eq 0 -o "$rc" -eq 1
+          "$BIN" sessions list >/dev/null
+
+      - name: package
+        run: |
+          set -euo pipefail
+          NAME="rapid-${{ matrix.target }}"
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "dist/${NAME}.zip" "./target/release/rapid.exe" >/dev/null
+            (cd dist && sha256sum "${NAME}.zip" > "${NAME}.zip.sha256")
+          else
+            tar -C target/release -czf "dist/${NAME}.tar.gz" rapid
+            (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+          fi
+          ls -l dist
+
       - uses: actions/upload-artifact@v4
         with:
           name: rapid-${{ matrix.target }}
-          path: target/release/rapid*
+          path: dist/*
+
+      # One release per tag, assets from all three jobs. The three jobs race
+      # to create it; the `||` tolerates "already exists" and nothing else —
+      # if creation genuinely failed, the upload that follows fails the job.
+      - name: publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --title "$TAG" --generate-notes \
+            || echo "release $TAG already exists or was created concurrently"
+          gh release upload "$TAG" dist/* --clobber
