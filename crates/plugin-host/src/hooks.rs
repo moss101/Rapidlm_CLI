@@ -15,8 +15,8 @@ use capability_broker::{
     ResourceDescriptor,
 };
 use process_supervisor::{
-    DEFAULT_GRACE, ExecBinding, ExecSpec, MAX_STDIN_BYTES, SecretOrValue, StdinSpec, TerminalStatus,
-    await_exit_draining, spawn,
+    DEFAULT_GRACE, ExecBinding, ExecSpec, MAX_STDIN_BYTES, SecretOrValue, StdinSpec,
+    TerminalStatus, await_exit_draining, spawn,
 };
 use protocol::{ApiError, ArtifactId, ErrorCode, JobId, LeaseId, SandboxTier, SessionId, TraceId};
 use sandbox::SandboxNetwork;
@@ -1062,8 +1062,9 @@ pub fn run_command_hook(
     // deadlocking on a hook whose combined output exceeds the OS pipe buffer
     // before it exits.
     let cap = usize::try_from(spec.sandbox.output_limit).unwrap_or(usize::MAX);
-    let (report, stdout, stderr) = await_exit_draining(&mut handle, &ctx.cancel, DEFAULT_GRACE, cap)
-        .map_err(|_| HookError::Wait)?;
+    let (report, stdout, stderr) =
+        await_exit_draining(&mut handle, &ctx.cancel, DEFAULT_GRACE, cap)
+            .map_err(|_| HookError::Wait)?;
     let stdout = HookCapture::from_bytes(stdout.bytes, stdout.truncated);
     let stderr = HookCapture::from_bytes(stderr.bytes, stderr.truncated);
     drop(handle);
@@ -1139,8 +1140,9 @@ fn run_prepared(
     // deadlocking on a hook whose combined output exceeds the OS pipe buffer
     // before it exits.
     let cap = usize::try_from(spec.sandbox.output_limit).unwrap_or(usize::MAX);
-    let (report, stdout, stderr) = await_exit_draining(&mut handle, &ctx.cancel, DEFAULT_GRACE, cap)
-        .map_err(|_| HookError::Wait)?;
+    let (report, stdout, stderr) =
+        await_exit_draining(&mut handle, &ctx.cancel, DEFAULT_GRACE, cap)
+            .map_err(|_| HookError::Wait)?;
     let stdout = HookCapture::from_bytes(stdout.bytes, stdout.truncated);
     let stderr = HookCapture::from_bytes(stderr.bytes, stderr.truncated);
     drop(handle);
@@ -1228,7 +1230,6 @@ fn status_from_terminal(status: TerminalStatus) -> HookRunStatus {
         }
     }
 }
-
 
 fn bind_env(
     spec: &HookSpec,

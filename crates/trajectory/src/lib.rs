@@ -100,7 +100,10 @@ mod tests {
     #[test]
     fn secrets_are_dropped_never_stored_and_counter_increments() {
         let mut c = TrajectoryCollector::new();
-        assert!(!c.record(1, "secret.used", "token=abc"), "secrets never stored");
+        assert!(
+            !c.record(1, "secret.used", "token=abc"),
+            "secrets never stored"
+        );
         assert!(c.record(2, "tool.completed", "wrote file"));
         assert_eq!(c.events().len(), 1);
         assert_eq!(c.dropped_secrets(), 1);

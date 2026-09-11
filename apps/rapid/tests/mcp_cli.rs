@@ -224,7 +224,11 @@ fn a_rejected_entry_is_reported_with_its_real_reason() {
     );
     let run = fixture.run(&["mcp", "list"]);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
-    assert!(run.stdout.contains("servers=1 rejected=3"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("servers=1 rejected=3"),
+        "{}",
+        run.stdout
+    );
     assert!(
         run.stdout.contains("stdio only"),
         "the remote entry must say why: {}",
@@ -268,7 +272,16 @@ fn an_env_value_never_reaches_stdout_or_stderr() {
 fn add_then_get_then_remove_round_trips_through_the_real_loader() {
     let fixture = fixture("roundtrip");
     let added = fixture.run(&[
-        "mcp", "add", "srv", "--command", "npx", "--arg", "-y", "--arg", "pkg", "--env",
+        "mcp",
+        "add",
+        "srv",
+        "--command",
+        "npx",
+        "--arg",
+        "-y",
+        "--arg",
+        "pkg",
+        "--env",
         "API_KEY=abc",
     ]);
     assert_eq!(added.code, Some(0), "{}", added.stderr);
@@ -328,7 +341,13 @@ fn probe_on_a_trusted_project_starts_the_real_server_and_lists_its_tools() {
     fixture.grant_trust();
 
     let run = fixture.run(&["mcp", "probe"]);
-    assert_eq!(run.code, Some(0), "stdout={}\nstderr={}", run.stdout, run.stderr);
+    assert_eq!(
+        run.code,
+        Some(0),
+        "stdout={}\nstderr={}",
+        run.stdout,
+        run.stderr
+    );
     assert!(run.stdout.contains("trust=trusted"), "{}", run.stdout);
     assert!(
         run.stdout.contains("ok=e2e") && run.stdout.contains("mcp__e2e__echo"),
@@ -501,7 +520,13 @@ for line in sys.stdin:
     fixture.grant_trust();
 
     let run = fixture.run(&["mcp", "probe"]);
-    assert_eq!(run.code, Some(0), "stdout={}\nstderr={}", run.stdout, run.stderr);
+    assert_eq!(
+        run.code,
+        Some(0),
+        "stdout={}\nstderr={}",
+        run.stdout,
+        run.stderr
+    );
     // The guarantee is structural, not textual: the forged text may survive
     // as quoted, flattened content, but it must not become a *line*. Exactly
     // one status row, and it is the real one.

@@ -32,13 +32,17 @@ const SHELL_OK_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","conte
 
 /// Tool call with an explicit argv (used to drive git operations).
 fn shell_call_body(id: &str, argv: &[&str]) -> String {
-    tool_call_body(id, "shell_exec", &format!(
-        "{{\\\"argv\\\":[{0}]}}",
-        argv.iter()
-            .map(|a| format!("\\\"{a}\\\""))
-            .collect::<Vec<_>>()
-            .join(",")
-    ))
+    tool_call_body(
+        id,
+        "shell_exec",
+        &format!(
+            "{{\\\"argv\\\":[{0}]}}",
+            argv.iter()
+                .map(|a| format!("\\\"{a}\\\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    )
 }
 
 /// Tool call with an explicit raw tool name and pre-escaped arguments JSON.
@@ -207,7 +211,10 @@ fn tool_failure_names_failing_tool_and_error_on_stderr() {
     // classified FailureCause, so it falls into the generic Runtime bucket.
     assert_eq!(code, Some(5), "a tool-failure stop exits non-zero");
     // Per-call stderr line with the tool name and the failing outcome.
-    assert!(stderr.contains("tool shell_exec:"), "per-call line missing: {stderr}");
+    assert!(
+        stderr.contains("tool shell_exec:"),
+        "per-call line missing: {stderr}"
+    );
     // The terminal failure names the tool and the underlying error instead of
     // the bare `tool_failed`.
     assert!(
@@ -263,11 +270,7 @@ fn json_schema_flag_prints_the_validated_result_instead_of_the_summary() {
     let responses = vec![
         (
             200,
-            tool_call_body(
-                "call_1",
-                "emit_structured_result",
-                r#"{\"answer\":\"42\"}"#,
-            ),
+            tool_call_body("call_1", "emit_structured_result", r#"{\"answer\":\"42\"}"#),
         ),
         (200, TERMINAL_BODY.to_owned()),
     ];
@@ -307,12 +310,15 @@ fn jsonl_flag_writes_versioned_protocol_records_and_keeps_diagnostics_on_stderr(
     let server = spawn_scripted_server(vec![(200, TERMINAL_BODY.to_owned())]);
     let config = write_config(&home, server.addr);
 
-    let (code, stdout, stderr) =
-        run_exec(&project, &home, &config, &["--jsonl", "say hello"]);
+    let (code, stdout, stderr) = run_exec(&project, &home, &config, &["--jsonl", "say hello"]);
 
     assert_eq!(code, Some(0), "stdout: {stdout} stderr: {stderr}");
     let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines.len(), 3, "schema + assistant.message + session.finished: {stdout}");
+    assert_eq!(
+        lines.len(),
+        3,
+        "schema + assistant.message + session.finished: {stdout}"
+    );
 
     let schema: serde_json::Value = serde_json::from_str(lines[0]).expect("valid JSON line");
     assert_eq!(schema["type"], "rapid.schema");
@@ -398,10 +404,13 @@ fn empty_final_response_after_committed_work_exits_zero() {
     let server = spawn_scripted_server(responses);
     let config = write_config(&home, server.addr);
 
-    let (code, _stdout, stderr) =
-        run_exec(&project, &home, &config, &["--verbose", "do one step"]);
+    let (code, _stdout, stderr) = run_exec(&project, &home, &config, &["--verbose", "do one step"]);
 
-    assert_eq!(code, Some(0), "empty final after committed work exits 0: {stderr}");
+    assert_eq!(
+        code,
+        Some(0),
+        "empty final after committed work exits 0: {stderr}"
+    );
     assert!(
         stderr.contains("empty_response"),
         "diagnostics should name the empty response: {stderr}"
@@ -450,8 +459,7 @@ fn provider_rejection_is_retried_and_visible_in_verbose() {
     ]);
     let config = write_config(&home, server.addr);
 
-    let (code, stdout, stderr) =
-        run_exec(&project, &home, &config, &["--verbose", "say pong"]);
+    let (code, stdout, stderr) = run_exec(&project, &home, &config, &["--verbose", "say pong"]);
 
     assert_eq!(code, Some(0), "a retried rejection must recover: {stderr}");
     assert!(stdout.contains("hello from scripted model"));
@@ -505,7 +513,10 @@ fn stderr_stays_complete_when_the_agent_git_adds_the_log_file() {
     std::fs::write(project.join("work.txt"), "seed content\n").expect("work file");
     let responses = vec![
         (200, shell_call_body("call_1", &["git", "add", "-A"])),
-        (200, shell_call_body("call_2", &["git", "commit", "-m", "wip"])),
+        (
+            200,
+            shell_call_body("call_2", &["git", "commit", "-m", "wip"]),
+        ),
         (200, shell_call_body("call_3", &["false"])),
         (200, shell_call_body("call_4", &["git", "add", "-A"])),
         (200, TERMINAL_BODY.to_owned()),
@@ -545,9 +556,17 @@ fn stderr_stays_complete_when_the_agent_git_adds_the_log_file() {
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert!(stdout.contains("hello from scripted model"), "{stdout}");
     // Four shell calls, each fully traced with its outcome.
-    assert_eq!(stderr.matches("tool shell_exec: argv=").count(), 4, "{stderr}");
+    assert_eq!(
+        stderr.matches("tool shell_exec: argv=").count(),
+        4,
+        "{stderr}"
+    );
     // add (0), commit (0), false (1), add (0).
-    assert_eq!(stderr.matches("tool shell_exec: ok (exit 0").count(), 3, "{stderr}");
+    assert_eq!(
+        stderr.matches("tool shell_exec: ok (exit 0").count(),
+        3,
+        "{stderr}"
+    );
     assert!(
         stderr.contains("tool shell_exec: ok (exit 1"),
         "the failing command's handled outcome is still traced: {stderr}"
@@ -574,8 +593,12 @@ fn unknown_tool_proposal_is_model_correctable_not_fatal() {
     let server = spawn_scripted_server(responses);
     let config = write_config(&home, server.addr);
 
-    let (code, stdout, stderr) =
-        run_exec(&project, &home, &config, &["--verbose", "read a file then act"]);
+    let (code, stdout, stderr) = run_exec(
+        &project,
+        &home,
+        &config,
+        &["--verbose", "read a file then act"],
+    );
 
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert!(stdout.contains("hello from scripted model"));

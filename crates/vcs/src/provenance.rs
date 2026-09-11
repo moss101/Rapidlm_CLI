@@ -1285,8 +1285,7 @@ fn unix_secs_to_rfc3339(secs: u64) -> Result<String, ProvenanceError> {
 fn civil_from_days(z: i64) -> Result<(i32, u32, u32), ProvenanceError> {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe =
-        u64::try_from(z - era * 146_097).map_err(|_| ProvenanceError::InvalidTimestamp)?;
+    let doe = u64::try_from(z - era * 146_097).map_err(|_| ProvenanceError::InvalidTimestamp)?;
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
     let y = i64::try_from(yoe).map_err(|_| ProvenanceError::InvalidTimestamp)? + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);

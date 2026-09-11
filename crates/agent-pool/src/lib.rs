@@ -192,11 +192,7 @@ impl ResourcePool {
         if !valid_id(owner, MAX_OWNER_BYTES) {
             return Err(PoolError::InvalidId);
         }
-        if let Some(idx) = self
-            .warm
-            .iter()
-            .position(|lease| lease.backend == backend)
-        {
+        if let Some(idx) = self.warm.iter().position(|lease| lease.backend == backend) {
             let mut lease = self.warm.remove(idx);
             lease.state = EnvironmentState::InUse;
             lease.owner = Some(owner.to_owned());
@@ -358,14 +354,18 @@ mod tests {
     fn warm_acquire_release_recycles() {
         let mut pool = ResourcePool::new(4);
         let mut p = prov();
-        let a = pool.acquire(PoolBackend::Container, "o1", 100, &mut p).expect("acquire");
+        let a = pool
+            .acquire(PoolBackend::Container, "o1", 100, &mut p)
+            .expect("acquire");
         assert_eq!(a.state(), EnvironmentState::InUse);
         assert_eq!(pool.in_use_count(), 1);
         pool.release(a.id(), true, 200, &mut p).expect("release");
         assert_eq!(pool.warm_count(), 1);
         assert_eq!(pool.in_use_count(), 0);
         // Re-acquire the warm environment.
-        let b = pool.acquire(PoolBackend::Container, "o2", 300, &mut p).expect("re-acquire");
+        let b = pool
+            .acquire(PoolBackend::Container, "o2", 300, &mut p)
+            .expect("re-acquire");
         assert_eq!(pool.in_use_count(), 1);
         assert_eq!(pool.warm_count(), 0);
         assert_eq!(b.id(), a.id());
@@ -376,7 +376,9 @@ mod tests {
     fn dirty_release_quarantines_and_sanitize_recycles() {
         let mut pool = ResourcePool::new(4);
         let mut p = prov();
-        let a = pool.acquire(PoolBackend::Remote, "o1", 100, &mut p).expect("acquire");
+        let a = pool
+            .acquire(PoolBackend::Remote, "o1", 100, &mut p)
+            .expect("acquire");
         pool.release(a.id(), false, 200, &mut p).expect("dirty");
         assert_eq!(pool.quarantined_count(), 1);
         assert_eq!(pool.warm_count(), 0);
@@ -389,8 +391,12 @@ mod tests {
     fn miss_fallback_provisions_on_pool_miss() {
         let mut pool = ResourcePool::new(4);
         let mut p = prov();
-        let a = pool.acquire(PoolBackend::Container, "o", 100, &mut p).expect("a");
-        let b = pool.acquire(PoolBackend::HostRestricted, "o", 101, &mut p).expect("b");
+        let a = pool
+            .acquire(PoolBackend::Container, "o", 100, &mut p)
+            .expect("a");
+        let b = pool
+            .acquire(PoolBackend::HostRestricted, "o", 101, &mut p)
+            .expect("b");
         assert_ne!(a.id(), b.id());
         let stats = pool.stats();
         assert_eq!(stats.provisions, 2, "both were misses");
@@ -402,8 +408,12 @@ mod tests {
     fn warm_full_disposes_on_release_and_tracks_telemetry() {
         let mut pool = ResourcePool::new(1);
         let mut p = prov();
-        let a = pool.acquire(PoolBackend::Container, "o", 1, &mut p).expect("a");
-        let b = pool.acquire(PoolBackend::Container, "o", 2, &mut p).expect("b");
+        let a = pool
+            .acquire(PoolBackend::Container, "o", 1, &mut p)
+            .expect("a");
+        let b = pool
+            .acquire(PoolBackend::Container, "o", 2, &mut p)
+            .expect("b");
         // Fill warm with b, then releasing a (warm full) disposes a.
         pool.release(b.id(), true, 3, &mut p).expect("release b");
         assert_eq!(pool.warm_count(), 1);
@@ -507,7 +517,9 @@ mod tests {
         let mut full = ResourcePool::new(0);
         let mut p2 = prov();
         for _ in 0..MAX_ENVIRONMENTS {
-            let _ = full.acquire(PoolBackend::Container, "o", 1, &mut p2).expect("fill");
+            let _ = full
+                .acquire(PoolBackend::Container, "o", 1, &mut p2)
+                .expect("fill");
         }
         assert!(matches!(
             full.acquire(PoolBackend::Container, "o", 1, &mut p2),
@@ -519,10 +531,7 @@ mod tests {
         // Disconnect during acquire (provision fails).
         struct FailingProvision;
         impl Provisioner for FailingProvision {
-            fn provision(
-                &mut self,
-                _backend: PoolBackend,
-            ) -> Result<String, PoolError> {
+            fn provision(&mut self, _backend: PoolBackend) -> Result<String, PoolError> {
                 Err(PoolError::ProvisionFailed)
             }
             fn sanitize(&mut self, _id: &str) -> Result<(), PoolError> {
@@ -637,13 +646,20 @@ mod tests {
         // A lease from generation N must not be released into generation N+1.
         let mut pool = ResourcePool::new(4);
         let mut p = prov();
-        let a = pool.acquire(PoolBackend::Container, "o1", 100, &mut p).expect("a");
+        let a = pool
+            .acquire(PoolBackend::Container, "o1", 100, &mut p)
+            .expect("a");
         // Release normally.
         pool.release(a.id(), true, 200, &mut p).expect("release");
         let warm_before = pool.warm_count();
         // Duplicate release of same id → no-op (not in in_use).
-        pool.release(a.id(), true, 300, &mut p).expect("no error on dup");
-        assert_eq!(pool.warm_count(), warm_before, "duplicate release must not double-add");
+        pool.release(a.id(), true, 300, &mut p)
+            .expect("no error on dup");
+        assert_eq!(
+            pool.warm_count(),
+            warm_before,
+            "duplicate release must not double-add"
+        );
     }
 
     #[test]
@@ -651,14 +667,18 @@ mod tests {
         // Simulate a partial install: env acquired then dirty-released.
         let mut pool = ResourcePool::new(4);
         let mut p = prov();
-        let env = pool.acquire(PoolBackend::Container, "installer", 1, &mut p).expect("env");
+        let env = pool
+            .acquire(PoolBackend::Container, "installer", 1, &mut p)
+            .expect("env");
         // Dirty release simulates partial install (clean=false).
-        pool.release(env.id(), false, 2, &mut p).expect("dirty release");
+        pool.release(env.id(), false, 2, &mut p)
+            .expect("dirty release");
         // Must be quarantined, NOT warm.
         assert_eq!(pool.quarantined_count(), 1);
         assert_eq!(pool.warm_count(), 0);
         // Sanitize recovers it.
-        pool.sanitize(env.id(), &mut p).expect("sanitize after partial install");
+        pool.sanitize(env.id(), &mut p)
+            .expect("sanitize after partial install");
         assert_eq!(pool.quarantined_count(), 0);
         assert_eq!(pool.warm_count(), 1, "recovered to warm after sanitize");
     }
@@ -668,8 +688,12 @@ mod tests {
         // Simulate a restart: save state, create new pool, restore.
         let mut pool = ResourcePool::new(4);
         let mut p = prov();
-        let a = pool.acquire(PoolBackend::Container, "o", 100, &mut p).expect("a");
-        let _b = pool.acquire(PoolBackend::Container, "o", 200, &mut p).expect("b");
+        let a = pool
+            .acquire(PoolBackend::Container, "o", 100, &mut p)
+            .expect("a");
+        let _b = pool
+            .acquire(PoolBackend::Container, "o", 200, &mut p)
+            .expect("b");
         // "Restart": release all, snapshot warm set.
         pool.release(a.id(), true, 300, &mut p).expect("release a");
         let snapshot: Vec<_> = pool.snapshot();
@@ -680,6 +704,10 @@ mod tests {
                 restored.warm.push(env.clone());
             }
         }
-        assert_eq!(restored.warm_count(), 1, "warm environment survives restart");
+        assert_eq!(
+            restored.warm_count(),
+            1,
+            "warm environment survives restart"
+        );
     }
 }

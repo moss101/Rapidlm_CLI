@@ -10,15 +10,15 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use crate::external_agents::CliRunner;
+use crate::headless::jsonl::JsonlExitCode;
+use agent_runtime::ToolDriver;
 use capability_broker::{
-    ActionRequest, ApprovalChoice, ApprovalResolution, ApprovalScopeId, CanonicalAction,
-    CancellationToken, ExecIntent, LeaseIssuer, LeaseValidator, LiveHostResolver, PolicyDocument,
+    ActionRequest, ApprovalChoice, ApprovalResolution, ApprovalScopeId, CancellationToken,
+    CanonicalAction, ExecIntent, LeaseIssuer, LeaseValidator, LiveHostResolver, PolicyDocument,
     PolicyRevision, PolicySource, PolicyStack, PrincipalRef, evaluate, issue, normalize_exec,
     request_approval, validate_use,
 };
-use agent_runtime::ToolDriver;
-use crate::external_agents::CliRunner;
-use crate::headless::jsonl::JsonlExitCode;
 use mcp::{ImplementationInfo, McpServer, McpServerConfig, ProtocolVersion};
 use scheduler::graph::RuntimeGraph;
 use scheduler::kinds::NodeKind;
@@ -49,7 +49,6 @@ impl std::fmt::Display for P9CommandError {
         }
     }
 }
-
 
 fn node_kind_from_str(raw: &str) -> Option<NodeKind> {
     match raw {
@@ -114,15 +113,17 @@ pub fn run_playbook_compile(args: &[String]) -> Result<i32, P9CommandError> {
                     .collect()
             })
             .unwrap_or_default();
-        let mut built =
-            PlaybookStep::new(key, kind, label).with_dependencies(deps);
-        if let Some(budget) = step.get("budget_tokens").and_then(serde_json::Value::as_u64) {
+        let mut built = PlaybookStep::new(key, kind, label).with_dependencies(deps);
+        if let Some(budget) = step
+            .get("budget_tokens")
+            .and_then(serde_json::Value::as_u64)
+        {
             built = built.with_budget(budget);
         }
         template = template.push(built);
     }
-    let graph: RuntimeGraph = compile(&template, protocol::GraphId::new())
-        .map_err(P9CommandError::Playbook)?;
+    let graph: RuntimeGraph =
+        compile(&template, protocol::GraphId::new()).map_err(P9CommandError::Playbook)?;
     let json = graph.export_json().map_err(P9CommandError::Json)?;
     println!("{json}");
     Ok(0)
@@ -152,19 +153,15 @@ pub fn run_mcp_tools(args: &[String]) -> Result<i32, P9CommandError> {
     // Policy: read-only tools publish; anything else stays unpublished.
     let policy = mcp_tools_policy(&tools, &CancellationToken::new());
     let mut server = McpServer::new(config, &policy);
-    let info =
-        ImplementationInfo::new("rapidlm-cli", "1").map_err(|err| P9CommandError::Agent(format!("{err:?}")))?;
+    let info = ImplementationInfo::new("rapidlm-cli", "1")
+        .map_err(|err| P9CommandError::Agent(format!("{err:?}")))?;
     server
         .accept_client(info, ProtocolVersion::TARGET, &CancellationToken::new())
         .map_err(|err| P9CommandError::Agent(format!("{err:?}")))?;
     let surface = server
         .published_surface(&CancellationToken::new())
         .map_err(|err| P9CommandError::Agent(format!("{err:?}")))?;
-    let tool_names: Vec<String> = surface
-        .tools()
-        .iter()
-        .map(|t| format!("{t:?}"))
-        .collect();
+    let tool_names: Vec<String> = surface.tools().iter().map(|t| format!("{t:?}")).collect();
     let payload = serde_json::json!({
         "schema": "rapidlm.mcp_surface",
         "requested": &tools,
@@ -196,7 +193,10 @@ pub fn run_tools_schema(args: &[String]) -> Result<i32, P9CommandError> {
         match args[i].as_str() {
             "--root" => {
                 i += 1;
-                root = args.get(i).map(PathBuf::from).ok_or(P9CommandError::Usage)?;
+                root = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or(P9CommandError::Usage)?;
             }
             "--read-only" => read_only = true,
             _ => return Err(P9CommandError::Usage),
@@ -232,10 +232,7 @@ pub fn run_tools_schema(args: &[String]) -> Result<i32, P9CommandError> {
     Ok(0)
 }
 
-fn mcp_tools_policy(
-    tools: &[&str],
-    cancel: &CancellationToken,
-) -> capability_broker::PolicyStack {
+fn mcp_tools_policy(tools: &[&str], cancel: &CancellationToken) -> capability_broker::PolicyStack {
     // Map each requested tool to its minimal capability family.
     let caps: Vec<String> = tools
         .iter()
@@ -348,8 +345,7 @@ pub fn run_agent_cli(args: &[String]) -> Result<i32, P9CommandError> {
         .run(spec, &task, guard, &cancel)
         .map_err(|err| P9CommandError::Agent(format!("{err:?}")))?;
     eprintln!("external agent result is untrusted context");
-    let outcome =
-        crate::external_agents::normalize_cli_exit(exit.ok, exit.code);
+    let outcome = crate::external_agents::normalize_cli_exit(exit.ok, exit.code);
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -361,14 +357,16 @@ pub fn run_agent_cli(args: &[String]) -> Result<i32, P9CommandError> {
         }))
         .map_err(P9CommandError::Json)?
     );
-    Ok(if matches!(
-        outcome,
-        crate::external_agents::AgentOutcome::Completed { .. }
-    ) {
-        0
-    } else {
-        1
-    })
+    Ok(
+        if matches!(
+            outcome,
+            crate::external_agents::AgentOutcome::Completed { .. }
+        ) {
+            0
+        } else {
+            1
+        },
+    )
 }
 
 fn outcome_marker(outcome: &crate::external_agents::AgentOutcome) -> String {
@@ -411,14 +409,16 @@ capability = "proc.exec"
 /// each other.
 fn agent_cli_key() -> [u8; 32] {
     static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-    *KEY.get_or_init(|| loop {
-        let mut seed = Vec::with_capacity(64);
-        for _ in 0..4 {
-            seed.extend_from_slice(protocol::SessionId::new().as_uuid().as_bytes());
-        }
-        let key = *protocol::ArtifactId::from_bytes(&seed).as_digest();
-        if key.iter().any(|byte| *byte != 0) {
-            return key;
+    *KEY.get_or_init(|| {
+        loop {
+            let mut seed = Vec::with_capacity(64);
+            for _ in 0..4 {
+                seed.extend_from_slice(protocol::SessionId::new().as_uuid().as_bytes());
+            }
+            let key = *protocol::ArtifactId::from_bytes(&seed).as_digest();
+            if key.iter().any(|byte| *byte != 0) {
+                return key;
+            }
         }
     })
 }
@@ -431,10 +431,7 @@ mod tests {
 
     fn temp_file(name: &str) -> PathBuf {
         let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        std::env::temp_dir().join(format!(
-            "rapidlm-p9-{name}-{}-{seq}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("rapidlm-p9-{name}-{}-{seq}", std::process::id()))
     }
 
     #[test]
@@ -443,7 +440,12 @@ mod tests {
         // it must not advertise behavior the implementation does not have.
         // (The previous help called this "sandbox/policy/credential
         // diagnostics" while every check reported `Unavailable`.)
-        for claim in ["Offline", "Read-only", "connectivity not\ntested", "Exit code"] {
+        for claim in [
+            "Offline",
+            "Read-only",
+            "connectivity not\ntested",
+            "Exit code",
+        ] {
             assert!(DOCTOR_USAGE.contains(claim), "help missing {claim:?}");
         }
         let code = run_doctor(&["--help".to_owned()]).expect("help");
@@ -537,7 +539,11 @@ mod tests {
             read_only < full,
             "read-only surface ({read_only}) should be strictly narrower than the full surface ({full})"
         );
-        let args = vec!["--root".to_owned(), root.to_string_lossy().into_owned(), "--read-only".to_owned()];
+        let args = vec![
+            "--root".to_owned(),
+            root.to_string_lossy().into_owned(),
+            "--read-only".to_owned(),
+        ];
         assert_eq!(run_tools_schema(&args).expect("tools command"), 0);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -545,7 +551,10 @@ mod tests {
     #[test]
     fn tools_schema_rejects_unknown_flags() {
         let args = vec!["--bogus".to_owned()];
-        assert!(matches!(run_tools_schema(&args), Err(P9CommandError::Usage)));
+        assert!(matches!(
+            run_tools_schema(&args),
+            Err(P9CommandError::Usage)
+        ));
     }
 
     #[test]
@@ -567,11 +576,11 @@ mod tests {
 
     #[test]
     fn agent_cli_rejects_missing_argv_separator() {
-        let args: Vec<String> = ["no separator here"].iter().map(|s| s.to_string()).collect();
-        assert!(matches!(
-            run_agent_cli(&args),
-            Err(P9CommandError::Usage)
-        ));
+        let args: Vec<String> = ["no separator here"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(matches!(run_agent_cli(&args), Err(P9CommandError::Usage)));
     }
 }
 
@@ -691,7 +700,10 @@ pub fn run_sessions(args: &[String]) -> Result<i32, P9CommandError> {
     // definitely-not-a-mode` listed every session and exited 0, so the
     // advertised distinction did not exist. Both modes are now real —
     // `search` requires its text, `list` refuses one.
-    let mode = rest.first().map(|s| s.as_str()).ok_or(P9CommandError::Usage)?;
+    let mode = rest
+        .first()
+        .map(|s| s.as_str())
+        .ok_or(P9CommandError::Usage)?;
     let needle = match mode {
         "list" => {
             if rest.len() > 1 {
@@ -736,9 +748,10 @@ pub fn run_sessions(args: &[String]) -> Result<i32, P9CommandError> {
     println!("schema=rapidlm.sessions count={}", sessions.len());
     for summary in &sessions {
         if let Some(text) = &needle
-            && !summary.session_id.contains(text.as_str()) {
-                continue;
-            }
+            && !summary.session_id.contains(text.as_str())
+        {
+            continue;
+        }
         println!(
             "session={} last_seq={} first_seen={}",
             summary.session_id, summary.last_seq, summary.first_seen
@@ -787,7 +800,10 @@ pub fn run_cron(args: &[String]) -> Result<i32, P9CommandError> {
         }
         i += 1;
     }
-    let mode = rest.first().map(|s| s.as_str()).ok_or(P9CommandError::Usage)?;
+    let mode = rest
+        .first()
+        .map(|s| s.as_str())
+        .ok_or(P9CommandError::Usage)?;
     let operands: Vec<&String> = rest[1..].to_vec();
     let db_path = db.unwrap_or_else(crate::interactive::current_project_ledger_path);
     // As in `run_sessions`: listing must not create the store it lists.
@@ -974,13 +990,19 @@ pub fn run_findings(args: &[String]) -> Result<i32, P9CommandError> {
     while i < args.len() {
         if args[i] == "--root" {
             i += 1;
-            root = args.get(i).map(PathBuf::from).ok_or(P9CommandError::Usage)?;
+            root = args
+                .get(i)
+                .map(PathBuf::from)
+                .ok_or(P9CommandError::Usage)?;
         } else {
             rest.push(&args[i]);
         }
         i += 1;
     }
-    let mode = rest.first().map(|s| s.as_str()).ok_or(P9CommandError::Usage)?;
+    let mode = rest
+        .first()
+        .map(|s| s.as_str())
+        .ok_or(P9CommandError::Usage)?;
     match mode {
         "list" => {
             let store = crate::findings_store::FindingsStore::load(&root);
@@ -1035,7 +1057,10 @@ pub fn run_scan(args: &[String]) -> Result<i32, P9CommandError> {
         match args[i].as_str() {
             "--root" => {
                 i += 1;
-                root = args.get(i).map(PathBuf::from).ok_or(P9CommandError::Usage)?;
+                root = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or(P9CommandError::Usage)?;
             }
             "--scanner" => {
                 i += 1;
@@ -1337,7 +1362,10 @@ pub fn run_agents(args: &[String]) -> Result<i32, P9CommandError> {
         }
         i += 1;
     }
-    let mode = rest.first().map(|s| s.as_str()).ok_or(P9CommandError::Usage)?;
+    let mode = rest
+        .first()
+        .map(|s| s.as_str())
+        .ok_or(P9CommandError::Usage)?;
     let defs_dir = dir.unwrap_or_else(|| crate::interactive::project_path("agents"));
     let registry = cli_implementation_registry();
     match mode {
@@ -1367,14 +1395,17 @@ pub fn run_agents(args: &[String]) -> Result<i32, P9CommandError> {
                 );
             }
             for rejected in &inventory.rejected {
-                println!("rejected path={} reason={}", rejected.path.display(), rejected.reason);
+                println!(
+                    "rejected path={} reason={}",
+                    rejected.path.display(),
+                    rejected.reason
+                );
             }
             Ok(0)
         }
         "validate" => {
-            let inventory =
-                agent_runtime::agent_defs::load_directory(&defs_dir, &registry)
-                    .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
+            let inventory = agent_runtime::agent_defs::load_directory(&defs_dir, &registry)
+                .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
             for def in &inventory.loaded {
                 match &def.source {
                     agent_runtime::agent_defs::DefSource::Project(path) => {
@@ -1384,7 +1415,11 @@ pub fn run_agents(args: &[String]) -> Result<i32, P9CommandError> {
                 }
             }
             for rejected in &inventory.rejected {
-                println!("rejected path={} reason={}", rejected.path.display(), rejected.reason);
+                println!(
+                    "rejected path={} reason={}",
+                    rejected.path.display(),
+                    rejected.reason
+                );
             }
             if inventory.rejected.is_empty() {
                 Ok(0)
@@ -1445,7 +1480,10 @@ pub fn run_plugins(args: &[String]) -> Result<i32, P9CommandError> {
         }
         i += 1;
     }
-    let mode = rest.first().map(|s| s.as_str()).ok_or(P9CommandError::Usage)?;
+    let mode = rest
+        .first()
+        .map(|s| s.as_str())
+        .ok_or(P9CommandError::Usage)?;
     let operands: Vec<&String> = rest[1..].to_vec();
     let catalog_path = catalog.unwrap_or_else(default_trust_catalog);
     let cancel = capability_broker::CancellationToken::new();
@@ -1488,11 +1526,9 @@ pub fn run_plugins(args: &[String]) -> Result<i32, P9CommandError> {
             let manifest = plugin_host::parse_manifest(&bytes, &cancel)
                 .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
             let identity = plugin_host::ExtensionIdentity::from_binding(&manifest.trust_binding());
-            let source = plugin_host::InstallSource::new(
-                plugin_host::InstallSourceKind::User,
-                locator,
-            )
-            .map_err(trust_err)?;
+            let source =
+                plugin_host::InstallSource::new(plugin_host::InstallSourceKind::User, locator)
+                    .map_err(trust_err)?;
             let observation = plugin_host::ExtensionObservation::new(
                 identity,
                 source,
@@ -1568,9 +1604,11 @@ pub fn run_plugins(args: &[String]) -> Result<i32, P9CommandError> {
             let capability = capability.ok_or(P9CommandError::Usage)?;
             let resource = resource.ok_or(P9CommandError::Usage)?;
             let capability: capability_broker::Capability =
-                capability.parse().map_err(|err: capability_broker::CapabilityError| {
-                    P9CommandError::Agent(format!("capability: {err}"))
-                })?;
+                capability
+                    .parse()
+                    .map_err(|err: capability_broker::CapabilityError| {
+                        P9CommandError::Agent(format!("capability: {err}"))
+                    })?;
             let resource = parse_cli_resource(resource)?;
             let store = plugin_host::ExtensionTrustStore::open(&catalog_path);
             let identity = stored_identity(&store, plugin_id, &cancel).map_err(trust_err)?;
@@ -1578,8 +1616,7 @@ pub fn run_plugins(args: &[String]) -> Result<i32, P9CommandError> {
             let mut granted: Vec<plugin_host::TrustedCapability> =
                 record.granted_capabilities().to_vec();
             granted.push(
-                plugin_host::TrustedCapability::new(capability, resource)
-                    .map_err(trust_err)?,
+                plugin_host::TrustedCapability::new(capability, resource).map_err(trust_err)?,
             );
             let mut grant = plugin_host::TrustGrant::new(
                 record.identity().clone(),
@@ -1592,7 +1629,9 @@ pub fn run_plugins(args: &[String]) -> Result<i32, P9CommandError> {
                     .with_version_range(range.min(), range.max())
                     .map_err(trust_err)?;
             }
-            let grant = grant.with_granted_capabilities(granted).map_err(trust_err)?;
+            let grant = grant
+                .with_granted_capabilities(granted)
+                .map_err(trust_err)?;
             let updated = store.grant(&grant, &cancel).map_err(trust_err)?;
             println!(
                 "id={} status={} policy={} caps={} executable_enabled={}",
@@ -1660,7 +1699,9 @@ pub fn run_plugins(args: &[String]) -> Result<i32, P9CommandError> {
                 plugin_host::HOOK_SPEC_SCHEMA,
                 spec.id().as_str(),
                 spec.event().as_str(),
-                spec.matcher().map(plugin_host::HookMatcher::as_str).unwrap_or("*"),
+                spec.matcher()
+                    .map(plugin_host::HookMatcher::as_str)
+                    .unwrap_or("*"),
                 spec.timeout().as_millis(),
                 spec.failure_policy().as_str(),
                 spec.event().is_blocking(),
@@ -1691,9 +1732,7 @@ const MAX_CLI_RESOURCE_BYTES: usize = 4096;
 
 /// Default trust catalog location, matching the install layout root.
 fn default_trust_catalog() -> PathBuf {
-    crate::interactive::project_path(
-        PathBuf::from("plugins").join(plugin_host::TRUST_CATALOG_FILE),
-    )
+    crate::interactive::project_path(PathBuf::from("plugins").join(plugin_host::TRUST_CATALOG_FILE))
 }
 
 /// Reads a file, rejecting it once its content exceeds `max_bytes`. Reads
@@ -1740,7 +1779,9 @@ fn stored_identity(
 }
 
 /// Review stamp from an explicit `--review` value or the current UTC time.
-fn review_timestamp(explicit: Option<&str>) -> Result<plugin_host::ReviewTimestamp, P9CommandError> {
+fn review_timestamp(
+    explicit: Option<&str>,
+) -> Result<plugin_host::ReviewTimestamp, P9CommandError> {
     let raw = match explicit {
         Some(raw) => raw.to_string(),
         None => utc_stamp_now(),
@@ -1781,7 +1822,9 @@ fn utc_stamp_from_unix_ms(ms: i64) -> Option<String> {
         (secs_of_day % 3600) / 60,
         secs_of_day % 60,
     );
-    Some(format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z"))
+    Some(format!(
+        "{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z"
+    ))
 }
 
 /// Operator resource grammar mapped onto the typed capability-broker
@@ -1806,9 +1849,11 @@ fn parse_cli_resource(raw: &str) -> Result<capability_broker::ResourceDescriptor
             return Err(P9CommandError::Usage);
         }
         let scheme: capability_broker::NetworkScheme =
-            scheme.parse().map_err(|err: capability_broker::CapabilityError| {
-                P9CommandError::Agent(format!("resource: {err}"))
-            })?;
+            scheme
+                .parse()
+                .map_err(|err: capability_broker::CapabilityError| {
+                    P9CommandError::Agent(format!("resource: {err}"))
+                })?;
         let port: u16 = port.parse().map_err(|_| P9CommandError::Usage)?;
         capability_broker::NetworkScope::new(scheme, host, port)
             .map_err(|err| P9CommandError::Agent(format!("resource: {err}")))
@@ -1891,14 +1936,22 @@ fn decode_hook_fixture(bytes: &[u8]) -> Result<plugin_host::HookEventInput, Stri
         .ok_or("missing string field 'name'")?;
     let event = plugin_host::HookEvent::parse(event).map_err(|err| err.to_string())?;
     let empty = serde_json::Map::new();
-    let fields = object.get("fields").and_then(|v| v.as_object()).unwrap_or(&empty);
+    let fields = object
+        .get("fields")
+        .and_then(|v| v.as_object())
+        .unwrap_or(&empty);
     if fields.len() > MAX_FIXTURE_FIELDS {
-        return Err(format!("too many fixture fields (limit {MAX_FIXTURE_FIELDS})"));
+        return Err(format!(
+            "too many fixture fields (limit {MAX_FIXTURE_FIELDS})"
+        ));
     }
-    plugin_host::HookEventInput::new(event, name, fields.iter().map(|(k, v)| (k.clone(), v.clone())))
-        .map_err(|err| err.to_string())
+    plugin_host::HookEventInput::new(
+        event,
+        name,
+        fields.iter().map(|(k, v)| (k.clone(), v.clone())),
+    )
+    .map_err(|err| err.to_string())
 }
-
 
 /// Minimal HTML entity escaping for the `--format html` export below. Ledger
 /// payloads are untrusted-origin text (tool output, model text) rendered into
@@ -1964,8 +2017,7 @@ pub fn run_inspect_export(args: &[String]) -> Result<i32, P9CommandError> {
     if positional.len() != 2 {
         return Err(P9CommandError::Usage);
     }
-    let session: protocol::SessionId =
-        positional[0].parse().map_err(|_| P9CommandError::Usage)?;
+    let session: protocol::SessionId = positional[0].parse().map_err(|_| P9CommandError::Usage)?;
     let db_path = db.unwrap_or_else(crate::interactive::current_project_ledger_path);
     let client = kernel::InProcessKernelClient::open(&db_path)
         .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
@@ -2014,9 +2066,7 @@ pub fn run_inspect_export(args: &[String]) -> Result<i32, P9CommandError> {
                 html_escape(&event.kind.to_string()),
                 event.seq,
                 html_escape(&event.recorded_at.to_string()),
-                html_escape(
-                    &serde_json::to_string(&payload).map_err(P9CommandError::Json)?
-                ),
+                html_escape(&serde_json::to_string(&payload).map_err(P9CommandError::Json)?),
             )
             .map_err(P9CommandError::Io)?;
         }
@@ -2031,8 +2081,12 @@ pub fn run_inspect_export(args: &[String]) -> Result<i32, P9CommandError> {
                 "payload": serde_json::from_str::<serde_json::Value>(&event.payload_json)
                     .unwrap_or(serde_json::Value::Null),
             });
-            writeln!(out, "{}", serde_json::to_string(&line).map_err(P9CommandError::Json)?)
-                .map_err(P9CommandError::Io)?;
+            writeln!(
+                out,
+                "{}",
+                serde_json::to_string(&line).map_err(P9CommandError::Json)?
+            )
+            .map_err(P9CommandError::Io)?;
         }
     }
     println!(
@@ -2044,8 +2098,14 @@ pub fn run_inspect_export(args: &[String]) -> Result<i32, P9CommandError> {
 
 /// Single source of truth for rapid subcommands (help, completions).
 pub fn run_completions(args: &[String]) -> Result<i32, P9CommandError> {
-    let shell = args.first().map(String::as_str).ok_or(P9CommandError::Usage)?;
-    print!("{}", completions_script(shell).ok_or(P9CommandError::Usage)?);
+    let shell = args
+        .first()
+        .map(String::as_str)
+        .ok_or(P9CommandError::Usage)?;
+    print!(
+        "{}",
+        completions_script(shell).ok_or(P9CommandError::Usage)?
+    );
     Ok(0)
 }
 
@@ -2168,12 +2228,8 @@ mod sessions_tests {
         }
 
         assert_eq!(
-            run_cron(&[
-                "list".to_owned(),
-                "--db".to_owned(),
-                db_arg.clone()
-            ])
-            .expect("listing cron in a project with no store is not an error"),
+            run_cron(&["list".to_owned(), "--db".to_owned(), db_arg.clone()])
+                .expect("listing cron in a project with no store is not an error"),
             0
         );
         assert!(
@@ -2191,7 +2247,10 @@ mod sessions_tests {
             "--db".to_owned(),
             db_arg,
         ]);
-        assert!(added.is_ok(), "adding a cron job must still work: {added:?}");
+        assert!(
+            added.is_ok(),
+            "adding a cron job must still work: {added:?}"
+        );
         assert!(db.exists(), "a write creates the store it writes to");
         let _ = std::fs::remove_file(&db);
     }
@@ -2240,7 +2299,10 @@ mod sessions_tests {
             vec!["search".to_owned(), "a".to_owned(), "b".to_owned()],
         ] {
             assert!(
-                matches!(run_sessions(&with_db(bad.clone())), Err(P9CommandError::Usage)),
+                matches!(
+                    run_sessions(&with_db(bad.clone())),
+                    Err(P9CommandError::Usage)
+                ),
                 "`rapid sessions {}` should be a usage error",
                 bad.join(" ")
             );
@@ -2290,11 +2352,7 @@ mod sessions_tests {
 
         // One fewer positional — the invocation the help used to advertise —
         // is a usage error, which is what made the old help unusable.
-        let short = vec![
-            seeded.to_string(),
-            "--db".to_owned(),
-            db_arg,
-        ];
+        let short = vec![seeded.to_string(), "--db".to_owned(), db_arg];
         assert!(
             matches!(run_inspect_export(&short), Err(P9CommandError::Usage)),
             "one positional is not enough, which is exactly what the help used to claim"
@@ -2305,7 +2363,7 @@ mod sessions_tests {
 
     #[test]
     fn inspect_export_writes_jsonl_of_real_ledger_events() {
-                let db = temp_db("export");
+        let db = temp_db("export");
         let out = db.with_extension("jsonl");
         let seeded = seed_session(&db);
         let session_id = seeded.to_string();
@@ -2343,7 +2401,10 @@ mod sessions_tests {
         let code = run_inspect_export(&args).expect("export command");
         assert_eq!(code, 0);
         let contents = std::fs::read_to_string(&out).expect("read export");
-        assert!(contents.starts_with(&format!("# Session {session_id}")), "{contents}");
+        assert!(
+            contents.starts_with(&format!("# Session {session_id}")),
+            "{contents}"
+        );
         assert!(contents.contains("**session.created**"), "{contents}");
         let _ = std::fs::remove_file(&db);
         let _ = std::fs::remove_file(&out);
@@ -2374,7 +2435,10 @@ mod sessions_tests {
             contents.contains(&format!("<title>Session {session_id}</title>")),
             "{contents}"
         );
-        assert!(contents.contains("<strong>session.created</strong>"), "{contents}");
+        assert!(
+            contents.contains("<strong>session.created</strong>"),
+            "{contents}"
+        );
         let _ = std::fs::remove_file(&db);
         let _ = std::fs::remove_file(&out);
     }
@@ -2446,8 +2510,7 @@ pub fn run_insights(args: &[String]) -> Result<i32, P9CommandError> {
     if positional.len() != 1 {
         return Err(P9CommandError::Usage);
     }
-    let session: protocol::SessionId =
-        positional[0].parse().map_err(|_| P9CommandError::Usage)?;
+    let session: protocol::SessionId = positional[0].parse().map_err(|_| P9CommandError::Usage)?;
     let db_path = db.unwrap_or_else(crate::interactive::current_project_ledger_path);
     for insight in session_insights(&db_path, session)? {
         println!("{}: {}", insight.kind, insight.detail);
@@ -2604,27 +2667,25 @@ mod release_tests {
 
     #[test]
     fn release_manifest_lists_real_artifact_digests() {
-        let dir = std::env::temp_dir().join(format!(
-            "rapidlm-p13-rel-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("rapidlm-p13-rel-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let art = dir.join("app.bin");
         std::fs::write(&art, b"release-payload").unwrap();
-        let code = run_release_manifest(&["1.0.0".to_owned(),
-            art.to_string_lossy().into_owned()])
-        .expect("manifest command");
+        let code = run_release_manifest(&["1.0.0".to_owned(), art.to_string_lossy().into_owned()])
+            .expect("manifest command");
         assert_eq!(code, 0);
         // Digest must equal the real ArtifactId of the file contents.
-        let expected =
-            protocol::ArtifactId::from_bytes(b"release-payload").to_string();
+        let expected = protocol::ArtifactId::from_bytes(b"release-payload").to_string();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(expected.starts_with("sha256:"));
     }
 
     #[test]
     fn release_manifest_requires_version_and_artifacts() {
-        assert!(matches!(run_release_manifest(&[]), Err(P9CommandError::Usage)));
+        assert!(matches!(
+            run_release_manifest(&[]),
+            Err(P9CommandError::Usage)
+        ));
         assert!(matches!(
             run_release_manifest(&["1.0.0".to_owned()]),
             Err(P9CommandError::Usage)
@@ -2662,8 +2723,7 @@ mod release_tests {
 
     #[test]
     fn explicit_review_timestamp_is_validated() {
-        let stamp =
-            review_timestamp(Some("2026-08-28T12:30:00Z")).expect("valid review stamp");
+        let stamp = review_timestamp(Some("2026-08-28T12:30:00Z")).expect("valid review stamp");
         assert_eq!(stamp.as_str(), "2026-08-28T12:30:00Z");
         assert!(review_timestamp(Some("not-a-stamp")).is_err());
         // The implicit stamp parses and is a current-era date.
@@ -2677,16 +2737,13 @@ mod release_tests {
         let repo = parse_cli_resource("repo:src/**/*.rs").expect("repo glob");
         assert_eq!(
             repo,
-            Rd::Filesystem(
-                capability_broker::FilesystemScope::repo("src/**/*.rs").expect("fs")
-            )
+            Rd::Filesystem(capability_broker::FilesystemScope::repo("src/**/*.rs").expect("fs"))
         );
         let net = parse_cli_resource("net:https:api.example.com:443").expect("net scope");
         assert!(Capability::NetConnect.compatible_with(&net).is_ok());
         let page = parse_cli_resource("page:https:docs.example.com:443").expect("page scope");
         assert!(Capability::BrowserNavigate.compatible_with(&page).is_ok());
-        let secret =
-            parse_cli_resource("secret:deploy-key:env").expect("secret scope");
+        let secret = parse_cli_resource("secret:deploy-key:env").expect("secret scope");
         assert!(Capability::SecretUse.compatible_with(&secret).is_ok());
         // Family mismatches and unknown kinds fail via the typed constructors.
         assert!(
@@ -2734,10 +2791,7 @@ mod release_tests {
 
     #[test]
     fn plugins_validate_rejects_a_privileged_manifest() {
-        let dir = std::env::temp_dir().join(format!(
-            "rapidlm-p13-plug-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("rapidlm-p13-plug-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let manifest_path = dir.join("ambient.json");
         // Host-root filesystem reads are ambient and fail closed at parse.
@@ -2757,12 +2811,12 @@ mod release_tests {
 
     #[test]
     fn read_bounded_file_accepts_at_the_limit_and_rejects_one_byte_over() {
-        let path = std::env::temp_dir().join(format!(
-            "rapidlm-p13-bounded-{}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("rapidlm-p13-bounded-{}", std::process::id()));
         std::fs::write(&path, b"12345").unwrap();
-        assert_eq!(read_bounded_file(path.to_str().unwrap(), 5).unwrap(), b"12345");
+        assert_eq!(
+            read_bounded_file(path.to_str().unwrap(), 5).unwrap(),
+            b"12345"
+        );
 
         std::fs::write(&path, b"123456").unwrap();
         let err = read_bounded_file(path.to_str().unwrap(), 5).unwrap_err();
@@ -2776,10 +2830,8 @@ mod release_tests {
         // A file far larger than max_bytes must still be rejected cheaply,
         // not read in full before the size is checked (the TOCTOU this
         // function's own doc comment exists to avoid).
-        let path = std::env::temp_dir().join(format!(
-            "rapidlm-p13-oversized-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("rapidlm-p13-oversized-{}", std::process::id()));
         std::fs::write(&path, vec![b'x'; 1_000_000]).unwrap();
         let err = read_bounded_file(path.to_str().unwrap(), 64).unwrap_err();
         assert!(matches!(err, P9CommandError::Agent(_)));
@@ -2824,7 +2876,10 @@ mod cron_tests {
 
         for n in 1..scheduler::MAX_CONSECUTIVE_EXECUTION_FAILURES {
             let line = report_cron_execution_outcome(&cron, &job.id, false, 1_000 + i64::from(n));
-            assert_eq!(line, None, "no line to print before the threshold (failure {n})");
+            assert_eq!(
+                line, None,
+                "no line to print before the threshold (failure {n})"
+            );
         }
         let line = report_cron_execution_outcome(
             &cron,
@@ -2842,7 +2897,10 @@ mod cron_tests {
             "{line}"
         );
         let stored = cron.store().get(&job.id).expect("get");
-        assert_eq!(stored.status, event_ledger::cron::CronJobStatus::Quarantined);
+        assert_eq!(
+            stored.status,
+            event_ledger::cron::CronJobStatus::Quarantined
+        );
 
         cleanup(&path);
     }

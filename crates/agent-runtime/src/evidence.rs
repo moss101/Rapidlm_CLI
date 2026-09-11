@@ -1031,8 +1031,7 @@ fn evaluate_criterion(
                 };
             }
             Some(kind) => {
-                if let Some(reason) =
-                    evaluate_kind(goal.id(), criterion_id, kind, store, backing)
+                if let Some(reason) = evaluate_kind(goal.id(), criterion_id, kind, store, backing)
                     && first_fail.is_none()
                 {
                     first_fail = Some(reason);
@@ -2169,12 +2168,18 @@ mod tests {
     #[test]
     fn backing_error_reasons_map_one_to_one_and_only_unavailable_is_retryable() {
         let cases = [
-            (BackingError::NotFound, CriterionUnsatisfied::LedgerEventNotFound),
+            (
+                BackingError::NotFound,
+                CriterionUnsatisfied::LedgerEventNotFound,
+            ),
             (
                 BackingError::NotABackingEvent,
                 CriterionUnsatisfied::LedgerEventWrongKind,
             ),
-            (BackingError::Unavailable, CriterionUnsatisfied::LedgerUnavailable),
+            (
+                BackingError::Unavailable,
+                CriterionUnsatisfied::LedgerUnavailable,
+            ),
         ];
         for (backing_error, expected_reason) in cases {
             let goal = goal_with_kinds(&["command"]);
@@ -2183,7 +2188,10 @@ mod tests {
             let spec = agent_command_record().with_ledger_ref(backed_ref());
             service.record(spec).expect("record");
             let verdicts = service.validate_goal(&goal);
-            assert!(!verdicts.allowed(), "{backing_error:?} must still fail closed");
+            assert!(
+                !verdicts.allowed(),
+                "{backing_error:?} must still fail closed"
+            );
             let reason = verdicts.verdicts()[0].reason();
             assert_eq!(reason, Some(expected_reason), "for {backing_error:?}");
             assert_eq!(
@@ -2201,7 +2209,10 @@ mod tests {
         service.record(passing_test()).expect("record");
         let verdicts = service.validate_goal(&goal);
         assert!(verdicts.allowed());
-        assert!(!verdicts.retry_advisable(), "nothing is blocked, nothing to retry");
+        assert!(
+            !verdicts.retry_advisable(),
+            "nothing is blocked, nothing to retry"
+        );
     }
 
     #[test]
@@ -2215,7 +2226,10 @@ mod tests {
         service.record(spec).expect("record");
         let verdicts = service.validate_goal(&retryable_goal);
         assert!(!verdicts.allowed());
-        assert!(verdicts.retry_advisable(), "a resolver outage alone should read as retryable");
+        assert!(
+            verdicts.retry_advisable(),
+            "a resolver outage alone should read as retryable"
+        );
 
         let final_goal = goal_with_kinds(&["command"]);
         let mut service = EvidenceService::new();

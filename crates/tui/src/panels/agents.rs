@@ -1390,9 +1390,7 @@ selected:000000000018
             EventKind::ApprovalRequested,
             serde_json::json!({}),
         ));
-        let blocked = events
-            .iter()
-            .fold(AppState::new(), reduce);
+        let blocked = events.iter().fold(AppState::new(), reduce);
         assert!(blocked.actions_blocked());
         let model = AgentsViewModel::from_state(
             &blocked,

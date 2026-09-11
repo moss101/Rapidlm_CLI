@@ -766,9 +766,10 @@ fn broaden_scope_paths(requested: &[String]) -> Vec<String> {
     let mut out: Vec<String> = requested.to_vec();
     for path in requested {
         if let Some((parent, _)) = path.rsplit_once('/')
-            && !parent.is_empty() {
-                out.push(parent.to_string());
-            }
+            && !parent.is_empty()
+        {
+            out.push(parent.to_string());
+        }
     }
     for prefix in BROADEN_PREFIXES {
         out.push((*prefix).to_string());

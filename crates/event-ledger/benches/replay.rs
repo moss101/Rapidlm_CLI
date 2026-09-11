@@ -1,5 +1,5 @@
 //! P10-030: append + read-back throughput for the durable event ledger.
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use event_ledger::event::{ActorKind, ActorRef, EventKind};
 use event_ledger::ledger::{AppendOptions, EventLedger};
@@ -13,7 +13,9 @@ fn bench_append_and_replay(c: &mut Criterion) {
     let cancel = event_ledger::ledger::CancellationToken::new();
     let ledger = EventLedger::open(&db).unwrap();
     let session = SessionId::new();
-    ledger.create_session(session, ProjectId::new(), &cancel).unwrap();
+    ledger
+        .create_session(session, ProjectId::new(), &cancel)
+        .unwrap();
     let actor = ActorRef::new(ActorKind::Human, &EventId::new().to_string()).unwrap();
 
     c.bench_function("append_1000_events", |b| {

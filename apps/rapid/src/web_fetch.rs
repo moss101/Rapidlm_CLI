@@ -80,11 +80,7 @@ fn split_url(url: &str) -> Option<SplitUrl<'_>> {
     if host.is_empty() {
         return None;
     }
-    Some(SplitUrl {
-        scheme,
-        host,
-        port,
-    })
+    Some(SplitUrl { scheme, host, port })
 }
 
 fn is_private_ipv4(v4: Ipv4Addr) -> bool {
@@ -154,7 +150,9 @@ pub fn classify_fetch(url: &str, allowlist: &[String]) -> Result<(), FetchRefusa
 /// approved internal service, would pass `classify_fetch` only to be
 /// refused a moment later by the second, unrelated check).
 fn host_is_allowlisted(host: &str, allowlist: &[String]) -> bool {
-    allowlist.iter().any(|allowed| allowed.eq_ignore_ascii_case(host))
+    allowlist
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(host))
 }
 
 fn strip_block(source: &str, block: &str) -> String {
@@ -246,7 +244,6 @@ pub fn html_to_text(html: &str) -> String {
     }
     text.trim().to_owned()
 }
-
 
 /// Fetch `url` and return bounded readable text. `allowlist` admits
 /// private/loopback hosts that the SSRF guard would otherwise refuse.
@@ -372,11 +369,20 @@ mod tests {
         // private/loopback/link-local IPv4 target past the IPv6 arm's
         // checks — a well-known SSRF-filter bypass technique.
         let refusal = classify_fetch("http://[::ffff:127.0.0.1]/x", &[]).unwrap_err();
-        assert!(matches!(refusal, FetchRefusal::PrivateTargetBlocked { .. }), "{refusal:?}");
+        assert!(
+            matches!(refusal, FetchRefusal::PrivateTargetBlocked { .. }),
+            "{refusal:?}"
+        );
         let refusal = classify_fetch("http://[::ffff:169.254.169.254]/x", &[]).unwrap_err();
-        assert!(matches!(refusal, FetchRefusal::PrivateTargetBlocked { .. }), "{refusal:?}");
+        assert!(
+            matches!(refusal, FetchRefusal::PrivateTargetBlocked { .. }),
+            "{refusal:?}"
+        );
         let refusal = classify_fetch("http://[::ffff:10.0.0.5]/x", &[]).unwrap_err();
-        assert!(matches!(refusal, FetchRefusal::PrivateTargetBlocked { .. }), "{refusal:?}");
+        assert!(
+            matches!(refusal, FetchRefusal::PrivateTargetBlocked { .. }),
+            "{refusal:?}"
+        );
     }
 
     #[test]

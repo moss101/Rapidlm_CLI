@@ -9,19 +9,20 @@ use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use auth::SecretRef;
 use capability_broker::{
-    evaluate, issue, normalize_exec, normalize_fs, request_approval, validate_use, ActionRequest,
-    ApprovalChoice, ApprovalResolution, ApprovalScopeId, CancellationToken, CanonicalAction,
-    CanonicalHostPath, Capability, CapabilityLease, DecisionWithTrace, ExecIntent, FilesystemRoot,
-    FsIntent, FsNormalizeError, FsResolver, Hostname, LeaseIssuer, LeaseValidator, NetworkIntent,
-    NetworkNormalizeError, NetworkResolver, PolicyDocument, PolicyError, PolicyRevision,
-    PolicySource, PolicyStack, PrincipalRef, ProcessScope, Resolver, ResourceDescriptor,
+    ActionRequest, ApprovalChoice, ApprovalResolution, ApprovalScopeId, CancellationToken,
+    CanonicalAction, CanonicalHostPath, Capability, CapabilityLease, DecisionWithTrace, ExecIntent,
+    FilesystemRoot, FsIntent, FsNormalizeError, FsResolver, Hostname, LeaseIssuer, LeaseValidator,
+    NetworkIntent, NetworkNormalizeError, NetworkResolver, PolicyDocument, PolicyError,
+    PolicyRevision, PolicySource, PolicyStack, PrincipalRef, ProcessScope, Resolver,
+    ResourceDescriptor, evaluate, issue, normalize_exec, normalize_fs, request_approval,
+    validate_use,
 };
 use protocol::{ErrorCode, RepoPath, SandboxTier, SessionId};
 use sandbox::{
@@ -29,14 +30,14 @@ use sandbox::{
     SandboxBackend, SandboxError, SandboxManager, SandboxMount, SandboxNetwork, SandboxSpec,
 };
 use security::{
-    authorize_connect, evaluate_scan_gate, filter_output, safe_json_for_export, CommandRiskScanner,
-    CommandRiskTag, CommandScanCancellation, CommandScanStatus, ConnectLease, EgressError,
-    EgressOutcome, EgressPolicy, EgressProxy, EgressReason, EgressRule, FindingsDisposition,
-    GateAuditId, GateDisposition, GatePhase, GateReasonCode, NetworkClient, OutputChannel,
-    OutputSafetyCancellation, OutputSafetyError, OutputSafetyStatus, PolicyException,
-    RedactionCancellation, RedactionError, RedactionStatus, ScanCancellation, ScanGatePolicy,
-    ScanGateResult, ScanRequest, ScanStatus, ScanTarget, ScanWaiver, ScannerId, ScannerOutcome,
-    SecretRedactionRegistry, SecretScanner, TextSink,
+    CommandRiskScanner, CommandRiskTag, CommandScanCancellation, CommandScanStatus, ConnectLease,
+    EgressError, EgressOutcome, EgressPolicy, EgressProxy, EgressReason, EgressRule,
+    FindingsDisposition, GateAuditId, GateDisposition, GatePhase, GateReasonCode, NetworkClient,
+    OutputChannel, OutputSafetyCancellation, OutputSafetyError, OutputSafetyStatus,
+    PolicyException, RedactionCancellation, RedactionError, RedactionStatus, ScanCancellation,
+    ScanGatePolicy, ScanGateResult, ScanRequest, ScanStatus, ScanTarget, ScanWaiver, ScannerId,
+    ScannerOutcome, SecretRedactionRegistry, SecretScanner, TextSink, authorize_connect,
+    evaluate_scan_gate, filter_output, safe_json_for_export,
 };
 
 const SECRET_CANARY: &str = "canary-secret-PLAINTEXT-do-not-leak-021-a7f3";
@@ -57,9 +58,11 @@ fn t001_prompt_injection_cannot_exfiltrate_secret_or_trip_canary() {
         .scan(&command, &CommandScanCancellation::new())
         .expect("command scan");
     assert_eq!(command_report.status(), CommandScanStatus::Findings);
-    assert!(command_report
-        .tags()
-        .contains(&CommandRiskTag::Exfiltration));
+    assert!(
+        command_report
+            .tags()
+            .contains(&CommandRiskTag::Exfiltration)
+    );
 
     let mut secrets = SecretScanner::new();
     secrets
@@ -1107,18 +1110,20 @@ impl Canary {
         let stop = Arc::new(AtomicBool::new(false));
         let hits_thread = Arc::clone(&hits);
         let stop_thread = Arc::clone(&stop);
-        let join = thread::spawn(move || loop {
-            if stop_thread.load(Ordering::SeqCst) {
-                break;
-            }
-            match listener.accept() {
-                Ok(_) => {
-                    hits_thread.fetch_add(1, Ordering::SeqCst);
+        let join = thread::spawn(move || {
+            loop {
+                if stop_thread.load(Ordering::SeqCst) {
+                    break;
                 }
-                Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(2));
+                match listener.accept() {
+                    Ok(_) => {
+                        hits_thread.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => thread::sleep(Duration::from_millis(2)),
                 }
-                Err(_) => thread::sleep(Duration::from_millis(2)),
             }
         });
         Self {

@@ -270,10 +270,11 @@ pub fn eligible(
         }
         let model = entry.descriptor().model_ref();
         if let Some(pin) = request.user_pin()
-            && &model != pin {
-                push_rejection(&mut rejections, model, RejectionReason::UserPinExcludes)?;
-                continue;
-            }
+            && &model != pin
+        {
+            push_rejection(&mut rejections, model, RejectionReason::UserPinExcludes)?;
+            continue;
+        }
         match hard_constraints(request, entry) {
             Ok(()) => {
                 if models.len() >= MAX_ELIGIBLE_MODELS {
@@ -336,11 +337,12 @@ pub fn hard_constraints(
         });
     }
     if let Some(region) = request.required_region.as_ref()
-        && !descriptor.regions().iter().any(|listed| listed == region) {
-            return Err(RejectionReason::RegionDenied {
-                required: region.clone(),
-            });
-        }
+        && !descriptor.regions().iter().any(|listed| listed == region)
+    {
+        return Err(RejectionReason::RegionDenied {
+            required: region.clone(),
+        });
+    }
     Ok(())
 }
 

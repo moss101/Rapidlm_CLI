@@ -14,8 +14,8 @@
 //! inside complete lines — invalid UTF-8, a missing interior newline — is
 //! reported, never rewritten.
 
-use std::fs;
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::journal::CancellationToken;
@@ -56,13 +56,22 @@ impl fmt::Display for RecoveryReport {
 #[derive(Debug)]
 pub enum RecoveryError {
     /// Another recovery (or writer) holds the lease for this log.
-    LeaseHeld { lock_path: PathBuf },
+    LeaseHeld {
+        lock_path: PathBuf,
+    },
     /// The log to recover does not exist.
-    TargetMissing { path: PathBuf },
+    TargetMissing {
+        path: PathBuf,
+    },
     /// The target changed after the lease was taken; the repair was not
     /// attempted (or its basis is gone).
-    TargetChanged { path: PathBuf },
-    Unreadable { path: PathBuf, reason: String },
+    TargetChanged {
+        path: PathBuf,
+    },
+    Unreadable {
+        path: PathBuf,
+        reason: String,
+    },
     Cancelled,
 }
 
@@ -81,7 +90,11 @@ impl fmt::Display for RecoveryError {
                 path.display()
             ),
             Self::Unreadable { path, reason } => {
-                write!(f, "retained log is unreadable: {}: {reason}", path.display())
+                write!(
+                    f,
+                    "retained log is unreadable: {}: {reason}",
+                    path.display()
+                )
             }
             Self::Cancelled => f.write_str("recovery cancelled"),
         }
@@ -225,7 +238,11 @@ impl WriterLease {
     /// Create the lockfile exclusively; an existing lockfile is a held lease.
     pub fn acquire(log_path: &Path) -> Result<Self, RecoveryError> {
         let lock_path = lock_path_for(log_path);
-        match fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
             Ok(_) => Ok(Self { lock_path }),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 Err(RecoveryError::LeaseHeld { lock_path })
@@ -318,10 +335,8 @@ mod tests {
         impl TempDir {
             pub(super) fn new() -> std::io::Result<Self> {
                 let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-                let dir = std::env::temp_dir().join(format!(
-                    "rapidlm-recovery-{}-{seq}",
-                    std::process::id()
-                ));
+                let dir = std::env::temp_dir()
+                    .join(format!("rapidlm-recovery-{}-{seq}", std::process::id()));
                 std::fs::create_dir_all(&dir)?;
                 Ok(Self(dir))
             }
@@ -379,8 +394,8 @@ mod tests {
         let (_dir, path) = scratch("held.jsonl");
         std::fs::write(&path, "a\n").expect("write");
         let lease = WriterLease::acquire(&path).expect("first lease");
-        let err = recover_retained_log(&path, &CancellationToken::new())
-            .expect_err("lease is held");
+        let err =
+            recover_retained_log(&path, &CancellationToken::new()).expect_err("lease is held");
         assert!(matches!(err, RecoveryError::LeaseHeld { .. }));
         assert!(err.to_string().contains("writer lease is held"));
         lease.release();
@@ -415,8 +430,8 @@ mod tests {
     #[test]
     fn missing_target_and_cancel_are_typed() {
         let (_dir, path) = scratch("absent.jsonl");
-        let err = recover_retained_log(&path, &CancellationToken::new())
-            .expect_err("missing target");
+        let err =
+            recover_retained_log(&path, &CancellationToken::new()).expect_err("missing target");
         assert!(matches!(err, RecoveryError::TargetMissing { .. }));
 
         let (_dir, path) = scratch("cancelled.jsonl");

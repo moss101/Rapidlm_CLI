@@ -121,12 +121,11 @@ fn active_from_doc(doc: &str) -> rapid::user_config::ActiveModel {
     resolve_active(&[], &config).expect("resolve active model")
 }
 
-fn scripted_model(
-    doc: &str,
-) -> ConfiguredModel<'static> {
+fn scripted_model(doc: &str) -> ConfiguredModel<'static> {
     // Leak a per-test store: integration tests construct one model per test
     // process-lifetime; the store must outlive the returned adapter.
-    let store: &'static InMemoryCredentialStore = Box::leak(Box::new(InMemoryCredentialStore::new()));
+    let store: &'static InMemoryCredentialStore =
+        Box::leak(Box::new(InMemoryCredentialStore::new()));
     let active = active_from_doc(doc);
     ConfiguredModel::build(&active, store).expect("build configured model")
 }
@@ -160,7 +159,10 @@ fn configured_model_step_reaches_loopback_openai_server() {
     assert!(request.contains("POST /v1/chat/completions"), "{request}");
     assert!(request.contains("\"model\":\"test-model\""), "{request}");
     assert!(request.contains("ship the scripted feature"), "{request}");
-    assert!(request.contains("Authorization: Bearer scripted-key"), "{request}");
+    assert!(
+        request.contains("Authorization: Bearer scripted-key"),
+        "{request}"
+    );
 }
 
 #[test]
@@ -230,13 +232,13 @@ fn anthropic_provider_builds_and_reaches_the_loopback_server() {
     );
     let config = parse_config_document(&doc, "gw.toml").expect("parse");
     // The credential comes from the env slice (pure core), not the process.
-    let active = resolve_active(
-        &[("GW_API_KEY".to_owned(), "gw-key".to_owned())],
-        &config,
-    )
-    .expect("resolve");
+    let active = resolve_active(&[("GW_API_KEY".to_owned(), "gw-key".to_owned())], &config)
+        .expect("resolve");
     assert_eq!(active.entry.provider, ConfigProvider::Anthropic);
-    assert_eq!(active.credential.source, CredentialSource::EnvVar("GW_API_KEY".to_owned()));
+    assert_eq!(
+        active.credential.source,
+        CredentialSource::EnvVar("GW_API_KEY".to_owned())
+    );
     let store = InMemoryCredentialStore::new();
     let mut model = ConfiguredModel::build(&active, &store).expect("build");
     let preserved = PreservedLiveContext::new("goal", Vec::new(), "", "", 1024, 64).expect("p");
@@ -294,8 +296,11 @@ fn binary_exec_uses_configured_model_end_to_end() {
     let server = spawn_scripted_server(vec![(200, NON_STREAMING_BODY.to_owned())]);
     let dir = temp_dir("exec-ok");
     let config_path = dir.join("config.toml");
-    std::fs::write(&config_path, config_doc(&format!("http://{}/v1", server.addr)))
-        .expect("write config");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
     let (code, stdout, stderr) = run_rapid(Some(&config_path), None, &dir);
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert!(
@@ -348,7 +353,10 @@ fn binary_exec_rejects_invalid_config_typed() {
         "typed config error missing: {stderr}"
     );
     let requests = server.requests.lock().expect("requests");
-    assert!(requests.is_empty(), "invalid config must not reach a provider");
+    assert!(
+        requests.is_empty(),
+        "invalid config must not reach a provider"
+    );
 }
 
 #[test]
@@ -356,8 +364,11 @@ fn binary_exec_rejects_unknown_model_override_typed() {
     let server = spawn_scripted_server(vec![(200, NON_STREAMING_BODY.to_owned())]);
     let dir = temp_dir("exec-bad-override");
     let config_path = dir.join("config.toml");
-    std::fs::write(&config_path, config_doc(&format!("http://{}/v1", server.addr)))
-        .expect("write config");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
     let (code, _stdout, stderr) = run_rapid(Some(&config_path), Some("missing-model"), &dir);
     // JsonlExitCode::Usage: an unknown model override is a user-input error.
     assert_eq!(code, Some(2));
@@ -366,7 +377,10 @@ fn binary_exec_rejects_unknown_model_override_typed() {
         "typed override error missing: {stderr}"
     );
     let requests = server.requests.lock().expect("requests");
-    assert!(requests.is_empty(), "bad override must not reach a provider");
+    assert!(
+        requests.is_empty(),
+        "bad override must not reach a provider"
+    );
 }
 
 #[test]
@@ -381,7 +395,11 @@ fn selection_is_unconfigured_when_no_config_exists_anywhere() {
         ModelSelection::Configured { .. } => panic!("unexpected configured selection"),
     };
     let err = selected
-        .step(&[], &agent_runtime::ModelStepInput::without_tools(1), &CancellationToken::new())
+        .step(
+            &[],
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &CancellationToken::new(),
+        )
         .expect_err("typed fallback");
     assert_eq!(err, ModelStepError::Failed);
 }
@@ -504,11 +522,8 @@ fn anthropic_tool_results_reach_the_provider_one_tool_result_per_call() {
         server.addr
     );
     let config = parse_config_document(&doc, "gw.toml").expect("parse");
-    let active = resolve_active(
-        &[("GW_API_KEY".to_owned(), "gw-key".to_owned())],
-        &config,
-    )
-    .expect("resolve");
+    let active = resolve_active(&[("GW_API_KEY".to_owned(), "gw-key".to_owned())], &config)
+        .expect("resolve");
     let store = InMemoryCredentialStore::new();
     let mut model = ConfiguredModel::build(&active, &store).expect("build");
     let workspace = tool_workspace("tool-channel-anthropic");
@@ -543,7 +558,10 @@ fn anthropic_tool_results_reach_the_provider_one_tool_result_per_call() {
         second_request.contains("\"tool_use\""),
         "assistant echo missing: {second_request}"
     );
-    assert!(!second_request.contains("tool results:"), "{second_request}");
+    assert!(
+        !second_request.contains("tool results:"),
+        "{second_request}"
+    );
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
@@ -656,8 +674,8 @@ fn binary_exec_applies_workspace_patch_end_to_end_in_accept_edits_mode() {
             "round {round}: stdout must carry the final model text: {stdout}"
         );
         // The workspace effect actually occurred on disk.
-        let content = std::fs::read_to_string(env.project.join("notes.txt"))
-            .expect("patched file exists");
+        let content =
+            std::fs::read_to_string(env.project.join("notes.txt")).expect("patched file exists");
         assert_eq!(content, "beta\n", "round {round}: patch must have landed");
         // The follow-up request carried the per-call tool result.
         let requests = server.requests.lock().expect("requests");
@@ -709,7 +727,11 @@ fn run_rapid_cron_in(
     db_path: &PathBuf,
     args: &[&str],
 ) -> (Option<i32>, String, String) {
-    let mut full_args = vec!["cron".to_owned(), "--db".to_owned(), db_path.display().to_string()];
+    let mut full_args = vec![
+        "cron".to_owned(),
+        "--db".to_owned(),
+        db_path.display().to_string(),
+    ];
     full_args.extend(args.iter().map(|s| (*s).to_owned()));
     let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
         .args(&full_args)
@@ -765,17 +787,31 @@ fn binary_cron_poll_runs_the_fired_job_in_plan_mode_and_denies_the_patch() {
         &env.home,
         &config_path,
         &db_path,
-        &["add", "--prompt", "patch notes.txt by replacing alpha with beta", "--schedule", "* * * * *"],
+        &[
+            "add",
+            "--prompt",
+            "patch notes.txt by replacing alpha with beta",
+            "--schedule",
+            "* * * * *",
+        ],
     );
     assert_eq!(add_code, Some(0), "cron add stderr: {add_stderr}");
-    assert!(add_stdout.contains("status=active"), "add stdout: {add_stdout}");
+    assert!(
+        add_stdout.contains("status=active"),
+        "add stdout: {add_stdout}"
+    );
 
-    std::thread::sleep(std::time::Duration::from_secs(seconds_until_next_minute_boundary()));
+    std::thread::sleep(std::time::Duration::from_secs(
+        seconds_until_next_minute_boundary(),
+    ));
 
     let (poll_code, poll_stdout, poll_stderr) =
         run_rapid_cron_in(&env.project, &env.home, &config_path, &db_path, &["poll"]);
     assert_eq!(poll_code, Some(0), "cron poll stderr: {poll_stderr}");
-    assert!(poll_stdout.contains("fired=1"), "poll stdout: {poll_stdout}");
+    assert!(
+        poll_stdout.contains("fired=1"),
+        "poll stdout: {poll_stdout}"
+    );
     assert!(
         poll_stdout.contains("outcome=exit:0"),
         "the fired job's turn must have actually run: {poll_stdout}"

@@ -18,7 +18,10 @@ impl DeterministicGrader {
     /// Score = passed/total assertions; pass requires every verdict Passed.
     pub fn grade(assertions: &[(Assertion, Verdict)]) -> Grade {
         let total = assertions.len().max(1);
-        let passed = assertions.iter().filter(|(_, v)| *v == Verdict::Passed).count();
+        let passed = assertions
+            .iter()
+            .filter(|(_, v)| *v == Verdict::Passed)
+            .count();
         Grade {
             grader: "deterministic",
             score: passed as f64 / total as f64,
@@ -123,7 +126,13 @@ impl FailureBundle {
         let failing: Vec<String> = verdicts
             .iter()
             .filter(|(_, v)| *v != Verdict::Passed)
-            .map(|(a, _)| format!("{}:{}", a.family.as_str(), a.contains.clone().unwrap_or_default()))
+            .map(|(a, _)| {
+                format!(
+                    "{}:{}",
+                    a.family.as_str(),
+                    a.contains.clone().unwrap_or_default()
+                )
+            })
             .collect();
         if failing.is_empty() {
             return None;
@@ -149,14 +158,26 @@ mod tests {
             LedgerRecord::new("job.completed", json!({})),
         ];
         let assertions = vec![
-            Assertion { family: AssertionFamily::Graph, contains: None, min_count: 1 },
-            Assertion { family: AssertionFamily::Process, contains: None, min_count: 1 },
+            Assertion {
+                family: AssertionFamily::Graph,
+                contains: None,
+                min_count: 1,
+            },
+            Assertion {
+                family: AssertionFamily::Process,
+                contains: None,
+                min_count: 1,
+            },
         ];
         let grade = DeterministicGrader::grade(&AssertionEngineProxy::eval(&records, &assertions));
         assert!(grade.passed);
         assert!((grade.score - 1.0).abs() < f64::EPSILON);
         let failing = vec![(
-            Assertion { family: AssertionFamily::BrowserComputer, contains: None, min_count: 5 },
+            Assertion {
+                family: AssertionFamily::BrowserComputer,
+                contains: None,
+                min_count: 5,
+            },
             Verdict::Failed { observed: 2 },
         )];
         let grade2 = DeterministicGrader::grade(&failing);
@@ -184,11 +205,19 @@ mod tests {
         let records: Vec<LedgerRecord> = vec![];
         let verdicts = vec![
             (
-                Assertion { family: AssertionFamily::Files, contains: Some("patch".into()), min_count: 1 },
+                Assertion {
+                    family: AssertionFamily::Files,
+                    contains: Some("patch".into()),
+                    min_count: 1,
+                },
                 Verdict::Failed { observed: 0 },
             ),
             (
-                Assertion { family: AssertionFamily::Policy, contains: None, min_count: 0 },
+                Assertion {
+                    family: AssertionFamily::Policy,
+                    contains: None,
+                    min_count: 0,
+                },
                 Verdict::Passed,
             ),
         ];
@@ -197,7 +226,11 @@ mod tests {
         assert_eq!(bundle.failing, vec!["files:patch".to_owned()]);
         // All passing -> no bundle.
         let all_pass = vec![(
-            Assertion { family: AssertionFamily::Policy, contains: None, min_count: 0 },
+            Assertion {
+                family: AssertionFamily::Policy,
+                contains: None,
+                min_count: 0,
+            },
             Verdict::Passed,
         )];
         assert!(FailureBundle::bundle("sc-1", &all_pass, &[]).is_none());

@@ -300,10 +300,11 @@ impl GoalHost {
     /// a real ledger row; without this resolver such records never satisfy a
     /// criterion (fail closed). Human and system records are unaffected.
     pub fn install_backing(&mut self, ledger: EventLedger) {
-        self.evidence.set_backing_resolver(Arc::new(LedgerEventBacking {
-            ledger,
-            cancel: LedgerCancel::new(),
-        }));
+        self.evidence
+            .set_backing_resolver(Arc::new(LedgerEventBacking {
+                ledger,
+                cancel: LedgerCancel::new(),
+            }));
     }
 
     /// Evidence service view (verdicts, store) for CLI rendering.
@@ -431,14 +432,15 @@ impl GoalHost {
         goal_path: &Path,
         mutate: impl FnOnce(&mut GoalHost) -> Result<T, E>,
     ) -> Result<T, GoalTransactionError<E>> {
-        let _lock = GoalLock::acquire(goal_path, GOAL_LOCK_FILE)
-            .map_err(GoalTransactionError::Persist)?;
+        let _lock =
+            GoalLock::acquire(goal_path, GOAL_LOCK_FILE).map_err(GoalTransactionError::Persist)?;
         self.machine = GoalHost::load(goal_path)
             .map_err(GoalTransactionError::Persist)?
             .map(|host| host.machine)
             .unwrap_or_default();
         let result = mutate(self).map_err(GoalTransactionError::Mutate)?;
-        self.save(goal_path).map_err(GoalTransactionError::Persist)?;
+        self.save(goal_path)
+            .map_err(GoalTransactionError::Persist)?;
         Ok(result)
     }
 
@@ -609,8 +611,7 @@ impl GoalHost {
             Ok(bytes) => {
                 let raw: Raw =
                     serde_json::from_slice(&bytes).map_err(|_| GoalPersistError::Json)?;
-                if raw.schema != EVIDENCE_DOC_SCHEMA || raw.schema_version != EVIDENCE_DOC_VERSION
-                {
+                if raw.schema != EVIDENCE_DOC_SCHEMA || raw.schema_version != EVIDENCE_DOC_VERSION {
                     return Err(GoalPersistError::Json);
                 }
                 let mut count = 0;
@@ -714,7 +715,7 @@ mod tests {
     use super::*;
     use agent_runtime::{
         Criterion, EvidenceKind, EvidenceLedgerRef, EvidenceProducer, EvidenceRequirement,
-        EvidenceSpec, EvidenceSource, EvidenceStatus, GoalBudget, GoalCommand, GoalEventKind,
+        EvidenceSource, EvidenceSpec, EvidenceStatus, GoalBudget, GoalCommand, GoalEventKind,
         GoalSpec, TEST_PASSED,
     };
     use protocol::{AgentId, ArtifactId, EvidenceId, GoalId, ProjectId, SessionId};
@@ -756,7 +757,11 @@ mod tests {
 
         let mut host = GoalHost::new();
         let created = host
-            .apply(GoalCommand::Create(spec("ship auth")), &human(), &CancellationToken::new())
+            .apply(
+                GoalCommand::Create(spec("ship auth")),
+                &human(),
+                &CancellationToken::new(),
+            )
             .expect("create");
         assert_eq!(created.event(), GoalEventKind::Created);
         host.save(&path).expect("save");
@@ -766,7 +771,10 @@ mod tests {
         // Lifecycle continues after a reload (durable goal host).
         reloaded
             .apply(
-                GoalCommand::Pause { goal_id: reloaded.snapshot().expect("id").id(), process_recovered: false },
+                GoalCommand::Pause {
+                    goal_id: reloaded.snapshot().expect("id").id(),
+                    process_recovered: false,
+                },
                 &human(),
                 &CancellationToken::new(),
             )
@@ -802,7 +810,10 @@ mod tests {
         fs::write(&path, vec![b'x'; MAX_GOAL_FILE_BYTES + 1]).expect("write");
         match GoalHost::load(&path) {
             Err(GoalPersistError::Io) => {}
-            other => panic!("expected Err(Io) for an oversized file, got {}", other.is_ok()),
+            other => panic!(
+                "expected Err(Io) for an oversized file, got {}",
+                other.is_ok()
+            ),
         }
         let _ = fs::remove_file(&path);
     }
@@ -813,8 +824,12 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         let mut host = GoalHost::new();
-        host.apply(GoalCommand::Create(spec("v1")), &human(), &CancellationToken::new())
-            .expect("create");
+        host.apply(
+            GoalCommand::Create(spec("v1")),
+            &human(),
+            &CancellationToken::new(),
+        )
+        .expect("create");
         host.apply(
             GoalCommand::Replace(spec("v2 contract")),
             &human(),
@@ -824,16 +839,25 @@ mod tests {
         host.save(&path).expect("save");
 
         let reloaded = GoalHost::load(&path).expect("load").expect("some");
-        assert_eq!(reloaded.snapshot().expect("snap").statement(), "v2 contract");
+        assert_eq!(
+            reloaded.snapshot().expect("snap").statement(),
+            "v2 contract"
+        );
         let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn export_emits_snapshot_verdicts_and_attestation() {
         let mut host = GoalHost::new();
-        host.apply(GoalCommand::Create(spec("ship auth")), &human(), &CancellationToken::new())
-            .expect("create");
-        let export = host.export(&CancellationToken::new()).expect("export has goal");
+        host.apply(
+            GoalCommand::Create(spec("ship auth")),
+            &human(),
+            &CancellationToken::new(),
+        )
+        .expect("create");
+        let export = host
+            .export(&CancellationToken::new())
+            .expect("export has goal");
         let doc: serde_json::Value = serde_json::from_str(&export).expect("json");
         assert_eq!(doc["snapshot"]["statement"], "ship auth");
         assert_eq!(doc["complete"], false);
@@ -882,12 +906,7 @@ mod tests {
         .expect("command")
     }
 
-    fn agent_record(
-        goal_id: GoalId,
-        session: SessionId,
-        event_id: &str,
-        seq: u64,
-    ) -> EvidenceSpec {
+    fn agent_record(goal_id: GoalId, session: SessionId, event_id: &str, seq: u64) -> EvidenceSpec {
         let citation = EvidenceLedgerRef::new(session, event_id, seq).expect("ref");
         EvidenceSpec::new(
             EvidenceId::new(),
@@ -1023,9 +1042,7 @@ mod tests {
         // Reload with backing: the citation re-resolves, still complete.
         let mut backed = GoalHost::load(&goal_path).expect("load").expect("some");
         backed.install_backing(EventLedger::open(&db).expect("reopen"));
-        backed
-            .load_evidence(&evidence_path)
-            .expect("load evidence");
+        backed.load_evidence(&evidence_path).expect("load evidence");
         assert!(backed.can_complete(&CancellationToken::new()));
 
         // Fresh host without a resolver: fail closed despite a valid citation.
@@ -1076,10 +1093,17 @@ mod tests {
         )
         .expect("spec");
         let created = host
-            .apply(GoalCommand::Create(spec), &human(), &CancellationToken::new())
+            .apply(
+                GoalCommand::Create(spec),
+                &human(),
+                &CancellationToken::new(),
+            )
             .expect("create");
         let goal_id = created.goal_id();
-        assert_eq!(host.snapshot().expect("snap").state(), agent_runtime::GoalState::Active);
+        assert_eq!(
+            host.snapshot().expect("snap").state(),
+            agent_runtime::GoalState::Active
+        );
         (host, goal_id)
     }
 
@@ -1095,7 +1119,10 @@ mod tests {
         let path = scratch("active-id-paused");
         let (mut host, goal_id) = active_host_with_budget(GoalBudget::default());
         host.apply(
-            GoalCommand::Pause { goal_id, process_recovered: false },
+            GoalCommand::Pause {
+                goal_id,
+                process_recovered: false,
+            },
             &human(),
             &CancellationToken::new(),
         )
@@ -1142,7 +1169,11 @@ mod tests {
 
         let reloaded = GoalHost::load(&path).expect("load").expect("some");
         let usage = reloaded.snapshot().expect("snap").usage();
-        assert_eq!(usage.turns(), 2, "two separate turns must accumulate, not overwrite");
+        assert_eq!(
+            usage.turns(),
+            2,
+            "two separate turns must accumulate, not overwrite"
+        );
         assert_eq!(usage.tokens(), 350);
         assert_eq!(usage.cost(), 50);
         assert_eq!(usage.active_ms(), 1_250);
@@ -1164,7 +1195,10 @@ mod tests {
         assert!(!accrue_turn_usage(&path, unrelated_goal_id, 999, 999, 999));
 
         let reloaded = GoalHost::load(&path).expect("load").expect("some");
-        assert_eq!(reloaded.snapshot().expect("snap").usage(), agent_runtime::GoalUsage::default());
+        assert_eq!(
+            reloaded.snapshot().expect("snap").usage(),
+            agent_runtime::GoalUsage::default()
+        );
         let _ = fs::remove_file(&path);
     }
 
@@ -1173,7 +1207,10 @@ mod tests {
         let path = scratch_dir("accrue-inactive").join(GOAL_FILE);
         let (mut host, goal_id) = active_host_with_budget(GoalBudget::default());
         host.apply(
-            GoalCommand::Pause { goal_id, process_recovered: false },
+            GoalCommand::Pause {
+                goal_id,
+                process_recovered: false,
+            },
             &human(),
             &CancellationToken::new(),
         )
@@ -1183,7 +1220,10 @@ mod tests {
         assert!(!accrue_turn_usage(&path, goal_id, 999, 999, 999));
 
         let reloaded = GoalHost::load(&path).expect("load").expect("some");
-        assert_eq!(reloaded.snapshot().expect("snap").usage(), agent_runtime::GoalUsage::default());
+        assert_eq!(
+            reloaded.snapshot().expect("snap").usage(),
+            agent_runtime::GoalUsage::default()
+        );
         let _ = fs::remove_file(&path);
     }
 
@@ -1192,7 +1232,10 @@ mod tests {
         let path = scratch_dir("accrue-missing").join(GOAL_FILE);
         let _ = fs::remove_file(&path);
         assert!(!accrue_turn_usage(&path, GoalId::new(), 100, 100, 100));
-        assert!(!path.exists(), "must not invent a goal file that never existed");
+        assert!(
+            !path.exists(),
+            "must not invent a goal file that never existed"
+        );
     }
 
     #[test]
@@ -1221,13 +1264,27 @@ mod tests {
         let (host, goal_id) = active_host_with_budget(GoalBudget::default());
         host.save(&path).expect("save");
 
-        assert!(accrue_turn_usage(&path, goal_id, u64::MAX - 10, u64::MAX - 10, 0));
+        assert!(accrue_turn_usage(
+            &path,
+            goal_id,
+            u64::MAX - 10,
+            u64::MAX - 10,
+            0
+        ));
         assert!(accrue_turn_usage(&path, goal_id, 100, 100, 0));
 
         let reloaded = GoalHost::load(&path).expect("load").expect("some");
         let usage = reloaded.snapshot().expect("snap").usage();
-        assert_eq!(usage.tokens(), u64::MAX, "must saturate, not wrap, past u64::MAX");
-        assert_eq!(usage.cost(), u64::MAX, "must saturate, not wrap, past u64::MAX");
+        assert_eq!(
+            usage.tokens(),
+            u64::MAX,
+            "must saturate, not wrap, past u64::MAX"
+        );
+        assert_eq!(
+            usage.cost(),
+            u64::MAX,
+            "must saturate, not wrap, past u64::MAX"
+        );
         let _ = fs::remove_file(&path);
     }
 
@@ -1287,12 +1344,22 @@ mod tests {
                 accrue_turn_usage(&path, goal_id, 20, 200, 15)
             })
         };
-        assert!(turn_a.join().expect("thread"), "turn A's accrual must succeed");
-        assert!(turn_b.join().expect("thread"), "turn B's accrual must succeed");
+        assert!(
+            turn_a.join().expect("thread"),
+            "turn A's accrual must succeed"
+        );
+        assert!(
+            turn_b.join().expect("thread"),
+            "turn B's accrual must succeed"
+        );
 
         let reloaded = GoalHost::load(&path).expect("load").expect("some");
         let usage = reloaded.snapshot().expect("snap").usage();
-        assert_eq!(usage.cost(), 300, "neither writer's cost may silently vanish");
+        assert_eq!(
+            usage.cost(),
+            300,
+            "neither writer's cost may silently vanish"
+        );
         assert_eq!(usage.tokens(), 30);
         assert_eq!(usage.active_ms(), 20);
         assert_eq!(usage.turns(), 2, "both turns must count, not just one");
@@ -1319,12 +1386,19 @@ mod tests {
             })
             .collect();
         for handle in handles {
-            assert!(handle.join().expect("thread panicked"), "every writer must succeed");
+            assert!(
+                handle.join().expect("thread panicked"),
+                "every writer must succeed"
+            );
         }
 
         let reloaded = GoalHost::load(&path).expect("load").expect("some");
         let usage = reloaded.snapshot().expect("snap").usage();
-        assert_eq!(usage.turns(), WRITERS, "every concurrent accrual must count, none lost");
+        assert_eq!(
+            usage.turns(),
+            WRITERS,
+            "every concurrent accrual must count, none lost"
+        );
         assert_eq!(usage.tokens(), WRITERS * 10);
         assert_eq!(usage.cost(), WRITERS * 100);
         assert_eq!(usage.active_ms(), WRITERS * 5);
@@ -1360,7 +1434,10 @@ mod tests {
                 accrue_turn_usage(&path, unrelated_goal_id, 999, 999, 999)
             })
         };
-        assert!(correct.join().expect("thread"), "the matching goal id must still accrue");
+        assert!(
+            correct.join().expect("thread"),
+            "the matching goal id must still accrue"
+        );
         assert!(
             !mismatched.join().expect("thread"),
             "a mismatched goal id must never accrue, race or not"
@@ -1368,7 +1445,11 @@ mod tests {
 
         let reloaded = GoalHost::load(&path).expect("load").expect("some");
         let usage = reloaded.snapshot().expect("snap").usage();
-        assert_eq!(usage.tokens(), 500, "only the matching writer's usage may land");
+        assert_eq!(
+            usage.tokens(),
+            500,
+            "only the matching writer's usage may land"
+        );
         assert_eq!(usage.cost(), 50);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(GoalLock::lock_path(&path, GOAL_LOCK_FILE));
@@ -1406,7 +1487,10 @@ mod tests {
                 let mut host = GoalHost::new();
                 host.update(&path, |host| {
                     host.apply(
-                        GoalCommand::Pause { goal_id, process_recovered: false },
+                        GoalCommand::Pause {
+                            goal_id,
+                            process_recovered: false,
+                        },
                         &human(),
                         &CancellationToken::new(),
                     )
@@ -1446,7 +1530,10 @@ mod tests {
         updater
             .update(&path, |host| {
                 host.apply(
-                    GoalCommand::Pause { goal_id, process_recovered: false },
+                    GoalCommand::Pause {
+                        goal_id,
+                        process_recovered: false,
+                    },
                     &human(),
                     &CancellationToken::new(),
                 )
@@ -1513,7 +1600,10 @@ mod tests {
         first
             .update(&path, |host| {
                 host.apply(
-                    GoalCommand::Pause { goal_id, process_recovered: false },
+                    GoalCommand::Pause {
+                        goal_id,
+                        process_recovered: false,
+                    },
                     &human(),
                     &CancellationToken::new(),
                 )
@@ -1532,7 +1622,10 @@ mod tests {
             .expect("second update");
 
         let reloaded = GoalHost::load(&path).expect("load").expect("some");
-        assert_eq!(reloaded.snapshot().expect("snap").state(), agent_runtime::GoalState::Paused);
+        assert_eq!(
+            reloaded.snapshot().expect("snap").state(),
+            agent_runtime::GoalState::Paused
+        );
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(GoalLock::lock_path(&path, GOAL_LOCK_FILE));
     }
@@ -1583,7 +1676,8 @@ mod tests {
                     barrier.wait();
                     let mut host = GoalHost::new();
                     host.update_evidence(&evidence_path, |host| {
-                        host.record_evidence(system_test_record(goal_id)).map(|_| ())
+                        host.record_evidence(system_test_record(goal_id))
+                            .map(|_| ())
                     })
                 })
             })
@@ -1617,7 +1711,8 @@ mod tests {
                     barrier.wait();
                     let mut host = GoalHost::new();
                     host.update_evidence(&evidence_path, |host| {
-                        host.record_evidence(system_test_record(goal_id)).map(|_| ())
+                        host.record_evidence(system_test_record(goal_id))
+                            .map(|_| ())
                     })
                 })
             })
@@ -1631,7 +1726,10 @@ mod tests {
 
         let mut reloaded = GoalHost::new();
         let count = reloaded.load_evidence(&evidence_path).expect("load");
-        assert_eq!(count, WRITERS, "every concurrent addition must count, none lost");
+        assert_eq!(
+            count, WRITERS,
+            "every concurrent addition must count, none lost"
+        );
         cleanup_evidence(&evidence_path);
     }
 
@@ -1648,7 +1746,8 @@ mod tests {
 
         first
             .update_evidence(&evidence_path, |host| {
-                host.record_evidence(system_test_record(goal_id)).map(|_| ())
+                host.record_evidence(system_test_record(goal_id))
+                    .map(|_| ())
             })
             .expect("first update");
 
@@ -1666,7 +1765,10 @@ mod tests {
 
         let mut reloaded = GoalHost::new();
         let count = reloaded.load_evidence(&evidence_path).expect("load");
-        assert_eq!(count, 1, "second's no-op mutate must not have erased first's record");
+        assert_eq!(
+            count, 1,
+            "second's no-op mutate must not have erased first's record"
+        );
         cleanup_evidence(&evidence_path);
     }
 
@@ -1678,7 +1780,8 @@ mod tests {
 
         let mut host = GoalHost::new();
         host.update_evidence(&evidence_path, |host| {
-            host.record_evidence(system_test_record(goal_id)).map(|_| ())
+            host.record_evidence(system_test_record(goal_id))
+                .map(|_| ())
         })
         .expect("update");
 
@@ -1728,10 +1831,14 @@ mod tests {
 
         let mut host = GoalHost::new();
         let result = host.update_evidence(&evidence_path, |host| {
-            host.record_evidence(system_test_record(GoalId::new())).map(|_| ())
+            host.record_evidence(system_test_record(GoalId::new()))
+                .map(|_| ())
         });
         assert!(
-            matches!(result, Err(GoalTransactionError::Persist(GoalPersistError::Json))),
+            matches!(
+                result,
+                Err(GoalTransactionError::Persist(GoalPersistError::Json))
+            ),
             "a corrupt existing doc must be a typed reload failure, not a panic or a silent \
              overwrite: {result:?}"
         );
@@ -1766,7 +1873,8 @@ mod tests {
                 let evidence_path = evidence_path.clone();
                 std::thread::spawn(move || {
                     let mut host = GoalHost::new();
-                    host.record_evidence(system_test_record(GoalId::new())).expect("record");
+                    host.record_evidence(system_test_record(GoalId::new()))
+                        .expect("record");
                     barrier.wait();
                     host.save_evidence(&evidence_path).unwrap_or_else(|err| {
                         panic!("writer {i} save must not itself fail: {err}")
@@ -1784,7 +1892,10 @@ mod tests {
         let count = reloaded.load_evidence(&evidence_path).expect(
             "the file left behind by racing direct saves must always be valid, complete JSON",
         );
-        assert_eq!(count, 1, "one writer's full record, never a partial/mixed one");
+        assert_eq!(
+            count, 1,
+            "one writer's full record, never a partial/mixed one"
+        );
         cleanup_evidence(&evidence_path);
     }
 
@@ -1805,10 +1916,17 @@ mod tests {
         let evidence_path = dir.join(EVIDENCE_FILE);
         let mut host = GoalHost::new();
         let created = host
-            .apply(GoalCommand::Create(spec("ship auth")), &human(), &CancellationToken::new())
+            .apply(
+                GoalCommand::Create(spec("ship auth")),
+                &human(),
+                &CancellationToken::new(),
+            )
             .expect("create");
         let goal_id = created.goal_id();
-        assert!(!host.can_complete(&CancellationToken::new()), "no evidence recorded yet");
+        assert!(
+            !host.can_complete(&CancellationToken::new()),
+            "no evidence recorded yet"
+        );
 
         // A concurrent writer commits the satisfying evidence through the
         // real locked transaction, on a *separate* `GoalHost` instance —
@@ -1816,7 +1934,9 @@ mod tests {
         let mut writer = GoalHost::new();
         writer
             .update_evidence(&evidence_path, |writer| {
-                writer.record_evidence(system_test_record(goal_id)).map(|_| ())
+                writer
+                    .record_evidence(system_test_record(goal_id))
+                    .map(|_| ())
             })
             .expect("writer commits evidence");
 
@@ -1898,7 +2018,11 @@ mod tests {
                 vec![],
             )
             .expect("spec");
-            host.apply(GoalCommand::Create(spec), &GoalActor::Human, &CancellationToken::new())
+            host.apply(
+                GoalCommand::Create(spec),
+                &GoalActor::Human,
+                &CancellationToken::new(),
+            )
         });
         assert!(
             result.is_ok(),

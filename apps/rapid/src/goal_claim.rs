@@ -16,15 +16,15 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use agent_runtime::{
-    AcceptanceCriterion, AcceptancePolicy, AgentContextPacket, CandidateCompletion, CheckResult,
-    CheckRunner, CheckStatus, CancellationToken, CompletionClaim, DiscoveryResult, EvidenceKind,
-    EvidenceLedgerRef, EvidenceNode, EvidenceProducer, EvidenceSpec, EvidenceSource, EvidenceStatus,
-    EvidenceTrust, Explorer, GapNode, GoalSnapshot, Implementer, MAX_ID_BYTES,
-    OrchestrationBudget, OrchestrationEvidenceKind, OrchestrationState, Planner, PlanResult,
-    RequirementClaim, RequirementClaimStatus, RequirementNode, Retriever, StrategyRevision,
-    Strategist, Supervisor, SupervisorDrivers, SupervisorError, TaskContract, TaskComplexity,
-    TransitionError, VerificationCheck, VerificationPolicy, Verdict, WorkspaceIdentity,
-    WorkspacePolicy, TEST_PASSED,
+    AcceptanceCriterion, AcceptancePolicy, AgentContextPacket, CancellationToken,
+    CandidateCompletion, CheckResult, CheckRunner, CheckStatus, CompletionClaim, DiscoveryResult,
+    EvidenceKind, EvidenceLedgerRef, EvidenceNode, EvidenceProducer, EvidenceSource, EvidenceSpec,
+    EvidenceStatus, EvidenceTrust, Explorer, GapNode, GoalSnapshot, Implementer, MAX_ID_BYTES,
+    OrchestrationBudget, OrchestrationEvidenceKind, OrchestrationState, PlanResult, Planner,
+    RequirementClaim, RequirementClaimStatus, RequirementNode, Retriever, Strategist,
+    StrategyRevision, Supervisor, SupervisorDrivers, SupervisorError, TEST_PASSED, TaskComplexity,
+    TaskContract, TransitionError, Verdict, VerificationCheck, VerificationPolicy,
+    WorkspaceIdentity, WorkspacePolicy,
 };
 use event_ledger::event::{ActorKind, ActorRef, EventKind};
 use event_ledger::ledger::{AppendOptions, CancellationToken as LedgerCancel, EventLedger};
@@ -86,7 +86,10 @@ impl GoalClaim {
                 return Err(GoalClaimError::InvalidCommand);
             }
         }
-        if !checks.windows(2).all(|w| w[0].requirement_id != w[1].requirement_id) {
+        if !checks
+            .windows(2)
+            .all(|w| w[0].requirement_id != w[1].requirement_id)
+        {
             return Err(GoalClaimError::DuplicateRequirement);
         }
         if !(MIN_TIMEOUT_SECS..=MAX_TIMEOUT_SECS).contains(&timeout_secs) {
@@ -126,7 +129,9 @@ impl fmt::Display for GoalClaimError {
             Self::NoChecks => f.write_str("a claim requires at least one --check"),
             Self::TooManyChecks => write!(f, "a claim accepts at most {MAX_CLAIM_CHECKS} checks"),
             Self::InvalidSummary => f.write_str("claim summary is empty or exceeds bound"),
-            Self::InvalidRequirement => f.write_str("check requirement id is empty or exceeds bound"),
+            Self::InvalidRequirement => {
+                f.write_str("check requirement id is empty or exceeds bound")
+            }
             Self::InvalidCommand => f.write_str("check command is empty or exceeds bound"),
             Self::InvalidTimeout => {
                 write!(
@@ -135,7 +140,9 @@ impl fmt::Display for GoalClaimError {
                 )
             }
             Self::DuplicateRequirement => f.write_str("duplicate check for one requirement"),
-            Self::UnknownRequirement => f.write_str("check names a criterion the goal does not have"),
+            Self::UnknownRequirement => {
+                f.write_str("check names a criterion the goal does not have")
+            }
             Self::InvalidCriterionId => {
                 f.write_str("a goal criterion id cannot form a valid contract id")
             }
@@ -201,10 +208,10 @@ fn run_check_command(spec: &CheckSpec, timeout: Duration) -> Result<CheckRun, Go
     let mut child = command.spawn().map_err(|_| GoalClaimError::CheckSpawn)?;
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
-    let stdout_reader =
-        stdout_pipe.map(|pipe| std::thread::spawn(move || drain_capped(pipe, MAX_CHECK_OUTPUT_BYTES)));
-    let stderr_reader =
-        stderr_pipe.map(|pipe| std::thread::spawn(move || drain_capped(pipe, MAX_CHECK_OUTPUT_BYTES)));
+    let stdout_reader = stdout_pipe
+        .map(|pipe| std::thread::spawn(move || drain_capped(pipe, MAX_CHECK_OUTPUT_BYTES)));
+    let stderr_reader = stderr_pipe
+        .map(|pipe| std::thread::spawn(move || drain_capped(pipe, MAX_CHECK_OUTPUT_BYTES)));
     let start = Instant::now();
     let mut timed_out = false;
     let status = loop {
@@ -213,9 +220,7 @@ fn run_check_command(spec: &CheckSpec, timeout: Duration) -> Result<CheckRun, Go
             Ok(None) if start.elapsed() >= timeout => {
                 timed_out = true;
                 let _ = child.kill();
-                break child
-                    .wait()
-                    .map_err(|_| GoalClaimError::CheckSpawn)?;
+                break child.wait().map_err(|_| GoalClaimError::CheckSpawn)?;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
             Err(_) => return Err(GoalClaimError::CheckSpawn),
@@ -551,12 +556,15 @@ fn record_goal_evidence(
         specs.push(spec);
     }
     let recorded = specs.len();
-    host.update_evidence(evidence_path, |host| -> Result<(), agent_runtime::EvidenceError> {
-        for spec in specs {
-            host.record_evidence(spec)?;
-        }
-        Ok(())
-    })
+    host.update_evidence(
+        evidence_path,
+        |host| -> Result<(), agent_runtime::EvidenceError> {
+            for spec in specs {
+                host.record_evidence(spec)?;
+            }
+            Ok(())
+        },
+    )
     .map_err(|err| {
         match &err {
             crate::goal_host::GoalTransactionError::Persist(persist_err) => {
@@ -752,10 +760,7 @@ pub fn run_claim(
     }
 
     // Host records the real observations first; the claim cites them.
-    let node_ids: Vec<EvidenceId> = passed_nodes
-        .iter()
-        .map(|(id, _)| *id)
-        .collect();
+    let node_ids: Vec<EvidenceId> = passed_nodes.iter().map(|(id, _)| *id).collect();
     for (_, node) in &passed_nodes {
         supervisor
             .record_evidence(node.clone())
@@ -780,7 +785,9 @@ pub fn run_claim(
     supervisor
         .submit_candidate(candidate)
         .map_err(GoalClaimError::Supervisor)?;
-    supervisor.run_checks().map_err(GoalClaimError::Supervisor)?;
+    supervisor
+        .run_checks()
+        .map_err(GoalClaimError::Supervisor)?;
     let verdict = supervisor.verify().map_err(GoalClaimError::Supervisor)?;
     let mut accepted = false;
     if supervisor.state() == OrchestrationState::Verified {
@@ -811,14 +818,14 @@ pub fn citation_resolves(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_runtime::{Criterion, EvidenceRequirement, GoalActor, GoalBudget, GoalCommand, GoalSpec};
+    use agent_runtime::{
+        Criterion, EvidenceRequirement, GoalActor, GoalBudget, GoalCommand, GoalSpec,
+    };
     use protocol::GoalId;
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rapid-goal-claim-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rapid-goal-claim-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
@@ -833,11 +840,8 @@ mod tests {
         let requirements: Vec<EvidenceRequirement> = requires
             .iter()
             .map(|(id, kinds)| {
-                EvidenceRequirement::new(
-                    *id,
-                    kinds.split(',').map(str::to_owned).collect(),
-                )
-                .expect("req")
+                EvidenceRequirement::new(*id, kinds.split(',').map(str::to_owned).collect())
+                    .expect("req")
             })
             .collect();
         let spec = GoalSpec::new(
@@ -971,7 +975,7 @@ mod tests {
             slow,
             &CancellationToken::new(),
         )
-            .expect("claim runs");
+        .expect("claim runs");
 
         assert!(!outcome.accepted);
         assert!(outcome.checks[0].timed_out);
@@ -1013,8 +1017,12 @@ mod tests {
             GoalClaimError::InvalidCommand
         );
         assert_eq!(
-            GoalClaim::new("s", vec![check("c1", "/bin/echo"), check("c1", "/bin/echo")], 30)
-                .unwrap_err(),
+            GoalClaim::new(
+                "s",
+                vec![check("c1", "/bin/echo"), check("c1", "/bin/echo")],
+                30
+            )
+            .unwrap_err(),
             GoalClaimError::DuplicateRequirement
         );
         assert_eq!(

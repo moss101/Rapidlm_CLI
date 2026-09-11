@@ -1054,9 +1054,7 @@ fn glob_star_question(pattern: &[u8], value: &[u8], budget: &mut u32) -> bool {
         }
         (Some(_), None) => false,
         (Some((b'?', prest)), Some((_, vrest))) => glob_star_question(prest, vrest, budget),
-        (Some((p, prest)), Some((v, vrest))) if p == v => {
-            glob_star_question(prest, vrest, budget)
-        }
+        (Some((p, prest)), Some((v, vrest))) if p == v => glob_star_question(prest, vrest, budget),
         (Some(_), Some(_)) => false,
     }
 }
@@ -1674,7 +1672,9 @@ resource = { root = "repo", glob = "src/**" }
         assert!(!glob_matches(&unmatchable_chars, "short.rs"));
         let unmatchable_segments = format!(
             "{}/z",
-            std::iter::repeat_n("**", 2048).collect::<Vec<_>>().join("/")
+            std::iter::repeat_n("**", 2048)
+                .collect::<Vec<_>>()
+                .join("/")
         );
         assert!(!glob_match_segments(
             &split_segments(&unmatchable_segments),

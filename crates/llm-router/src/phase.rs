@@ -156,9 +156,7 @@ impl PhaseRoute {
 
     /// The profile serving `purpose`: its override, else the main profile.
     pub fn route(&self, purpose: ModelPurpose) -> &ProfileId {
-        self.overrides[slot(purpose)]
-            .as_ref()
-            .unwrap_or(&self.main)
+        self.overrides[slot(purpose)].as_ref().unwrap_or(&self.main)
     }
 
     /// The explicit override for `purpose`, if one is configured.
@@ -216,10 +214,7 @@ mod tests {
             err.describe_input("an-extremely-long-effort-name"),
             "an-extre…".to_owned()
         );
-        assert_eq!(
-            ReasoningEffort::parse(""),
-            Err(ReasoningEffortParseError)
-        );
+        assert_eq!(ReasoningEffort::parse(""), Err(ReasoningEffortParseError));
     }
 
     #[test]
@@ -240,9 +235,8 @@ mod tests {
             "embed",
             "computer_use",
         ] {
-            let purpose = parse_purpose_name(name).unwrap_or_else(|| {
-                panic!("purpose name {name} must parse")
-            });
+            let purpose = parse_purpose_name(name)
+                .unwrap_or_else(|| panic!("purpose name {name} must parse"));
             assert_eq!(purpose_name(purpose), name);
         }
         assert_eq!(parse_purpose_name("COMPACT"), Some(ModelPurpose::Compact));

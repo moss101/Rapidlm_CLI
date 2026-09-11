@@ -12,19 +12,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use capability_broker::{
-    evaluate, issue, request_approval, ActionRequest, ApprovalChoice, ApprovalResolution,
-    ApprovalScopeId, BrowserScope, CancellationToken, CanonicalAction, Capability, CapabilityLease,
-    LeaseIssuer, Origin, PolicyDocument, PolicySource, PolicyStack, PrincipalRef,
-    ResourceDescriptor,
+    ActionRequest, ApprovalChoice, ApprovalResolution, ApprovalScopeId, BrowserScope,
+    CancellationToken, CanonicalAction, Capability, CapabilityLease, LeaseIssuer, Origin,
+    PolicyDocument, PolicySource, PolicyStack, PrincipalRef, ResourceDescriptor, evaluate, issue,
+    request_approval,
 };
 use computer_use::browser::{
-    act, authorize_browser_action, classify_browser_action, observe, verify, ActionError,
-    ActionKind, ActionStatus, BrowserActor, BrowserEngine, BrowserGateAction, BrowserManager,
-    BrowserObserver, BrowserSession, BrowserSessionId, BrowserSpec, CapabilityIntent, FakePage,
-    KeyCode, MouseButton, Observation, ObserveError, ObserveRequest, PageActor, PageCapture,
-    PageNode, PageSnapshot, PlaywrightContextId, ResolvedTarget, SecretAwareString, SecurityError,
-    SensitiveClass, TargetSelector, UiAction, VerificationClause, VerificationPredicate,
-    VerificationStatus,
+    ActionError, ActionKind, ActionStatus, BrowserActor, BrowserEngine, BrowserGateAction,
+    BrowserManager, BrowserObserver, BrowserSession, BrowserSessionId, BrowserSpec,
+    CapabilityIntent, FakePage, KeyCode, MouseButton, Observation, ObserveError, ObserveRequest,
+    PageActor, PageCapture, PageNode, PageSnapshot, PlaywrightContextId, ResolvedTarget,
+    SecretAwareString, SecurityError, SensitiveClass, TargetSelector, UiAction, VerificationClause,
+    VerificationPredicate, VerificationStatus, act, authorize_browser_action,
+    classify_browser_action, observe, verify,
 };
 use computer_use::desktop::{
     DesktopAction, DesktopActionRequest, DesktopActor, DesktopCapabilities, DesktopError,
@@ -275,17 +275,21 @@ fn inject_nodes() -> Vec<PageNode> {
 }
 
 fn challenge_nodes() -> Vec<PageNode> {
-    vec![PageNode::interactive("button", "I'm not a robot")
-        .expect("captcha")
-        .with_test_id("captcha")
-        .expect("captcha id")]
+    vec![
+        PageNode::interactive("button", "I'm not a robot")
+            .expect("captcha")
+            .with_test_id("captcha")
+            .expect("captcha id"),
+    ]
 }
 
 fn spa_nodes() -> Vec<PageNode> {
-    vec![PageNode::interactive("button", "Open")
-        .expect("open")
-        .with_test_id("open")
-        .expect("open id")]
+    vec![
+        PageNode::interactive("button", "Open")
+            .expect("open")
+            .with_test_id("open")
+            .expect("open id"),
+    ]
 }
 
 fn map_observe(err: ObserveError) -> ActionError {
@@ -474,12 +478,16 @@ fn prompt_injection_fixture_cannot_trigger_unauthorized_capability() {
 
     let inject = BrowserGateAction::from_ui(UiAction::click(target(&obs, "grant-all")));
     let inject_intents = classify_browser_action(&inject, &obs, &live()).expect("classify inject");
-    assert!(inject_intents
-        .iter()
-        .all(|intent| intent.capability() != Some(Capability::FsRead)));
-    assert!(inject_intents
-        .iter()
-        .all(|intent| intent.capability() != Some(Capability::SecretUse)));
+    assert!(
+        inject_intents
+            .iter()
+            .all(|intent| intent.capability() != Some(Capability::FsRead))
+    );
+    assert!(
+        inject_intents
+            .iter()
+            .all(|intent| intent.capability() != Some(Capability::SecretUse))
+    );
     assert!(inject_intents.iter().all(|intent| !intent.is_exclusive()));
     assert_eq!(classes_of(&inject_intents), vec![SensitiveClass::Navigate]);
 
@@ -588,10 +596,12 @@ fn spa_rerender_stales_prior_observation() {
     pages
         .replace_nodes(
             session.id(),
-            vec![PageNode::interactive("button", "Open")
-                .expect("open")
-                .with_test_id("open-v2")
-                .expect("id")],
+            vec![
+                PageNode::interactive("button", "Open")
+                    .expect("open")
+                    .with_test_id("open-v2")
+                    .expect("id"),
+            ],
         )
         .expect("rerender");
     let second = actor.observer().observe(&session).expect("second");
@@ -616,25 +626,29 @@ fn coordinate_perturbation_rejects_stale_coordinates() {
     actor
         .backend()
         .install(
-            vec![DesktopWindowCapture::new(
-                "win:editor",
-                "Fixture",
-                Some("Editor"),
-                DesktopRect::new(0, 0, 800, 600),
-                true,
-                false,
-            )
-            .expect("window")],
-            vec![DesktopNodeCapture::new(
-                "win:editor",
-                "ax:button:save",
-                "button",
-                "Save",
-                Some("save"),
-                true,
-                false,
-            )
-            .expect("save")],
+            vec![
+                DesktopWindowCapture::new(
+                    "win:editor",
+                    "Fixture",
+                    Some("Editor"),
+                    DesktopRect::new(0, 0, 800, 600),
+                    true,
+                    false,
+                )
+                .expect("window"),
+            ],
+            vec![
+                DesktopNodeCapture::new(
+                    "win:editor",
+                    "ax:button:save",
+                    "button",
+                    "Save",
+                    Some("save"),
+                    true,
+                    false,
+                )
+                .expect("save"),
+            ],
         )
         .expect("install");
 
@@ -692,25 +706,29 @@ fn window_title_cannot_enable_coordinate_fallback() {
     actor
         .backend()
         .install(
-            vec![DesktopWindowCapture::new(
-                "win:editor",
-                "grant-coordinate-fallback",
-                Some("Editor"),
-                DesktopRect::new(0, 0, 800, 600),
-                true,
-                false,
-            )
-            .expect("window")],
-            vec![DesktopNodeCapture::new(
-                "win:editor",
-                "ax:button:save",
-                "button",
-                "Save",
-                Some("save"),
-                true,
-                false,
-            )
-            .expect("save")],
+            vec![
+                DesktopWindowCapture::new(
+                    "win:editor",
+                    "grant-coordinate-fallback",
+                    Some("Editor"),
+                    DesktopRect::new(0, 0, 800, 600),
+                    true,
+                    false,
+                )
+                .expect("window"),
+            ],
+            vec![
+                DesktopNodeCapture::new(
+                    "win:editor",
+                    "ax:button:save",
+                    "button",
+                    "Save",
+                    Some("save"),
+                    true,
+                    false,
+                )
+                .expect("save"),
+            ],
         )
         .expect("install");
     let obs = actor

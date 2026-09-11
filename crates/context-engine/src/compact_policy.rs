@@ -16,7 +16,9 @@
 
 use std::fmt;
 
-use crate::compact::{compact_packet, CompactError, CompactMethod, CompactedContext, PacketSummarizer};
+use crate::compact::{
+    CompactError, CompactMethod, CompactedContext, PacketSummarizer, compact_packet,
+};
 use crate::compile::{ContextPacket, ContextSource, explain_packet};
 use crate::repo_manifest::CancellationToken;
 
@@ -162,7 +164,10 @@ impl fmt::Display for CompactPolicyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::StillOverHard { estimate, hard } => {
-                write!(f, "compacted context still exceeds the hard threshold (estimate {estimate} >= {hard} tokens)")
+                write!(
+                    f,
+                    "compacted context still exceeds the hard threshold (estimate {estimate} >= {hard} tokens)"
+                )
             }
             other => f.write_str(other.as_str()),
         }
@@ -218,8 +223,8 @@ pub fn compact_with_policy(
         CompactionStrategy::ModelPreferred => summarizer,
         CompactionStrategy::DeterministicOnly => None,
     };
-    let compacted = compact_packet(packet, effective_summarizer, cancel)
-        .map_err(|err| match err {
+    let compacted =
+        compact_packet(packet, effective_summarizer, cancel).map_err(|err| match err {
             CompactError::Cancelled => CompactPolicyError::Cancelled,
             CompactError::InvalidPacket => CompactPolicyError::InvalidPacket,
         })?;
@@ -332,7 +337,8 @@ mod tests {
 
     #[test]
     fn classification_matches_band_boundaries() {
-        let policy = CompactionPolicy::new(50, 100, CompactionStrategy::ModelPreferred).expect("policy");
+        let policy =
+            CompactionPolicy::new(50, 100, CompactionStrategy::ModelPreferred).expect("policy");
         assert_eq!(classify(49, &policy), ThresholdDecision::Under);
         assert_eq!(classify(50, &policy), ThresholdDecision::Soft);
         assert_eq!(classify(99, &policy), ThresholdDecision::Soft);
@@ -348,22 +354,35 @@ mod tests {
                 .user(block("task", 10)),
         )
         .expect("compile");
-        let policy = CompactionPolicy::new(500, 900, CompactionStrategy::ModelPreferred).expect("policy");
-        let outcome =
-            compact_with_policy(&packet, &policy, Some(&OkSummarizer), &CancellationToken::new())
-                .expect("outcome");
+        let policy =
+            CompactionPolicy::new(500, 900, CompactionStrategy::ModelPreferred).expect("policy");
+        let outcome = compact_with_policy(
+            &packet,
+            &policy,
+            Some(&OkSummarizer),
+            &CancellationToken::new(),
+        )
+        .expect("outcome");
         assert_eq!(outcome.decision, ThresholdDecision::Under);
         assert!(outcome.compacted.is_none());
         assert!(outcome.evidence.verified);
-        assert_eq!(outcome.evidence.before_tokens, outcome.evidence.after_estimate_tokens);
+        assert_eq!(
+            outcome.evidence.before_tokens,
+            outcome.evidence.after_estimate_tokens
+        );
     }
 
     #[test]
     fn soft_decision_prefers_model_summary_and_verifies() {
-        let policy = CompactionPolicy::new(10, 10_000, CompactionStrategy::ModelPreferred).expect("policy");
-        let outcome =
-            compact_with_policy(&packet(), &policy, Some(&OkSummarizer), &CancellationToken::new())
-                .expect("outcome");
+        let policy =
+            CompactionPolicy::new(10, 10_000, CompactionStrategy::ModelPreferred).expect("policy");
+        let outcome = compact_with_policy(
+            &packet(),
+            &policy,
+            Some(&OkSummarizer),
+            &CancellationToken::new(),
+        )
+        .expect("outcome");
         assert_eq!(outcome.decision, ThresholdDecision::Soft);
         let compacted = outcome.compacted.expect("compacted");
         assert_eq!(compacted.method(), CompactMethod::Model);
@@ -373,7 +392,8 @@ mod tests {
 
     #[test]
     fn deterministic_strategy_never_calls_the_summarizer() {
-        let policy = CompactionPolicy::new(10, 10_000, CompactionStrategy::DeterministicOnly).expect("policy");
+        let policy = CompactionPolicy::new(10, 10_000, CompactionStrategy::DeterministicOnly)
+            .expect("policy");
         let outcome = compact_with_policy(
             &packet(),
             &policy,
@@ -393,14 +413,10 @@ mod tests {
             Err(PolicyValidationError::SoftNotBelowHard),
             "degenerate bands are rejected at construction"
         );
-        let policy = CompactionPolicy::new(1, 2, CompactionStrategy::DeterministicOnly).expect("policy");
-        let err = compact_with_policy(
-            &packet(),
-            &policy,
-            None,
-            &CancellationToken::new(),
-        )
-        .expect_err("replacement cannot fit in 2 tokens");
+        let policy =
+            CompactionPolicy::new(1, 2, CompactionStrategy::DeterministicOnly).expect("policy");
+        let err = compact_with_policy(&packet(), &policy, None, &CancellationToken::new())
+            .expect_err("replacement cannot fit in 2 tokens");
         match err {
             CompactPolicyError::StillOverHard { estimate, hard } => {
                 assert!(estimate >= hard);
@@ -424,7 +440,8 @@ mod tests {
         // most of the way there. The old locator-label-based estimate would
         // have summed to only a handful of tokens (nowhere near 50) and
         // wrongly reported `verified: true`.
-        let policy = CompactionPolicy::new(1, 50, CompactionStrategy::DeterministicOnly).expect("policy");
+        let policy =
+            CompactionPolicy::new(1, 50, CompactionStrategy::DeterministicOnly).expect("policy");
         let packet = compile(
             &CompileContext::new(100, 20)
                 .safety_margin(0)
@@ -450,7 +467,8 @@ mod tests {
     fn cancelled_input_fails_typed() {
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let policy = CompactionPolicy::new(10, 10_000, CompactionStrategy::ModelPreferred).expect("policy");
+        let policy =
+            CompactionPolicy::new(10, 10_000, CompactionStrategy::ModelPreferred).expect("policy");
         assert_eq!(
             compact_with_policy(&packet(), &policy, Some(&OkSummarizer), &cancel),
             Err(CompactPolicyError::Cancelled)

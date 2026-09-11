@@ -102,7 +102,11 @@ impl fmt::Display for AgentDefError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Parse { path, reason } => {
-                write!(f, "agent definition {} is invalid: {reason}", path.display())
+                write!(
+                    f,
+                    "agent definition {} is invalid: {reason}",
+                    path.display()
+                )
             }
             Self::IdInvalid => write!(
                 f,
@@ -111,10 +115,9 @@ impl fmt::Display for AgentDefError {
             Self::IdTooLong { limit } => {
                 write!(f, "definition id exceeds {limit} bytes")
             }
-            Self::DescriptionTooLarge { limit, observed } => write!(
-                f,
-                "description is {observed} bytes; limit is {limit} bytes"
-            ),
+            Self::DescriptionTooLarge { limit, observed } => {
+                write!(f, "description is {observed} bytes; limit is {limit} bytes")
+            }
             Self::UnknownRole { name } => {
                 write!(f, "unknown role '{name}'; see AgentRole::ALL")
             }
@@ -363,11 +366,10 @@ impl AgentDefinition {
                         path: path.clone(),
                         reason: "[agent] tools entries must be strings".to_string(),
                     })?;
-                    let class = parse_tool_class(name).ok_or_else(|| {
-                        AgentDefError::UnknownToolClass {
+                    let class =
+                        parse_tool_class(name).ok_or_else(|| AgentDefError::UnknownToolClass {
                             name: name.to_string(),
-                        }
-                    })?;
+                        })?;
                     tool_surface = tool_surface.with(class);
                 }
             }
@@ -425,15 +427,14 @@ impl AgentDefinition {
 /// Compiled-in definitions. Project files may add agents but never shadow
 /// these ids.
 pub fn builtin_definitions() -> Vec<AgentDefinition> {
-    let builtin = |id: &str, description: &str, role: AgentRole, surface: RoleToolSurface| {
-        AgentDefinition {
+    let builtin =
+        |id: &str, description: &str, role: AgentRole, surface: RoleToolSurface| AgentDefinition {
             id: AgentDefId::parse(id).expect("builtin id is canonical"),
             description: description.to_string(),
             role,
             tool_surface: surface,
             source: DefSource::BuiltIn,
-        }
-    };
+        };
     use RoleToolClass::{Git, Read};
     vec![
         builtin(
@@ -660,7 +661,8 @@ mod tests {
         assert!(err.to_string().contains("unknown top-level field 'extra'"));
         let unknown_agent = format!("{}\n", def_toml("x", "explorer", "[]"))
             .replace("tools = []", "tools = []\nstealth = true");
-        let err = AgentDefinition::parse(DefSource::BuiltIn, &unknown_agent).expect_err("agent field");
+        let err =
+            AgentDefinition::parse(DefSource::BuiltIn, &unknown_agent).expect_err("agent field");
         assert!(err.to_string().contains("unknown [agent] field 'stealth'"));
     }
 
@@ -690,7 +692,10 @@ mod tests {
         let err = def
             .validate_grants(&registry)
             .expect_err("missing implementation");
-        assert!(err.to_string().contains("no declared runtime implementation"));
+        assert!(
+            err.to_string()
+                .contains("no declared runtime implementation")
+        );
         // With Git declared the same definition validates.
         let registry = registry.declare(RoleToolClass::Git, "rapidlm.impl.git.v1");
         def.validate_grants(&registry).expect("declared");
@@ -716,11 +721,8 @@ mod tests {
     fn scaffold_output_parses_back_into_a_valid_definition() {
         let id = AgentDefId::parse("my-agent").expect("id");
         let text = AgentDefinition::scaffold(&id);
-        let def = AgentDefinition::parse(
-            DefSource::Project(PathBuf::from("scaffold")),
-            &text,
-        )
-        .expect("scaffold parses");
+        let def = AgentDefinition::parse(DefSource::Project(PathBuf::from("scaffold")), &text)
+            .expect("scaffold parses");
         assert_eq!(def.id.as_str(), "my-agent");
         let registry = full_registry();
         def.validate_grants(&registry).expect("scaffold validates");
@@ -743,8 +745,11 @@ mod tests {
         // Not a regular file: rejected without following. The real target
         // lives in a subdirectory the scan does not read.
         std::fs::create_dir_all(dir.join("src")).expect("mkdir src");
-        std::fs::write(dir.join("src/real.toml"), def_toml("target", "explorer", "[]"))
-            .expect("write target");
+        std::fs::write(
+            dir.join("src/real.toml"),
+            def_toml("target", "explorer", "[]"),
+        )
+        .expect("write target");
         #[cfg(unix)]
         std::os::unix::fs::symlink(dir.join("src/real.toml"), dir.join("link.toml"))
             .expect("symlink");
@@ -758,9 +763,17 @@ mod tests {
             .iter()
             .map(|r| r.reason.as_str())
             .collect();
-        assert!(rejected_reasons.iter().any(|r| r.contains("unsupported schema")));
+        assert!(
+            rejected_reasons
+                .iter()
+                .any(|r| r.contains("unsupported schema"))
+        );
         #[cfg(unix)]
-        assert!(rejected_reasons.iter().any(|r| r.contains("not a regular file")));
+        assert!(
+            rejected_reasons
+                .iter()
+                .any(|r| r.contains("not a regular file"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -801,8 +814,11 @@ mod tests {
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("rapidlm-agent-defs-collide-{seq}"));
         std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::write(dir.join("shadow.toml"), def_toml("explore", "explorer", "[\"read\"]"))
-            .expect("write");
+        std::fs::write(
+            dir.join("shadow.toml"),
+            def_toml("explore", "explorer", "[\"read\"]"),
+        )
+        .expect("write");
         let registry = full_registry();
         let err = load_directory(&dir, &registry).expect_err("collision");
         assert!(err.to_string().contains("cannot be overridden"));
@@ -817,8 +833,11 @@ mod tests {
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("rapidlm-agent-defs-full-{seq}"));
         std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::write(dir.join("z.toml"), def_toml("z-project", "tester", "[\"read\"]"))
-            .expect("write");
+        std::fs::write(
+            dir.join("z.toml"),
+            def_toml("z-project", "tester", "[\"read\"]"),
+        )
+        .expect("write");
         let registry = full_registry();
         let inventory = full_inventory(&dir, &registry).expect("inventory");
         let ids: Vec<&str> = inventory.loaded.iter().map(|d| d.id.as_str()).collect();

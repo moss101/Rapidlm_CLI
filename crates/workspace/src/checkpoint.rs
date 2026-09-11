@@ -1503,14 +1503,26 @@ mod tests {
         let fx = fixture(ViewAccess::ReadWrite);
         let a = repo("src/a.rs");
         let b = repo("src/b.rs");
-        backend(&fx).write(&a, b"a1\n", None, &cancel()).expect("write a").expect("entry");
-        backend(&fx).write(&b, b"b1\n", None, &cancel()).expect("write b").expect("entry");
+        backend(&fx)
+            .write(&a, b"a1\n", None, &cancel())
+            .expect("write a")
+            .expect("entry");
+        backend(&fx)
+            .write(&b, b"b1\n", None, &cancel())
+            .expect("write b")
+            .expect("entry");
         let manager = CheckpointManager::new();
         let snap = manager
             .checkpoint(backend(&fx).view(), backend(&fx), "before", &cancel())
             .expect("checkpoint");
-        backend(&fx).write(&a, b"a2\n", None, &cancel()).expect("update a").expect("entry");
-        backend(&fx).write(&b, b"b2\n", None, &cancel()).expect("update b").expect("entry");
+        backend(&fx)
+            .write(&a, b"a2\n", None, &cancel())
+            .expect("update a")
+            .expect("entry");
+        backend(&fx)
+            .write(&b, b"b2\n", None, &cancel())
+            .expect("update b")
+            .expect("entry");
 
         let stored = {
             let inner = manager.lock().expect("lock");
@@ -1521,7 +1533,8 @@ mod tests {
                 .expect("stored checkpoint")
         };
         let journal = backend(&fx).journal().expect("journal");
-        let (ops, conflicts) = plan_rewind(backend(&fx), &stored, &journal, &cancel()).expect("plan");
+        let (ops, conflicts) =
+            plan_rewind(backend(&fx), &stored, &journal, &cancel()).expect("plan");
         assert!(conflicts.is_empty());
         assert_eq!(ops.len(), 2, "both files need restoring");
 
@@ -1529,20 +1542,27 @@ mod tests {
         // apply just the first op, exactly like `apply_plan`'s loop would.
         apply_one(backend(&fx), &ops[0], &cancel()).expect("apply first op");
         assert_eq!(
-            backend(&fx).read(&ops[0].path, &cancel()).expect("read after apply"),
+            backend(&fx)
+                .read(&ops[0].path, &cancel())
+                .expect("read after apply"),
             b"a1\n",
             "the first op's own restore must have landed"
         );
 
         rollback_applied(backend(&fx), &ops[..1]);
         assert_eq!(
-            backend(&fx).read(&ops[0].path, &cancel()).expect("read after rollback"),
+            backend(&fx)
+                .read(&ops[0].path, &cancel())
+                .expect("read after rollback"),
             b"a2\n",
             "rollback must undo the applied op, restoring the pre-rewind (modified) content"
         );
         // The second file was never touched by either the simulated partial
         // apply or the rollback — it must be untouched throughout.
-        assert_eq!(backend(&fx).read(&b, &cancel()).expect("b untouched"), b"b2\n");
+        assert_eq!(
+            backend(&fx).read(&b, &cancel()).expect("b untouched"),
+            b"b2\n"
+        );
     }
 
     #[test]

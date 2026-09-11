@@ -945,48 +945,42 @@ impl ExternalScannerAdapter {
 
         match kind {
             ExternalExecKind::Cancelled => Err(ExternalScanError::Cancelled),
-            ExternalExecKind::Unavailable => {
-                Ok(status_report(
-                    ExternalScanStatus::Unavailable,
-                    evidence,
-                    Vec::new(),
-                    0,
-                    0,
-                    sarif.len(),
-                    raw,
-                    vec![ExternalScanError::Unavailable],
-                    &request.config,
-                    None,
-                ))
-            }
-            ExternalExecKind::TimedOut => {
-                Ok(status_report(
-                    ExternalScanStatus::Error,
-                    evidence,
-                    Vec::new(),
-                    0,
-                    0,
-                    sarif.len(),
-                    raw,
-                    vec![ExternalScanError::TimedOut],
-                    &request.config,
-                    None,
-                ))
-            }
-            ExternalExecKind::Crashed => {
-                Ok(status_report(
-                    ExternalScanStatus::Error,
-                    evidence,
-                    Vec::new(),
-                    0,
-                    0,
-                    sarif.len(),
-                    raw,
-                    vec![ExternalScanError::Crashed],
-                    &request.config,
-                    None,
-                ))
-            }
+            ExternalExecKind::Unavailable => Ok(status_report(
+                ExternalScanStatus::Unavailable,
+                evidence,
+                Vec::new(),
+                0,
+                0,
+                sarif.len(),
+                raw,
+                vec![ExternalScanError::Unavailable],
+                &request.config,
+                None,
+            )),
+            ExternalExecKind::TimedOut => Ok(status_report(
+                ExternalScanStatus::Error,
+                evidence,
+                Vec::new(),
+                0,
+                0,
+                sarif.len(),
+                raw,
+                vec![ExternalScanError::TimedOut],
+                &request.config,
+                None,
+            )),
+            ExternalExecKind::Crashed => Ok(status_report(
+                ExternalScanStatus::Error,
+                evidence,
+                Vec::new(),
+                0,
+                0,
+                sarif.len(),
+                raw,
+                vec![ExternalScanError::Crashed],
+                &request.config,
+                None,
+            )),
             ExternalExecKind::Completed { exit_code } => {
                 let parsed = match parse_sarif(sarif, request.config.kind, cancel) {
                     Ok(parsed) => parsed,
@@ -1779,8 +1773,7 @@ mod tests {
             );
             assert_ne!(report.status(), ExternalScanStatus::Passed);
             assert!(
-                report
-                    .errors().contains(&ExternalScanError::MalformedSarif),
+                report.errors().contains(&ExternalScanError::MalformedSarif),
                 "missing malformed error for {body:?}"
             );
             if !body.is_empty() {

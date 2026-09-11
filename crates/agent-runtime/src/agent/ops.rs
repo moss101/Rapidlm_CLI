@@ -63,9 +63,7 @@ pub enum AttemptSelectionError {
     /// Attempt indexes must be unique; duplicates mean the host double-counted.
     DuplicateIndex,
     /// More attempts than one selection may consider.
-    TooManyAttempts {
-        limit: usize,
-    },
+    TooManyAttempts { limit: usize },
     /// Every attempt was cancelled or failed.
     NoViableAttempt,
     /// An empty attempt list has nothing to select.
@@ -97,7 +95,9 @@ impl AttemptSelector {
     /// Reject terminal-failure attempts outright, then prefer the cheapest
     /// viable attempt by tokens; ties resolve to the lowest index. The
     /// decision depends only on the input list, so re-running it is stable.
-    pub fn select_best(attempts: &[ScoredAttempt]) -> Result<&ScoredAttempt, AttemptSelectionError> {
+    pub fn select_best(
+        attempts: &[ScoredAttempt],
+    ) -> Result<&ScoredAttempt, AttemptSelectionError> {
         if attempts.is_empty() {
             return Err(AttemptSelectionError::NoAttempts);
         }
@@ -107,7 +107,10 @@ impl AttemptSelector {
             });
         }
         for (i, attempt) in attempts.iter().enumerate() {
-            if attempts[..i].iter().any(|prior| prior.index == attempt.index) {
+            if attempts[..i]
+                .iter()
+                .any(|prior| prior.index == attempt.index)
+            {
                 return Err(AttemptSelectionError::DuplicateIndex);
             }
         }
@@ -183,10 +186,8 @@ impl SweepPlanner {
                     plan.retain.push((record.view_id, RetainReason::Active));
                 }
                 GitWorktreeRecordState::CleanupFailed => {
-                    plan.retain.push((
-                        record.view_id,
-                        RetainReason::CleanupFailedNeedsOperator,
-                    ));
+                    plan.retain
+                        .push((record.view_id, RetainReason::CleanupFailedNeedsOperator));
                 }
             }
         }
@@ -210,19 +211,11 @@ pub struct ReplayRecord {
 /// Typed replay failures. Malformed records are rejected, never repaired.
 #[derive(Debug)]
 pub enum ReplayError {
-    SchemaMismatch {
-        found: String,
-    },
-    UnknownStatus {
-        name: String,
-    },
-    SummaryTooLarge {
-        limit: usize,
-    },
+    SchemaMismatch { found: String },
+    UnknownStatus { name: String },
+    SummaryTooLarge { limit: usize },
     EmptySummary,
-    TooManyRecords {
-        limit: usize,
-    },
+    TooManyRecords { limit: usize },
     Decode(serde_json::Error),
 }
 
@@ -258,12 +251,13 @@ impl std::error::Error for ReplayError {
 }
 
 /// Persist one batch of scored attempts as replay JSON.
-pub fn persist_replay(attempts: &[ScoredAttempt], summaries: &[String]) -> Result<String, ReplayError> {
+pub fn persist_replay(
+    attempts: &[ScoredAttempt],
+    summaries: &[String],
+) -> Result<String, ReplayError> {
     if attempts.len() != summaries.len() {
         return Err(ReplayError::Decode(
-            <serde_json::Error as serde::de::Error>::custom(
-                "attempt and summary counts differ",
-            ),
+            <serde_json::Error as serde::de::Error>::custom("attempt and summary counts differ"),
         ));
     }
     let records: Vec<ReplayRecord> = attempts
@@ -352,7 +346,12 @@ mod tests {
             attempt(4, AgentTerminalStatus::Succeeded, 100),
             attempt(2, AgentTerminalStatus::Succeeded, 100),
         ];
-        assert_eq!(AttemptSelector::select_best(&attempts).expect("select").index, 2);
+        assert_eq!(
+            AttemptSelector::select_best(&attempts)
+                .expect("select")
+                .index,
+            2
+        );
     }
 
     #[test]
@@ -477,7 +476,10 @@ mod tests {
         let empty = format!(
             "[{{\"schema\":\"{REPLAY_SCHEMA}\",\"index\":0,\"status\":\"succeeded\",\"tokens\":1,\"summary\":\"\"}}]"
         );
-        assert!(matches!(hydrate_replay(&empty), Err(ReplayError::EmptySummary)));
+        assert!(matches!(
+            hydrate_replay(&empty),
+            Err(ReplayError::EmptySummary)
+        ));
     }
 
     #[test]

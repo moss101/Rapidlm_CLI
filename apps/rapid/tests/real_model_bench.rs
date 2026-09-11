@@ -120,8 +120,14 @@ fn run_real(project: &Path, home: &Path, prompt: &str, scenario: &str) -> RealRu
     // Persist the run output as evidence when an evidence dir is provided.
     if let Ok(dir) = std::env::var("RAPIDLM_EVIDENCE_DIR") {
         let base = std::path::Path::new(&dir).join(format!("real-{scenario}"));
-        let _ = std::fs::write(format!("{}-{}.out.log", base.to_string_lossy(), std::process::id()), &output.stdout);
-        let _ = std::fs::write(format!("{}-{}.err.log", base.to_string_lossy(), std::process::id()), &output.stderr);
+        let _ = std::fs::write(
+            format!("{}-{}.out.log", base.to_string_lossy(), std::process::id()),
+            &output.stdout,
+        );
+        let _ = std::fs::write(
+            format!("{}-{}.err.log", base.to_string_lossy(), std::process::id()),
+            &output.stderr,
+        );
     }
     run
 }
@@ -141,7 +147,12 @@ fn real_s1_single_tool_call_creates_a_file() {
         "Create a file named hello.txt whose content is exactly: hello from rapidlm",
         "S1_smoke",
     );
-    assert!(!run.timed_out, "run exceeded {}s: {}", RUN_DEADLINE.as_secs(), run.stderr);
+    assert!(
+        !run.timed_out,
+        "run exceeded {}s: {}",
+        RUN_DEADLINE.as_secs(),
+        run.stderr
+    );
     assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
     let content = project.read("hello.txt");
     assert!(
@@ -171,14 +182,23 @@ fn real_s2_cross_step_memory_two_reads_then_sum() {
          containing just the sum of the two numbers you read. Finally state the sum.",
         "S2_cross_step",
     );
-    assert!(!run.timed_out, "run exceeded {}s: {}", RUN_DEADLINE.as_secs(), run.stderr);
+    assert!(
+        !run.timed_out,
+        "run exceeded {}s: {}",
+        RUN_DEADLINE.as_secs(),
+        run.stderr
+    );
     assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
     let content = project.read("sum.txt");
     assert!(
         content.contains("42"),
         "sum.txt must contain 42 (17+25) — cross-step memory defect if missing: {content:?}"
     );
-    assert!(run.stdout.contains("42"), "final answer must state 42: {}", run.stdout);
+    assert!(
+        run.stdout.contains("42"),
+        "final answer must state 42: {}",
+        run.stdout
+    );
 }
 
 #[test]
@@ -213,7 +233,12 @@ fn real_s3_multi_file_rename_with_verification() {
          then report how many files you changed.",
         "S3_rename",
     );
-    assert!(!run.timed_out, "run exceeded {}s: {}", RUN_DEADLINE.as_secs(), run.stderr);
+    assert!(
+        !run.timed_out,
+        "run exceeded {}s: {}",
+        RUN_DEADLINE.as_secs(),
+        run.stderr
+    );
     assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
     for name in ["src_a.rs", "src_b.rs", "src_c.rs"] {
         let content = project.read(name);
@@ -258,16 +283,23 @@ fn real_s4_subagent_explore_task() {
          workspace_write containing exactly what the subagent reported, and state the code.",
         "S4_subagent",
     );
-    assert!(!run.timed_out, "run exceeded {}s: {}", RUN_DEADLINE.as_secs(), run.stderr);
+    assert!(
+        !run.timed_out,
+        "run exceeded {}s: {}",
+        RUN_DEADLINE.as_secs(),
+        run.stderr
+    );
     assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
     let content = project.read("report.txt");
     assert!(
         content.contains("BLUE-7"),
         "report.txt must carry the subagent's finding: {content:?}"
     );
-    assert!(run.stdout.contains("BLUE-7"), "final answer must carry the code");
+    assert!(
+        run.stdout.contains("BLUE-7"),
+        "final answer must carry the code"
+    );
 }
-
 
 #[test]
 fn real_s5_web_fetch_through_the_live_provider() {
@@ -286,7 +318,12 @@ fn real_s5_web_fetch_through_the_live_provider() {
         "Use web_fetch to fetch https://example.com and then tell me the page's main          heading. After reporting the heading, create a file named heading.txt containing          just that heading text.",
         "S5_web_fetch",
     );
-    assert!(!run.timed_out, "run exceeded {}s: {}", RUN_DEADLINE.as_secs(), run.stderr);
+    assert!(
+        !run.timed_out,
+        "run exceeded {}s: {}",
+        RUN_DEADLINE.as_secs(),
+        run.stderr
+    );
     assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
     let content = project.read("heading.txt");
     assert!(

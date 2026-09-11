@@ -910,9 +910,9 @@ mod tests {
         ModelPurpose, PriceTableVersion, PrivacyClass, ProviderCapabilities, ProviderId,
         ReasoningSupport, Region, UsageFieldSet,
     };
-    use crate::route::filter::{eligible, RouteRequest, LOCAL_ONLY_TAG, NO_TRAINING_TAG};
+    use crate::route::filter::{LOCAL_ONLY_TAG, NO_TRAINING_TAG, RouteRequest, eligible};
     use crate::route::score::{
-        select, QualityPrior, ReliabilityPrior, RoutePolicyV1, RouteWeightsV1, ScoreDefaultsV1,
+        QualityPrior, ReliabilityPrior, RoutePolicyV1, RouteWeightsV1, ScoreDefaultsV1, select,
     };
 
     const GOLDEN_TRACE: &str = "018f3c8a-7e2b-7a10-8c4d-0123456789ab";
@@ -1483,9 +1483,11 @@ mod tests {
         assert_eq!(api.code(), ErrorCode::PolicyDenied);
         assert!(!api.message().contains(leak));
         assert!(!api.retryable());
-        assert!(FallbackError::Cancelled
-            .into_api_error(GOLDEN_TRACE.parse().expect("trace"))
-            .is_none());
+        assert!(
+            FallbackError::Cancelled
+                .into_api_error(GOLDEN_TRACE.parse().expect("trace"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -1502,10 +1504,12 @@ mod tests {
                 !rejected.iter().any(|denied| denied == model),
                 "denied model entered chain: {model:?}"
             );
-            assert!(decision
-                .candidate_scores()
-                .iter()
-                .any(|row| row.model() == model));
+            assert!(
+                decision
+                    .candidate_scores()
+                    .iter()
+                    .any(|row| row.model() == model)
+            );
         }
         assert_eq!(controller.chain()[0], *decision.model());
     }
@@ -1522,7 +1526,10 @@ mod tests {
             &live(),
         )
         .expect("controller");
-        assert_eq!(controller.chain(), &[primary.clone(), alt1.clone(), alt2.clone()]);
+        assert_eq!(
+            controller.chain(),
+            &[primary.clone(), alt1.clone(), alt2.clone()]
+        );
         assert_eq!(controller.current(), &primary);
     }
 
@@ -1540,14 +1547,19 @@ mod tests {
         // Exhaust same-model retries; with nothing configured to fall back
         // onto, the only valid outcome is Stop, never a fabricated alternate.
         for _ in 0..=FallbackPolicy::standard().max_same_model_retries() {
-            let plan = controller.plan(&trigger, AttemptProgress::PreResponse, &live()).expect("plan");
+            let plan = controller
+                .plan(&trigger, AttemptProgress::PreResponse, &live())
+                .expect("plan");
             controller.apply(&plan).expect("apply");
         }
         let plan = controller
             .plan(&trigger, AttemptProgress::PreResponse, &live())
             .expect("plan");
         match plan {
-            FallbackPlan::PreResponse { action: FallbackAction::Stop { reason, .. }, .. } => {
+            FallbackPlan::PreResponse {
+                action: FallbackAction::Stop { reason, .. },
+                ..
+            } => {
                 assert_eq!(reason, StopReason::FallbackChainExhausted);
             }
             other => panic!("expected Stop, got {other:?}"),
@@ -1577,7 +1589,9 @@ mod tests {
                 assert_eq!(from, &primary);
                 assert_eq!(to, &alt);
             }
-            other => panic!("expected an auth failure to fall back onto the configured alternate, got {other:?}"),
+            other => panic!(
+                "expected an auth failure to fall back onto the configured alternate, got {other:?}"
+            ),
         }
         controller.apply(&plan).expect("apply");
         assert_eq!(controller.current(), &alt);

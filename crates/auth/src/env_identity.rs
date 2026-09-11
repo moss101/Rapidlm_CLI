@@ -100,8 +100,7 @@ mod tests {
         // single crafted binding could collide with a genuinely different
         // multi-variable environment's fingerprint.
         let two_bindings = EnvIdentity::from_parts(1000, env(&[("a", "1"), ("b", "2")]));
-        let one_crafted_binding =
-            EnvIdentity::from_parts(1000, env(&[("a", "1\0b\x002")]));
+        let one_crafted_binding = EnvIdentity::from_parts(1000, env(&[("a", "1\0b\x002")]));
         assert_ne!(two_bindings, one_crafted_binding);
     }
 

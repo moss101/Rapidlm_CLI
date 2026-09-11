@@ -281,7 +281,6 @@ impl EventLedger {
         &self,
         cancel: &CancellationToken,
     ) -> Result<Vec<SessionSummary>, LedgerError> {
-        
         cancel.check()?;
         let conn = self.connect()?;
         let mut stmt = conn.prepare(

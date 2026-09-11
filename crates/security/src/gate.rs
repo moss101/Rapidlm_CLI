@@ -10,7 +10,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 use crate::scanners::command::{CommandScanReport, CommandScanStatus, SCANNER_ID as COMMAND_ID};
 use crate::scanners::external::{ExternalScanReport, ExternalScanStatus, MAX_SCANNER_ID_BYTES};
 use crate::scanners::patch::{PatchScanReport, PatchScanStatus, SCANNER_ID as PATCH_ID};
-use crate::scanners::secrets::{ScanReport, ScanStatus, SCANNER_ID as SECRETS_ID};
+use crate::scanners::secrets::{SCANNER_ID as SECRETS_ID, ScanReport, ScanStatus};
 
 /// Maximum required scanners on one [`ScanGatePolicy`].
 pub const MAX_REQUIRED_SCANNERS: usize = 32;
@@ -848,10 +848,12 @@ mod tests {
         assert!(verdict.allows_apply());
         assert!(verdict.allows_verification());
         assert_eq!(verdict.phase(), GatePhase::Apply);
-        assert!(verdict
-            .reasons()
-            .iter()
-            .all(|reason| reason.code() == GateReasonCode::Clean));
+        assert!(
+            verdict
+                .reasons()
+                .iter()
+                .all(|reason| reason.code() == GateReasonCode::Clean)
+        );
     }
 
     #[test]

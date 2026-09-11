@@ -18,8 +18,8 @@ use protocol::{ApiError, ArtifactId, ArtifactIdParseError, ErrorCode, TraceId};
 use serde_json::{Map, Value};
 
 use crate::manifest::{
-    CompatibilityRange, ManifestTrustBinding, PluginId, PluginVersion, PublisherId, SemVer,
-    MAX_REQUESTED_CAPS,
+    CompatibilityRange, MAX_REQUESTED_CAPS, ManifestTrustBinding, PluginId, PluginVersion,
+    PublisherId, SemVer,
 };
 use crate::skills::ProjectTrust;
 
@@ -1040,9 +1040,10 @@ impl ExtensionTrustStore {
             });
         }
         if let Some(parent) = self.catalog.parent()
-            && !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
         let tmp = part_path(&self.catalog);
         let write_result = (|| {
             cancel_check(cancel)?;
@@ -1072,9 +1073,11 @@ impl ExtensionTrustStore {
         cancel: &CancellationToken,
     ) -> Result<bool, TrustError> {
         if let Some(stored) = stored
-            && stored.identity.publisher_eq(identity) && stored.identity.package_eq(identity) {
-                return Ok(false);
-            }
+            && stored.identity.publisher_eq(identity)
+            && stored.identity.package_eq(identity)
+        {
+            return Ok(false);
+        }
         let observations = self.load_quarantine(cancel)?;
         Ok(observations
             .iter()
@@ -1141,9 +1144,10 @@ impl ExtensionTrustStore {
         }
         let path = self.quarantine_path();
         if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
         let tmp = part_path(&path);
         let write_result = (|| {
             cancel_check(cancel)?;
@@ -2488,11 +2492,13 @@ mod tests {
                 .expect_err("cancel"),
             TrustError::Cancelled
         );
-        assert!(store
-            .get(&identity("acme.fmt", "1.2.3", HASH_A), &cancel)
-            .expect_err("cancel")
-            .code()
-            .is_none());
+        assert!(
+            store
+                .get(&identity("acme.fmt", "1.2.3", HASH_A), &cancel)
+                .expect_err("cancel")
+                .code()
+                .is_none()
+        );
     }
 
     #[test]

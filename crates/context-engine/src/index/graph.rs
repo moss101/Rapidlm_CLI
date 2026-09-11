@@ -1821,7 +1821,9 @@ fn helper() -> u32 { 1 }
 
         let a_fn = locator_of(&a, SymbolKind::Function, "a");
         let b_fn = locator_of(&b, SymbolKind::Function, "b");
-        let found = graph.symbols_at_path(repo, &path("src/a.rs")).expect("lookup");
+        let found = graph
+            .symbols_at_path(repo, &path("src/a.rs"))
+            .expect("lookup");
         assert!(found.contains(&a_fn), "{found:?}");
         assert!(!found.contains(&b_fn), "b.rs's symbols must not leak in");
 
@@ -1844,7 +1846,9 @@ fn helper() -> u32 { 1 }
         // (b.rs), find its symbols, then find what would be impacted by
         // changing them, then resolve those impacted symbols to a
         // human-showable (name, path).
-        let symbols = graph.symbols_at_path(repo, &path("src/b.rs")).expect("lookup");
+        let symbols = graph
+            .symbols_at_path(repo, &path("src/b.rs"))
+            .expect("lookup");
         let b_fn = locator_of(&b, SymbolKind::Function, "b");
         assert!(symbols.contains(&b_fn), "{symbols:?}");
         let impacted = graph.impact(&b_fn, 1, 64).expect("impact");
@@ -1853,11 +1857,17 @@ fn helper() -> u32 { 1 }
             .filter_map(|edge| graph.symbol_label(edge.from()))
             .collect();
         assert!(
-            labelled.iter().any(|(name, p)| name == "a" && *p == path("src/a.rs")),
+            labelled
+                .iter()
+                .any(|(name, p)| name == "a" && *p == path("src/a.rs")),
             "{labelled:?}"
         );
 
-        assert!(graph.symbol_label(&locator_of(&a, SymbolKind::Function, "a")).is_some());
+        assert!(
+            graph
+                .symbol_label(&locator_of(&a, SymbolKind::Function, "a"))
+                .is_some()
+        );
         let bogus = SymbolLocator::new(repo, "nope").expect("locator");
         assert!(graph.symbol_label(&bogus).is_none());
     }

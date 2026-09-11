@@ -168,13 +168,19 @@ mod tests {
             }
         );
         let out = model.step(&input, &cancel).expect("step 2");
-        assert_eq!(out, ModelStepOutput::Terminal {
-            text: "second".into(),
-            tokens: 7,
-            cost_usd_micros: None,
-        });
+        assert_eq!(
+            out,
+            ModelStepOutput::Terminal {
+                text: "second".into(),
+                tokens: 7,
+                cost_usd_micros: None,
+            }
+        );
         // Exhausted script fails closed with BoundExceeded.
-        assert_eq!(model.step(&input, &cancel), Err(ModelStepError::BoundExceeded));
+        assert_eq!(
+            model.step(&input, &cancel),
+            Err(ModelStepError::BoundExceeded)
+        );
     }
 
     #[test]
@@ -198,9 +204,10 @@ mod tests {
 
     #[test]
     fn replay_provider_rebuilds_script_from_records_and_fails_closed_on_garbage() {
-        let provider =
-            ReplayProvider::from_records("{\"text\":\"a\",\"tokens\":2}\n{\"text\":\"b\",\"tokens\":3}\n")
-                .expect("records");
+        let provider = ReplayProvider::from_records(
+            "{\"text\":\"a\",\"tokens\":2}\n{\"text\":\"b\",\"tokens\":3}\n",
+        )
+        .expect("records");
         let mut provider = provider;
         let input = ModelStepInput::without_tools(0);
         let cancel = CancellationToken::new();
@@ -210,7 +217,10 @@ mod tests {
         ));
         assert!(ReplayProvider::from_records("{not json").is_err());
         assert!(ReplayProvider::from_records("   \n").is_err());
-        assert!(ReplayProvider::from_records("{\"text\":\"a\"}").is_err(), "missing tokens");
+        assert!(
+            ReplayProvider::from_records("{\"text\":\"a\"}").is_err(),
+            "missing tokens"
+        );
     }
 
     #[test]

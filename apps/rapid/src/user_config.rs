@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use llm_router::{parse_purpose_name, purpose_name, PhaseRoute, ReasoningEffort};
+use llm_router::{PhaseRoute, ReasoningEffort, parse_purpose_name, purpose_name};
 
 /// Env var holding an explicit config file path (Grok: `GROK_CONFIG`).
 pub const CONFIG_PATH_ENV: &str = "RAPIDLM_CONFIG";
@@ -161,38 +161,69 @@ pub enum ModelSelection {
         active: Box<ActiveModel>,
         warnings: Vec<String>,
     },
-    Unconfigured { searched: Vec<String> },
+    Unconfigured {
+        searched: Vec<String>,
+    },
 }
 
 /// Typed configuration failure. Messages name keys/paths, never secret values.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UserConfigError {
     /// `RAPIDLM_CONFIG` points at a missing file.
-    ExplicitConfigMissing { path: String },
-    Unreadable { path: String },
-    TooLarge { path: String },
-    InvalidUtf8 { path: String },
-    Syntax { path: String, message: String },
-    TypeMismatch { key: String },
-    InvalidValue { key: String, reason: String },
-    MissingKey { key: String },
+    ExplicitConfigMissing {
+        path: String,
+    },
+    Unreadable {
+        path: String,
+    },
+    TooLarge {
+        path: String,
+    },
+    InvalidUtf8 {
+        path: String,
+    },
+    Syntax {
+        path: String,
+        message: String,
+    },
+    TypeMismatch {
+        key: String,
+    },
+    InvalidValue {
+        key: String,
+        reason: String,
+    },
+    MissingKey {
+        key: String,
+    },
     NoModelsDefined,
-    NoDefaultModel { available: Vec<String> },
-    UnknownDefaultModel { id: String, available: Vec<String> },
+    NoDefaultModel {
+        available: Vec<String>,
+    },
+    UnknownDefaultModel {
+        id: String,
+        available: Vec<String>,
+    },
     /// A `[phases]` override names a `[model.<id>]` that does not exist.
-    UnknownPhaseModel { key: String, id: String, available: Vec<String> },
+    UnknownPhaseModel {
+        key: String,
+        id: String,
+        available: Vec<String>,
+    },
 }
 
 impl fmt::Display for UserConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ExplicitConfigMissing { path } => write!(
-                f,
-                "RAPIDLM_CONFIG points at a missing config file: {path}"
-            ),
+            Self::ExplicitConfigMissing { path } => {
+                write!(f, "RAPIDLM_CONFIG points at a missing config file: {path}")
+            }
             Self::Unreadable { path } => write!(f, "config file is not readable: {path}"),
             Self::TooLarge { path } => {
-                write!(f, "config file exceeds {MAX_USER_CONFIG_BYTES} bytes: {path}")
+                write!(
+                    f,
+                    "config file exceeds {MAX_USER_CONFIG_BYTES} bytes: {path}"
+                )
             }
             Self::InvalidUtf8 { path } => write!(f, "config file is not valid UTF-8: {path}"),
             Self::Syntax { path, message } => {
@@ -314,16 +345,16 @@ pub fn read_config_file(path: &Path) -> Result<UserConfig, UserConfigError> {
     // Bound the read itself, not just check the size of what was already
     // fully buffered — the same stat-then-read gap `read_file_bounded`
     // closes elsewhere in this binary.
-    let bytes = crate::exec_tools::read_file_bounded(path, MAX_USER_CONFIG_BYTES).map_err(|err| {
-        match err {
-            crate::exec_tools::BoundedReadError::TooLarge => {
-                UserConfigError::TooLarge { path: shown.clone() }
-            }
-            crate::exec_tools::BoundedReadError::Io(_) => {
-                UserConfigError::Unreadable { path: shown.clone() }
-            }
-        }
-    })?;
+    let bytes = crate::exec_tools::read_file_bounded(path, MAX_USER_CONFIG_BYTES).map_err(
+        |err| match err {
+            crate::exec_tools::BoundedReadError::TooLarge => UserConfigError::TooLarge {
+                path: shown.clone(),
+            },
+            crate::exec_tools::BoundedReadError::Io(_) => UserConfigError::Unreadable {
+                path: shown.clone(),
+            },
+        },
+    )?;
     let body = String::from_utf8(bytes).map_err(|_| UserConfigError::InvalidUtf8 {
         path: shown.clone(),
     })?;
@@ -332,11 +363,10 @@ pub fn read_config_file(path: &Path) -> Result<UserConfig, UserConfigError> {
 
 /// Parse a config document body (pure).
 pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserConfigError> {
-    let parsed: toml::Value = toml::from_str(body)
-        .map_err(|err| UserConfigError::Syntax {
-            path: path.to_owned(),
-            message: err.message().to_owned(),
-        })?;
+    let parsed: toml::Value = toml::from_str(body).map_err(|err| UserConfigError::Syntax {
+        path: path.to_owned(),
+        message: err.message().to_owned(),
+    })?;
     let root = parsed.as_table().ok_or(UserConfigError::TypeMismatch {
         key: "(document root)".to_owned(),
     })?;
@@ -387,9 +417,10 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
                 });
             }
             let entry_table = expect_table(value, &format!("model.{id}"))?;
-            models
-                .entries
-                .insert(id.clone(), parse_model_entry(id, entry_table, &mut unknown_keys)?);
+            models.entries.insert(
+                id.clone(),
+                parse_model_entry(id, entry_table, &mut unknown_keys)?,
+            );
         }
     }
 
@@ -402,7 +433,9 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
                 continue;
             };
             let id = expect_non_empty_str(value, &format!("phases.{key}"))?.to_owned();
-            phases.overrides.insert(purpose_name(purpose).to_owned(), id);
+            phases
+                .overrides
+                .insert(purpose_name(purpose).to_owned(), id);
         }
     }
 
@@ -475,7 +508,9 @@ fn parse_model_entry(
 
     let env_key = match table.get("env_key") {
         None => Vec::new(),
-        Some(toml::Value::String(raw)) => vec![validate_env_name(raw, &format!("{prefix}.env_key"))?],
+        Some(toml::Value::String(raw)) => {
+            vec![validate_env_name(raw, &format!("{prefix}.env_key"))?]
+        }
         Some(toml::Value::Array(items)) => {
             let mut names = Vec::with_capacity(items.len());
             for item in items {
@@ -507,10 +542,12 @@ fn parse_model_entry(
             let raw = value.as_str().ok_or(UserConfigError::TypeMismatch {
                 key: format!("{prefix}.reasoning_effort"),
             })?;
-            Some(ReasoningEffort::parse(raw).map_err(|_| UserConfigError::InvalidValue {
-                key: format!("{prefix}.reasoning_effort"),
-                reason: "expected none|minimal|low|medium|high|xhigh|ultra".to_owned(),
-            })?)
+            Some(
+                ReasoningEffort::parse(raw).map_err(|_| UserConfigError::InvalidValue {
+                    key: format!("{prefix}.reasoning_effort"),
+                    reason: "expected none|minimal|low|medium|high|xhigh|ultra".to_owned(),
+                })?,
+            )
         }
     };
 
@@ -530,9 +567,7 @@ fn parse_model_entry(
 fn validate_env_name(raw: &str, key: &str) -> Result<String, UserConfigError> {
     let valid = !raw.is_empty()
         && raw.len() <= 256
-        && raw
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        && raw.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
     if !valid {
         return Err(UserConfigError::InvalidValue {
             key: key.to_owned(),
@@ -555,19 +590,13 @@ fn positive_u32(value: &toml::Value, key: &str) -> Result<u32, UserConfigError> 
     Ok(raw as u32)
 }
 
-fn expect_table<'a>(
-    value: &'a toml::Value,
-    key: &str,
-) -> Result<&'a toml::Table, UserConfigError> {
+fn expect_table<'a>(value: &'a toml::Value, key: &str) -> Result<&'a toml::Table, UserConfigError> {
     value.as_table().ok_or(UserConfigError::TypeMismatch {
         key: key.to_owned(),
     })
 }
 
-fn expect_non_empty_str<'a>(
-    value: &'a toml::Value,
-    key: &str,
-) -> Result<&'a str, UserConfigError> {
+fn expect_non_empty_str<'a>(value: &'a toml::Value, key: &str) -> Result<&'a str, UserConfigError> {
     let raw = value.as_str().ok_or(UserConfigError::TypeMismatch {
         key: key.to_owned(),
     })?;
@@ -583,7 +612,10 @@ fn expect_non_empty_str<'a>(
 /// Apply the Grok precedence: `RAPIDLM_MODEL` > `[models].default`, then
 /// resolve the entry and its credential (`api_key` > first non-empty
 /// `env_key` > keyless).
-pub fn resolve_active(env: &[(String, String)], config: &UserConfig) -> Result<ActiveModel, UserConfigError> {
+pub fn resolve_active(
+    env: &[(String, String)],
+    config: &UserConfig,
+) -> Result<ActiveModel, UserConfigError> {
     if config.models.entries.is_empty() {
         return Err(UserConfigError::NoModelsDefined);
     }
@@ -606,14 +638,12 @@ pub fn resolve_active(env: &[(String, String)], config: &UserConfig) -> Result<A
             }
         },
     };
-    let entry = config
-        .models
-        .entries
-        .get(&default_id)
-        .ok_or_else(|| UserConfigError::UnknownDefaultModel {
+    let entry = config.models.entries.get(&default_id).ok_or_else(|| {
+        UserConfigError::UnknownDefaultModel {
             id: default_id.clone(),
             available: available.clone(),
-        })?;
+        }
+    })?;
     // `[phases]` overrides must name defined models; an unknown purpose name
     // was already demoted to a warning at parse time (typo tolerance), but a
     // missing target model is a hard error, like the default model.
@@ -632,12 +662,11 @@ pub fn resolve_active(env: &[(String, String)], config: &UserConfig) -> Result<A
             });
         }
         if let Some(purpose) = parse_purpose_name(purpose_name) {
-            let profile = llm_router::ProfileId::parse(id).map_err(|_| {
-                UserConfigError::InvalidValue {
+            let profile =
+                llm_router::ProfileId::parse(id).map_err(|_| UserConfigError::InvalidValue {
                     key: format!("phases.{purpose_name}"),
                     reason: "must satisfy the llm-router profile alphabet".to_owned(),
-                }
-            })?;
+                })?;
             route = route.with_override(purpose, profile);
         }
     }
@@ -701,13 +730,16 @@ pub fn resolve_purpose_model(
     if routed == active.profile_id {
         return Ok(active);
     }
-    let entry = config.models.entries.get(routed).ok_or_else(|| {
-        UserConfigError::UnknownPhaseModel {
-            key: format!("phases.{}", llm_router::purpose_name(purpose)),
-            id: routed.to_owned(),
-            available: config.models.entries.keys().cloned().collect(),
-        }
-    })?;
+    let entry =
+        config
+            .models
+            .entries
+            .get(routed)
+            .ok_or_else(|| UserConfigError::UnknownPhaseModel {
+                key: format!("phases.{}", llm_router::purpose_name(purpose)),
+                id: routed.to_owned(),
+                available: config.models.entries.keys().cloned().collect(),
+            })?;
     Ok(ActiveModel {
         profile_id: routed.to_owned(),
         entry: entry.clone(),
@@ -800,8 +832,8 @@ pub fn select_active_model_gated(
 }
 
 /// Process-env entry point for the managed-policy-aware selection.
-pub fn select_from_process_env_gated(
-) -> Result<ModelSelection, crate::managed_config::GatedConfigError> {
+pub fn select_from_process_env_gated()
+-> Result<ModelSelection, crate::managed_config::GatedConfigError> {
     let env: Vec<(String, String)> = std::env::vars().collect();
     select_active_model_gated(&env)
 }
@@ -872,7 +904,10 @@ base_url = "http://127.0.0.1:1"
 env_ky = "X"
 "#;
         let config = parse_config_document(doc, "test.toml").expect("parse");
-        assert_eq!(config.unknown_keys, vec!["models.typo_key", "model.a.env_ky"]);
+        assert_eq!(
+            config.unknown_keys,
+            vec!["models.typo_key", "model.a.env_ky"]
+        );
     }
 
     #[test]
@@ -941,24 +976,31 @@ reasoning_effort = "maximum"
 
     #[test]
     fn resolve_active_builds_phase_route_and_validates_targets() {
-        let config =
-            parse_config_document(PHASES_DOC, "test.toml").expect("parse");
+        let config = parse_config_document(PHASES_DOC, "test.toml").expect("parse");
         let active = resolve_active(&[], &config).expect("resolve");
         assert_eq!(active.profile_id, "local");
         assert_eq!(
-            active.phase_route.route(llm_router::provider::ModelPurpose::Compact)
+            active
+                .phase_route
+                .route(llm_router::provider::ModelPurpose::Compact)
                 .as_str(),
             "cloud"
         );
         assert_eq!(
-            active.phase_route.route(llm_router::provider::ModelPurpose::Chat).as_str(),
+            active
+                .phase_route
+                .route(llm_router::provider::ModelPurpose::Chat)
+                .as_str(),
             "local"
         );
         // The default-model env override also re-roots the phase route.
         let env = env(&[("RAPIDLM_MODEL", "cloud")]);
         let active = resolve_active(&env, &config).expect("resolve override");
         assert_eq!(
-            active.phase_route.route(llm_router::provider::ModelPurpose::Chat).as_str(),
+            active
+                .phase_route
+                .route(llm_router::provider::ModelPurpose::Chat)
+                .as_str(),
             "cloud"
         );
     }
@@ -979,9 +1021,10 @@ base_url = "http://127.0.0.1:11434/v1"
 "#;
         let config = parse_config_document(doc, "test.toml").expect("parse");
         let err = resolve_active(&[], &config).expect_err("unknown phase target");
-        assert!(err
-            .to_string()
-            .contains("phases.compact names model 'missing'"));
+        assert!(
+            err.to_string()
+                .contains("phases.compact names model 'missing'")
+        );
     }
 
     #[test]
@@ -1262,7 +1305,9 @@ env_key = ["MISSING_A", "PRESENT_B"]
             &parse_config_document(VALID_DOC, "t").expect("parse"),
         )
         .expect_err("empty override");
-        assert!(matches!(err, UserConfigError::InvalidValue { key, .. } if key == DEFAULT_MODEL_ENV));
+        assert!(
+            matches!(err, UserConfigError::InvalidValue { key, .. } if key == DEFAULT_MODEL_ENV)
+        );
     }
 
     #[test]
@@ -1318,8 +1363,8 @@ env_key = ["MISSING_A", "PRESENT_B"]
     fn home_fallback_missing_yields_unconfigured() {
         let dir = std::env::temp_dir().join(format!("rapidlm-empty-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("mkdir");
-        let selection = select_active_model(&env(&[(HOME_ENV, dir.to_str().unwrap())]))
-            .expect("selection");
+        let selection =
+            select_active_model(&env(&[(HOME_ENV, dir.to_str().unwrap())])).expect("selection");
         match selection {
             ModelSelection::Unconfigured { searched } => {
                 assert_eq!(searched.len(), 1);

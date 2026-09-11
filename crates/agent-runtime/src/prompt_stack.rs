@@ -86,7 +86,10 @@ impl PromptContext {
 
     /// Environment facts (cwd, OS) rendered in the `# Environment` section.
     /// Bounded; an empty string is treated as absent.
-    pub fn with_environment(mut self, environment: impl Into<String>) -> Result<Self, PromptStackError> {
+    pub fn with_environment(
+        mut self,
+        environment: impl Into<String>,
+    ) -> Result<Self, PromptStackError> {
         let environment = environment.into();
         if environment.is_empty() {
             self.environment = None;
@@ -231,10 +234,8 @@ mod tests {
 
     #[test]
     fn zero_token_budget_is_absent_not_empty() {
-        let prompt = render_system_prompt(
-            &PromptContext::new().with_token_budget(0, 4_096),
-        )
-        .expect("render");
+        let prompt = render_system_prompt(&PromptContext::new().with_token_budget(0, 4_096))
+            .expect("render");
         assert!(!prompt.contains("## Token budget"));
     }
 

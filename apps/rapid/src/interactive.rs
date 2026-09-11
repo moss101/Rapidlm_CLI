@@ -35,16 +35,16 @@ use tui::state::{
 };
 use tui::{
     AppState, CommandError, FrontendAction, FrontendKind, Inspector, KernelAction, KernelApi,
-    LocalAction, PermissionsIntent,
-    RecordingBackend, TerminalError, TerminalGuard, dispatch, parse_command_in, reduce,
+    LocalAction, PermissionsIntent, RecordingBackend, TerminalError, TerminalGuard, dispatch,
+    parse_command_in, reduce,
 };
 
+use crate::exec_tools::ExecTools;
 use crate::goal_host::{
     DriverLease, EVIDENCE_FILE, GOAL_FILE, GoalHost, GoalTransactionError, SESSIONS_DB_FILE,
     accrue_turn_usage, active_goal_id, try_acquire_driver_lease,
 };
 use crate::headless::jsonl::JsonlExitCode;
-use crate::exec_tools::ExecTools;
 use crate::host::{
     ExecOutcome, FallbackChainModel, PreservedLiveContext, RouterDecisionReason, StepDiag,
     UnconfiguredModel, run_live_exec,
@@ -101,7 +101,10 @@ pub enum InteractiveInput {
     Backspace,
     Enter,
     Submit(String),
-    Resize { width: u16, height: u16 },
+    Resize {
+        width: u16,
+        height: u16,
+    },
     /// Scroll the transcript viewport one page toward earlier output.
     PageUp,
     /// Scroll the transcript viewport one page toward later output.
@@ -412,7 +415,10 @@ fn sync_persisted_goal(ui: &mut AppState, ledger_path: &Path) {
         return;
     };
     let projection = project_goal(snapshot);
-    *ui = reduce(ui.clone(), &UiEvent::Local(LocalUiEvent::SyncGoal(projection)));
+    *ui = reduce(
+        ui.clone(),
+        &UiEvent::Local(LocalUiEvent::SyncGoal(projection)),
+    );
 }
 
 /// Map an agent-runtime goal snapshot into the TUI goal projection.
@@ -917,11 +923,7 @@ fn run_subcommand(args: &[String]) -> Result<i32, InteractiveError> {
         return Err(InteractiveError::Usage);
     };
     let operands = &args[1..];
-    if !entry.own_help
-        && operands
-            .iter()
-            .any(|arg| arg == "--help" || arg == "-h")
-    {
+    if !entry.own_help && operands.iter().any(|arg| arg == "--help" || arg == "-h") {
         // Answered here rather than left to the handler: `CLI_USAGE`
         // promises `rapid <subcommand> --help` works, and these handlers
         // either reject the flag as a usage error, ignore it, or treat it as
@@ -995,7 +997,9 @@ fn run_trust_command(args: &[String]) -> Result<i32, InteractiveError> {
 
     match sub {
         "grant" => {
-            let before = store.get(&identity, &cancel).map_err(InteractiveError::Trust)?;
+            let before = store
+                .get(&identity, &cancel)
+                .map_err(InteractiveError::Trust)?;
             store
                 .set(&identity, TrustStatus::Trusted, &cancel)
                 .map_err(InteractiveError::Trust)?;
@@ -1007,7 +1011,9 @@ fn run_trust_command(args: &[String]) -> Result<i32, InteractiveError> {
             Ok(0)
         }
         "revoke" => {
-            let before = store.get(&identity, &cancel).map_err(InteractiveError::Trust)?;
+            let before = store
+                .get(&identity, &cancel)
+                .map_err(InteractiveError::Trust)?;
             store
                 .set(&identity, TrustStatus::Untrusted, &cancel)
                 .map_err(InteractiveError::Trust)?;
@@ -1019,7 +1025,9 @@ fn run_trust_command(args: &[String]) -> Result<i32, InteractiveError> {
             Ok(0)
         }
         "status" => {
-            let status = store.get(&identity, &cancel).map_err(InteractiveError::Trust)?;
+            let status = store
+                .get(&identity, &cancel)
+                .map_err(InteractiveError::Trust)?;
             println!("{}: {root_display}", status.as_str());
             Ok(0)
         }
@@ -1043,10 +1051,7 @@ pub(crate) const GOAL_SUBCOMMANDS: &[&str] = &[
 /// across invocations; completion still requires the evidence gate.
 fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
     let Some(sub) = args.first().map(String::as_str) else {
-        eprintln!(
-            "usage: rapid goal <{}> ...",
-            GOAL_SUBCOMMANDS.join("|")
-        );
+        eprintln!("usage: rapid goal <{}> ...", GOAL_SUBCOMMANDS.join("|"));
         return Err(InteractiveError::Usage);
     };
     // Checked before any file or ledger is opened, and against the same list
@@ -1074,17 +1079,17 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
     // the ledger the gate stays fail-closed for agent records; human and
     // system records are unaffected. The handle is kept for `goal claim`,
     // which appends its own audit events.
-    let claim_ledger =
-        match event_ledger::ledger::EventLedger::open(current_project_ledger_path()) {
-            Ok(ledger) => {
-                host.install_backing(ledger.clone());
-                Some(ledger)
-            }
-            Err(err) => {
-                eprintln!("ledger unavailable ({err}); agent evidence cannot be backed");
-                None
-            }
-        };
+    let claim_ledger = match event_ledger::ledger::EventLedger::open(current_project_ledger_path())
+    {
+        Ok(ledger) => {
+            host.install_backing(ledger.clone());
+            Some(ledger)
+        }
+        Err(err) => {
+            eprintln!("ledger unavailable ({err}); agent evidence cannot be backed");
+            None
+        }
+    };
     if let Err(err) = host.load_evidence(&evidence_path) {
         eprintln!("{err}");
         return Ok(JsonlExitCode::Runtime.as_i32());
@@ -1122,12 +1127,12 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
                     return Err(InteractiveError::Usage);
                 };
                 let kinds: Vec<String> = kinds.split(',').map(str::to_owned).collect();
-                requirements.push(
-                    agent_runtime::EvidenceRequirement::new(id, kinds).map_err(|err| {
+                requirements.push(agent_runtime::EvidenceRequirement::new(id, kinds).map_err(
+                    |err| {
                         eprintln!("{err}");
                         InteractiveError::Usage
-                    })?,
-                );
+                    },
+                )?);
             }
             let max_steps = match one(&flags, "max-steps") {
                 Some(raw) => Some(raw.parse::<u64>().map_err(|_| InteractiveError::Usage)?),
@@ -1158,13 +1163,15 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
             // process's own `host` happened to load before a concurrent
             // writer (another `rapid goal create`, a `rapid exec` turn's
             // usage accrual) may have changed it.
-            host.update(&path, |host| host.apply(command, &GoalActor::Human, &cancel))
-                .map_err(|err| {
-                    if let GoalTransactionError::Persist(persist_err) = &err {
-                        eprintln!("{persist_err}");
-                    }
-                    InteractiveError::Internal
-                })?;
+            host.update(&path, |host| {
+                host.apply(command, &GoalActor::Human, &cancel)
+            })
+            .map_err(|err| {
+                if let GoalTransactionError::Persist(persist_err) = &err {
+                    eprintln!("{persist_err}");
+                }
+                InteractiveError::Internal
+            })?;
             Ok(0)
         }
         "show" => {
@@ -1229,11 +1236,12 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
                     command: command.to_owned(),
                 });
             }
-            let claim = crate::goal_claim::GoalClaim::new(summary, checks, timeout_secs)
-                .map_err(|err| {
+            let claim = crate::goal_claim::GoalClaim::new(summary, checks, timeout_secs).map_err(
+                |err| {
                     eprintln!("{err}");
                     InteractiveError::Usage
-                })?;
+                },
+            )?;
             let outcome =
                 crate::goal_claim::run_claim(&mut host, &evidence_path, ledger, claim, &cancel)
                     .map_err(|err| {
@@ -1358,15 +1366,24 @@ fn parse_flags(
             .filter(|k| !k.is_empty())
             .ok_or(InteractiveError::Usage)?;
         let value = args.get(idx + 1).ok_or(InteractiveError::Usage)?;
-        flags.entry(key.to_owned()).or_insert(Vec::new()).push(value.clone());
+        flags
+            .entry(key.to_owned())
+            .or_insert(Vec::new())
+            .push(value.clone());
         idx += 2;
     }
     Ok(flags)
 }
 
 /// First value of a flag, for single-value flags.
-fn one<'a>(flags: &'a std::collections::BTreeMap<String, Vec<String>>, key: &str) -> Option<&'a str> {
-    flags.get(key).and_then(|values| values.first()).map(String::as_str)
+fn one<'a>(
+    flags: &'a std::collections::BTreeMap<String, Vec<String>>,
+    key: &str,
+) -> Option<&'a str> {
+    flags
+        .get(key)
+        .and_then(|values| values.first())
+        .map(String::as_str)
 }
 
 fn goal_evidence_record(
@@ -1413,11 +1430,10 @@ fn goal_evidence_record(
         None if kind == EvidenceKind::Test => TEST_PASSED.to_owned(),
         None => kind.as_str().to_owned(),
     };
-    let subject = one(&flags, "subject")
-        .unwrap_or("goal")
-        .to_owned();
-    let source_hash =
-        protocol::ArtifactId::from_bytes(one(&flags, "source-hash").unwrap_or(&assertion).as_bytes());
+    let subject = one(&flags, "subject").unwrap_or("goal").to_owned();
+    let source_hash = protocol::ArtifactId::from_bytes(
+        one(&flags, "source-hash").unwrap_or(&assertion).as_bytes(),
+    );
     let mut spec = EvidenceSpec::new(
         protocol::EvidenceId::new(),
         snapshot.id(),
@@ -1446,7 +1462,11 @@ fn goal_evidence_record(
             InteractiveError::Usage
         })?;
     }
-    match (one(&flags, "session"), one(&flags, "seq"), one(&flags, "event-id")) {
+    match (
+        one(&flags, "session"),
+        one(&flags, "seq"),
+        one(&flags, "event-id"),
+    ) {
         (None, None, None) => {}
         (Some(session), Some(seq), Some(event_id)) => {
             let session = session
@@ -1467,17 +1487,20 @@ fn goal_evidence_record(
     // `rapid goal evidence record`, or a `rapid goal claim` persisting a
     // check's own evidence) can never have its already-committed record
     // silently erased by this process's own possibly-stale in-memory copy.
-    host.update_evidence(evidence_path, |host| -> Result<(), agent_runtime::EvidenceError> {
-        let record = host.record_evidence(spec)?;
-        println!(
-            "recorded {} kind={} status={} producer={}",
-            record.id(),
-            record.kind(),
-            record.status(),
-            record.producer()
-        );
-        Ok(())
-    })
+    host.update_evidence(
+        evidence_path,
+        |host| -> Result<(), agent_runtime::EvidenceError> {
+            let record = host.record_evidence(spec)?;
+            println!(
+                "recorded {} kind={} status={} producer={}",
+                record.id(),
+                record.kind(),
+                record.status(),
+                record.producer()
+            );
+            Ok(())
+        },
+    )
     .map_err(|err| {
         match &err {
             GoalTransactionError::Persist(persist_err) => eprintln!("{persist_err}"),
@@ -1504,10 +1527,7 @@ fn goal_evidence_list(host: &GoalHost) -> Result<i32, InteractiveError> {
             record.freshness(),
             record.producer(),
             criterion,
-            record
-                .ledger_ref()
-                .map(|_| " backed=ledger")
-                .unwrap_or(""),
+            record.ledger_ref().map(|_| " backed=ledger").unwrap_or(""),
         );
     }
     Ok(0)
@@ -1622,7 +1642,9 @@ fn unrouted_inspector_text(inspector: &Inspector) -> String {
         | Inspector::Goal
         | Inspector::Context { .. }
         | Inspector::Memory
-        | Inspector::Jobs { .. } => "this inspector has a TUI route and should not reach this message",
+        | Inspector::Jobs { .. } => {
+            "this inspector has a TUI route and should not reach this message"
+        }
         // Handled by `open_unrouted_inspector` with a real report.
         Inspector::Mcp => "MCP configuration is reported inline and should not reach this message",
         Inspector::Knowledge => {
@@ -1741,10 +1763,14 @@ are supported, and they have no auth step"
         KernelAction::ApplyChangeSet { .. } | KernelAction::Rollback { .. } => {
             "no change-set apply/rollback backend exists yet"
         }
-        KernelAction::Handoff { .. } | KernelAction::Takeover { .. } | KernelAction::ControlReturn => {
+        KernelAction::Handoff { .. }
+        | KernelAction::Takeover { .. }
+        | KernelAction::ControlReturn => {
             "execution handoff/takeover is not wired into the interactive session yet"
         }
-        KernelAction::ComputerObserve | KernelAction::ComputerRecord | KernelAction::ComputerTest => {
+        KernelAction::ComputerObserve
+        | KernelAction::ComputerRecord
+        | KernelAction::ComputerTest => {
             "computer-use actions are not wired into the interactive session yet"
         }
         _ => "not available yet",
@@ -1770,8 +1796,10 @@ see docs/configuration.md";
 /// project-scoped input behaves on that path.
 fn load_active_reminders(
     root: Option<&Path>,
-) -> Result<Option<(String, agent_runtime::reminders::ReminderFloor)>, agent_runtime::reminders::ReminderError>
-{
+) -> Result<
+    Option<(String, agent_runtime::reminders::ReminderFloor)>,
+    agent_runtime::reminders::ReminderError,
+> {
     let Some(root) = root else {
         return Ok(None);
     };
@@ -1787,9 +1815,7 @@ fn load_active_reminders(
         .map(|feed| feed.name.clone())
         .collect();
     let active = agent_runtime::reminders::ActiveReminders::admit(&roster, &nominated);
-    Ok(active
-        .render()
-        .map(|block| (block, active.effort_floor())))
+    Ok(active.render().map(|block| (block, active.effort_floor())))
 }
 
 /// Load the managed policy once and gate every `[models] fallback` candidate
@@ -1807,8 +1833,10 @@ fn load_active_reminders(
 fn gate_fallback_candidates(
     process_env: &[(String, String)],
     candidates: Vec<crate::user_config::ActiveModel>,
-) -> Result<(Vec<crate::user_config::ActiveModel>, Vec<String>), crate::managed_config::ManagedConfigError>
-{
+) -> Result<
+    (Vec<crate::user_config::ActiveModel>, Vec<String>),
+    crate::managed_config::ManagedConfigError,
+> {
     let policy = crate::managed_config::load_policy(process_env)?;
     let mut gated = Vec::new();
     let mut warnings = Vec::new();
@@ -1979,11 +2007,7 @@ fn describe_turn_failure(
         );
     }
     match cause {
-        Some(cause) => format!(
-            "{summary} ({}; {})",
-            cause.as_str(),
-            cause.remedy()
-        ),
+        Some(cause) => format!("{summary} ({}; {})", cause.as_str(), cause.remedy()),
         None => summary.to_owned(),
     }
 }
@@ -2033,7 +2057,8 @@ fn exec_turn_exit_code(
 const PERMISSION_MODE_ENV: &str = "RAPIDLM_PERMISSION_MODE";
 /// Project settings documents consulted for the permission lattice, in
 /// precedence order (RapidLM's own first, then the Claude-compat path).
-pub(crate) const PROJECT_SETTINGS_FILES: [&str; 2] = [".rapidlm/settings.json", ".claude/settings.json"];
+pub(crate) const PROJECT_SETTINGS_FILES: [&str; 2] =
+    [".rapidlm/settings.json", ".claude/settings.json"];
 /// Persisted per-project allow grants consulted before any ask.
 pub(crate) const PERMISSIONS_STORE_NAME: &str = "project-permissions.json";
 /// Maximum rule entries admitted across all settings documents. Each file is
@@ -2071,9 +2096,8 @@ fn exec_permission_mode() -> Result<crate::permissions::PermissionMode, String> 
         let Ok(text) = fs::read_to_string(file_name) else {
             continue;
         };
-        let settings = parse_settings(&text).map_err(|err| {
-            format!("{} could not be loaded: {}", file_name, err.as_str())
-        })?;
+        let settings = parse_settings(&text)
+            .map_err(|err| format!("{} could not be loaded: {}", file_name, err.as_str()))?;
         if let Some(mode) = settings.mode {
             return Ok(mode);
         }
@@ -2137,10 +2161,7 @@ fn exec_permission_lattice(
     canonical_root: Option<&Path>,
     forced_mode: Option<crate::permissions::PermissionMode>,
 ) -> Result<crate::permissions::PermissionLattice, String> {
-    use crate::permissions::{
-        PermissionLattice, PermissionMode, ProjectSettings,
-        parse_settings,
-    };
+    use crate::permissions::{PermissionLattice, PermissionMode, ProjectSettings, parse_settings};
     let mut mode: Option<PermissionMode> = match exec_permission_mode() {
         Ok(mode) => Some(mode),
         Err(msg) => {
@@ -2153,9 +2174,8 @@ fn exec_permission_lattice(
         let Ok(text) = fs::read_to_string(file_name) else {
             continue;
         };
-        let settings = parse_settings(&text).map_err(|err| {
-            format!("{} could not be loaded: {}", file_name, err.as_str())
-        })?;
+        let settings = parse_settings(&text)
+            .map_err(|err| format!("{} could not be loaded: {}", file_name, err.as_str()))?;
         if mode.is_none() {
             mode = settings.mode;
         }
@@ -2180,7 +2200,8 @@ fn exec_permission_lattice(
     // become "no policy".
     let managed_policy = crate::managed_config::load_policy(&std::env::vars().collect::<Vec<_>>())
         .map_err(|err| format!("managed policy could not be loaded: {err}"))?;
-    let (mode, gate_report) = crate::managed_config::gate_permission_mode(mode, managed_policy.as_ref());
+    let (mode, gate_report) =
+        crate::managed_config::gate_permission_mode(mode, managed_policy.as_ref());
     if let Some(report) = gate_report {
         eprintln!("warning: {report}");
     }
@@ -2193,7 +2214,10 @@ fn exec_permission_lattice(
     // ceiling above): applied unconditionally, since a pure addition to
     // `denied_tools` has no lower-trust value to compare against — there is
     // no "allow_tools" override checked earlier that could widen past it.
-    if let Some(patterns) = managed_policy.as_ref().and_then(|policy| policy.denied_tools()) {
+    if let Some(patterns) = managed_policy
+        .as_ref()
+        .and_then(|policy| policy.denied_tools())
+    {
         eprintln!(
             "warning: managed policy bans {} tool pattern(s) outright",
             patterns.len()
@@ -2205,7 +2229,10 @@ fn exec_permission_lattice(
     // of any per-task_spawn write_scope (see `PermissionLattice::
     // admin_write_scope`'s own doc comment for why the two never share a
     // field).
-    if let Some(scope) = managed_policy.as_ref().and_then(|policy| policy.confine_writes_to()) {
+    if let Some(scope) = managed_policy
+        .as_ref()
+        .and_then(|policy| policy.confine_writes_to())
+    {
         eprintln!("warning: managed policy confines every write to '{scope}'");
         lattice = lattice.with_admin_write_scope(scope);
     }
@@ -2424,8 +2451,15 @@ pub(crate) fn load_project_integrations(root: &Path) -> ProjectIntegrations {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
             continue;
         };
-        if let Some(entries) = value.get("fetch_allowlist").and_then(serde_json::Value::as_array) {
-            fetch_allowlist.extend(entries.iter().filter_map(|entry| entry.as_str().map(str::to_owned)));
+        if let Some(entries) = value
+            .get("fetch_allowlist")
+            .and_then(serde_json::Value::as_array)
+        {
+            fetch_allowlist.extend(
+                entries
+                    .iter()
+                    .filter_map(|entry| entry.as_str().map(str::to_owned)),
+            );
         }
         if let Some(file_hooks) = crate::hooks::HooksConfig::parse(&value) {
             hooks.pre_tool_use.extend(file_hooks.pre_tool_use);
@@ -2528,7 +2562,10 @@ struct LiveSubagentRunner {
     /// subagent getting its own fresh one. See `ExecTools::
     /// share_turn_budgets`'s own doc comment for why a fresh-per-child
     /// counter under-enforces a "per-turn" ceiling.
-    turn_budgets: (std::sync::Arc<std::sync::atomic::AtomicU64>, std::sync::Arc<std::sync::atomic::AtomicU64>),
+    turn_budgets: (
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ),
     /// The parent's shared per-path write-lock registry (Modbit `WRK-017`),
     /// so a subagent writing the same resolved path as its parent or a
     /// sibling subagent serializes against them instead of racing on the
@@ -3060,8 +3097,9 @@ pub(crate) fn build_backing_model<'store>(
             let model_ref = llm_router::provider::ModelRef::new(
                 llm_router::provider::ProviderId::parse(active.entry.provider.as_str())
                     .expect("provider id already validated by user_config parsing"),
-                llm_router::provider::ModelId::parse(&active.profile_id)
-                    .expect("profile id already validated against the stricter llm-router alphabet"),
+                llm_router::provider::ModelId::parse(&active.profile_id).expect(
+                    "profile id already validated against the stricter llm-router alphabet",
+                ),
             );
             match ConfiguredModel::build(active, store) {
                 Ok(model) => backends.push((model_ref, model)),
@@ -3086,7 +3124,10 @@ pub(crate) fn build_backing_model<'store>(
             }
         } else {
             let primary_ref = backends[0].0.clone();
-            let alternate_refs: Vec<_> = backends[1..].iter().map(|(model_ref, _)| model_ref.clone()).collect();
+            let alternate_refs: Vec<_> = backends[1..]
+                .iter()
+                .map(|(model_ref, _)| model_ref.clone())
+                .collect();
             let policy = llm_router::fallback::FallbackPolicy::standard();
             let router_cancel = llm_router::provider::CancellationToken::new();
             match llm_router::fallback::FallbackController::from_explicit_chain(
@@ -3160,9 +3201,16 @@ fn build_live_context(
             eprintln!("warning: system prompt not rendered: {}", err.as_str());
         })
         .unwrap_or_default();
-    PreservedLiveContext::new(prompt, Vec::new(), agents_rules, String::new(), context_limit, output_reserve)
-        .map_err(|_| "context rejected".to_owned())
-        .map(|preserved| preserved.with_system_prompt(Some(system_prompt)))
+    PreservedLiveContext::new(
+        prompt,
+        Vec::new(),
+        agents_rules,
+        String::new(),
+        context_limit,
+        output_reserve,
+    )
+    .map_err(|_| "context rejected".to_owned())
+    .map(|preserved| preserved.with_system_prompt(Some(system_prompt)))
 }
 
 /// Build the live-context host around the prompt and run one agent turn through
@@ -3211,14 +3259,16 @@ pub(crate) fn exec_turn(
     // surface refuses all proposed tool calls. Resolved once here and reused
     // below (subagent tools, the refuses-all warning) instead of re-resolving
     // the mode/env at every call site.
-    let permission_lattice =
-        match exec_permission_lattice(workspace.as_ref().map(|(root, _)| root.as_path()), forced_mode) {
-            Ok(lattice) => lattice,
-            Err(reason) => {
-                eprintln!("permission configuration error: {reason}");
-                return Ok(JsonlExitCode::Policy.as_i32());
-            }
-        };
+    let permission_lattice = match exec_permission_lattice(
+        workspace.as_ref().map(|(root, _)| root.as_path()),
+        forced_mode,
+    ) {
+        Ok(lattice) => lattice,
+        Err(reason) => {
+            eprintln!("permission configuration error: {reason}");
+            return Ok(JsonlExitCode::Policy.as_i32());
+        }
+    };
     let mut tools = match &workspace {
         Some((root, TrustStatus::Trusted)) => {
             ExecTools::workspace_with_permissions(root, permission_lattice.clone())
@@ -3243,7 +3293,9 @@ pub(crate) fn exec_turn(
     // between reads and the log naming a policy that wasn't the one
     // actually applied.
     let mut policy_version: Option<String> = None;
-    if let Ok(Some(policy)) = crate::managed_config::load_policy(&std::env::vars().collect::<Vec<_>>()) {
+    if let Ok(Some(policy)) =
+        crate::managed_config::load_policy(&std::env::vars().collect::<Vec<_>>())
+    {
         if let Some(max) = policy.max_write_bytes_per_turn() {
             tools.narrow_write_ceiling(max);
         }
@@ -3284,8 +3336,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     // all) previously got permission-rule compat but silently lost hooks/
     // mcp/shadow-diagnostics/fetch-allowlist, since this block only ever
     // read the one RapidLM-native file name.
-    if let (Some((root, TrustStatus::Trusted)), ExecTools::Workspace(_)) =
-        (&workspace, &mut tools)
+    if let (Some((root, TrustStatus::Trusted)), ExecTools::Workspace(_)) = (&workspace, &mut tools)
     {
         let ProjectIntegrations {
             fetch_allowlist: allowlist,
@@ -3544,21 +3595,29 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     // concern the way trust otherwise gates this run, and the interactive
     // TUI's own equivalent (`sync_persisted_goal`) reads it unconditionally
     // too.
-    let goal_path = workspace.as_ref().map(|(root, _)| root.join(PROJECT_MARKER).join(GOAL_FILE));
+    let goal_path = workspace
+        .as_ref()
+        .map(|(root, _)| root.join(PROJECT_MARKER).join(GOAL_FILE));
     let goal_id = goal_path.as_deref().and_then(active_goal_id);
     let turn_started = Instant::now();
     let run_result = if let Some(schema_path) = parsed.json_schema.as_ref() {
         let schema_text = match std::fs::read_to_string(schema_path) {
             Ok(text) => text,
             Err(err) => {
-                eprintln!("--json-schema: failed to read {}: {err}", schema_path.display());
+                eprintln!(
+                    "--json-schema: failed to read {}: {err}",
+                    schema_path.display()
+                );
                 return Ok(JsonlExitCode::Usage.as_i32());
             }
         };
         let schema_value: serde_json::Value = match serde_json::from_str(&schema_text) {
             Ok(value) => value,
             Err(err) => {
-                eprintln!("--json-schema: {} is not valid JSON: {err}", schema_path.display());
+                eprintln!(
+                    "--json-schema: {} is not valid JSON: {err}",
+                    schema_path.display()
+                );
                 return Ok(JsonlExitCode::Usage.as_i32());
             }
         };
@@ -3702,7 +3761,11 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                     .expect("guard just matched Some")
                     .to_owned();
                 crate::exec_diag::stderr_line(&format!("needs context: {question}"));
-                (Some(question), JsonlExitCode::NeedsContext, outcome.cost_usd_micros)
+                (
+                    Some(question),
+                    JsonlExitCode::NeedsContext,
+                    outcome.cost_usd_micros,
+                )
             }
             Ok(outcome) => {
                 let mut message = describe_turn_failure(
@@ -3834,18 +3897,20 @@ fn run_started_session(
     // replay, and asking for one would re-deliver its `SessionCreated`.
     let (session_id, mut ui, from_seq, replay_through) = match options.resume {
         Some(resume) => {
-            let snapshot = block_on(client.get_session(resume), &options.cancel).map_err(|err| match &err {
-                // The common case by far: a typo, or an id from another
-                // project (the ledger is per-project, so a real id from
-                // elsewhere is simply absent here). Every other kernel
-                // failure keeps its own diagnosis.
-                InteractiveError::Kernel(api)
-                    if api.code() == protocol::ErrorCode::SessionNotFound =>
-                {
-                    InteractiveError::UnknownSession(resume)
-                }
-                _ => err,
-            })?;
+            let snapshot = block_on(client.get_session(resume), &options.cancel).map_err(
+                |err| match &err {
+                    // The common case by far: a typo, or an id from another
+                    // project (the ledger is per-project, so a real id from
+                    // elsewhere is simply absent here). Every other kernel
+                    // failure keeps its own diagnosis.
+                    InteractiveError::Kernel(api)
+                        if api.code() == protocol::ErrorCode::SessionNotFound =>
+                    {
+                        InteractiveError::UnknownSession(resume)
+                    }
+                    _ => err,
+                },
+            )?;
             // Deliberately *not* seeded with the snapshot: `reduce`'s kernel
             // path requires each event's seq to be exactly `snapshot.seq +
             // 1`, so seeding with the current tip would make every replayed
@@ -3870,7 +3935,12 @@ fn run_started_session(
             )?;
             let seq = snapshot.seq();
             let id = snapshot.id();
-            (id, reduce(AppState::new(), &UiEvent::Snapshot(snapshot)), seq, seq)
+            (
+                id,
+                reduce(AppState::new(), &UiEvent::Snapshot(snapshot)),
+                seq,
+                seq,
+            )
         }
     };
     let mut stream = block_on(
@@ -3899,7 +3969,10 @@ fn run_started_session(
     // is addressed to the user, and stderr written before the alt screen
     // opens is wiped before it can be read.
     if let Some(notice) = resolved.ledger_notice.clone() {
-        ui = reduce(ui, &UiEvent::Local(LocalUiEvent::AppendCommandOutput(notice)));
+        ui = reduce(
+            ui,
+            &UiEvent::Local(LocalUiEvent::AppendCommandOutput(notice)),
+        );
     }
     let mut interrupt_count = 0;
     let mut saw_ctrl_c = false;
@@ -4472,10 +4545,8 @@ denied\n",
             PermissionsIntent::Allow { pattern } => ("allow", pattern),
             PermissionsIntent::Revoke { pattern } => ("revoke", pattern),
         };
-        let outcome = crate::permissions_cli::run(
-            &[verb.to_owned(), pattern],
-            &self.permissions_env(),
-        );
+        let outcome =
+            crate::permissions_cli::run(&[verb.to_owned(), pattern], &self.permissions_env());
         match outcome {
             Ok(outcome) if outcome.exit == 0 => self.append_command_output(outcome.text),
             Ok(outcome) => self.append_command_error(outcome.text),
@@ -4507,10 +4578,7 @@ denied\n",
         if matches!(inspector, Inspector::Permissions) {
             // The real report `rapid permissions list` prints, from the same
             // store a real run reads — not a note saying there is no panel.
-            match crate::permissions_cli::run(
-                &["list".to_owned()],
-                &self.permissions_env(),
-            ) {
+            match crate::permissions_cli::run(&["list".to_owned()], &self.permissions_env()) {
                 Ok(outcome) => {
                     let mut text = outcome.text;
                     text.push_str(&self.denied_this_session());
@@ -4771,7 +4839,10 @@ denied\n",
         if self.autonomous.is_none() {
             return Ok(());
         }
-        if self.turn_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .turn_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Ok(());
         }
         let started_at = self
@@ -4949,10 +5020,7 @@ denied\n",
     /// re-synced rather than carried across, because it is read from files
     /// and environment and belongs to the *project*, not to either session —
     /// re-reading it is both simpler and correct if it changed.
-    fn switch_to_session(
-        &mut self,
-        target: protocol::SessionId,
-    ) -> Result<(), InteractiveError> {
+    fn switch_to_session(&mut self, target: protocol::SessionId) -> Result<(), InteractiveError> {
         let snapshot = block_on(self.client.get_session(target), self.cancel)?;
         let mut fresh = AppState::new();
         let mut stream = block_on(
@@ -5008,7 +5076,10 @@ denied\n",
         &mut self,
         session: Option<protocol::SessionId>,
     ) -> Result<(), InteractiveError> {
-        if self.turn_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .turn_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             self.append_command_error(
                 "a turn is running; wait for it to finish before resuming another session"
                     .to_owned(),
@@ -5141,7 +5212,10 @@ session"
                     // is still writing to, and the switch below would move
                     // the session out from under a thread still emitting
                     // into it.
-                    if self.turn_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+                    if self
+                        .turn_in_flight
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
                         self.append_command_error(
                             "a turn is running; wait for it to finish before forking".to_owned(),
                         );
@@ -5219,9 +5293,7 @@ the parent is unchanged; `/resume {parent_id}` returns to it\n"
                             return Err(InteractiveError::Cancelled);
                         }
                         Err(err) => {
-                            self.append_command_error(format!(
-                                "rewind to {to_seq} failed: {err}"
-                            ));
+                            self.append_command_error(format!("rewind to {to_seq} failed: {err}"));
                         }
                     }
                 }
@@ -5248,7 +5320,10 @@ the parent is unchanged; `/resume {parent_id}` returns to it\n"
         // submission while one is in flight (rather than queuing it) is the
         // deliberately simple choice for a first working version of real
         // turn execution.
-        if self.turn_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .turn_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Ok(());
         }
         let expected_seq = self.ui.snapshot().map(|s| s.seq()).unwrap_or(0);
@@ -5355,7 +5430,9 @@ the parent is unchanged; `/resume {parent_id}` returns to it\n"
             self.cancel,
         )?;
         self.refresh_job_logs();
-        self.renderer.render(self.ui).map_err(|_| InteractiveError::Io)
+        self.renderer
+            .render(self.ui)
+            .map_err(|_| InteractiveError::Io)
     }
 
     /// Re-read an open `/jobs logs` view from the spool before painting.
@@ -5441,7 +5518,10 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
                 None,
                 Some(tokens),
             ),
-            TurnEvent::ModelFailed { turn_id, request_id } => (
+            TurnEvent::ModelFailed {
+                turn_id,
+                request_id,
+            } => (
                 EventKind::ModelFailed,
                 turn_id,
                 None,
@@ -5450,26 +5530,83 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
                 None,
                 None,
             ),
-            TurnEvent::ToolRequested { turn_id, call_id, tool } => {
-                (EventKind::ToolRequested, turn_id, Some(call_id), Some(tool), None, None, None)
-            }
-            TurnEvent::ToolStarted { turn_id, call_id, tool } => {
-                (EventKind::ToolStarted, turn_id, Some(call_id), Some(tool), None, None, None)
-            }
-            TurnEvent::ToolCompleted { turn_id, call_id, tool } => {
-                (EventKind::ToolCompleted, turn_id, Some(call_id), Some(tool), None, None, None)
-            }
-            TurnEvent::ToolFailed { turn_id, call_id, tool } => {
-                (EventKind::ToolFailed, turn_id, Some(call_id), Some(tool), None, None, None)
-            }
+            TurnEvent::ToolRequested {
+                turn_id,
+                call_id,
+                tool,
+            } => (
+                EventKind::ToolRequested,
+                turn_id,
+                Some(call_id),
+                Some(tool),
+                None,
+                None,
+                None,
+            ),
+            TurnEvent::ToolStarted {
+                turn_id,
+                call_id,
+                tool,
+            } => (
+                EventKind::ToolStarted,
+                turn_id,
+                Some(call_id),
+                Some(tool),
+                None,
+                None,
+                None,
+            ),
+            TurnEvent::ToolCompleted {
+                turn_id,
+                call_id,
+                tool,
+            } => (
+                EventKind::ToolCompleted,
+                turn_id,
+                Some(call_id),
+                Some(tool),
+                None,
+                None,
+                None,
+            ),
+            TurnEvent::ToolFailed {
+                turn_id,
+                call_id,
+                tool,
+            } => (
+                EventKind::ToolFailed,
+                turn_id,
+                Some(call_id),
+                Some(tool),
+                None,
+                None,
+                None,
+            ),
             // The only tool event that carries a reason: it is what tells a
             // user *why* a call was refused and what to do about it, and it
             // reached only the model before this.
-            TurnEvent::ToolDenied { turn_id, call_id, tool, reason } => {
+            TurnEvent::ToolDenied {
+                turn_id,
+                call_id,
+                tool,
+                reason,
+            } => {
                 denial_reason = reason;
-                (EventKind::ToolDenied, turn_id, Some(call_id), Some(tool), None, None, None)
+                (
+                    EventKind::ToolDenied,
+                    turn_id,
+                    Some(call_id),
+                    Some(tool),
+                    None,
+                    None,
+                    None,
+                )
             }
-            TurnEvent::ToolApprovalRequired { turn_id, call_id, tool } => (
+            TurnEvent::ToolApprovalRequired {
+                turn_id,
+                call_id,
+                tool,
+            } => (
                 EventKind::ToolApprovalRequired,
                 turn_id,
                 Some(call_id),
@@ -5478,7 +5615,11 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
                 None,
                 None,
             ),
-            TurnEvent::ToolContextRequired { turn_id, call_id, tool } => (
+            TurnEvent::ToolContextRequired {
+                turn_id,
+                call_id,
+                tool,
+            } => (
                 EventKind::ToolContextRequired,
                 turn_id,
                 Some(call_id),
@@ -5605,7 +5746,9 @@ impl crate::exec_tools::WorkspaceChanges for LedgerWorkspaceChanges {
 /// deep in `run_live_exec` would strand the lease *and* leave the session
 /// silently unresponsive to every later message for the rest of the
 /// process (found in an adversarial self-review of this feature).
-fn catching_panics(f: impl FnOnce() -> kernel::TurnOutcome + std::panic::UnwindSafe) -> kernel::TurnOutcome {
+fn catching_panics(
+    f: impl FnOnce() -> kernel::TurnOutcome + std::panic::UnwindSafe,
+) -> kernel::TurnOutcome {
     std::panic::catch_unwind(f).unwrap_or_else(|_| kernel::TurnOutcome::Failed {
         reason: "interactive turn execution panicked".to_owned(),
     })
@@ -5996,11 +6139,17 @@ fn run_interactive_turn_inner(
     };
     let (context_limit, output_reserve) = context_budget_for(&backing);
 
-    let (preserved, mut tools) =
-        match build_interactive_turn_context(root, trusted, text, None, context_limit, output_reserve) {
-            Ok(built) => built,
-            Err(outcome) => return outcome,
-        };
+    let (preserved, mut tools) = match build_interactive_turn_context(
+        root,
+        trusted,
+        text,
+        None,
+        context_limit,
+        output_reserve,
+    ) {
+        Ok(built) => built,
+        Err(outcome) => return outcome,
+    };
     if let Some(snapshot) = redaction_snapshot {
         tools.set_redaction(snapshot);
     }
@@ -6008,7 +6157,9 @@ fn run_interactive_turn_inner(
     // `SessionLoop::jobs`.
     tools.share_job_table(jobs);
 
-    execute_interactive_turn(client, session_id, actor, root, text, preserved, &mut tools, backing, cancel)
+    execute_interactive_turn(
+        client, session_id, actor, root, text, preserved, &mut tools, backing, cancel,
+    )
 }
 
 /// Test-only-but-real sibling of `run_interactive_turn_inner`: identical
@@ -6061,7 +6212,9 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     };
     // Same session-scoped job table the production path uses.
     tools.share_job_table(jobs);
-    execute_interactive_turn(client, session_id, actor, root, text, preserved, &mut tools, backing, cancel)
+    execute_interactive_turn(
+        client, session_id, actor, root, text, preserved, &mut tools, backing, cancel,
+    )
 }
 
 /// Run one turn's model/tool-call loop through the shared, already-governed
@@ -6240,7 +6393,10 @@ fn context_required_question(outcome: &crate::host::ExecOutcome) -> Option<&str>
     if outcome.stop_reason != Some(agent_runtime::TurnStopReason::ContextRequired) {
         return None;
     }
-    outcome.failure_detail.as_ref().map(TurnFailureDetail::error)
+    outcome
+        .failure_detail
+        .as_ref()
+        .map(TurnFailureDetail::error)
 }
 
 /// The `SubagentReport` for a child turn that stopped needing context —
@@ -6458,10 +6614,7 @@ fn sync_configured_models(ui: &mut AppState) {
     if rows.is_empty() {
         return;
     }
-    *ui = reduce(
-        ui.clone(),
-        &UiEvent::Local(LocalUiEvent::SyncModels(rows)),
-    );
+    *ui = reduce(ui.clone(), &UiEvent::Local(LocalUiEvent::SyncModels(rows)));
 }
 
 /// Project the project memory index into the frontend, so `/memory` shows
@@ -6632,7 +6785,9 @@ impl TuiRenderer {
 
         let mut composer = tui::ComposerModel::new();
         let _ = composer.apply(tui::ComposerCommand::SetWidth(size.width()));
-        let _ = composer.apply(tui::ComposerCommand::Insert(ui.composer().text().to_owned()));
+        let _ = composer.apply(tui::ComposerCommand::Insert(
+            ui.composer().text().to_owned(),
+        ));
         let requested_height = composer.preferred_height();
         let layout = tui::compute_screen_layout(ui, size, requested_height, modal_open);
         let composer_view = composer.render(layout.composer().width(), layout.composer().height());
@@ -7259,8 +7414,8 @@ max_tokens = 500
         let store_b = auth::InMemoryCredentialStore::new();
         let primary =
             ConfiguredModel::build(&active_from_doc(primary_doc), &store_a).expect("build primary");
-        let alternate =
-            ConfiguredModel::build(&active_from_doc(alternate_doc), &store_b).expect("build alternate");
+        let alternate = ConfiguredModel::build(&active_from_doc(alternate_doc), &store_b)
+            .expect("build alternate");
 
         let primary_ref = llm_router::provider::ModelRef::new(
             llm_router::provider::ProviderId::parse("openai-compatible").expect("provider"),
@@ -7340,7 +7495,10 @@ base_url = "http://127.0.0.1:11434/v1"
         // correctly blocked by the allowlist (a warning, not an error).
         let (gated, warnings) =
             gate_fallback_candidates(&env, vec![candidate.clone()]).expect("first read succeeds");
-        assert!(gated.is_empty(), "candidate must be blocked by the allowlist");
+        assert!(
+            gated.is_empty(),
+            "candidate must be blocked by the allowlist"
+        );
         assert_eq!(warnings.len(), 1);
 
         // The same path, now unreadable (garbage/corrupt on a re-read):
@@ -7384,7 +7542,10 @@ base_url = "http://127.0.0.1:11434/v1"
         // No flag at all: max_wall_time stays None, existing behavior
         // (unbounded, same as before this flag existed) is unchanged.
         let unbounded: Vec<String> = vec!["just".to_owned(), "a".to_owned(), "prompt".to_owned()];
-        assert_eq!(parse_exec_args(&unbounded).expect("parses").max_wall_time, None);
+        assert_eq!(
+            parse_exec_args(&unbounded).expect("parses").max_wall_time,
+            None
+        );
     }
 
     #[test]
@@ -7398,11 +7559,9 @@ base_url = "http://127.0.0.1:11434/v1"
         let plan = exec_permission_lattice(None, Some(crate::permissions::PermissionMode::Plan))
             .expect("lattice");
         assert_eq!(plan.mode(), crate::permissions::PermissionMode::Plan);
-        let accept_edits = exec_permission_lattice(
-            None,
-            Some(crate::permissions::PermissionMode::AcceptEdits),
-        )
-        .expect("lattice");
+        let accept_edits =
+            exec_permission_lattice(None, Some(crate::permissions::PermissionMode::AcceptEdits))
+                .expect("lattice");
         assert_eq!(
             accept_edits.mode(),
             crate::permissions::PermissionMode::AcceptEdits
@@ -7428,7 +7587,10 @@ base_url = "http://127.0.0.1:11434/v1"
         cancel.cancel();
         spawn_wall_time_watchdog(cancel.clone(), Duration::from_millis(20));
         std::thread::sleep(Duration::from_millis(100));
-        assert!(cancel.is_cancelled(), "stays cancelled, no panic or double-fire");
+        assert!(
+            cancel.is_cancelled(),
+            "stays cancelled, no panic or double-fire"
+        );
     }
 
     /// **Characterization test for a known, open gap — it asserts what the
@@ -7478,9 +7640,8 @@ base_url = "http://127.0.0.1:11434/v1"
             crate::permissions::PermissionMode::Default,
             "this test characterizes the *default* mode; unset RAPIDLM_PERMISSION_MODE to run it"
         );
-        let mut tools =
-            crate::exec_tools::ExecTools::workspace_with_permissions(&root, lattice)
-                .expect("workspace tools");
+        let mut tools = crate::exec_tools::ExecTools::workspace_with_permissions(&root, lattice)
+            .expect("workspace tools");
 
         let call = agent_runtime::ProposedToolCall::new(
             "c1",
@@ -7840,9 +8001,11 @@ approval gap has been closed and this characterization test should be rewritten:
             .skip(1)
             .take_while(|line| !line.trim().is_empty())
             .collect();
-        assert!(block.len() > 15, "the Commands block did not parse: {block:?}");
-        let mut advertised: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
+        assert!(
+            block.len() > 15,
+            "the Commands block did not parse: {block:?}"
+        );
+        let mut advertised: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut previous_was_an_entry = false;
         for line in &block {
             // An entry whose invocation reaches the summary column carries
@@ -7989,7 +8152,11 @@ alignment below it: {line:?}",
         // not the guard exists — a vacuous assertion. The guard's own input
         // is this list, which is what is checked here.
         let unique: std::collections::BTreeSet<&&str> = GOAL_SUBCOMMANDS.iter().collect();
-        assert_eq!(unique.len(), GOAL_SUBCOMMANDS.len(), "duplicate goal subcommand");
+        assert_eq!(
+            unique.len(),
+            GOAL_SUBCOMMANDS.len(),
+            "duplicate goal subcommand"
+        );
         assert!(
             !GOAL_SUBCOMMANDS.contains(&"budget"),
             "`budget` has no arm in run_goal_command"
@@ -8012,7 +8179,10 @@ alignment below it: {line:?}",
         let zsh = crate::p9_commands::completions_script("zsh").expect("zsh");
         let define = zsh.find("_rapid()").expect("the function is defined");
         let compdef = zsh.find("compdef").expect("compdef is called");
-        assert!(define < compdef, "compdef must come after the definition:\n{zsh}");
+        assert!(
+            define < compdef,
+            "compdef must come after the definition:\n{zsh}"
+        );
 
         let fish = crate::p9_commands::completions_script("fish").expect("fish");
         for line in fish.lines() {
@@ -8050,8 +8220,8 @@ alignment below it: {line:?}",
         // that makes the claim true.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/reference/cli-command-reference.md");
-        let doc = fs::read_to_string(&path)
-            .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        let doc =
+            fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
         let start = doc
             .find("> **What the binary actually dispatches today**")
             .expect("the shipped-commands paragraph");
@@ -8060,8 +8230,7 @@ alignment below it: {line:?}",
             .map(|offset| start + offset)
             .expect("the paragraph ends");
         let paragraph = &doc[start..end];
-        let mut listed: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
+        let mut listed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut rest = paragraph;
         while let Some(open) = rest.find('`') {
             rest = &rest[open + 1..];
@@ -8377,7 +8546,9 @@ alignment below it: {line:?}",
         ]))
         .expect("an unknown slash command must not end the session with an error");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(
             painted.contains("unknown command") && painted.contains("/help"),
             "{painted}"
@@ -8385,7 +8556,8 @@ alignment below it: {line:?}",
     }
 
     #[test]
-    fn invalid_slash_command_arguments_show_specific_usage_not_a_generic_failure_or_the_full_catalog() {
+    fn invalid_slash_command_arguments_show_specific_usage_not_a_generic_failure_or_the_full_catalog()
+     {
         let _lock = lock_terminal();
         let env = TempEnv::create();
         let report = run_interactive(env.options_capturing_render(vec![
@@ -8394,7 +8566,9 @@ alignment below it: {line:?}",
         ]))
         .expect("invalid arguments on a known command must not end the session either");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(painted.contains("/fork"), "{painted}");
         assert!(
             !painted.contains("/playbook"),
@@ -8412,13 +8586,18 @@ alignment below it: {line:?}",
         // default 24-row terminal would only show the catalog's last screen
         // full, not whether `/goal` (near the top) is present at all.
         let report = run_interactive(env.options_capturing_render(vec![
-            InteractiveInput::Resize { width: 80, height: 60 },
+            InteractiveInput::Resize {
+                width: 80,
+                height: 60,
+            },
             InteractiveInput::Submit("/help".to_owned()),
             InteractiveInput::Submit("/quit".to_owned()),
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(painted.contains("/goal"), "{painted}");
         assert!(painted.contains("/quit"), "{painted}");
     }
@@ -8433,8 +8612,13 @@ alignment below it: {line:?}",
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
-        assert!(painted.contains("goal started: ship the thing"), "{painted}");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
+        assert!(
+            painted.contains("goal started: ship the thing"),
+            "{painted}"
+        );
 
         // The real mutation: `GoalHost`'s own concurrency-safe persistence,
         // not a test-only bypass — the same file `rapid goal show` reads.
@@ -8484,12 +8668,16 @@ alignment below it: {line:?}",
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(painted.contains("goal pause: ok"), "{painted}");
         assert!(painted.contains("goal resume: ok"), "{painted}");
 
         let goal_path = env.project.join(PROJECT_MARKER).join(GOAL_FILE);
-        let host = GoalHost::load(&goal_path).expect("load").expect("goal exists");
+        let host = GoalHost::load(&goal_path)
+            .expect("load")
+            .expect("goal exists");
         assert_eq!(
             host.snapshot().expect("snapshot").state(),
             agent_runtime::GoalState::Active,
@@ -8512,7 +8700,9 @@ alignment below it: {line:?}",
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(painted.contains("goal cancel: ok"), "{painted}");
         // `rendered_output` is every frame this session ever painted,
         // concatenated (the renderer's own capture buffer has no per-frame
@@ -8522,7 +8712,10 @@ alignment below it: {line:?}",
         // goal — split on this renderer's own screen-clear sequence
         // (`crossterm::terminal::Clear(ClearType::All)`, emitted once per
         // `TuiRenderer::render` call) and check only the final one.
-        let last_frame = painted.rsplit("\u{1b}[2J").next().expect("at least one frame");
+        let last_frame = painted
+            .rsplit("\u{1b}[2J")
+            .next()
+            .expect("at least one frame");
         assert!(
             last_frame.contains("no goal"),
             "the final frame must show the Goals panel's empty state, not the \
@@ -8552,7 +8745,9 @@ alignment below it: {line:?}",
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(painted.contains("no active goal"), "{painted}");
     }
 
@@ -8568,7 +8763,9 @@ alignment below it: {line:?}",
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(painted.contains("/goal start"), "{painted}");
     }
 
@@ -8583,7 +8780,9 @@ alignment below it: {line:?}",
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(painted.contains("not running"), "{painted}");
     }
 
@@ -8599,7 +8798,10 @@ alignment below it: {line:?}",
             "ship the thing",
             vec![agent_runtime::Criterion::new("c1", "tests pass").expect("criterion")],
             GoalBudget::default(),
-            vec![agent_runtime::EvidenceRequirement::new("c1", vec!["test".to_owned()]).expect("req")],
+            vec![
+                agent_runtime::EvidenceRequirement::new("c1", vec!["test".to_owned()])
+                    .expect("req"),
+            ],
         )
         .expect("spec");
         let effect = host
@@ -8672,9 +8874,7 @@ alignment below it: {line:?}",
         panic!("autonomous goal loop did not reach a terminal state in time");
     }
 
-    fn scripted_backing_queue(
-        models: Vec<ScriptedModel>,
-    ) -> ScriptedBackingQueue {
+    fn scripted_backing_queue(models: Vec<ScriptedModel>) -> ScriptedBackingQueue {
         std::sync::Arc::new(std::sync::Mutex::new(
             models
                 .into_iter()
@@ -8733,7 +8933,8 @@ alignment below it: {line:?}",
         session.create_active_goal();
 
         let cancel = CancellationToken::new();
-        let snapshot = block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
         let mut stream = block_on(
             session
                 .client
@@ -8785,8 +8986,13 @@ alignment below it: {line:?}",
 
         drive_autonomous_goal(&mut loop_state);
 
-        assert!(loop_state.autonomous.is_none(), "pausing must stop the autonomous loop");
-        let host = GoalHost::load(&session.goal_path()).expect("load").expect("goal exists");
+        assert!(
+            loop_state.autonomous.is_none(),
+            "pausing must stop the autonomous loop"
+        );
+        let host = GoalHost::load(&session.goal_path())
+            .expect("load")
+            .expect("goal exists");
         let snapshot = host.snapshot().expect("snapshot");
         assert_eq!(snapshot.state(), GoalState::Paused);
         assert_eq!(
@@ -8824,7 +9030,8 @@ alignment below it: {line:?}",
         host.save(&session.goal_path()).expect("save goal");
 
         let cancel = CancellationToken::new();
-        let snapshot = block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
         let mut stream = block_on(
             session
                 .client
@@ -8862,21 +9069,41 @@ alignment below it: {line:?}",
         );
 
         loop_state.start_autonomous_goal().expect("start");
-        assert!(loop_state.autonomous.is_some(), "the first iteration must be submitted");
+        assert!(
+            loop_state.autonomous.is_some(),
+            "the first iteration must be submitted"
+        );
         drive_autonomous_goal(&mut loop_state);
 
         assert!(
             loop_state.autonomous.is_none(),
             "the loop must have stopped once the turn budget was exhausted"
         );
-        let host = GoalHost::load(&session.goal_path()).expect("load").expect("goal exists");
+        let host = GoalHost::load(&session.goal_path())
+            .expect("load")
+            .expect("goal exists");
         let snapshot = host.snapshot().expect("snapshot");
         assert_eq!(snapshot.state(), GoalState::Blocked);
-        assert_eq!(snapshot.stop_reason(), Some(agent_runtime::GoalStopReason::BudgetExhausted));
+        assert_eq!(
+            snapshot.stop_reason(),
+            Some(agent_runtime::GoalStopReason::BudgetExhausted)
+        );
         let usage = snapshot.usage();
-        assert_eq!(usage.turns(), 2, "exactly two real iterations, never a third");
-        assert_eq!(usage.tokens(), 110, "50 + 60 — each iteration's real tokens accrued exactly once");
-        assert_eq!(usage.cost(), 500, "200 + 300 — each iteration's real cost accrued exactly once");
+        assert_eq!(
+            usage.turns(),
+            2,
+            "exactly two real iterations, never a third"
+        );
+        assert_eq!(
+            usage.tokens(),
+            110,
+            "50 + 60 — each iteration's real tokens accrued exactly once"
+        );
+        assert_eq!(
+            usage.cost(),
+            500,
+            "200 + 300 — each iteration's real cost accrued exactly once"
+        );
     }
 
     /// Context-budget P0 regression, autonomous side: `continue_or_stop_
@@ -8912,7 +9139,8 @@ alignment below it: {line:?}",
         host.save(&session.goal_path()).expect("save goal");
 
         let cancel = CancellationToken::new();
-        let snapshot = block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
         let mut stream = block_on(
             session
                 .client
@@ -8947,7 +9175,11 @@ alignment below it: {line:?}",
         drive_autonomous_goal(&mut loop_state);
 
         let prompts = captured.lock().unwrap_or_else(|p| p.into_inner());
-        assert_eq!(prompts.len(), 1, "exactly one autonomous iteration must have called step()");
+        assert_eq!(
+            prompts.len(),
+            1,
+            "exactly one autonomous iteration must have called step()"
+        );
         let expected = format!(
             "Context window: {} tokens. Reserve {} tokens",
             crate::user_config::DEFAULT_CONTEXT_WINDOW,
@@ -8984,7 +9216,8 @@ alignment below it: {line:?}",
         record_passing_evidence(&evidence_path, goal_id);
 
         let cancel = CancellationToken::new();
-        let snapshot = block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
         let mut stream = block_on(
             session
                 .client
@@ -9053,7 +9286,8 @@ alignment below it: {line:?}",
         host.save(&session.goal_path()).expect("save goal");
 
         let cancel = CancellationToken::new();
-        let snapshot = block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
         let mut stream = block_on(
             session
                 .client
@@ -9086,7 +9320,10 @@ alignment below it: {line:?}",
         loop_state.start_autonomous_goal().expect("start");
         drive_autonomous_goal(&mut loop_state);
 
-        assert!(loop_state.autonomous.is_none(), "the loop must stop, not keep guessing");
+        assert!(
+            loop_state.autonomous.is_none(),
+            "the loop must stop, not keep guessing"
+        );
         assert!(
             loop_state
                 .ui
@@ -9116,7 +9353,9 @@ alignment below it: {line:?}",
             "no second iteration should ever have been attempted: {:?}",
             loop_state.ui.transcript()
         );
-        let host = GoalHost::load(&session.goal_path()).expect("load").expect("goal exists");
+        let host = GoalHost::load(&session.goal_path())
+            .expect("load")
+            .expect("goal exists");
         assert_eq!(
             host.snapshot().expect("snapshot").state(),
             GoalState::Active,
@@ -9131,7 +9370,8 @@ alignment below it: {line:?}",
         let goal_id = session.create_active_goal();
 
         let cancel = CancellationToken::new();
-        let snapshot = block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
         let mut stream = block_on(
             session
                 .client
@@ -9169,8 +9409,13 @@ alignment below it: {line:?}",
         loop_state.start_autonomous_goal().expect("start");
         drive_autonomous_goal(&mut loop_state);
 
-        assert!(loop_state.autonomous.is_none(), "a failed turn must stop the loop");
-        let host = GoalHost::load(&session.goal_path()).expect("load").expect("goal exists");
+        assert!(
+            loop_state.autonomous.is_none(),
+            "a failed turn must stop the loop"
+        );
+        let host = GoalHost::load(&session.goal_path())
+            .expect("load")
+            .expect("goal exists");
         let host_snapshot = host.snapshot().expect("snapshot");
         assert_eq!(host_snapshot.id(), goal_id);
         assert_eq!(
@@ -9195,7 +9440,8 @@ alignment below it: {line:?}",
         let held = try_acquire_driver_lease(&session.goal_path()).expect("first lease");
 
         let cancel = CancellationToken::new();
-        let snapshot = block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
         let mut stream = block_on(
             session
                 .client
@@ -9253,12 +9499,17 @@ alignment below it: {line:?}",
             InteractiveInput::Submit("/goal start ship the thing".to_owned()),
             InteractiveInput::Submit("/goal run".to_owned()),
         ];
-        inputs.extend((0..80).map(|_| InteractiveInput::Resize { width: 80, height: 24 }));
+        inputs.extend((0..80).map(|_| InteractiveInput::Resize {
+            width: 80,
+            height: 24,
+        }));
         inputs.push(InteractiveInput::Submit("/goal stop".to_owned()));
         inputs.push(InteractiveInput::Submit("/quit".to_owned()));
         let report = run_interactive(env.options_capturing_render(inputs)).expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(
             painted.contains("autonomous goal execution started"),
             "{painted}"
@@ -9290,7 +9541,10 @@ alignment below it: {line:?}",
             InteractiveInput::Submit("/goal start ship the thing".to_owned()),
             InteractiveInput::Submit("/goal run".to_owned()),
         ];
-        inputs.extend((0..80).map(|_| InteractiveInput::Resize { width: 80, height: 24 }));
+        inputs.extend((0..80).map(|_| InteractiveInput::Resize {
+            width: 80,
+            height: 24,
+        }));
         inputs.push(InteractiveInput::Submit("/goal stop".to_owned()));
         inputs.push(InteractiveInput::Submit("/quit".to_owned()));
         let report = run_interactive(env.options_capturing_render(inputs)).expect("run");
@@ -9314,7 +9568,9 @@ alignment below it: {line:?}",
         let identity = identity_for(&env.project);
         let store = ProjectTrustStore::open(&catalog_path);
         assert_eq!(
-            store.get(&identity, &CancellationToken::new()).expect("get"),
+            store
+                .get(&identity, &CancellationToken::new())
+                .expect("get"),
             TrustStatus::Untrusted,
             "no autonomous iteration may leave this project trusted"
         );
@@ -9328,7 +9584,9 @@ alignment below it: {line:?}",
             .set(&identity, TrustStatus::Trusted, &CancellationToken::new())
             .expect("explicit grant");
         assert_eq!(
-            store.get(&identity, &CancellationToken::new()).expect("get"),
+            store
+                .get(&identity, &CancellationToken::new())
+                .expect("get"),
             TrustStatus::Trusted
         );
     }
@@ -9343,7 +9601,9 @@ alignment below it: {line:?}",
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(painted.contains("not available"), "{painted}");
         // Not just "MCP": the message must send the user to the command
         // that can actually do it, which now exists.
@@ -9381,7 +9641,9 @@ alignment below it: {line:?}",
             ]))
             .expect("run");
             assert_eq!(report.outcome, InteractiveOutcome::Quit);
-            let painted = report.rendered_output.expect("capture_render was requested");
+            let painted = report
+                .rendered_output
+                .expect("capture_render was requested");
             assert!(
                 painted.contains("not available"),
                 "`{command}` produced no output at all:\n{painted}"
@@ -9466,7 +9728,10 @@ subcommand"
             named += 1;
             rest = &rest[end..];
         }
-        assert!(named >= 4, "expected several messages to point at a real command");
+        assert!(
+            named >= 4,
+            "expected several messages to point at a real command"
+        );
     }
 
     #[test]
@@ -9496,9 +9761,8 @@ subcommand"
             session.session_id
         };
 
-        let mut options = env.options_capturing_render(vec![
-            InteractiveInput::Submit("/quit".to_owned()),
-        ]);
+        let mut options =
+            env.options_capturing_render(vec![InteractiveInput::Submit("/quit".to_owned())]);
         options.resume = Some(session_id);
         let resumed = run_interactive(options).expect("resumed session");
 
@@ -9507,7 +9771,9 @@ subcommand"
             Some(session_id),
             "a resumed run must stay on the session it was asked for, not create a new one"
         );
-        let painted = resumed.rendered_output.expect("capture_render was requested");
+        let painted = resumed
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(
             painted.contains("the earlier answer"),
             "the resumed session must show the earlier run's assistant output:\n{painted}"
@@ -9537,7 +9803,9 @@ subcommand"
             env.options_capturing_render(vec![InteractiveInput::Submit("/quit".to_owned())]);
         options.resume = Some(session);
         let resumed = run_interactive(options).expect("resumed");
-        let painted = resumed.rendered_output.expect("capture_render was requested");
+        let painted = resumed
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(
             !painted.contains("allow=workspace_write"),
             "local command output is session-local by design and must not appear to persist:\n{painted}"
@@ -9554,10 +9822,9 @@ subcommand"
         // everything.
         let _lock = lock_terminal();
         let env = TempEnv::create();
-        let first = run_interactive(env.options(vec![InteractiveInput::Submit(
-            "/quit".to_owned(),
-        )]))
-        .expect("first session");
+        let first =
+            run_interactive(env.options(vec![InteractiveInput::Submit("/quit".to_owned())]))
+                .expect("first session");
         let session = first.session_id.expect("session id");
 
         let ledger_path = project_ledger_path(&env.project.join(PROJECT_MARKER));
@@ -9698,12 +9965,10 @@ subcommand"
             "a project with nothing recorded has nothing to offer"
         );
 
-        let real = run_interactive(env.options(vec![InteractiveInput::Submit(
-            "/quit".to_owned(),
-        )]))
-        .expect("a session")
-        .session_id
-        .expect("id");
+        let real = run_interactive(env.options(vec![InteractiveInput::Submit("/quit".to_owned())]))
+            .expect("a session")
+            .session_id
+            .expect("id");
         let hint = known_sessions_hint(&ledger_path).expect("a recorded session to offer");
         assert!(
             hint.contains(&real.to_string()),
@@ -9773,8 +10038,7 @@ subcommand"
         )
         .expect("subscribe");
         let mut ui = AppState::new();
-        replay_history(&client, &mut stream, &mut ui, session_id, tip, &cancel)
-            .expect("replay");
+        replay_history(&client, &mut stream, &mut ui, session_id, tip, &cancel).expect("replay");
 
         assert!(
             stream.cursor() >= tip,
@@ -9845,7 +10109,11 @@ subcommand"
         // fallback would answer `None` here too.)
         let bare = root.join("elsewhere");
         fs::create_dir_all(bare.join(PROJECT_MARKER)).expect("bare");
-        assert!(load_active_reminders(Some(&bare)).expect("no roster").is_none());
+        assert!(
+            load_active_reminders(Some(&bare))
+                .expect("no roster")
+                .is_none()
+        );
         assert!(load_active_reminders(None).expect("no root").is_none());
     }
 
@@ -10102,7 +10370,8 @@ that is no longer there"
         fs::remove_dir_all(dir.project.join(PROJECT_MARKER)).ok();
         let resolved = project_path_in(&bare, GOAL_FILE);
         assert!(
-            resolved.starts_with(&bare) || resolved.starts_with(fs::canonicalize(&dir.project).expect("c")),
+            resolved.starts_with(&bare)
+                || resolved.starts_with(fs::canonicalize(&dir.project).expect("c")),
             "an unmarked directory falls back to itself or its nearest marker: {}",
             resolved.display()
         );
@@ -10116,18 +10385,16 @@ that is no longer there"
         // colliding with the first one's records.
         let _lock = lock_terminal();
         let env = TempEnv::create();
-        let first = run_interactive(env.options(vec![InteractiveInput::Submit(
-            "/quit".to_owned(),
-        )]))
-        .expect("first run")
-        .session_id
-        .expect("id");
-        let second = run_interactive(env.options(vec![InteractiveInput::Submit(
-            "/quit".to_owned(),
-        )]))
-        .expect("running rapid a second time in the same project must work")
-        .session_id
-        .expect("id");
+        let first =
+            run_interactive(env.options(vec![InteractiveInput::Submit("/quit".to_owned())]))
+                .expect("first run")
+                .session_id
+                .expect("id");
+        let second =
+            run_interactive(env.options(vec![InteractiveInput::Submit("/quit".to_owned())]))
+                .expect("running rapid a second time in the same project must work")
+                .session_id
+                .expect("id");
         assert_ne!(first, second, "each run gets its own session");
     }
 
@@ -10221,7 +10488,10 @@ that is no longer there"
 
         let rows = model_rows(&config, Some("big"));
         let big = rows.iter().find(|row| row.id == "big").expect("big");
-        assert!(big.active, "the resolved model must be marked as the one that runs");
+        assert!(
+            big.active,
+            "the resolved model must be marked as the one that runs"
+        );
         assert_eq!(big.context_window, Some(200_000));
         assert_eq!(big.fallback_rank, None);
 
@@ -10423,7 +10693,11 @@ the parent delivers nothing for the session the user is now in"
             Some((3, 9)),
             "the resumed session's events must reach the UI"
         );
-        assert!(!loop_state.ui.actions_blocked(), "{:?}", loop_state.ui.protocol_error());
+        assert!(
+            !loop_state.ui.actions_blocked(),
+            "{:?}",
+            loop_state.ui.protocol_error()
+        );
 
         // Bare: "the other one" — the most recently active session that is
         // not this one. Here that is the child, the only other session.
@@ -10447,7 +10721,9 @@ the parent delivers nothing for the session the user is now in"
         let cancel = CancellationToken::new();
         let snapshot = block_on(session.client.get_session(here), &cancel).expect("session");
         let mut stream = block_on(
-            session.client.subscribe(SubscribeEvents::new(here, snapshot.seq())),
+            session
+                .client
+                .subscribe(SubscribeEvents::new(here, snapshot.seq())),
             &cancel,
         )
         .expect("subscribe");
@@ -10470,7 +10746,10 @@ the parent delivers nothing for the session the user is now in"
         loop_state
             .dispatch_slash("/resume 019c0000-0000-7000-8000-00000000dead")
             .expect("dispatch");
-        assert_eq!(loop_state.session_id, here, "an unknown id must not move the session");
+        assert_eq!(
+            loop_state.session_id, here,
+            "an unknown id must not move the session"
+        );
         let text = loop_state
             .ui
             .transcript()
@@ -10533,7 +10812,9 @@ the parent delivers nothing for the session the user is now in"
             ),
         );
         let changed = session.state().changed_files();
-        let file = changed.get("lib.rs").expect("the written file is projected");
+        let file = changed
+            .get("lib.rs")
+            .expect("the written file is projected");
         let hunks = file
             .hunks
             .as_deref()
@@ -10609,8 +10890,7 @@ the parent delivers nothing for the session the user is now in"
         // it; pinned rather than assumed, like `MAX_RESULT_DETAIL_BYTES`.
         let marker_room = 64;
         assert!(
-            crate::line_diff::MAX_UNIFIED_BYTES + marker_room
-                <= tui::state::MAX_DISPLAY_TEXT_BYTES,
+            crate::line_diff::MAX_UNIFIED_BYTES + marker_room <= tui::state::MAX_DISPLAY_TEXT_BYTES,
             "hunk text ({}) plus its truncation marker must fit the display bound ({})",
             crate::line_diff::MAX_UNIFIED_BYTES,
             tui::state::MAX_DISPLAY_TEXT_BYTES
@@ -10742,11 +11022,7 @@ not this session's own earlier output"
         );
 
         // It reaches the status line, which is where the dash was.
-        let rendered = tui::render_status_with(
-            session.state(),
-            &tui::StatusChrome::default(),
-            120,
-        );
+        let rendered = tui::render_status_with(session.state(), &tui::StatusChrome::default(), 120);
         assert!(
             rendered.content().contains(&format!("{used}")),
             "the status line must show the compiled usage: {}",
@@ -10761,11 +11037,13 @@ not this session's own earlier output"
         // complete widget fed nothing, on the one surface always on screen.
         let _lock = lock_terminal();
         let env = TempEnv::create();
-        let report = run_interactive(env.options_capturing_render(vec![
-            InteractiveInput::Submit("/quit".to_owned()),
-        ]))
+        let report = run_interactive(
+            env.options_capturing_render(vec![InteractiveInput::Submit("/quit".to_owned())]),
+        )
         .expect("run");
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
 
         // Only the policy item is asserted: the model shown is whatever the
         // *process environment* configures, which is a property of the
@@ -10902,7 +11180,10 @@ was already finished"
         );
 
         // A second turn runs, and it is still there — same table, same job.
-        session.run_turn("keep working", ScriptedModel::terminal("did something else"));
+        session.run_turn(
+            "keep working",
+            ScriptedModel::terminal("did something else"),
+        );
         let jobs = session.state().jobs();
         assert_eq!(jobs.len(), 1, "the same job, not a second one: {jobs:?}");
         let job = jobs.values().next().expect("the job");
@@ -10973,10 +11254,7 @@ was already finished"
         let mut session = ScriptedSession::create(&env);
         session.run_turn(
             "start the build",
-            ScriptedModel::background_job_then_answer(
-                &["/bin/echo", "building"],
-                "started it",
-            ),
+            ScriptedModel::background_job_then_answer(&["/bin/echo", "building"], "started it"),
         );
 
         // `job.started` is appended by the tool call itself, so it is in the
@@ -11215,11 +11493,7 @@ was already finished"
             ),
         );
         session.drain_until("both jobs to finish", |state| {
-            state.jobs().len() == 2
-                && state
-                    .jobs()
-                    .values()
-                    .all(|job| job.state().is_terminal())
+            state.jobs().len() == 2 && state.jobs().values().all(|job| job.state().is_terminal())
         });
 
         let cancel = CancellationToken::new();
@@ -11568,7 +11842,9 @@ was already finished"
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(
             painted.contains("no per-agent attribution"),
             "a flag that cannot narrow anything must say so:\n{painted}"
@@ -11581,7 +11857,9 @@ was already finished"
             InteractiveInput::Submit("/quit".to_owned()),
         ]))
         .expect("run");
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(
             !painted.contains("no per-agent attribution"),
             "a bare /diff must not carry the flag's notice:\n{painted}"
@@ -11610,7 +11888,10 @@ was already finished"
             .handle()
             .expect("the projection must keep the handle the producer recorded")
             .to_owned();
-        assert!(handle.starts_with("job-"), "the model-facing handle: {handle}");
+        assert!(
+            handle.starts_with("job-"),
+            "the model-facing handle: {handle}"
+        );
 
         let cancel = CancellationToken::new();
         let snapshot =
@@ -11742,7 +12023,9 @@ was already finished"
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(
             painted.contains("run a marked command"),
             "bare /help must say where the specific reason lives:\n{painted}"
@@ -11800,7 +12083,9 @@ was already finished"
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(
             !painted.contains("run a marked command"),
             "per-command help must not become the whole catalog:\n{painted}"
@@ -11829,7 +12114,9 @@ was already finished"
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(
             painted.contains("now on child session"),
             "the branch it moved onto must be named:\n{painted}"
@@ -11872,7 +12159,9 @@ the user was in is no longer the one they are in:\n{painted}"
             InteractiveOutcome::Quit,
             "a rejected rewind must not end the session"
         );
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(
             painted.contains("rewind to 999999 failed"),
             "the rejection must be reported as a command error:\n{painted}"
@@ -11912,7 +12201,9 @@ the user was in is no longer the one they are in:\n{painted}"
             report.interrupt_count, 0,
             "the session was interrupted by a command that names a job"
         );
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(
             painted.contains("no job 01234567-89ab-7cde-89ab-0123456789ab in this session"),
             "an id this session never had must be said so, not acknowledged as \
@@ -11939,7 +12230,9 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             report.interrupt_count, 0,
             "a bare cancel must not interrupt the turn either"
         );
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(painted.contains("not available"), "{painted}");
     }
 
@@ -11955,7 +12248,9 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(painted.contains("allow=workspace_write"), "{painted}");
 
         // Read back the way a real run does: the production reader, against
@@ -12006,7 +12301,9 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(painted.contains("grants=1"), "{painted}");
         assert!(painted.contains("allow=repo_read"), "{painted}");
         assert!(
@@ -12025,7 +12322,9 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(painted.contains("not a valid pattern"), "{painted}");
         let canonical = fs::canonicalize(&env.project).expect("canonicalize");
         assert!(
@@ -12069,7 +12368,9 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(painted.contains("servers="), "{painted}");
         assert!(
             painted.contains("good"),
@@ -12115,7 +12416,9 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(
             painted.contains("trust=trusted"),
             "the grant in this session's own home was not observed:\n{painted}"
@@ -12149,7 +12452,9 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             before,
             "an approval-gated action mutated project settings with no approval"
         );
-        let painted = report.rendered_output.expect("capture_render was requested");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
         assert!(
             painted.contains("rapid mcp remove"),
             "it must name the argv-only command that can do this:\n{painted}"
@@ -12203,7 +12508,10 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             command_error_text(&CommandError::UnknownCommand),
             "unknown command — type /help for available commands"
         );
-        assert_eq!(command_error_text(&CommandError::TooLong), "command too long");
+        assert_eq!(
+            command_error_text(&CommandError::TooLong),
+            "command too long"
+        );
         assert_eq!(
             command_error_text(&CommandError::InvalidArgs { command: "fork" }),
             "/fork"
@@ -12560,7 +12868,9 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             // real work today, but not something a test should rely on
             // staying slow enough to round up to a whole millisecond.
             std::thread::sleep(std::time::Duration::from_millis(5));
-            self.outputs.pop_front().unwrap_or(Err(ModelStepError::Failed))
+            self.outputs
+                .pop_front()
+                .unwrap_or(Err(ModelStepError::Failed))
         }
     }
 
@@ -12602,7 +12912,11 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             let actor = human_actor().expect("actor");
             let cancel = CancellationToken::new();
             let snapshot = block_on(
-                client.create_session(CreateSession::new(ProjectId::new(), actor.clone(), TraceId::new())),
+                client.create_session(CreateSession::new(
+                    ProjectId::new(),
+                    actor.clone(),
+                    TraceId::new(),
+                )),
                 &cancel,
             )
             .expect("create session");
@@ -12700,7 +13014,8 @@ cancelled and not turned into a turn interrupt:\n{painted}"
                 !turn_in_flight.load(std::sync::atomic::Ordering::SeqCst),
                 "turn_in_flight must reset to false once the turn thread finishes"
             );
-            let snapshot = block_on(self.client.get_session(self.session_id), &cancel).expect("session");
+            let snapshot =
+                block_on(self.client.get_session(self.session_id), &cancel).expect("session");
             assert!(
                 snapshot.active_turn().is_none(),
                 "the turn's kernel lease must be released once finish_turn has run \
@@ -12950,13 +13265,15 @@ pre-approve it with `rapid permissions allow <tool>`";
         let small_captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         session.run_turn_with_budget(
             "say hi",
-            ScriptedModel::terminal("ok").capturing_system_prompt(std::sync::Arc::clone(&small_captured)),
+            ScriptedModel::terminal("ok")
+                .capturing_system_prompt(std::sync::Arc::clone(&small_captured)),
             (2_000, 200),
         );
         let large_captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         session.run_turn_with_budget(
             "say hi again",
-            ScriptedModel::terminal("ok").capturing_system_prompt(std::sync::Arc::clone(&large_captured)),
+            ScriptedModel::terminal("ok")
+                .capturing_system_prompt(std::sync::Arc::clone(&large_captured)),
             (200_000, 8_000),
         );
 
@@ -13059,7 +13376,10 @@ pre-approve it with `rapid permissions allow <tool>`";
         assert_eq!(usage.cost(), 4_200);
         // Real wall-clock time was spent; this harness cannot pin an exact
         // value, but it must not have stayed at the zero it starts at.
-        assert!(usage.active_ms() > 0, "active_ms must reflect real elapsed time, got 0");
+        assert!(
+            usage.active_ms() > 0,
+            "active_ms must reflect real elapsed time, got 0"
+        );
     }
 
     #[test]
@@ -13068,7 +13388,10 @@ pre-approve it with `rapid permissions allow <tool>`";
         let mut session = ScriptedSession::create(&env);
         // Deliberately no `create_active_goal()` call.
 
-        session.run_turn("no goal here", ScriptedModel::terminal_with_usage("done", 100, 100));
+        session.run_turn(
+            "no goal here",
+            ScriptedModel::terminal_with_usage("done", 100, 100),
+        );
 
         assert!(
             !session.goal_path().exists(),
@@ -13100,7 +13423,11 @@ pre-approve it with `rapid permissions allow <tool>`";
             "sanity check: the turn must actually have failed"
         );
         let usage = session.goal_usage();
-        assert_eq!(usage.turns(), 1, "a failed turn still counts as one incurred turn");
+        assert_eq!(
+            usage.turns(),
+            1,
+            "a failed turn still counts as one incurred turn"
+        );
         assert_eq!(usage.tokens(), 300);
         assert_eq!(usage.cost(), 150);
     }
@@ -13147,9 +13474,21 @@ pre-approve it with `rapid permissions allow <tool>`";
         session.run_turn("fails immediately", ScriptedModel::failing());
 
         let usage = session.goal_usage();
-        assert_eq!(usage.turns(), 1, "the turn still ran (and failed), so it still counts");
-        assert_eq!(usage.tokens(), 0, "must not invent tokens that were never reported");
-        assert_eq!(usage.cost(), 0, "must not invent cost that was never reported");
+        assert_eq!(
+            usage.turns(),
+            1,
+            "the turn still ran (and failed), so it still counts"
+        );
+        assert_eq!(
+            usage.tokens(),
+            0,
+            "must not invent tokens that were never reported"
+        );
+        assert_eq!(
+            usage.cost(),
+            0,
+            "must not invent cost that was never reported"
+        );
     }
 
     #[test]
@@ -13163,8 +13502,14 @@ pre-approve it with `rapid permissions allow <tool>`";
         let mut session = ScriptedSession::create(&env);
         session.create_active_goal();
 
-        session.run_turn("first", ScriptedModel::terminal_with_usage("first done", 100, 10));
-        session.run_turn("second", ScriptedModel::terminal_with_usage("second done", 250, 40));
+        session.run_turn(
+            "first",
+            ScriptedModel::terminal_with_usage("first done", 100, 10),
+        );
+        session.run_turn(
+            "second",
+            ScriptedModel::terminal_with_usage("second done", 250, 40),
+        );
 
         let usage = session.goal_usage();
         assert_eq!(usage.turns(), 2);
@@ -13203,17 +13548,24 @@ pre-approve it with `rapid permissions allow <tool>`";
              verbatim: {transcript:?}"
         );
         assert!(
-            !transcript.iter().any(|entry| matches!(entry, TranscriptEntry::TurnFailed { .. })),
+            !transcript
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::TurnFailed { .. })),
             "needing context is not a failure and must not show a failure banner: {transcript:?}"
         );
         assert!(
-            !transcript.iter().any(|entry| matches!(entry, TranscriptEntry::TurnInterrupted)),
+            !transcript
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::TurnInterrupted)),
             "needing context is not a cancellation: {transcript:?}"
         );
         assert!(
             !transcript.iter().any(|entry| matches!(
                 entry,
-                TranscriptEntry::ToolActivity { status: ToolActivityStatus::Failed, .. }
+                TranscriptEntry::ToolActivity {
+                    status: ToolActivityStatus::Failed,
+                    ..
+                }
             )),
             "needing context must not show a failure marker on the ask_user call either: \
              {transcript:?}"
@@ -13221,7 +13573,10 @@ pre-approve it with `rapid permissions allow <tool>`";
         assert!(
             transcript.iter().any(|entry| matches!(
                 entry,
-                TranscriptEntry::ToolActivity { status: ToolActivityStatus::ContextRequired, .. }
+                TranscriptEntry::ToolActivity {
+                    status: ToolActivityStatus::ContextRequired,
+                    ..
+                }
             )),
             "the ask_user call gets its own non-failure activity marker: {transcript:?}"
         );
@@ -13248,7 +13603,8 @@ pre-approve it with `rapid permissions allow <tool>`";
             })
             .count();
         assert_eq!(
-            occurrences, 1,
+            occurrences,
+            1,
             "the clarification question must appear exactly once, not duplicated as a second \
              UI-visible message: {:?}",
             session.transcript()
@@ -13271,8 +13627,16 @@ pre-approve it with `rapid permissions allow <tool>`";
         );
 
         let usage = session.goal_usage();
-        assert_eq!(usage.turns(), 1, "a context-required turn still counts as one incurred turn");
-        assert_eq!(usage.tokens(), 1, "ScriptedModel::asks_for_context reports 1 token");
+        assert_eq!(
+            usage.turns(),
+            1,
+            "a context-required turn still counts as one incurred turn"
+        );
+        assert_eq!(
+            usage.tokens(),
+            1,
+            "ScriptedModel::asks_for_context reports 1 token"
+        );
     }
 
     #[test]
@@ -13330,7 +13694,10 @@ pre-approve it with `rapid permissions allow <tool>`";
         // the same-shaped field. Only `ContextRequired` counts.
         let with_tool_failed = test_exec_outcome(
             Some(agent_runtime::TurnStopReason::ToolFailed),
-            Some(agent_runtime::TurnFailureDetail::new("shell_exec", "not found")),
+            Some(agent_runtime::TurnFailureDetail::new(
+                "shell_exec",
+                "not found",
+            )),
         );
         assert_eq!(context_required_question(&with_tool_failed), None);
 
@@ -13339,9 +13706,15 @@ pre-approve it with `rapid permissions allow <tool>`";
 
         let with_context_required = test_exec_outcome(
             Some(agent_runtime::TurnStopReason::ContextRequired),
-            Some(agent_runtime::TurnFailureDetail::new("ask_user", "Which one?")),
+            Some(agent_runtime::TurnFailureDetail::new(
+                "ask_user",
+                "Which one?",
+            )),
         );
-        assert_eq!(context_required_question(&with_context_required), Some("Which one?"));
+        assert_eq!(
+            context_required_question(&with_context_required),
+            Some("Which one?")
+        );
     }
 
     #[test]
@@ -13364,7 +13737,9 @@ pre-approve it with `rapid permissions allow <tool>`";
             vec!["Which environment should I deploy to?".to_owned()]
         );
         assert!(
-            report.summary.contains("Which environment should I deploy to?"),
+            report
+                .summary
+                .contains("Which environment should I deploy to?"),
             "{}",
             report.summary
         );
@@ -13656,13 +14031,19 @@ pre-approve it with `rapid permissions allow <tool>`";
 
         let wide = reduce(
             session.state().clone(),
-            &UiEvent::Local(LocalUiEvent::SetViewport { width: 120, height: 30 }),
+            &UiEvent::Local(LocalUiEvent::SetViewport {
+                width: 120,
+                height: 30,
+            }),
         );
         renderer.render(&wide).expect("render wide");
 
         let narrow = reduce(
             session.state().clone(),
-            &UiEvent::Local(LocalUiEvent::SetViewport { width: 40, height: 10 }),
+            &UiEvent::Local(LocalUiEvent::SetViewport {
+                width: 40,
+                height: 10,
+            }),
         );
         renderer.render(&narrow).expect("render narrow");
         let painted = renderer.captured_text().expect("captured");
@@ -13680,13 +14061,18 @@ pre-approve it with `rapid permissions allow <tool>`";
         // rather than being reimplemented here.
         let mut renderer = TuiRenderer::new(true);
         for i in 0..40 {
-            renderer.transcript.push_entry(&tui::state::TranscriptEntry::Assistant {
-                text: format!("line {i}"),
-            });
+            renderer
+                .transcript
+                .push_entry(&tui::state::TranscriptEntry::Assistant {
+                    text: format!("line {i}"),
+                });
         }
         let state = reduce(
             AppState::new(),
-            &UiEvent::Local(LocalUiEvent::SetViewport { width: 80, height: 8 }),
+            &UiEvent::Local(LocalUiEvent::SetViewport {
+                width: 80,
+                height: 8,
+            }),
         );
         renderer.render(&state).expect("render");
         assert!(
@@ -13734,9 +14120,11 @@ pre-approve it with `rapid permissions allow <tool>`";
         let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut renderer = TuiRenderer::new(true);
         for i in 0..40 {
-            renderer.transcript.push_entry(&tui::state::TranscriptEntry::Assistant {
-                text: format!("line {i}"),
-            });
+            renderer
+                .transcript
+                .push_entry(&tui::state::TranscriptEntry::Assistant {
+                    text: format!("line {i}"),
+                });
         }
         renderer.viewport.resize(80, 8);
 
@@ -13764,7 +14152,10 @@ pre-approve it with `rapid permissions allow <tool>`";
                 .handle_input(InteractiveInput::PageUp)
                 .expect("page up");
         }
-        assert!(!renderer.viewport.follow_tail(), "PageUp must reach the renderer's viewport");
+        assert!(
+            !renderer.viewport.follow_tail(),
+            "PageUp must reach the renderer's viewport"
+        );
 
         {
             let mut loop_state = SessionLoop {
@@ -13812,7 +14203,10 @@ pre-approve it with `rapid permissions allow <tool>`";
         let _lock = lock_terminal();
         let env = TempEnv::create();
         let report = run_interactive(env.options_capturing_render(vec![
-            InteractiveInput::Resize { width: 80, height: 24 },
+            InteractiveInput::Resize {
+                width: 80,
+                height: 24,
+            },
             InteractiveInput::Submit("/goal".to_owned()),
             InteractiveInput::Submit("/quit".to_owned()),
         ]))

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use capability_broker::CancellationToken;
 use protocol::{ErrorCode, JobId};
 
-use crate::jobs::{JobLifetime, JobRegistry, ProcessIdentity, RunningTombstone, MAX_LIVE_JOBS};
+use crate::jobs::{JobLifetime, JobRegistry, MAX_LIVE_JOBS, ProcessIdentity, RunningTombstone};
 
 /// Observed kernel start may be slightly after the recorded stamp (etime rounding).
 pub const START_AHEAD_SLACK_MS: u64 = 2_000;
@@ -1245,14 +1245,16 @@ mod tests {
         let killer = RecordingKiller::default();
         let report = reconcile(&[a, b], &probe, &killer);
         assert!(killer.killed().is_empty());
-        assert!(report
-            .outcomes()
-            .iter()
-            .all(|o| o.ownership() == Ownership::Unknown
-                && o.decision()
-                    == ReconcileDecision::Blocked {
-                        warning: RecoveryWarning::UnknownOwnership,
-                    }));
+        assert!(
+            report
+                .outcomes()
+                .iter()
+                .all(|o| o.ownership() == Ownership::Unknown
+                    && o.decision()
+                        == ReconcileDecision::Blocked {
+                            warning: RecoveryWarning::UnknownOwnership,
+                        })
+        );
     }
 
     #[test]

@@ -40,8 +40,10 @@ fn trusted_project(home: &Path, project: &Path) {
         .output()
         .expect("git init");
     assert!(init.status.success(), "git init failed");
-    for (key, value) in [("user.email", "evidencerace@example.com"), ("user.name", "evidencerace")]
-    {
+    for (key, value) in [
+        ("user.email", "evidencerace@example.com"),
+        ("user.name", "evidencerace"),
+    ] {
         let _ = Command::new("git")
             .args(["config", key, value])
             .current_dir(project)
@@ -127,7 +129,11 @@ fn concurrent_rapid_goal_evidence_record_processes_all_commit_their_record() {
 
     // Setup: create the goal synchronously, before any race participant
     // starts — not itself part of the timed race.
-    let (code, _out, err) = run_goal(&project, &home, &["create", "ship it", "--criterion", "c1=works"]);
+    let (code, _out, err) = run_goal(
+        &project,
+        &home,
+        &["create", "ship it", "--criterion", "c1=works"],
+    );
     assert_eq!(code, Some(0), "goal create must succeed: {err}");
 
     // Launch every writer concurrently — never `.output()` (which would
@@ -138,7 +144,9 @@ fn concurrent_rapid_goal_evidence_record_processes_all_commit_their_record() {
         .map(|command| spawn_evidence_record(&project, &home, command))
         .collect();
     for (i, mut child) in children.into_iter().enumerate() {
-        let status = child.wait().unwrap_or_else(|err| panic!("wait for writer {i}: {err}"));
+        let status = child
+            .wait()
+            .unwrap_or_else(|err| panic!("wait for writer {i}: {err}"));
         assert!(status.success(), "writer {i} must exit cleanly");
     }
 
@@ -154,8 +162,11 @@ fn concurrent_rapid_goal_evidence_record_processes_all_commit_their_record() {
         .map(|record| record["command"].as_str().expect("command"))
         .collect();
     let expected: std::collections::BTreeSet<&str> = commands.iter().map(String::as_str).collect();
-    assert_eq!(seen, expected, "every writer's specific record must be the one that survived, \
-        not duplicates of a subset");
+    assert_eq!(
+        seen, expected,
+        "every writer's specific record must be the one that survived, \
+        not duplicates of a subset"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }

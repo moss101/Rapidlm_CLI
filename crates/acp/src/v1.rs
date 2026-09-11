@@ -1065,10 +1065,7 @@ fn tool_call_update(
 /// Map a staged/committed workspace patch onto an edit tool-call update that
 /// carries the bounded unified diff. Payload without a usable path or patch
 /// body maps to `None`.
-fn file_edit_update(
-    session_id: SessionId,
-    payload: &Value,
-) -> Option<SessionUpdateNotification> {
+fn file_edit_update(session_id: SessionId, payload: &Value) -> Option<SessionUpdateNotification> {
     let path = payload_string(payload, &["path", "file", "target"])
         .filter(|p| !p.is_empty() && p.len() <= MAX_DIFF_PATH_BYTES)?;
     let mut unified = payload_string(payload, &["diff", "patch", "unified"])?;
@@ -1666,8 +1663,12 @@ mod tests {
             serde_json::json!({"path": "a.rs", "diff": ""}),
         ] {
             assert!(
-                map_kernel_event(&envelope(EventKind::WorkspacePatchStaged, SessionId::new(), payload))
-                    .is_none(),
+                map_kernel_event(&envelope(
+                    EventKind::WorkspacePatchStaged,
+                    SessionId::new(),
+                    payload
+                ))
+                .is_none(),
                 "payload without path+diff must not map"
             );
         }
@@ -1682,7 +1683,10 @@ mod tests {
         let mut s = "a".repeat(max - 1);
         s.push('é');
         assert_eq!(s.len(), max + 1);
-        assert!(!s.is_char_boundary(max), "test fixture must actually straddle the cut");
+        assert!(
+            !s.is_char_boundary(max),
+            "test fixture must actually straddle the cut"
+        );
         s
     }
 
@@ -1721,7 +1725,10 @@ mod tests {
         ))
         .expect("mapped");
         let MappedEvent::SessionUpdate(SessionUpdateNotification {
-            update: SessionUpdate::ToolCallUpdate { diff: Some(diff), .. },
+            update:
+                SessionUpdate::ToolCallUpdate {
+                    diff: Some(diff), ..
+                },
             ..
         }) = mapped
         else {

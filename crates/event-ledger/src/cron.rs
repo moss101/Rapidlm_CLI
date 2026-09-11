@@ -135,26 +135,23 @@ impl fmt::Display for CronStoreError {
                 f,
                 "cron job '{id}' is not in the firing state; refusing to complete it"
             ),
-            Self::PromptTooLarge { limit, observed } => write!(
-                f,
-                "prompt is {observed} bytes; limit is {limit} bytes"
-            ),
+            Self::PromptTooLarge { limit, observed } => {
+                write!(f, "prompt is {observed} bytes; limit is {limit} bytes")
+            }
             Self::ScheduleTooLarge { limit, observed } => write!(
                 f,
                 "schedule expression is {observed} bytes; limit is {limit} bytes"
             ),
-            Self::SessionIdTooLarge { limit, observed } => write!(
-                f,
-                "session id is {observed} bytes; limit is {limit} bytes"
-            ),
+            Self::SessionIdTooLarge { limit, observed } => {
+                write!(f, "session id is {observed} bytes; limit is {limit} bytes")
+            }
             Self::ReasonTooLarge { limit, observed } => write!(
                 f,
                 "quarantine reason is {observed} bytes; limit is {limit} bytes"
             ),
-            Self::TooManyJobs { limit } => write!(
-                f,
-                "cron store already holds the maximum of {limit} jobs"
-            ),
+            Self::TooManyJobs { limit } => {
+                write!(f, "cron store already holds the maximum of {limit} jobs")
+            }
             Self::Corrupt(why) => write!(f, "cron store row is corrupt: {why}"),
             Self::Migration(err) => write!(f, "cron store migration failed: {err}"),
             Self::Sqlite(err) => write!(f, "sqlite error: {err}"),
@@ -202,9 +199,8 @@ fn generate_id() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let mixed = nanos
-        ^ ((std::process::id() as u64) << 32)
-        ^ (seq.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let mixed =
+        nanos ^ ((std::process::id() as u64) << 32) ^ (seq.wrapping_mul(0x9E37_79B9_7F4A_7C15));
     format!("cron-{mixed:016x}")
 }
 
@@ -451,12 +447,7 @@ impl CronStore {
     /// Quarantine a job: kept, not loaded. Works from any state so an
     /// operator can stop a firing job mid-flight; completion afterwards
     /// fails closed.
-    pub fn quarantine(
-        &self,
-        id: &str,
-        reason: &str,
-        now_ms: i64,
-    ) -> Result<(), CronStoreError> {
+    pub fn quarantine(&self, id: &str, reason: &str, now_ms: i64) -> Result<(), CronStoreError> {
         let reason_bytes = reason.len();
         if reason_bytes > MAX_QUARANTINE_REASON_BYTES {
             return Err(CronStoreError::ReasonTooLarge {
@@ -581,10 +572,8 @@ mod tests {
     impl TempDb {
         fn open_store() -> (CronStore, Self) {
             let seq = TEMP_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "rapidlm-cron-{}-{seq}.sqlite",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("rapidlm-cron-{}-{seq}.sqlite", std::process::id()));
             let _ = std::fs::remove_file(&path);
             let store = CronStore::open(&path).expect("open cron store");
             (store, Self { path })
@@ -659,7 +648,10 @@ mod tests {
         assert_eq!(claimed[0].id, due.id);
         assert_eq!(claimed[0].status, CronJobStatus::Firing);
         assert_eq!(claimed[0].last_claim_ms, Some(2_000));
-        assert_eq!(store.get(&future.id).expect("get").status, CronJobStatus::Active);
+        assert_eq!(
+            store.get(&future.id).expect("get").status,
+            CronJobStatus::Active
+        );
         // Second claim at the same instant gets nothing: the lease holds.
         let again = store.claim_due(2_000, 10).expect("claim again");
         assert!(again.is_empty());
@@ -714,8 +706,12 @@ mod tests {
         let (store, _db) = TempDb::open_store();
         let job = add_job(&store, 1_000);
         store.claim_due(1_000, 10).expect("claim");
-        store.quarantine(&job.id, "operator stop", 1_010).expect("quarantine");
-        let err = store.complete(&job.id, 61_000, 1_050).expect_err("complete");
+        store
+            .quarantine(&job.id, "operator stop", 1_010)
+            .expect("quarantine");
+        let err = store
+            .complete(&job.id, 61_000, 1_050)
+            .expect_err("complete");
         match err {
             CronStoreError::JobNotClaimed { id } => assert_eq!(id, job.id),
             other => panic!("expected JobNotClaimed, got {other:?}"),
@@ -732,11 +728,15 @@ mod tests {
         assert_eq!(job.consecutive_failures, 0, "a brand-new job starts at 0");
 
         assert_eq!(
-            store.record_execution_result(&job.id, false, 2_000).expect("record"),
+            store
+                .record_execution_result(&job.id, false, 2_000)
+                .expect("record"),
             1
         );
         assert_eq!(
-            store.record_execution_result(&job.id, false, 3_000).expect("record"),
+            store
+                .record_execution_result(&job.id, false, 3_000)
+                .expect("record"),
             2
         );
         let mid = store.get(&job.id).expect("get");
@@ -745,14 +745,18 @@ mod tests {
 
         // A single success resets the streak entirely, not just decrements it.
         assert_eq!(
-            store.record_execution_result(&job.id, true, 4_000).expect("record"),
+            store
+                .record_execution_result(&job.id, true, 4_000)
+                .expect("record"),
             0
         );
         let after_success = store.get(&job.id).expect("get");
         assert_eq!(after_success.consecutive_failures, 0);
 
         assert_eq!(
-            store.record_execution_result(&job.id, false, 5_000).expect("record"),
+            store
+                .record_execution_result(&job.id, false, 5_000)
+                .expect("record"),
             1,
             "the counter must start over from 0, not resume the pre-reset streak"
         );
@@ -788,7 +792,10 @@ mod tests {
                 })
             })
             .collect();
-        let mut results: Vec<u32> = handles.into_iter().map(|h| h.join().expect("thread")).collect();
+        let mut results: Vec<u32> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread"))
+            .collect();
         results.sort_unstable();
         assert_eq!(
             results,
@@ -822,14 +829,20 @@ mod tests {
         // `fresh` completes and comes due again at 61_000, so its re-claim
         // lease (61_000) is still live at the sweep; `stale` keeps its
         // original 1_000 claim and is orphaned.
-        store.complete(&fresh.id, 61_000, 1_100).expect("complete fresh");
+        store
+            .complete(&fresh.id, 61_000, 1_100)
+            .expect("complete fresh");
         store.claim_due(61_000, 10).expect("re-claim fresh");
-        let requeued = store
-            .requeue_orphaned(120_000, 60_000)
-            .expect("requeue");
+        let requeued = store.requeue_orphaned(120_000, 60_000).expect("requeue");
         assert_eq!(requeued, 1);
-        assert_eq!(store.get(&stale.id).expect("get").status, CronJobStatus::Active);
-        assert_eq!(store.get(&fresh.id).expect("get").status, CronJobStatus::Firing);
+        assert_eq!(
+            store.get(&stale.id).expect("get").status,
+            CronJobStatus::Active
+        );
+        assert_eq!(
+            store.get(&fresh.id).expect("get").status,
+            CronJobStatus::Firing
+        );
     }
 
     #[test]
@@ -845,7 +858,9 @@ mod tests {
         let (store, _db) = TempDb::open_store();
         let later = add_job(&store, 5_000);
         let earlier = add_job(&store, 2_000);
-        store.quarantine(&later.id, "bad schedule", 1_500).expect("quarantine");
+        store
+            .quarantine(&later.id, "bad schedule", 1_500)
+            .expect("quarantine");
         let listed = store.list().expect("list");
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, earlier.id);

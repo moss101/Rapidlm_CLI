@@ -14,8 +14,8 @@ use acp::stdio::{JsonRpcId, JsonRpcMessage, StdioError};
 use acp::v1::StopReason;
 use capability_broker::{CancellationToken, CanonicalHostPath, LeaseUseGuard, PrincipalRef};
 use process_supervisor::{
-    ExecBinding, ExecSpec, MAX_STDIN_BYTES, SecretOrValue, StdinSpec, await_exit_draining, spawn,
-    DEFAULT_GRACE,
+    DEFAULT_GRACE, ExecBinding, ExecSpec, MAX_STDIN_BYTES, SecretOrValue, StdinSpec,
+    await_exit_draining, spawn,
 };
 use protocol::SessionId;
 
@@ -113,15 +113,15 @@ pub struct ExternalAgentTask {
 }
 
 impl ExternalAgentTask {
-    pub fn new(session_id: SessionId, prompt: impl Into<String>) -> Result<Self, ExternalAgentError> {
+    pub fn new(
+        session_id: SessionId,
+        prompt: impl Into<String>,
+    ) -> Result<Self, ExternalAgentError> {
         let prompt = prompt.into();
         if prompt.is_empty() || prompt.len() > MAX_AGENT_PROMPT_BYTES || !valid_text(&prompt) {
             return Err(ExternalAgentError::PromptTooLarge);
         }
-        Ok(Self {
-            session_id,
-            prompt,
-        })
+        Ok(Self { session_id, prompt })
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -145,8 +145,12 @@ pub enum AgentFlavor {
 /// Normalized terminal outcome for one external invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentOutcome {
-    Completed { stop_reason: String },
-    Failed { reason: String },
+    Completed {
+        stop_reason: String,
+    },
+    Failed {
+        reason: String,
+    },
     /// Process crash/disconnect: bounded recovery result, never a panic.
     ProcessLost,
 }
@@ -329,7 +333,12 @@ pub fn parse_acp_prompt_result(
                 .get("text")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            Ok(normalize_result(AgentFlavor::Acp, session_id, outcome, text))
+            Ok(normalize_result(
+                AgentFlavor::Acp,
+                session_id,
+                outcome,
+                text,
+            ))
         }
         JsonRpcMessage::Error { .. } => Ok(normalize_result(
             AgentFlavor::Acp,
@@ -499,14 +508,15 @@ impl CliRunner for SupervisedCliRunner {
         cancel: &CancellationToken,
     ) -> Result<CliExit, ExternalAgentError> {
         let _ = task;
-        let mut handle = spawn(exec, lease)
-            .map_err(|_| ExternalAgentError::Supervised("spawn".into()))?;
+        let mut handle =
+            spawn(exec, lease).map_err(|_| ExternalAgentError::Supervised("spawn".into()))?;
         // Draining stdout concurrently with the wait (not after) avoids
         // deadlocking on an agent whose combined output exceeds the OS pipe
         // buffer before it exits.
         let cap = usize::try_from(self.output_limit).unwrap_or(usize::MAX);
-        let (report, stdout, _stderr) = await_exit_draining(&mut handle, cancel, DEFAULT_GRACE, cap)
-            .map_err(|_| ExternalAgentError::Supervised("await".into()))?;
+        let (report, stdout, _stderr) =
+            await_exit_draining(&mut handle, cancel, DEFAULT_GRACE, cap)
+                .map_err(|_| ExternalAgentError::Supervised("await".into()))?;
         let stdout_bytes = stdout.bytes;
         drop(handle);
         let status = report.status();
@@ -550,9 +560,10 @@ mod tests {
             _cancel: &CancellationToken,
         ) -> Result<Vec<u8>, ExternalAgentError> {
             if let Some(after) = self.closed_after
-                && self.served >= after {
-                    return Err(ExternalAgentError::ChannelClosed);
-                }
+                && self.served >= after
+            {
+                return Err(ExternalAgentError::ChannelClosed);
+            }
             let response = self
                 .responses
                 .get(self.served)
@@ -586,8 +597,7 @@ mod tests {
             closed_after: None,
             served: 0,
         };
-        let outcome =
-            run_acp_agent(&mut channel, &task("fix the build"), &cancel).expect("run");
+        let outcome = run_acp_agent(&mut channel, &task("fix the build"), &cancel).expect("run");
         assert_eq!(outcome.flavor(), AgentFlavor::Acp);
         assert_eq!(
             outcome.outcome(),
@@ -604,7 +614,9 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut channel = ScriptedChannel {
             responses: vec![
-                serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}).to_string().into_bytes(),
+                serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}})
+                    .to_string()
+                    .into_bytes(),
             ],
             closed_after: Some(1),
             served: 0,
@@ -618,7 +630,8 @@ mod tests {
     #[test]
     fn acp_refusal_and_malformed_frames_map_correctly() {
         let session_id = SessionId::new();
-        let refused = parse_acp_prompt_result(session_id, &result_frame("refusal", "")).expect("refusal");
+        let refused =
+            parse_acp_prompt_result(session_id, &result_frame("refusal", "")).expect("refusal");
         assert_eq!(
             refused.outcome(),
             &AgentOutcome::Failed {
@@ -627,11 +640,11 @@ mod tests {
         );
         let malformed = parse_acp_prompt_result(session_id, b"{not json");
         assert!(matches!(malformed, Err(ExternalAgentError::ProtocolFault)));
-        let unknown_stop = parse_acp_prompt_result(
-            session_id,
-            &result_frame("warp_drive", ""),
-        );
-        assert!(matches!(unknown_stop, Err(ExternalAgentError::ProtocolFault)));
+        let unknown_stop = parse_acp_prompt_result(session_id, &result_frame("warp_drive", ""));
+        assert!(matches!(
+            unknown_stop,
+            Err(ExternalAgentError::ProtocolFault)
+        ));
     }
 
     #[test]
@@ -693,7 +706,10 @@ mod tests {
         let long_tool = "t".repeat(200);
         assert!(ExternalAgentCapabilities::new(false, 4, vec![long_tool]).is_err());
         assert!(ExternalAgentTask::new(SessionId::new(), "").is_err());
-        assert!(ExternalAgentTask::new(SessionId::new(), "y".repeat(MAX_AGENT_PROMPT_BYTES + 1)).is_err());
+        assert!(
+            ExternalAgentTask::new(SessionId::new(), "y".repeat(MAX_AGENT_PROMPT_BYTES + 1))
+                .is_err()
+        );
     }
 
     #[test]
@@ -764,7 +780,10 @@ capability = "proc.exec"
         .expect("parse")])
         .expect("stack");
         let issuer = LeaseIssuer::from_key([0x5au8; 32]).expect("issuer");
-        let validator = LeaseValidator::new(LeaseIssuer::from_key([0x5au8; 32]).expect("issuer2"), PolicyRevision::of_stack(&policies));
+        let validator = LeaseValidator::new(
+            LeaseIssuer::from_key([0x5au8; 32]).expect("issuer2"),
+            PolicyRevision::of_stack(&policies),
+        );
 
         // Production runner drives a real OS child (/bin/cat echoes stdin).
         let tmp = std::env::temp_dir().canonicalize().expect("tmp");
@@ -790,8 +809,7 @@ capability = "proc.exec"
                 }
                 _ => panic!("expected argv invocation"),
             };
-            let command =
-                normalize_exec(&intent, &FrozenPathResolver, &cancel).expect("canon");
+            let command = normalize_exec(&intent, &FrozenPathResolver, &cancel).expect("canon");
             let action = CanonicalAction::Command(command);
             let request = ActionRequest::new(
                 binding.principal().clone(),
@@ -804,10 +822,14 @@ capability = "proc.exec"
             .expect("request");
             let now = Instant::now();
             let decision = evaluate(&policies, &request, &cancel).expect("evaluate");
-            let approval =
-                request_approval(&request, &decision, now, &cancel).expect("approval");
+            let approval = request_approval(&request, &decision, now, &cancel).expect("approval");
             let approved = match approval
-                .resolve(ApprovalChoice::Approve(ApprovalScopeId::Once), &request, now, &cancel)
+                .resolve(
+                    ApprovalChoice::Approve(ApprovalScopeId::Once),
+                    &request,
+                    now,
+                    &cancel,
+                )
                 .expect("resolve")
             {
                 ApprovalResolution::Approved(approved) => approved,
@@ -835,8 +857,7 @@ capability = "proc.exec"
                 }
                 _ => panic!("expected argv invocation"),
             };
-            let command =
-                normalize_exec(&intent, &FrozenPathResolver, &cancel).expect("canon2");
+            let command = normalize_exec(&intent, &FrozenPathResolver, &cancel).expect("canon2");
             let action = CanonicalAction::Command(command);
             let request = ActionRequest::new(
                 binding.principal().clone(),
@@ -852,7 +873,12 @@ capability = "proc.exec"
             let approval2 =
                 request_approval(&request, &decision2, now2, &cancel).expect("approval2");
             let approved2 = match approval2
-                .resolve(ApprovalChoice::Approve(ApprovalScopeId::Once), &request, now2, &cancel)
+                .resolve(
+                    ApprovalChoice::Approve(ApprovalScopeId::Once),
+                    &request,
+                    now2,
+                    &cancel,
+                )
                 .expect("resolve2")
             {
                 ApprovalResolution::Approved(a) => a,

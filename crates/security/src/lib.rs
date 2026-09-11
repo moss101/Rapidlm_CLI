@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 pub mod doctor;
-pub mod hardening;
 pub mod gate;
+pub mod hardening;
 pub mod network_policy;
 pub mod output_safety;
 pub mod redaction;

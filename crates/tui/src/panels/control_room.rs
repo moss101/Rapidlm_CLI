@@ -28,12 +28,8 @@ pub const MAX_ROOM_NAME_BYTES: usize = 32;
 /// Typed panel failure. Display never echoes names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum ControlRoomError {
-    TooManyPhases {
-        limit: usize,
-    },
-    TooManyStreams {
-        limit: usize,
-    },
+    TooManyPhases { limit: usize },
+    TooManyStreams { limit: usize },
     InvalidField,
 }
 
@@ -161,12 +157,7 @@ pub struct ControlRoomViewModel {
 
 /// Copy a goal observation into the room. The statement is sanitized and
 /// preview-truncated here so untrusted text never reaches rendering.
-pub fn goal_row(
-    statement: &str,
-    lifecycle: GoalLifecycle,
-    turns: u64,
-    tokens: u64,
-) -> RoomGoal {
+pub fn goal_row(statement: &str, lifecycle: GoalLifecycle, turns: u64, tokens: u64) -> RoomGoal {
     let sanitized: String = match sanitize_untrusted(statement) {
         Cow::Borrowed(safe) => safe.to_string(),
         Cow::Owned(safe) => safe,
@@ -228,9 +219,7 @@ impl ControlRoomViewModel {
     /// error, never a silent drop.
     pub fn push_phase(&mut self, phase: RoomPhase) -> Result<(), ControlRoomError> {
         if self.phases.len() >= MAX_PHASES {
-            return Err(ControlRoomError::TooManyPhases {
-                limit: MAX_PHASES,
-            });
+            return Err(ControlRoomError::TooManyPhases { limit: MAX_PHASES });
         }
         self.phases.push(phase);
         Ok(())
@@ -239,9 +228,7 @@ impl ControlRoomViewModel {
     /// Add a child-stream row.
     pub fn push_stream(&mut self, stream: RoomStream) -> Result<(), ControlRoomError> {
         if self.streams.len() >= MAX_STREAMS {
-            return Err(ControlRoomError::TooManyStreams {
-                limit: MAX_STREAMS,
-            });
+            return Err(ControlRoomError::TooManyStreams { limit: MAX_STREAMS });
         }
         self.streams.push(stream);
         Ok(())
@@ -282,15 +269,14 @@ impl ControlRoomViewModel {
         for phase in &self.phases {
             lines.push(format!(
                 "phase {} {} children:{}/{}",
-                phase.name, phase.state.as_str(), phase.children_running, phase.children_done
+                phase.name,
+                phase.state.as_str(),
+                phase.children_running,
+                phase.children_done
             ));
         }
         for stream in &self.streams {
-            lines.push(format!(
-                "stream {} {}",
-                stream.name,
-                stream.state.as_str()
-            ));
+            lines.push(format!("stream {} {}", stream.name, stream.state.as_str()));
         }
         let height = usize::from(height);
         lines.truncate(height);
@@ -360,12 +346,7 @@ mod tests {
 
     fn fixture_model() -> ControlRoomViewModel {
         let mut model = ControlRoomViewModel::new();
-        model.set_goal(goal_row(
-            "ship the release",
-            GoalLifecycle::Active,
-            3,
-            120,
-        ));
+        model.set_goal(goal_row("ship the release", GoalLifecycle::Active, 3, 120));
         model
             .push_phase(phase_row("plan", RoomPhaseState::Done, 0, 2).expect("phase"))
             .expect("push");
@@ -401,7 +382,13 @@ stream reviewer blocked";
         assert_eq!(model.render(200, 24).golden(), GOLDEN_80);
         // Height clamp: rows padded/truncated to the requested height.
         assert_eq!(model.render(80, 24).text().lines().count(), 24);
-        assert!(model.render(80, 3).text().lines().all(|l| l.chars().count() == 80));
+        assert!(
+            model
+                .render(80, 3)
+                .text()
+                .lines()
+                .all(|l| l.chars().count() == 80)
+        );
         assert_eq!(model.render(80, 0).text(), String::new());
     }
 
@@ -429,7 +416,9 @@ stream reviewer blocked";
         let mut model = ControlRoomViewModel::new();
         for index in 0..MAX_PHASES {
             model
-                .push_phase(phase_row(&format!("p{index}"), RoomPhaseState::Pending, 0, 0).expect("row"))
+                .push_phase(
+                    phase_row(&format!("p{index}"), RoomPhaseState::Pending, 0, 0).expect("row"),
+                )
                 .expect("push");
         }
         let err = model
@@ -439,7 +428,9 @@ stream reviewer blocked";
         let mut stream_room = ControlRoomViewModel::new();
         for index in 0..MAX_STREAMS {
             stream_room
-                .push_stream(stream_row(&format!("s{index}"), RoomPhaseState::Running).expect("row"))
+                .push_stream(
+                    stream_row(&format!("s{index}"), RoomPhaseState::Running).expect("row"),
+                )
                 .expect("push");
         }
         let err = stream_room
@@ -455,6 +446,9 @@ stream reviewer blocked";
     #[test]
     fn an_empty_room_renders_the_header_only() {
         let model = ControlRoomViewModel::new();
-        assert_eq!(model.render(80, 8).golden(), "control room goal:none\nphases:0 running:0 blocked:0");
+        assert_eq!(
+            model.render(80, 8).golden(),
+            "control room goal:none\nphases:0 running:0 blocked:0"
+        );
     }
 }

@@ -590,7 +590,12 @@ fn spawn_frame_reader<R: Read + Send + 'static>(
         let never_cancelled = CancellationToken::new();
         let mut leftover = Vec::new();
         loop {
-            let frame = read_newline_frame(&mut reader, &mut leftover, max_frame_bytes, &never_cancelled);
+            let frame = read_newline_frame(
+                &mut reader,
+                &mut leftover,
+                max_frame_bytes,
+                &never_cancelled,
+            );
             let terminal = frame.is_err();
             if tx.send(frame).is_err() || terminal {
                 return;
@@ -1798,14 +1803,17 @@ mod tests {
     #[test]
     fn tools_list_parses_advertised_descriptors() {
         let mut transport = LoopbackTransport::new(TransportKind::Stdio, IoBounds::standard());
-        transport.push_inbound(initialize_ok(MCP_PROTOCOL_VERSION)).expect("inbound");
+        transport
+            .push_inbound(initialize_ok(MCP_PROTOCOL_VERSION))
+            .expect("inbound");
         let mut session = McpSession::new(
             transport,
             ImplementationInfo::rapidlm(),
             ClientCapabilities::new(true),
         );
         session.initialize(&CancellationToken::new()).expect("init");
-        session.transport_mut()
+        session
+            .transport_mut()
             .push_inbound(
                 r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[
                     {"name":"echo","description":"echoes input","inputSchema":{"type":"object"}},
@@ -1820,7 +1828,10 @@ mod tests {
         assert_eq!(tools.len(), 3, "nameless entry skipped, named kept");
         assert_eq!(tools[0].name, "echo");
         assert_eq!(tools[0].description.as_deref(), Some("echoes input"));
-        assert_eq!(tools[1].name, "noname", "schema-less entry keeps default schema");
+        assert_eq!(
+            tools[1].name, "noname",
+            "schema-less entry keeps default schema"
+        );
         assert_eq!(tools[1].input_schema, serde_json::json!({}));
         assert_eq!(tools[2].name, "calc");
         assert_eq!(tools[2].description, None);
@@ -1831,14 +1842,17 @@ mod tests {
     #[test]
     fn tools_call_returns_text_content_and_error_flag() {
         let mut transport = LoopbackTransport::new(TransportKind::Stdio, IoBounds::standard());
-        transport.push_inbound(initialize_ok(MCP_PROTOCOL_VERSION)).expect("inbound");
+        transport
+            .push_inbound(initialize_ok(MCP_PROTOCOL_VERSION))
+            .expect("inbound");
         let mut session = McpSession::new(
             transport,
             ImplementationInfo::rapidlm(),
             ClientCapabilities::new(true),
         );
         session.initialize(&CancellationToken::new()).expect("init");
-        session.transport_mut()
+        session
+            .transport_mut()
             .push_inbound(
                 r#"{"jsonrpc":"2.0","id":2,"result":{"content":[
                     {"type":"text","text":"part one"},
@@ -1865,14 +1879,17 @@ mod tests {
     #[test]
     fn tools_call_maps_server_error_to_typed_tool_failed() {
         let mut transport = LoopbackTransport::new(TransportKind::Stdio, IoBounds::standard());
-        transport.push_inbound(initialize_ok(MCP_PROTOCOL_VERSION)).expect("inbound");
+        transport
+            .push_inbound(initialize_ok(MCP_PROTOCOL_VERSION))
+            .expect("inbound");
         let mut session = McpSession::new(
             transport,
             ImplementationInfo::rapidlm(),
             ClientCapabilities::new(true),
         );
         session.initialize(&CancellationToken::new()).expect("init");
-        session.transport_mut()
+        session
+            .transport_mut()
             .push_inbound(
                 r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"boom"}}"#
                     .as_bytes()
@@ -1880,8 +1897,7 @@ mod tests {
             )
             .expect("inbound");
         assert_eq!(
-            session
-                .tools_call("echo", &serde_json::json!({}), &CancellationToken::new()),
+            session.tools_call("echo", &serde_json::json!({}), &CancellationToken::new()),
             Err(TransportError::ToolFailed)
         );
     }
@@ -2036,12 +2052,8 @@ mod tests {
     #[test]
     fn stdio_recv_frame_is_interrupted_by_cancellation_when_the_peer_never_writes() {
         let (reader, _writer) = std::os::unix::net::UnixStream::pair().expect("pair");
-        let mut transport = StdioTransport::from_pipes(
-            reader,
-            Cursor::new(Vec::new()),
-            None,
-            IoBounds::standard(),
-        );
+        let mut transport =
+            StdioTransport::from_pipes(reader, Cursor::new(Vec::new()), None, IoBounds::standard());
         let cancel = CancellationToken::new();
         let watchdog = cancel.clone();
         thread::spawn(move || {

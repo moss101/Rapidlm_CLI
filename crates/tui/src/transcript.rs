@@ -701,7 +701,9 @@ impl Display for TranscriptError {
         match self {
             Self::UnknownBlock => f.write_str("unknown transcript block"),
             Self::DuplicateBlock => f.write_str("duplicate transcript block id"),
-            Self::BackPressure | Self::IndexOutOfRange => f.write_str("transcript insert index out of range"),
+            Self::BackPressure | Self::IndexOutOfRange => {
+                f.write_str("transcript insert index out of range")
+            }
         }
     }
 }
@@ -1464,7 +1466,8 @@ mod coalescer_tests {
         // (non-English text, emoji, box-drawing characters), so this must
         // never panic regardless of where max_chunk_bytes happens to fall.
         let mut c = StreamCoalescer::new(3, 10);
-        c.push("a€").expect("push must not panic on a straddling multi-byte char");
+        c.push("a€")
+            .expect("push must not panic on a straddling multi-byte char");
         assert_eq!(c.drain().join(""), "a€", "no text may be dropped");
     }
 

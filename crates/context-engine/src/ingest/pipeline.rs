@@ -462,12 +462,14 @@ impl IndexPipeline {
         let hash_wire = hash.to_string();
         let path = loaded.path().clone();
         if let Some(canonical) = self.canonical(repo_id, &path)?
-            && canonical.content_hash == hash_wire && self.pending(repo_id, &path)?.is_none() {
-                return Ok(IndexOutcome::Unchanged {
-                    generation: canonical.generation,
-                    content_hash: hash,
-                });
-            }
+            && canonical.content_hash == hash_wire
+            && self.pending(repo_id, &path)?.is_none()
+        {
+            return Ok(IndexOutcome::Unchanged {
+                generation: canonical.generation,
+                content_hash: hash,
+            });
+        }
         self.check_bounds(started)?;
         let prepared = prepare_file(repo_id, &loaded, &self.limits, started)?;
         self.check_bounds(started)?;

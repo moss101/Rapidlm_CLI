@@ -885,7 +885,11 @@ impl TraceJobsViewModel {
                     span_id: None,
                     cursor: ArtifactCursor {
                         artifact,
-                        offset: next_view_offset(&row.excerpt_lines, row.cursor, self.selection.log_page),
+                        offset: next_view_offset(
+                            &row.excerpt_lines,
+                            row.cursor,
+                            self.selection.log_page,
+                        ),
                     },
                 })
             }

@@ -155,9 +155,8 @@ impl HostRuntime {
                 last_verdict: None,
             },
         );
-        self.events.push(HostEvent::MonitorRegistered {
-            monitor_id,
-        });
+        self.events
+            .push(HostEvent::MonitorRegistered { monitor_id });
         Ok(())
     }
 
@@ -167,9 +166,10 @@ impl HostRuntime {
         monitor_id: &str,
         observation: &MonitorObservation,
     ) -> Result<MonitorVerdict, HostRuntimeError> {
-        let monitor = self.monitors.get_mut(monitor_id).ok_or({
-            HostRuntimeError::MonitorRegistration(MonitorError::InvalidId)
-        })?;
+        let monitor = self
+            .monitors
+            .get_mut(monitor_id)
+            .ok_or({ HostRuntimeError::MonitorRegistration(MonitorError::InvalidId) })?;
         let verdict = monitor.spec.observe(observation);
         monitor.last_verdict = Some(verdict);
         if verdict.matched_flag() {
@@ -203,16 +203,16 @@ impl HostRuntime {
         trigger_id: &str,
         now: u64,
     ) -> Result<FireDecision, HostRuntimeError> {
-        let trigger = self.triggers.get_mut(trigger_id).ok_or({
-            HostRuntimeError::TriggerRegistration(TriggerError::InvalidId)
-        })?;
+        let trigger = self
+            .triggers
+            .get_mut(trigger_id)
+            .ok_or({ HostRuntimeError::TriggerRegistration(TriggerError::InvalidId) })?;
         use process_supervisor::trigger::UnitTime;
-        let decision =
-            trigger.spec.kind().fires_at(UnitTime::new(now), &trigger.cursor);
-        if matches!(
-            decision,
-            FireDecision::Fire | FireDecision::MissedBackfill
-        ) {
+        let decision = trigger
+            .spec
+            .kind()
+            .fires_at(UnitTime::new(now), &trigger.cursor);
+        if matches!(decision, FireDecision::Fire | FireDecision::MissedBackfill) {
             trigger.cursor.advance(decision, now);
             self.events.push(HostEvent::TriggerFired {
                 trigger_id: trigger_id.to_owned(),
@@ -239,12 +239,8 @@ impl HostRuntime {
         self.events
             .iter()
             .filter_map(|event| match event {
-                HostEvent::MonitorFired { monitor_id } => {
-                    Some((monitor_id.clone(), "monitor"))
-                }
-                HostEvent::TriggerFired { trigger_id } => {
-                    Some((trigger_id.clone(), "trigger"))
-                }
+                HostEvent::MonitorFired { monitor_id } => Some((monitor_id.clone(), "monitor")),
+                HostEvent::TriggerFired { trigger_id } => Some((trigger_id.clone(), "trigger")),
                 HostEvent::WakeEmitted { reason } => Some((reason.clone(), "wake")),
                 _ => None,
             })
@@ -276,9 +272,7 @@ mod tests {
         // This is the production-path integration test (§7 of the objective):
         // HostRuntime → acquire resource → register monitor → observe monitor
         // → register trigger → evaluate trigger → wake event emitted.
-        let mut runtime = HostRuntime::new(
-            RuntimeId::new("test-session").unwrap(),
-        );
+        let mut runtime = HostRuntime::new(RuntimeId::new("test-session").unwrap());
         let mut provisioner = FakeProvisioner;
 
         // Acquire a resource lease through the pool.
@@ -301,19 +295,23 @@ mod tests {
         // Observe the monitor — the output file was created.
         let observation =
             MonitorObservation::file("/tmp/output.json", FileEventKind::Created).expect("obs");
-        let verdict = runtime.observe_monitor("output-ready", &observation).expect("observe");
-        assert!(verdict.matched_flag(), "monitor should fire on matching observation");
+        let verdict = runtime
+            .observe_monitor("output-ready", &observation)
+            .expect("observe");
+        assert!(
+            verdict.matched_flag(),
+            "monitor should fire on matching observation"
+        );
 
         // Register a cron trigger that wakes graph work.
-        let trigger_spec = TriggerSpec::new(
-            "wake-trigger",
-            TriggerKind::Interval { seconds: 60 },
-        )
-        .expect("trigger spec");
+        let trigger_spec = TriggerSpec::new("wake-trigger", TriggerKind::Interval { seconds: 60 })
+            .expect("trigger spec");
         runtime.register_trigger(trigger_spec).expect("register");
 
         // Evaluate the trigger at a time past its interval → fires.
-        let decision = runtime.evaluate_trigger("wake-trigger", 120).expect("evaluate");
+        let decision = runtime
+            .evaluate_trigger("wake-trigger", 120)
+            .expect("evaluate");
         assert_eq!(decision, FireDecision::Fire);
 
         // Release the environment back to warm.
@@ -322,30 +320,42 @@ mod tests {
             .expect("release");
 
         // Verify the event log records every lifecycle transition.
-        assert!(runtime.events().iter().any(|e| matches!(
-            e,
-            HostEvent::ResourceAcquired { .. }
-        )));
-        assert!(runtime.events().iter().any(|e| matches!(
-            e,
-            HostEvent::MonitorRegistered { .. }
-        )));
-        assert!(runtime.events().iter().any(|e| matches!(
-            e,
-            HostEvent::MonitorFired { .. }
-        )));
-        assert!(runtime.events().iter().any(|e| matches!(
-            e,
-            HostEvent::TriggerFired { .. }
-        )));
-        assert!(runtime.events().iter().any(|e| matches!(
-            e,
-            HostEvent::WakeEmitted { .. }
-        )));
-        assert!(runtime.events().iter().any(|e| matches!(
-            e,
-            HostEvent::ResourceReleased { .. }
-        )));
+        assert!(
+            runtime
+                .events()
+                .iter()
+                .any(|e| matches!(e, HostEvent::ResourceAcquired { .. }))
+        );
+        assert!(
+            runtime
+                .events()
+                .iter()
+                .any(|e| matches!(e, HostEvent::MonitorRegistered { .. }))
+        );
+        assert!(
+            runtime
+                .events()
+                .iter()
+                .any(|e| matches!(e, HostEvent::MonitorFired { .. }))
+        );
+        assert!(
+            runtime
+                .events()
+                .iter()
+                .any(|e| matches!(e, HostEvent::TriggerFired { .. }))
+        );
+        assert!(
+            runtime
+                .events()
+                .iter()
+                .any(|e| matches!(e, HostEvent::WakeEmitted { .. }))
+        );
+        assert!(
+            runtime
+                .events()
+                .iter()
+                .any(|e| matches!(e, HostEvent::ResourceReleased { .. }))
+        );
     }
 
     #[test]
@@ -356,8 +366,7 @@ mod tests {
 
     #[test]
     fn drain_wake_signals_extracts_monitor_and_trigger_fires() {
-        let mut runtime =
-            HostRuntime::new(RuntimeId::new("wake-test").unwrap());
+        let mut runtime = HostRuntime::new(RuntimeId::new("wake-test").unwrap());
         let mut provisioner = FakeProvisioner;
 
         runtime
@@ -374,7 +383,9 @@ mod tests {
             )
             .expect("register monitor");
         let obs = MonitorObservation::ExitCode { code: 0 };
-        let verdict = runtime.observe_monitor("exit-monitor", &obs).expect("observe");
+        let verdict = runtime
+            .observe_monitor("exit-monitor", &obs)
+            .expect("observe");
         assert!(verdict.matched_flag());
 
         runtime
@@ -382,16 +393,22 @@ mod tests {
                 TriggerSpec::new("interval-t", TriggerKind::Interval { seconds: 60 }).unwrap(),
             )
             .expect("register trigger");
-        let decision = runtime.evaluate_trigger("interval-t", 120).expect("evaluate");
+        let decision = runtime
+            .evaluate_trigger("interval-t", 120)
+            .expect("evaluate");
         assert_eq!(decision, FireDecision::Fire);
 
         let signals = runtime.drain_wake_signals();
         assert!(
-            signals.iter().any(|(id, kind)| id == "exit-monitor" && *kind == "monitor"),
+            signals
+                .iter()
+                .any(|(id, kind)| id == "exit-monitor" && *kind == "monitor"),
             "monitor wake signal must be present"
         );
         assert!(
-            signals.iter().any(|(id, kind)| id == "interval-t" && *kind == "trigger"),
+            signals
+                .iter()
+                .any(|(id, kind)| id == "interval-t" && *kind == "trigger"),
             "trigger wake signal must be present"
         );
     }

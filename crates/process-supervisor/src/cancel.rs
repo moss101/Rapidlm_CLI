@@ -279,9 +279,10 @@ pub fn await_exit(
             return terminate_tree(job, GracePeriod::user_cancel(grace)?);
         }
         if let Some(deadline) = deadline
-            && Instant::now() >= deadline {
-                return terminate_tree(job, GracePeriod::timeout(grace)?);
-            }
+            && Instant::now() >= deadline
+        {
+            return terminate_tree(job, GracePeriod::timeout(grace)?);
+        }
 
         let slice = match deadline {
             Some(deadline) => POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
@@ -329,7 +330,9 @@ pub fn await_exit_draining(
     let stderr_reader = stderr.map(|pipe| thread::spawn(move || drain_capped(pipe, cap)));
     let report = await_exit(job, cancel, grace)?;
     let join = |reader: Option<thread::JoinHandle<DrainedStream>>| {
-        reader.and_then(|handle| handle.join().ok()).unwrap_or_default()
+        reader
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default()
     };
     Ok((report, join(stdout_reader), join(stderr_reader)))
 }
@@ -554,14 +557,14 @@ mod tests {
     use std::time::Instant;
 
     use capability_broker::{
-        evaluate, issue, request_approval, validate_use, ActionRequest, ApprovalChoice,
-        ApprovalResolution, ApprovalScopeId, CanonicalAction, CapabilityLease, LeaseIssuer,
-        LeaseUseGuard, LeaseValidator, PolicyDocument, PolicyRevision, PolicySource, PolicyStack,
-        PrincipalRef,
+        ActionRequest, ApprovalChoice, ApprovalResolution, ApprovalScopeId, CanonicalAction,
+        CapabilityLease, LeaseIssuer, LeaseUseGuard, LeaseValidator, PolicyDocument,
+        PolicyRevision, PolicySource, PolicyStack, PrincipalRef, evaluate, issue, request_approval,
+        validate_use,
     };
     use protocol::SessionId;
 
-    use crate::spawn::{spawn, ExecBinding, ExecSpec, SecretOrValue, StdinSpec};
+    use crate::spawn::{ExecBinding, ExecSpec, SecretOrValue, StdinSpec, spawn};
 
     const CANARY: &str = "canary-secret-PLAINTEXT-do-not-leak-7c1e9b";
 
@@ -661,7 +664,7 @@ capability = "proc.exec"
     }
 
     fn spec_command(spec: &ExecSpec) -> capability_broker::CanonicalCommand {
-        use capability_broker::{normalize_exec, ExecIntent, Resolver};
+        use capability_broker::{ExecIntent, Resolver, normalize_exec};
 
         struct FrozenPathResolver;
         impl Resolver for FrozenPathResolver {
@@ -759,9 +762,10 @@ capability = "proc.exec"
         loop {
             if let Ok(text) = fs::read_to_string(path)
                 && let Ok(pid) = text.trim().parse::<u32>()
-                    && pid >= 2 {
-                        return pid;
-                    }
+                && pid >= 2
+            {
+                return pid;
+            }
             if Instant::now() >= deadline {
                 panic!("pid file {} was not written", path.display());
             }
@@ -1025,8 +1029,8 @@ capability = "proc.exec"
         let script = big_output_script();
         let argv: Vec<&str> = script.iter().map(String::as_str).collect();
         let mut handle = spawn_argv(&argv, Some(Duration::from_millis(300)));
-        let report = await_exit(&mut handle, &CancellationToken::new(), DEFAULT_GRACE)
-            .expect("await");
+        let report =
+            await_exit(&mut handle, &CancellationToken::new(), DEFAULT_GRACE).expect("await");
         assert!(
             report.status().is_timeout(),
             "a child blocked writing to an undrained pipe must be misreported as timed out \

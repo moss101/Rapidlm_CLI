@@ -160,9 +160,11 @@ pub fn sidebar_lines(
 ) -> Vec<String> {
     match route {
         UiRoute::Transcript => Vec::new(),
-        UiRoute::Agents => AgentsViewModel::from_state(state, &[], AgentsSelection::default(), cancel)
-            .map(|model| model.render(width, height).lines().to_vec())
-            .unwrap_or_default(),
+        UiRoute::Agents => {
+            AgentsViewModel::from_state(state, &[], AgentsSelection::default(), cancel)
+                .map(|model| model.render(width, height).lines().to_vec())
+                .unwrap_or_default()
+        }
         UiRoute::Goals => goal_lines(state, width, height),
         UiRoute::Jobs => job_lines(state, width, height),
         UiRoute::Approvals => approval_lines(state, width, height),
@@ -462,7 +464,10 @@ fn context_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
         return context_search_lines(found, width, height);
     }
     let Some((used, limit)) = state.context_usage() else {
-        return vec![fit_width("no turn has compiled a context yet", usize::from(width))];
+        return vec![fit_width(
+            "no turn has compiled a context yet",
+            usize::from(width),
+        )];
     };
     let mut lines = vec![format!("total {used}/{limit}")];
     for partition in state.context_partitions() {
@@ -559,7 +564,10 @@ fn diff_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
             Some(before) => format!("{before} -> {} lines", file.lines_after),
         };
         if file.writes > 1 {
-            lines.push(format!("{path}  {change} ({} writes, latest shown)", file.writes));
+            lines.push(format!(
+                "{path}  {change} ({} writes, latest shown)",
+                file.writes
+            ));
         } else {
             lines.push(format!("{path}  {change}"));
         }
@@ -613,20 +621,36 @@ pub fn paint_screen(
 
     let transcript_rect = layout.transcript();
     let window = viewport.visible(transcript);
-    let transcript_lines: Vec<String> = window.rows().iter().map(|row| row.text().to_owned()).collect();
+    let transcript_lines: Vec<String> = window
+        .rows()
+        .iter()
+        .map(|row| row.text().to_owned())
+        .collect();
 
     let route = state.route();
     if layout.sidebar().is_empty() && route != UiRoute::Transcript {
         screen.paint_lines(
             transcript_rect,
-            &sidebar_lines(route, state, transcript_rect.width(), transcript_rect.height(), cancel),
+            &sidebar_lines(
+                route,
+                state,
+                transcript_rect.width(),
+                transcript_rect.height(),
+                cancel,
+            ),
         );
     } else {
         screen.paint_lines(transcript_rect, &transcript_lines);
         if !layout.sidebar().is_empty() {
             screen.paint_lines(
                 layout.sidebar(),
-                &sidebar_lines(route, state, layout.sidebar().width(), layout.sidebar().height(), cancel),
+                &sidebar_lines(
+                    route,
+                    state,
+                    layout.sidebar().width(),
+                    layout.sidebar().height(),
+                    cancel,
+                ),
             );
         }
     }
@@ -637,7 +661,10 @@ pub fn paint_screen(
     screen.paint_lines(layout.status(), &[status.text()]);
 
     if modal_open && !layout.modal().is_empty() {
-        screen.paint_lines(layout.modal(), &modal_lines(state, layout.modal().width(), layout.modal().height()));
+        screen.paint_lines(
+            layout.modal(),
+            &modal_lines(state, layout.modal().width(), layout.modal().height()),
+        );
     }
 
     screen
@@ -692,7 +719,9 @@ fn fit_width(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{GoalLifecycle, GoalProjection, LocalUiEvent, TranscriptEntry, UiEvent, reduce};
+    use crate::state::{
+        GoalLifecycle, GoalProjection, LocalUiEvent, TranscriptEntry, UiEvent, reduce,
+    };
     use protocol::GoalId;
 
     fn cancel() -> CancellationToken {
@@ -763,7 +792,8 @@ mod tests {
     }
 
     #[test]
-    fn transcript_entries_render_with_distinct_glyphs_and_never_conflate_context_required_with_failure() {
+    fn transcript_entries_render_with_distinct_glyphs_and_never_conflate_context_required_with_failure()
+     {
         let mut transcript = Transcript::new();
         transcript.push_entry(&TranscriptEntry::User {
             text: "deploy the app".to_owned(),
@@ -853,7 +883,11 @@ mod tests {
             &cancel(),
         );
 
-        assert!(transcript_screen.snapshot().contains("hello from the transcript"));
+        assert!(
+            transcript_screen
+                .snapshot()
+                .contains("hello from the transcript")
+        );
         assert!(
             goal_screen.snapshot().contains("ship the release"),
             "{}",
@@ -1204,7 +1238,9 @@ pre-approve it with `rapid permissions allow <tool>`";
         );
         let painted = sidebar_lines(UiRoute::Context, &empty, 60, 8, &cancel());
         assert!(
-            painted.iter().any(|line| line.contains("nothing retrieved")),
+            painted
+                .iter()
+                .any(|line| line.contains("nothing retrieved")),
             "an empty result must say so: {painted:?}"
         );
     }
@@ -1338,7 +1374,9 @@ pre-approve it with `rapid permissions allow <tool>`";
             "counts alone for a write that carried no hunks: {painted:?}"
         );
         assert!(
-            painted.get(logo + 1).is_none_or(|next| !next.starts_with("  @@")),
+            painted
+                .get(logo + 1)
+                .is_none_or(|next| !next.starts_with("  @@")),
             "and no hunk is invented under it: {painted:?}"
         );
     }
@@ -1453,7 +1491,9 @@ pre-approve it with `rapid permissions allow <tool>`";
             "no escape sequence from a job's stdout may reach the terminal: {painted:?}"
         );
         assert!(
-            painted.iter().any(|line| line.contains("compiling the payload")),
+            painted
+                .iter()
+                .any(|line| line.contains("compiling the payload")),
             "and the text is still readable, just inert: {painted:?}"
         );
     }
@@ -1558,7 +1598,9 @@ pre-approve it with `rapid permissions allow <tool>`";
         use event_ledger::event::{ActorKind, ActorRef, EventEnvelope, EventKind, RecordedAt};
         use protocol::{EventId, RedactionClass, SessionId, TraceId};
 
-        let session: SessionId = "019c0000-0000-7000-8000-000000000010".parse().expect("session");
+        let session: SessionId = "019c0000-0000-7000-8000-000000000010"
+            .parse()
+            .expect("session");
         let actor = ActorRef::new(ActorKind::System, "019c0000-0000-7000-8000-000000000016")
             .expect("actor");
         let event = |seq: u64, kind: EventKind, payload: serde_json::Value| {
@@ -1568,7 +1610,9 @@ pre-approve it with `rapid permissions allow <tool>`";
                     .expect("event id"),
                 session,
                 seq,
-                "2026-08-14T15:20:04.123Z".parse::<RecordedAt>().expect("recorded_at"),
+                "2026-08-14T15:20:04.123Z"
+                    .parse::<RecordedAt>()
+                    .expect("recorded_at"),
                 actor.clone(),
                 TraceId::new(),
                 kind,

@@ -698,9 +698,7 @@ fn sidebar_lines(route: UiRoute, state: &tui::AppState, width: u16, height: u16)
         UiRoute::Approvals => approval_model().render(width, height).lines().to_vec(),
         UiRoute::Goals => Vec::new(),
         // P10 routes render main-panel content only; no sidebar model yet.
-        UiRoute::Graph | UiRoute::Computer | UiRoute::Resources | UiRoute::Models => {
-            Vec::new()
-        }
+        UiRoute::Graph | UiRoute::Computer | UiRoute::Resources | UiRoute::Models => Vec::new(),
     }
 }
 

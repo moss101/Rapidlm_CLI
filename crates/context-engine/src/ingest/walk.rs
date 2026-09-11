@@ -303,9 +303,10 @@ impl FileWalker<'_> {
     fn check_cancel(&mut self) -> Result<(), WalkError> {
         self.steps = self.steps.wrapping_add(1);
         if (self.steps == 1 || self.steps.is_multiple_of(CANCEL_STRIDE))
-            && self.cancel.is_cancelled() {
-                return Err(WalkError::Cancelled);
-            }
+            && self.cancel.is_cancelled()
+        {
+            return Err(WalkError::Cancelled);
+        }
         Ok(())
     }
 

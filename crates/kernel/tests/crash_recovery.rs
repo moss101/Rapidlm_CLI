@@ -292,14 +292,14 @@ fn wait_for_durable_tool_started(db: &Path, session_path: &Path) -> SessionMeta 
             let meta = SessionMeta::from_value(&read_json(session_path));
             if let Ok(event) = EventLedger::open(db).and_then(|ledger| {
                 ledger.get(meta.session_id, meta.tool_started_seq, &ledger_live())
-            })
-                && event.kind() == EventKind::ToolStarted {
-                    assert_eq!(
-                        event.payload().get("call_id").and_then(Value::as_str),
-                        Some(TOOL_CALL_ID)
-                    );
-                    return meta;
-                }
+            }) && event.kind() == EventKind::ToolStarted
+            {
+                assert_eq!(
+                    event.payload().get("call_id").and_then(Value::as_str),
+                    Some(TOOL_CALL_ID)
+                );
+                return meta;
+            }
         }
         thread::sleep(POLL_EVERY);
     }

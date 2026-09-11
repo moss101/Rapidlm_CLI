@@ -150,10 +150,15 @@ pub enum ProjectTrustError {
     InvalidRoot,
     InvalidFingerprint,
     InvalidManifestHash,
-    CatalogTooLarge { limit: u64, observed: u64 },
+    CatalogTooLarge {
+        limit: u64,
+        observed: u64,
+    },
     TooManyRecords,
     CatalogCorrupt,
-    UnsupportedSchema { found: u16 },
+    UnsupportedSchema {
+        found: u16,
+    },
     /// The cross-process transaction lock could not be created, opened, or
     /// acquired. Never returned because another holder is *slow* — the lock
     /// blocks until acquired — only on an I/O failure standing up the lock
@@ -432,9 +437,7 @@ impl ProjectTrustStore {
     fn transact<T>(
         &self,
         cancel: &CancellationToken,
-        mutate: impl FnOnce(
-            &mut BTreeMap<CanonicalRoot, StoredRecord>,
-        ) -> Result<T, ProjectTrustError>,
+        mutate: impl FnOnce(&mut BTreeMap<CanonicalRoot, StoredRecord>) -> Result<T, ProjectTrustError>,
     ) -> Result<T, ProjectTrustError> {
         cancel.check().map_err(|_| ProjectTrustError::Cancelled)?;
         let _lock = TrustLock::acquire(&self.catalog)?;
@@ -484,9 +487,10 @@ impl ProjectTrustStore {
             });
         }
         if let Some(parent) = self.catalog.parent()
-            && !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
         let tmp = part_path(&self.catalog);
         let write_result = (|| {
             cancel.check().map_err(|_| ProjectTrustError::Cancelled)?;

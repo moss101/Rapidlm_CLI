@@ -179,10 +179,14 @@ impl WindowsUiaPattern {
             (
                 Self::Invoke | Self::Toggle | Self::SelectionItem | Self::ExpandCollapse,
                 ActionKind::Click
-            )
-                | (Self::Value | Self::Text | Self::RangeValue, ActionKind::TypeText)
-                | (Self::Scroll, ActionKind::Scroll)
-                | (Self::Window, ActionKind::FocusWindow | ActionKind::CloseWindow)
+            ) | (
+                Self::Value | Self::Text | Self::RangeValue,
+                ActionKind::TypeText
+            ) | (Self::Scroll, ActionKind::Scroll)
+                | (
+                    Self::Window,
+                    ActionKind::FocusWindow | ActionKind::CloseWindow
+                )
                 | (Self::Transform | Self::Window, ActionKind::ResizeWindow)
         )
     }
@@ -853,9 +857,10 @@ impl WindowsUiaHost for ScriptedWindowsUiaHost {
             return Err(DesktopError::HealthFailed);
         }
         if let Some(target) = resolved.node().or(resolved.window())
-            && !state.live_elements.contains(target) {
-                return Err(DesktopError::StaleObservation);
-            }
+            && !state.live_elements.contains(target)
+        {
+            return Err(DesktopError::StaleObservation);
+        }
         let patterns = patterns_for(&state, resolved)?.to_vec();
         if !uia_pattern_supports_action(&patterns, action.kind()) {
             // No Invoke/Value/Window/… match and no PowerShell SendKeys path.

@@ -230,11 +230,7 @@ pub struct MarketplaceMetadata {
 }
 
 impl MarketplaceMetadata {
-    pub fn of(
-        origin: SkillOrigin,
-        trust: ProjectTrust,
-        update: Option<UpdatePointer>,
-    ) -> Self {
+    pub fn of(origin: SkillOrigin, trust: ProjectTrust, update: Option<UpdatePointer>) -> Self {
         Self {
             origin,
             trust,
@@ -679,17 +675,18 @@ pub fn discover(roots: &SkillRoots, limits: &SkillLimits) -> Result<Vec<SkillRec
         )?;
     }
     if let Some(project) = &roots.project_root
-        && roots.project_trust.is_trusted() {
-            scan_root(
-                project,
-                PROJECT_SKILLS_DIR,
-                SkillOrigin::Project,
-                Some(project.as_path()),
-                limits,
-                started,
-                &mut found,
-            )?;
-        }
+        && roots.project_trust.is_trusted()
+    {
+        scan_root(
+            project,
+            PROJECT_SKILLS_DIR,
+            SkillOrigin::Project,
+            Some(project.as_path()),
+            limits,
+            started,
+            &mut found,
+        )?;
+    }
     merge_records(found, limits)
 }
 
@@ -955,9 +952,7 @@ fn parse_skill_update(
     check_limits(limits, started)?;
     let fields = decode_frontmatter_map(front, limits, started)?;
     match fields.values.iter().find(|(key, _)| key == "update") {
-        Some((_, FrontmatterValue::Scalar(raw))) => {
-            UpdatePointer::parse(raw).map(Some)
-        }
+        Some((_, FrontmatterValue::Scalar(raw))) => UpdatePointer::parse(raw).map(Some),
         Some((_, FrontmatterValue::List(_))) => Err(SkillError::InvalidFrontmatter),
         None => Ok(None),
     }
@@ -1056,13 +1051,16 @@ fn origin_rank(origin: SkillOrigin) -> u8 {
 
 fn not_found_or_untrusted(id: &SkillId, roots: &SkillRoots) -> SkillError {
     if !roots.project_trust.is_trusted()
-        && let Some(project) = &roots.project_root {
-            let dir = join_rel(project, PROJECT_SKILLS_DIR).join(id.as_str());
-            if let Ok(meta) = fs::symlink_metadata(&dir)
-                && meta.file_type().is_dir() && !meta.file_type().is_symlink() {
-                    return SkillError::ProjectUntrusted;
-                }
+        && let Some(project) = &roots.project_root
+    {
+        let dir = join_rel(project, PROJECT_SKILLS_DIR).join(id.as_str());
+        if let Ok(meta) = fs::symlink_metadata(&dir)
+            && meta.file_type().is_dir()
+            && !meta.file_type().is_symlink()
+        {
+            return SkillError::ProjectUntrusted;
         }
+    }
     SkillError::NotFound
 }
 
@@ -1167,7 +1165,7 @@ fn resolve_under(root: &Path, relative: &RepoPath) -> Result<PathBuf, SkillError
 
 #[cfg(unix)]
 fn open_confined(root: &Path, relative: &RepoPath) -> Result<File, SkillError> {
-    use rustix::fs::{open, openat, statat, AtFlags, FileType as RxFileType, Mode, OFlags};
+    use rustix::fs::{AtFlags, FileType as RxFileType, Mode, OFlags, open, openat, statat};
 
     let names: Vec<&str> = relative.components().collect();
     if names.is_empty() {
@@ -1267,9 +1265,10 @@ fn instructions_locator(
     match origin {
         SkillOrigin::Project => {
             if let Some(project) = project_root
-                && let Some(rel) = strip_prefix_path(skill_file, project) {
-                    return parse_repo_path(&rel);
-                }
+                && let Some(rel) = strip_prefix_path(skill_file, project)
+            {
+                return parse_repo_path(&rel);
+            }
             parse_repo_path(&format!(
                 "{PROJECT_SKILLS_DIR}/{dir_name}/{SKILL_FILE_NAME}"
             ))
@@ -2284,9 +2283,14 @@ mod tests {
         std::os::unix::fs::symlink(&canary, &style).expect("swap symlink");
         let bytes = read_file_bounded(opened, DEFAULT_MAX_RESOURCE_BYTES).expect("fd read");
         assert_eq!(bytes, b"ok-style\n");
-        assert!(!bytes.windows(CANARY.len()).any(|chunk| chunk == CANARY.as_bytes()));
+        assert!(
+            !bytes
+                .windows(CANARY.len())
+                .any(|chunk| chunk == CANARY.as_bytes())
+        );
 
-        let err = read_confined(&bundle, &rel, DEFAULT_MAX_RESOURCE_BYTES).expect_err("open after swap");
+        let err =
+            read_confined(&bundle, &rel, DEFAULT_MAX_RESOURCE_BYTES).expect_err("open after swap");
         assert_eq!(err, SkillError::Symlink);
         assert!(!err.to_string().contains(CANARY));
 

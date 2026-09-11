@@ -44,7 +44,7 @@ pub use compact::{
     CompactError, CompactMethod, CompactedContext, PacketSummarizer, compact_packet,
 };
 pub use compact_policy::{
-    CompactPolicyError, CompactionEvidence, CompactionPolicy, CompactionOutcome,
+    CompactPolicyError, CompactionEvidence, CompactionOutcome, CompactionPolicy,
     CompactionStrategy, PolicyValidationError, ThresholdDecision, classify, compact_with_policy,
 };
 pub use compile::{

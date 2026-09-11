@@ -24,15 +24,15 @@ pub use credentials::{
     SecretRef, SecretValue,
 };
 pub use fallback::{
-    classify_failure, AttemptProgress, DEFAULT_BACKOFF_BASE_MS, DEFAULT_BACKOFF_CAP_MS,
-    DEFAULT_SAME_MODEL_RETRIES, FALLBACK_PLAN_SCHEMA, FALLBACK_POLICY_SCHEMA,
-    FALLBACK_POLICY_VERSION, FallbackAction, FallbackController, FallbackError, FallbackPlan,
-    FallbackPolicy, FallbackTrigger, FailureClass, MAX_EXPLICIT_ALTERNATES, MAX_FALLBACK_MODELS,
-    MAX_SAME_MODEL_RETRIES, StopReason,
+    AttemptProgress, DEFAULT_BACKOFF_BASE_MS, DEFAULT_BACKOFF_CAP_MS, DEFAULT_SAME_MODEL_RETRIES,
+    FALLBACK_PLAN_SCHEMA, FALLBACK_POLICY_SCHEMA, FALLBACK_POLICY_VERSION, FailureClass,
+    FallbackAction, FallbackController, FallbackError, FallbackPlan, FallbackPolicy,
+    FallbackTrigger, MAX_EXPLICIT_ALTERNATES, MAX_FALLBACK_MODELS, MAX_SAME_MODEL_RETRIES,
+    StopReason, classify_failure,
 };
 pub use phase::{
-    parse_purpose_name, purpose_name, PhaseRoute, PHASE_ROUTE_SCHEMA, ReasoningEffort,
-    ReasoningEffortParseError, REASONING_EFFORT_NAMES,
+    PHASE_ROUTE_SCHEMA, PhaseRoute, REASONING_EFFORT_NAMES, ReasoningEffort,
+    ReasoningEffortParseError, parse_purpose_name, purpose_name,
 };
 pub use provider::{
     CANONICAL_MODEL_REQUEST_SCHEMA, CancellationToken, CanonicalMessage, CanonicalModelRequest,
@@ -56,13 +56,11 @@ pub use providers::anthropic::{
     encode_anthropic_payload,
 };
 pub use providers::openai_compatible::{
-    http_get, 
     DEFAULT_HTTP_TIMEOUT, Http1Transport, HttpTransport, MAX_BASE_URL_BYTES,
     MAX_HTTP_REQUEST_BYTES, MAX_HTTP_RESPONSE_BYTES, OPENAI_COMPATIBLE_CONFIG_SCHEMA,
     OPENAI_COMPATIBLE_SCHEMA_VERSION, OpenAiApiStyle, OpenAiCompatibleAdapter,
     OpenAiCompatibleConfig, OpenAiCompatibleEndpoint, ProviderHttpRequest, ProviderHttpResponse,
-    StaticWireAuth, WireAuthorization, encode_provider_payload,
-
+    StaticWireAuth, WireAuthorization, encode_provider_payload, http_get,
 };
 pub use route::filter::{
     EligibleSet, HardRejection, LOCAL_ONLY_TAG, LOCAL_PROVIDER_ID, MAX_ELIGIBLE_MODELS,
@@ -70,11 +68,11 @@ pub use route::filter::{
     hard_constraints, is_local_provider, is_no_training_tag,
 };
 pub use route::score::{
-    score, select, LatencyBudgetsV1, QualityPrior, ReliabilityPrior, RouteDecision,
-    RoutePolicyV1, RouteScoreError, RouteWeightsV1, ScoreBreakdown, ScoreComponents,
-    ScoreDefaultsV1, MAX_CANDIDATE_SCORES, MAX_QUALITY_PRIORS, MAX_RELIABILITY_PRIORS,
-    ROUTE_DECISION_SCHEMA, ROUTE_POLICY_SCHEMA, ROUTE_POLICY_VERSION, SCORE_BREAKDOWN_SCHEMA,
-    SCORE_SCALE,
+    LatencyBudgetsV1, MAX_CANDIDATE_SCORES, MAX_QUALITY_PRIORS, MAX_RELIABILITY_PRIORS,
+    QualityPrior, ROUTE_DECISION_SCHEMA, ROUTE_POLICY_SCHEMA, ROUTE_POLICY_VERSION,
+    ReliabilityPrior, RouteDecision, RoutePolicyV1, RouteScoreError, RouteWeightsV1,
+    SCORE_BREAKDOWN_SCHEMA, SCORE_SCALE, ScoreBreakdown, ScoreComponents, ScoreDefaultsV1, score,
+    select,
 };
 pub use usage::{
     AccountedCost, MODEL_USAGE_SCHEMA, MODEL_USAGE_SCHEMA_VERSION, ModelUsage, UsageAccumulator,

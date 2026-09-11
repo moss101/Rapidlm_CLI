@@ -13,7 +13,7 @@ use capability_broker::{CancellationToken, Capability, FilesystemRoot, ResourceD
 use protocol::{ApiError, ErrorCode, TraceId};
 use serde_json::{Map, Value};
 
-use crate::manifest::{validate_for_load, ManifestError, PluginId, PluginManifest};
+use crate::manifest::{ManifestError, PluginId, PluginManifest, validate_for_load};
 
 /// WIT host import module. The only legal guest import namespace.
 pub const HOST_WIT_MODULE: &str = "rapidlm:plugin/host@1.0.0";
@@ -2365,9 +2365,11 @@ mod tests {
             ErrorCode::PluginCapabilityDenied
         );
         assert!(!WasmError::AmbientWasi.to_string().contains("fd_write"));
-        assert!(!WasmError::AmbientWasi
-            .to_string()
-            .contains("wasi_snapshot_preview1"));
+        assert!(
+            !WasmError::AmbientWasi
+                .to_string()
+                .contains("wasi_snapshot_preview1")
+        );
     }
 
     #[test]

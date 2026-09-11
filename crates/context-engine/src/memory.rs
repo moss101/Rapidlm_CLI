@@ -726,9 +726,10 @@ impl MemoryStore {
         let prepared = prepare_write(&req, &self.limits)?;
         let created_at = read_now(&self.conn)?;
         if let Some(expires) = prepared.expires_at.as_ref()
-            && expires.precedes_or_eq(&created_at) {
-                return Err(MemoryError::InvalidWrite);
-            }
+            && expires.precedes_or_eq(&created_at)
+        {
+            return Err(MemoryError::InvalidWrite);
+        }
 
         let Self {
             conn,
@@ -998,9 +999,10 @@ fn record_applies(record: &MemoryRecord, query: &MemoryQuery, now: &MemoryTimest
         return false;
     }
     if let Some(scopes) = query.scopes.as_ref()
-        && !scopes.contains(&record.scope.kind()) {
-            return false;
-        }
+        && !scopes.contains(&record.scope.kind())
+    {
+        return false;
+    }
     match record.scope {
         MemoryScope::User => true,
         MemoryScope::Project(project_id) => query.project_id == Some(project_id),

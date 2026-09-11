@@ -177,13 +177,14 @@ impl TakeoverReconciler {
         self.state = ReconciliationState::Reconciling;
         // URL changed → navigation → replan required.
         if let (Some(expected), Some(actual)) = (expected_url, actual_url)
-            && expected != actual {
-                self.record_change(SurfaceChange::Navigated {
-                    new_url: actual.to_owned(),
-                });
-                self.state = ReconciliationState::ReplanRequired;
-                return Ok(ReconciliationOutcome::Changed);
-            }
+            && expected != actual
+        {
+            self.record_change(SurfaceChange::Navigated {
+                new_url: actual.to_owned(),
+            });
+            self.state = ReconciliationState::ReplanRequired;
+            return Ok(ReconciliationOutcome::Changed);
+        }
         // Auth state changed → unsafe → block.
         if self
             .changes
@@ -244,7 +245,12 @@ mod tests {
         rec.request_return().unwrap();
         rec.reobserve().unwrap();
         let outcome = rec
-            .reconcile(Some("https://app.com/page"), Some("https://app.com/page"), &[], &[])
+            .reconcile(
+                Some("https://app.com/page"),
+                Some("https://app.com/page"),
+                &[],
+                &[],
+            )
             .unwrap();
         assert_eq!(outcome, ReconciliationOutcome::Compatible);
         rec.resume().unwrap();
@@ -267,10 +273,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outcome, ReconciliationOutcome::Changed);
-        assert!(rec
-            .changes()
-            .iter()
-            .any(|c| matches!(c, SurfaceChange::Navigated { .. })));
+        assert!(
+            rec.changes()
+                .iter()
+                .any(|c| matches!(c, SurfaceChange::Navigated { .. }))
+        );
     }
 
     #[test]

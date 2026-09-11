@@ -89,7 +89,10 @@ pub enum UiEvent {
 pub enum LocalUiEvent {
     FocusPanel(PanelId),
     SetRoute(UiRoute),
-    SetViewport { width: u16, height: u16 },
+    SetViewport {
+        width: u16,
+        height: u16,
+    },
     SetComposerText(String),
     CloseModal,
     SelectAgent(Option<AgentId>),
@@ -354,8 +357,12 @@ pub enum GoalLifecycle {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TranscriptEntry {
-    User { text: String },
-    Assistant { text: String },
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
     ToolActivity {
         tool: String,
         status: ToolActivityStatus,
@@ -366,18 +373,24 @@ pub enum TranscriptEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
-    TurnFailed { reason: String },
+    TurnFailed {
+        reason: String,
+    },
     TurnInterrupted,
     /// A local slash-command's own output (help text, a confirmation). Never
     /// sent to or produced by the model — kept distinct from [`Self::
     /// Assistant`] so a command result is never misrepresented as model
     /// output.
-    CommandOutput { text: String },
+    CommandOutput {
+        text: String,
+    },
     /// A local slash-command that could not run (unknown command, bad
     /// arguments, a refused domain mutation). Kept distinct from [`Self::
     /// TurnFailed`] so a parser/dispatch error is never misrepresented as a
     /// turn failure — no turn ever started.
-    CommandError { text: String },
+    CommandError {
+        text: String,
+    },
 }
 
 /// One tool call's lifecycle, as reflected into the transcript. Not the
@@ -869,10 +882,16 @@ fn apply_local(mut state: AppState, event: &LocalUiEvent) -> Result<AppState, Ui
             }
         }
         LocalUiEvent::AppendCommandOutput(text) => {
-            push_transcript(&mut state, TranscriptEntry::CommandOutput { text: text.clone() });
+            push_transcript(
+                &mut state,
+                TranscriptEntry::CommandOutput { text: text.clone() },
+            );
         }
         LocalUiEvent::AppendCommandError(text) => {
-            push_transcript(&mut state, TranscriptEntry::CommandError { text: text.clone() });
+            push_transcript(
+                &mut state,
+                TranscriptEntry::CommandError { text: text.clone() },
+            );
         }
     }
     Ok(state)
@@ -2162,11 +2181,15 @@ mod tests {
     fn append_command_output_and_error_push_distinct_transcript_kinds() {
         let state = reduce(
             AppState::new(),
-            &UiEvent::Local(LocalUiEvent::AppendCommandOutput("goal started: x".to_owned())),
+            &UiEvent::Local(LocalUiEvent::AppendCommandOutput(
+                "goal started: x".to_owned(),
+            )),
         );
         let state = reduce(
             state,
-            &UiEvent::Local(LocalUiEvent::AppendCommandError("unknown command".to_owned())),
+            &UiEvent::Local(LocalUiEvent::AppendCommandError(
+                "unknown command".to_owned(),
+            )),
         );
         assert_eq!(
             state.transcript(),
@@ -2186,9 +2209,7 @@ mod tests {
         let events = fixture();
         let first = replay_ok(&events);
         let second = replay_ok(&events);
-        let folded = events
-            .iter()
-            .fold(AppState::new(), reduce);
+        let folded = events.iter().fold(AppState::new(), reduce);
         let a = serde_json::to_vec(&first).expect("bytes a");
         let b = serde_json::to_vec(&second).expect("bytes b");
         let c = serde_json::to_vec(&folded).expect("bytes c");
@@ -2282,9 +2303,7 @@ mod tests {
                 field: "approval_id"
             })
         ));
-        let blocked = events
-            .iter()
-            .fold(AppState::new(), reduce);
+        let blocked = events.iter().fold(AppState::new(), reduce);
         assert!(blocked.actions_blocked());
         assert!(blocked.protocol_error().is_some());
         assert!(

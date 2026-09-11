@@ -47,9 +47,7 @@ use kernel::{CancellationToken, ProjectIdentity, ProjectTrustStore, TrustStatus}
 use crate::interactive::{
     PERMISSIONS_STORE_NAME, TRUST_CATALOG_NAME, resolve_project_root, user_home_from,
 };
-use crate::permissions::{
-    GrantsError, PermissionGrants, ToolPattern, parse_grants, render_grants,
-};
+use crate::permissions::{GrantsError, PermissionGrants, ToolPattern, parse_grants, render_grants};
 
 /// Process inputs, injectable so the command is testable without changing the
 /// test process's working directory or environment — the same shape
@@ -210,9 +208,8 @@ fn resolve(env: &PermissionsEnv) -> Result<Project, String> {
     // a reachable bug — which is why the test below proves the *end-to-end*
     // agreement through a symlinked working directory rather than asserting
     // this line in isolation, where it cannot fail.
-    let canonical = std::fs::canonicalize(&found.root).map_err(|err| {
-        format!("{} could not be canonicalized: {err}", found.root.display())
-    })?;
+    let canonical = std::fs::canonicalize(&found.root)
+        .map_err(|err| format!("{} could not be canonicalized: {err}", found.root.display()))?;
     let trust = trust_of(&canonical, &home, &cancel);
     Ok(Project {
         canonical_root: canonical.to_string_lossy().into_owned(),
@@ -222,11 +219,7 @@ fn resolve(env: &PermissionsEnv) -> Result<Project, String> {
     })
 }
 
-fn trust_of(
-    root: &Path,
-    home: &Path,
-    cancel: &CancellationToken,
-) -> Result<TrustStatus, String> {
+fn trust_of(root: &Path, home: &Path, cancel: &CancellationToken) -> Result<TrustStatus, String> {
     let identity = ProjectIdentity::new(root, None)
         .map_err(|err| format!("project identity could not be derived: {err}"))?;
     ProjectTrustStore::open(home.join(TRUST_CATALOG_NAME))
@@ -299,12 +292,8 @@ letting this command overwrite every project's grants",
 }
 
 fn save(project: &Project, grants: &PermissionGrants, mode: Option<u32>) -> Result<(), String> {
-    let text = render_grants(grants).map_err(|err| {
-        format!(
-            "the grant store could not be encoded ({})",
-            describe(err)
-        )
-    })?;
+    let text = render_grants(grants)
+        .map_err(|err| format!("the grant store could not be encoded ({})", describe(err)))?;
     if let Some(parent) = project.store_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("{} could not be created: {err}", parent.display()))?;
@@ -324,13 +313,14 @@ fn save(project: &Project, grants: &PermissionGrants, mode: Option<u32>) -> Resu
     }
     // Owner-only: the store names the exact tools a project may run without
     // being asked, so another local account must not be able to add one.
-    crate::exec_tools::atomic_write_with_mode(&project.store_path, &bytes, mode)
-        .map_err(|err| {
+    crate::exec_tools::atomic_write_with_mode(&project.store_path, &bytes, mode).map_err(
+        |err| {
             format!(
                 "{} could not be written: {err}",
                 project.store_path.display()
             )
-        })?;
+        },
+    )?;
     enforce_store_mode(project, mode);
     Ok(())
 }
@@ -347,10 +337,8 @@ fn save(project: &Project, grants: &PermissionGrants, mode: Option<u32>) -> Resu
 fn enforce_store_mode(project: &Project, mode: Option<u32>) {
     use std::os::unix::fs::PermissionsExt;
     if let Some(mode) = mode {
-        let _ = std::fs::set_permissions(
-            &project.store_path,
-            std::fs::Permissions::from_mode(mode),
-        );
+        let _ =
+            std::fs::set_permissions(&project.store_path, std::fs::Permissions::from_mode(mode));
     }
 }
 
@@ -639,8 +627,8 @@ mod tests {
     /// can_prompt_for_approval`; after it, the same call succeeds.
     #[test]
     fn a_granted_tool_actually_becomes_allowed_in_the_default_mode() {
-        use agent_runtime::ToolDriver;
         use crate::permissions::{PermissionLattice, PermissionMode};
+        use agent_runtime::ToolDriver;
 
         let fixture = Fixture::new("effective");
         let canonical = std::fs::canonicalize(&fixture.project).expect("canonicalize");
@@ -736,7 +724,12 @@ mod tests {
     #[test]
     fn granting_is_idempotent_and_revoking_what_was_never_granted_fails() {
         let fixture = Fixture::new("idem");
-        assert!(fixture.run(&["allow", "workspace_write"]).text.contains("allow=workspace_write"));
+        assert!(
+            fixture
+                .run(&["allow", "workspace_write"])
+                .text
+                .contains("allow=workspace_write")
+        );
         let again = fixture.run(&["allow", "workspace_write"]);
         assert_eq!(again.exit, 0);
         assert!(
@@ -764,7 +757,11 @@ mod tests {
         std::fs::write(fixture.store(), before).expect("write store");
         let outcome = fixture.run(&["allow", "workspace_write"]);
         assert_eq!(outcome.exit, 1);
-        assert!(outcome.text.contains("not a usable grant store"), "{}", outcome.text);
+        assert!(
+            outcome.text.contains("not a usable grant store"),
+            "{}",
+            outcome.text
+        );
         assert_eq!(
             std::fs::read_to_string(fixture.store()).expect("still there"),
             before,
@@ -801,7 +798,11 @@ mod tests {
         let fixture = Fixture::new("untrusted");
         let outcome = fixture.run(&["allow", "workspace_write"]);
         assert_eq!(outcome.exit, 0);
-        assert!(outcome.text.contains("rapid trust grant"), "{}", outcome.text);
+        assert!(
+            outcome.text.contains("rapid trust grant"),
+            "{}",
+            outcome.text
+        );
         assert!(outcome.text.contains("trust=untrusted"), "{}", outcome.text);
 
         fixture.trust();
@@ -853,7 +854,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         fn mode_of(path: &Path) -> u32 {
-            std::fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
         }
 
         let fixture = Fixture::new("mode");

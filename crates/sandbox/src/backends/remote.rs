@@ -1178,7 +1178,13 @@ impl SandboxBackend for RemoteBackend {
             .as_ref()
             .ok_or(SandboxError::TierUnavailable)?
             .id;
-        work_lease.verify(&self.issuer, self.controller_id, attached_worker, now, cancel)?;
+        work_lease.verify(
+            &self.issuer,
+            self.controller_id,
+            attached_worker,
+            now,
+            cancel,
+        )?;
         // No Firecracker transport in this protocol task. Fail closed; not a pass.
         Err(SandboxError::HealthFailed)
     }

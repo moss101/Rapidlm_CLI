@@ -117,7 +117,12 @@ fn temp_dir(name: &str) -> PathBuf {
 
 fn git_project(project: &Path) {
     std::fs::create_dir_all(project).expect("project");
-    let init = Command::new("git").arg("init").arg("-q").current_dir(project).output().expect("git init");
+    let init = Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .current_dir(project)
+        .output()
+        .expect("git init");
     assert!(init.status.success(), "git init failed");
 }
 
@@ -127,7 +132,12 @@ fn write_config(home: &Path, addr: std::net::SocketAddr, extra: &str) -> PathBuf
     config
 }
 
-fn run_exec(project: &Path, home: &Path, config: &Path, prompt: &str) -> (Option<i32>, String, String) {
+fn run_exec(
+    project: &Path,
+    home: &Path,
+    config: &Path,
+    prompt: &str,
+) -> (Option<i32>, String, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
         .args(["exec", "--verbose", prompt])
         .current_dir(project)
@@ -151,12 +161,18 @@ fn configured_context_window_reaches_the_actual_wire_request() {
     let project = home.join("project");
     git_project(&project);
     let server = spawn_scripted_server(vec![(200, TERMINAL_BODY.to_owned())]);
-    let config = write_config(&home, server.addr, "context_window = 200000\nmax_tokens = 8000");
+    let config = write_config(
+        &home,
+        server.addr,
+        "context_window = 200000\nmax_tokens = 8000",
+    );
 
     let (code, _stdout, stderr) = run_exec(&project, &home, &config, "say hi");
     assert_eq!(code, Some(0), "{stderr}");
     assert!(
-        stderr.contains("context budget: context_window=200000 output_reserve=8000 source=configured"),
+        stderr.contains(
+            "context budget: context_window=200000 output_reserve=8000 source=configured"
+        ),
         "verbose diagnostic must report the real configured budget: {stderr}"
     );
 
@@ -227,7 +243,10 @@ fn overflow_regression_small_budget_rejects_what_a_large_budget_accepts() {
     let small_config = home.join("config-small.toml");
     std::fs::write(
         &small_config,
-        config_doc("http://127.0.0.1:1/v1", "context_window = 200\nmax_tokens = 50"),
+        config_doc(
+            "http://127.0.0.1:1/v1",
+            "context_window = 200\nmax_tokens = 50",
+        ),
     )
     .expect("small config");
     let (code, _stdout, stderr) = run_exec(&project, &home, &small_config, &long_prompt);
@@ -250,7 +269,11 @@ fn overflow_regression_small_budget_rejects_what_a_large_budget_accepts() {
          for it: {stderr}"
     );
     let requests = server.requests.lock().expect("requests");
-    assert_eq!(requests.len(), 1, "the large-budget run must have actually reached the provider");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the large-budget run must have actually reached the provider"
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -304,7 +327,11 @@ fn fallback_chain_budget_combines_min_context_and_max_output_not_just_the_primar
     .expect("config");
 
     let (code, _stdout, stderr) = run_exec(&project, &home, &config, "say hi");
-    assert_eq!(code, Some(0), "the primary must have served this turn successfully: {stderr}");
+    assert_eq!(
+        code,
+        Some(0),
+        "the primary must have served this turn successfully: {stderr}"
+    );
     assert!(
         stderr.contains("context budget: context_window=8000 output_reserve=6000"),
         "the diagnostic must report the chain-wide (min context_limit, max \
@@ -314,7 +341,11 @@ fn fallback_chain_budget_combines_min_context_and_max_output_not_just_the_primar
     );
 
     let requests = server.requests.lock().expect("requests");
-    assert_eq!(requests.len(), 1, "the primary alone must have served this turn");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the primary alone must have served this turn"
+    );
     assert!(
         requests[0].contains("Context window: 8000 tokens. Reserve 6000 tokens"),
         "the primary's own real request must carry the chain-wide (min context, max \

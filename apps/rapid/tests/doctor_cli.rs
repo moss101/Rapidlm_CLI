@@ -187,7 +187,13 @@ fn a_healthy_controlled_configuration_succeeds_and_reports_every_check() {
     let config = write_config(&fixture, &healthy_config("http://127.0.0.1:9/v1"));
     let run = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
 
-    assert_eq!(run.code, Some(0), "stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+    assert_eq!(
+        run.code,
+        Some(0),
+        "stdout:\n{}\nstderr:\n{}",
+        run.stdout,
+        run.stderr
+    );
     for id in EXPECTED_CHECKS {
         assert!(
             run.stdout
@@ -360,7 +366,11 @@ fn a_trusted_project_reports_trusted_and_enables_workspace_tools() {
         .env_remove("RAPIDLM_HOME")
         .output()
         .expect("rapid trust grant");
-    assert!(grant.status.success(), "{}", String::from_utf8_lossy(&grant.stderr));
+    assert!(
+        grant.status.success(),
+        "{}",
+        String::from_utf8_lossy(&grant.stderr)
+    );
 
     let run = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
     assert_eq!(run.status("project-trust"), "PASS");
@@ -415,7 +425,10 @@ fn no_configured_model_warns_but_still_reports_a_real_context_budget() {
     assert_eq!(run.status("context-budget"), "PASS");
     assert!(run.row("context-budget").contains("context_window=32768"));
     assert!(run.row("context-budget").contains("output_reserve=4096"));
-    assert!(run.row("context-budget").contains("source=default (no model configured)"));
+    assert!(
+        run.row("context-budget")
+            .contains("source=default (no model configured)")
+    );
 }
 
 #[test]
@@ -452,9 +465,16 @@ fn a_crossed_fallback_chain_reports_the_same_safe_budget_execution_derives() {
     assert!(row.contains("context_window=100000"), "{row}");
     assert!(row.contains("output_reserve=16384"), "{row}");
     assert!(row.contains("input_budget=83616"), "{row}");
-    assert!(row.contains("chain: minimum context_limit / maximum max_output"), "{row}");
+    assert!(
+        row.contains("chain: minimum context_limit / maximum max_output"),
+        "{row}"
+    );
     // And the model row must show the chain it actually resolved.
-    assert!(run.row("model").contains("small -> large"), "{}", run.row("model"));
+    assert!(
+        run.row("model").contains("small -> large"),
+        "{}",
+        run.row("model")
+    );
 }
 
 #[test]
@@ -562,7 +582,10 @@ fn help_is_printed_without_running_any_check_and_exits_zero() {
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("usage: rapid doctor"));
-    assert!(!stdout.contains("PASS "), "help must not run checks:\n{stdout}");
+    assert!(
+        !stdout.contains("PASS "),
+        "help must not run checks:\n{stdout}"
+    );
 }
 
 #[test]
@@ -574,16 +597,12 @@ fn configured_hooks_scanners_mcp_and_plugins_are_reported_without_being_executed
     // one whose path does not exist at all.
     let marker = fixture.project.join("HOOK-RAN");
     let script = fixture.project.join("hook.sh");
-    std::fs::write(
-        &script,
-        format!("#!/bin/sh\ntouch {}\n", marker.display()),
-    )
-    .expect("hook script");
+    std::fs::write(&script, format!("#!/bin/sh\ntouch {}\n", marker.display()))
+        .expect("hook script");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     }
     std::fs::write(
         fixture.project.join(".rapidlm").join("settings.json"),
@@ -653,5 +672,9 @@ fn the_sandbox_probe_executes_the_real_backend_and_leaves_the_project_untouched(
         .filter_map(Result::ok)
         .map(|entry| entry.file_name())
         .collect();
-    assert_eq!(before.len(), after.len(), "the project gained or lost files");
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "the project gained or lost files"
+    );
 }

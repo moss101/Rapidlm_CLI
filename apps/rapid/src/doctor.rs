@@ -41,9 +41,9 @@ use std::time::Duration;
 use kernel::{CancellationToken, ProjectIdentity, ProjectTrustStore, TrustStatus};
 
 use crate::interactive::{
-    FoundProject, GIT_MARKER, PROJECT_MARKER, TRUST_CATALOG_NAME, build_backing_model, context_budget_for,
-    context_budget_source, load_project_integrations, resolve_model_plan, resolve_project_root,
-    user_home_from,
+    FoundProject, GIT_MARKER, PROJECT_MARKER, TRUST_CATALOG_NAME, build_backing_model,
+    context_budget_for, context_budget_source, load_project_integrations, resolve_model_plan,
+    resolve_project_root, user_home_from,
 };
 use crate::user_config::{ConfigSource, CredentialSource};
 
@@ -264,7 +264,11 @@ impl DoctorReport {
                 width = width
             ));
             if let Some(remediation) = &check.remediation {
-                out.push_str(&format!("      {:<width$}  -> {remediation}\n", "", width = width));
+                out.push_str(&format!(
+                    "      {:<width$}  -> {remediation}\n",
+                    "",
+                    width = width
+                ));
             }
         }
         out.push_str(&format!(
@@ -411,14 +415,7 @@ pub fn diagnose(env: &DoctorEnv) -> DoctorReport {
                 .cloned()
                 .collect();
             let mut build_sink = |line: &str| build_notes.push(line.to_owned());
-            match build_backing_model(
-                &plan.models,
-                &stores,
-                false,
-                None,
-                None,
-                &mut build_sink,
-            ) {
+            match build_backing_model(&plan.models, &stores, false, None, None, &mut build_sink) {
                 Ok((backing, _)) => {
                     checks.push(check_model(plan, &build_notes));
                     checks.push(check_credentials(plan));
@@ -451,7 +448,10 @@ pub fn diagnose(env: &DoctorEnv) -> DoctorReport {
     let trust = match (&home, &identity) {
         (Some(home), Some(identity)) => {
             let store = ProjectTrustStore::open(home.join(TRUST_CATALOG_NAME));
-            Some((store.catalog_path().to_path_buf(), store.get(identity, &cancel)))
+            Some((
+                store.catalog_path().to_path_buf(),
+                store.get(identity, &cancel),
+            ))
         }
         _ => None,
     };
@@ -480,7 +480,9 @@ pub fn diagnose(env: &DoctorEnv) -> DoctorReport {
     let integrations = root.as_deref().map(load_project_integrations);
     let security_report = evaluate_security(
         &manager,
-        trust.as_ref().and_then(|(_, got)| got.as_ref().ok().copied()),
+        trust
+            .as_ref()
+            .and_then(|(_, got)| got.as_ref().ok().copied()),
         root.as_deref(),
         integrations.as_ref(),
     );
@@ -488,9 +490,16 @@ pub fn diagnose(env: &DoctorEnv) -> DoctorReport {
     checks.push(check_sandbox_probe(env.sandbox_probe, &manager, seatbelt));
 
     // --- project-scoped tooling -----------------------------------------
-    let marked = project.as_ref().map(|found| found.marker.is_some()).unwrap_or(false);
+    let marked = project
+        .as_ref()
+        .map(|found| found.marker.is_some())
+        .unwrap_or(false);
     checks.push(check_git(root.as_deref()));
-    match root.as_deref().filter(|_| marked).zip(integrations.as_ref()) {
+    match root
+        .as_deref()
+        .filter(|_| marked)
+        .zip(integrations.as_ref())
+    {
         Some((root, integrations)) => {
             checks.push(check_scanner(root));
             checks.push(check_hooks(root, integrations));
@@ -599,7 +608,10 @@ fn check_config(
         Err(crate::user_config::UserConfigError::ExplicitConfigMissing { .. }) => {
             DoctorCheck::fail(
                 "config",
-                format!("{} does not exist (named by RAPIDLM_CONFIG)", path.display()),
+                format!(
+                    "{} does not exist (named by RAPIDLM_CONFIG)",
+                    path.display()
+                ),
                 "point RAPIDLM_CONFIG at an existing config file, or unset it to use the default",
             )
         }
@@ -652,7 +664,10 @@ fn check_credentials(plan: &crate::interactive::ModelPlan) -> DoctorCheck {
     match &primary.credential.source {
         CredentialSource::InlineApiKey => DoctorCheck::pass(
             "credentials",
-            format!("profile '{}': inline api_key configured", primary.profile_id),
+            format!(
+                "profile '{}': inline api_key configured",
+                primary.profile_id
+            ),
         ),
         CredentialSource::EnvVar(name) => DoctorCheck::pass(
             "credentials",
@@ -741,9 +756,7 @@ fn check_project_trust(
 ) -> DoctorCheck {
     match trust {
         None => DoctorCheck::skipped("project-trust", "no project or RapidLM home resolved"),
-        Some(Ok(TrustStatus::Trusted)) => {
-            DoctorCheck::pass("project-trust", "trusted")
-        }
+        Some(Ok(TrustStatus::Trusted)) => DoctorCheck::pass("project-trust", "trusted"),
         Some(Ok(TrustStatus::Untrusted)) => DoctorCheck::warn(
             "project-trust",
             "untrusted (workspace file/shell tools, retrieval, hooks, and MCP stay disabled)",
@@ -791,10 +804,9 @@ fn check_workspace_tools(
 ) -> DoctorCheck {
     match trust {
         None => DoctorCheck::skipped("workspace-tools", "no project or RapidLM home resolved"),
-        Some(Ok(TrustStatus::Trusted)) => DoctorCheck::pass(
-            "workspace-tools",
-            "enabled (project is trusted)",
-        ),
+        Some(Ok(TrustStatus::Trusted)) => {
+            DoctorCheck::pass("workspace-tools", "enabled (project is trusted)")
+        }
         // An intentional trust denial is not a software fault: it is the
         // security boundary working. Warn with the action, never fail.
         Some(Ok(TrustStatus::Untrusted)) => DoctorCheck::warn(
@@ -906,7 +918,11 @@ fn check_scanner(root: &Path) -> DoctorCheck {
             if missing.is_empty() {
                 DoctorCheck::pass(
                     "scanner",
-                    format!("{} configured and present: {}", present.len(), present.join(", ")),
+                    format!(
+                        "{} configured and present: {}",
+                        present.len(),
+                        present.join(", ")
+                    ),
                 )
             } else {
                 DoctorCheck::warn(
@@ -954,8 +970,7 @@ fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegratio
             // keyword, and flagging those would be a false alarm rather than
             // a finding.
             let program = command.split_whitespace().next().unwrap_or_default();
-            if program.contains('/')
-                && crate::sandbox_exec::resolve_program(root, program).is_err()
+            if program.contains('/') && crate::sandbox_exec::resolve_program(root, program).is_err()
             {
                 unresolved.push(format!("{stage}:{program}"));
             }
@@ -969,7 +984,10 @@ fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegratio
     } else {
         DoctorCheck::warn(
             "hooks",
-            format!("{total} hook(s) configured; path not found for {}", unresolved.join(", ")),
+            format!(
+                "{total} hook(s) configured; path not found for {}",
+                unresolved.join(", ")
+            ),
             "create the hook scripts above or remove them from the project settings",
         )
     }
@@ -1064,7 +1082,10 @@ fn check_plugins(root: &Path) -> DoctorCheck {
             DoctorCheck::skipped("plugins", "plugin trust catalog is empty")
         }
         Ok(views) => {
-            let enabled = views.iter().filter(|view| view.executable_enabled()).count();
+            let enabled = views
+                .iter()
+                .filter(|view| view.executable_enabled())
+                .count();
             DoctorCheck::pass(
                 "plugins",
                 format!(
@@ -1114,7 +1135,11 @@ fn check_sandbox_probe(
     if !enabled {
         return DoctorCheck::skipped("sandbox-probe", "live probe disabled for this run");
     }
-    let backend = if seatbelt { "seatbelt" } else { "host-restricted" };
+    let backend = if seatbelt {
+        "seatbelt"
+    } else {
+        "host-restricted"
+    };
     // A scratch directory, never the project: the probe mounts its root
     // read-write, so it must not be pointed at anything real.
     let Some(root) = probe_dir() else {
@@ -1124,10 +1149,7 @@ fn check_sandbox_probe(
             "ensure the system temp directory is writable",
         );
     };
-    let argv = vec![
-        "echo".to_owned(),
-        SANDBOX_PROBE_TOKEN.to_owned(),
-    ];
+    let argv = vec!["echo".to_owned(), SANDBOX_PROBE_TOKEN.to_owned()];
     let outcome = crate::sandbox_exec::run_sandboxed_with(
         manager,
         &root,
@@ -1273,14 +1295,19 @@ fn probe_keychain() -> auth::KeychainProbe {
     std::thread::spawn(move || {
         let _ = sender.send(keychain.probe());
     });
-    receiver.recv_timeout(KEYCHAIN_PROBE_TIMEOUT).unwrap_or(unavailable)
+    receiver
+        .recv_timeout(KEYCHAIN_PROBE_TIMEOUT)
+        .unwrap_or(unavailable)
 }
 
 fn security_check(
     report: &Result<security::DoctorReport, String>,
     id: security::DoctorCheckId,
 ) -> Option<security::DoctorCheck> {
-    report.as_ref().ok().and_then(|report| report.check(id).cloned())
+    report
+        .as_ref()
+        .ok()
+        .and_then(|report| report.check(id).cloned())
 }
 
 fn security_detail(check: &security::DoctorCheck) -> String {
@@ -1326,9 +1353,9 @@ fn check_credential_store(report: &Result<security::DoctorReport, String>) -> Do
         _ => DoctorCheck::warn(
             "credential-store",
             detail,
-            check
-                .remediation()
-                .unwrap_or("platform keychain is unavailable; model keys still come from config/env"),
+            check.remediation().unwrap_or(
+                "platform keychain is unavailable; model keys still come from config/env",
+            ),
         ),
     }
 }
@@ -1524,16 +1551,15 @@ fn finalize(report: DoctorReport, secrets: &[String]) -> DoctorReport {
     let snapshot = registry.snapshot();
     let scrub = |text: &str| -> String {
         let cancel = security::RedactionCancellation::new();
-        let scrubbed = match snapshot.redact_text(security::TextSink::ProcessStdout, text, &cancel)
-        {
-            Ok(output) => output
-                .as_text()
-                .map(str::to_owned)
-                .unwrap_or_else(|_| "<redacted: diagnostic text was not valid UTF-8>".to_owned()),
-            // A redaction failure must never let raw text through: replace
-            // the row's text rather than printing something unscrubbed.
-            Err(_) => "<redacted: diagnostic text could not be scrubbed>".to_owned(),
-        };
+        let scrubbed =
+            match snapshot.redact_text(security::TextSink::ProcessStdout, text, &cancel) {
+                Ok(output) => output.as_text().map(str::to_owned).unwrap_or_else(|_| {
+                    "<redacted: diagnostic text was not valid UTF-8>".to_owned()
+                }),
+                // A redaction failure must never let raw text through: replace
+                // the row's text rather than printing something unscrubbed.
+                Err(_) => "<redacted: diagnostic text could not be scrubbed>".to_owned(),
+            };
         // Literal backstop, applied to *every* secret including any the
         // registry refused (over its own size bound, or past its registered-
         // secret limit). Without it a single failed registration would leak
@@ -1541,7 +1567,9 @@ fn finalize(report: DoctorReport, secrets: &[String]) -> DoctorReport {
         let scrubbed = secrets
             .iter()
             .filter(|secret| !secret.is_empty())
-            .fold(scrubbed, |acc, secret| acc.replace(secret.as_str(), REDACTED));
+            .fold(scrubbed, |acc, secret| {
+                acc.replace(secret.as_str(), REDACTED)
+            });
         // Bounding and control-character sanitization come last, so a secret
         // can never survive by being split across the truncation point.
         bounded(&scrubbed)
@@ -1702,7 +1730,10 @@ PASS  model  everything is perfectly fine";
             })
             .collect();
         assert_eq!(row_lines.len(), 2, "forged rows appeared:\n{rendered}");
-        assert!(rendered.contains("everything is perfectly fine"), "text is kept, just flattened");
+        assert!(
+            rendered.contains("everything is perfectly fine"),
+            "text is kept, just flattened"
+        );
         assert!(!rendered.contains("\nPASS  model"));
     }
 
@@ -1767,7 +1798,11 @@ PASS  model  everything is perfectly fine";
             )]),
             &found,
         );
-        assert!(!scrubbed.render().contains("hunter2"), "{}", scrubbed.render());
+        assert!(
+            !scrubbed.render().contains("hunter2"),
+            "{}",
+            scrubbed.render()
+        );
     }
 
     #[test]
@@ -1846,10 +1881,7 @@ PASS  model  everything is perfectly fine";
 
     #[test]
     fn outside_a_project_the_trust_rows_skip_instead_of_failing() {
-        assert_eq!(
-            check_project_trust(None).status(),
-            DoctorStatus::Skipped
-        );
+        assert_eq!(check_project_trust(None).status(), DoctorStatus::Skipped);
         assert_eq!(check_trust_store(None).status(), DoctorStatus::Skipped);
         assert_eq!(check_workspace_tools(None).status(), DoctorStatus::Skipped);
     }
@@ -1908,13 +1940,21 @@ PASS  model  everything is perfectly fine";
         assert_eq!(reserve, crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS);
         assert_eq!(check.status(), DoctorStatus::Pass);
         assert!(check.detail().contains(&format!("context_window={limit}")));
-        assert!(check.detail().contains(&format!("output_reserve={reserve}")));
+        assert!(
+            check
+                .detail()
+                .contains(&format!("output_reserve={reserve}"))
+        );
         assert!(
             check
                 .detail()
                 .contains(&format!("input_budget={}", limit - reserve))
         );
-        assert!(check.detail().contains("source=default (no model configured)"));
+        assert!(
+            check
+                .detail()
+                .contains("source=default (no model configured)")
+        );
     }
 
     #[test]
@@ -1956,7 +1996,10 @@ PASS  model  everything is perfectly fine";
         let request = security::DoctorRequest::new();
         let cancel = capability_broker::CancellationToken::new();
         let report = Ok(security::evaluate_doctor(&request, &cancel).expect("evaluate"));
-        assert_eq!(check_security_policy(&report).status(), DoctorStatus::Skipped);
+        assert_eq!(
+            check_security_policy(&report).status(),
+            DoctorStatus::Skipped
+        );
         assert_eq!(
             check_release_signature(&report).status(),
             DoctorStatus::Skipped
@@ -1969,10 +2012,9 @@ PASS  model  everything is perfectly fine";
 
     #[test]
     fn an_unavailable_keychain_is_a_warning_because_model_keys_come_from_config_or_env() {
-        let request = security::DoctorRequest::new()
-            .with_keychain_probe(auth::KeychainProbe::unavailable(
-                auth::PlatformKeychainKind::Unsupported,
-            ));
+        let request = security::DoctorRequest::new().with_keychain_probe(
+            auth::KeychainProbe::unavailable(auth::PlatformKeychainKind::Unsupported),
+        );
         let cancel = capability_broker::CancellationToken::new();
         let report = Ok(security::evaluate_doctor(&request, &cancel).expect("evaluate"));
         let check = check_credential_store(&report);
@@ -1987,7 +2029,10 @@ PASS  model  everything is perfectly fine";
         let request = security::DoctorRequest::new().with_sandbox_probe_failed();
         let cancel = capability_broker::CancellationToken::new();
         let report = Ok(security::evaluate_doctor(&request, &cancel).expect("evaluate"));
-        assert_eq!(check_sandbox_availability(&report).status(), DoctorStatus::Warn);
+        assert_eq!(
+            check_sandbox_availability(&report).status(),
+            DoctorStatus::Warn
+        );
     }
 
     #[test]
@@ -2010,12 +2055,19 @@ PASS  model  everything is perfectly fine";
             matches!(check.status(), DoctorStatus::Pass | DoctorStatus::Warn),
             "the probe must never fail the command outright: {check:?}"
         );
-        let expected = if seatbelt { "seatbelt" } else { "host-restricted" };
+        let expected = if seatbelt {
+            "seatbelt"
+        } else {
+            "host-restricted"
+        };
         assert!(check.detail().contains(expected), "{}", check.detail());
         // Nothing this call created may survive it. (Anything a *concurrent*
         // sibling created is in both sets, so it cancels out.)
         let leaked: Vec<_> = after.difference(&before).collect();
-        assert!(leaked.is_empty(), "probe left scratch dirs behind: {leaked:?}");
+        assert!(
+            leaked.is_empty(),
+            "probe left scratch dirs behind: {leaked:?}"
+        );
     }
 
     fn probe_dirs() -> std::collections::BTreeSet<std::ffi::OsString> {
@@ -2024,10 +2076,7 @@ PASS  model  everything is perfectly fine";
                 entries
                     .filter_map(Result::ok)
                     .map(|entry| entry.file_name())
-                    .filter(|name| {
-                        name.to_string_lossy()
-                            .starts_with("rapidlm-doctor-probe-")
-                    })
+                    .filter(|name| name.to_string_lossy().starts_with("rapidlm-doctor-probe-"))
                     .collect()
             })
             .unwrap_or_default()

@@ -20,13 +20,13 @@ use std::path::Path;
 use std::time::Duration;
 
 use capability_broker::{CancellationToken, LeaseIssuer, LeaseValidator};
+use security::gate::ScannerId;
 use security::{
     ExternalExecKind, ExternalExecResult, ExternalFinding, ExternalSandboxPlan, ExternalScanError,
     ExternalScanReport, ExternalScanRequest, ExternalScanStatus, ExternalScannerAdapter,
     ExternalScannerConfig, ExternalScannerKind, FindingsDisposition, GatePhase, GateVerdict,
     ScanGatePolicy, ScanGateResult, ScannerOutcome, SupervisedScannerExec, evaluate_scan_gate,
 };
-use security::gate::ScannerId;
 
 /// Workspace-relative path of the external-scanner configuration.
 pub const SCANNERS_CONFIG_PATH: &str = ".rapidlm/scanners.json";
@@ -100,18 +100,17 @@ pub fn load_scanners_config(root: &Path) -> Result<Vec<ScannerEntry>, ScannersCo
 }
 
 fn parse_scanners_config(bytes: &[u8]) -> Result<Vec<ScannerEntry>, ScannersConfigError> {
-    let value: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|err| ScannersConfigError::Malformed(err.to_string()))?;
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|err| ScannersConfigError::Malformed(err.to_string()))?;
     let scanners = value
         .get("scanners")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| ScannersConfigError::Malformed("missing \"scanners\" array".to_owned()))?;
     let mut out = Vec::with_capacity(scanners.len());
     for (index, entry) in scanners.iter().enumerate() {
-        out.push(
-            parse_scanner_entry(entry)
-                .map_err(|reason| ScannersConfigError::Malformed(format!("scanners[{index}]: {reason}")))?,
-        );
+        out.push(parse_scanner_entry(entry).map_err(|reason| {
+            ScannersConfigError::Malformed(format!("scanners[{index}]: {reason}"))
+        })?);
     }
     Ok(out)
 }
@@ -156,9 +155,9 @@ fn parse_scanner_entry(value: &serde_json::Value) -> Result<ScannerEntry, String
     // `load_scanners_config` states a malformed config is a real error, not
     // something to go quiet about.
     if let Some(value) = obj.get("timeout_secs") {
-        let secs = value
-            .as_u64()
-            .ok_or_else(|| format!("\"timeout_secs\" must be a non-negative integer, got {value}"))?;
+        let secs = value.as_u64().ok_or_else(|| {
+            format!("\"timeout_secs\" must be a non-negative integer, got {value}")
+        })?;
         config = config
             .with_timeout(Duration::from_secs(secs))
             .map_err(|err| err.to_string())?;
@@ -167,7 +166,9 @@ fn parse_scanner_entry(value: &serde_json::Value) -> Result<ScannerEntry, String
         let limit = value.as_u64().ok_or_else(|| {
             format!("\"output_limit_bytes\" must be a non-negative integer, got {value}")
         })?;
-        config = config.with_output_limit(limit).map_err(|err| err.to_string())?;
+        config = config
+            .with_output_limit(limit)
+            .map_err(|err| err.to_string())?;
     }
     let on_findings = match obj.get("on_findings") {
         None => FindingsDisposition::Block,
@@ -179,7 +180,10 @@ fn parse_scanner_entry(value: &serde_json::Value) -> Result<ScannerEntry, String
             None => return Err(format!("\"on_findings\" must be a string, got {value}")),
         },
     };
-    Ok(ScannerEntry { config, on_findings })
+    Ok(ScannerEntry {
+        config,
+        on_findings,
+    })
 }
 
 /// Runs a planned scan through the same capability-broker lease + sandbox
@@ -301,8 +305,8 @@ pub fn run_configured_scanners(
     for entry in entries {
         let request = ExternalScanRequest::new(entry.config.clone(), workspace.clone());
         let report = adapter.scan(&request, Some(&exec), cancel)?;
-        let scanner_id = ScannerId::parse(entry.config.id())
-            .map_err(|_| ExternalScanError::InvalidScannerId)?;
+        let scanner_id =
+            ScannerId::parse(entry.config.id()).map_err(|_| ExternalScanError::InvalidScannerId)?;
         policy = policy
             .require(scanner_id.clone(), entry.on_findings)
             .map_err(|_| ExternalScanError::InvalidScannerId)?;
@@ -431,14 +435,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".rapidlm")).expect("dir");
         std::fs::write(root.join(SCANNERS_CONFIG_PATH), b"not json").expect("write");
-        let err = load_scanners_config(&root).expect_err("malformed file must error, not go silent");
+        let err =
+            load_scanners_config(&root).expect_err("malformed file must error, not go silent");
         assert!(matches!(err, ScannersConfigError::Malformed(_)));
         let _ = std::fs::remove_dir_all(&root);
     }
 
     fn temp_workspace(tag: &str) -> std::path::PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("rapidlm-external-scan-{tag}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "rapidlm-external-scan-{tag}-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("root");
         std::fs::canonicalize(&root).expect("canonicalize")
@@ -469,13 +476,9 @@ mod tests {
     fn a_real_sandboxed_scanner_with_no_findings_passes_the_gate() {
         let root = temp_workspace("clean");
         let entry = sh_scanner("fakescan", CLEAN_SARIF);
-        let (verdict, outcomes) = run_configured_scanners(
-            &[entry],
-            &root,
-            |_fp| false,
-            &CancellationToken::new(),
-        )
-        .expect("scan");
+        let (verdict, outcomes) =
+            run_configured_scanners(&[entry], &root, |_fp| false, &CancellationToken::new())
+                .expect("scan");
         assert!(verdict.is_pass(), "{verdict}");
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].report.status(), ExternalScanStatus::Passed);
@@ -487,14 +490,14 @@ mod tests {
     fn a_real_sandboxed_scanner_with_a_finding_blocks_the_gate_by_default() {
         let root = temp_workspace("finding");
         let entry = sh_scanner("fakescan", &finding_sarif());
-        let (verdict, outcomes) = run_configured_scanners(
-            &[entry],
-            &root,
-            |_fp| false,
-            &CancellationToken::new(),
-        )
-        .expect("scan");
-        assert_eq!(verdict.disposition(), security::GateDisposition::Block, "{verdict}");
+        let (verdict, outcomes) =
+            run_configured_scanners(&[entry], &root, |_fp| false, &CancellationToken::new())
+                .expect("scan");
+        assert_eq!(
+            verdict.disposition(),
+            security::GateDisposition::Block,
+            "{verdict}"
+        );
         assert_eq!(outcomes[0].report.status(), ExternalScanStatus::Failed);
         assert_eq!(outcomes[0].undismissed.len(), 1);
         let _ = std::fs::remove_dir_all(&root);
@@ -528,14 +531,14 @@ mod tests {
         let root = temp_workspace("warn");
         let mut entry = sh_scanner("fakescan", &finding_sarif());
         entry.on_findings = FindingsDisposition::Warn;
-        let (verdict, _outcomes) = run_configured_scanners(
-            &[entry],
-            &root,
-            |_fp| false,
-            &CancellationToken::new(),
-        )
-        .expect("scan");
-        assert_eq!(verdict.disposition(), security::GateDisposition::Warn, "{verdict}");
+        let (verdict, _outcomes) =
+            run_configured_scanners(&[entry], &root, |_fp| false, &CancellationToken::new())
+                .expect("scan");
+        assert_eq!(
+            verdict.disposition(),
+            security::GateDisposition::Warn,
+            "{verdict}"
+        );
         assert!(verdict.allows_apply());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -554,13 +557,9 @@ mod tests {
             config,
             on_findings: FindingsDisposition::Block,
         };
-        let (verdict, outcomes) = run_configured_scanners(
-            &[entry],
-            &root,
-            |_fp| false,
-            &CancellationToken::new(),
-        )
-        .expect("scan");
+        let (verdict, outcomes) =
+            run_configured_scanners(&[entry], &root, |_fp| false, &CancellationToken::new())
+                .expect("scan");
         assert_eq!(
             verdict.disposition(),
             security::GateDisposition::Block,

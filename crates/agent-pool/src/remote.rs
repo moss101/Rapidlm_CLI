@@ -110,7 +110,8 @@ mod tests {
         let lease = pool
             .acquire(PoolBackend::Remote, "o", 1000, &mut prov)
             .expect("acquire");
-        pool.release(lease.id(), true, 200, &mut prov).expect("release");
+        pool.release(lease.id(), true, 200, &mut prov)
+            .expect("release");
         assert_eq!(pool.warm_count(), 1);
     }
 

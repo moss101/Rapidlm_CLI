@@ -51,6 +51,7 @@ pub mod browser {
         MAX_CLICK_COUNT, MAX_SCROLL_ABS, MAX_STABLE_REF_BYTES, MAX_TYPE_BYTES, MouseButton,
         PageActor, ResolvedTarget, SecretAwareString, TargetSelector, UiAction, act,
     };
+    pub use fence::{FenceError, FencedContent, SurfaceSource, TrustClass};
     pub use observe::{
         AccessibilitySnapshotRef, BrowserObserver, DomSnapshotRef, FakePage, MAX_NAME_BYTES,
         MAX_OBSERVE_TIMEOUT, MAX_ROLE_BYTES, MAX_SCREENSHOT_BYTES, MAX_SCREENSHOT_HEIGHT,
@@ -59,6 +60,7 @@ pub mod browser {
         PageNode, PageSnapshot, SCREENSHOT_MEDIA_TYPE, ScreenshotMeta, SemanticSource,
         SemanticTarget, SemanticTargetView, observe,
     };
+    pub use policy::{BatchDecision, SettlePolicy, batchable, settle_policy};
     pub use security::{
         BrowserGateAction, CapabilityIntent, ClipboardOp, DOWNLOAD_STAGING_PATH, DownloadDest,
         MAX_FILE_PATH_BYTES, SecurityError, SensitiveClass, UploadSource, authorize_browser_action,
@@ -82,8 +84,6 @@ pub mod browser {
         MAX_VERIFY_TIMEOUT, VerificationClause, VerificationPredicate, VerificationResult,
         VerificationStatus, VerifyError, verify,
     };
-    pub use policy::{BatchDecision, SettlePolicy, batchable, settle_policy};
-    pub use fence::{FencedContent, FenceError, SurfaceSource, TrustClass};
 }
 
 pub use browser::{

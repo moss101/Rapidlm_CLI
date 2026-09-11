@@ -195,8 +195,7 @@ impl JobLease {
     /// A lease is live if it is before expiry and heartbeat is within grace.
     pub fn is_live(&self, now: UnitTime, heartbeat_grace_secs: u64) -> bool {
         now.secs() < self.expires_at.secs()
-            && now.secs().saturating_sub(self.heartbeat_at.secs())
-                <= heartbeat_grace_secs
+            && now.secs().saturating_sub(self.heartbeat_at.secs()) <= heartbeat_grace_secs
     }
     /// Renew the lease: bump expiry from `now` and refresh the heartbeat.
     pub fn renew(&mut self, now: UnitTime, lease_secs: u64) {
@@ -214,18 +213,14 @@ impl CronExpr {
         if parts.len() != 5 {
             return Err(TriggerError::InvalidExpression);
         }
-        let ranges = [
-            (0u64, 59u64),
-            (0, 23),
-            (1, 31),
-            (1, 12),
-            (0, 6),
-        ];
+        let ranges = [(0u64, 59u64), (0, 23), (1, 31), (1, 12), (0, 6)];
         let mut fields = Vec::with_capacity(5);
         for (i, part) in parts.iter().enumerate() {
             fields.push(parse_field(part, ranges[i])?);
         }
-        let fields: [Field; 5] = fields.try_into().map_err(|_| TriggerError::InvalidExpression)?;
+        let fields: [Field; 5] = fields
+            .try_into()
+            .map_err(|_| TriggerError::InvalidExpression)?;
         Ok(Self {
             fields,
             raw: raw.to_string(),
@@ -282,10 +277,12 @@ impl TriggerKind {
                 Some(_) => FireDecision::Skip,
                 None => FireDecision::Fire,
             },
-            TriggerKind::Cron { expr } => match expr.next_after(UnitTime::new(cursor.last_fire().unwrap_or(0))) {
-                Some(next) if now.secs() >= next.secs() => FireDecision::Fire,
-                _ => FireDecision::Skip,
-            },
+            TriggerKind::Cron { expr } => {
+                match expr.next_after(UnitTime::new(cursor.last_fire().unwrap_or(0))) {
+                    Some(next) if now.secs() >= next.secs() => FireDecision::Fire,
+                    _ => FireDecision::Skip,
+                }
+            }
         }
     }
 }
@@ -337,7 +334,9 @@ fn parse_field(raw: &str, range: (u64, u64)) -> Result<Field, TriggerError> {
             continue;
         }
         if let Some(step_raw) = token.strip_prefix("*/") {
-            let step: u64 = step_raw.parse().map_err(|_| TriggerError::InvalidExpression)?;
+            let step: u64 = step_raw
+                .parse()
+                .map_err(|_| TriggerError::InvalidExpression)?;
             if step == 0 {
                 return Err(TriggerError::InvalidExpression);
             }
@@ -394,7 +393,11 @@ mod tests {
         assert!(a < 1000);
         // Different seeds may differ (not asserted equal).
         assert_ne!(deterministic_jitter(8, 1000), a);
-        assert_eq!(deterministic_jitter(7, 0), 0, "zero bucket yields zero jitter");
+        assert_eq!(
+            deterministic_jitter(7, 0),
+            0,
+            "zero bucket yields zero jitter"
+        );
     }
 
     #[test]
@@ -443,9 +446,18 @@ mod tests {
     fn interval_fires_on_elapsed_and_skips_otherwise() {
         let spec = TriggerSpec::new("t2", TriggerKind::Interval { seconds: 60 }).expect("spec");
         let mut cursor = TriggerCursor::new();
-        assert_eq!(spec.kind().fires_at(UnitTime::new(0), &cursor), FireDecision::Fire);
+        assert_eq!(
+            spec.kind().fires_at(UnitTime::new(0), &cursor),
+            FireDecision::Fire
+        );
         cursor.advance(FireDecision::Fire, 0);
-        assert_eq!(spec.kind().fires_at(UnitTime::new(30), &cursor), FireDecision::Skip);
-        assert_eq!(spec.kind().fires_at(UnitTime::new(61), &cursor), FireDecision::Fire);
+        assert_eq!(
+            spec.kind().fires_at(UnitTime::new(30), &cursor),
+            FireDecision::Skip
+        );
+        assert_eq!(
+            spec.kind().fires_at(UnitTime::new(61), &cursor),
+            FireDecision::Fire
+        );
     }
 }

@@ -1132,12 +1132,10 @@ mod tests {
         let resolved = LiveHostResolver
             .resolve_executable(
                 link.to_str().expect("utf8 path"),
-                &CanonicalHostPath::from_resolved(dir.0.to_str().expect("utf8 path"))
-                    .expect("cwd"),
+                &CanonicalHostPath::from_resolved(dir.0.to_str().expect("utf8 path")).expect("cwd"),
             )
             .expect("resolve through symlink");
-        let canonical_real =
-            std::fs::canonicalize(&real_target).expect("canonicalize real target");
+        let canonical_real = std::fs::canonicalize(&real_target).expect("canonicalize real target");
         assert_eq!(resolved.as_str(), canonical_real.to_str().expect("utf8"));
     }
 

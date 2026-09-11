@@ -187,10 +187,12 @@ impl ContextLocator {
             return Err(ReadSetError::InvalidObservation);
         }
         if let Some(chunk_id) = self.chunk_id.as_deref()
-            && (chunk_id.is_empty() || chunk_id.len() > MAX_LOCATOR_BYTES || chunk_id.contains('\0'))
-            {
-                return Err(ReadSetError::InvalidObservation);
-            }
+            && (chunk_id.is_empty()
+                || chunk_id.len() > MAX_LOCATOR_BYTES
+                || chunk_id.contains('\0'))
+        {
+            return Err(ReadSetError::InvalidObservation);
+        }
         Ok(())
     }
 }
@@ -440,9 +442,10 @@ impl ReadSet {
             self.check_stride(step, started)?;
             locator.validate()?;
             if self.freshness_unchecked(locator, *hash) == Freshness::Stale
-                && let Some(record) = self.records.get(locator) {
-                    stale.push(record.clone());
-                }
+                && let Some(record) = self.records.get(locator)
+            {
+                stale.push(record.clone());
+            }
         }
         Ok(stale)
     }

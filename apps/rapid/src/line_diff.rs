@@ -97,9 +97,7 @@ fn myers(a: &[&str], b: &[&str]) -> Option<Vec<Edit>> {
         let mut k = -(d as isize);
         while k <= d as isize {
             let idx = (k + offset as isize) as usize;
-            let mut x = if k == -(d as isize)
-                || (k != d as isize && v[idx - 1] < v[idx + 1])
-            {
+            let mut x = if k == -(d as isize) || (k != d as isize && v[idx - 1] < v[idx + 1]) {
                 v[idx + 1]
             } else {
                 v[idx - 1] + 1
@@ -119,7 +117,13 @@ fn myers(a: &[&str], b: &[&str]) -> Option<Vec<Edit>> {
     None
 }
 
-fn backtrack(a: &[&str], b: &[&str], trace: &[Vec<usize>], d_end: usize, offset: usize) -> Vec<Edit> {
+fn backtrack(
+    a: &[&str],
+    b: &[&str],
+    trace: &[Vec<usize>],
+    d_end: usize,
+    offset: usize,
+) -> Vec<Edit> {
     let mut edits = Vec::new();
     let mut x = a.len();
     let mut y = b.len();
@@ -297,7 +301,10 @@ mod tests {
             panic!("expected hunks");
         };
         assert_eq!(text.matches("@@ ").count(), 2, "{text}");
-        assert!(text.starts_with("@@ -1,5 +1,5 @@\n l1\n-l2\n+L2\n l3\n"), "{text}");
+        assert!(
+            text.starts_with("@@ -1,5 +1,5 @@\n l1\n-l2\n+L2\n l3\n"),
+            "{text}"
+        );
         assert!(text.contains("@@ -25,6 +25,6 @@\n"), "{text}");
     }
 
@@ -373,7 +380,10 @@ mod tests {
         assert_eq!(out.len(), MAX_UNIFIED_BYTES - 1);
         out.push('日');
         out.push('\n');
-        assert!(!out.is_char_boundary(MAX_UNIFIED_BYTES), "the cap must land mid-character");
+        assert!(
+            !out.is_char_boundary(MAX_UNIFIED_BYTES),
+            "the cap must land mid-character"
+        );
 
         let cut = truncate(out);
         assert!(cut.starts_with(&format!("{}\n{TRUNCATION_MARKER}\n", "x".repeat(100))));
@@ -385,7 +395,9 @@ mod tests {
         // inside a character on some line. The first version sliced the
         // String at the cap and would have panicked here — in the write
         // path, on any source file with a non-ASCII comment.
-        let before: String = (0..MAX_DIFF_LINES).map(|n| format!("зміна {n}\n")).collect();
+        let before: String = (0..MAX_DIFF_LINES)
+            .map(|n| format!("зміна {n}\n"))
+            .collect();
         let after: String = (0..MAX_DIFF_LINES)
             .map(|n| {
                 if n % 5 == 0 {
@@ -403,7 +415,10 @@ mod tests {
         // Every line is intact: the marker follows a complete line.
         let body = &text[..text.len() - TRUNCATION_MARKER.len() - 1];
         assert!(body.ends_with('\n'));
-        assert!(body.lines().all(|line| line.is_empty() || line.starts_with(['@', ' ', '-', '+'])));
+        assert!(
+            body.lines()
+                .all(|line| line.is_empty() || line.starts_with(['@', ' ', '-', '+']))
+        );
     }
 
     #[test]
@@ -423,7 +438,11 @@ mod tests {
         let DiffOutcome::Unified(text) = unified(&before, &after) else {
             panic!("expected hunks");
         };
-        assert!(text.len() <= MAX_UNIFIED_BYTES + TRUNCATION_MARKER.len() + 1, "{}", text.len());
+        assert!(
+            text.len() <= MAX_UNIFIED_BYTES + TRUNCATION_MARKER.len() + 1,
+            "{}",
+            text.len()
+        );
         assert!(text.ends_with(&format!("{TRUNCATION_MARKER}\n")));
         // Cut on a line boundary: the line before the marker is complete.
         let body = &text[..text.len() - TRUNCATION_MARKER.len() - 1];

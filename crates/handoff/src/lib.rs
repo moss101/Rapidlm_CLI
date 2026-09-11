@@ -91,10 +91,7 @@ impl FreshIssuance {
         if !has_lease || !has_observation {
             return Err(HandoffError::IncompleteIssuance);
         }
-        Ok(Self {
-            generation,
-            refs,
-        })
+        Ok(Self { generation, refs })
     }
 }
 
@@ -517,7 +514,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let ledger = OwnershipLedger::new(path.clone());
         super::acquire(&ledger, session(), "foreground", 1).expect("acquire");
-        let bundle = super::detach(&ledger, session(), "foreground", "daemon", 1000).expect("detach");
+        let bundle =
+            super::detach(&ledger, session(), "foreground", "daemon", 1000).expect("detach");
         assert_eq!(bundle.relinquished_generation, 1);
         assert_eq!(bundle.accepted_generation, 2);
         // After detach, no owner exists (foreground relinquished).
@@ -540,7 +538,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let ledger = OwnershipLedger::new(path.clone());
         super::acquire(&ledger, session(), "foreground", 1).expect("acquire");
-        let bundle = super::detach(&ledger, session(), "foreground", "daemon", 1000).expect("detach");
+        let bundle =
+            super::detach(&ledger, session(), "foreground", "daemon", 1000).expect("detach");
         // Ledger is empty right after detach; a third party must not be able
         // to accept under a different owner string than the bundle names.
         assert!(ledger.load().expect("load").is_none());
@@ -590,15 +589,17 @@ mod tests {
         let path = scratch("lease");
         let _ = std::fs::remove_file(&path);
         let ledger = OwnershipLedger::new(path.clone());
-        let lease =
-            super::acquire_lease(&ledger, session(), "foreground", 7, 1_000, 60_000).expect("acquire");
+        let lease = super::acquire_lease(&ledger, session(), "foreground", 7, 1_000, 60_000)
+            .expect("acquire");
         assert_eq!(lease.generation, 7);
         assert!(!lease.expired(1_000));
         assert!(lease.expired(61_000));
 
-        let bundle = super::detach(&ledger, session(), "foreground", "daemon", 2_000).expect("detach");
+        let bundle =
+            super::detach(&ledger, session(), "foreground", "daemon", 2_000).expect("detach");
         // Fresh bundle accepts and mints a target lease at N+1.
-        let accepted = super::accept_lease(&ledger, &bundle, "daemon", 3_000, 60_000).expect("accept");
+        let accepted =
+            super::accept_lease(&ledger, &bundle, "daemon", 3_000, 60_000).expect("accept");
         assert_eq!(accepted.generation, 8);
         assert_eq!(accepted.owner, "daemon");
         assert!(!accepted.expired(3_000));
@@ -672,10 +673,7 @@ mod tests {
         sm.restore_verified().expect("restore");
         // Pre-commit failure parks the session with no target writes.
         let mut parked = sm.clone();
-        assert_eq!(
-            parked.park().expect("park"),
-            super::HandoffPhase::Parked
-        );
+        assert_eq!(parked.park().expect("park"), super::HandoffPhase::Parked);
         assert!(matches!(
             parked.commit_generation(),
             Err(super::HandoffError::InvalidPhase)

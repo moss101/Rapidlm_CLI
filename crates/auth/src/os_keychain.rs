@@ -4,7 +4,9 @@
 
 use std::process::Command;
 
-use crate::store::{KeychainItemMeta, KeychainProbe, PlatformKeychain, PlatformKeychainKind, StoreError};
+use crate::store::{
+    KeychainItemMeta, KeychainProbe, PlatformKeychain, PlatformKeychainKind, StoreError,
+};
 
 /// Production macOS Keychain-backed store. Secrets live only inside the
 /// login keychain; nothing is written to disk by this type.
@@ -57,7 +59,13 @@ impl PlatformKeychain for MacosKeychain {
         // Replace any existing entry, then add the fresh secret bytes.
         let account = self.account(item);
         let _ = Command::new("/usr/bin/security")
-            .args(["delete-generic-password", "-s", &self.service, "-a", &account])
+            .args([
+                "delete-generic-password",
+                "-s",
+                &self.service,
+                "-a",
+                &account,
+            ])
             .output();
         let out = Command::new("/usr/bin/security")
             .args([
@@ -149,8 +157,12 @@ mod tests {
     fn item() -> KeychainItemMeta {
         let secret_ref = crate::secret::SecretRef::from_id("018f3c8a-7e2b-7a10-8c4d-0123456789ab")
             .expect("secret ref");
-        KeychainItemMeta::new(secret_ref, CredentialKind::ProviderApiKey, Some("test-provider".to_owned()))
-            .expect("meta")
+        KeychainItemMeta::new(
+            secret_ref,
+            CredentialKind::ProviderApiKey,
+            Some("test-provider".to_owned()),
+        )
+        .expect("meta")
     }
 
     /// P4-032 live evidence: real login-keychain round trip on this host.
@@ -173,6 +185,9 @@ mod tests {
         assert_eq!(kc.get(&meta, &cancel).unwrap(), b"rotated".to_vec());
         kc.delete(&meta, &cancel).expect("delete");
         assert!(matches!(kc.get(&meta, &cancel), Err(StoreError::NotFound)));
-        assert!(matches!(kc.delete(&meta, &cancel), Err(StoreError::NotFound)));
+        assert!(matches!(
+            kc.delete(&meta, &cancel),
+            Err(StoreError::NotFound)
+        ));
     }
 }

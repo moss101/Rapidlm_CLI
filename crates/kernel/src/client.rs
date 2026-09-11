@@ -802,8 +802,9 @@ impl InProcessKernelClient {
                 seq: env.seq(),
                 kind: env.kind().as_str().to_owned(),
                 recorded_at: env.recorded_at().as_str().to_owned(),
-                payload_json: serde_json::to_string(env.payload())
-                    .map_err(|_| api_error(ErrorCode::InternalUnexpected, "export encode", trace))?,
+                payload_json: serde_json::to_string(env.payload()).map_err(|_| {
+                    api_error(ErrorCode::InternalUnexpected, "export encode", trace)
+                })?,
             });
         }
         Ok(out)

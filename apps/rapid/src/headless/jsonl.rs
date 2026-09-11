@@ -616,8 +616,9 @@ mod tests {
     fn now_rfc3339_produces_a_real_parseable_recent_utc_timestamp() {
         let stamp = now_rfc3339();
         assert!(stamp.ends_with('Z'), "{stamp}");
-        let parsed: event_ledger::event::RecordedAt =
-            stamp.parse().expect("must round-trip through the ledger's own RFC3339 parser");
+        let parsed: event_ledger::event::RecordedAt = stamp
+            .parse()
+            .expect("must round-trip through the ledger's own RFC3339 parser");
         assert_eq!(parsed.as_str(), stamp);
     }
 

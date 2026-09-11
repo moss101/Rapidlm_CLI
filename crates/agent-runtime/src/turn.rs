@@ -173,7 +173,9 @@ pub enum ModelStepError {
     Failed,
     /// Provider-classified failure. `cause` is operator-actionable and never
     /// echoes provider bodies or credential material.
-    ProviderFailed { cause: FailureCause },
+    ProviderFailed {
+        cause: FailureCause,
+    },
     BoundExceeded,
 }
 
@@ -389,11 +391,26 @@ pub enum ModelStepOutput {
 /// question a user sees is the model's own, not a generic substitute.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ToolStepResult {
-    Succeeded { call_id: String, summary: String },
-    Failed { call_id: String, handled: bool, detail: Option<String> },
-    Denied { call_id: String, detail: Option<String> },
-    ApprovalRequired { call_id: String },
-    ContextRequired { call_id: String, question: String },
+    Succeeded {
+        call_id: String,
+        summary: String,
+    },
+    Failed {
+        call_id: String,
+        handled: bool,
+        detail: Option<String>,
+    },
+    Denied {
+        call_id: String,
+        detail: Option<String>,
+    },
+    ApprovalRequired {
+        call_id: String,
+    },
+    ContextRequired {
+        call_id: String,
+        question: String,
+    },
 }
 
 /// One kernel-shaped lifecycle event emitted by the loop.
@@ -1317,11 +1334,9 @@ where
             let proposed = calls.clone();
             match run_tool_steps(state, tools, events, calls, cancel)? {
                 ToolBatchOutcome::Stopped(stop) => Ok(StepDecision::Stop(stop)),
-                ToolBatchOutcome::Completed(results) => {
-                    Ok(StepDecision::Continue(ToolStepExchange::new(
-                        proposed, results,
-                    )))
-                }
+                ToolBatchOutcome::Completed(results) => Ok(StepDecision::Continue(
+                    ToolStepExchange::new(proposed, results),
+                )),
             }
         }
     }
@@ -1428,10 +1443,8 @@ where
             }
             Err(err @ (ToolStepError::Invalid | ToolStepError::Failed)) => {
                 state.unhandled_tool_failure = true;
-                state.failure_detail = Some(TurnFailureDetail::new(
-                    call.tool.clone(),
-                    err.as_str(),
-                ));
+                state.failure_detail =
+                    Some(TurnFailureDetail::new(call.tool.clone(), err.as_str()));
                 refusal = Some(StepRefusal {
                     call: Some(call),
                     action: RefusalAction::Fail(TurnStopReason::ToolFailed),
@@ -1511,8 +1524,10 @@ where
     if let Some(stop) = stop_if_cancelled(state, events, cancel)? {
         return Ok(ToolBatchOutcome::Stopped(stop));
     }
-    let validated: Vec<ValidatedToolCall> =
-        prepared.iter().map(|(_, validated)| validated.clone()).collect();
+    let validated: Vec<ValidatedToolCall> = prepared
+        .iter()
+        .map(|(_, validated)| validated.clone())
+        .collect();
     let outcomes = tools.execute_batch(&validated, cancel);
 
     // `execute_batch` already ran every call concurrently and joined all of
@@ -1538,10 +1553,8 @@ where
             Err(err @ (ToolStepError::Invalid | ToolStepError::Failed)) => {
                 emit_tool_failed(state, events, call)?;
                 state.unhandled_tool_failure = true;
-                state.failure_detail = Some(TurnFailureDetail::new(
-                    call.tool.clone(),
-                    err.as_str(),
-                ));
+                state.failure_detail =
+                    Some(TurnFailureDetail::new(call.tool.clone(), err.as_str()));
                 if stop_outcome.is_none() {
                     stop_outcome = Some(ToolBatchOutcome::Stopped(fail(
                         state,
@@ -1702,8 +1715,10 @@ fn fail<E: TurnEventSink>(
     // same way (`dispatch_prepared` sets `state.failure_detail` for both
     // before calling this); every other stop has no tool detail by
     // definition.
-    let detail = if matches!(reason, TurnStopReason::ToolFailed | TurnStopReason::ContextRequired)
-    {
+    let detail = if matches!(
+        reason,
+        TurnStopReason::ToolFailed | TurnStopReason::ContextRequired
+    ) {
         state.failure_detail.clone()
     } else {
         None
@@ -1785,9 +1800,7 @@ fn model_budget_exhausted(state: &LoopState) -> bool {
 
 fn tool_budget_exhausted(used: u32, pending_in_batch: usize, budget: TurnBudget) -> bool {
     match budget.max_tool_calls {
-        Some(limit) => {
-            (used as usize).saturating_add(pending_in_batch) >= limit as usize
-        }
+        Some(limit) => (used as usize).saturating_add(pending_in_batch) >= limit as usize,
         None => false,
     }
 }
@@ -2174,10 +2187,11 @@ mod tests {
             &live(),
         )
         .expect("run");
-        assert!(events.iter().any(|event| matches!(
-            event,
-            TurnEvent::ToolDenied { reason: None, .. }
-        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TurnEvent::ToolDenied { reason: None, .. }))
+        );
     }
 
     #[test]
@@ -2644,9 +2658,9 @@ mod tests {
             "c3's completion, after the failing c2, must still be emitted"
         );
         assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, TurnEvent::ToolFailed { call_id, .. } if call_id == "c2")),
+            events.iter().any(
+                |event| matches!(event, TurnEvent::ToolFailed { call_id, .. } if call_id == "c2")
+            ),
             "c2's failure must still be reported"
         );
     }
@@ -2675,11 +2689,10 @@ mod tests {
                         .collect(),
                 ));
                 if input.prior_tools().is_empty() {
-                    Ok(tools_out(
-                        vec![call("c1", "repo.read"), call("c2", "repo.read")],
-                        1,
+                    Ok(
+                        tools_out(vec![call("c1", "repo.read"), call("c2", "repo.read")], 1)
+                            .expect("calls"),
                     )
-                    .expect("calls"))
                 } else {
                     terminal("paired", 1)
                 }
@@ -2748,8 +2761,7 @@ mod tests {
             }
         }
         let notification = ToolStepExchange::new(
-            vec![ProposedToolCall::new("notify-job-1", "background_jobs", "{}")
-                .expect("call")],
+            vec![ProposedToolCall::new("notify-job-1", "background_jobs", "{}").expect("call")],
             vec![ToolStepResult::Succeeded {
                 call_id: "notify-job-1".to_owned(),
                 summary: "job-1: completed exit 0 — output: done".to_owned(),
@@ -2767,15 +2779,12 @@ mod tests {
             ) -> Result<ModelStepOutput, ModelStepError> {
                 self.steps += 1;
                 let seen_notification = input.history().iter().any(|exchange| {
-                    exchange
-                        .results()
-                        .iter()
-                        .any(|result| match result {
-                            ToolStepResult::Succeeded { summary, .. } => {
-                                summary.contains("completed exit 0")
-                            }
-                            _ => false,
-                        })
+                    exchange.results().iter().any(|result| match result {
+                        ToolStepResult::Succeeded { summary, .. } => {
+                            summary.contains("completed exit 0")
+                        }
+                        _ => false,
+                    })
                 });
                 if seen_notification {
                     self.notification_seen = true;
@@ -2786,8 +2795,9 @@ mod tests {
                     });
                 }
                 Ok(ModelStepOutput::ToolCalls {
-                    calls: vec![ProposedToolCall::new("bg", "background_jobs", "{}")
-                        .expect("call")],
+                    calls: vec![
+                        ProposedToolCall::new("bg", "background_jobs", "{}").expect("call"),
+                    ],
                     tokens: 1,
                     cost_usd_micros: None,
                 })
@@ -3023,7 +3033,10 @@ mod tests {
         .expect("run");
         assert_eq!(result.status(), TurnStatus::Failed);
         assert_eq!(result.reason(), Some(TurnStopReason::EmptyResponse));
-        assert_eq!(tools.executed, 1, "the executed tool call is never replayed");
+        assert_eq!(
+            tools.executed, 1,
+            "the executed tool call is never replayed"
+        );
         assert_eq!(model.seen, 2);
     }
 

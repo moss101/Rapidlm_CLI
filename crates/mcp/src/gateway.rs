@@ -133,11 +133,7 @@ pub struct InvocationContext {
 /// (fail-closed); a veto at or before [`MiddlewareStage::PreHook`] prevents
 /// any server I/O. `on_evidence` receives the terminal record.
 pub trait McpMiddleware {
-    fn observe(
-        &self,
-        stage: MiddlewareStage,
-        ctx: &InvocationContext,
-    ) -> Result<(), GatewayError> {
+    fn observe(&self, stage: MiddlewareStage, ctx: &InvocationContext) -> Result<(), GatewayError> {
         let _ = (stage, ctx);
         Ok(())
     }
@@ -180,7 +176,10 @@ impl EvidenceCollector {
 
 impl McpMiddleware for EvidenceCollector {
     fn on_evidence(&self, evidence: &InvocationEvidence) {
-        self.records.lock().expect("evidence mutex").push(evidence.clone());
+        self.records
+            .lock()
+            .expect("evidence mutex")
+            .push(evidence.clone());
     }
 }
 
@@ -1705,10 +1704,11 @@ capability = "mcp.invoke"
 
         let recorder = StageRecorder::new(None);
         let evidence = std::sync::Arc::new(EvidenceCollector::new());
-        let gateway = McpGateway::new(&catalog, &store, &policies, &validator).with_middleware(vec![
-            Box::new(recorder.clone()),
-            Box::new(std::sync::Arc::clone(&evidence)),
-        ]);
+        let gateway =
+            McpGateway::new(&catalog, &store, &policies, &validator).with_middleware(vec![
+                Box::new(recorder.clone()),
+                Box::new(std::sync::Arc::clone(&evidence)),
+            ]);
         let mut transport = CountingTransport::new(tools_result(
             9,
             json!({"content":[{"type":"text","text":"hits"}],"isError":false}),
@@ -1760,17 +1760,22 @@ capability = "mcp.invoke"
 
         let recorder = StageRecorder::new(Some(MiddlewareStage::PreHook));
         let evidence = std::sync::Arc::new(EvidenceCollector::new());
-        let gateway = McpGateway::new(&catalog, &store, &policies, &validator).with_middleware(vec![
-            Box::new(recorder.clone()),
-            Box::new(std::sync::Arc::clone(&evidence)),
-        ]);
+        let gateway =
+            McpGateway::new(&catalog, &store, &policies, &validator).with_middleware(vec![
+                Box::new(recorder.clone()),
+                Box::new(std::sync::Arc::clone(&evidence)),
+            ]);
         let mut transport = CountingTransport::new(tools_result(
             11,
             json!({"content":[{"type":"text","text":"hits"}],"isError":false}),
         ));
         let outcome = gateway.invoke(&request, &mut transport, &live());
         assert!(outcome.is_err(), "veto must fail the invocation closed");
-        assert_eq!(transport.calls.get(), 0, "no server I/O after pre-hook veto");
+        assert_eq!(
+            transport.calls.get(),
+            0,
+            "no server I/O after pre-hook veto"
+        );
         assert!(transport.inner.outbound().is_empty());
         assert_eq!(
             recorder.stages(),

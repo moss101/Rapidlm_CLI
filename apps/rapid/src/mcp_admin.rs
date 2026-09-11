@@ -202,7 +202,9 @@ pub fn run(args: &[String], env: &McpEnv) -> Result<McpOutcome, McpUsageError> {
             }
             Ok(probe(&project, rest.first().map(String::as_str)))
         }
-        other => Err(McpUsageError(format!("rapid mcp: unknown command '{other}'"))),
+        other => Err(McpUsageError(format!(
+            "rapid mcp: unknown command '{other}'"
+        ))),
     }
 }
 
@@ -227,11 +229,7 @@ fn resolve(env: &McpEnv) -> Result<Project, McpUsageError> {
     })
 }
 
-fn trust_of(
-    root: &Path,
-    env: &McpEnv,
-    cancel: &CancellationToken,
-) -> Result<TrustStatus, String> {
+fn trust_of(root: &Path, env: &McpEnv, cancel: &CancellationToken) -> Result<TrustStatus, String> {
     let home = match env.home.clone() {
         Some(home) => home,
         None => match user_home_from(&env.env) {
@@ -352,7 +350,10 @@ fn quoted(value: &str) -> String {
 fn get(project: &Project, name: &str) -> McpOutcome {
     let mut text = header(project);
     if let Some(entry) = project.config.get(name) {
-        text.push_str(&format!("server={} file={}\n", entry.config.name, entry.file));
+        text.push_str(&format!(
+            "server={} file={}\n",
+            entry.config.name, entry.file
+        ));
         text.push_str(&format!("command={}\n", quoted(&entry.config.command)));
         for (index, arg) in entry.config.args.iter().enumerate() {
             text.push_str(&format!("arg[{index}]={}\n", quoted(arg)));
@@ -468,7 +469,9 @@ fn add(project: &Project, args: &[String]) -> Result<McpOutcome, McpUsageError> 
         }
     }
     let Some(name) = name else {
-        return Err(McpUsageError("rapid mcp add: no server name given".to_owned()));
+        return Err(McpUsageError(
+            "rapid mcp add: no server name given".to_owned(),
+        ));
     };
     let Some(command) = command else {
         return Err(McpUsageError(
@@ -481,7 +484,9 @@ fn add(project: &Project, args: &[String]) -> Result<McpOutcome, McpUsageError> 
         return Err(McpUsageError(format!("rapid mcp add: {issue}")));
     }
     if command.is_empty() {
-        return Err(McpUsageError("rapid mcp add: --command is empty".to_owned()));
+        return Err(McpUsageError(
+            "rapid mcp add: --command is empty".to_owned(),
+        ));
     }
     if command.len() > MAX_COMMAND_BYTES {
         return Err(McpUsageError(format!(
@@ -847,7 +852,9 @@ fn expect_no_args(sub: &str, args: &[String]) -> Result<(), McpUsageError> {
 
 fn one_name(sub: &str, args: &[String]) -> Result<String, McpUsageError> {
     let Some(name) = args.first() else {
-        return Err(McpUsageError(format!("rapid mcp {sub}: no server name given")));
+        return Err(McpUsageError(format!(
+            "rapid mcp {sub}: no server name given"
+        )));
     };
     if args.len() > 1 {
         return Err(McpUsageError(format!(
@@ -959,10 +966,20 @@ mod tests {
                }}"#,
         );
         let outcome = fixture.run(&["list"]);
-        assert_eq!(outcome.exit, 0, "listing is not a diagnosis: {}", outcome.text);
-        assert!(outcome.text.contains("servers=1 rejected=2"), "{}", outcome.text);
+        assert_eq!(
+            outcome.exit, 0,
+            "listing is not a diagnosis: {}",
+            outcome.text
+        );
         assert!(
-            outcome.text.contains("server=ok file=.rapidlm/settings.json"),
+            outcome.text.contains("servers=1 rejected=2"),
+            "{}",
+            outcome.text
+        );
+        assert!(
+            outcome
+                .text
+                .contains("server=ok file=.rapidlm/settings.json"),
             "{}",
             outcome.text
         );
@@ -974,7 +991,11 @@ mod tests {
         );
         // Every rejection carries a reason: the whole point is that a
         // dropped entry stops being invisible.
-        for line in outcome.text.lines().filter(|line| line.starts_with("rejected=")) {
+        for line in outcome
+            .text
+            .lines()
+            .filter(|line| line.starts_with("rejected="))
+        {
             assert!(line.contains(" reason="), "no reason on: {line}");
         }
     }
@@ -1048,7 +1069,15 @@ mod tests {
             r#"{"fetch_allowlist": ["example.com"]}"#,
         );
         let outcome = fixture.run(&[
-            "add", "srv", "--command", "npx", "--arg", "-y", "--arg", "pkg", "--env",
+            "add",
+            "srv",
+            "--command",
+            "npx",
+            "--arg",
+            "-y",
+            "--arg",
+            "pkg",
+            "--env",
             "API_KEY=abc",
         ]);
         assert_eq!(outcome.exit, 0, "{}", outcome.text);
@@ -1104,7 +1133,11 @@ mod tests {
         let forced = fixture.run(&["add", "srv", "--command", "replacement", "--force"]);
         assert_eq!(forced.exit, 0, "{}", forced.text);
         assert!(forced.text.starts_with("replaced srv"), "{}", forced.text);
-        assert!(fixture.read(".rapidlm/settings.json").contains("replacement"));
+        assert!(
+            fixture
+                .read(".rapidlm/settings.json")
+                .contains("replacement")
+        );
     }
 
     #[test]
@@ -1118,7 +1151,9 @@ mod tests {
         assert_eq!(outcome.exit, 1);
         assert!(outcome.text.contains("not valid JSON"), "{}", outcome.text);
         assert!(
-            fixture.read(".rapidlm/settings.json").contains("// a comment"),
+            fixture
+                .read(".rapidlm/settings.json")
+                .contains("// a comment"),
             "the unparsable file must be left exactly as it was"
         );
     }
@@ -1144,17 +1179,26 @@ mod tests {
         );
 
         let outcome = fixture.run(&["add", "onemore", "--command", "true"]);
-        assert_eq!(outcome.exit, 0, "the write itself succeeded: {}", outcome.text);
-        assert!(outcome.text.starts_with("added onemore"), "{}", outcome.text);
+        assert_eq!(
+            outcome.exit, 0,
+            "the write itself succeeded: {}",
+            outcome.text
+        );
+        assert!(
+            outcome.text.starts_with("added onemore"),
+            "{}",
+            outcome.text
+        );
         assert!(
             outcome.text.contains("warning: onemore will still not run"),
             "{}",
             outcome.text
         );
         assert!(
-            outcome
-                .text
-                .contains(&format!("{}-server limit", crate::mcp_config::MAX_MCP_SERVERS)),
+            outcome.text.contains(&format!(
+                "{}-server limit",
+                crate::mcp_config::MAX_MCP_SERVERS
+            )),
             "the warning must name the real reason: {}",
             outcome.text
         );
@@ -1219,18 +1263,31 @@ mod tests {
         let outcome = fixture.run(&["add", "srv", "--command", "true", "--env", "API_KEY=tok"]);
         assert_eq!(outcome.exit, 0, "{}", outcome.text);
         let path = fixture.project.join(".rapidlm/settings.json");
-        let mode = std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "a settings file this command created is 0o{mode:o}");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a settings file this command created is 0o{mode:o}"
+        );
 
         // An existing mode is carried across rather than replaced: this
         // command does not get to loosen (or tighten) a decision the user or
         // another tool already made.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
-            .expect("set mode");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("set mode");
         let outcome = fixture.run(&["add", "other", "--command", "true"]);
         assert_eq!(outcome.exit, 0, "{}", outcome.text);
-        let mode = std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
-        assert_eq!(mode, 0o640, "an existing mode was not preserved (0o{mode:o})");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o640,
+            "an existing mode was not preserved (0o{mode:o})"
+        );
     }
 
     #[test]
@@ -1288,7 +1345,9 @@ mod tests {
             outcome.text
         );
         assert!(
-            fixture.read(".claude/settings.json").contains("// a comment"),
+            fixture
+                .read(".claude/settings.json")
+                .contains("// a comment"),
             "the unparsable file must be left exactly as it was"
         );
     }
@@ -1299,7 +1358,11 @@ mod tests {
         fixture.settings(".rapidlm/settings.json", r#"{"mcpServers": {}}"#);
         let outcome = fixture.run(&["remove", "srv"]);
         assert_eq!(outcome.exit, 1);
-        assert!(outcome.text.contains("no MCP server named"), "{}", outcome.text);
+        assert!(
+            outcome.text.contains("no MCP server named"),
+            "{}",
+            outcome.text
+        );
     }
 
     #[test]
@@ -1362,7 +1425,11 @@ mod tests {
         fixture.set_trust(TrustStatus::Trusted);
         let outcome = fixture.run(&["probe"]);
         assert_eq!(outcome.exit, 0, "{}", outcome.text);
-        assert!(outcome.text.contains("no MCP server is configured"), "{}", outcome.text);
+        assert!(
+            outcome.text.contains("no MCP server is configured"),
+            "{}",
+            outcome.text
+        );
     }
 
     #[test]
@@ -1371,7 +1438,11 @@ mod tests {
         fixture.set_trust(TrustStatus::Trusted);
         let outcome = fixture.run(&["probe", "nope"]);
         assert_eq!(outcome.exit, 1);
-        assert!(outcome.text.contains("no MCP server named"), "{}", outcome.text);
+        assert!(
+            outcome.text.contains("no MCP server named"),
+            "{}",
+            outcome.text
+        );
     }
 
     #[test]
@@ -1407,8 +1478,12 @@ mod tests {
         // Same rule as the name check: a write must never produce an entry
         // `rapid mcp list` reports as broken one line later.
         let fixture = Fixture::new("addbounds");
-        let mut args: Vec<String> =
-            vec!["add".into(), "srv".into(), "--command".into(), "true".into()];
+        let mut args: Vec<String> = vec![
+            "add".into(),
+            "srv".into(),
+            "--command".into(),
+            "true".into(),
+        ];
         for index in 0..=crate::mcp_config::MAX_ARGS {
             args.push("--arg".into());
             args.push(index.to_string());
@@ -1420,8 +1495,12 @@ mod tests {
             "a rejected add must not create a settings file"
         );
 
-        let mut args: Vec<String> =
-            vec!["add".into(), "srv".into(), "--command".into(), "true".into()];
+        let mut args: Vec<String> = vec![
+            "add".into(),
+            "srv".into(),
+            "--command".into(),
+            "true".into(),
+        ];
         for index in 0..=crate::mcp_config::MAX_ENV_VARS {
             args.push("--env".into());
             args.push(format!("K{index}=v"));

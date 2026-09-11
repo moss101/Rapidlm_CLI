@@ -12,11 +12,11 @@
 //! lattice before execution; a headless denial is a typed model-visible
 //! result, never a silent pass.
 
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -454,7 +454,8 @@ impl JobRegistry {
             reported: Arc::new(AtomicBool::new(false)),
             sandbox_cancel: None,
         };
-        self.table.jobs
+        self.table
+            .jobs
             .lock()
             .map_err(|_| ToolStepError::Failed)?
             .insert(id.clone(), shared.clone());
@@ -698,7 +699,8 @@ impl JobRegistry {
             reported: Arc::new(AtomicBool::new(false)),
             sandbox_cancel: Some(sandbox_cancel.clone()),
         };
-        self.table.jobs
+        self.table
+            .jobs
             .lock()
             .map_err(|_| ToolStepError::Failed)?
             .insert(id.clone(), shared.clone());
@@ -919,10 +921,7 @@ impl JobRegistry {
 /// finished. Shared by [`JobRegistry::cancel`] and [`JobTable::kill_all`] so
 /// stopping one job and stopping all of them cannot drift apart.
 fn stop_if_running(job: &JobShared) -> bool {
-    let running = matches!(
-        job.state.lock().as_deref(),
-        Ok(JobState::Running)
-    );
+    let running = matches!(job.state.lock().as_deref(), Ok(JobState::Running));
     if !running {
         return false;
     }
@@ -1055,7 +1054,9 @@ impl WriteLocks {
         // the filesystem's actual case sensitivity.
         let key = path.to_string_lossy().to_ascii_lowercase();
         let mut map = self.0.lock().expect("write locks");
-        map.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+        map.entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 }
 
@@ -1076,7 +1077,8 @@ pub struct WorkspaceTools {
     fetch_allowlist: Vec<String>,
     hooks: crate::hooks::HooksConfig,
     shadow_diagnostics: Option<crate::shadow_diagnostics::ShadowDiagnosticsConfig>,
-    ask_stdin: Option<Arc<dyn Fn(&str, &[String], Duration) -> Result<String, String> + Send + Sync>>,
+    ask_stdin:
+        Option<Arc<dyn Fn(&str, &[String], Duration) -> Result<String, String> + Send + Sync>>,
     mcp: Arc<Mutex<Vec<McpConnection>>>,
     mcp_surface: Arc<Mutex<Vec<(String, String, mcp::transport::McpToolDescriptor)>>>,
     /// Resource ceiling (Modbit `WRK-017`'s concurrency axis) bounding the
@@ -1142,7 +1144,9 @@ impl WorkspaceTools {
         if !root.is_dir() {
             return Err(ToolSetupError::RootNotADirectory);
         }
-        let root = root.canonicalize().map_err(|_| ToolSetupError::RootUnresolvable)?;
+        let root = root
+            .canonicalize()
+            .map_err(|_| ToolSetupError::RootUnresolvable)?;
         Ok(Self {
             root,
             permissions,
@@ -1403,7 +1407,11 @@ impl WorkspaceTools {
     /// imply. Called on every subagent child's own tools
     /// (`LiveSubagentRunner::run`) with the handles the parent's own
     /// `turn_budget_handles()` returned.
-    pub(crate) fn share_turn_budgets(&mut self, bytes_written: Arc<AtomicU64>, fetch_bytes: Arc<AtomicU64>) {
+    pub(crate) fn share_turn_budgets(
+        &mut self,
+        bytes_written: Arc<AtomicU64>,
+        fetch_bytes: Arc<AtomicU64>,
+    ) {
         self.bytes_written = bytes_written;
         self.fetch_bytes = fetch_bytes;
     }
@@ -1606,8 +1614,12 @@ impl WorkspaceTools {
             WORKSPACE_WRITE_TOOL => parse_write_args(arguments).ok().map(|args| args.path),
             WORKSPACE_READ_TOOL | REPO_READ_TOOL => parse_path_argument(arguments),
             WORKSPACE_PATCH_TOOL => parse_patch_args(arguments).ok().map(|args| args.path),
-            SHELL_EXEC_TOOL => parse_shell_args(arguments).ok().map(|args| args.argv.join(" ")),
-            REPO_GLOB_TOOL => parse_repo_glob_args(arguments).ok().map(|args| args.pattern),
+            SHELL_EXEC_TOOL => parse_shell_args(arguments)
+                .ok()
+                .map(|args| args.argv.join(" ")),
+            REPO_GLOB_TOOL => parse_repo_glob_args(arguments)
+                .ok()
+                .map(|args| args.pattern),
             TODO_WRITE_TOOL => Some(TODOS_PATH.to_owned()),
             PLAN_ENTER_TOOL => Some(PLAN_ENTER_TOOL.to_owned()),
             PLAN_EXIT_TOOL => Some(PLAN_EXIT_TOOL.to_owned()),
@@ -1624,8 +1636,7 @@ impl WorkspaceTools {
     /// additionally gated: only read-only calls and writes to the plan file
     /// pass (Claude's plan-file carve-out).
     fn permission_for(&self, call: &ValidatedToolCall) -> Decision {
-        let subject =
-            Self::rule_subject(call.tool(), call.arguments()).unwrap_or_default();
+        let subject = Self::rule_subject(call.tool(), call.arguments()).unwrap_or_default();
         let decision = self
             .permissions
             .evaluate(call.tool(), &subject, tool_class(call.tool()));
@@ -1669,7 +1680,11 @@ impl WorkspaceTools {
                     format!("tool {}: approval_required", call.tool())
                 }
                 Ok(ToolStepResult::ContextRequired { question, .. }) => {
-                    format!("tool {}: context_required ({})", call.tool(), single_line(question))
+                    format!(
+                        "tool {}: context_required ({})",
+                        call.tool(),
+                        single_line(question)
+                    )
                 }
                 Err(err) => format!("tool {}: error ({})", call.tool(), err.as_str()),
             };
@@ -1957,7 +1972,12 @@ impl WorkspaceTools {
                         args.content.len(),
                         args.path
                     );
-                    append_write_advisories(&mut summary, self.root(), &args.path, args.content.as_bytes());
+                    append_write_advisories(
+                        &mut summary,
+                        self.root(),
+                        &args.path,
+                        args.content.as_bytes(),
+                    );
                     return Ok(ToolStepResult::Succeeded {
                         call_id: call.call_id().to_owned(),
                         summary: bounded_detail(&summary),
@@ -1974,7 +1994,12 @@ impl WorkspaceTools {
                         args.content.len(),
                         args.path
                     );
-                    append_write_advisories(&mut summary, self.root(), &args.path, args.content.as_bytes());
+                    append_write_advisories(
+                        &mut summary,
+                        self.root(),
+                        &args.path,
+                        args.content.as_bytes(),
+                    );
                     return Ok(ToolStepResult::Succeeded {
                         call_id: call.call_id().to_owned(),
                         summary: bounded_detail(&summary),
@@ -1984,7 +2009,12 @@ impl WorkspaceTools {
         }
         self.write_workspace_file(&target, &args.path, args.content.as_bytes())?;
         let mut summary = format!("wrote {} bytes to {}", args.content.len(), args.path);
-        append_write_advisories(&mut summary, self.root(), &args.path, args.content.as_bytes());
+        append_write_advisories(
+            &mut summary,
+            self.root(),
+            &args.path,
+            args.content.as_bytes(),
+        );
         Ok(ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
             summary,
@@ -2077,7 +2107,7 @@ impl WorkspaceTools {
                     call_id: call.call_id().to_owned(),
                     handled: true,
                     detail: Some(bounded_detail(&format!("{}: file not found", args.path))),
-                })
+                });
             }
             Err(BoundedReadError::TooLarge) => {
                 return Ok(ToolStepResult::Failed {
@@ -2147,24 +2177,30 @@ impl WorkspaceTools {
         let args = parse_repo_search_args(call.arguments())?;
         let mut all_hits: Vec<String> = Vec::new();
         let mut walked = 0usize;
-        walk_text_files(self.root(), self.root(), 0, &mut walked, &mut |path, contents| {
-            if cancel.is_cancelled() {
-                return;
-            }
-            for (index, line) in contents.lines().enumerate() {
-                if !line.contains(&args.pattern) {
-                    continue;
+        walk_text_files(
+            self.root(),
+            self.root(),
+            0,
+            &mut walked,
+            &mut |path, contents| {
+                if cancel.is_cancelled() {
+                    return;
                 }
-                let line_text: String = if line.chars().count() > 200 {
-                    let cut: String = line.chars().take(200).collect();
-                    format!("{cut}…")
-                } else {
-                    line.to_owned()
-                };
-                all_hits.push(format!("{path}:{}: {line_text}", index + 1));
-                return; // one hit per file keeps the result compact
-            }
-        });
+                for (index, line) in contents.lines().enumerate() {
+                    if !line.contains(&args.pattern) {
+                        continue;
+                    }
+                    let line_text: String = if line.chars().count() > 200 {
+                        let cut: String = line.chars().take(200).collect();
+                        format!("{cut}…")
+                    } else {
+                        line.to_owned()
+                    };
+                    all_hits.push(format!("{path}:{}: {line_text}", index + 1));
+                    return; // one hit per file keeps the result compact
+                }
+            },
+        );
         if cancel.is_cancelled() {
             return Err(ToolStepError::Cancelled);
         }
@@ -2234,7 +2270,7 @@ impl WorkspaceTools {
                     call_id: call.call_id().to_owned(),
                     handled: true,
                     detail: Some(bounded_detail(&format!("{}: file not found", args.path))),
-                })
+                });
             }
             Err(BoundedReadError::TooLarge) => {
                 return Ok(ToolStepResult::Failed {
@@ -2279,7 +2315,10 @@ impl WorkspaceTools {
                 });
             }
             self.write_workspace_file(&target, &args.path, updated.as_bytes())?;
-            let mut summary = format!("replaced {exact_occurrences} occurrence(s) in {}", args.path);
+            let mut summary = format!(
+                "replaced {exact_occurrences} occurrence(s) in {}",
+                args.path
+            );
             append_write_advisories(&mut summary, self.root(), &args.path, updated.as_bytes());
             return Ok(ToolStepResult::Succeeded {
                 call_id: call.call_id().to_owned(),
@@ -2362,7 +2401,8 @@ impl WorkspaceTools {
         let args = parse_shell_args(call.arguments())?;
         if self.trace_calls {
             crate::exec_diag::stderr_line(&format!(
-                "tool shell_exec: argv={:?} background={} sandbox={}", args.argv, args.background, args.sandbox
+                "tool shell_exec: argv={:?} background={} sandbox={}",
+                args.argv, args.background, args.sandbox
             ));
         }
         // `PatchPolicyGate` (Modbit `VER-009`) must run before any branch
@@ -2492,8 +2532,14 @@ read with job_output, in this turn or a later one — the job is stopped when th
         // `try_wait()` can then never observe the exit.
         let output_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let pipes: Vec<Box<dyn std::io::Read + Send>> = [
-            child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-            child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+            child
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+            child
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
         ]
         .into_iter()
         .flatten()
@@ -2544,7 +2590,10 @@ read with job_output, in this turn or a later one — the job is stopped when th
             let _ = reader.join();
         }
         let output_text = {
-            let combined = output_buf.lock().map(|guard| guard.clone()).unwrap_or_default();
+            let combined = output_buf
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
             self.redact_output(bounded_text(&combined, MAX_SHELL_OUTPUT_BYTES))
         };
         match status {
@@ -2633,7 +2682,8 @@ read with job_output, in this turn or a later one — the job is stopped when th
         for entry in &args.todos {
             match entry.id.as_deref() {
                 Some(id) => {
-                    if let Some(slot) = todos.iter_mut().find(|todo| todo.id.as_deref() == Some(id)) {
+                    if let Some(slot) = todos.iter_mut().find(|todo| todo.id.as_deref() == Some(id))
+                    {
                         slot.content = entry.content.clone();
                         slot.status = entry.status.clone();
                         // Patch semantics: a key absent from this entry's
@@ -2748,12 +2798,7 @@ read with job_output, in this turn or a later one — the job is stopped when th
         });
         let serialized = serde_json::to_vec_pretty(&document).map_err(|_| ToolStepError::Failed)?;
         atomic_write(&target, &serialized).map_err(|_| ToolStepError::Failed)?;
-        let count = |status: &str| {
-            todos
-                .iter()
-                .filter(|todo| todo.status == status)
-                .count()
-        };
+        let count = |status: &str| todos.iter().filter(|todo| todo.status == status).count();
         let mut summary = format!(
             "{} task(s): {} pending, {} in_progress, {} completed",
             todos.len(),
@@ -2852,7 +2897,7 @@ read with job_output, in this turn or a later one — the job is stopped when th
                     detail: Some(bounded_detail(&format!(
                         "write the plan to {PLAN_PATH} with workspace_write before plan_exit"
                     ))),
-                })
+                });
             }
             Err(_) => return Err(ToolStepError::Failed),
         };
@@ -2890,10 +2935,7 @@ read with job_output, in this turn or a later one — the job is stopped when th
             None => Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
-                detail: Some(bounded_detail(&format!(
-                    "{}: unknown job id",
-                    args.job_id
-                ))),
+                detail: Some(bounded_detail(&format!("{}: unknown job id", args.job_id))),
             }),
         }
     }
@@ -2906,14 +2948,12 @@ read with job_output, in this turn or a later one — the job is stopped when th
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_job_id_args(call.arguments(), true)?;
         let offset = args.offset.unwrap_or(0);
-        let Some((text, done, next, state, overflow)) = self.jobs.output(&args.job_id, offset) else {
+        let Some((text, done, next, state, overflow)) = self.jobs.output(&args.job_id, offset)
+        else {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
-                detail: Some(bounded_detail(&format!(
-                    "{}: unknown job id",
-                    args.job_id
-                ))),
+                detail: Some(bounded_detail(&format!("{}: unknown job id", args.job_id))),
             });
         };
         let mut summary = self.redact_output(text);
@@ -3000,8 +3040,8 @@ read with job_output, in this turn or a later one — the job is stopped when th
                 ))),
             });
         };
-        let arguments: serde_json::Value = serde_json::from_str(call.arguments())
-            .unwrap_or_else(|_| serde_json::json!({}));
+        let arguments: serde_json::Value =
+            serde_json::from_str(call.arguments()).unwrap_or_else(|_| serde_json::json!({}));
         let Ok(connections) = self.mcp.lock() else {
             return Err(ToolStepError::Failed);
         };
@@ -3086,9 +3126,7 @@ read with job_output, in this turn or a later one — the job is stopped when th
             Err(err) => Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
-                detail: Some(bounded_detail(&format!(
-                    "[mcp:{server_name}] {err}"
-                ))),
+                detail: Some(bounded_detail(&format!("[mcp:{server_name}] {err}"))),
             }),
         }
     }
@@ -3138,9 +3176,7 @@ read with job_output, in this turn or a later one — the job is stopped when th
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
-                detail: Some(bounded_detail(
-                    "subagents are not available in this run",
-                )),
+                detail: Some(bounded_detail("subagents are not available in this run")),
             });
         };
         if self.subagent_spawns.fetch_add(1, Ordering::SeqCst) >= self.max_subagent_spawns {
@@ -3161,7 +3197,12 @@ read with job_output, in this turn or a later one — the job is stopped when th
                 crate::hooks::HOOK_TIMEOUT,
             );
         }
-        let outcome = runner.run(&args.prompt, &args.agent_type, args.write_scope.as_deref(), cancel);
+        let outcome = runner.run(
+            &args.prompt,
+            &args.agent_type,
+            args.write_scope.as_deref(),
+            cancel,
+        );
         if !self.hooks.subagent_stop.is_empty() {
             let (status, ok) = match &outcome {
                 Ok(report) => (report.status.clone(), true),
@@ -3231,9 +3272,9 @@ read with job_output, in this turn or a later one — the job is stopped when th
     fn write_group_key(call: &ValidatedToolCall, index: usize) -> Option<String> {
         match call.tool() {
             SHELL_EXEC_TOOL => Some(SHELL_EXEC_TOOL.to_owned()),
-            WORKSPACE_WRITE_TOOL => {
-                parse_write_args(call.arguments()).ok().map(|args| args.path)
-            }
+            WORKSPACE_WRITE_TOOL => parse_write_args(call.arguments())
+                .ok()
+                .map(|args| args.path),
             WORKSPACE_PATCH_TOOL => parse_patch_args(call.arguments()).ok().map(|a| a.path),
             TODO_WRITE_TOOL => Some(TODOS_PATH.to_owned()),
             _ => Some(format!("solo:{index}")),
@@ -3254,8 +3295,9 @@ pub fn tool_kind(tool: &str) -> ToolKind {
 fn tool_class(tool: &str) -> ToolClass {
     match tool {
         WORKSPACE_READ_TOOL | REPO_READ_TOOL | REPO_SEARCH_TOOL | REPO_GLOB_TOOL
-        | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL | PLAN_ENTER_TOOL | PLAN_EXIT_TOOL
-        | WEB_FETCH_TOOL => ToolClass::ReadOnly,
+        | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL | PLAN_ENTER_TOOL | PLAN_EXIT_TOOL | WEB_FETCH_TOOL => {
+            ToolClass::ReadOnly
+        }
         WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL | TODO_WRITE_TOOL => ToolClass::FileEdit,
         _ => ToolClass::Other,
     }
@@ -3285,7 +3327,10 @@ pub(crate) enum BoundedReadError {
 /// check and the read that follows it. Capping the read itself means at
 /// most `max_bytes + 1` bytes are ever buffered, regardless of how large the
 /// file actually is.
-pub(crate) fn read_file_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, BoundedReadError> {
+pub(crate) fn read_file_bounded(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Vec<u8>, BoundedReadError> {
     use std::io::Read;
     let file = fs::File::open(path).map_err(BoundedReadError::Io)?;
     let mut buf = Vec::new();
@@ -3327,9 +3372,7 @@ fn pdf_page_count(bytes: &[u8]) -> usize {
         let skip = rest.iter().take(4).count();
         let _ = skip;
         let trimmed = leading_spaces(rest);
-        if rest[trimmed..].starts_with(b"/Page")
-            && !rest[trimmed..].starts_with(b"/Pages")
-        {
+        if rest[trimmed..].starts_with(b"/Page") && !rest[trimmed..].starts_with(b"/Pages") {
             count += 1;
         }
         cursor = (at + 6).min(bytes.len());
@@ -3781,9 +3824,7 @@ fn sandboxed_status_line(
             "killed: sandbox CPU-time limit exceeded (SIGXCPU)".to_owned()
         }
         None if oom => "killed: sandbox memory limit exceeded (OOM)".to_owned(),
-        None if policy_violation => {
-            "killed: sandbox process-count limit exceeded".to_owned()
-        }
+        None if policy_violation => "killed: sandbox process-count limit exceeded".to_owned(),
         None => match signal {
             Some(signal) => format!("no exit code (signal {signal})"),
             None => "no exit code (signalled)".to_owned(),
@@ -3840,7 +3881,10 @@ fn run_git(root: &Path, args: &[&str]) -> Option<std::process::Output> {
 /// non-dismissed finding's own advisory text verbatim. Shared by both
 /// `PatchPolicyGate` boundaries — the only thing that differs between them
 /// is *which* files and content count as "about to become permanent."
-fn collect_content_findings(root: &Path, files: impl Iterator<Item = (String, Vec<u8>)>) -> Vec<String> {
+fn collect_content_findings(
+    root: &Path,
+    files: impl Iterator<Item = (String, Vec<u8>)>,
+) -> Vec<String> {
     let mut findings = Vec::new();
     // `scan_for_secrets_advisory`/`scan_patch_advisory` collapse a scanner
     // error (oversized content, unreadable path) to `None` — the same
@@ -3937,9 +3981,9 @@ fn find_git_verb_index(root: &Path, argv: &[String], verb: &str) -> Option<usize
     argv[1..]
         .iter()
         .position(|token| {
-            aliases
-                .iter()
-                .any(|(name, value)| *name == token && value.split_whitespace().any(|word| word == verb))
+            aliases.iter().any(|(name, value)| {
+                *name == token && value.split_whitespace().any(|word| word == verb)
+            })
         })
         .map(|index| index + 1)
 }
@@ -3951,9 +3995,10 @@ fn find_git_verb_index(root: &Path, argv: &[String], verb: &str) -> Option<usize
 /// read would never see, since it was never staged at all before the
 /// commit that includes it.
 fn commit_flags_include_all(flags: &[String]) -> bool {
-    flags
-        .iter()
-        .any(|token| token == "--all" || (token.starts_with('-') && !token.starts_with("--") && token.contains('a')))
+    flags.iter().any(|token| {
+        token == "--all"
+            || (token.starts_with('-') && !token.starts_with("--") && token.contains('a'))
+    })
 }
 
 /// Blocking pre-commit gate (Modbit `VER-009` `PatchPolicyGate`): when
@@ -3988,7 +4033,10 @@ fn scan_git_commit_gate(root: &Path, argv: &[String]) -> Option<String> {
     let staged = if include_all {
         run_git(root, &["diff", "HEAD", "--name-only", "--diff-filter=ACMR"])?
     } else {
-        run_git(root, &["diff", "--cached", "--name-only", "--diff-filter=ACMR"])?
+        run_git(
+            root,
+            &["diff", "--cached", "--name-only", "--diff-filter=ACMR"],
+        )?
     };
     let files = String::from_utf8_lossy(&staged.stdout)
         .lines()
@@ -4145,7 +4193,9 @@ fn scan_external_findings(root: &Path, boundary: &str) -> Vec<String> {
             let details: Vec<String> = outcome
                 .undismissed
                 .iter()
-                .map(|finding| format!("{} ({})", finding.rule_id(), finding.fingerprint().as_hex()))
+                .map(|finding| {
+                    format!("{} ({})", finding.rule_id(), finding.fingerprint().as_hex())
+                })
                 .collect();
             findings.push(format!(
                 "advisory: scanner {} reported: {} — verify before this {boundary}, or dismiss \
@@ -4212,13 +4262,15 @@ fn scan_for_secrets_advisory(root: &Path, path: &str, content: &[u8]) -> Option<
 /// before — without duplicating the scan pipeline itself.
 fn secrets_scan(root: &Path, path: &str, content: &[u8]) -> Result<Option<String>, String> {
     let repo_path = protocol::RepoPath::parse(path).map_err(|err| err.to_string())?;
-    let target =
-        security::ScanTarget::staged_diff(repo_path, content.to_vec()).map_err(|err| err.to_string())?;
+    let target = security::ScanTarget::staged_diff(repo_path, content.to_vec())
+        .map_err(|err| err.to_string())?;
     let mut request = security::ScanRequest::new();
     request.push_target(target).map_err(|err| err.to_string())?;
     let scanner = security::SecretScanner::new();
     let cancel = security::ScanCancellation::new();
-    let report = scanner.scan(&request, &cancel).map_err(|err| err.to_string())?;
+    let report = scanner
+        .scan(&request, &cancel)
+        .map_err(|err| err.to_string())?;
     let store = crate::findings_store::FindingsStore::load(root);
     let findings: Vec<&security::Finding> = report
         .findings()
@@ -4314,7 +4366,9 @@ fn patch_scan(root: &Path, path: &str, content: &[u8]) -> Result<Option<String>,
     request.push_target(target).map_err(|err| err.to_string())?;
     let scanner = security::PatchScanner::new();
     let cancel = security::PatchScanCancellation::new();
-    let report = scanner.scan(&request, &cancel).map_err(|err| err.to_string())?;
+    let report = scanner
+        .scan(&request, &cancel)
+        .map_err(|err| err.to_string())?;
     let store = crate::findings_store::FindingsStore::load(root);
     let findings: Vec<&security::PatchFinding> = report
         .findings()
@@ -4465,7 +4519,11 @@ fn suggest_closest_line(contents: &str, needle: &str) -> Option<(usize, String)>
 fn parse_patch_args(raw: &str) -> Result<PatchArgs, ToolStepError> {
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
     let object = value.as_object().ok_or(ToolStepError::Invalid)?;
-    let expected = if object.contains_key("replace_all") { 4 } else { 3 };
+    let expected = if object.contains_key("replace_all") {
+        4
+    } else {
+        3
+    };
     if object.len() != expected {
         return Err(ToolStepError::Invalid);
     }
@@ -4506,8 +4564,7 @@ fn parse_repo_glob_args(raw: &str) -> Result<RepoGlobArgs, ToolStepError> {
     const ALLOWED: &[&str] = &["pattern", "head_limit"];
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
     let object = value.as_object().ok_or(ToolStepError::Invalid)?;
-    if !object.keys().all(|key| ALLOWED.contains(&key.as_str()))
-        || !object.contains_key("pattern")
+    if !object.keys().all(|key| ALLOWED.contains(&key.as_str())) || !object.contains_key("pattern")
     {
         return Err(ToolStepError::Invalid);
     }
@@ -4689,7 +4746,8 @@ fn find_dependency_cycle(todos: &[TodoEntry]) -> Option<Vec<String>> {
             Some(Mark::Done) => return None,
             Some(Mark::InProgress) => {
                 let start = path.iter().position(|node| *node == id).unwrap_or(0);
-                let mut cycle: Vec<String> = path[start..].iter().map(|node| node.to_string()).collect();
+                let mut cycle: Vec<String> =
+                    path[start..].iter().map(|node| node.to_string()).collect();
                 cycle.push(id.to_owned());
                 return Some(cycle);
             }
@@ -4918,9 +4976,7 @@ impl ConnectedMcpServer {
     /// — `ExecTools::register_mcp_servers`, which keeps them for the whole
     /// turn behind [`McpConnection`]'s own `Drop`. This type's `Drop` then
     /// has nothing left to reap.
-    pub(crate) fn into_connection(
-        mut self,
-    ) -> (mcp_session_box::SessionBox, std::process::Child) {
+    pub(crate) fn into_connection(mut self) -> (mcp_session_box::SessionBox, std::process::Child) {
         let session = self.session.take().expect("session taken once");
         let child = self.child.take().expect("child taken once");
         (session, child)
@@ -4987,14 +5043,8 @@ fn parse_job_id_args(raw: &str, with_offset: bool) -> Result<JobIdArgs, ToolStep
     const ALLOWED: &[&str] = &["job_id", "offset"];
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
     let object = value.as_object().ok_or(ToolStepError::Invalid)?;
-    let allowed: &[&str] = if with_offset {
-        ALLOWED
-    } else {
-        &["job_id"]
-    };
-    if !object.keys().all(|key| allowed.contains(&key.as_str()))
-        || !object.contains_key("job_id")
-    {
+    let allowed: &[&str] = if with_offset { ALLOWED } else { &["job_id"] };
+    if !object.keys().all(|key| allowed.contains(&key.as_str())) || !object.contains_key("job_id") {
         return Err(ToolStepError::Invalid);
     }
     let job_id = object
@@ -5031,9 +5081,7 @@ fn parse_web_fetch_args(raw: &str) -> Result<(String, usize), ToolStepError> {
     const ALLOWED: &[&str] = &["url", "max_bytes"];
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
     let object = value.as_object().ok_or(ToolStepError::Invalid)?;
-    if !object.keys().all(|key| ALLOWED.contains(&key.as_str()))
-        || !object.contains_key("url")
-    {
+    if !object.keys().all(|key| ALLOWED.contains(&key.as_str())) || !object.contains_key("url") {
         return Err(ToolStepError::Invalid);
     }
     let url = object
@@ -5063,9 +5111,7 @@ fn parse_task_args(raw: &str) -> Result<TaskSpawnArgs, ToolStepError> {
     const ALLOWED: &[&str] = &["prompt", "type", "description", "write_scope"];
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
     let object = value.as_object().ok_or(ToolStepError::Invalid)?;
-    if !object.keys().all(|key| ALLOWED.contains(&key.as_str()))
-        || !object.contains_key("prompt")
-    {
+    if !object.keys().all(|key| ALLOWED.contains(&key.as_str())) || !object.contains_key("prompt") {
         return Err(ToolStepError::Invalid);
     }
     let prompt = object
@@ -5161,7 +5207,8 @@ pub fn glob_path_match(pattern: &str, path: &str) -> bool {
 fn parse_shell_args(raw: &str) -> Result<ShellArgs, ToolStepError> {
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
     let object = value.as_object().ok_or(ToolStepError::Invalid)?;
-    let expected = 1 + usize::from(object.contains_key("timeout_ms"))
+    let expected = 1
+        + usize::from(object.contains_key("timeout_ms"))
         + usize::from(object.contains_key("background"))
         + usize::from(object.contains_key("sandbox"));
     if object.len() != expected {
@@ -5179,7 +5226,9 @@ fn parse_shell_args(raw: &str) -> Result<ShellArgs, ToolStepError> {
         let token = token.as_str().ok_or(ToolStepError::Invalid)?;
         if token.is_empty()
             || token.len() > MAX_SHELL_ARG_BYTES
-            || token.bytes().any(|byte| byte == 0 || byte.is_ascii_control())
+            || token
+                .bytes()
+                .any(|byte| byte == 0 || byte.is_ascii_control())
         {
             return Err(ToolStepError::Invalid);
         }
@@ -5217,9 +5266,7 @@ fn parse_repo_read_args(raw: &str) -> Result<RepoReadArgs, ToolStepError> {
     const ALLOWED: &[&str] = &["path", "offset", "limit"];
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
     let object = value.as_object().ok_or(ToolStepError::Invalid)?;
-    if !object.keys().all(|key| ALLOWED.contains(&key.as_str()))
-        || !object.contains_key("path")
-    {
+    if !object.keys().all(|key| ALLOWED.contains(&key.as_str())) || !object.contains_key("path") {
         return Err(ToolStepError::Invalid);
     }
     let path = object
@@ -5260,8 +5307,7 @@ fn parse_repo_search_args(raw: &str) -> Result<RepoSearchArgs, ToolStepError> {
     const ALLOWED: &[&str] = &["pattern", "head_limit", "offset"];
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
     let object = value.as_object().ok_or(ToolStepError::Invalid)?;
-    if !object.keys().all(|key| ALLOWED.contains(&key.as_str()))
-        || !object.contains_key("pattern")
+    if !object.keys().all(|key| ALLOWED.contains(&key.as_str())) || !object.contains_key("pattern")
     {
         return Err(ToolStepError::Invalid);
     }
@@ -5330,10 +5376,9 @@ impl ExecTools {
         root: &Path,
         permissions: PermissionLattice,
     ) -> Result<Self, ToolSetupError> {
-        Ok(Self::Workspace(WorkspaceTools::open_read_only_with_permissions(
-            root,
-            permissions,
-        )?))
+        Ok(Self::Workspace(
+            WorkspaceTools::open_read_only_with_permissions(root, permissions)?,
+        ))
     }
 
     /// This surface's job-event sink, if any — for propagating to a
@@ -5479,7 +5524,11 @@ impl ExecTools {
 
     /// Adopt the parent's disk/network resource-ceiling counters (no-op on
     /// the no-op surface). See `WorkspaceTools::share_turn_budgets`.
-    pub(crate) fn share_turn_budgets(&mut self, bytes_written: Arc<AtomicU64>, fetch_bytes: Arc<AtomicU64>) {
+    pub(crate) fn share_turn_budgets(
+        &mut self,
+        bytes_written: Arc<AtomicU64>,
+        fetch_bytes: Arc<AtomicU64>,
+    ) {
         if let Self::Workspace(tools) = self {
             tools.share_turn_budgets(bytes_written, fetch_bytes);
         }
@@ -5626,7 +5675,6 @@ impl ToolDriver for WorkspaceTools {
         Ok(ValidatedToolCall::from_proposed(call))
     }
 
-
     fn execute(
         &mut self,
         call: &ValidatedToolCall,
@@ -5681,15 +5729,18 @@ fn batch_dispatch(
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for (_, indexes) in groups {
-            handles.push((indexes.clone(), scope.spawn(move || {
-                indexes
-                    .into_iter()
-                    .map(|index| {
-                        let outcome = tools.execute_call(&calls[index], cancel);
-                        (index, outcome)
-                    })
-                    .collect::<Vec<_>>()
-            })));
+            handles.push((
+                indexes.clone(),
+                scope.spawn(move || {
+                    indexes
+                        .into_iter()
+                        .map(|index| {
+                            let outcome = tools.execute_call(&calls[index], cancel);
+                            (index, outcome)
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            ));
         }
         for (indexes, handle) in handles {
             // A dead worker (unexpected panic) must never silently drop its
@@ -5924,7 +5975,11 @@ impl WorkspaceTools {
             ToolSurface::new(
                 PLAN_EXIT_TOOL,
                 "Leave plan mode: the plan is read from .rapidlm/plan.md on disk (must exist                  and be non-empty) and returned for approval. Arguments JSON: {}.",
-                arguments_schema("Exit plan mode with the written plan", serde_json::json!({}), &[]),
+                arguments_schema(
+                    "Exit plan mode with the written plan",
+                    serde_json::json!({}),
+                    &[],
+                ),
             ),
             ToolSurface::new(
                 JOB_STATUS_TOOL,
@@ -6052,7 +6107,6 @@ impl WorkspaceTools {
         }
         surface
     }
-
 }
 
 /// A [`ToolDriver`] with no tool gateway configured. Structural tool calls are
@@ -6080,9 +6134,7 @@ impl ToolDriver for NoopTools {
 mod tests {
     use super::*;
     use crate::host::{PreservedLiveContext, run_live_exec};
-    use crate::permissions::{
-        RuleEffect, ToolPattern, ToolRule,
-    };
+    use crate::permissions::{RuleEffect, ToolPattern, ToolRule};
     use agent_runtime::{
         AgentExecutionRequest, AgentRole, AgentSpec, AgentTerminalStatus, ContextRetryPolicy,
         ModelStepError, ModelStepInput, ModelStepOutput,
@@ -6090,7 +6142,7 @@ mod tests {
     use protocol::{AgentId, SessionId, WorkspaceViewId};
     use std::collections::VecDeque;
     use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex};
 
     /// Temp workspace root removed on drop.
     struct TempRoot(PathBuf);
@@ -6186,7 +6238,8 @@ use std::sync::{Arc, Mutex};
     }
 
     fn preserved() -> PreservedLiveContext {
-        PreservedLiveContext::new("create a file", Vec::new(), "", "", 8192, 256).expect("preserved")
+        PreservedLiveContext::new("create a file", Vec::new(), "", "", 8192, 256)
+            .expect("preserved")
     }
 
     fn make_call(id: &str, tool: &str, arguments: &str) -> ProposedToolCall {
@@ -6204,17 +6257,17 @@ use std::sync::{Arc, Mutex};
     }
 
     fn validate_one(tools: &mut ExecTools, call: &ProposedToolCall) -> ValidatedToolCall {
-        tools.validate(call, &CancellationToken::new()).expect("validate")
+        tools
+            .validate(call, &CancellationToken::new())
+            .expect("validate")
     }
 
     fn run_batch(
         tools: &mut ExecTools,
         calls: &[ProposedToolCall],
     ) -> Vec<Result<ToolStepResult, ToolStepError>> {
-        let validated: Vec<ValidatedToolCall> = calls
-            .iter()
-            .map(|call| validate_one(tools, call))
-            .collect();
+        let validated: Vec<ValidatedToolCall> =
+            calls.iter().map(|call| validate_one(tools, call)).collect();
         tools.execute_batch(&validated, &CancellationToken::new())
     }
 
@@ -6222,7 +6275,13 @@ use std::sync::{Arc, Mutex};
     fn narrow_write_ceiling_only_ever_lowers_never_raises() {
         let root = TempRoot::new("narrow-ceiling");
         let mut tools = permissive_workspace(&root.0);
-        assert_eq!(tools.turn_ceilings(), (MAX_TOTAL_WRITE_BYTES_PER_TURN, MAX_TOTAL_FETCH_BYTES_PER_TURN));
+        assert_eq!(
+            tools.turn_ceilings(),
+            (
+                MAX_TOTAL_WRITE_BYTES_PER_TURN,
+                MAX_TOTAL_FETCH_BYTES_PER_TURN
+            )
+        );
 
         tools.narrow_write_ceiling(1024);
         tools.narrow_fetch_ceiling(2048);
@@ -6243,15 +6302,23 @@ use std::sync::{Arc, Mutex};
         let call = ProposedToolCall::new(
             "c1",
             WORKSPACE_WRITE_TOOL,
-            &serde_json::to_string(&serde_json::json!({"path": "a.txt", "content": "x".repeat(2000)}))
-                .expect("encode call"),
+            &serde_json::to_string(
+                &serde_json::json!({"path": "a.txt", "content": "x".repeat(2000)}),
+            )
+            .expect("encode call"),
         )
         .expect("call");
         let validated = tools.validate(&call, &cancel).expect("v");
         match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
-                assert!(detail.unwrap().contains("disk-write budget exhausted: 1024 bytes"));
+                assert!(
+                    detail
+                        .unwrap()
+                        .contains("disk-write budget exhausted: 1024 bytes")
+                );
             }
             other => panic!("expected the narrowed ceiling to refuse the write, got {other:?}"),
         }
@@ -6278,7 +6345,13 @@ use std::sync::{Arc, Mutex};
             calls: Arc<StdMutex<Vec<()>>>,
         }
         impl crate::exec_tools::SubagentRunner for FakeRunner {
-            fn run(&self, _prompt: &str, _agent_type: &str, _write_scope: Option<&str>, _cancel: &CancellationToken) -> Result<SubagentReport, String> {
+            fn run(
+                &self,
+                _prompt: &str,
+                _agent_type: &str,
+                _write_scope: Option<&str>,
+                _cancel: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
                 self.calls.lock().expect("lock").push(());
                 Ok(SubagentReport {
                     summary: "done".to_owned(),
@@ -6296,26 +6369,48 @@ use std::sync::{Arc, Mutex};
             }
         }
         let calls = Arc::new(StdMutex::new(Vec::new()));
-        tools.subagents = Some(Arc::new(FakeRunner { calls: calls.clone() }) as Arc<dyn SubagentRunner>);
+        tools.subagents = Some(Arc::new(FakeRunner {
+            calls: calls.clone(),
+        }) as Arc<dyn SubagentRunner>);
         let cancel = CancellationToken::new();
         for i in 0..2 {
-            let call = make_call(&format!("c{i}"), TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
+            let call = make_call(
+                &format!("c{i}"),
+                TASK_SPAWN_TOOL,
+                r#"{"prompt":"x","type":"explore"}"#,
+            );
             let validated = tools.validate(&call, &cancel).expect("v");
             match tools.execute(&validated, &cancel).expect("execute") {
                 ToolStepResult::Succeeded { .. } => {}
-                other => panic!("expected spawn {i} within the narrowed budget to succeed, got {other:?}"),
+                other => panic!(
+                    "expected spawn {i} within the narrowed budget to succeed, got {other:?}"
+                ),
             }
         }
-        let over = make_call("c-over", TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
+        let over = make_call(
+            "c-over",
+            TASK_SPAWN_TOOL,
+            r#"{"prompt":"x","type":"explore"}"#,
+        );
         let validated = tools.validate(&over, &cancel).expect("v");
         match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
-                assert!(detail.unwrap().contains("task_spawn budget exhausted: 2 subagents"));
+                assert!(
+                    detail
+                        .unwrap()
+                        .contains("task_spawn budget exhausted: 2 subagents")
+                );
             }
             other => panic!("expected the narrowed spawn ceiling to refuse, got {other:?}"),
         }
-        assert_eq!(calls.lock().expect("lock").len(), 2, "the runner never even ran past the cap");
+        assert_eq!(
+            calls.lock().expect("lock").len(),
+            2,
+            "the runner never even ran past the cap"
+        );
     }
 
     #[test]
@@ -6354,7 +6449,9 @@ use std::sync::{Arc, Mutex};
         .expect("call");
         let validated = tools.validate(&over, &cancel).expect("v");
         match tools.execute(&validated, &cancel).expect("handled") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.unwrap().contains("disk-write budget exhausted"));
             }
@@ -6404,9 +6501,14 @@ use std::sync::{Arc, Mutex};
         // its own writes straight through — confirming the gap was real.
         let mut unshared_child = permissive_workspace(&root.0);
         let validated = unshared_child.validate(&call, &cancel).expect("v");
-        match unshared_child.execute(&validated, &cancel).expect("execute") {
+        match unshared_child
+            .execute(&validated, &cancel)
+            .expect("execute")
+        {
             ToolStepResult::Succeeded { .. } => {}
-            other => panic!("sanity check: an unconfigured child should write through, got {other:?}"),
+            other => {
+                panic!("sanity check: an unconfigured child should write through, got {other:?}")
+            }
         }
 
         // With the parent's shadow-diagnostics config propagated (what
@@ -6424,7 +6526,9 @@ use std::sync::{Arc, Mutex};
         .expect("call");
         let validated = child.validate(&call2, &cancel).expect("v");
         match child.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.unwrap().contains("shadow diagnostics failed"));
             }
@@ -6459,7 +6563,11 @@ use std::sync::{Arc, Mutex};
         tools.set_redaction(registry.snapshot());
 
         let cancel = CancellationToken::new();
-        let call = make_call("c1", WORKSPACE_WRITE_TOOL, r#"{"path":"a.txt","content":"hi"}"#);
+        let call = make_call(
+            "c1",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"a.txt","content":"hi"}"#,
+        );
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
             ToolStepResult::Succeeded { summary, .. } => {
@@ -6493,7 +6601,10 @@ use std::sync::{Arc, Mutex};
         // already impossible.
         let mut unshared_child = permissive_workspace(&root.0);
         let validated = unshared_child.validate(&call, &cancel).expect("v");
-        match unshared_child.execute(&validated, &cancel).expect("execute") {
+        match unshared_child
+            .execute(&validated, &cancel)
+            .expect("execute")
+        {
             ToolStepResult::Succeeded { .. } => {}
             other => panic!("sanity check: an unhooked child should succeed, got {other:?}"),
         }
@@ -6541,13 +6652,17 @@ use std::sync::{Arc, Mutex};
         let over = ProposedToolCall::new(
             "c1",
             WORKSPACE_WRITE_TOOL,
-            &serde_json::to_string(&serde_json::json!({"path": "b.txt", "content": "x".repeat(1024)}))
-                .expect("encode call"),
+            &serde_json::to_string(
+                &serde_json::json!({"path": "b.txt", "content": "x".repeat(1024)}),
+            )
+            .expect("encode call"),
         )
         .expect("call");
         let validated = child.validate(&over, &cancel).expect("v");
         match child.execute(&validated, &cancel).expect("handled") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.unwrap().contains("disk-write budget exhausted"));
             }
@@ -6562,14 +6677,21 @@ use std::sync::{Arc, Mutex};
         let clean = ProposedToolCall::new(
             "c2",
             WORKSPACE_WRITE_TOOL,
-            &serde_json::to_string(&serde_json::json!({"path": "c.txt", "content": "x".repeat(1024)}))
-                .expect("encode call"),
+            &serde_json::to_string(
+                &serde_json::json!({"path": "c.txt", "content": "x".repeat(1024)}),
+            )
+            .expect("encode call"),
         )
         .expect("call");
         let validated = unshared_child.validate(&clean, &cancel).expect("v");
-        match unshared_child.execute(&validated, &cancel).expect("execute") {
+        match unshared_child
+            .execute(&validated, &cancel)
+            .expect("execute")
+        {
             ToolStepResult::Succeeded { .. } => {}
-            other => panic!("sanity check: a genuinely fresh child should not be budget-exhausted, got {other:?}"),
+            other => panic!(
+                "sanity check: a genuinely fresh child should not be budget-exhausted, got {other:?}"
+            ),
         }
     }
 
@@ -6591,7 +6713,9 @@ use std::sync::{Arc, Mutex};
         );
         let validated = tools.validate(&call, &cancel).expect("v");
         match tools.execute(&validated, &cancel).expect("handled") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.unwrap().contains("disk-write budget exhausted"));
             }
@@ -6782,7 +6906,10 @@ use std::sync::{Arc, Mutex};
                     summary.contains("advisory: possible patch-policy issue"),
                     "{summary}"
                 );
-                assert!(summary.contains("patch.ci_permissions_broaden"), "{summary}");
+                assert!(
+                    summary.contains("patch.ci_permissions_broaden"),
+                    "{summary}"
+                );
             }
             other => panic!("expected success (advisory only), got {other:?}"),
         }
@@ -6825,7 +6952,9 @@ use std::sync::{Arc, Mutex};
         .expect("call");
         let validated = tools.validate(&call, &cancel).expect("validate");
         let fingerprint = match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 let detail = detail.expect("detail");
                 assert!(detail.contains("write blocked"), "{detail}");
@@ -6920,7 +7049,9 @@ use std::sync::{Arc, Mutex};
         .expect("call");
         let validated = tools.validate(&patch, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 let detail = detail.expect("detail");
                 assert!(detail.contains("mandatory"), "{detail}");
@@ -6953,12 +7084,8 @@ use std::sync::{Arc, Mutex};
         let written = fs::read(root.0.join("src/main.rs")).expect("file exists");
         assert_eq!(written, b"fn main() { println!(\"hi\"); }");
 
-        let read = ProposedToolCall::new(
-            "c2",
-            WORKSPACE_READ_TOOL,
-            r#"{"path":"src/main.rs"}"#,
-        )
-        .expect("call");
+        let read = ProposedToolCall::new("c2", WORKSPACE_READ_TOOL, r#"{"path":"src/main.rs"}"#)
+            .expect("call");
         let validated = tools.validate(&read, &cancel).expect("validate");
         let result = tools.execute(&validated, &cancel).expect("execute");
         match result {
@@ -6978,12 +7105,24 @@ use std::sync::{Arc, Mutex};
                 .env("GIT_TERMINAL_PROMPT", "0")
                 .output()
                 .expect("git");
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         run(&["init", "-b", "main"]);
         fs::write(dir.join("seed.txt"), b"seed\n").expect("seed");
         run(&["add", "seed.txt"]);
-        run(&["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-m", "seed"]);
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t.invalid",
+            "commit",
+            "-m",
+            "seed",
+        ]);
     }
 
     #[test]
@@ -7008,8 +7147,11 @@ use std::sync::{Arc, Mutex};
         let mut tools = permissive_workspace(&root.0);
         let cancel = CancellationToken::new();
         let token = format!("ghp_{}", "f".repeat(36));
-        fs::write(root.0.join("config.rs"), format!("const TOKEN: &str = \"{token}\";\n"))
-            .expect("write secret file");
+        fs::write(
+            root.0.join("config.rs"),
+            format!("const TOKEN: &str = \"{token}\";\n"),
+        )
+        .expect("write secret file");
         let stage = std::process::Command::new("git")
             .arg("-C")
             .arg(&root.0)
@@ -7018,10 +7160,16 @@ use std::sync::{Arc, Mutex};
             .expect("git add");
         assert!(stage.status.success());
 
-        let commit_call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","add config"]}"#);
+        let commit_call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["git","commit","-m","add config"]}"#,
+        );
         let validated = tools.validate(&commit_call, &cancel).expect("validate");
         let fingerprint = match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 let detail = detail.expect("detail");
                 assert!(detail.contains("commit blocked"), "{detail}");
@@ -7039,14 +7187,22 @@ use std::sync::{Arc, Mutex};
             .args(["log", "--oneline"])
             .output()
             .expect("git log");
-        assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 1, "only the seed commit");
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).lines().count(),
+            1,
+            "only the seed commit"
+        );
 
         // Dismissing the fingerprint unblocks the commit.
         let canonical_root = tools.root().to_path_buf();
         let mut store = crate::findings_store::FindingsStore::load(&canonical_root);
         store.dismiss(&fingerprint, "test fixture, not a real secret");
         store.save(&canonical_root).expect("save dismissal");
-        let retry = make_call("c2", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","add config"]}"#);
+        let retry = make_call(
+            "c2",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["git","commit","-m","add config"]}"#,
+        );
         let validated = tools.validate(&retry, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
             ToolStepResult::Succeeded { .. } => {}
@@ -7058,7 +7214,11 @@ use std::sync::{Arc, Mutex};
             .args(["log", "--oneline"])
             .output()
             .expect("git log");
-        assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 2, "seed + the real commit");
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).lines().count(),
+            2,
+            "seed + the real commit"
+        );
     }
 
     /// Writes `.rapidlm/scanners.json` with one real (sandboxed, not
@@ -7118,16 +7278,24 @@ use std::sync::{Arc, Mutex};
             .expect("git add");
         assert!(stage.status.success());
 
-        let commit_call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","add app"]}"#);
+        let commit_call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["git","commit","-m","add app"]}"#,
+        );
         let validated = tools.validate(&commit_call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 let detail = detail.expect("detail");
                 assert!(detail.contains("commit blocked"), "{detail}");
                 assert!(detail.contains("fakescan"), "{detail}");
             }
-            other => panic!("expected the commit to be blocked by the external scanner, got {other:?}"),
+            other => {
+                panic!("expected the commit to be blocked by the external scanner, got {other:?}")
+            }
         }
         let log = std::process::Command::new("git")
             .arg("-C")
@@ -7135,7 +7303,11 @@ use std::sync::{Arc, Mutex};
             .args(["log", "--oneline"])
             .output()
             .expect("git log");
-        assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 1, "only the seed commit");
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).lines().count(),
+            1,
+            "only the seed commit"
+        );
     }
 
     #[test]
@@ -7166,11 +7338,17 @@ use std::sync::{Arc, Mutex};
             .expect("git add");
         assert!(stage.status.success());
 
-        let commit_call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","add app"]}"#);
+        let commit_call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["git","commit","-m","add app"]}"#,
+        );
         let validated = tools.validate(&commit_call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
             ToolStepResult::Succeeded { .. } => {}
-            other => panic!("expected the commit to succeed with a clean external scan, got {other:?}"),
+            other => {
+                panic!("expected the commit to succeed with a clean external scan, got {other:?}")
+            }
         }
         let log = std::process::Command::new("git")
             .arg("-C")
@@ -7178,7 +7356,11 @@ use std::sync::{Arc, Mutex};
             .args(["log", "--oneline"])
             .output()
             .expect("git log");
-        assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 2, "seed + the real commit");
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).lines().count(),
+            2,
+            "seed + the real commit"
+        );
     }
 
     #[test]
@@ -7203,7 +7385,11 @@ use std::sync::{Arc, Mutex};
         configure(&["config", "user.name", "t"]);
         configure(&["config", "user.email", "t@t.invalid"]);
         fs::create_dir_all(root.0.join(".rapidlm")).expect("dir");
-        fs::write(root.0.join(crate::external_scan::SCANNERS_CONFIG_PATH), b"not json").expect("write");
+        fs::write(
+            root.0.join(crate::external_scan::SCANNERS_CONFIG_PATH),
+            b"not json",
+        )
+        .expect("write");
 
         let mut tools = permissive_workspace(&root.0);
         let cancel = CancellationToken::new();
@@ -7216,16 +7402,24 @@ use std::sync::{Arc, Mutex};
             .expect("git add");
         assert!(stage.status.success());
 
-        let commit_call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","add app"]}"#);
+        let commit_call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["git","commit","-m","add app"]}"#,
+        );
         let validated = tools.validate(&commit_call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 let detail = detail.expect("detail");
                 assert!(detail.contains("commit blocked"), "{detail}");
                 assert!(detail.contains("malformed"), "{detail}");
             }
-            other => panic!("expected the commit to be blocked by the malformed scanners config, got {other:?}"),
+            other => panic!(
+                "expected the commit to be blocked by the malformed scanners config, got {other:?}"
+            ),
         }
     }
 
@@ -7281,10 +7475,16 @@ use std::sync::{Arc, Mutex};
             .expect("git add");
         assert!(stage.status.success());
 
-        let commit_call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","add app"]}"#);
+        let commit_call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["git","commit","-m","add app"]}"#,
+        );
         let validated = tools.validate(&commit_call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 let detail = detail.expect("detail");
                 assert!(detail.contains("commit blocked"), "{detail}");
@@ -7299,7 +7499,11 @@ use std::sync::{Arc, Mutex};
             .args(["log", "--oneline"])
             .output()
             .expect("git log");
-        assert_eq!(String::from_utf8_lossy(&log.stdout).lines().count(), 1, "only the seed commit");
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).lines().count(),
+            1,
+            "only the seed commit"
+        );
     }
 
     #[test]
@@ -7329,8 +7533,11 @@ use std::sync::{Arc, Mutex};
         let mut tools = permissive_workspace(&root.0);
         let cancel = CancellationToken::new();
         let token = format!("ghp_{}", "f".repeat(36));
-        fs::write(root.0.join("config.rs"), format!("const TOKEN: &str = \"{token}\";\n"))
-            .expect("write secret file");
+        fs::write(
+            root.0.join("config.rs"),
+            format!("const TOKEN: &str = \"{token}\";\n"),
+        )
+        .expect("write secret file");
         let stage = std::process::Command::new("git")
             .arg("-C")
             .arg(&root.0)
@@ -7346,7 +7553,9 @@ use std::sync::{Arc, Mutex};
         );
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 let detail = detail.expect("detail");
                 assert!(detail.contains("commit blocked"), "{detail}");
@@ -7390,8 +7599,11 @@ use std::sync::{Arc, Mutex};
         configure(&["config", "user.name", "t"]);
         configure(&["config", "user.email", "t@t.invalid"]);
         let token = format!("ghp_{}", "e".repeat(36));
-        fs::write(root.0.join("config.rs"), format!("const TOKEN: &str = \"{token}\";\n"))
-            .expect("write secret file");
+        fs::write(
+            root.0.join("config.rs"),
+            format!("const TOKEN: &str = \"{token}\";\n"),
+        )
+        .expect("write secret file");
         let stage = std::process::Command::new("git")
             .arg("-C")
             .arg(&root.0)
@@ -7428,7 +7640,9 @@ use std::sync::{Arc, Mutex};
         );
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.expect("detail").contains("commit blocked"));
             }
@@ -7458,7 +7672,9 @@ use std::sync::{Arc, Mutex};
         let call = make_call("c1", SHELL_EXEC_TOOL, &args.to_string());
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.expect("detail").contains("commit blocked"));
             }
@@ -7479,10 +7695,16 @@ use std::sync::{Arc, Mutex};
         assert!(alias.status.success());
         let mut tools = permissive_workspace(&root.0);
         let cancel = CancellationToken::new();
-        let call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","c","-m","add config"]}"#);
+        let call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["git","c","-m","add config"]}"#,
+        );
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.expect("detail").contains("commit blocked"));
             }
@@ -7513,21 +7735,34 @@ use std::sync::{Arc, Mutex};
         let token = format!("ghp_{}", "g".repeat(36));
         // `seed.txt` is already tracked (committed by `git_init`); modify
         // it on disk without ever staging it.
-        fs::write(root.0.join("seed.txt"), format!("const TOKEN: &str = \"{token}\";\n"))
-            .expect("modify tracked file");
+        fs::write(
+            root.0.join("seed.txt"),
+            format!("const TOKEN: &str = \"{token}\";\n"),
+        )
+        .expect("modify tracked file");
         let mut tools = permissive_workspace(&root.0);
         let cancel = CancellationToken::new();
-        let call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-am","update seed"]}"#);
+        let call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["git","commit","-am","update seed"]}"#,
+        );
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 let detail = detail.expect("detail");
                 assert!(detail.contains("commit blocked"), "{detail}");
             }
             other => panic!("expected `-am` to scan the unstaged modification, got {other:?}"),
         }
-        assert_commit_count(&root.0, 1, "an -am commit sweeping in a secret must still be blocked");
+        assert_commit_count(
+            &root.0,
+            1,
+            "an -am commit sweeping in a secret must still be blocked",
+        );
     }
 
     #[test]
@@ -7557,10 +7792,16 @@ use std::sync::{Arc, Mutex};
         assert!(stage.status.success());
         let mut tools = permissive_workspace(&root.0);
         let cancel = CancellationToken::new();
-        let call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","add huge file"]}"#);
+        let call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["git","commit","-m","add huge file"]}"#,
+        );
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 let detail = detail.expect("detail");
                 assert!(detail.contains("commit blocked"), "{detail}");
@@ -7568,11 +7809,16 @@ use std::sync::{Arc, Mutex};
             }
             other => panic!("expected an unscannable file to block the commit, got {other:?}"),
         }
-        assert_commit_count(&root.0, 1, "content too large to scan must never be committed unscanned");
+        assert_commit_count(
+            &root.0,
+            1,
+            "content too large to scan must never be committed unscanned",
+        );
     }
 
     #[test]
-    fn collect_content_findings_blocks_a_file_the_scanners_cannot_parse_rather_than_passing_it_silently() {
+    fn collect_content_findings_blocks_a_file_the_scanners_cannot_parse_rather_than_passing_it_silently()
+     {
         // A path containing `..` fails `protocol::RepoPath::parse` before
         // either scanner ever runs — well under the size cap, so this is a
         // distinct failure mode from `commit_gate_blocks_rather_than_
@@ -7591,8 +7837,18 @@ use std::sync::{Arc, Mutex};
         )];
         let findings = collect_content_findings(&root.0, files.into_iter());
         assert_eq!(findings.len(), 2, "{findings:?}");
-        assert!(findings.iter().any(|f| f.contains("secret scan could not run")), "{findings:?}");
-        assert!(findings.iter().any(|f| f.contains("patch scan could not run")), "{findings:?}");
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.contains("secret scan could not run")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.contains("patch scan could not run")),
+            "{findings:?}"
+        );
     }
 
     #[test]
@@ -7622,7 +7878,11 @@ use std::sync::{Arc, Mutex};
             .expect("git add");
         assert!(stage.status.success());
 
-        let call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","add plain"]}"#);
+        let call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["git","commit","-m","add plain"]}"#,
+        );
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
             ToolStepResult::Succeeded { summary, .. } => {
@@ -7643,7 +7903,11 @@ use std::sync::{Arc, Mutex};
                 .args(args)
                 .output()
                 .expect("git");
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         git(&["config", "user.name", "t"]);
         git(&["config", "user.email", "t@t.invalid"]);
@@ -7651,10 +7915,17 @@ use std::sync::{Arc, Mutex};
         let mut tools = permissive_workspace(&root.0);
         let cancel = CancellationToken::new();
         let token = format!("ghp_{}", "h".repeat(36));
-        fs::write(root.0.join("config.rs"), format!("const TOKEN: &str = \"{token}\";\n"))
-            .expect("write secret file");
+        fs::write(
+            root.0.join("config.rs"),
+            format!("const TOKEN: &str = \"{token}\";\n"),
+        )
+        .expect("write secret file");
         git(&["add", "config.rs"]);
-        let blocked_call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","x"]}"#);
+        let blocked_call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["git","commit","-m","x"]}"#,
+        );
         let validated = tools.validate(&blocked_call, &cancel).expect("validate");
         let fingerprint = match tools.execute(&validated, &cancel).expect("execute") {
             ToolStepResult::Failed { detail, .. } => {
@@ -7670,14 +7941,19 @@ use std::sync::{Arc, Mutex};
         let mut store = crate::findings_store::FindingsStore::load(&canonical_root);
         store.dismiss(&fingerprint, "test fixture, not a real secret");
         store.save(&canonical_root).expect("save dismissal");
-        let clean_call = make_call("c2", SHELL_EXEC_TOOL, r#"{"argv":["git","commit","-m","x"]}"#);
+        let clean_call = make_call(
+            "c2",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["git","commit","-m","x"]}"#,
+        );
         let validated = tools.validate(&clean_call, &cancel).expect("validate");
         assert!(matches!(
             tools.execute(&validated, &cancel).expect("execute"),
             ToolStepResult::Succeeded { .. }
         ));
 
-        let log = fs::read_to_string(canonical_root.join(".rapidlm/gate_log.jsonl")).expect("gate log");
+        let log =
+            fs::read_to_string(canonical_root.join(".rapidlm/gate_log.jsonl")).expect("gate log");
         let lines: Vec<serde_json::Value> = log
             .lines()
             .map(|line| serde_json::from_str(line).expect("json line"))
@@ -7685,12 +7961,20 @@ use std::sync::{Arc, Mutex};
         assert_eq!(lines.len(), 2, "{log}");
         assert_eq!(lines[0]["boundary"], "commit");
         assert_eq!(lines[0]["blocked"], true);
-        assert!(!lines[0]["findings"].as_array().expect("findings array").is_empty());
+        assert!(
+            !lines[0]["findings"]
+                .as_array()
+                .expect("findings array")
+                .is_empty()
+        );
         assert!(lines[0]["time"].as_str().is_some_and(|t| !t.is_empty()));
         assert_eq!(lines[1]["boundary"], "commit");
         assert_eq!(lines[1]["blocked"], false);
         assert!(
-            lines[1]["findings"].as_array().expect("findings array").is_empty(),
+            lines[1]["findings"]
+                .as_array()
+                .expect("findings array")
+                .is_empty(),
             "the dismissed finding must not resurface in a clean pass's own record"
         );
     }
@@ -7706,24 +7990,37 @@ use std::sync::{Arc, Mutex};
                 .args(args)
                 .output()
                 .expect("git");
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         git(&["config", "user.name", "t"]);
         git(&["config", "user.email", "t@t.invalid"]);
         git(&["checkout", "-b", "feature"]);
         let token = format!("ghp_{}", "g".repeat(36));
-        fs::write(root.0.join("config.rs"), format!("const TOKEN: &str = \"{token}\";\n"))
-            .expect("write secret file");
+        fs::write(
+            root.0.join("config.rs"),
+            format!("const TOKEN: &str = \"{token}\";\n"),
+        )
+        .expect("write secret file");
         git(&["add", "config.rs"]);
         git(&["commit", "-m", "add config on feature"]);
         git(&["checkout", "main"]);
 
         let mut tools = permissive_workspace(&root.0);
         let cancel = CancellationToken::new();
-        let merge_call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","merge","feature"]}"#);
+        let merge_call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["git","merge","feature"]}"#,
+        );
         let validated = tools.validate(&merge_call, &cancel).expect("validate");
         let fingerprint = match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 let detail = detail.expect("detail");
                 assert!(detail.contains("merge blocked"), "{detail}");
@@ -7741,13 +8038,20 @@ use std::sync::{Arc, Mutex};
         let mut store = crate::findings_store::FindingsStore::load(&canonical_root);
         store.dismiss(&fingerprint, "test fixture, not a real secret");
         store.save(&canonical_root).expect("save dismissal");
-        let retry = make_call("c2", SHELL_EXEC_TOOL, r#"{"argv":["git","merge","feature"]}"#);
+        let retry = make_call(
+            "c2",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["git","merge","feature"]}"#,
+        );
         let validated = tools.validate(&retry, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
             ToolStepResult::Succeeded { .. } => {}
             other => panic!("expected the merge to succeed after dismissal, got {other:?}"),
         }
-        assert!(root.0.join("config.rs").exists(), "the merge should have actually run this time");
+        assert!(
+            root.0.join("config.rs").exists(),
+            "the merge should have actually run this time"
+        );
     }
 
     #[test]
@@ -7767,7 +8071,11 @@ use std::sync::{Arc, Mutex};
                 .args(args)
                 .output()
                 .expect("git");
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         git(&["config", "user.name", "t"]);
         git(&["config", "user.email", "t@t.invalid"]);
@@ -7780,18 +8088,29 @@ use std::sync::{Arc, Mutex};
 
         let mut tools = permissive_workspace(&root.0);
         let cancel = CancellationToken::new();
-        let merge_call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["git","merge","feature"]}"#);
+        let merge_call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["git","merge","feature"]}"#,
+        );
         let validated = tools.validate(&merge_call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 let detail = detail.expect("detail");
                 assert!(detail.contains("merge blocked"), "{detail}");
                 assert!(detail.contains("fakescan"), "{detail}");
             }
-            other => panic!("expected the merge to be blocked by the external scanner, got {other:?}"),
+            other => {
+                panic!("expected the merge to be blocked by the external scanner, got {other:?}")
+            }
         }
-        assert!(!root.0.join("app.rs").exists(), "the merge must never actually have happened");
+        assert!(
+            !root.0.join("app.rs").exists(),
+            "the merge must never actually have happened"
+        );
     }
 
     #[test]
@@ -7815,7 +8134,9 @@ use std::sync::{Arc, Mutex};
         let validated = tools.validate(&call, &cancel).expect("validate");
         let result = tools.execute(&validated, &cancel).expect("execute");
         match result {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.unwrap().contains("shadow diagnostics failed"));
             }
@@ -7859,7 +8180,10 @@ use std::sync::{Arc, Mutex};
             }
             other => panic!("expected success, got {other:?}"),
         }
-        assert_eq!(fs::read(root.0.join("good.txt")).expect("written"), content.as_bytes());
+        assert_eq!(
+            fs::read(root.0.join("good.txt")).expect("written"),
+            content.as_bytes()
+        );
     }
 
     #[test]
@@ -7885,7 +8209,10 @@ use std::sync::{Arc, Mutex};
         let validated = tools.validate(&call, &cancel).expect("validate");
         let result = tools.execute(&validated, &cancel).expect("execute");
         assert!(matches!(result, ToolStepResult::Succeeded { .. }));
-        assert_eq!(fs::read(root.0.join("unrelated.txt")).expect("written"), b"fine");
+        assert_eq!(
+            fs::read(root.0.join("unrelated.txt")).expect("written"),
+            b"fine"
+        );
     }
 
     #[test]
@@ -7910,7 +8237,9 @@ use std::sync::{Arc, Mutex};
         );
         let validated = tools.validate(&write, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.expect("detail").contains(".git are refused"));
             }
@@ -7929,7 +8258,9 @@ use std::sync::{Arc, Mutex};
         );
         let validated = tools.validate(&patch, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.expect("detail").contains(".git are refused"));
             }
@@ -8003,7 +8334,9 @@ use std::sync::{Arc, Mutex};
         let validated = tools.validate(&write, &cancel).expect("validate");
         match tools.execute(&validated, &cancel) {
             Ok(ToolStepResult::Failed { .. }) | Ok(ToolStepResult::Denied { .. }) | Err(_) => {}
-            other => panic!("expected the write through the symlinked directory to be refused, got {other:?}"),
+            other => panic!(
+                "expected the write through the symlinked directory to be refused, got {other:?}"
+            ),
         }
         assert!(
             !outside.0.join("subdir").exists(),
@@ -8034,12 +8367,15 @@ use std::sync::{Arc, Mutex};
             )
             .as_str(),
         ] {
-            let call =
-                ProposedToolCall::new("c1", WORKSPACE_WRITE_TOOL, arguments).expect("call");
-            let validated = tools.validate(&call, &cancel).expect("known tool validates");
+            let call = ProposedToolCall::new("c1", WORKSPACE_WRITE_TOOL, arguments).expect("call");
+            let validated = tools
+                .validate(&call, &cancel)
+                .expect("known tool validates");
             let outcome = tools.execute(&validated, &cancel).expect("handled");
             match outcome {
-                ToolStepResult::Failed { handled, detail, .. } => {
+                ToolStepResult::Failed {
+                    handled, detail, ..
+                } => {
                     assert!(handled, "{arguments}");
                     assert!(!detail.unwrap().is_empty(), "{arguments}");
                 }
@@ -8061,7 +8397,9 @@ use std::sync::{Arc, Mutex};
         let validated = tools.validate(&call, &cancel).expect("validate");
         let result = tools.execute(&validated, &cancel).expect("handled");
         match result {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 let detail = detail.unwrap();
                 assert!(detail.contains("unknown tool `mcp.call`"));
@@ -8089,7 +8427,9 @@ use std::sync::{Arc, Mutex};
         let validated = tools.validate(&call, &cancel).expect("validate");
         let result = tools.execute(&validated, &cancel).expect("handled");
         match result {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.unwrap().contains("not found"));
             }
@@ -8113,9 +8453,14 @@ use std::sync::{Arc, Mutex};
     #[test]
     fn repo_read_returns_the_requested_offset_limit_window() {
         let root = TempRoot::new("repo-read");
-        fs::write(root.0.join("lines.txt"), (1..=30).map(|n| n.to_string())
-            .collect::<Vec<_>>().join("\n"))
-            .expect("seed");
+        fs::write(
+            root.0.join("lines.txt"),
+            (1..=30)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("seed");
         let mut tools = permissive_workspace(&root.0);
         let cancel = CancellationToken::new();
 
@@ -8158,7 +8503,9 @@ use std::sync::{Arc, Mutex};
             r#"{"path":"lines.txt","extra":1}"#,
         ] {
             let call = make_call("c3", REPO_READ_TOOL, arguments);
-            let validated = tools.validate(&call, &cancel).expect("known tool validates");
+            let validated = tools
+                .validate(&call, &cancel)
+                .expect("known tool validates");
             match tools.execute(&validated, &cancel).expect("handled") {
                 ToolStepResult::Failed { handled, .. } => assert!(handled, "{arguments}"),
                 other => panic!("expected handled refusal for {arguments}, got {other:?}"),
@@ -8235,17 +8582,15 @@ use std::sync::{Arc, Mutex};
         // model ever sees. It must now be refused as a bounded, handled
         // failure instead, without ever buffering past the cap.
         let root = TempRoot::new("workspace-read-oversized");
-        fs::write(
-            root.0.join("huge.bin"),
-            vec![b'A'; MAX_FILE_READ_BYTES + 1],
-        )
-        .expect("seed");
+        fs::write(root.0.join("huge.bin"), vec![b'A'; MAX_FILE_READ_BYTES + 1]).expect("seed");
         let mut tools = permissive_workspace(&root.0);
         let cancel = CancellationToken::new();
         let call = make_call("c1", WORKSPACE_READ_TOOL, r#"{"path":"huge.bin"}"#);
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 let detail = detail.unwrap();
                 assert!(detail.contains("exceeds"), "{detail}");
@@ -8319,7 +8664,9 @@ use std::sync::{Arc, Mutex};
             r#"{"pattern":"x","extra":1}"#,
         ] {
             let call = make_call("c4", REPO_SEARCH_TOOL, arguments);
-            let validated = tools.validate(&call, &cancel).expect("known tool validates");
+            let validated = tools
+                .validate(&call, &cancel)
+                .expect("known tool validates");
             match tools.execute(&validated, &cancel).expect("handled") {
                 ToolStepResult::Failed { handled, .. } => assert!(handled, "{arguments}"),
                 other => panic!("expected handled refusal for {arguments}, got {other:?}"),
@@ -8384,16 +8731,20 @@ use std::sync::{Arc, Mutex};
         );
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("handled") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 let detail = detail.unwrap();
                 assert!(detail.contains("2 locations"), "{detail}");
             }
             other => panic!("expected ambiguity refusal, got {other:?}"),
         }
-        assert!(!fs::read_to_string(root.0.join("code.rs"))
-            .expect("read")
-            .contains("fn c()"));
+        assert!(
+            !fs::read_to_string(root.0.join("code.rs"))
+                .expect("read")
+                .contains("fn c()")
+        );
 
         // replace_all replaces every occurrence.
         let call = make_call(
@@ -8424,7 +8775,9 @@ use std::sync::{Arc, Mutex};
         );
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("handled") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.unwrap().contains("not found"));
             }
@@ -8440,7 +8793,11 @@ use std::sync::{Arc, Mutex};
 
         // Exact-match tier: a patch that introduces a likely secret is
         // flagged the same way workspace_write's plain path already is.
-        fs::write(root.0.join("config.rs"), "const TOKEN: &str = \"placeholder\";\n").expect("seed");
+        fs::write(
+            root.0.join("config.rs"),
+            "const TOKEN: &str = \"placeholder\";\n",
+        )
+        .expect("seed");
         let token = format!("ghp_{}", "d".repeat(36));
         let call = make_call(
             "c1",
@@ -8476,12 +8833,18 @@ use std::sync::{Arc, Mutex};
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
             ToolStepResult::Succeeded { summary, .. } => {
-                assert!(summary.contains("whitespace-insensitive match"), "{summary}");
+                assert!(
+                    summary.contains("whitespace-insensitive match"),
+                    "{summary}"
+                );
                 assert!(
                     summary.contains("advisory: possible patch-policy issue"),
                     "{summary}"
                 );
-                assert!(summary.contains("patch.ci_permissions_broaden"), "{summary}");
+                assert!(
+                    summary.contains("patch.ci_permissions_broaden"),
+                    "{summary}"
+                );
             }
             other => panic!("expected patch success, got {other:?}"),
         }
@@ -8514,7 +8877,10 @@ use std::sync::{Arc, Mutex};
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
             ToolStepResult::Succeeded { summary, .. } => {
-                assert!(summary.contains("whitespace-insensitive match"), "{summary}");
+                assert!(
+                    summary.contains("whitespace-insensitive match"),
+                    "{summary}"
+                );
             }
             other => panic!("expected a whitespace-insensitive success, got {other:?}"),
         }
@@ -8545,7 +8911,9 @@ use std::sync::{Arc, Mutex};
         );
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("handled") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 let detail = detail.unwrap();
                 assert!(detail.contains("2 locations"), "{detail}");
@@ -8573,8 +8941,11 @@ use std::sync::{Arc, Mutex};
     #[test]
     fn workspace_patch_reports_the_closest_line_when_nothing_matches_even_loosely() {
         let root = TempRoot::new("patch-hint");
-        fs::write(&root.0.join("code.rs"), "fn greet(name: &str) {\n    println!(\"hi\");\n}\n")
-            .expect("seed");
+        fs::write(
+            &root.0.join("code.rs"),
+            "fn greet(name: &str) {\n    println!(\"hi\");\n}\n",
+        )
+        .expect("seed");
         let mut tools = permissive_workspace(&root.0);
         let cancel = CancellationToken::new();
         let call = make_call(
@@ -8584,7 +8955,9 @@ use std::sync::{Arc, Mutex};
         );
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("handled") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 let detail = detail.unwrap();
                 assert!(detail.contains("not found"), "{detail}");
@@ -8606,12 +8979,14 @@ use std::sync::{Arc, Mutex};
             r#"{"path":"a.rs","old":"x","new":"x"}"#, // must differ
             r#"{"path":"a.rs","old":"","new":"y"}"#,  // empty old
             r#"{"path":"a.rs","old":"x","new":"y","replace_all":"yes"}"#,
-            r#"{"path":"a.rs","old":"x"}"#,           // missing new
+            r#"{"path":"a.rs","old":"x"}"#, // missing new
             r#"{"path":"../out.rs","old":"x","new":"y"}"#,
             r#"{"path":"a.rs","old":"x","new":"y","extra":1}"#,
         ] {
             let call = make_call("c1", WORKSPACE_PATCH_TOOL, arguments);
-            let validated = tools.validate(&call, &cancel).expect("known tool validates");
+            let validated = tools
+                .validate(&call, &cancel)
+                .expect("known tool validates");
             match tools.execute(&validated, &cancel).expect("handled") {
                 ToolStepResult::Failed { handled, .. } => assert!(handled, "{arguments}"),
                 other => panic!("expected handled refusal for {arguments}, got {other:?}"),
@@ -8624,8 +8999,11 @@ use std::sync::{Arc, Mutex};
     fn shell_exec_runs_argv_inside_the_root_with_bounded_output() {
         use std::os::unix::fs::PermissionsExt;
         let root = TempRoot::new("shell");
-        fs::write(root.0.join("echoer"), "#!/bin/sh\necho hello-out\necho hello-err >&2\n")
-            .expect("seed");
+        fs::write(
+            root.0.join("echoer"),
+            "#!/bin/sh\necho hello-out\necho hello-err >&2\n",
+        )
+        .expect("seed");
         let chmod = |path: &Path| {
             fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
         };
@@ -8654,7 +9032,10 @@ use std::sync::{Arc, Mutex};
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
             ToolStepResult::Succeeded { summary, .. } => {
-                assert!(summary.contains(root.0.to_string_lossy().as_ref()), "{summary}");
+                assert!(
+                    summary.contains(root.0.to_string_lossy().as_ref()),
+                    "{summary}"
+                );
             }
             other => panic!("expected cwd proof, got {other:?}"),
         }
@@ -8683,8 +9064,11 @@ use std::sync::{Arc, Mutex};
         // must not hand that value back to the model verbatim.
         let root = TempRoot::new("shell-redaction");
         let secret = "sk-not-a-real-secret-0123456789abcdef";
-        fs::write(root.0.join("cat_secret.sh"), format!("#!/bin/sh\necho {secret}\n"))
-            .expect("seed");
+        fs::write(
+            root.0.join("cat_secret.sh"),
+            format!("#!/bin/sh\necho {secret}\n"),
+        )
+        .expect("seed");
         fs::set_permissions(
             root.0.join("cat_secret.sh"),
             fs::Permissions::from_mode(0o755),
@@ -8835,8 +9219,11 @@ use std::sync::{Arc, Mutex};
 
         let mut completed = false;
         for _ in 0..100 {
-            let status_call =
-                make_call("s1", JOB_STATUS_TOOL, &format!(r#"{{"job_id":"{job_id}"}}"#));
+            let status_call = make_call(
+                "s1",
+                JOB_STATUS_TOOL,
+                &format!(r#"{{"job_id":"{job_id}"}}"#),
+            );
             let validated = tools.validate(&status_call, &cancel).expect("validate");
             if let ToolStepResult::Succeeded { summary, .. } =
                 tools.execute(&validated, &cancel).expect("execute")
@@ -8847,7 +9234,10 @@ use std::sync::{Arc, Mutex};
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        assert!(completed, "sandboxed job must complete via the real Seatbelt backend");
+        assert!(
+            completed,
+            "sandboxed job must complete via the real Seatbelt backend"
+        );
 
         let output_call = make_call(
             "o1",
@@ -8903,8 +9293,11 @@ use std::sync::{Arc, Mutex};
 
         let mut terminal = false;
         for _ in 0..100 {
-            let status_call =
-                make_call("s1", JOB_STATUS_TOOL, &format!(r#"{{"job_id":"{job_id}"}}"#));
+            let status_call = make_call(
+                "s1",
+                JOB_STATUS_TOOL,
+                &format!(r#"{{"job_id":"{job_id}"}}"#),
+            );
             let validated = tools.validate(&status_call, &cancel).expect("validate");
             if let ToolStepResult::Succeeded { summary, .. } =
                 tools.execute(&validated, &cancel).expect("execute")
@@ -8976,7 +9369,10 @@ use std::sync::{Arc, Mutex};
             std::thread::sleep(Duration::from_millis(20));
         }
         let pid = pid.expect("sandboxed job wrote its pid before entering sleep");
-        assert!(alive(pid), "sandboxed job's real process must still be running before drop");
+        assert!(
+            alive(pid),
+            "sandboxed job's real process must still be running before drop"
+        );
 
         // Shutdown path: dropping the real WorkspaceTools (and the
         // JobRegistry it owns) must kill the still-running sandboxed child,
@@ -9000,8 +9396,14 @@ use std::sync::{Arc, Mutex};
 
     #[test]
     fn sandboxed_status_line_names_the_cpu_limit_specifically() {
-        assert_eq!(sandboxed_status_line(Some(0), false, None, false, false), "exit 0");
-        assert_eq!(sandboxed_status_line(None, true, None, false, false), "timed out");
+        assert_eq!(
+            sandboxed_status_line(Some(0), false, None, false, false),
+            "exit 0"
+        );
+        assert_eq!(
+            sandboxed_status_line(None, true, None, false, false),
+            "timed out"
+        );
         assert_eq!(
             sandboxed_status_line(None, false, Some(24), false, false),
             "killed: sandbox CPU-time limit exceeded (SIGXCPU)"
@@ -9046,7 +9448,9 @@ use std::sync::{Arc, Mutex};
         let validated = tools.validate(&call, &cancel).expect("validate");
         let started = Instant::now();
         match tools.execute(&validated, &cancel).expect("handled") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 let detail = detail.unwrap();
                 assert!(detail.contains("timed out"), "{detail}");
@@ -9107,9 +9511,14 @@ use std::sync::{Arc, Mutex};
             r#"{"argv":["prog"],"cwd":"/etc"}"#,
         ];
         let oversize = format!(r#"{{"argv":["{}"]}}"#, "x".repeat(MAX_SHELL_ARG_BYTES + 1));
-        for arguments in bad_arguments.into_iter().chain(std::iter::once(oversize.as_str())) {
+        for arguments in bad_arguments
+            .into_iter()
+            .chain(std::iter::once(oversize.as_str()))
+        {
             let call = ProposedToolCall::new("c1", SHELL_EXEC_TOOL, arguments).expect("call");
-            let validated = tools.validate(&call, &cancel).expect("known tool validates");
+            let validated = tools
+                .validate(&call, &cancel)
+                .expect("known tool validates");
             match tools.execute(&validated, &cancel).expect("handled") {
                 ToolStepResult::Failed { handled: true, .. } => {}
                 other => panic!("expected handled refusal for {arguments}, got {other:?}"),
@@ -9122,8 +9531,7 @@ use std::sync::{Arc, Mutex};
         let root = TempRoot::new("denied");
         fs::write(root.0.join("a.rs"), "x").expect("seed");
         let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default);
-        let mut tools =
-            ExecTools::workspace_with_permissions(&root.0, lattice).expect("tools");
+        let mut tools = ExecTools::workspace_with_permissions(&root.0, lattice).expect("tools");
         // File edits in default mode ask, and *every* surface in this build
         // renders that as a typed denial with the reason — the interactive
         // TUI included, because nothing can prompt for an approval yet (see
@@ -9166,8 +9574,7 @@ use std::sync::{Arc, Mutex};
                 effect: RuleEffect::Deny,
                 pattern: ToolPattern::parse("repo_read(.env*)").expect("rule"),
             }]);
-        let mut tools =
-            ExecTools::workspace_with_permissions(&root.0, lattice).expect("tools");
+        let mut tools = ExecTools::workspace_with_permissions(&root.0, lattice).expect("tools");
         let calls = vec![make_call("c1", REPO_READ_TOOL, r#"{"path":".env.local"}"#)];
         let results = run_batch(&mut tools, &calls);
         assert!(matches!(
@@ -9191,8 +9598,7 @@ use std::sync::{Arc, Mutex};
                 effect: RuleEffect::Deny,
                 pattern: ToolPattern::parse("web_fetch(domain:evil.example*)").expect("rule"),
             }]);
-        let mut tools =
-            ExecTools::workspace_with_permissions(&root.0, lattice).expect("tools");
+        let mut tools = ExecTools::workspace_with_permissions(&root.0, lattice).expect("tools");
         let calls = vec![make_call(
             "c1",
             WEB_FETCH_TOOL,
@@ -9267,8 +9673,7 @@ use std::sync::{Arc, Mutex};
         let root = TempRoot::new("grant");
         let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default)
             .with_grants(vec![ToolPattern::parse("workspace_patch").expect("grant")]);
-        let mut tools =
-            ExecTools::workspace_with_permissions(&root.0, lattice).expect("tools");
+        let mut tools = ExecTools::workspace_with_permissions(&root.0, lattice).expect("tools");
         fs::write(root.0.join("a.rs"), "x").expect("seed");
         let calls = vec![make_call(
             "c1",
@@ -9287,8 +9692,11 @@ use std::sync::{Arc, Mutex};
         let root = TempRoot::new("batch");
         fs::write(root.0.join("target.txt"), "base").expect("seed");
         for index in 0..3 {
-            fs::write(root.0.join(format!("read{index}.txt")), format!("body {index}\n"))
-                .expect("seed");
+            fs::write(
+                root.0.join(format!("read{index}.txt")),
+                format!("body {index}\n"),
+            )
+            .expect("seed");
         }
         let mut tools = ExecTools::workspace_with_permissions(
             &root.0,
@@ -9297,10 +9705,22 @@ use std::sync::{Arc, Mutex};
         .expect("tools");
         let calls = vec![
             make_call("r0", REPO_READ_TOOL, r#"{"path":"read0.txt"}"#),
-            make_call("w1", WORKSPACE_WRITE_TOOL, r#"{"path":"target.txt","content":"1"}"#),
+            make_call(
+                "w1",
+                WORKSPACE_WRITE_TOOL,
+                r#"{"path":"target.txt","content":"1"}"#,
+            ),
             make_call("r1", REPO_READ_TOOL, r#"{"path":"read1.txt"}"#),
-            make_call("w2", WORKSPACE_WRITE_TOOL, r#"{"path":"target.txt","content":"2"}"#),
-            make_call("p1", WORKSPACE_PATCH_TOOL, r#"{"path":"target.txt","old":"2","new":"2-patched"}"#),
+            make_call(
+                "w2",
+                WORKSPACE_WRITE_TOOL,
+                r#"{"path":"target.txt","content":"2"}"#,
+            ),
+            make_call(
+                "p1",
+                WORKSPACE_PATCH_TOOL,
+                r#"{"path":"target.txt","old":"2","new":"2-patched"}"#,
+            ),
             make_call("r2", REPO_SEARCH_TOOL, r#"{"pattern":"body"}"#),
         ];
         let results = run_batch(&mut tools, &calls);
@@ -9313,10 +9733,14 @@ use std::sync::{Arc, Mutex};
                 results[index]
             );
         }
-        assert!(matches!(&results[0], Ok(ToolStepResult::Succeeded { summary, .. })
-            if summary.contains("body 0")));
-        assert!(matches!(&results[5], Ok(ToolStepResult::Succeeded { summary, .. })
-            if summary.contains("body 1")));
+        assert!(
+            matches!(&results[0], Ok(ToolStepResult::Succeeded { summary, .. })
+            if summary.contains("body 0"))
+        );
+        assert!(
+            matches!(&results[5], Ok(ToolStepResult::Succeeded { summary, .. })
+            if summary.contains("body 1"))
+        );
         // Same-path writes applied in a serialized, defined order, then the patch.
         assert_eq!(
             fs::read_to_string(root.0.join("target.txt")).expect("read"),
@@ -9334,8 +9758,16 @@ use std::sync::{Arc, Mutex};
         )
         .expect("tools");
         let calls = vec![
-            make_call("p1", WORKSPACE_PATCH_TOOL, r#"{"path":"log.txt","old":"start","new":"start-1"}"#),
-            make_call("p2", WORKSPACE_PATCH_TOOL, r#"{"path":"log.txt","old":"start-1","new":"start-1-2"}"#),
+            make_call(
+                "p1",
+                WORKSPACE_PATCH_TOOL,
+                r#"{"path":"log.txt","old":"start","new":"start-1"}"#,
+            ),
+            make_call(
+                "p2",
+                WORKSPACE_PATCH_TOOL,
+                r#"{"path":"log.txt","old":"start-1","new":"start-1-2"}"#,
+            ),
         ];
         let results = run_batch(&mut tools, &calls);
         // Both succeed deterministically: p2 sees p1's output because
@@ -9365,7 +9797,10 @@ use std::sync::{Arc, Mutex};
         ];
         let results = run_batch(&mut tools, &calls);
         for result in &results {
-            assert!(matches!(result, Ok(ToolStepResult::Succeeded { .. })), "{results:?}");
+            assert!(
+                matches!(result, Ok(ToolStepResult::Succeeded { .. })),
+                "{results:?}"
+            );
         }
         assert!(root.0.join("one.txt").exists());
         assert!(root.0.join("two.txt").exists());
@@ -9541,11 +9976,13 @@ use std::sync::{Arc, Mutex};
         .expect("typed failed turn, not an execution error");
         assert_eq!(outcome.result.status(), AgentTerminalStatus::Failed);
         assert_eq!(
-            outcome.failure_cause,
-            None,
+            outcome.failure_cause, None,
             "a tool refusal is not a provider failure"
         );
-        assert!(!root.0.join("plan.md").exists(), "fail-closed: nothing written");
+        assert!(
+            !root.0.join("plan.md").exists(),
+            "fail-closed: nothing written"
+        );
     }
 
     #[test]
@@ -9565,7 +10002,10 @@ use std::sync::{Arc, Mutex};
         match tools.execute(&validated, &cancel).expect("execute") {
             ToolStepResult::Succeeded { summary, .. } => {
                 assert!(summary.contains("a.rs"), "{summary}");
-                assert!(!summary.contains("c.rs"), "star must not cross directories: {summary}");
+                assert!(
+                    !summary.contains("c.rs"),
+                    "star must not cross directories: {summary}"
+                );
             }
             other => panic!("expected glob success, got {other:?}"),
         }
@@ -9575,7 +10015,11 @@ use std::sync::{Arc, Mutex};
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
             ToolStepResult::Succeeded { summary, .. } => {
-                assert!(summary.contains("a.rs") && summary.contains("c.rs") && summary.contains("d.rs"));
+                assert!(
+                    summary.contains("a.rs")
+                        && summary.contains("c.rs")
+                        && summary.contains("d.rs")
+                );
             }
             other => panic!("expected deep glob success, got {other:?}"),
         }
@@ -9603,7 +10047,10 @@ use std::sync::{Arc, Mutex};
         assert!(!glob_path_match("*", "src/a.txt"), "* stays in one segment");
         assert!(glob_path_match("**", "src/deep/a.rs"));
         assert!(glob_path_match("**/*.rs", "src/deep/a.rs"));
-        assert!(glob_path_match("**/*.rs", "a.rs"), "star-star matches zero segments");
+        assert!(
+            glob_path_match("**/*.rs", "a.rs"),
+            "star-star matches zero segments"
+        );
         assert!(glob_path_match("src/*.rs", "src/a.rs"));
         assert!(!glob_path_match("src/*.rs", "other/a.rs"));
         assert!(glob_path_match("src/?.rs", "src/a.rs"));
@@ -9648,7 +10095,10 @@ use std::sync::{Arc, Mutex};
         let result = atomic_write(&target, b"this must never land");
         fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).expect("chmod restore");
 
-        assert!(result.is_err(), "expected the write to fail under a read-only directory");
+        assert!(
+            result.is_err(),
+            "expected the write to fail under a read-only directory"
+        );
         assert_eq!(
             fs::read(&target).expect("read"),
             b"original content, must survive",
@@ -9673,7 +10123,10 @@ use std::sync::{Arc, Mutex};
                 std::thread::spawn(move || atomic_write(&target, format!("writer-{i}").as_bytes()))
             })
             .collect();
-        let results: Vec<_> = handles.into_iter().map(|h| h.join().expect("thread")).collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread"))
+            .collect();
         let failures: Vec<_> = results.iter().filter(|r| r.is_err()).collect();
         assert!(
             failures.is_empty(),
@@ -9700,7 +10153,10 @@ use std::sync::{Arc, Mutex};
         fs::create_dir_all(&target).expect("mkdir");
 
         let result = atomic_write(&target, b"this must never land");
-        assert!(result.is_err(), "renaming a file over an existing directory must fail");
+        assert!(
+            result.is_err(),
+            "renaming a file over an existing directory must fail"
+        );
 
         let leftovers: Vec<_> = fs::read_dir(&root.0)
             .expect("read dir")
@@ -9763,7 +10219,9 @@ use std::sync::{Arc, Mutex};
             r#"{"items":[]}"#,
         ] {
             let call = make_call("c3", TODO_WRITE_TOOL, arguments);
-            let validated = tools.validate(&call, &cancel).expect("known tool validates");
+            let validated = tools
+                .validate(&call, &cancel)
+                .expect("known tool validates");
             match tools.execute(&validated, &cancel).expect("handled") {
                 ToolStepResult::Failed { handled, .. } => assert!(handled, "{arguments}"),
                 other => panic!("expected handled refusal for {arguments}, got {other:?}"),
@@ -9816,7 +10274,9 @@ use std::sync::{Arc, Mutex};
             r#"{"todos":[{"id":"1","content":"do it","status":"in_progress"}]}"#,
         );
         let validated = tools.validate(&status_only, &cancel).expect("validate");
-        tools.execute(&validated, &cancel).expect("status-only update");
+        tools
+            .execute(&validated, &cancel)
+            .expect("status-only update");
         let persisted = fs::read_to_string(root.0.join(TODOS_PATH)).expect("persisted");
         let value: serde_json::Value = serde_json::from_str(&persisted).expect("json");
         let first = &value["todos"][0];
@@ -9856,7 +10316,9 @@ use std::sync::{Arc, Mutex};
         );
         let validated = tools.validate(&dangling, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("handled") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.unwrap().contains("unknown task id"));
             }
@@ -9874,7 +10336,9 @@ use std::sync::{Arc, Mutex};
         );
         let validated = tools.validate(&self_dep, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("handled") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.unwrap().contains("cannot depend on itself"));
             }
@@ -9895,7 +10359,9 @@ use std::sync::{Arc, Mutex};
         );
         let validated = tools.validate(&cycle, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("handled") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.unwrap().contains("dependency cycle"));
             }
@@ -9936,7 +10402,9 @@ use std::sync::{Arc, Mutex};
         );
         let validated = tools.validate(&close_the_cycle, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("handled") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.unwrap().contains("dependency cycle"));
             }
@@ -9976,9 +10444,14 @@ use std::sync::{Arc, Mutex};
         let validated = tools.validate(&diamond, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("handled") {
             ToolStepResult::Succeeded { .. } => {}
-            other => panic!("a diamond-shaped (non-cyclic) dependency graph must not be refused, got {other:?}"),
+            other => panic!(
+                "a diamond-shaped (non-cyclic) dependency graph must not be refused, got {other:?}"
+            ),
         }
-        assert!(root.0.join(TODOS_PATH).exists(), "the write must have actually persisted");
+        assert!(
+            root.0.join(TODOS_PATH).exists(),
+            "the write must have actually persisted"
+        );
     }
 
     #[test]
@@ -10006,7 +10479,9 @@ use std::sync::{Arc, Mutex};
             r#"{"todos":[{"id":"1","content":"x","status":"pending","owner":123}]}"#,
         ] {
             let call = make_call("c1", TODO_WRITE_TOOL, arguments);
-            let validated = tools.validate(&call, &cancel).expect("known tool validates");
+            let validated = tools
+                .validate(&call, &cancel)
+                .expect("known tool validates");
             match tools.execute(&validated, &cancel).expect("handled") {
                 ToolStepResult::Failed { handled, .. } => assert!(handled, "{arguments}"),
                 other => panic!("expected handled refusal for {arguments}, got {other:?}"),
@@ -10072,9 +10547,7 @@ use std::sync::{Arc, Mutex};
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("execute") {
             ToolStepResult::Succeeded { .. } => {}
-            other => panic!(
-                "depending on a not-yet-completed task must be allowed, got {other:?}"
-            ),
+            other => panic!("depending on a not-yet-completed task must be allowed, got {other:?}"),
         }
     }
 
@@ -10128,7 +10601,11 @@ use std::sync::{Arc, Mutex};
         let mut completed = false;
         for _ in 0..50 {
             if let ToolStepResult::Succeeded { summary, .. } = {
-                let status_call = make_call("s1", JOB_STATUS_TOOL, &format!(r#"{{"job_id":"{job_id}"}}"#));
+                let status_call = make_call(
+                    "s1",
+                    JOB_STATUS_TOOL,
+                    &format!(r#"{{"job_id":"{job_id}"}}"#),
+                );
                 let validated = tools.validate(&status_call, &cancel).expect("validate");
                 tools.execute(&validated, &cancel).expect("execute")
             } {
@@ -10177,8 +10654,11 @@ use std::sync::{Arc, Mutex};
             other => panic!("expected background start, got {other:?}"),
         };
         {
-            let status_call =
-                make_call("s2", JOB_STATUS_TOOL, &format!(r#"{{"job_id":"{long_id}"}}"#));
+            let status_call = make_call(
+                "s2",
+                JOB_STATUS_TOOL,
+                &format!(r#"{{"job_id":"{long_id}"}}"#),
+            );
             let validated = tools.validate(&status_call, &cancel).expect("validate");
             match tools.execute(&validated, &cancel).expect("execute") {
                 ToolStepResult::Succeeded { summary, .. } => {
@@ -10261,8 +10741,11 @@ use std::sync::{Arc, Mutex};
 
         let mut final_state = None;
         for _ in 0..100 {
-            let status_call =
-                make_call("s1", JOB_STATUS_TOOL, &format!(r#"{{"job_id":"{job_id}"}}"#));
+            let status_call = make_call(
+                "s1",
+                JOB_STATUS_TOOL,
+                &format!(r#"{{"job_id":"{job_id}"}}"#),
+            );
             let validated = tools.validate(&status_call, &cancel).expect("validate");
             if let ToolStepResult::Succeeded { summary, .. } =
                 tools.execute(&validated, &cancel).expect("execute")
@@ -10369,8 +10852,11 @@ use std::sync::{Arc, Mutex};
         };
         let mut completed = false;
         for _ in 0..50 {
-            let status_call =
-                make_call("s1", JOB_STATUS_TOOL, &format!(r#"{{"job_id":"{job_id}"}}"#));
+            let status_call = make_call(
+                "s1",
+                JOB_STATUS_TOOL,
+                &format!(r#"{{"job_id":"{job_id}"}}"#),
+            );
             let validated = tools.validate(&status_call, &cancel).expect("validate");
             if let ToolStepResult::Succeeded { summary, .. } =
                 tools.execute(&validated, &cancel).expect("execute")
@@ -10412,7 +10898,10 @@ use std::sync::{Arc, Mutex};
             !combined.contains('\u{FFFD}'),
             "a character straddling the page boundary must not be mangled: {combined:?}"
         );
-        assert!(combined.contains("éEND"), "full content must survive pagination: {combined:?}");
+        assert!(
+            combined.contains("éEND"),
+            "full content must survive pagination: {combined:?}"
+        );
     }
 
     #[test]
@@ -10497,7 +10986,9 @@ use std::sync::{Arc, Mutex};
         let exit = make_call("p5", PLAN_EXIT_TOOL, "{}");
         let validated = tools.validate(&exit, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("handled") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.unwrap().contains("not active"));
             }
@@ -10512,7 +11003,13 @@ use std::sync::{Arc, Mutex};
             calls: Arc<StdMutex<Vec<(String, String)>>>,
         }
         impl crate::exec_tools::SubagentRunner for FakeRunner {
-            fn run(&self, prompt: &str, agent_type: &str, _write_scope: Option<&str>, _cancel: &CancellationToken) -> Result<SubagentReport, String> {
+            fn run(
+                &self,
+                prompt: &str,
+                agent_type: &str,
+                _write_scope: Option<&str>,
+                _cancel: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
                 self.calls
                     .lock()
                     .expect("lock")
@@ -10547,7 +11044,10 @@ use std::sync::{Arc, Mutex};
             r#"{"prompt":"count the tests","type":"explore"}"#,
         );
         let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
-        match tools.execute(&validated, &CancellationToken::new()).expect("e") {
+        match tools
+            .execute(&validated, &CancellationToken::new())
+            .expect("e")
+        {
             ToolStepResult::Succeeded { summary, .. } => {
                 assert!(summary.contains("subagent (explore)"), "{summary}");
                 assert!(summary.contains("child finished the task"));
@@ -10566,13 +11066,12 @@ use std::sync::{Arc, Mutex};
         );
 
         // Unknown agent types are handled failures (never a dead turn).
-        let bad = make_call(
-            "c2",
-            TASK_SPAWN_TOOL,
-            r#"{"prompt":"x","type":"ninja"}"#,
-        );
+        let bad = make_call("c2", TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"ninja"}"#);
         let validated = tools.validate(&bad, &CancellationToken::new()).expect("v");
-        match tools.execute(&validated, &CancellationToken::new()).expect("handled") {
+        match tools
+            .execute(&validated, &CancellationToken::new())
+            .expect("handled")
+        {
             ToolStepResult::Failed { handled, .. } => assert!(handled),
             other => panic!("expected handled type refusal, got {other:?}"),
         }
@@ -10585,7 +11084,10 @@ use std::sync::{Arc, Mutex};
             .map(|tool| tool.name().to_owned())
             .collect();
         let surface: Vec<&str> = surface_owned.iter().map(|name| name.as_str()).collect();
-        assert!(!surface.contains(&TASK_SPAWN_TOOL), "depth 1 enforced: {surface:?}");
+        assert!(
+            !surface.contains(&TASK_SPAWN_TOOL),
+            "depth 1 enforced: {surface:?}"
+        );
         assert!(surface.contains(&REPO_READ_TOOL), "reads stay available");
     }
 
@@ -10607,22 +11109,30 @@ use std::sync::{Arc, Mutex};
             PermissionLattice::new(PermissionMode::BypassPermissions),
         )
         .expect("child");
-        let surface_before: Vec<String> =
-            child.tool_surface().iter().map(|tool| tool.name().to_owned()).collect();
+        let surface_before: Vec<String> = child
+            .tool_surface()
+            .iter()
+            .map(|tool| tool.name().to_owned())
+            .collect();
         assert!(
             surface_before.iter().any(|name| name == TASK_SPAWN_TOOL),
             "sanity check: a write-capable driver normally offers task_spawn"
         );
 
         child.disable_nested_spawn();
-        let surface_after: Vec<String> =
-            child.tool_surface().iter().map(|tool| tool.name().to_owned()).collect();
+        let surface_after: Vec<String> = child
+            .tool_surface()
+            .iter()
+            .map(|tool| tool.name().to_owned())
+            .collect();
         assert!(
             !surface_after.iter().any(|name| name == TASK_SPAWN_TOOL),
             "depth 1 enforced for write-capable children too: {surface_after:?}"
         );
         assert!(
-            surface_after.iter().any(|name| name == WORKSPACE_WRITE_TOOL),
+            surface_after
+                .iter()
+                .any(|name| name == WORKSPACE_WRITE_TOOL),
             "writes stay available"
         );
 
@@ -10653,7 +11163,10 @@ use std::sync::{Arc, Mutex};
                 write_scope: Option<&str>,
                 _cancel: &CancellationToken,
             ) -> Result<SubagentReport, String> {
-                self.seen.lock().expect("lock").push(write_scope.map(str::to_owned));
+                self.seen
+                    .lock()
+                    .expect("lock")
+                    .push(write_scope.map(str::to_owned));
                 Ok(SubagentReport {
                     summary: "done".to_owned(),
                     status: "succeeded".to_owned(),
@@ -10673,8 +11186,9 @@ use std::sync::{Arc, Mutex};
         let root = TempRoot::new("spawn-scope");
         let mut tools = permissive_workspace(&root.0);
         let seen = Arc::new(StdMutex::new(Vec::new()));
-        tools.subagents =
-            Some(Arc::new(ScopeCapturingRunner { seen: Arc::clone(&seen) }) as Arc<dyn SubagentRunner>);
+        tools.subagents = Some(Arc::new(ScopeCapturingRunner {
+            seen: Arc::clone(&seen),
+        }) as Arc<dyn SubagentRunner>);
         let cancel = CancellationToken::new();
 
         // With a scope: forwarded verbatim.
@@ -10714,7 +11228,13 @@ use std::sync::{Arc, Mutex};
     fn task_spawn_refuses_once_the_per_turn_budget_is_exhausted() {
         struct CountingRunner(Arc<AtomicU64>);
         impl crate::exec_tools::SubagentRunner for CountingRunner {
-            fn run(&self, _prompt: &str, _agent_type: &str, _write_scope: Option<&str>, _cancel: &CancellationToken) -> Result<SubagentReport, String> {
+            fn run(
+                &self,
+                _prompt: &str,
+                _agent_type: &str,
+                _write_scope: Option<&str>,
+                _cancel: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(SubagentReport {
                     summary: "done".to_owned(),
@@ -10735,7 +11255,8 @@ use std::sync::{Arc, Mutex};
         let root = TempRoot::new("spawn-budget");
         let mut tools = permissive_workspace(&root.0);
         let ran = Arc::new(AtomicU64::new(0));
-        tools.subagents = Some(Arc::new(CountingRunner(Arc::clone(&ran))) as Arc<dyn SubagentRunner>);
+        tools.subagents =
+            Some(Arc::new(CountingRunner(Arc::clone(&ran))) as Arc<dyn SubagentRunner>);
         let cancel = CancellationToken::new();
         let call = make_call("c1", TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
 
@@ -10752,7 +11273,9 @@ use std::sync::{Arc, Mutex};
         // the runner is never even invoked.
         let validated = tools.validate(&call, &cancel).expect("v");
         match tools.execute(&validated, &cancel).expect("handled") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.unwrap().contains("budget exhausted"));
             }
@@ -10850,7 +11373,9 @@ use std::sync::{Arc, Mutex};
                             // Trailing `\n` keeps single-digit slots (e.g.
                             // "SLOT_1") from matching as an ambiguous
                             // substring of "SLOT_10".."SLOT_19".
-                            &format!(r#"{{"path":"shared.txt","old":"SLOT_{i}\n","new":"DONE_{i}\n"}}"#),
+                            &format!(
+                                r#"{{"path":"shared.txt","old":"SLOT_{i}\n","new":"DONE_{i}\n"}}"#
+                            ),
                         );
                         let cancel = CancellationToken::new();
                         let validated = tools.validate(&call, &cancel).expect("v");
@@ -10862,7 +11387,10 @@ use std::sync::{Arc, Mutex};
                     })
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().expect("thread")).collect()
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("thread"))
+                .collect()
         });
 
         let succeeded = outcomes
@@ -10909,7 +11437,13 @@ use std::sync::{Arc, Mutex};
     fn task_spawn_report_renders_cost_only_when_reported() {
         struct CostRunner(Option<u64>);
         impl crate::exec_tools::SubagentRunner for CostRunner {
-            fn run(&self, _prompt: &str, _agent_type: &str, _write_scope: Option<&str>, _cancel: &CancellationToken) -> Result<SubagentReport, String> {
+            fn run(
+                &self,
+                _prompt: &str,
+                _agent_type: &str,
+                _write_scope: Option<&str>,
+                _cancel: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
                 Ok(SubagentReport {
                     summary: "done".to_owned(),
                     status: "succeeded".to_owned(),
@@ -10932,7 +11466,10 @@ use std::sync::{Arc, Mutex};
         tools.subagents = Some(Arc::new(CostRunner(Some(42))) as Arc<dyn SubagentRunner>);
         let call = make_call("c1", TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
         let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
-        match tools.execute(&validated, &CancellationToken::new()).expect("e") {
+        match tools
+            .execute(&validated, &CancellationToken::new())
+            .expect("e")
+        {
             ToolStepResult::Succeeded { summary, .. } => {
                 assert!(summary.contains("cost_usd_micros=42"), "{summary}");
             }
@@ -10945,8 +11482,13 @@ use std::sync::{Arc, Mutex};
         let mut tools2 = permissive_workspace(&root2.0);
         tools2.subagents = Some(Arc::new(CostRunner(None)) as Arc<dyn SubagentRunner>);
         let call2 = make_call("c2", TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
-        let validated2 = tools2.validate(&call2, &CancellationToken::new()).expect("v");
-        match tools2.execute(&validated2, &CancellationToken::new()).expect("e") {
+        let validated2 = tools2
+            .validate(&call2, &CancellationToken::new())
+            .expect("v");
+        match tools2
+            .execute(&validated2, &CancellationToken::new())
+            .expect("e")
+        {
             ToolStepResult::Succeeded { summary, .. } => {
                 assert!(!summary.contains("cost_usd_micros"), "{summary}");
             }
@@ -10958,7 +11500,13 @@ use std::sync::{Arc, Mutex};
     fn task_spawn_report_surfaces_claims_blockers_questions_and_patch_summary() {
         struct RichRunner;
         impl crate::exec_tools::SubagentRunner for RichRunner {
-            fn run(&self, _prompt: &str, _agent_type: &str, _write_scope: Option<&str>, _cancel: &CancellationToken) -> Result<SubagentReport, String> {
+            fn run(
+                &self,
+                _prompt: &str,
+                _agent_type: &str,
+                _write_scope: Option<&str>,
+                _cancel: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
                 Ok(SubagentReport {
                     summary: "done".to_owned(),
                     status: "succeeded".to_owned(),
@@ -10980,9 +11528,15 @@ use std::sync::{Arc, Mutex};
         tools.subagents = Some(Arc::new(RichRunner) as Arc<dyn SubagentRunner>);
         let call = make_call("c1", TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
         let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
-        match tools.execute(&validated, &CancellationToken::new()).expect("e") {
+        match tools
+            .execute(&validated, &CancellationToken::new())
+            .expect("e")
+        {
             ToolStepResult::Succeeded { summary, .. } => {
-                assert!(summary.contains("claim: tests pass (satisfied)"), "{summary}");
+                assert!(
+                    summary.contains("claim: tests pass (satisfied)"),
+                    "{summary}"
+                );
                 assert!(
                     summary.contains("blocker: [policy] needs human approval"),
                     "{summary}"
@@ -11057,17 +11611,19 @@ use std::sync::{Arc, Mutex};
 
     #[test]
     fn workspace_read_pdf_extracts_text_from_uncompressed_and_flate_streams() {
-        use flate2::write::ZlibEncoder;
         use flate2::Compression;
+        use flate2::write::ZlibEncoder;
         use std::io::Write as _;
         let root = TempRoot::new("pdf-read");
         let content = "BT /F1 12 Tf (the launch code is BLUE-7) Tj ET";
         // Uncompressed.
         let mut uncompressed = b"%PDF-1.4\n".to_vec();
-        uncompressed
-            .extend_from_slice(format!("1 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes());
+        uncompressed.extend_from_slice(
+            format!("1 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
         uncompressed.extend_from_slice(content.as_bytes());
-        uncompressed.extend_from_slice(b"\nendstream\nendobj\n2 0 obj\n<< /Type /Page >>\nendobj\n%%EOF");
+        uncompressed
+            .extend_from_slice(b"\nendstream\nendobj\n2 0 obj\n<< /Type /Page >>\nendobj\n%%EOF");
         fs::write(root.0.join("plain.pdf"), &uncompressed).expect("seed");
         // FlateDecode.
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -11075,8 +11631,11 @@ use std::sync::{Arc, Mutex};
         let compressed = encoder.finish().expect("finish");
         let mut flated = b"%PDF-1.4\n".to_vec();
         flated.extend_from_slice(
-            format!("1 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n", compressed.len())
-                .as_bytes(),
+            format!(
+                "1 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n",
+                compressed.len()
+            )
+            .as_bytes(),
         );
         flated.extend_from_slice(&compressed);
         flated.extend_from_slice(b"\nendstream\nendobj\n2 0 obj\n<< /Type /Page >>\nendobj\n%%EOF");
@@ -11085,7 +11644,11 @@ use std::sync::{Arc, Mutex};
         let mut tools = permissive_workspace(&root.0);
         let cancel = CancellationToken::new();
         for name in ["plain.pdf", "flat.pdf"] {
-            let call = make_call("c1", WORKSPACE_READ_TOOL, &format!(r#"{{"path":"{name}"}}"#));
+            let call = make_call(
+                "c1",
+                WORKSPACE_READ_TOOL,
+                &format!(r#"{{"path":"{name}"}}"#),
+            );
             let validated = tools.validate(&call, &cancel).expect("validate");
             match tools.execute(&validated, &cancel).expect("execute") {
                 ToolStepResult::Succeeded { summary, .. } => {
@@ -11114,7 +11677,9 @@ use std::sync::{Arc, Mutex};
         let validated = tools.validate(&call, &cancel).expect("validate");
         // Must return *some* typed outcome (success or a handled failure)
         // rather than unwinding a panic out of `execute`.
-        let _ = tools.execute(&validated, &cancel).expect("execute must not panic");
+        let _ = tools
+            .execute(&validated, &cancel)
+            .expect("execute must not panic");
     }
 
     #[test]
@@ -11128,7 +11693,9 @@ use std::sync::{Arc, Mutex};
         let call = make_call("w1", WEB_FETCH_TOOL, &format!(r#"{{"url":"{url}"}}"#));
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("handled") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(
                     detail.unwrap().contains("private/loopback"),
@@ -11216,8 +11783,7 @@ for line in sys.stdin:
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
-                .expect("chmod");
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         let servers = vec![McpServerConfig {
             name: "demo".to_owned(),
@@ -11259,8 +11825,13 @@ for line in sys.stdin:
         );
         let call = make_call("m1", "mcp__dead__offline", "{}");
         let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
-        match tools.execute(&validated, &CancellationToken::new()).expect("e") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+        match tools
+            .execute(&validated, &CancellationToken::new())
+            .expect("e")
+        {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.unwrap().contains("failed to start"));
             }
@@ -11268,13 +11839,12 @@ for line in sys.stdin:
         }
 
         // Dispatch through the JSON-RPC session.
-        let call = make_call(
-            "m2",
-            "mcp__demo__echo",
-            r#"{"message":"ping"}"#,
-        );
+        let call = make_call("m2", "mcp__demo__echo", r#"{"message":"ping"}"#);
         let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
-        match tools.execute(&validated, &CancellationToken::new()).expect("dispatch") {
+        match tools
+            .execute(&validated, &CancellationToken::new())
+            .expect("dispatch")
+        {
             ToolStepResult::Succeeded { summary, .. } => {
                 assert!(summary.contains("echo: ping"), "{summary}");
             }
@@ -11333,7 +11903,9 @@ for line in sys.stdin:
             .collect();
 
         assert!(
-            surface.iter().any(|name| name == "mcp__envcheck__got_delivered"),
+            surface
+                .iter()
+                .any(|name| name == "mcp__envcheck__got_delivered"),
             "configured env did not reach the child: {surface:?}"
         );
     }
@@ -11366,8 +11938,13 @@ for line in sys.stdin:
         );
         let call = make_call("h1", "mcp__quitter__offline", "{}");
         let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
-        match tools.execute(&validated, &CancellationToken::new()).expect("e") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+        match tools
+            .execute(&validated, &CancellationToken::new())
+            .expect("e")
+        {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 let detail = detail.expect("detail");
                 assert!(
@@ -11417,8 +11994,7 @@ for line in sys.stdin:
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
-                .expect("chmod");
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         let servers = vec![McpServerConfig {
             name: "leaky".to_owned(),
@@ -11439,7 +12015,10 @@ for line in sys.stdin:
 
         let call = make_call("m1", "mcp__leaky__read_file", "{}");
         let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
-        match tools.execute(&validated, &CancellationToken::new()).expect("dispatch") {
+        match tools
+            .execute(&validated, &CancellationToken::new())
+            .expect("dispatch")
+        {
             ToolStepResult::Succeeded { summary, .. } => {
                 assert!(!summary.contains(secret), "{summary}");
                 assert!(summary.contains("[REDACTED:secret:"), "{summary}");
@@ -11482,8 +12061,7 @@ for line in sys.stdin:
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
-                .expect("chmod");
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         let servers = vec![McpServerConfig {
             name: "envcheck".to_owned(),
@@ -11496,7 +12074,10 @@ for line in sys.stdin:
 
         let call = make_call("e1", "mcp__envcheck__keys", "{}");
         let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
-        match tools.execute(&validated, &CancellationToken::new()).expect("dispatch") {
+        match tools
+            .execute(&validated, &CancellationToken::new())
+            .expect("dispatch")
+        {
             ToolStepResult::Succeeded { summary, .. } => {
                 let keys_line = summary.lines().last().unwrap_or("");
                 // The four we deliberately forward, plus vars macOS's own
@@ -11562,8 +12143,7 @@ time.sleep(30)
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
-                .expect("chmod");
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         let pid_path = root.0.join("server.pid");
         let servers = vec![McpServerConfig {
@@ -11737,8 +12317,7 @@ for line in sys.stdin:
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
-                .expect("chmod");
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         let servers = vec![McpServerConfig {
             name: "hang".to_owned(),
@@ -11797,7 +12376,10 @@ for line in sys.stdin:
             mcp_tools < 40,
             "the byte cap must omit some of the 40 registered tools: got {mcp_tools}"
         );
-        assert!(mcp_tools > 0, "at least the earliest registrations must survive");
+        assert!(
+            mcp_tools > 0,
+            "at least the earliest registrations must survive"
+        );
         // First-registered-wins: tool0 always makes it in under the cap.
         assert!(
             surface.iter().any(|t| t.name() == "mcp__srv__tool0"),
@@ -11817,9 +12399,13 @@ for line in sys.stdin:
             SHELL_EXEC_TOOL,
             r#"{"argv":["sh","-c","echo all-done"],"background":true}"#,
         );
-        let validated = tools.validate(&start, &CancellationToken::new()).expect("v");
+        let validated = tools
+            .validate(&start, &CancellationToken::new())
+            .expect("v");
         assert!(matches!(
-            tools.execute(&validated, &CancellationToken::new()).expect("e"),
+            tools
+                .execute(&validated, &CancellationToken::new())
+                .expect("e"),
             ToolStepResult::Succeeded { .. }
         ));
         // Wait until the registry marks the job finished, then drain once via
@@ -11848,11 +12434,11 @@ for line in sys.stdin:
         // via `.expect("fixed name/args")`. The driver must sanitize the
         // summary before it is ever embedded in the call arguments.
         let root = TempRoot::new("notify-control-byte");
-        let mut tools =
-            ExecTools::workspace_with_permissions(&root.0, PermissionLattice::new(
-                crate::permissions::PermissionMode::BypassPermissions,
-            ))
-            .expect("tools");
+        let mut tools = ExecTools::workspace_with_permissions(
+            &root.0,
+            PermissionLattice::new(crate::permissions::PermissionMode::BypassPermissions),
+        )
+        .expect("tools");
         let start = make_call(
             "c1",
             SHELL_EXEC_TOOL,
@@ -11860,9 +12446,13 @@ for line in sys.stdin:
             // byte between two markers.
             r#"{"argv":["sh","-c","printf 'before\\177after'"],"background":true}"#,
         );
-        let validated = tools.validate(&start, &CancellationToken::new()).expect("v");
+        let validated = tools
+            .validate(&start, &CancellationToken::new())
+            .expect("v");
         assert!(matches!(
-            tools.execute(&validated, &CancellationToken::new()).expect("e"),
+            tools
+                .execute(&validated, &CancellationToken::new())
+                .expect("e"),
             ToolStepResult::Succeeded { .. }
         ));
         let mut exchanges = Vec::new();
@@ -11875,13 +12465,20 @@ for line in sys.stdin:
         }
         assert!(!exchanges.is_empty(), "completion notice must be available");
         let exchange = &exchanges[0];
-        assert_eq!(exchange.calls().len(), 1, "one synthetic call per job notice");
+        assert_eq!(
+            exchange.calls().len(),
+            1,
+            "one synthetic call per job notice"
+        );
         let call = &exchange.calls()[0];
         // The built call's JSON arguments must contain no raw control bytes
         // (this is exactly the condition `ProposedToolCall::new` enforces;
         // reaching this line at all proves it did not panic).
         assert!(
-            !call.arguments().chars().any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t'),
+            !call
+                .arguments()
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t'),
             "sanitized arguments must carry no raw control bytes: {:?}",
             call.arguments()
         );
@@ -11979,7 +12576,9 @@ for line in sys.stdin:
         );
         let validated = tools.validate(&call, &cancel).expect("validate");
         match tools.execute(&validated, &cancel).expect("handled") {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.unwrap().contains("web_fetch budget exhausted"));
             }
@@ -12002,7 +12601,10 @@ for line in sys.stdin:
             r#"{"question":"Deploy?","options":["yes","no"]}"#,
         );
         let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
-        match tools.execute(&validated, &CancellationToken::new()).expect("e") {
+        match tools
+            .execute(&validated, &CancellationToken::new())
+            .expect("e")
+        {
             ToolStepResult::ContextRequired { call_id, question } => {
                 assert_eq!(call_id, "a1");
                 assert_eq!(question, "Deploy?\n1. yes\n2. no");
@@ -12013,19 +12615,24 @@ for line in sys.stdin:
         // Interactive: a source returns the selected option.
         let seen: Arc<StdMutex<Vec<(String, Vec<String>)>>> = Arc::default();
         let source_seen = Arc::clone(&seen);
-        tools.set_ask_source(Arc::new(move |_prompt: &str, options: &[String], _budget| {
-            let seen = Arc::clone(&source_seen);
-            let mut guard = seen.lock().expect("lock");
-            guard.push(("deploy?".to_owned(), options.to_vec()));
-            Ok(options.first().cloned().unwrap_or_default())
-        }));
+        tools.set_ask_source(Arc::new(
+            move |_prompt: &str, options: &[String], _budget| {
+                let seen = Arc::clone(&source_seen);
+                let mut guard = seen.lock().expect("lock");
+                guard.push(("deploy?".to_owned(), options.to_vec()));
+                Ok(options.first().cloned().unwrap_or_default())
+            },
+        ));
         let call = make_call(
             "a2",
             ASK_USER_TOOL,
             r#"{"question":"Deploy now?","options":["yes","no","maybe"]}"#,
         );
         let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
-        match tools.execute(&validated, &CancellationToken::new()).expect("e") {
+        match tools
+            .execute(&validated, &CancellationToken::new())
+            .expect("e")
+        {
             ToolStepResult::Succeeded { summary, .. } => {
                 assert!(summary.contains("user selected: yes"), "{summary}");
             }
@@ -12088,6 +12695,10 @@ for line in sys.stdin:
         assert_eq!(tool_kind(JOB_OUTPUT_TOOL), ToolKind::Read);
         assert_eq!(tool_kind(PLAN_ENTER_TOOL), ToolKind::Write);
         assert_eq!(tool_kind(TASK_SPAWN_TOOL), ToolKind::Write);
-        assert_eq!(tool_kind("unknown"), ToolKind::Write, "unknown tools stay write-class");
+        assert_eq!(
+            tool_kind("unknown"),
+            ToolKind::Write,
+            "unknown tools stay write-class"
+        );
     }
 }

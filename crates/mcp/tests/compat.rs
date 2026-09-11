@@ -10,14 +10,14 @@ use std::time::SystemTime;
 
 use capability_broker::{CancellationToken, PolicyDocument, PolicySource, PolicyStack};
 use mcp::{
-    encode_list_request, parse_list_page, AuthorizedInvocation, AuthorizedResourceRead,
-    CatalogError, CatalogKind, CatalogMeta, CatalogTrust, ClientCapabilities, ExternalSource,
-    ImplementationInfo, IoBounds, LoopbackTransport, McpCatalogCache, McpServer, McpServerConfig,
-    McpServerId, McpSession, ProtocolVersion, PublishedExecutor, ServerError, ServerListResults,
-    ServerResourceContents, ServerToolResult, TransportError, TransportKind, MAX_FRAME_BYTES,
-    MCP_PRIOR_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION,
+    AuthorizedInvocation, AuthorizedResourceRead, CatalogError, CatalogKind, CatalogMeta,
+    CatalogTrust, ClientCapabilities, ExternalSource, ImplementationInfo, IoBounds,
+    LoopbackTransport, MAX_FRAME_BYTES, MCP_PRIOR_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION,
+    McpCatalogCache, McpServer, McpServerConfig, McpServerId, McpSession, ProtocolVersion,
+    PublishedExecutor, ServerError, ServerListResults, ServerResourceContents, ServerToolResult,
+    TransportError, TransportKind, encode_list_request, parse_list_page,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 const SECRET_CANARY: &str = "hunter2-capability-lease";
 

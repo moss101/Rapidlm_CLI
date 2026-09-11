@@ -259,7 +259,9 @@ mod tests {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         );
-        std::env::temp_dir().join("rapidlm-filekeychain").join(unique)
+        std::env::temp_dir()
+            .join("rapidlm-filekeychain")
+            .join(unique)
     }
 
     struct Fixture(PathBuf);
@@ -295,7 +297,10 @@ mod tests {
         // shorter — `write_owner_only` opens with `create` + `truncate`,
         // not `create_new`, specifically so this keeps working.
         keychain.put(&item(), b"short", &cancel).expect("re-put");
-        assert_eq!(keychain.get(&item(), &cancel).expect("get after re-put"), b"short");
+        assert_eq!(
+            keychain.get(&item(), &cancel).expect("get after re-put"),
+            b"short"
+        );
     }
 
     #[test]

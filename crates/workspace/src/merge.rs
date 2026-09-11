@@ -678,9 +678,10 @@ fn accept_preview(
         cancel,
     )?;
     if let Some(claimed) = claimed_hash
-        && claimed != preview_hash {
-            return Err(MergeError::UnknownVariant);
-        }
+        && claimed != preview_hash
+    {
+        return Err(MergeError::UnknownVariant);
+    }
     Ok(MergePreview {
         child_view_id,
         parent_view_id,

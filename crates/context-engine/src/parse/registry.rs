@@ -438,10 +438,9 @@ fn markdown_structure_valid(text: &str, budget: &ParseBudget) -> bool {
 fn bounded_text_scan(text: &str, budget: &ParseBudget, max_flow_depth: usize) -> bool {
     let mut depth = 0usize;
     for (i, ch) in text.chars().enumerate() {
-        if (i == 0 || i.is_multiple_of(CANCEL_STRIDE))
-            && budget.cancel.is_cancelled() {
-                return false;
-            }
+        if (i == 0 || i.is_multiple_of(CANCEL_STRIDE)) && budget.cancel.is_cancelled() {
+            return false;
+        }
         match ch {
             '{' | '[' => {
                 depth = depth.saturating_add(1);

@@ -711,9 +711,10 @@ impl BrowserObserver {
             .get(&session_id)
             .and_then(|cursor| cursor.current);
         if let Some(previous) = previous
-            && let Some(stored) = ledger.observations.get_mut(&previous) {
-                stored.superseded = true;
-            }
+            && let Some(stored) = ledger.observations.get_mut(&previous)
+        {
+            stored.superseded = true;
+        }
         let generation = {
             let cursor = ledger.sessions.entry(session_id).or_insert(SessionCursor {
                 generation: 0,
@@ -1538,10 +1539,12 @@ mod tests {
                 session.id(),
                 "https://app.example.test/home",
                 "Home",
-                vec![PageNode::interactive("button", "Logout")
-                    .expect("logout")
-                    .with_test_id("logout")
-                    .expect("id")],
+                vec![
+                    PageNode::interactive("button", "Logout")
+                        .expect("logout")
+                        .with_test_id("logout")
+                        .expect("id"),
+                ],
                 None,
             )
             .expect("nav");
@@ -1841,10 +1844,12 @@ mod tests {
                 session.id(),
                 "https://app.example.test/public",
                 "Public",
-                vec![PageNode::interactive("button", "Ok")
-                    .expect("ok")
-                    .with_test_id("ok")
-                    .expect("id")],
+                vec![
+                    PageNode::interactive("button", "Ok")
+                        .expect("ok")
+                        .with_test_id("ok")
+                        .expect("id"),
+                ],
                 Some(png(b"public-pixels")),
             )
             .expect("install");

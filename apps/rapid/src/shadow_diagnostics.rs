@@ -272,10 +272,15 @@ fn run_diagnostics_once(argv: &[String], cwd: &Path, timeout: Duration) -> (bool
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let output =
-                    crate::exec_tools::read_capped_bytes(&output_path, MAX_DIAGNOSTICS_OUTPUT_BYTES);
+                let output = crate::exec_tools::read_capped_bytes(
+                    &output_path,
+                    MAX_DIAGNOSTICS_OUTPUT_BYTES,
+                );
                 let _ = std::fs::remove_file(&output_path);
-                return (status.success(), truncate(&output, MAX_DIAGNOSTICS_OUTPUT_BYTES));
+                return (
+                    status.success(),
+                    truncate(&output, MAX_DIAGNOSTICS_OUTPUT_BYTES),
+                );
             }
             Ok(None) => {
                 if started.elapsed() > timeout {
@@ -324,14 +329,16 @@ mod tests {
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .expect("git");
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn seeded_repo(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rapidlm-shadow-test-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rapidlm-shadow-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         git(&dir, &["init", "-b", "main"]);
@@ -339,14 +346,23 @@ mod tests {
         git(&dir, &["add", "seed.txt"]);
         git(
             &dir,
-            &["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-m", "seed"],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t.invalid",
+                "commit",
+                "-m",
+                "seed",
+            ],
         );
         dir
     }
 
     #[test]
     fn parse_requires_a_nonempty_command() {
-        let value = serde_json::json!({ "shadow_diagnostics": { "command": [], "globs": ["*.py"] } });
+        let value =
+            serde_json::json!({ "shadow_diagnostics": { "command": [], "globs": ["*.py"] } });
         assert!(ShadowDiagnosticsConfig::parse(&value).is_none());
 
         let value = serde_json::json!({});
@@ -363,8 +379,10 @@ mod tests {
             "shadow_diagnostics": { "command": ["true"], "globs": ["*.py"] }
         });
         let config = ShadowDiagnosticsConfig::parse(&value).expect("parsed");
-        assert!(config.matches("a.py", |pattern, path| pattern == "*.py" && path.ends_with(".py")));
-        assert!(!config.matches("a.rs", |pattern, path| pattern == "*.py" && path.ends_with(".py")));
+        assert!(config.matches("a.py", |pattern, path| pattern == "*.py"
+            && path.ends_with(".py")));
+        assert!(!config.matches("a.rs", |pattern, path| pattern == "*.py"
+            && path.ends_with(".py")));
     }
 
     #[test]
@@ -377,8 +395,14 @@ mod tests {
         }))
         .expect("parsed");
         let outcome = verify_candidate(&root, "new.txt", b"hello\n", &config);
-        assert!(matches!(outcome, ShadowVerifyOutcome::Passed { .. }), "{outcome:?}");
-        assert!(!root.join("new.txt").exists(), "verify_candidate must never write the real tree");
+        assert!(
+            matches!(outcome, ShadowVerifyOutcome::Passed { .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            !root.join("new.txt").exists(),
+            "verify_candidate must never write the real tree"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -390,7 +414,10 @@ mod tests {
         }))
         .expect("parsed");
         let outcome = verify_candidate(&root, "broken.txt", b"bad\n", &config);
-        assert!(matches!(outcome, ShadowVerifyOutcome::Failed { .. }), "{outcome:?}");
+        assert!(
+            matches!(outcome, ShadowVerifyOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
         assert!(!root.join("broken.txt").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -406,7 +433,10 @@ mod tests {
         let ok = verify_candidate(&root, "check.txt", b"has MARKER inside\n", &config);
         assert!(matches!(ok, ShadowVerifyOutcome::Passed { .. }), "{ok:?}");
         let missing = verify_candidate(&root, "check.txt", b"nothing here\n", &config);
-        assert!(matches!(missing, ShadowVerifyOutcome::Failed { .. }), "{missing:?}");
+        assert!(
+            matches!(missing, ShadowVerifyOutcome::Failed { .. }),
+            "{missing:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -445,7 +475,10 @@ mod tests {
         }))
         .expect("parsed");
         let outcome = verify_candidate(&dir, "a.txt", b"x", &config);
-        assert!(matches!(outcome, ShadowVerifyOutcome::Skipped { .. }), "{outcome:?}");
+        assert!(
+            matches!(outcome, ShadowVerifyOutcome::Skipped { .. }),
+            "{outcome:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -19,10 +19,10 @@ use capability_broker::{CancellationToken, CanonicalHostPath, Capability, Capabi
 use protocol::{LeaseId, RepoPath, RuntimeId, SandboxTier};
 
 use crate::backend::{
-    supports_spec, BackendHealth, HealthReason, IsolationStrength, MountCapability, MountMode,
-    NetworkCapability, ResourceCapability, ResourceUsage, SandboxBackend, SandboxCapabilities,
-    SandboxError, SandboxExecRequest, SandboxExecResult, SandboxExit, SandboxExitReason,
-    SandboxHandle, SandboxId, SandboxMount, SandboxNetwork, SandboxSpec,
+    BackendHealth, HealthReason, IsolationStrength, MountCapability, MountMode, NetworkCapability,
+    ResourceCapability, ResourceUsage, SandboxBackend, SandboxCapabilities, SandboxError,
+    SandboxExecRequest, SandboxExecResult, SandboxExit, SandboxExitReason, SandboxHandle,
+    SandboxId, SandboxMount, SandboxNetwork, SandboxSpec, supports_spec,
 };
 
 /// Maximum prepared gVisor sandboxes retained by one backend.
@@ -470,7 +470,10 @@ impl GvisorPlan {
     pub fn uses_host_rootfs(&self) -> bool {
         !self.least_mounts
             || self.args.iter().any(|part| part == "do")
-            || self.binds.iter().any(|bind| bind.source.as_deref() == Some("/"))
+            || self
+                .binds
+                .iter()
+                .any(|bind| bind.source.as_deref() == Some("/"))
     }
 
     fn program_is_docker(&self) -> bool {
@@ -787,9 +790,10 @@ fn resolve_cwd(cwd: &RepoPath, mounts: &[SandboxMount]) -> Result<CanonicalHostP
             continue;
         }
         if let Some(prefix_len) = target_covers(mount.target(), cwd)
-            && best.is_none_or(|(_, len)| prefix_len > len) {
-                best = Some((mount, prefix_len));
-            }
+            && best.is_none_or(|(_, len)| prefix_len > len)
+        {
+            best = Some((mount, prefix_len));
+        }
     }
     let (mount, _) = best.ok_or(SandboxError::ForbiddenMount)?;
     let source = mount.source().ok_or(SandboxError::InvalidSpec)?;
@@ -1004,14 +1008,23 @@ fn cpu_limit_seconds(cpu_millis: u32) -> u64 {
 }
 
 fn memory_limit_bytes(memory_mb: u32) -> u64 {
-    u64::from(memory_mb).saturating_mul(1024).saturating_mul(1024)
+    u64::from(memory_mb)
+        .saturating_mul(1024)
+        .saturating_mul(1024)
 }
 
-fn runsc_version(program: &str, cancel: &CancellationToken) -> Result<Option<String>, SandboxError> {
+fn runsc_version(
+    program: &str,
+    cancel: &CancellationToken,
+) -> Result<Option<String>, SandboxError> {
     let Some(output) = run_bounded_output(program, &["--version"], cancel)? else {
         return Ok(None);
     };
-    let text = if output.0.is_empty() { output.1 } else { output.0 };
+    let text = if output.0.is_empty() {
+        output.1
+    } else {
+        output.0
+    };
     let line = match text.lines().next() {
         Some(line) => line,
         None => return Ok(None),
@@ -1148,8 +1161,17 @@ fn probe_private_rootfs(
     if binds.is_empty() {
         return Ok(false);
     }
-    if !run_probe_bundle(program, platform, &binds, &[true_bin], "/", 1_000, 256, 32, cancel)?
-    {
+    if !run_probe_bundle(
+        program,
+        platform,
+        &binds,
+        &[true_bin],
+        "/",
+        1_000,
+        256,
+        32,
+        cancel,
+    )? {
         return Ok(false);
     }
     if host_sensitive_visible(program, platform, &binds, cancel)? {
@@ -1182,20 +1204,20 @@ fn host_sensitive_visible(
         }
         if let Ok(home) = std::env::var("HOME")
             && !home.is_empty()
-                && run_probe_bundle(
-                    program,
-                    platform,
-                    binds,
-                    &[test_bin, "-e", &home],
-                    "/",
-                    1_000,
-                    256,
-                    32,
-                    cancel,
-                )?
-            {
-                return Ok(true);
-            }
+            && run_probe_bundle(
+                program,
+                platform,
+                binds,
+                &[test_bin, "-e", &home],
+                "/",
+                1_000,
+                256,
+                32,
+                cancel,
+            )?
+        {
+            return Ok(true);
+        }
         return Ok(false);
     }
     if let Some(ls) = first_existing(LS_PROGRAMS) {
@@ -1577,9 +1599,7 @@ fn create_bundle(
         }
     }
     let cid = format!("rlm{}", RuntimeId::new()).replace('-', "");
-    let spec = match write_oci_spec(
-        &rootfs, binds, argv, cwd, cpu_millis, memory_mb, pids,
-    ) {
+    let spec = match write_oci_spec(&rootfs, binds, argv, cwd, cpu_millis, memory_mb, pids) {
         Ok(spec) => spec,
         Err(err) => {
             let _ = fs::remove_dir_all(&root);
@@ -2031,15 +2051,12 @@ fn pgrep_group(pgid: u32) -> Option<Vec<u32>> {
     let mut pids = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         if let Ok(pid) = line.trim().parse::<u32>()
-            && pid >= 2 {
-                pids.push(pid);
-            }
+            && pid >= 2
+        {
+            pids.push(pid);
+        }
     }
-    if pids.is_empty() {
-        None
-    } else {
-        Some(pids)
-    }
+    if pids.is_empty() { None } else { Some(pids) }
 }
 
 fn ps_group(pgid: u32) -> Option<Vec<u32>> {
@@ -2068,11 +2085,7 @@ fn ps_group(pgid: u32) -> Option<Vec<u32>> {
             pids.push(pid);
         }
     }
-    if pids.is_empty() {
-        None
-    } else {
-        Some(pids)
-    }
+    if pids.is_empty() { None } else { Some(pids) }
 }
 
 fn pid_rss_kb(pid: u32) -> Option<u64> {
@@ -2135,13 +2148,13 @@ fn check_cancel(cancel: &CancellationToken) -> Result<(), SandboxError> {
 mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use capability_broker::{
-        evaluate, issue, request_approval, ActionRequest, ApprovalChoice, ApprovalResolution,
-        ApprovalScopeId, CanonicalAction, FilesystemScope, LeaseIssuer, PolicyDocument,
-        PolicySource, PolicyStack, PrincipalRef, ProcessScope, ResourceDescriptor, SecretHandle,
+        ActionRequest, ApprovalChoice, ApprovalResolution, ApprovalScopeId, CanonicalAction,
+        FilesystemScope, LeaseIssuer, PolicyDocument, PolicySource, PolicyStack, PrincipalRef,
+        ProcessScope, ResourceDescriptor, SecretHandle, evaluate, issue, request_approval,
     };
     use protocol::{ErrorCode, SessionId};
 
@@ -2393,9 +2406,10 @@ capability = "fs.read"
         assert!(plan.program().ends_with("runsc"));
         assert!(plan.bind_sources().all(|src| src != "/"));
         assert!(plan.bind_sources().all(|src| !is_docker_socket(src)));
-        assert!(plan
-            .bind_sources()
-            .all(|src| !is_forbidden_host_source(src) || SYSTEM_RO_BINDS.contains(&src)));
+        assert!(
+            plan.bind_sources()
+                .all(|src| !is_forbidden_host_source(src) || SYSTEM_RO_BINDS.contains(&src))
+        );
     }
 
     #[test]
@@ -2554,12 +2568,16 @@ capability = "fs.read"
             backend.prepare(&spec, &lease, &live).expect_err("etc"),
             SandboxError::ForbiddenMount
         );
-        assert!(!SandboxError::ForbiddenMount
-            .as_str()
-            .contains("docker.sock"));
-        assert!(!SandboxError::ForbiddenMount
-            .as_str()
-            .contains("canary-home"));
+        assert!(
+            !SandboxError::ForbiddenMount
+                .as_str()
+                .contains("docker.sock")
+        );
+        assert!(
+            !SandboxError::ForbiddenMount
+                .as_str()
+                .contains("canary-home")
+        );
         assert!(!SandboxError::ForbiddenMount.as_str().contains(CANARY));
         assert_eq!(
             SandboxError::ForbiddenMount.error_code(),
@@ -2597,26 +2615,26 @@ capability = "fs.read"
         );
 
         if let Ok(home) = std::env::var("HOME")
-            && !home.is_empty() && Path::new(&home).is_dir() {
-                let home_ws = TempWorkspace::new();
-                let via_home = home_ws.path.join("via");
-                std::os::unix::fs::symlink(&home, &via_home).expect("symlink home");
-                let home_host = CanonicalHostPath::from_resolved(via_home.to_str().expect("utf8"))
-                    .expect("home host");
-                let home_spec = SandboxSpec::builder(SandboxTier::Gvisor)
-                    .cwd(cwd())
-                    .mount(
-                        SandboxMount::bind(home_host, cwd(), MountMode::ReadWrite).expect("bind"),
-                    )
-                    .build()
-                    .expect("home spec");
-                assert_eq!(
-                    backend
-                        .prepare(&home_spec, &lease, &live)
-                        .expect_err("home symlink"),
-                    SandboxError::ForbiddenMount
-                );
-            }
+            && !home.is_empty()
+            && Path::new(&home).is_dir()
+        {
+            let home_ws = TempWorkspace::new();
+            let via_home = home_ws.path.join("via");
+            std::os::unix::fs::symlink(&home, &via_home).expect("symlink home");
+            let home_host = CanonicalHostPath::from_resolved(via_home.to_str().expect("utf8"))
+                .expect("home host");
+            let home_spec = SandboxSpec::builder(SandboxTier::Gvisor)
+                .cwd(cwd())
+                .mount(SandboxMount::bind(home_host, cwd(), MountMode::ReadWrite).expect("bind"))
+                .build()
+                .expect("home spec");
+            assert_eq!(
+                backend
+                    .prepare(&home_spec, &lease, &live)
+                    .expect_err("home symlink"),
+                SandboxError::ForbiddenMount
+            );
+        }
 
         let cwd_ws = TempWorkspace::new();
         std::os::unix::fs::symlink("/etc", cwd_ws.path.join("escape")).expect("cwd symlink");
@@ -2638,13 +2656,14 @@ capability = "fs.read"
         let spec = gvisor_spec(&ws);
         let plan = GvisorPlan::from_spec(&spec).expect("plan");
         if let Ok(home) = std::env::var("HOME")
-            && !home.is_empty() {
-                assert!(
-                    plan.bind_sources().all(|src| src != home.as_str()
-                        && !src.starts_with(&format!("{}/", home.trim_end_matches('/')))),
-                    "host home must not be a bind source"
-                );
-            }
+            && !home.is_empty()
+        {
+            assert!(
+                plan.bind_sources().all(|src| src != home.as_str()
+                    && !src.starts_with(&format!("{}/", home.trim_end_matches('/')))),
+                "host home must not be a bind source"
+            );
+        }
         assert!(!plan.uses_docker_socket());
         assert!(!plan.shares_host_network());
         assert!(!plan.uses_host_rootfs());
@@ -2701,10 +2720,11 @@ capability = "fs.read"
             && src != "/private/etc"
             && !src.starts_with("/private/etc/")));
         if let Ok(home) = std::env::var("HOME")
-            && !home.is_empty() {
-                assert!(plan.bind_sources().all(|src| src != home.as_str()
-                    && !src.starts_with(&format!("{}/", home.trim_end_matches('/')))));
-            }
+            && !home.is_empty()
+        {
+            assert!(plan.bind_sources().all(|src| src != home.as_str()
+                && !src.starts_with(&format!("{}/", home.trim_end_matches('/')))));
+        }
 
         let live = CancellationToken::new();
         let Some(_) = live_runtime(&backend) else {
@@ -2733,7 +2753,9 @@ capability = "fs.read"
         for path in ["/etc", "/etc/passwd", "/var/run/docker.sock"] {
             let request =
                 SandboxExecRequest::new([ls, path], Duration::from_secs(2), 4096).expect("req");
-            let result = backend.exec(&handle, &request, &lease, &live).expect("exec");
+            let result = backend
+                .exec(&handle, &request, &lease, &live)
+                .expect("exec");
             assert_ne!(
                 result.exit().code(),
                 Some(0),
@@ -2746,7 +2768,11 @@ capability = "fs.read"
         let result = backend
             .exec(&handle, &request, &lease, &live)
             .expect("home exec");
-        assert_ne!(result.exit().code(), Some(0), "host home must be unreachable");
+        assert_ne!(
+            result.exit().code(),
+            Some(0),
+            "host home must be unreachable"
+        );
         backend.destroy(&handle, &live).expect("destroy");
     }
 

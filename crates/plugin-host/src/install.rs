@@ -17,7 +17,7 @@ use capability_broker::CancellationToken;
 use protocol::{ApiError, ArtifactId, ErrorCode, TraceId};
 
 use crate::manifest::{
-    parse_manifest, validate_for_install, ManifestError, PluginId, PluginManifest,
+    ManifestError, PluginId, PluginManifest, parse_manifest, validate_for_install,
 };
 use crate::trust::{
     ExtensionIdentity, ExtensionObservation, ExtensionTrustRecord, ExtensionTrustStore,
@@ -517,18 +517,20 @@ impl PluginInstaller {
             return Err(InstallError::HashMismatch);
         }
         if let Some(expected) = request.policy.expected_hash
-            && expected != package_hash {
-                return Err(InstallError::HashMismatch);
-            }
+            && expected != package_hash
+        {
+            return Err(InstallError::HashMismatch);
+        }
         if request.policy.signature_required() && request.signature.is_none() {
             self.record_quarantine(&manifest, request, package_hash, cancel)?;
             return Err(InstallError::Quarantined);
         }
         if let Some(expected) = request.policy.expected_signature
-            && request.signature != Some(expected) {
-                self.record_quarantine(&manifest, request, package_hash, cancel)?;
-                return Err(InstallError::Quarantined);
-            }
+            && request.signature != Some(expected)
+        {
+            self.record_quarantine(&manifest, request, package_hash, cancel)?;
+            return Err(InstallError::Quarantined);
+        }
         check_policy(&manifest, &request.policy)?;
         let mut identity = ExtensionIdentity::from_binding(&manifest.trust_binding());
         if let Some(signature) = request.signature {
@@ -1171,12 +1173,14 @@ mod tests {
             Err(InstallError::Cancelled)
         );
         assert!(!installer.is_active("acme.fmt", &live()).expect("query"));
-        assert!(installer
-            .staging
-            .read_dir()
-            .expect("staging")
-            .next()
-            .is_none());
+        assert!(
+            installer
+                .staging
+                .read_dir()
+                .expect("staging")
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1328,13 +1332,9 @@ mod tests {
             Err(TrustError::Untrusted)
         );
 
-        let rejected_missing = ExtensionIdentity::new(
-            "acme.fmt",
-            "1.5.0",
-            "acme",
-            &digest(&unsigned).to_string(),
-        )
-        .expect("rejected missing");
+        let rejected_missing =
+            ExtensionIdentity::new("acme.fmt", "1.5.0", "acme", &digest(&unsigned).to_string())
+                .expect("rejected missing");
         assert_eq!(
             installer.trust().authorize_executable(
                 &rejected_missing,
@@ -1561,10 +1561,12 @@ mod tests {
                 installer.install(&request(&package_bytes()), &live()),
                 Err(InstallError::UnsafePath)
             );
-            assert!(fs::symlink_metadata(&dest)
-                .expect("meta")
-                .file_type()
-                .is_symlink());
+            assert!(
+                fs::symlink_metadata(&dest)
+                    .expect("meta")
+                    .file_type()
+                    .is_symlink()
+            );
             assert!(outside.read_dir().expect("outside").next().is_none());
         }
     }
@@ -1632,10 +1634,7 @@ mod tests {
 
         let v2 = b"not-a-wasm-module-fixture-plugin-v2".to_vec();
         let receipt = installer
-            .update(
-                &request_at(&v2, "1.3.0", pinned_source(), later()),
-                &live(),
-            )
+            .update(&request_at(&v2, "1.3.0", pinned_source(), later()), &live())
             .expect("update");
         assert_eq!(receipt.package_hash(), digest(&v2));
         assert!(installer.is_active("acme.fmt", &live()).expect("active"));
@@ -1687,10 +1686,7 @@ mod tests {
         installer.disable("acme.fmt", &live()).expect("disable");
         let v2 = b"updated-package-bytes-v2".to_vec();
         installer
-            .update(
-                &request_at(&v2, "2.0.0", pinned_source(), later()),
-                &live(),
-            )
+            .update(&request_at(&v2, "2.0.0", pinned_source(), later()), &live())
             .expect("update while disabled");
         assert!(
             !installer.is_active("acme.fmt", &live()).expect("active"),

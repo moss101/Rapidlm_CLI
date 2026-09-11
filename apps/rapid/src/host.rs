@@ -38,9 +38,7 @@ use context_engine::compile::{
 use llm_router::fallback::{
     AttemptProgress, FallbackAction, FallbackController, FallbackPlan, FallbackTrigger,
 };
-use llm_router::provider::{
-    CancellationToken as RouterCancellationToken, ModelRef, ProviderError,
-};
+use llm_router::provider::{CancellationToken as RouterCancellationToken, ModelRef, ProviderError};
 use protocol::{ArtifactId, ArtifactRef, EvidenceId, WorkspaceViewId};
 
 /// Hard byte cap for the goal statement.
@@ -191,9 +189,9 @@ impl PreservedLiveContext {
 
     /// Attach the always-loaded memory index (`.rapidlm/MEMORY.md`).
     pub fn with_memory_index(mut self, memory: Option<String>) -> Self {
-        let within_bounds = memory.as_ref().is_none_or(|text| {
-            !text.is_empty() && text.len() <= MAX_MEMORY_INDEX_BYTES
-        });
+        let within_bounds = memory
+            .as_ref()
+            .is_none_or(|text| !text.is_empty() && text.len() <= MAX_MEMORY_INDEX_BYTES);
         if within_bounds {
             self.memory_index = memory;
         }
@@ -209,9 +207,9 @@ impl PreservedLiveContext {
     /// of only living in the transcript (Modbit `AGT-016`). Same bounds
     /// discipline as `with_memory_index`.
     pub fn with_todos_index(mut self, todos: Option<String>) -> Self {
-        let within_bounds = todos.as_ref().is_none_or(|text| {
-            !text.is_empty() && text.len() <= MAX_MEMORY_INDEX_BYTES
-        });
+        let within_bounds = todos
+            .as_ref()
+            .is_none_or(|text| !text.is_empty() && text.len() <= MAX_MEMORY_INDEX_BYTES);
         if within_bounds {
             self.todos_index = todos;
         }
@@ -228,9 +226,9 @@ impl PreservedLiveContext {
     /// `LiveContextModelDriver::step` on every step as the pattern
     /// appears/resolves — never by a caller directly.
     fn with_stall_warning(mut self, warning: Option<String>) -> Self {
-        let within_bounds = warning.as_ref().is_none_or(|text| {
-            !text.is_empty() && text.len() <= MAX_STALL_WARNING_BYTES
-        });
+        let within_bounds = warning
+            .as_ref()
+            .is_none_or(|text| !text.is_empty() && text.len() <= MAX_STALL_WARNING_BYTES);
         if within_bounds {
             self.stall_warning = warning;
         }
@@ -244,9 +242,9 @@ impl PreservedLiveContext {
     /// Attach the rendered dynamic system prompt for this turn. Empty or
     /// oversized blocks are refused at the caller; None adds no block.
     pub fn with_system_prompt(mut self, system_prompt: Option<String>) -> Self {
-        let within_bounds = system_prompt.as_ref().is_none_or(|text| {
-            !text.is_empty() && text.len() <= MAX_SYSTEM_PROMPT_BLOCK_BYTES
-        });
+        let within_bounds = system_prompt
+            .as_ref()
+            .is_none_or(|text| !text.is_empty() && text.len() <= MAX_SYSTEM_PROMPT_BLOCK_BYTES);
         if within_bounds {
             self.system_prompt = system_prompt;
         }
@@ -390,13 +388,22 @@ impl ContextController for LiveRecoveryController {
                 .max(1);
             let soft_tokens = hard_tokens.saturating_mul(4) / 5;
             let soft_tokens = soft_tokens.clamp(1, hard_tokens.saturating_sub(1).max(1));
-            let policy = match CompactionPolicy::new(soft_tokens, hard_tokens, CompactionStrategy::ModelPreferred) {
+            let policy = match CompactionPolicy::new(
+                soft_tokens,
+                hard_tokens,
+                CompactionStrategy::ModelPreferred,
+            ) {
                 Ok(policy) => policy,
                 Err(_) => return ContextRecoveryDecision::NotRecoverable,
             };
-            let outcome = match compact_with_policy(live.packet(), &policy, None, &CeCancel::new()) {
+            let outcome = match compact_with_policy(live.packet(), &policy, None, &CeCancel::new())
+            {
                 Ok(outcome) => outcome,
-                Err(CompactPolicyError::StillOverHard { .. } | CompactPolicyError::InvalidPacket | CompactPolicyError::Cancelled) => {
+                Err(
+                    CompactPolicyError::StillOverHard { .. }
+                    | CompactPolicyError::InvalidPacket
+                    | CompactPolicyError::Cancelled,
+                ) => {
                     return ContextRecoveryDecision::NotRecoverable;
                 }
             };
@@ -765,7 +772,10 @@ impl CostAccumulator {
 
     fn total(&self) -> Option<u64> {
         if self.any_reported.load(std::sync::atomic::Ordering::Relaxed) {
-            Some(self.sum_usd_micros.load(std::sync::atomic::Ordering::Relaxed))
+            Some(
+                self.sum_usd_micros
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
         } else {
             None
         }
@@ -801,7 +811,8 @@ const STALL_REPEAT_THRESHOLD: usize = 3;
 /// is further follow-up, not attempted here — see `newtask.md` §2.5.
 fn detect_stall(history: &[agent_runtime::ToolStepExchange]) -> Option<String> {
     let window_start = history.len().saturating_sub(STALL_WINDOW);
-    let mut counts: std::collections::BTreeMap<(&str, &str), usize> = std::collections::BTreeMap::new();
+    let mut counts: std::collections::BTreeMap<(&str, &str), usize> =
+        std::collections::BTreeMap::new();
     for exchange in &history[window_start..] {
         for call in exchange.calls() {
             *counts.entry((call.tool(), call.arguments())).or_insert(0) += 1;
@@ -1052,7 +1063,11 @@ impl<B: LiveModelCall> FallbackChainModel<B> {
     /// model `controller.chain()` can ever name — the composition root
     /// builds both from the same resolved `[models] fallback` list, so this
     /// invariant holds by construction.
-    pub fn new(backends: Vec<(ModelRef, B)>, controller: FallbackController, diag: Option<StepDiag>) -> Self {
+    pub fn new(
+        backends: Vec<(ModelRef, B)>,
+        controller: FallbackController,
+        diag: Option<StepDiag>,
+    ) -> Self {
         Self {
             backends,
             controller,
@@ -1124,8 +1139,12 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
             let err = match result {
                 Ok(output) => {
                     let cost = match &output {
-                        ModelStepOutput::Terminal { cost_usd_micros, .. }
-                        | ModelStepOutput::ToolCalls { cost_usd_micros, .. } => *cost_usd_micros,
+                        ModelStepOutput::Terminal {
+                            cost_usd_micros, ..
+                        }
+                        | ModelStepOutput::ToolCalls {
+                            cost_usd_micros, ..
+                        } => *cost_usd_micros,
                     };
                     if let Some(cost) = cost {
                         *self
@@ -1133,7 +1152,10 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                             .entry(model_label(&current))
                             .or_insert(0) += cost;
                     }
-                    self.diag_line(format!("fallback model={} outcome=ok", model_label(&current)));
+                    self.diag_line(format!(
+                        "fallback model={} outcome=ok",
+                        model_label(&current)
+                    ));
                     return Ok(output);
                 }
                 Err(ModelStepError::Cancelled) => return Err(ModelStepError::Cancelled),
@@ -1141,20 +1163,27 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
             };
             let trigger = to_fallback_trigger(&err);
             let router_cancel = RouterCancellationToken::new();
-            let plan = match self.controller.plan(&trigger, AttemptProgress::PreResponse, &router_cancel) {
-                Ok(plan) => plan,
-                // The controller itself failed closed (e.g. an internal
-                // bound) — surface the original error rather than a
-                // second-order fallback failure the caller can't act on.
-                Err(_) => return Err(err),
-            };
+            let plan =
+                match self
+                    .controller
+                    .plan(&trigger, AttemptProgress::PreResponse, &router_cancel)
+                {
+                    Ok(plan) => plan,
+                    // The controller itself failed closed (e.g. an internal
+                    // bound) — surface the original error rather than a
+                    // second-order fallback failure the caller can't act on.
+                    Err(_) => return Err(err),
+                };
             // apply() only fails on a stale/already-terminal plan, neither
             // of which is reachable here (plan was just computed fresh from
             // the controller's own current state) — best-effort, never
             // panics either way.
             let _ = self.controller.apply(&plan);
             match &plan {
-                FallbackPlan::PreResponse { action: FallbackAction::RetrySame { backoff_ms, .. }, .. } => {
+                FallbackPlan::PreResponse {
+                    action: FallbackAction::RetrySame { backoff_ms, .. },
+                    ..
+                } => {
                     self.diag_line(format!(
                         "fallback model={} outcome=retry backoff_ms={backoff_ms}",
                         model_label(&current)
@@ -1170,7 +1199,10 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                         return Err(ModelStepError::Cancelled);
                     }
                 }
-                FallbackPlan::PreResponse { action: FallbackAction::FallbackTo { to, backoff_ms, .. }, .. } => {
+                FallbackPlan::PreResponse {
+                    action: FallbackAction::FallbackTo { to, backoff_ms, .. },
+                    ..
+                } => {
                     self.diag_line(format!(
                         "fallback model={} -> {} backoff_ms={backoff_ms}",
                         model_label(&current),
@@ -1187,7 +1219,10 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                         return Err(ModelStepError::Cancelled);
                     }
                 }
-                FallbackPlan::PreResponse { action: FallbackAction::Stop { reason, .. }, .. } => {
+                FallbackPlan::PreResponse {
+                    action: FallbackAction::Stop { reason, .. },
+                    ..
+                } => {
                     self.diag_line(format!(
                         "fallback model={} outcome=stop reason={}",
                         model_label(&current),
@@ -1202,7 +1237,8 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                     });
                     return Err(err);
                 }
-                FallbackPlan::PartiallyStreamed { reason, .. } | FallbackPlan::ToolSideEffect { reason, .. } => {
+                FallbackPlan::PartiallyStreamed { reason, .. }
+                | FallbackPlan::ToolSideEffect { reason, .. } => {
                     self.diag_line(format!(
                         "fallback model={} outcome=stop reason={}",
                         model_label(&current),
@@ -1245,10 +1281,14 @@ fn to_fallback_trigger(err: &ModelStepError) -> FallbackTrigger {
             FailureCause::Auth => ProviderError::AuthFailed,
             FailureCause::Connection => ProviderError::Connection,
             FailureCause::Rejected => ProviderError::InvalidRequest,
-            FailureCause::Transient { retry_after_ms: Some(after) } => {
-                ProviderError::RateLimited { retry_after_ms: Some(*after) }
-            }
-            FailureCause::Transient { retry_after_ms: None } => ProviderError::Transient,
+            FailureCause::Transient {
+                retry_after_ms: Some(after),
+            } => ProviderError::RateLimited {
+                retry_after_ms: Some(*after),
+            },
+            FailureCause::Transient {
+                retry_after_ms: None,
+            } => ProviderError::Transient,
             FailureCause::Unspecified => ProviderError::Permanent,
             // #[non_exhaustive]: an unrecognized future cause fails closed
             // rather than being guessed into a retryable class.
@@ -1499,22 +1539,13 @@ pub fn build_packet(
         .task("live agent turn")
         .goal(preserved.goal_statement.clone());
     if let Some(system_prompt) = preserved.system_prompt() {
-        ctx = ctx.system(CompileInput::new(
-            "system/prompt",
-            system_prompt.to_owned(),
-        ));
+        ctx = ctx.system(CompileInput::new("system/prompt", system_prompt.to_owned()));
     }
     if let Some(memory) = preserved.memory_index() {
-        ctx = ctx.system(CompileInput::new(
-            "memory/index",
-            memory.to_owned(),
-        ));
+        ctx = ctx.system(CompileInput::new("memory/index", memory.to_owned()));
     }
     if let Some(todos) = preserved.todos_index() {
-        ctx = ctx.system(CompileInput::new(
-            "plan/todos",
-            todos.to_owned(),
-        ));
+        ctx = ctx.system(CompileInput::new("plan/todos", todos.to_owned()));
     }
     if let Some(warning) = preserved.stall_warning() {
         ctx = ctx.system(CompileInput::new(
@@ -1538,9 +1569,10 @@ pub fn build_packet(
         ctx = ctx.goal_block(CompileInput::new("criterion", criterion.clone()));
     }
     if let Some(summary) = summary
-        && !summary.is_empty() {
-            ctx = ctx.memory(CompileInput::new("context/compaction", summary.to_owned()));
-        }
+        && !summary.is_empty()
+    {
+        ctx = ctx.memory(CompileInput::new("context/compaction", summary.to_owned()));
+    }
     if let Some(reminders) = preserved.reminders_block() {
         ctx = ctx.system(CompileInput::new("reminders/active", reminders.to_owned()));
     }
@@ -1614,7 +1646,10 @@ mod tests {
             exchange("repo_read", r#"{"path":"a.rs"}"#),
         ];
         for i in 0..STALL_WINDOW {
-            history.push(exchange("repo_read", &format!(r#"{{"path":"distinct-{i}.rs"}}"#)));
+            history.push(exchange(
+                "repo_read",
+                &format!(r#"{{"path":"distinct-{i}.rs"}}"#),
+            ));
         }
         assert!(
             detect_stall(&history).is_none(),
@@ -1691,11 +1726,15 @@ mod tests {
     }
 
     fn auth_failure() -> Result<ModelStepOutput, ModelStepError> {
-        Err(ModelStepError::ProviderFailed { cause: FailureCause::Auth })
+        Err(ModelStepError::ProviderFailed {
+            cause: FailureCause::Auth,
+        })
     }
 
     fn connection_failure() -> Result<ModelStepOutput, ModelStepError> {
-        Err(ModelStepError::ProviderFailed { cause: FailureCause::Connection })
+        Err(ModelStepError::ProviderFailed {
+            cause: FailureCause::Connection,
+        })
     }
 
     fn step_input() -> ModelStepInput<'static> {
@@ -1735,7 +1774,12 @@ mod tests {
         let err = chain
             .step(&[], &step_input(), &CancellationToken::new())
             .expect_err("no alternate configured, must stay a typed failure");
-        assert_eq!(err, ModelStepError::ProviderFailed { cause: FailureCause::Auth });
+        assert_eq!(
+            err,
+            ModelStepError::ProviderFailed {
+                cause: FailureCause::Auth
+            }
+        );
     }
 
     #[test]
@@ -1857,8 +1901,7 @@ mod tests {
         let primary_ref = model_ref("b-ai", "deepseek");
         let controller = chain_controller(primary_ref.clone(), Vec::new());
         let primary = ScriptedBacking::new(vec![auth_failure(), auth_failure()]);
-        let mut chain =
-            FallbackChainModel::new(vec![(primary_ref, primary)], controller, None);
+        let mut chain = FallbackChainModel::new(vec![(primary_ref, primary)], controller, None);
 
         let _ = chain.step(&[], &step_input(), &CancellationToken::new());
         chain.set_policy_version(Some("deadbeefcafef00d".to_owned()));
@@ -1908,10 +1951,22 @@ mod tests {
         // captured, not just diagnosed to stderr.
         let decisions = chain.decisions().snapshot();
         assert_eq!(decisions.len(), 3, "{decisions:?}");
-        assert!(matches!(decisions[0].reason, RouterDecisionReason::RetrySame));
-        assert!(matches!(decisions[1].reason, RouterDecisionReason::RetrySame));
-        assert!(matches!(decisions[2].reason, RouterDecisionReason::FallbackTo));
-        assert!(decisions[2].resolved_model.contains("ling-3"), "{decisions:?}");
+        assert!(matches!(
+            decisions[0].reason,
+            RouterDecisionReason::RetrySame
+        ));
+        assert!(matches!(
+            decisions[1].reason,
+            RouterDecisionReason::RetrySame
+        ));
+        assert!(matches!(
+            decisions[2].reason,
+            RouterDecisionReason::FallbackTo
+        ));
+        assert!(
+            decisions[2].resolved_model.contains("ling-3"),
+            "{decisions:?}"
+        );
     }
 
     #[test]
@@ -1929,7 +1984,12 @@ mod tests {
         let err = chain
             .step(&[], &step_input(), &CancellationToken::new())
             .expect_err("both backends fail, chain exhausted");
-        assert_eq!(err, ModelStepError::ProviderFailed { cause: FailureCause::Auth });
+        assert_eq!(
+            err,
+            ModelStepError::ProviderFailed {
+                cause: FailureCause::Auth
+            }
+        );
     }
 
     #[test]
@@ -2037,15 +2097,28 @@ mod tests {
             .iter()
             .find(|b| b.text().contains("budget-guard"))
             .expect("reminders block in packet");
-        assert_eq!(reminders.source(), context_engine::compile::ContextSource::System);
+        assert_eq!(
+            reminders.source(),
+            context_engine::compile::ContextSource::System
+        );
         // Out-of-bounds blocks are refused: nothing enters the packet.
         let oversized = "x".repeat(MAX_REMINDERS_BLOCK_BYTES + 1);
         let with_oversized = preserved().with_reminders_block(Some(oversized));
         let packet = build_packet(&with_oversized, None).expect("packet");
-        assert!(packet.blocks().iter().all(|b| !b.text().contains("reminders schema")));
+        assert!(
+            packet
+                .blocks()
+                .iter()
+                .all(|b| !b.text().contains("reminders schema"))
+        );
         // None adds no block.
         let packet = build_packet(&preserved(), None).expect("packet");
-        assert!(packet.blocks().iter().all(|b| !b.text().contains("reminders schema")));
+        assert!(
+            packet
+                .blocks()
+                .iter()
+                .all(|b| !b.text().contains("reminders schema"))
+        );
     }
 
     #[test]
@@ -2058,32 +2131,52 @@ mod tests {
             .iter()
             .find(|b| b.text().contains("wire the thing"))
             .expect("todos block in packet");
-        assert_eq!(block.source(), context_engine::compile::ContextSource::System);
+        assert_eq!(
+            block.source(),
+            context_engine::compile::ContextSource::System
+        );
         // None adds no block.
         let packet = build_packet(&preserved(), None).expect("packet");
-        assert!(packet.blocks().iter().all(|b| !b.text().contains("wire the thing")));
+        assert!(
+            packet
+                .blocks()
+                .iter()
+                .all(|b| !b.text().contains("wire the thing"))
+        );
     }
 
     #[test]
     fn stall_warning_is_compiled_into_the_packet_as_a_system_block() {
-        let with_warning =
-            preserved().with_stall_warning(Some("repo_read repeated 3x".to_owned()));
+        let with_warning = preserved().with_stall_warning(Some("repo_read repeated 3x".to_owned()));
         let packet = build_packet(&with_warning, None).expect("packet");
         let block = packet
             .blocks()
             .iter()
             .find(|b| b.text().contains("repo_read repeated 3x"))
             .expect("stall block in packet");
-        assert_eq!(block.source(), context_engine::compile::ContextSource::System);
+        assert_eq!(
+            block.source(),
+            context_engine::compile::ContextSource::System
+        );
         assert!(block.text().starts_with("Stall detected:"));
         // Out-of-bounds is refused: nothing enters the packet.
         let oversized = "x".repeat(MAX_STALL_WARNING_BYTES + 1);
         let with_oversized = preserved().with_stall_warning(Some(oversized));
         let packet = build_packet(&with_oversized, None).expect("packet");
-        assert!(packet.blocks().iter().all(|b| !b.text().contains("Stall detected")));
+        assert!(
+            packet
+                .blocks()
+                .iter()
+                .all(|b| !b.text().contains("Stall detected"))
+        );
         // None adds no block.
         let packet = build_packet(&preserved(), None).expect("packet");
-        assert!(packet.blocks().iter().all(|b| !b.text().contains("Stall detected")));
+        assert!(
+            packet
+                .blocks()
+                .iter()
+                .all(|b| !b.text().contains("Stall detected"))
+        );
     }
 
     #[test]
@@ -2098,7 +2191,11 @@ mod tests {
             preserved: base,
             summary: None,
         }));
-        let backing = ScriptedBacking::new(vec![ok_terminal("s1"), ok_terminal("s2"), ok_terminal("s3")]);
+        let backing = ScriptedBacking::new(vec![
+            ok_terminal("s1"),
+            ok_terminal("s2"),
+            ok_terminal("s3"),
+        ]);
         let mut driver = LiveContextModelDriver {
             live: Rc::clone(&live),
             backing,
@@ -2109,7 +2206,13 @@ mod tests {
             .step(&ModelStepInput::without_tools(1), &CancellationToken::new())
             .expect("step 1");
         assert!(live.borrow().preserved().stall_warning().is_none());
-        assert!(live.borrow().packet().blocks().iter().all(|b| !b.text().contains("Stall detected")));
+        assert!(
+            live.borrow()
+                .packet()
+                .blocks()
+                .iter()
+                .all(|b| !b.text().contains("Stall detected"))
+        );
 
         // A real stall: the same call repeated with no distinct progress.
         let stalled = vec![
@@ -2146,7 +2249,13 @@ mod tests {
             )
             .expect("step 3");
         assert!(live.borrow().preserved().stall_warning().is_none());
-        assert!(live.borrow().packet().blocks().iter().all(|b| !b.text().contains("Stall detected")));
+        assert!(
+            live.borrow()
+                .packet()
+                .blocks()
+                .iter()
+                .all(|b| !b.text().contains("Stall detected"))
+        );
     }
 
     #[test]
@@ -2255,7 +2364,10 @@ mod tests {
         )
         .expect("write");
         let rendered = load_todos_index(&root).expect("rendered");
-        assert_eq!(rendered, "- [in_progress] wire the thing\n- [pending] test it");
+        assert_eq!(
+            rendered,
+            "- [in_progress] wire the thing\n- [pending] test it"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2347,12 +2459,20 @@ mod tests {
             .iter()
             .find(|b| b.text().contains("LRUCache"))
             .expect("retrieved block in packet");
-        assert_eq!(retrieved.source(), context_engine::compile::ContextSource::Retrieved);
+        assert_eq!(
+            retrieved.source(),
+            context_engine::compile::ContextSource::Retrieved
+        );
         assert_eq!(retrieved.trust(), TrustClass::Untrusted);
         assert_eq!(retrieved.freshness(), Freshness::Fresh);
         // No retrieved blocks configured: none enter the packet either.
         let packet = build_packet(&preserved(), None).expect("packet");
-        assert!(packet.blocks().iter().all(|b| !b.text().contains("LRUCache")));
+        assert!(
+            packet
+                .blocks()
+                .iter()
+                .all(|b| !b.text().contains("LRUCache"))
+        );
     }
 
     #[test]
@@ -2509,7 +2629,10 @@ mod tests {
         )
         .expect("execute");
         assert_eq!(outcome.result.summary(), "wired recovery");
-        assert_eq!(outcome.tokens, 1, "terminal step's provider tokens are reported");
+        assert_eq!(
+            outcome.tokens, 1,
+            "terminal step's provider tokens are reported"
+        );
         assert_eq!(outcome.failure_cause, None, "success carries no cause");
         assert_eq!(outcome.result.context_lineage().len(), 1);
         assert_eq!(
@@ -2533,14 +2656,20 @@ mod tests {
             None,
         )
         .expect("execute");
-        assert_eq!(outcome.result.status(), agent_runtime::AgentTerminalStatus::Failed);
+        assert_eq!(
+            outcome.result.status(),
+            agent_runtime::AgentTerminalStatus::Failed
+        );
         assert_eq!(outcome.tokens, 0, "failed turns report no provider tokens");
         assert_eq!(
             outcome.failure_cause,
             Some(FailureCause::Unspecified),
             "unconfigured backing is an unspecified provider failure"
         );
-        assert!(outcome.result.context_lineage().is_empty(), "no fake recovery");
+        assert!(
+            outcome.result.context_lineage().is_empty(),
+            "no fake recovery"
+        );
     }
 
     #[test]
@@ -2549,7 +2678,9 @@ mod tests {
         let mut events = Vec::new();
         // Sequence: transient blip → context overflow (recovery) → terminal ok.
         let mut outputs = vec![Err(ModelStepError::ProviderFailed {
-            cause: FailureCause::Transient { retry_after_ms: None },
+            cause: FailureCause::Transient {
+                retry_after_ms: None,
+            },
         })];
         outputs.push(Err(ModelStepError::BoundExceeded));
         outputs.push(Ok(ModelStepOutput::Terminal {
@@ -2570,7 +2701,10 @@ mod tests {
             None,
         )
         .expect("transient failure recovers without operator action");
-        assert_eq!(outcome.result.status(), agent_runtime::AgentTerminalStatus::Succeeded);
+        assert_eq!(
+            outcome.result.status(),
+            agent_runtime::AgentTerminalStatus::Succeeded
+        );
         assert_eq!(outcome.result.summary(), "after transient blip");
         assert_eq!(outcome.failure_cause, None);
         assert_eq!(
@@ -2608,10 +2742,15 @@ mod tests {
             None,
         )
         .expect("bounded retry exhaustion is a typed Failed result");
-        assert_eq!(outcome.result.status(), agent_runtime::AgentTerminalStatus::Failed);
+        assert_eq!(
+            outcome.result.status(),
+            agent_runtime::AgentTerminalStatus::Failed
+        );
         assert_eq!(
             outcome.failure_cause,
-            Some(FailureCause::Transient { retry_after_ms: None }),
+            Some(FailureCause::Transient {
+                retry_after_ms: None
+            }),
             "the cause class survives to the CLI boundary"
         );
         assert_eq!(
@@ -2648,7 +2787,10 @@ mod tests {
             None,
         )
         .expect("execute");
-        assert_eq!(outcome.result.status(), agent_runtime::AgentTerminalStatus::Failed);
+        assert_eq!(
+            outcome.result.status(),
+            agent_runtime::AgentTerminalStatus::Failed
+        );
         assert_eq!(outcome.failure_cause, Some(FailureCause::Auth));
         assert_eq!(
             witness.saw_blocks.borrow().len(),
@@ -2688,7 +2830,11 @@ mod tests {
         .expect("execute");
         assert_eq!(outcome.result.summary(), "recovered after rejection");
         assert_eq!(outcome.failure_cause, None);
-        assert_eq!(witness.saw_blocks.borrow().len(), 2, "one retry, then success");
+        assert_eq!(
+            witness.saw_blocks.borrow().len(),
+            2,
+            "one retry, then success"
+        );
     }
 
     #[test]
@@ -2769,7 +2915,10 @@ mod tests {
         // the empty response it gets back as terminal and does not retry
         // again, so the backing sees exactly 3 calls, not a compounded 3x3.
         assert_eq!(witness.saw_blocks.borrow().len(), 3);
-        assert_eq!(outcome.result.status(), agent_runtime::AgentTerminalStatus::Failed);
+        assert_eq!(
+            outcome.result.status(),
+            agent_runtime::AgentTerminalStatus::Failed
+        );
         assert_eq!(outcome.stop_reason, Some(TurnStopReason::EmptyResponse));
         assert_eq!(outcome.failure_cause, None);
         assert_eq!(outcome.tool_calls, 0);
@@ -2806,7 +2955,11 @@ mod tests {
         .expect("execute");
         assert_eq!(outcome.result.summary(), "recovered after reconnect");
         assert_eq!(outcome.failure_cause, None);
-        assert_eq!(witness.saw_blocks.borrow().len(), 2, "one retry, then success");
+        assert_eq!(
+            witness.saw_blocks.borrow().len(),
+            2,
+            "one retry, then success"
+        );
 
         // Exhausted connection retries still surface the typed cause.
         let mut events = Vec::new();
@@ -2850,7 +3003,9 @@ mod tests {
                 cost_usd_micros: None,
             }),
             Err(ModelStepError::ProviderFailed {
-                cause: FailureCause::Transient { retry_after_ms: None },
+                cause: FailureCause::Transient {
+                    retry_after_ms: None,
+                },
             }),
             Ok(ModelStepOutput::Terminal {
                 text: "recovered after tools".to_owned(),
@@ -2869,7 +3024,10 @@ mod tests {
             None,
         )
         .expect("execute");
-        assert_eq!(outcome.result.status(), agent_runtime::AgentTerminalStatus::Succeeded);
+        assert_eq!(
+            outcome.result.status(),
+            agent_runtime::AgentTerminalStatus::Succeeded
+        );
         assert_eq!(
             tools.executed, 1,
             "the committed tool effect ran exactly once; the retry re-asked the model only"
@@ -2890,7 +3048,9 @@ mod tests {
             ) -> Result<ModelStepOutput, ModelStepError> {
                 cancel.cancel();
                 Err(ModelStepError::ProviderFailed {
-                    cause: FailureCause::Transient { retry_after_ms: None },
+                    cause: FailureCause::Transient {
+                        retry_after_ms: None,
+                    },
                 })
             }
         }
@@ -2922,7 +3082,9 @@ mod tests {
         let request = AgentExecutionRequest::new(spec(), SessionId::new());
         let mut events = Vec::new();
         let mut outputs = vec![Err(ModelStepError::ProviderFailed {
-            cause: FailureCause::Transient { retry_after_ms: None },
+            cause: FailureCause::Transient {
+                retry_after_ms: None,
+            },
         })];
         outputs.push(Ok(ModelStepOutput::Terminal {
             text: "done".to_owned(),
@@ -3005,7 +3167,10 @@ mod tests {
         );
         let lines = lines.borrow().clone();
         assert!(
-            lines.last().expect("turn line").contains("cost_usd_micros=2000"),
+            lines
+                .last()
+                .expect("turn line")
+                .contains("cost_usd_micros=2000"),
             "turn summary line should carry the total: {lines:?}"
         );
     }
@@ -3043,7 +3208,15 @@ mod tests {
             diag.line(format!("line {index}"));
         }
         let lines = lines.borrow().clone();
-        assert_eq!(lines.len(), MAX_DIAG_LINES, "extra lines are dropped, bounded");
-        assert_eq!(diag.host(), "api.example.com", "userinfo and path are stripped");
+        assert_eq!(
+            lines.len(),
+            MAX_DIAG_LINES,
+            "extra lines are dropped, bounded"
+        );
+        assert_eq!(
+            diag.host(),
+            "api.example.com",
+            "userinfo and path are stripped"
+        );
     }
 }

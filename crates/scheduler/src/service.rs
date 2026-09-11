@@ -278,7 +278,11 @@ impl GraphService {
     /// external token, re-enters scheduling via `Pending` on resume). Only a
     /// currently-`Running` node can be paused; the scheduler never enters
     /// `Paused` on its own.
-    pub fn pause(&mut self, graph_id: GraphId, node_id: NodeId) -> Result<RuntimeGraph, GraphError> {
+    pub fn pause(
+        &mut self,
+        graph_id: GraphId,
+        node_id: NodeId,
+    ) -> Result<RuntimeGraph, GraphError> {
         let running = self
             .graphs
             .get(&graph_id)
@@ -294,7 +298,11 @@ impl GraphService {
     /// there is no dependency to re-check — the node was already running and
     /// mid-work when it was paused, so it picks up exactly where it left off
     /// rather than re-entering the ready queue.
-    pub fn resume(&mut self, graph_id: GraphId, node_id: NodeId) -> Result<RuntimeGraph, GraphError> {
+    pub fn resume(
+        &mut self,
+        graph_id: GraphId,
+        node_id: NodeId,
+    ) -> Result<RuntimeGraph, GraphError> {
         let paused = self
             .graphs
             .get(&graph_id)

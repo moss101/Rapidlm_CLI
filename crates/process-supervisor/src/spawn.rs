@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use auth::SecretAwareValue;
 use capability_broker::normalize::command::{
-    MAX_ARGV, MAX_ARG_BYTES, MAX_ENV_NAMES, MAX_ENV_NAME_BYTES, MAX_PATH_BYTES,
+    MAX_ARG_BYTES, MAX_ARGV, MAX_ENV_NAME_BYTES, MAX_ENV_NAMES, MAX_PATH_BYTES,
     MAX_SHELL_SCRIPT_BYTES,
 };
 use capability_broker::{
@@ -382,7 +382,9 @@ impl ExecSpec {
             ShellMode::ShellString if family != SHELL_COMMAND_FAMILY => {
                 Err(SpawnError::ShellGrantRequired)
             }
-            ShellMode::Argv if family == SHELL_COMMAND_FAMILY => Err(SpawnError::ShellGrantRequired),
+            ShellMode::Argv if family == SHELL_COMMAND_FAMILY => {
+                Err(SpawnError::ShellGrantRequired)
+            }
             _ => Ok(()),
         }
     }
@@ -636,7 +638,6 @@ fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     }
     acc == 0
 }
-
 
 struct Prepared {
     program: PathBuf,
@@ -1035,10 +1036,10 @@ mod tests {
 
     use auth::SecretRef;
     use capability_broker::{
-        evaluate, issue, request_approval, validate_use, ActionRequest, ApprovalChoice,
-        ApprovalResolution, ApprovalScopeId, CanonicalAction, Capability, CapabilityLease,
-        FilesystemScope, LeaseIssuer, LeaseValidator, PolicyDocument, PolicyRevision, PolicySource,
-        PolicyStack, PrincipalRef, ProcessScope, ResourceDescriptor,
+        ActionRequest, ApprovalChoice, ApprovalResolution, ApprovalScopeId, CanonicalAction,
+        Capability, CapabilityLease, FilesystemScope, LeaseIssuer, LeaseValidator, PolicyDocument,
+        PolicyRevision, PolicySource, PolicyStack, PrincipalRef, ProcessScope, ResourceDescriptor,
+        evaluate, issue, request_approval, validate_use,
     };
     use protocol::SessionId;
 
@@ -1123,8 +1124,8 @@ capability = "fs.read"
         now: Instant,
     ) -> CapabilityLease {
         let decision = evaluate(policies, request, &CancellationToken::new()).expect("evaluate");
-        let approval = request_approval(request, &decision, now, &CancellationToken::new())
-            .expect("approval");
+        let approval =
+            request_approval(request, &decision, now, &CancellationToken::new()).expect("approval");
         let approved = match approval
             .resolve(
                 ApprovalChoice::Approve(ApprovalScopeId::Once),
@@ -1155,14 +1156,7 @@ capability = "fs.read"
         let now = Instant::now();
         let lease = approve_issue(request, policies, now);
         let validator = LeaseValidator::new(issuer(), PolicyRevision::of_stack(policies));
-        validate_use(
-            &validator,
-            &lease,
-            actual,
-            now,
-            &CancellationToken::new(),
-        )
-        .expect("guard")
+        validate_use(&validator, &lease, actual, now, &CancellationToken::new()).expect("guard")
     }
 
     fn lease_guard(spec: &ExecSpec) -> LeaseUseGuard {
@@ -1438,11 +1432,17 @@ capability = "fs.read"
                     break pid;
                 }
             }
-            assert!(Instant::now() < deadline, "grandchild pid file was never written");
+            assert!(
+                Instant::now() < deadline,
+                "grandchild pid file was never written"
+            );
             std::thread::sleep(Duration::from_millis(10));
         };
         assert!(pid_alive(leader_pid), "leader should still be running");
-        assert!(pid_alive(grandchild_pid), "grandchild should still be running");
+        assert!(
+            pid_alive(grandchild_pid),
+            "grandchild should still be running"
+        );
 
         crate::cancel::signal_group(process_group_id, crate::cancel::SignalKind::Kill)
             .expect("signal group");

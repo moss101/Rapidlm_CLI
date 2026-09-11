@@ -206,8 +206,7 @@ mod tests {
             assert_eq!(verdict, Verdict::Passed, "{family:?} should pass");
         }
         // Absence assertions: zero browser events must pass with min_count 0.
-        let empty: Vec<LedgerRecord> =
-            vec![LedgerRecord::new("session.created", json!({}))];
+        let empty: Vec<LedgerRecord> = vec![LedgerRecord::new("session.created", json!({}))];
         assert_eq!(
             AssertionEngine::evaluate(
                 &empty,
@@ -238,12 +237,7 @@ mod tests {
         ];
         let verdicts = AssertionEngine::evaluate_all(&records, &assertions);
         assert_eq!(verdicts[0].1, Verdict::Passed);
-        assert_eq!(
-            verdicts[1].1,
-            Verdict::Failed {
-                observed: 0
-            }
-        );
+        assert_eq!(verdicts[1].1, Verdict::Failed { observed: 0 });
         // Family parser accepts documented aliases and rejects junk.
         assert!(AssertionFamily::parse("capability").is_some());
         assert!(AssertionFamily::parse("nope").is_none());

@@ -185,7 +185,9 @@ impl ExperimentRegistry {
             return PromotionDecision::RejectedHardGate { gate: "security" };
         }
         if !correctness_clean {
-            return PromotionDecision::RejectedHardGate { gate: "correctness" };
+            return PromotionDecision::RejectedHardGate {
+                gate: "correctness",
+            };
         }
         if heldout_score < Self::MIN_HELDOUT_SCORE {
             return PromotionDecision::RejectedRanking {
@@ -219,12 +221,18 @@ mod tests {
             "contradictions reduce confidence, never overwrite history"
         );
         // Reject feedback starts below baseline.
-        let rejected =
-            PreferenceCandidate::from_feedback(&FeedbackEvent::new("s1", FeedbackKind::Reject, "x"))
-                .unwrap();
+        let rejected = PreferenceCandidate::from_feedback(&FeedbackEvent::new(
+            "s1",
+            FeedbackKind::Reject,
+            "x",
+        ))
+        .unwrap();
         assert!((rejected.confidence - 0.1).abs() < 1e-9);
         // Empty statements are not learnable.
-        assert!(PreferenceCandidate::from_feedback(&FeedbackEvent::new("s", FeedbackKind::Accept, "")).is_none());
+        assert!(
+            PreferenceCandidate::from_feedback(&FeedbackEvent::new("s", FeedbackKind::Accept, ""))
+                .is_none()
+        );
     }
 
     #[test]
@@ -241,20 +249,35 @@ mod tests {
     #[test]
     fn store_merges_by_proposition_and_decay_lowers_stale_preferences() {
         let mut store = PreferenceStore::new();
-        store.merge(PreferenceCandidate::from_feedback(
-            &FeedbackEvent::new("s", FeedbackKind::Accept, "always run fmt"),
-        ).unwrap());
+        store.merge(
+            PreferenceCandidate::from_feedback(&FeedbackEvent::new(
+                "s",
+                FeedbackKind::Accept,
+                "always run fmt",
+            ))
+            .unwrap(),
+        );
         let before = store.all()[0].confidence;
         store.apply_decay(30);
         assert!(store.all()[0].confidence < before, "idle preferences decay");
         // Same proposition merges (confirm), distinct propositions append.
-        store.merge(PreferenceCandidate::from_feedback(
-            &FeedbackEvent::new("s", FeedbackKind::Accept, "always run fmt"),
-        ).unwrap());
+        store.merge(
+            PreferenceCandidate::from_feedback(&FeedbackEvent::new(
+                "s",
+                FeedbackKind::Accept,
+                "always run fmt",
+            ))
+            .unwrap(),
+        );
         assert_eq!(store.all().len(), 1);
-        store.merge(PreferenceCandidate::from_feedback(
-            &FeedbackEvent::new("s", FeedbackKind::Accept, "never force push"),
-        ).unwrap());
+        store.merge(
+            PreferenceCandidate::from_feedback(&FeedbackEvent::new(
+                "s",
+                FeedbackKind::Accept,
+                "never force push",
+            ))
+            .unwrap(),
+        );
         assert_eq!(store.all().len(), 2);
     }
 
@@ -327,7 +350,9 @@ mod tests {
         );
         assert_eq!(
             ExperimentRegistry::promote(0.9, 0.9, true, false),
-            PromotionDecision::RejectedHardGate { gate: "correctness" }
+            PromotionDecision::RejectedHardGate {
+                gate: "correctness"
+            }
         );
         assert_eq!(
             ExperimentRegistry::promote(0.5, 0.9, true, true),

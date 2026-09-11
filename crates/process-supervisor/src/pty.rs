@@ -139,8 +139,7 @@ mod tests {
 
     #[test]
     fn pty_child_sees_terminal_semantics() {
-        let mut session =
-            PtySession::spawn("/usr/bin/tty", &[], || false).expect("spawn tty");
+        let mut session = PtySession::spawn("/usr/bin/tty", &[], || false).expect("spawn tty");
         let output = session.read_remaining();
         session.try_wait().expect("try_wait");
         assert!(

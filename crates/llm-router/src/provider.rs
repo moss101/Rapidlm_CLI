@@ -168,7 +168,9 @@ pub struct CancellationToken {
 pub enum ProviderError {
     Cancelled,
     AuthFailed,
-    RateLimited { retry_after_ms: Option<u64> },
+    RateLimited {
+        retry_after_ms: Option<u64>,
+    },
     ContextTooLarge,
     InvalidRequest,
     Transient,
@@ -367,11 +369,17 @@ pub struct NormalizedUsage {
 /// One canonical message part. Images are artifact refs, never inline bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContentPart {
-    Text { text: String },
-    Image { artifact: ArtifactRef },
+    Text {
+        text: String,
+    },
+    Image {
+        artifact: ArtifactRef,
+    },
     /// Inline image as a `data:image/<type>;base64,<payload>` URL (vision
     /// tool results). Bounded by the constructor.
-    ImageData { data_url: String },
+    ImageData {
+        data_url: String,
+    },
 }
 
 /// Assistant-emitted tool call recorded on a message.
@@ -590,7 +598,12 @@ impl ModelId {
     /// vendor/tag forms (`vendor/model:tag`) in addition to the canonical
     /// `-/_.` separators.
     pub fn parse(raw: impl AsRef<str>) -> Result<Self, ProviderError> {
-        parse_token(raw.as_ref(), MAX_MODEL_ID_BYTES, TokenAlphabet::ProviderModel).map(Self)
+        parse_token(
+            raw.as_ref(),
+            MAX_MODEL_ID_BYTES,
+            TokenAlphabet::ProviderModel,
+        )
+        .map(Self)
     }
 
     pub fn as_str(&self) -> &str {
@@ -1381,10 +1394,7 @@ impl CanonicalModelRequest {
     }
     /// Builder-style effort override for requests from phases that want more
     /// or less deliberation than the provider default.
-    pub fn with_reasoning_effort(
-        mut self,
-        effort: crate::phase::ReasoningEffort,
-    ) -> Self {
+    pub fn with_reasoning_effort(mut self, effort: crate::phase::ReasoningEffort) -> Self {
         self.reasoning_effort = Some(effort);
         self
     }

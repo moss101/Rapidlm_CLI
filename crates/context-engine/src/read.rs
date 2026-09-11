@@ -324,9 +324,10 @@ pub fn read_repo(
         return Err(ReadError::InvalidRequest);
     }
     if let Some(cursor) = &request.cursor
-        && (cursor.path != request.path || cursor.next_line == 0) {
-            return Err(ReadError::InvalidRequest);
-        }
+        && (cursor.path != request.path || cursor.next_line == 0)
+    {
+        return Err(ReadError::InvalidRequest);
+    }
 
     let abs = resolve_file(root, &request.path)?;
     check_ready(limits, started)?;
@@ -423,10 +424,13 @@ fn slice_text(
             break;
         }
         out.push_str(emitted);
-        if line_clamped && !emitted.ends_with('\n') && raw_line.ends_with('\n')
-            && out.len().saturating_add(1) <= limits.max_bytes {
-                out.push('\n');
-            }
+        if line_clamped
+            && !emitted.ends_with('\n')
+            && raw_line.ends_with('\n')
+            && out.len().saturating_add(1) <= limits.max_bytes
+        {
+            out.push('\n');
+        }
 
         let tokens = estimator
             .estimate(TokenizerFamily::Unknown, &out)

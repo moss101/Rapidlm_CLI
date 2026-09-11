@@ -13,7 +13,6 @@ use std::error::Error;
 use std::fmt;
 use std::process::{Child, Command, Stdio};
 
-
 /// Maximum bytes captured from dev server output.
 pub const MAX_PREVIEW_OUTPUT: usize = 64 * 1024;
 /// Default port range start for preview servers.
@@ -129,12 +128,7 @@ impl PreviewSupervisor {
     ///
     /// The caller provides the spawn command; this supervisor manages lifecycle,
     /// monitors readiness, and transitions through the state machine.
-    pub fn start(
-        &mut self,
-        program: &str,
-        args: &[&str],
-        now_ms: u64,
-    ) -> Result<(), PreviewError> {
+    pub fn start(&mut self, program: &str, args: &[&str], now_ms: u64) -> Result<(), PreviewError> {
         if self.child.is_some() {
             return Err(PreviewError::AlreadyRunning);
         }

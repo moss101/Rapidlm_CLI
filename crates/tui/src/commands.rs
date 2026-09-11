@@ -214,10 +214,17 @@ pub enum CommandError {
     TooLong,
     NotACommand,
     UnknownCommand,
-    InvalidArgs { command: &'static str },
-    InvalidId { field: &'static str },
+    InvalidArgs {
+        command: &'static str,
+    },
+    InvalidId {
+        field: &'static str,
+    },
     /// A short identifier matched more than one thing the session knows.
-    AmbiguousId { field: &'static str, matched: usize },
+    AmbiguousId {
+        field: &'static str,
+        matched: usize,
+    },
 }
 
 /// Local chrome or kernel-bound action. Never a shell string.
@@ -257,15 +264,21 @@ pub enum Inspector {
     /// since it existed (`panels::agents::resolve_selection`), and nothing
     /// ever set the field — so `/agents show <id>` parsed an id, dropped
     /// it, and painted the detail block of whichever agent sorted first.
-    Agents { id: Option<AgentId> },
-    Diff { agent: Option<AgentId> },
+    Agents {
+        id: Option<AgentId>,
+    },
+    Diff {
+        agent: Option<AgentId>,
+    },
     Goal,
     /// `query` is the text `/context search` named, if any.
     ///
     /// Carried for the same reason the other selections are: the query was
     /// parsed and then dropped, so `/context search <text>` opened the same
     /// compiled-context summary as a bare `/context` and never searched.
-    Context { query: Option<String> },
+    Context {
+        query: Option<String>,
+    },
     Memory,
     /// `id` is the job `/jobs show|logs` named, `logs` which view of it.
     ///
@@ -273,7 +286,10 @@ pub enum Inspector {
     /// and every consumer discarded it at [`Inspector::route`], so `/jobs
     /// show <id>` and `/jobs logs <id>` opened the same unfiltered list as
     /// a bare `/jobs` — a parsed operand with no effect.
-    Jobs { id: Option<JobId>, logs: bool },
+    Jobs {
+        id: Option<JobId>,
+        logs: bool,
+    },
     Knowledge,
     Playbook,
     Trace,
@@ -659,7 +675,9 @@ pub const MIN_SHORT_ID_CHARS: usize = 4;
 pub enum Resolution<T> {
     Found(T),
     /// More than one candidate matched; `matched` says how many.
-    Ambiguous { matched: usize },
+    Ambiguous {
+        matched: usize,
+    },
     Unknown,
 }
 
@@ -696,7 +714,10 @@ impl IdResolver for NoResolver {
 
 impl IdResolver for crate::state::AppState {
     fn resolve_job(&self, text: &str) -> Resolution<JobId> {
-        resolve_short(text, self.jobs().values().map(|job| (job.id(), job.handle())))
+        resolve_short(
+            text,
+            self.jobs().values().map(|job| (job.id(), job.handle())),
+        )
     }
 
     fn resolve_agent(&self, text: &str) -> Resolution<AgentId> {
@@ -930,10 +951,14 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         UiCommand::McpRemove { name } => FrontendAction::Kernel(KernelAction::RemoveMcp { name }),
         UiCommand::McpAuth { name } => FrontendAction::Kernel(KernelAction::AuthMcp { name }),
         UiCommand::PermissionsAllow { pattern } => {
-            FrontendAction::Local(LocalAction::Permissions(PermissionsIntent::Allow { pattern }))
+            FrontendAction::Local(LocalAction::Permissions(PermissionsIntent::Allow {
+                pattern,
+            }))
         }
         UiCommand::PermissionsRevoke { pattern } => {
-            FrontendAction::Local(LocalAction::Permissions(PermissionsIntent::Revoke { pattern }))
+            FrontendAction::Local(LocalAction::Permissions(PermissionsIntent::Revoke {
+                pattern,
+            }))
         }
         UiCommand::PluginList => FrontendAction::Local(LocalAction::Open(Inspector::Plugins)),
         UiCommand::PluginInstall { spec } => {
@@ -1548,7 +1573,10 @@ fn usage_for(name: &str) -> Option<&'static str> {
 }
 
 fn help_for(topic: Option<&str>) -> InlineHelp {
-    let usage = topic.and_then(usage_for).unwrap_or_else(catalog_help).to_owned();
+    let usage = topic
+        .and_then(usage_for)
+        .unwrap_or_else(catalog_help)
+        .to_owned();
     InlineHelp {
         topic: topic.map(str::to_owned),
         usage,
@@ -1805,10 +1833,16 @@ mod tests {
         use event_ledger::event::{ActorKind, ActorRef, EventEnvelope, EventKind, RecordedAt};
         use protocol::{EventId, RedactionClass, TraceId};
 
-        let session: SessionId = "019c0000-0000-7000-8000-000000000010".parse().expect("session");
+        let session: SessionId = "019c0000-0000-7000-8000-000000000010"
+            .parse()
+            .expect("session");
         let actor = ActorRef::new(ActorKind::System, "019c0000-0000-7000-8000-000000000016")
             .expect("actor");
-        let kind = if seq == 1 { EventKind::SessionCreated } else { EventKind::JobStarted };
+        let kind = if seq == 1 {
+            EventKind::SessionCreated
+        } else {
+            EventKind::JobStarted
+        };
         let mut payload = serde_json::json!({"job_id": id});
         if seq == 1 {
             payload = serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"});
@@ -1816,10 +1850,14 @@ mod tests {
             payload["handle"] = serde_json::Value::String(handle.to_owned());
         }
         let event = EventEnvelope::new(
-            format!("019c0000-0000-7000-8000-{seq:012x}").parse::<EventId>().expect("event id"),
+            format!("019c0000-0000-7000-8000-{seq:012x}")
+                .parse::<EventId>()
+                .expect("event id"),
             session,
             seq,
-            "2026-09-11T09:00:00.000Z".parse::<RecordedAt>().expect("recorded_at"),
+            "2026-09-11T09:00:00.000Z"
+                .parse::<RecordedAt>()
+                .expect("recorded_at"),
             actor,
             TraceId::new(),
             kind,
@@ -1904,7 +1942,10 @@ mod tests {
         // `…0000000000ab` and `…0000000100ab` both end in `00ab`.
         assert_eq!(
             parse_command_in("/jobs cancel 00ab", &state),
-            Err(CommandError::AmbiguousId { field: "jobs", matched: 2 }),
+            Err(CommandError::AmbiguousId {
+                field: "jobs",
+                matched: 2
+            }),
             "a shared suffix must be refused with the count, never picked from"
         );
         // More of the id disambiguates.
@@ -1916,7 +1957,10 @@ mod tests {
         // is the right one.
         let err = parse_command_in("/jobs cancel 00ab", &state).expect_err("ambiguous");
         assert!(err.help().contains("/jobs"), "{}", err.help());
-        assert_eq!(err.to_string(), "ambiguous identifier: matches 2 in this session");
+        assert_eq!(
+            err.to_string(),
+            "ambiguous identifier: matches 2 in this session"
+        );
     }
 
     #[test]

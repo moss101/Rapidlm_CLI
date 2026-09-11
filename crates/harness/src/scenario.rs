@@ -34,8 +34,7 @@ impl ScenarioSpec {
     }
 
     pub fn parse(json: &str) -> Result<Self, ScenarioError> {
-        let spec: Self =
-            serde_json::from_str(json).map_err(|_| ScenarioError::InvalidSchema)?;
+        let spec: Self = serde_json::from_str(json).map_err(|_| ScenarioError::InvalidSchema)?;
         if spec.schema != EVAL_SCHEMA || spec.name.is_empty() || spec.name.len() > 128 {
             return Err(ScenarioError::InvalidSchema);
         }
@@ -125,10 +124,8 @@ mod tests {
     use super::*;
 
     fn temp(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rapidlm-p11-fixtures-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rapidlm-p11-fixtures-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

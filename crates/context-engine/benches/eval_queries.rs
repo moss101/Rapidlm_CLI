@@ -694,9 +694,10 @@ fn compile_hits(
 
 fn lookup_hit<'a>(corpus: &'a IndexedCorpus, hit: &RankedContextHit) -> Option<&'a IndexedChunk> {
     if let Some(chunk_id) = hit.chunk_id()
-        && let Some(found) = corpus.chunks.iter().find(|c| c.chunk_id == chunk_id) {
-            return Some(found);
-        }
+        && let Some(found) = corpus.chunks.iter().find(|c| c.chunk_id == chunk_id)
+    {
+        return Some(found);
+    }
     let path = hit.path()?.as_str();
     corpus.chunks.iter().find(|chunk| {
         chunk.path == path
@@ -763,13 +764,15 @@ fn judgment_matches(
         && let Some(actual) = hit
             .symbol()
             .or_else(|| lookup_hit(corpus, hit).and_then(|chunk| chunk.symbol.as_deref()))
-            && actual != expected {
-                return false;
-            }
+        && actual != expected
+    {
+        return false;
+    }
     if let (Some(start), Some(end)) = (judgment.start_line, judgment.end_line)
-        && let Some(chunk) = lookup_hit(corpus, hit) {
-            return ranges_overlap(start, end, chunk.start_line, chunk.end_line);
-        }
+        && let Some(chunk) = lookup_hit(corpus, hit)
+    {
+        return ranges_overlap(start, end, chunk.start_line, chunk.end_line);
+    }
     if let (Some(start), Some(end)) = (judgment.start_byte, judgment.end_byte) {
         return match (hit.start_byte(), hit.end_byte()) {
             (Some(hs), Some(he)) => ranges_overlap(start, end, hs, he),
@@ -840,9 +843,11 @@ fn redundant_after_mmr(
 
 fn similarity(left: &RankedContextHit, right: &RankedContextHit) -> f64 {
     if let (Some(a), Some(b)) = (left.chunk_id(), right.chunk_id())
-        && a == b && left.repo_id() == right.repo_id() {
-            return 1.0;
-        }
+        && a == b
+        && left.repo_id() == right.repo_id()
+    {
+        return 1.0;
+    }
     match (left.path(), right.path()) {
         (Some(a), Some(b)) if a == b && left.repo_id() == right.repo_id() => {
             match (

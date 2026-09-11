@@ -177,8 +177,7 @@ impl LinuxAtspiAction {
             (
                 Self::Click | Self::Press | Self::Toggle | Self::Activate,
                 ActionKind::Click
-            )
-                | (Self::SetText, ActionKind::TypeText)
+            ) | (Self::SetText, ActionKind::TypeText)
                 | (Self::Scroll, ActionKind::Scroll)
                 | (Self::Activate, ActionKind::FocusWindow)
                 | (Self::Expand | Self::Collapse, ActionKind::Click)
@@ -804,9 +803,10 @@ impl LinuxAtspiHost for ScriptedLinuxAtspiHost {
             return Err(DesktopError::HealthFailed);
         }
         if let Some(target) = resolved.node().or(resolved.window())
-            && !state.live_elements.contains(target) {
-                return Err(DesktopError::StaleObservation);
-            }
+            && !state.live_elements.contains(target)
+        {
+            return Err(DesktopError::StaleObservation);
+        }
         let actions = actions_for(&state, resolved)?.to_vec();
         if !atspi_action_supports_action(&actions, action.kind()) {
             // No AT-SPI click/settext/activate match and no xdotool path.

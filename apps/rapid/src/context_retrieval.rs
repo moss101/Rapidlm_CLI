@@ -26,7 +26,9 @@ use context_engine::CancellationToken;
 use context_engine::compile::{CompileInput, CompileReason};
 use context_engine::ingest::pipeline::{IndexPipeline, PipelineLimits};
 use context_engine::ingest::walk::{RepoScope, WalkLimits, walk_manifest, walk_repo};
-use context_engine::need::{CompletenessRequirement, InformationNeed, NegativeClaimPolicy, ScopeSet};
+use context_engine::need::{
+    CompletenessRequirement, InformationNeed, NegativeClaimPolicy, ScopeSet,
+};
 use context_engine::repo_manifest::WorkspaceManifest;
 use context_engine::retrieval::candidates::{Freshness, TrustClass};
 use context_engine::scout::{ScoutLimits, ScoutSources, scout};
@@ -73,7 +75,10 @@ pub fn retrieve(root: &Path, task_prompt: &str, budget_tokens: u32) -> Vec<Compi
     watcher.stop();
     match result {
         Ok(blocks) => {
-            eprintln!("context retrieval: {} block(s) proactively retrieved", blocks.len());
+            eprintln!(
+                "context retrieval: {} block(s) proactively retrieved",
+                blocks.len()
+            );
             blocks
         }
         Err(reason) => {
@@ -128,7 +133,9 @@ fn retrieve_inner(
     )
     .map_err(|err| format!("need: {err:?}"))?;
 
-    let sources = ScoutSources::new().fts(pipeline.fts()).graph(pipeline.graph());
+    let sources = ScoutSources::new()
+        .fts(pipeline.fts())
+        .graph(pipeline.graph());
     let scout_limits = ScoutLimits::new()
         .timeout(RETRIEVAL_TIMEOUT)
         .cancellation(cancel.clone())
@@ -138,9 +145,12 @@ fn retrieve_inner(
 
     let mut blocks = Vec::new();
     for reference in report.references() {
-        let Some(text) =
-            read_snippet(root, reference.path().as_str(), reference.start_byte(), reference.end_byte())
-        else {
+        let Some(text) = read_snippet(
+            root,
+            reference.path().as_str(),
+            reference.start_byte(),
+            reference.end_byte(),
+        ) else {
             continue;
         };
         let locator = format!("retrieved:{}", reference.path().as_str());
@@ -224,9 +234,17 @@ fn ripple_advisory_inner(root: &Path, path: &str, cancel: &CancellationToken) ->
     if impacted.is_empty() {
         return None;
     }
-    let listed: Vec<String> = impacted.iter().take(MAX_RIPPLE_PATHS_LISTED).cloned().collect();
+    let listed: Vec<String> = impacted
+        .iter()
+        .take(MAX_RIPPLE_PATHS_LISTED)
+        .cloned()
+        .collect();
     let more = impacted.len().saturating_sub(listed.len());
-    let suffix = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+    let suffix = if more > 0 {
+        format!(" (+{more} more)")
+    } else {
+        String::new()
+    };
     Some(format!(
         "advisory: editing {path} may affect code that references it in: {}{suffix} — verify \
          they still work",
@@ -235,7 +253,9 @@ fn ripple_advisory_inner(root: &Path, path: &str, cancel: &CancellationToken) ->
 }
 
 fn build_manifest(root: &Path, cancel: &CancellationToken) -> Result<WorkspaceManifest, String> {
-    let canonical = root.canonicalize().map_err(|err| format!("canonicalize root: {err}"))?;
+    let canonical = root
+        .canonicalize()
+        .map_err(|err| format!("canonicalize root: {err}"))?;
     let manifest_toml = format!(
         "schema = 1\n[[repos]]\nalias = \"main\"\nroot = {:?}\nmode = \"read_write\"\n",
         canonical.display()
@@ -258,7 +278,12 @@ fn bounded_str(text: &str, max_bytes: usize) -> String {
 /// Read `[start, end)` of `relative` under `root`, or the file's leading
 /// bytes when the scout hit carried no byte range. Never follows the walk's
 /// own trust — this is a plain bounded read inside a root we already own.
-fn read_snippet(root: &Path, relative: &str, start: Option<u32>, end: Option<u32>) -> Option<String> {
+fn read_snippet(
+    root: &Path,
+    relative: &str,
+    start: Option<u32>,
+    end: Option<u32>,
+) -> Option<String> {
     let bytes = std::fs::read(root.join(relative)).ok()?;
     let (start, end) = match (start, end) {
         (Some(start), Some(end)) if (start as usize) <= (end as usize) => {
@@ -266,7 +291,9 @@ fn read_snippet(root: &Path, relative: &str, start: Option<u32>, end: Option<u32
         }
         _ => (0, bytes.len()),
     };
-    let end = end.min(bytes.len()).min(start.saturating_add(MAX_SNIPPET_BYTES));
+    let end = end
+        .min(bytes.len())
+        .min(start.saturating_add(MAX_SNIPPET_BYTES));
     let start = start.min(end);
     if start == end {
         return None;
@@ -317,7 +344,8 @@ mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("rapidlm-ctxretrieve-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rapidlm-ctxretrieve-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
@@ -448,7 +476,11 @@ mod tests {
         let blocks = retrieve(&root, "find_me_marker function", 4096);
         assert!(!blocks.is_empty(), "expected at least one retrieved block");
         for block in &blocks {
-            assert!(block.locator().starts_with("retrieved:"), "{}", block.locator());
+            assert!(
+                block.locator().starts_with("retrieved:"),
+                "{}",
+                block.locator()
+            );
             assert!(!block.text().is_empty());
         }
         let _ = std::fs::remove_dir_all(&root);

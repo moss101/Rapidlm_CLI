@@ -215,13 +215,21 @@ mod tests {
             executed: Vec::new(),
         };
         let wrapped = StructuredOutputTools::new(inner, schema()).expect("valid schema");
-        let names: Vec<_> = wrapped.tool_surface().iter().map(ToolSurface::name).map(str::to_owned).collect();
+        let names: Vec<_> = wrapped
+            .tool_surface()
+            .iter()
+            .map(ToolSurface::name)
+            .map(str::to_owned)
+            .collect();
         assert_eq!(names, vec!["read_file", TOOL_NAME]);
     }
 
     #[test]
     fn valid_result_is_captured_and_reported_succeeded() {
-        let inner = RecordingDriver { surface: Vec::new(), executed: Vec::new() };
+        let inner = RecordingDriver {
+            surface: Vec::new(),
+            executed: Vec::new(),
+        };
         let mut wrapped = StructuredOutputTools::new(inner, schema()).expect("valid schema");
         let captured = wrapped.captured_result();
         let cancel = CancellationToken::new();
@@ -235,7 +243,10 @@ mod tests {
 
     #[test]
     fn schema_mismatch_is_a_handled_failure_not_a_silent_pass() {
-        let inner = RecordingDriver { surface: Vec::new(), executed: Vec::new() };
+        let inner = RecordingDriver {
+            surface: Vec::new(),
+            executed: Vec::new(),
+        };
         let mut wrapped = StructuredOutputTools::new(inner, schema()).expect("valid schema");
         let captured = wrapped.captured_result();
         let cancel = CancellationToken::new();
@@ -245,7 +256,9 @@ mod tests {
         );
         let result = wrapped.execute(&call, &cancel).expect("execute");
         match result {
-            ToolStepResult::Failed { handled, detail, .. } => {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
                 assert!(handled);
                 assert!(detail.unwrap().contains("schema"));
             }
@@ -256,19 +269,28 @@ mod tests {
 
     #[test]
     fn malformed_json_arguments_are_a_handled_failure() {
-        let inner = RecordingDriver { surface: Vec::new(), executed: Vec::new() };
+        let inner = RecordingDriver {
+            surface: Vec::new(),
+            executed: Vec::new(),
+        };
         let mut wrapped = StructuredOutputTools::new(inner, schema()).expect("valid schema");
         let cancel = CancellationToken::new();
         let call = ValidatedToolCall::from_proposed(
             &ProposedToolCall::new("c1", TOOL_NAME, "not json").expect("call"),
         );
         let result = wrapped.execute(&call, &cancel).expect("execute");
-        assert!(matches!(result, ToolStepResult::Failed { handled: true, .. }));
+        assert!(matches!(
+            result,
+            ToolStepResult::Failed { handled: true, .. }
+        ));
     }
 
     #[test]
     fn other_tool_calls_delegate_to_the_inner_driver_unchanged() {
-        let inner = RecordingDriver { surface: Vec::new(), executed: Vec::new() };
+        let inner = RecordingDriver {
+            surface: Vec::new(),
+            executed: Vec::new(),
+        };
         let mut wrapped = StructuredOutputTools::new(inner, schema()).expect("valid schema");
         let cancel = CancellationToken::new();
         let call = ValidatedToolCall::from_proposed(
@@ -282,7 +304,10 @@ mod tests {
 
     #[test]
     fn execute_batch_handles_the_synthetic_tool_inline_and_delegates_the_rest() {
-        let inner = RecordingDriver { surface: Vec::new(), executed: Vec::new() };
+        let inner = RecordingDriver {
+            surface: Vec::new(),
+            executed: Vec::new(),
+        };
         let mut wrapped = StructuredOutputTools::new(inner, schema()).expect("valid schema");
         let cancel = CancellationToken::new();
         let calls = vec![
@@ -295,15 +320,27 @@ mod tests {
         ];
         let results = wrapped.execute_batch(&calls, &cancel);
         assert_eq!(results.len(), 2);
-        assert!(matches!(results[0].as_ref().unwrap(), ToolStepResult::Succeeded { .. }));
-        assert!(matches!(results[1].as_ref().unwrap(), ToolStepResult::Succeeded { .. }));
+        assert!(matches!(
+            results[0].as_ref().unwrap(),
+            ToolStepResult::Succeeded { .. }
+        ));
+        assert!(matches!(
+            results[1].as_ref().unwrap(),
+            ToolStepResult::Succeeded { .. }
+        ));
         assert_eq!(wrapped.inner.executed, vec!["read_file".to_owned()]);
-        assert_eq!(wrapped.captured_result().borrow().as_deref(), Some(r#"{"answer":"ok"}"#));
+        assert_eq!(
+            wrapped.captured_result().borrow().as_deref(),
+            Some(r#"{"answer":"ok"}"#)
+        );
     }
 
     #[test]
     fn invalid_schema_document_is_rejected_at_construction() {
-        let inner = RecordingDriver { surface: Vec::new(), executed: Vec::new() };
+        let inner = RecordingDriver {
+            surface: Vec::new(),
+            executed: Vec::new(),
+        };
         match StructuredOutputTools::new(inner, serde_json::json!({"type": "not-a-type"})) {
             Err(err) => assert!(err.to_string().contains("invalid --json-schema")),
             Ok(_) => panic!("malformed schema must be rejected"),

@@ -7,8 +7,8 @@
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::de::{self, Deserializer};
 use serde::ser::{SerializeStruct, Serializer};

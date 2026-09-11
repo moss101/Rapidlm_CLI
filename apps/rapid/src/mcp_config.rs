@@ -108,13 +108,17 @@ pub enum McpConfigIssue {
     /// directory in its place, an I/O error). Non-fatal by long-standing
     /// precedent: a broken settings file has never failed a run, it just
     /// contributes nothing. What changes is that it is no longer silent.
-    FileUnreadable { detail: String },
+    FileUnreadable {
+        detail: String,
+    },
     /// `mcpServers` is present but is not a JSON object.
     NotAnObject,
     /// The entry's value is not a JSON object.
     EntryNotAnObject,
     NameEmpty,
-    NameTooLong { bytes: usize },
+    NameTooLong {
+        bytes: usize,
+    },
     /// A name outside `[A-Za-z0-9._:-]` cannot appear verbatim in a
     /// model-facing tool name — that is `agent_runtime::turn::valid_ident`'s
     /// alphabet, which the composed `mcp__<server>__<tool>` has to satisfy.
@@ -128,25 +132,49 @@ pub enum McpConfigIssue {
     /// A `type`/`url` entry: a transport this build does not speak. Reported
     /// as its own issue rather than as "no command", which would be true but
     /// useless.
-    RemoteTransport { kind: String },
+    RemoteTransport {
+        kind: String,
+    },
     CommandEmpty,
-    CommandTooLong { bytes: usize },
+    CommandTooLong {
+        bytes: usize,
+    },
     ArgsNotAnArray,
-    ArgNotAString { index: usize },
-    TooManyArgs { count: usize },
-    ArgTooLong { index: usize, bytes: usize },
+    ArgNotAString {
+        index: usize,
+    },
+    TooManyArgs {
+        count: usize,
+    },
+    ArgTooLong {
+        index: usize,
+        bytes: usize,
+    },
     EnvNotAnObject,
-    TooManyEnvVars { count: usize },
+    TooManyEnvVars {
+        count: usize,
+    },
     /// An environment variable name outside `[A-Za-z_][A-Za-z0-9_]*`.
-    EnvKeyInvalid { key: String },
-    EnvValueNotAString { key: String },
-    EnvValueTooLong { key: String, bytes: usize },
+    EnvKeyInvalid {
+        key: String,
+    },
+    EnvValueNotAString {
+        key: String,
+    },
+    EnvValueTooLong {
+        key: String,
+        bytes: usize,
+    },
     /// A server of this name was already admitted from an earlier settings
     /// file. First file wins, matching every other list-shaped setting's
     /// precedence.
-    Shadowed { by_file: String },
+    Shadowed {
+        by_file: String,
+    },
     /// Admitted entries already reached [`MAX_MCP_SERVERS`].
-    OverCapacity { limit: usize },
+    OverCapacity {
+        limit: usize,
+    },
 }
 
 impl std::fmt::Display for McpConfigIssue {
@@ -159,7 +187,10 @@ impl std::fmt::Display for McpConfigIssue {
             Self::EntryNotAnObject => f.write_str("entry is not a JSON object"),
             Self::NameEmpty => f.write_str("server name is empty"),
             Self::NameTooLong { bytes } => {
-                write!(f, "server name is {bytes} bytes, over the {MAX_SERVER_NAME_BYTES}-byte limit")
+                write!(
+                    f,
+                    "server name is {bytes} bytes, over the {MAX_SERVER_NAME_BYTES}-byte limit"
+                )
             }
             Self::NameCharset => f.write_str(
                 "server name may only contain letters, digits, '-', '_', '.' and ':' \
@@ -177,7 +208,10 @@ so an entry needs a `command`"
             ),
             Self::CommandEmpty => f.write_str("`command` is empty"),
             Self::CommandTooLong { bytes } => {
-                write!(f, "`command` is {bytes} bytes, over the {MAX_COMMAND_BYTES}-byte limit")
+                write!(
+                    f,
+                    "`command` is {bytes} bytes, over the {MAX_COMMAND_BYTES}-byte limit"
+                )
             }
             Self::ArgsNotAnArray => f.write_str("`args` is not a JSON array"),
             Self::ArgNotAString { index } => write!(f, "`args[{index}]` is not a string"),
@@ -185,7 +219,10 @@ so an entry needs a `command`"
                 write!(f, "{count} args, over the {MAX_ARGS} limit")
             }
             Self::ArgTooLong { index, bytes } => {
-                write!(f, "`args[{index}]` is {bytes} bytes, over the {MAX_ARG_BYTES}-byte limit")
+                write!(
+                    f,
+                    "`args[{index}]` is {bytes} bytes, over the {MAX_ARG_BYTES}-byte limit"
+                )
             }
             Self::EnvNotAnObject => f.write_str("`env` is not a JSON object"),
             Self::TooManyEnvVars { count } => {
@@ -203,7 +240,10 @@ so an entry needs a `command`"
                 "env value for {key:?} is {bytes} bytes, over the {MAX_ENV_VALUE_BYTES}-byte limit"
             ),
             Self::Shadowed { by_file } => {
-                write!(f, "a server of this name was already configured by {by_file}")
+                write!(
+                    f,
+                    "a server of this name was already configured by {by_file}"
+                )
             }
             Self::OverCapacity { limit } => {
                 write!(f, "already at the {limit}-server limit for this project")
@@ -294,7 +334,10 @@ impl McpProjectConfig {
     /// The spawn descriptions, in registration order — the exact list handed
     /// to `ExecTools::register_mcp_servers`.
     pub fn configs(&self) -> Vec<McpServerConfig> {
-        self.servers.iter().map(|entry| entry.config.clone()).collect()
+        self.servers
+            .iter()
+            .map(|entry| entry.config.clone())
+            .collect()
     }
 
     pub fn get(&self, name: &str) -> Option<&LoadedMcpServer> {
@@ -417,7 +460,10 @@ fn parse_file(
 }
 
 /// Validate one `mcpServers` entry into a spawn description.
-pub fn parse_entry(name: &str, spec: &serde_json::Value) -> Result<McpServerConfig, McpConfigIssue> {
+pub fn parse_entry(
+    name: &str,
+    spec: &serde_json::Value,
+) -> Result<McpServerConfig, McpConfigIssue> {
     validate_server_name(name)?;
     let Some(spec) = spec.as_object() else {
         return Err(McpConfigIssue::EntryNotAnObject);
@@ -434,9 +480,9 @@ pub fn parse_entry(name: &str, spec: &serde_json::Value) -> Result<McpServerConf
                 .map(str::to_owned)
                 .or_else(|| spec.get("url").map(|_| "url".to_owned()));
             return Err(match kind {
-                Some(kind) if kind != "stdio" => McpConfigIssue::RemoteTransport {
-                    kind: label(&kind),
-                },
+                Some(kind) if kind != "stdio" => {
+                    McpConfigIssue::RemoteTransport { kind: label(&kind) }
+                }
                 _ => McpConfigIssue::MissingCommand,
             });
         }
@@ -527,11 +573,7 @@ pub fn validate_server_name(name: &str) -> Result<(), McpConfigIssue> {
     // did work, and tightening past what the runtime actually requires would
     // break those projects for no gain.
     if !name.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric()
-            || byte == b'-'
-            || byte == b'_'
-            || byte == b'.'
-            || byte == b':'
+        byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.' || byte == b':'
     }) {
         return Err(McpConfigIssue::NameCharset);
     }
@@ -604,9 +646,8 @@ mod tests {
         // The whole point of the `env` field: `register_mcp_servers` calls
         // `env_clear()`, so before this a server needing an API key in its
         // environment could not be configured at all.
-        let config =
-            parse_one(r#"{"command": "srv", "env": {"API_KEY": "k", "REGION": "eu"}}"#)
-                .expect("parse");
+        let config = parse_one(r#"{"command": "srv", "env": {"API_KEY": "k", "REGION": "eu"}}"#)
+            .expect("parse");
         assert_eq!(
             config.env,
             vec![
@@ -631,8 +672,14 @@ mod tests {
     #[test]
     fn a_name_that_could_not_appear_in_a_tool_name_is_rejected() {
         assert_eq!(validate_server_name(""), Err(McpConfigIssue::NameEmpty));
-        assert_eq!(validate_server_name("has space"), Err(McpConfigIssue::NameCharset));
-        assert_eq!(validate_server_name("slash/es"), Err(McpConfigIssue::NameCharset));
+        assert_eq!(
+            validate_server_name("has space"),
+            Err(McpConfigIssue::NameCharset)
+        );
+        assert_eq!(
+            validate_server_name("slash/es"),
+            Err(McpConfigIssue::NameCharset)
+        );
         // Deliberately still accepted: the previous parser validated only
         // length, so a dotted or namespaced name did work, and it is inside
         // `agent_runtime::turn::valid_ident`'s alphabet. Rejecting it would
@@ -700,7 +747,10 @@ mod tests {
                 key: "OK".to_owned()
             })
         );
-        assert_eq!(parse_one(r#"{"command": ""}"#), Err(McpConfigIssue::CommandEmpty));
+        assert_eq!(
+            parse_one(r#"{"command": ""}"#),
+            Err(McpConfigIssue::CommandEmpty)
+        );
         assert_eq!(parse_one("7"), Err(McpConfigIssue::EntryNotAnObject));
     }
 
@@ -751,15 +801,12 @@ mod tests {
         assert_eq!(loaded.servers().len(), MAX_MCP_SERVERS);
         assert_eq!(loaded.rejections().len(), MAX_MCP_SERVERS);
         assert!(
-            loaded
-                .rejections()
-                .iter()
-                .all(|rejection| matches!(
-                    rejection.issue,
-                    McpConfigIssue::OverCapacity {
-                        limit: MAX_MCP_SERVERS
-                    }
-                )),
+            loaded.rejections().iter().all(|rejection| matches!(
+                rejection.issue,
+                McpConfigIssue::OverCapacity {
+                    limit: MAX_MCP_SERVERS
+                }
+            )),
             "{:?}",
             loaded.rejections()
         );
@@ -919,7 +966,10 @@ mod tests {
             "an unbounded settings value reached a report line ({} bytes)",
             reason.len()
         );
-        assert!(reason.contains("..."), "truncation should be visible: {reason}");
+        assert!(
+            reason.contains("..."),
+            "truncation should be visible: {reason}"
+        );
     }
 
     #[test]
@@ -969,7 +1019,10 @@ mod tests {
             McpConfigIssue::ArgsNotAnArray,
             McpConfigIssue::ArgNotAString { index: 0 },
             McpConfigIssue::TooManyArgs { count: 99 },
-            McpConfigIssue::ArgTooLong { index: 0, bytes: 99 },
+            McpConfigIssue::ArgTooLong {
+                index: 0,
+                bytes: 99,
+            },
             McpConfigIssue::EnvNotAnObject,
             McpConfigIssue::TooManyEnvVars { count: 99 },
             McpConfigIssue::EnvKeyInvalid { key: "9".into() },

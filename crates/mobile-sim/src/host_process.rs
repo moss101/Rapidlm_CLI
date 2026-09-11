@@ -240,15 +240,9 @@ mod tests {
         let echo = require_bin("/bin/echo");
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let err = run_bounded_capturing_stdout(
-            echo,
-            ["hi"],
-            None,
-            Duration::from_secs(5),
-            1024,
-            &cancel,
-        )
-        .expect_err("cancelled");
+        let err =
+            run_bounded_capturing_stdout(echo, ["hi"], None, Duration::from_secs(5), 1024, &cancel)
+                .expect_err("cancelled");
         assert_eq!(err, HostRunError::Cancelled);
     }
 }

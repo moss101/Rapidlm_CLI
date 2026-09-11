@@ -204,18 +204,20 @@ pub fn discover_instructions(
     // one file; admit each real file once.
     let mut seen: Vec<PathBuf> = Vec::new();
     let admit = |path: PathBuf,
-                     text: String,
-                     locator: String,
-                     entries: &mut Vec<RuleEntry>,
-                     total: &mut usize,
-                     seen: &mut Vec<PathBuf>|
+                 text: String,
+                 locator: String,
+                 entries: &mut Vec<RuleEntry>,
+                 total: &mut usize,
+                 seen: &mut Vec<PathBuf>|
      -> Result<(), RulesError> {
         let canonical = fs::canonicalize(&path).unwrap_or(path);
         if seen.contains(&canonical) {
             return Ok(());
         }
         seen.push(canonical);
-        *total = total.checked_add(text.len()).ok_or(RulesError::BoundExceeded)?;
+        *total = total
+            .checked_add(text.len())
+            .ok_or(RulesError::BoundExceeded)?;
         if *total > MAX_AGENTS_BYTES || entries.len() >= MAX_AGENTS_FILES {
             return Err(RulesError::BoundExceeded);
         }
@@ -237,7 +239,14 @@ pub fn discover_instructions(
             let bytes = fs::read(&path).map_err(|_| RulesError::Unreadable)?;
             let text = String::from_utf8(bytes).map_err(|_| RulesError::Malformed)?;
             let locator = scoped_locator(&root, &dir, file_name)?;
-            admit(path.clone(), text, locator, &mut entries, &mut total, &mut seen)?;
+            admit(
+                path.clone(),
+                text,
+                locator,
+                &mut entries,
+                &mut total,
+                &mut seen,
+            )?;
         }
         for compat_dir in COMPAT_RULES_DIRS {
             let dir_path = dir.join(compat_dir);
@@ -248,7 +257,9 @@ pub fn discover_instructions(
                 .flatten()
                 .filter(|entry| {
                     entry.path().extension().is_some_and(|ext| ext == "md")
-                        && fs::metadata(entry.path()).map(|meta| meta.is_file()).unwrap_or(false)
+                        && fs::metadata(entry.path())
+                            .map(|meta| meta.is_file())
+                            .unwrap_or(false)
                 })
                 .map(|entry| entry.path())
                 .collect();
@@ -264,7 +275,14 @@ pub fn discover_instructions(
                     .map(|name| name.to_string_lossy().into_owned())
                     .ok_or(RulesError::PathEscape)?;
                 let locator = scoped_locator(&root, &dir, &format!("{compat_dir}/{file_name}"))?;
-                admit(path.clone(), text, locator, &mut entries, &mut total, &mut seen)?;
+                admit(
+                    path.clone(),
+                    text,
+                    locator,
+                    &mut entries,
+                    &mut total,
+                    &mut seen,
+                )?;
             }
         }
     }

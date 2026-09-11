@@ -16,14 +16,14 @@ use acp::v1::{
     encode_permission_request, encode_prompt_response, encode_session_update, map_kernel_event,
 };
 use acp::{
-    negotiate, AcpVersion, CancellationToken, HandleResult, InitializeOutcome, JsonRpcId,
-    JsonRpcMessage, MappedEvent, StopReason, V1Adapter, V2Adapter, INTERNAL_ERROR, INVALID_PARAMS,
-    METHOD_NOT_FOUND, PROTOCOL_VERSION, V2_PROTOCOL_VERSION,
+    AcpVersion, CancellationToken, HandleResult, INTERNAL_ERROR, INVALID_PARAMS, InitializeOutcome,
+    JsonRpcId, JsonRpcMessage, METHOD_NOT_FOUND, MappedEvent, PROTOCOL_VERSION, StopReason,
+    V1Adapter, V2_PROTOCOL_VERSION, V2Adapter, negotiate,
 };
 use event_ledger::event::{ActorKind, ActorRef, EventEnvelope, EventKind, RecordedAt};
 use kernel::InProcessKernelClient;
 use protocol::{EventId, ProjectId, RedactionClass, SessionId, TraceId};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 

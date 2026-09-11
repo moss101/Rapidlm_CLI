@@ -96,9 +96,18 @@ fn the_command_is_dispatched_and_reports_an_empty_project() {
 #[test]
 fn a_grant_written_by_one_invocation_is_seen_by_the_next() {
     let fixture = fixture("roundtrip");
-    let added = fixture.run(&["permissions", "allow", "workspace_write", "shell_exec(git *)"]);
+    let added = fixture.run(&[
+        "permissions",
+        "allow",
+        "workspace_write",
+        "shell_exec(git *)",
+    ]);
     assert_eq!(added.code, Some(0), "stderr: {}", added.stderr);
-    assert!(added.stdout.contains("allow=workspace_write"), "{}", added.stdout);
+    assert!(
+        added.stdout.contains("allow=workspace_write"),
+        "{}",
+        added.stdout
+    );
 
     let listed = fixture.run(&["permissions", "list"]);
     assert_eq!(listed.code, Some(0));
@@ -125,7 +134,11 @@ fn revoking_something_that_was_never_granted_exits_non_zero() {
     let fixture = fixture("revokemissing");
     let run = fixture.run(&["permissions", "revoke", "workspace_write"]);
     assert_eq!(run.code, Some(1), "{}", run.stdout);
-    assert!(run.stdout.contains("not-granted=workspace_write"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("not-granted=workspace_write"),
+        "{}",
+        run.stdout
+    );
 }
 
 #[test]
@@ -139,7 +152,11 @@ fn a_bad_invocation_is_a_usage_error_on_stderr_with_nothing_on_stdout() {
     ] {
         let run = fixture.run(&args);
         assert_eq!(run.code, Some(2), "{args:?} -> {}", run.stdout);
-        assert!(run.stdout.is_empty(), "{args:?} wrote stdout: {}", run.stdout);
+        assert!(
+            run.stdout.is_empty(),
+            "{args:?} wrote stdout: {}",
+            run.stdout
+        );
         assert!(
             run.stderr.contains("usage: rapid permissions"),
             "{args:?} stderr: {}",

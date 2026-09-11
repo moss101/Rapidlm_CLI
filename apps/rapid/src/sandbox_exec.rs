@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use capability_broker::{
     ActionRequest, ApprovalChoice, ApprovalResolution, ApprovalScopeId, CancellationToken,
-    CanonicalAction, Capability, CapabilityLease, CanonicalHostPath, LeaseIssuer, LeaseValidator,
+    CanonicalAction, CanonicalHostPath, Capability, CapabilityLease, LeaseIssuer, LeaseValidator,
     PolicyDocument, PolicyRevision, PolicySource, PolicyStack, PrincipalRef, ProcessScope,
     ResourceDescriptor, evaluate, issue, request_approval,
 };
@@ -368,7 +368,11 @@ mod tests {
     #[test]
     fn run_sandboxed_executes_and_captures_real_output() {
         let root = temp_root("basic");
-        let argv = vec!["sh".to_owned(), "-c".to_owned(), "echo hello-from-sandbox".to_owned()];
+        let argv = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "echo hello-from-sandbox".to_owned(),
+        ];
         let outcome = run_sandboxed(&root, &argv, Duration::from_secs(5), 4096).expect("run");
         assert_eq!(outcome.exit_code, Some(0));
         assert!(!outcome.timed_out);
@@ -405,8 +409,7 @@ mod tests {
     fn run_sandboxed_times_out_a_long_running_command() {
         let root = temp_root("timeout");
         let argv = vec!["sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()];
-        let outcome =
-            run_sandboxed(&root, &argv, Duration::from_millis(300), 4096).expect("run");
+        let outcome = run_sandboxed(&root, &argv, Duration::from_millis(300), 4096).expect("run");
         assert!(outcome.timed_out);
         let _ = std::fs::remove_dir_all(&root);
     }

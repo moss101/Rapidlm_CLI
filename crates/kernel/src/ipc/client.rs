@@ -544,10 +544,11 @@ impl DaemonEventStream {
         #[cfg(unix)]
         {
             if let Some(conn) = self.conn.as_mut()
-                && set_timeouts(&mut conn.stream, Some(STREAM_POLL), self.client.limits).is_err() {
-                    self.drop_conn();
-                    return Ok(None);
-                }
+                && set_timeouts(&mut conn.stream, Some(STREAM_POLL), self.client.limits).is_err()
+            {
+                self.drop_conn();
+                return Ok(None);
+            }
         }
         match self.read_stream_frame() {
             Ok(Inbound::Event { id, event, cursor }) => {
@@ -1470,10 +1471,7 @@ mod tests {
         // load the scripted worker may only be scheduled late, but it always
         // runs (spawn failure falls back to inline handling above).
         let recorded = rx.recv_timeout(Duration::from_secs(30)).expect("recorded");
-        assert!(
-            recorded.starts_with("submit_turn:"),
-            "recorded: {recorded}"
-        );
+        assert!(recorded.starts_with("submit_turn:"), "recorded: {recorded}");
         thread::sleep(Duration::from_millis(50));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }

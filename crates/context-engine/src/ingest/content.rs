@@ -543,10 +543,9 @@ fn read_bounded_file(
     let mut steps = 0u32;
     loop {
         steps = steps.wrapping_add(1);
-        if (steps == 1 || steps.is_multiple_of(CANCEL_STRIDE))
-            && cancel.is_cancelled() {
-                return Err(ContentError::Cancelled);
-            }
+        if (steps == 1 || steps.is_multiple_of(CANCEL_STRIDE)) && cancel.is_cancelled() {
+            return Err(ContentError::Cancelled);
+        }
         let n = file.read(&mut chunk).map_err(ContentError::from_io)?;
         if n == 0 {
             break;
@@ -569,10 +568,9 @@ fn hash_file_streaming(
     let mut steps = 0u32;
     loop {
         steps = steps.wrapping_add(1);
-        if (steps == 1 || steps.is_multiple_of(CANCEL_STRIDE))
-            && cancel.is_cancelled() {
-                return Err(ContentError::Cancelled);
-            }
+        if (steps == 1 || steps.is_multiple_of(CANCEL_STRIDE)) && cancel.is_cancelled() {
+            return Err(ContentError::Cancelled);
+        }
         let n = file.read(&mut chunk).map_err(ContentError::from_io)?;
         if n == 0 {
             break;
@@ -908,10 +906,7 @@ mod tests {
                         ContentClass::MetadataOnly(MetadataOnlyReason::Oversized)
                     );
                     assert_eq!(loaded.text(), None);
-                    assert_eq!(
-                        loaded.content_hash(),
-                        ContentHash::from_bytes(&[b'a'; 64])
-                    );
+                    assert_eq!(loaded.content_hash(), ContentHash::from_bytes(&[b'a'; 64]));
                 }
                 ".keep" => {}
                 other => panic!("unexpected path {other}"),

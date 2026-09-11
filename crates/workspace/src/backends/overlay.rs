@@ -444,7 +444,10 @@ mod tests {
                         })
                     })
                     .collect();
-                handles.into_iter().map(|h| h.join().expect("thread")).collect()
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("thread"))
+                    .collect()
             });
             let successes = results.iter().filter(|r| r.is_ok()).count();
             assert_eq!(

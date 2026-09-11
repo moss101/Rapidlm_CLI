@@ -110,7 +110,10 @@ fn trusted_project(home: &Path, project: &Path) {
         .output()
         .expect("git init");
     assert!(init.status.success(), "git init failed");
-    for (key, value) in [("user.email", "goalrace@example.com"), ("user.name", "goalrace")] {
+    for (key, value) in [
+        ("user.email", "goalrace@example.com"),
+        ("user.name", "goalrace"),
+    ] {
         let _ = Command::new("git")
             .args(["config", key, value])
             .current_dir(project)
@@ -200,7 +203,11 @@ fn concurrent_rapid_exec_processes_all_accrue_usage_to_the_same_goal() {
 
     // Setup: create the goal synchronously, before any race participant
     // starts — not itself part of the timed race.
-    let (code, _out, err) = run_goal(&project, &home, &["create", "ship it", "--max-tokens", "1000000"]);
+    let (code, _out, err) = run_goal(
+        &project,
+        &home,
+        &["create", "ship it", "--max-tokens", "1000000"],
+    );
     assert_eq!(code, Some(0), "goal create must succeed: {err}");
 
     // One scripted server per writer, each replying to exactly one request
@@ -230,7 +237,9 @@ fn concurrent_rapid_exec_processes_all_accrue_usage_to_the_same_goal() {
         .map(|(i, config)| spawn_exec(&project, &home, config, &format!("turn {i}")))
         .collect();
     for (i, mut child) in children.into_iter().enumerate() {
-        let status = child.wait().unwrap_or_else(|err| panic!("wait for turn {i}: {err}"));
+        let status = child
+            .wait()
+            .unwrap_or_else(|err| panic!("wait for turn {i}: {err}"));
         assert!(status.success(), "turn {i} must exit cleanly");
     }
 

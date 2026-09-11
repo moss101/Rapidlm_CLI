@@ -161,7 +161,8 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> (bool, S
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let output = crate::exec_tools::read_capped_bytes(&output_path, MAX_HOOK_STDERR_BYTES);
+                let output =
+                    crate::exec_tools::read_capped_bytes(&output_path, MAX_HOOK_STDERR_BYTES);
                 let _ = std::fs::remove_file(&output_path);
                 let text = truncate(&output, MAX_HOOK_STDERR_BYTES);
                 return (status.success(), text);
@@ -267,7 +268,10 @@ pub fn run_notify_hooks(
             map
         }
     };
-    input.insert("event".to_owned(), serde_json::Value::String(event.to_owned()));
+    input.insert(
+        "event".to_owned(),
+        serde_json::Value::String(event.to_owned()),
+    );
     let input = serde_json::Value::Object(input).to_string();
     let mut combined = String::new();
     for command in hooks {
@@ -300,8 +304,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         format!("sh {}", path.display())
     }
@@ -355,11 +358,7 @@ exit 0"#,
         let dir = std::env::temp_dir().join(format!("hook-stdin-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let capture = dir.join("captured.json");
-        let hook = script(
-            &dir,
-            "capture.sh",
-            &format!("cat > {}", capture.display()),
-        );
+        let hook = script(&dir, "capture.sh", &format!("cat > {}", capture.display()));
         let input = r#"{"tool":"repo_read","arguments":{"path":"a.txt"}}"#;
         assert_eq!(
             run_pre_tool_hooks(&[hook], "repo_read", r#"{"path":"a.txt"}"#, HOOK_TIMEOUT),
@@ -376,12 +375,7 @@ exit 0"#,
         std::fs::create_dir_all(&dir).expect("dir");
         let hang = script(&dir, "hang.sh", "sleep 30");
         let started = std::time::Instant::now();
-        match run_pre_tool_hooks(
-            &[hang],
-            "shell_exec",
-            "{}",
-            Duration::from_millis(250),
-        ) {
+        match run_pre_tool_hooks(&[hang], "shell_exec", "{}", Duration::from_millis(250)) {
             PreHookOutcome::Denied { reason } => {
                 assert!(reason.contains("timed out"), "{reason}");
             }
@@ -439,7 +433,12 @@ exit 0"#,
         let hang = script(&dir, "hang.sh", "sleep 30");
         let big_argument = format!("\"{}\"", "x".repeat(4_000_000));
         let started = std::time::Instant::now();
-        match run_pre_tool_hooks(&[hang], "shell_exec", &big_argument, Duration::from_millis(250)) {
+        match run_pre_tool_hooks(
+            &[hang],
+            "shell_exec",
+            &big_argument,
+            Duration::from_millis(250),
+        ) {
             PreHookOutcome::Denied { reason } => {
                 assert!(reason.contains("timed out"), "{reason}");
             }

@@ -837,9 +837,15 @@ fn handle_connection<C>(
     while !cancel.is_cancelled() {
         match read_frame(&mut stream, limits.max_frame_bytes) {
             Ok(body) => {
-                if let Err(err) =
-                    handle_request(&mut stream, &client, &cancel, limits, &body, auth, grant.as_ref())
-                {
+                if let Err(err) = handle_request(
+                    &mut stream,
+                    &client,
+                    &cancel,
+                    limits,
+                    &body,
+                    auth,
+                    grant.as_ref(),
+                ) {
                     match err {
                         IpcError::Cancelled
                         | IpcError::Io
@@ -1745,7 +1751,6 @@ mod tests {
         guard.wait().expect("join");
     }
 
-
     use auth::{DaemonAuth, DaemonTokenHandle};
 
     static AUTH_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1791,8 +1796,7 @@ mod tests {
         let mut stream = connect(&tmp.sock);
 
         // The daemon opens with an auth.challenge frame.
-        let challenge_frame =
-            read_frame(&mut stream, MAX_FRAME_BYTES).expect("challenge frame");
+        let challenge_frame = read_frame(&mut stream, MAX_FRAME_BYTES).expect("challenge frame");
         let challenge: Value = serde_json::from_slice(&challenge_frame).unwrap();
         assert_eq!(challenge["method"], "auth.challenge");
 
@@ -1850,10 +1854,14 @@ mod tests {
             "id": "auth-0",
             "params": { "challenge_id": cid, "response": "a中" }
         });
-        write_frame(&mut stream, &serde_json::to_vec(&bogus_proof).unwrap(), MAX_FRAME_BYTES)
-            .unwrap();
-        let verdict =
-            read_frame(&mut stream, MAX_FRAME_BYTES).expect("clean verdict frame, not a dropped connection");
+        write_frame(
+            &mut stream,
+            &serde_json::to_vec(&bogus_proof).unwrap(),
+            MAX_FRAME_BYTES,
+        )
+        .unwrap();
+        let verdict = read_frame(&mut stream, MAX_FRAME_BYTES)
+            .expect("clean verdict frame, not a dropped connection");
         let verdict: Value = serde_json::from_slice(&verdict).unwrap();
         assert_eq!(verdict["error"]["code"], "auth.required");
     }
@@ -1877,19 +1885,23 @@ mod tests {
 
         // Wrong proof first: rejected.
         let mut bad = connect(&tmp.sock);
-        let challenge_frame =
-            read_frame(&mut bad, MAX_FRAME_BYTES).expect("challenge frame");
-        let challenge_value: Value =
-            serde_json::from_slice(&challenge_frame).expect("json");
-        let cid = challenge_value["params"]["challenge_id"].as_str().expect("cid");
+        let challenge_frame = read_frame(&mut bad, MAX_FRAME_BYTES).expect("challenge frame");
+        let challenge_value: Value = serde_json::from_slice(&challenge_frame).expect("json");
+        let cid = challenge_value["params"]["challenge_id"]
+            .as_str()
+            .expect("cid");
         assert_eq!(cid.len(), 32, "16-byte challenge id hex");
         let bogus_proof = serde_json::json!({
             "schema": 1u16,
             "id": "auth-0",
             "params": { "challenge_id": cid, "response": "ab".repeat(32) }
         });
-        write_frame(&mut bad, &serde_json::to_vec(&bogus_proof).unwrap(), MAX_FRAME_BYTES)
-            .unwrap();
+        write_frame(
+            &mut bad,
+            &serde_json::to_vec(&bogus_proof).unwrap(),
+            MAX_FRAME_BYTES,
+        )
+        .unwrap();
         let verdict = read_frame(&mut bad, MAX_FRAME_BYTES).expect("verdict");
         let verdict: Value = serde_json::from_slice(&verdict).unwrap();
         assert_eq!(verdict["error"]["code"], "auth.required");
@@ -1897,10 +1909,8 @@ mod tests {
 
         // Correct proof: challenge -> prove -> served.
         let mut good = connect(&tmp.sock);
-        let challenge_frame =
-            read_frame(&mut good, MAX_FRAME_BYTES).expect("challenge frame");
-        let challenge_value: Value =
-            serde_json::from_slice(&challenge_frame).expect("json");
+        let challenge_frame = read_frame(&mut good, MAX_FRAME_BYTES).expect("challenge frame");
+        let challenge_value: Value = serde_json::from_slice(&challenge_frame).expect("json");
         let cid_hex = challenge_value["params"]["challenge_id"]
             .as_str()
             .expect("cid")
@@ -1914,8 +1924,11 @@ mod tests {
         let mut nonce_bytes = [0u8; 32];
         nonce_bytes.copy_from_slice(&unhex(&nonce_hex));
         let challenge = auth::AuthChallenge::from_parts(id_bytes, nonce_bytes);
-        let client_auth = auth::LocalDaemonClient::open(&runtime, &auth::CancellationToken::new()).expect("client open");
-        let proof = client_auth.prove(&challenge, &auth::CancellationToken::new()).expect("prove");
+        let client_auth = auth::LocalDaemonClient::open(&runtime, &auth::CancellationToken::new())
+            .expect("client open");
+        let proof = client_auth
+            .prove(&challenge, &auth::CancellationToken::new())
+            .expect("prove");
         let proof_body = serde_json::json!({
             "schema": 1u16,
             "id": "auth-0",
@@ -1942,7 +1955,10 @@ mod tests {
                 }),
             ),
         );
-        assert!(created.get("error").is_none(), "authenticated call succeeds");
+        assert!(
+            created.get("error").is_none(),
+            "authenticated call succeeds"
+        );
     }
 
     #[test]
@@ -1981,8 +1997,8 @@ mod tests {
         let mut nonce_bytes = [0u8; 32];
         nonce_bytes.copy_from_slice(&unhex(&nonce_hex));
         let challenge = auth::AuthChallenge::from_parts(id_bytes, nonce_bytes);
-        let client_auth =
-            auth::LocalDaemonClient::open(&runtime, &auth::CancellationToken::new()).expect("client open");
+        let client_auth = auth::LocalDaemonClient::open(&runtime, &auth::CancellationToken::new())
+            .expect("client open");
         let proof = client_auth
             .prove(&challenge, &auth::CancellationToken::new())
             .expect("prove");
@@ -1994,8 +2010,12 @@ mod tests {
                 "response": proof.response_hex(),
             }
         });
-        write_frame(&mut stream, &serde_json::to_vec(&proof_body).unwrap(), MAX_FRAME_BYTES)
-            .expect("write proof");
+        write_frame(
+            &mut stream,
+            &serde_json::to_vec(&proof_body).unwrap(),
+            MAX_FRAME_BYTES,
+        )
+        .expect("write proof");
 
         // The freshly authenticated connection can call a session API.
         let created = exchange(
@@ -2010,7 +2030,10 @@ mod tests {
                 }),
             ),
         );
-        assert!(created.get("error").is_none(), "call succeeds before rotation");
+        assert!(
+            created.get("error").is_none(),
+            "call succeeds before rotation"
+        );
 
         // Rotate the token — the daemon owner revoking/re-issuing while the
         // connection stays open, exactly as `DaemonAuth::issue`'s own
@@ -2031,8 +2054,9 @@ mod tests {
                 }),
             ),
         );
-        let err = rejected.get("error").expect("must be rejected after rotation");
+        let err = rejected
+            .get("error")
+            .expect("must be rejected after rotation");
         assert_eq!(err["code"], "auth.required");
     }
-
 }

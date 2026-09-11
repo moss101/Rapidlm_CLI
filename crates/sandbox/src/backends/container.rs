@@ -262,7 +262,8 @@ impl ContainerPlan {
                 }
                 MountMode::ReadOnly | MountMode::ReadWrite => {
                     let source = mount.source().ok_or(SandboxError::InvalidSpec)?;
-                    if is_forbidden_host_source(source.as_str()) || is_docker_socket(source.as_str())
+                    if is_forbidden_host_source(source.as_str())
+                        || is_docker_socket(source.as_str())
                     {
                         return Err(SandboxError::ForbiddenMount);
                     }
@@ -637,9 +638,10 @@ fn require_cwd_covered(cwd: &RepoPath, mounts: &[SandboxMount]) -> Result<(), Sa
     let mut best: Option<usize> = None;
     for mount in mounts {
         if let Some(prefix_len) = target_covers(mount.target(), cwd)
-            && best.is_none_or(|len| prefix_len > len) {
-                best = Some(prefix_len);
-            }
+            && best.is_none_or(|len| prefix_len > len)
+        {
+            best = Some(prefix_len);
+        }
     }
     best.ok_or(SandboxError::ForbiddenMount).map(|_| ())
 }
@@ -740,7 +742,8 @@ fn is_forbidden_host_source(path: &str) -> bool {
 
 fn sensitive_prefix_match(path: &str) -> bool {
     SENSITIVE_PREFIXES.iter().any(|prefix| {
-        path == *prefix || path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/')
+        path == *prefix
+            || path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/')
     })
 }
 
@@ -807,7 +810,10 @@ fn bwrap_version(program: &str) -> Option<String> {
     }
 }
 
-fn probe_rootless_namespaces(program: &str, cancel: &CancellationToken) -> Result<bool, SandboxError> {
+fn probe_rootless_namespaces(
+    program: &str,
+    cancel: &CancellationToken,
+) -> Result<bool, SandboxError> {
     check_cancel(cancel)?;
     let true_bin = match first_existing(TRUE_PROGRAMS) {
         Some(path) => path,
@@ -1355,15 +1361,12 @@ fn pgrep_group(pgid: u32) -> Option<Vec<u32>> {
     let mut pids = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         if let Ok(pid) = line.trim().parse::<u32>()
-            && pid >= 2 {
-                pids.push(pid);
-            }
+            && pid >= 2
+        {
+            pids.push(pid);
+        }
     }
-    if pids.is_empty() {
-        None
-    } else {
-        Some(pids)
-    }
+    if pids.is_empty() { None } else { Some(pids) }
 }
 
 fn ps_group(pgid: u32) -> Option<Vec<u32>> {
@@ -1392,11 +1395,7 @@ fn ps_group(pgid: u32) -> Option<Vec<u32>> {
             pids.push(pid);
         }
     }
-    if pids.is_empty() {
-        None
-    } else {
-        Some(pids)
-    }
+    if pids.is_empty() { None } else { Some(pids) }
 }
 
 fn pid_rss_kb(pid: u32) -> Option<u64> {
@@ -1520,13 +1519,13 @@ mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use capability_broker::{
-        evaluate, issue, request_approval, ActionRequest, ApprovalChoice, ApprovalResolution,
-        ApprovalScopeId, CanonicalAction, FilesystemScope, LeaseIssuer, PolicyDocument,
-        PolicySource, PolicyStack, PrincipalRef, ProcessScope, ResourceDescriptor, SecretHandle,
+        ActionRequest, ApprovalChoice, ApprovalResolution, ApprovalScopeId, CanonicalAction,
+        FilesystemScope, LeaseIssuer, PolicyDocument, PolicySource, PolicyStack, PrincipalRef,
+        ProcessScope, ResourceDescriptor, SecretHandle, evaluate, issue, request_approval,
     };
     use protocol::{ErrorCode, SessionId};
 
@@ -1705,7 +1704,10 @@ capability = "fs.read"
     }
 
     fn host_tool(candidates: &[&'static str]) -> Option<&'static str> {
-        candidates.iter().copied().find(|path| Path::new(path).is_file())
+        candidates
+            .iter()
+            .copied()
+            .find(|path| Path::new(path).is_file())
     }
 
     fn live_runtime(backend: &ContainerBackend) -> Option<BackendHealth> {
@@ -1796,11 +1798,19 @@ capability = "fs.read"
 
         let sock = CanonicalHostPath::from_resolved("/var/run/docker.sock").expect("sock");
         assert_eq!(
-            SandboxMount::bind(sock, RepoPath::parse("docker.sock").expect("t"), MountMode::ReadWrite)
-                .expect_err("bind"),
+            SandboxMount::bind(
+                sock,
+                RepoPath::parse("docker.sock").expect("t"),
+                MountMode::ReadWrite
+            )
+            .expect_err("bind"),
             SandboxError::ForbiddenMount
         );
-        assert!(!SandboxError::ForbiddenMount.as_str().contains("docker.sock"));
+        assert!(
+            !SandboxError::ForbiddenMount
+                .as_str()
+                .contains("docker.sock")
+        );
         assert_eq!(
             SandboxError::ForbiddenMount.error_code(),
             Some(ErrorCode::PolicyDenied)
@@ -1810,9 +1820,7 @@ capability = "fs.read"
     #[test]
     fn health_is_unavailable_not_clean_when_host_cannot_rootless() {
         let backend = ContainerBackend::new();
-        let health = backend
-            .health(&CancellationToken::new())
-            .expect("health");
+        let health = backend.health(&CancellationToken::new()).expect("health");
         if live_runtime(&backend).is_some() {
             assert!(health.is_available());
             assert!(health.reason().is_none());
@@ -1946,7 +1954,11 @@ capability = "fs.read"
             backend.prepare(&spec, &lease, &live).expect_err("ssh"),
             SandboxError::ForbiddenMount
         );
-        assert!(!SandboxError::ForbiddenMount.as_str().contains("canary-home"));
+        assert!(
+            !SandboxError::ForbiddenMount
+                .as_str()
+                .contains("canary-home")
+        );
         assert!(!SandboxError::ForbiddenMount.as_str().contains(CANARY));
     }
 
@@ -1957,19 +1969,22 @@ capability = "fs.read"
         let spec = container_spec(&ws);
         let plan = ContainerPlan::from_spec(&spec).expect("plan");
         if let Ok(home) = std::env::var("HOME")
-            && !home.is_empty() {
-                assert!(
-                    plan.bind_sources().all(|src| src != home.as_str()
-                        && !src.starts_with(&format!("{}/", home.trim_end_matches('/')))),
-                    "host home must not be a bind source"
-                );
-            }
-        assert!(plan.bind_sources().all(|src| !is_home_root(
-            &src.to_ascii_lowercase()
-                .split('/')
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-        )));
+            && !home.is_empty()
+        {
+            assert!(
+                plan.bind_sources().all(|src| src != home.as_str()
+                    && !src.starts_with(&format!("{}/", home.trim_end_matches('/')))),
+                "host home must not be a bind source"
+            );
+        }
+        assert!(plan.bind_sources().all(|src| {
+            !is_home_root(
+                &src.to_ascii_lowercase()
+                    .split('/')
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>(),
+            )
+        }));
 
         let live = CancellationToken::new();
         let Some(_) = live_runtime(&backend) else {
@@ -1981,8 +1996,8 @@ capability = "fs.read"
         let handle = backend.prepare(&spec, &lease, &live).expect("prepare");
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_owned());
         let ls = host_tool(&["/bin/ls", "/usr/bin/ls"]).expect("ls");
-        let request = SandboxExecRequest::new([ls, &home], Duration::from_secs(2), 4096)
-            .expect("request");
+        let request =
+            SandboxExecRequest::new([ls, &home], Duration::from_secs(2), 4096).expect("request");
         let result = backend
             .exec(&handle, &request, &lease, &live)
             .expect("exec");
@@ -2030,22 +2045,24 @@ capability = "fs.read"
         while hits.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(hits.load(Ordering::SeqCst), 1, "host probe must hit endpoint");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "host probe must hit endpoint"
+        );
 
         let live = CancellationToken::new();
         let Some(_) = live_runtime(&backend) else {
             let health = backend.health(&live).expect("health");
             assert!(!health.is_available());
-            assert!(
-                matches!(
-                    health.reason(),
-                    Some(
-                        HealthReason::PlatformUnsupported
-                            | HealthReason::RuntimeMissing
-                            | HealthReason::FeatureMissing
-                    )
+            assert!(matches!(
+                health.reason(),
+                Some(
+                    HealthReason::PlatformUnsupported
+                        | HealthReason::RuntimeMissing
+                        | HealthReason::FeatureMissing
                 )
-            );
+            ));
             thread::sleep(Duration::from_millis(50));
             assert_eq!(
                 hits.load(Ordering::SeqCst),
@@ -2067,8 +2084,8 @@ capability = "fs.read"
             addr.ip(),
             addr.port()
         );
-        let request =
-            SandboxExecRequest::new([sh, "-c", &script], Duration::from_secs(2), 4096).expect("req");
+        let request = SandboxExecRequest::new([sh, "-c", &script], Duration::from_secs(2), 4096)
+            .expect("req");
         let result = backend
             .exec(&handle, &request, &lease, &live)
             .expect("exec");
@@ -2145,7 +2162,9 @@ capability = "fs.read"
         let live = CancellationToken::new();
         let Some(_) = live_runtime(&backend) else {
             assert_eq!(
-                backend.prepare(&spec, &lease, &live).expect_err("no runtime"),
+                backend
+                    .prepare(&spec, &lease, &live)
+                    .expect_err("no runtime"),
                 SandboxError::TierUnavailable
             );
             let heavy = SandboxSpec::builder(SandboxTier::Container)
@@ -2158,8 +2177,7 @@ capability = "fs.read"
         };
         let handle = backend.prepare(&spec, &lease, &live).expect("prepare");
         let true_bin = host_tool(&["/usr/bin/true", "/bin/true"]).expect("true");
-        let wide =
-            SandboxExecRequest::new([true_bin], Duration::from_secs(5), 1024).expect("wide");
+        let wide = SandboxExecRequest::new([true_bin], Duration::from_secs(5), 1024).expect("wide");
         assert_eq!(
             backend
                 .exec(&handle, &wide, &lease, &live)

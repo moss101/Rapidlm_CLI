@@ -75,7 +75,9 @@ pub struct EventSummary {
 
 impl EventSummary {
     pub fn new(kind: &str) -> Self {
-        Self { kind: kind.to_owned() }
+        Self {
+            kind: kind.to_owned(),
+        }
     }
 }
 
@@ -110,10 +112,7 @@ impl EnduranceTier {
 /// Execute a compressed endurance run: drive `step` until the tier's event
 /// budget is met. Real-duration wall-clock execution is an environmental
 /// limitation; this driver keeps the contract time-budget aware.
-pub fn run_endurance(
-    tier: EnduranceTier,
-    mut step: impl FnMut(u64) -> Result<(), ()>,
-) -> u64 {
+pub fn run_endurance(tier: EnduranceTier, mut step: impl FnMut(u64) -> Result<(), ()>) -> u64 {
     let budget = tier.planned_events();
     for i in 1..=budget {
         if step(i).is_err() {
@@ -174,7 +173,10 @@ mod tests {
         assert!(kinds.contains(&"goal_completion"));
         assert!(kinds.contains(&"approvals"));
         assert!(kinds.contains(&"error_pressure"));
-        let approvals = insights.iter().find(|i| i.kind == "approvals").expect("approvals");
+        let approvals = insights
+            .iter()
+            .find(|i| i.kind == "approvals")
+            .expect("approvals");
         assert_eq!(approvals.detail, "3 approval-lifecycle events");
         let errors = insights
             .iter()

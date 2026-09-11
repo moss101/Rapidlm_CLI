@@ -509,9 +509,9 @@ impl TransactionManager {
                 .txs
                 .get(&tx)
                 .is_some_and(|stored| stored.meta.state == TransactionState::Staged)
-            {
-                abort_staged(&mut inner, tx);
-            }
+        {
+            abort_staged(&mut inner, tx);
+        }
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Inner>, TransactionError> {
@@ -766,9 +766,9 @@ fn verify_required_checks(
                 if let Some(staged) = staged
                     && (staged.view_id() != preview.parent_view_id()
                         || staged.base_revision() != preview.parent_revision())
-                    {
-                        return Err(TransactionError::Preimage);
-                    }
+                {
+                    return Err(TransactionError::Preimage);
+                }
             }
         }
     }

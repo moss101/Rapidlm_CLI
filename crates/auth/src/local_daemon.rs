@@ -113,7 +113,10 @@ impl AuthProof {
     /// Reconstruct a proof from wire bytes. Only the constant-time MAC check
     /// in [`DaemonAuth::authenticate`] grants any authority.
     pub fn from_parts(challenge_id: [u8; CHALLENGE_ID_BYTES], response: [u8; TOKEN_BYTES]) -> Self {
-        Self { challenge_id, response }
+        Self {
+            challenge_id,
+            response,
+        }
     }
 }
 

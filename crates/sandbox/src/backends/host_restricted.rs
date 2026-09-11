@@ -403,9 +403,10 @@ pub(crate) fn resolve_cwd(
             continue;
         }
         if let Some(prefix_len) = target_covers(mount.target(), cwd)
-            && best.is_none_or(|(_, len)| prefix_len > len) {
-                best = Some((mount, prefix_len));
-            }
+            && best.is_none_or(|(_, len)| prefix_len > len)
+        {
+            best = Some((mount, prefix_len));
+        }
     }
     let (mount, _) = best.ok_or(SandboxError::ForbiddenMount)?;
     let source = mount.source().ok_or(SandboxError::InvalidSpec)?;
@@ -1076,15 +1077,12 @@ fn pgrep_group(pgid: u32) -> Option<Vec<u32>> {
     let mut pids = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         if let Ok(pid) = line.trim().parse::<u32>()
-            && pid >= 2 {
-                pids.push(pid);
-            }
+            && pid >= 2
+        {
+            pids.push(pid);
+        }
     }
-    if pids.is_empty() {
-        None
-    } else {
-        Some(pids)
-    }
+    if pids.is_empty() { None } else { Some(pids) }
 }
 
 fn ps_group(pgid: u32) -> Option<Vec<u32>> {
@@ -1113,11 +1111,7 @@ fn ps_group(pgid: u32) -> Option<Vec<u32>> {
             pids.push(pid);
         }
     }
-    if pids.is_empty() {
-        None
-    } else {
-        Some(pids)
-    }
+    if pids.is_empty() { None } else { Some(pids) }
 }
 
 /// Resident set size for one pid, in KB.
@@ -1184,9 +1178,9 @@ mod tests {
     use std::time::Instant;
 
     use capability_broker::{
-        evaluate, issue, request_approval, ActionRequest, ApprovalChoice, ApprovalResolution,
-        ApprovalScopeId, CanonicalAction, FilesystemScope, LeaseIssuer, PolicyDocument,
-        PolicySource, PolicyStack, PrincipalRef, ProcessScope, ResourceDescriptor, SecretHandle,
+        ActionRequest, ApprovalChoice, ApprovalResolution, ApprovalScopeId, CanonicalAction,
+        FilesystemScope, LeaseIssuer, PolicyDocument, PolicySource, PolicyStack, PrincipalRef,
+        ProcessScope, ResourceDescriptor, SecretHandle, evaluate, issue, request_approval,
     };
     use protocol::{ErrorCode, SessionId};
 
@@ -1402,9 +1396,10 @@ capability = "fs.read"
         loop {
             if let Ok(text) = fs::read_to_string(path)
                 && let Ok(pid) = text.trim().parse::<u32>()
-                    && pid >= 2 {
-                        return pid;
-                    }
+                && pid >= 2
+            {
+                return pid;
+            }
             if Instant::now() >= deadline {
                 panic!("pid file {} was not written", path.display());
             }
@@ -1550,9 +1545,11 @@ capability = "fs.read"
             SandboxError::ForbiddenMount.error_code(),
             Some(ErrorCode::PolicyDenied)
         );
-        assert!(!SandboxError::ForbiddenMount
-            .as_str()
-            .contains("canary-home"));
+        assert!(
+            !SandboxError::ForbiddenMount
+                .as_str()
+                .contains("canary-home")
+        );
     }
 
     #[test]
@@ -1823,8 +1820,8 @@ capability = "fs.read"
         // matching the pre-existing byte-count guarantee this field now
         // carries the real content for.
         let script = "i=0; while [ $i -lt 200 ]; do echo 0123456789; i=$((i+1)); done";
-        let request =
-            SandboxExecRequest::new([sh, "-c", script], Duration::from_secs(2), 16).expect("request");
+        let request = SandboxExecRequest::new([sh, "-c", script], Duration::from_secs(2), 16)
+            .expect("request");
         let result = backend
             .exec(&handle, &request, &lease, &live)
             .expect("exec");

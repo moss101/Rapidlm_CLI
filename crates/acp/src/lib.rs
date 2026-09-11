@@ -12,8 +12,8 @@ pub use stdio::{
     TransportState,
 };
 pub use v1::{
-    ContentBlock, FileDiff, HandleResult, InitializeResult, MappedEvent, NewSessionResult,
-    MAX_DIFF_BYTES, MAX_DIFF_PATH_BYTES, PROTOCOL_VERSION, PermissionOutcome, PermissionRequest,
+    ContentBlock, FileDiff, HandleResult, InitializeResult, MAX_DIFF_BYTES, MAX_DIFF_PATH_BYTES,
+    MappedEvent, NewSessionResult, PROTOCOL_VERSION, PermissionOutcome, PermissionRequest,
     PromptTurn, SessionUpdate, SessionUpdateNotification, StopReason, ToolCallStatus, V1Adapter,
     V1Error,
 };

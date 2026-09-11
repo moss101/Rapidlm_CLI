@@ -93,7 +93,10 @@ impl fmt::Display for ConfigFieldError {
         write!(
             f,
             "managed gate violation at '{}' (origin={}): {}; remediation: {}",
-            self.field_id, self.origin.as_str(), self.reason, self.remediation
+            self.field_id,
+            self.origin.as_str(),
+            self.reason,
+            self.remediation
         )
     }
 }
@@ -220,9 +223,7 @@ impl ManagedPolicy {
         })?;
         for key in table.keys() {
             if key != "schema" && key != "policy" {
-                return Err(ManagedConfigError::UnknownField {
-                    field: key.clone(),
-                });
+                return Err(ManagedConfigError::UnknownField { field: key.clone() });
             }
         }
         let schema = table
@@ -236,9 +237,11 @@ impl ManagedPolicy {
                 found: schema.to_string(),
             });
         }
-        let policy = table.get("policy").ok_or_else(|| ManagedConfigError::Parse {
-            reason: "missing [policy] table".to_string(),
-        })?;
+        let policy = table
+            .get("policy")
+            .ok_or_else(|| ManagedConfigError::Parse {
+                reason: "missing [policy] table".to_string(),
+            })?;
         let policy = policy.as_table().ok_or_else(|| ManagedConfigError::Parse {
             reason: "[policy] must be a table".to_string(),
         })?;
@@ -281,14 +284,12 @@ impl ManagedPolicy {
         let allowed_providers = match policy.get("allowed_providers") {
             None => None,
             Some(raw) => {
-                let entries =
-                    raw.as_array()
-                        .ok_or_else(|| {
-                            ManagedConfigError::PolicyField(field_error(
-                                "policy.allowed_providers",
-                                "must be an array of provider names",
-                            ))
-                        })?;
+                let entries = raw.as_array().ok_or_else(|| {
+                    ManagedConfigError::PolicyField(field_error(
+                        "policy.allowed_providers",
+                        "must be an array of provider names",
+                    ))
+                })?;
                 let mut names = Vec::with_capacity(entries.len());
                 for entry in entries {
                     let name = entry.as_str().ok_or_else(|| {
@@ -373,12 +374,13 @@ impl ManagedPolicy {
                             "entries must be strings",
                         ))
                     })?;
-                    let pattern = crate::permissions::ToolPattern::parse(name).ok_or_else(|| {
-                        ManagedConfigError::PolicyField(field_error(
-                            "policy.denied_tools",
-                            &format!("'{name}' is not a valid tool pattern"),
-                        ))
-                    })?;
+                    let pattern =
+                        crate::permissions::ToolPattern::parse(name).ok_or_else(|| {
+                            ManagedConfigError::PolicyField(field_error(
+                                "policy.denied_tools",
+                                &format!("'{name}' is not a valid tool pattern"),
+                            ))
+                        })?;
                     patterns.push(pattern);
                 }
                 if patterns.is_empty() {
@@ -586,7 +588,10 @@ impl fmt::Display for GateReportEntry {
         write!(
             f,
             "{} enforced at '{}' (origin={}); remediation: {}",
-            self.field_id, self.detail, self.origin.as_str(), self.remediation
+            self.field_id,
+            self.detail,
+            self.origin.as_str(),
+            self.remediation
         )
     }
 }
@@ -636,7 +641,9 @@ impl From<ManagedConfigError> for GatedConfigError {
 /// set-but-unreadable is an error (a configured-but-absent control document
 /// must not silently become "no policy").
 pub fn load_policy(env: &[(String, String)]) -> Result<Option<ManagedPolicy>, ManagedConfigError> {
-    let Some(path) = env_value(env, MANAGED_CONFIG_ENV).map(str::trim).filter(|p| !p.is_empty())
+    let Some(path) = env_value(env, MANAGED_CONFIG_ENV)
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
     else {
         return Ok(None);
     };
@@ -645,17 +652,17 @@ pub fn load_policy(env: &[(String, String)]) -> Result<Option<ManagedPolicy>, Ma
     // binary. This document defines several of the byte/count ceilings
     // this module enforces on everything else; it should not be the one
     // unbounded read in the whole gating layer.
-    let bytes = crate::exec_tools::read_file_bounded(
-        std::path::Path::new(path),
-        MAX_MANAGED_POLICY_BYTES,
-    )
-    .map_err(|err| match err {
-        crate::exec_tools::BoundedReadError::Io(io_err) => ManagedConfigError::Io(io_err),
-        crate::exec_tools::BoundedReadError::TooLarge => ManagedConfigError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("managed policy exceeds {MAX_MANAGED_POLICY_BYTES} bytes"),
-        )),
-    })?;
+    let bytes =
+        crate::exec_tools::read_file_bounded(std::path::Path::new(path), MAX_MANAGED_POLICY_BYTES)
+            .map_err(|err| match err {
+                crate::exec_tools::BoundedReadError::Io(io_err) => ManagedConfigError::Io(io_err),
+                crate::exec_tools::BoundedReadError::TooLarge => {
+                    ManagedConfigError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("managed policy exceeds {MAX_MANAGED_POLICY_BYTES} bytes"),
+                    ))
+                }
+            })?;
     let text = String::from_utf8(bytes).map_err(|_| {
         ManagedConfigError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -717,7 +724,9 @@ pub fn resolve_gated(
 
     // Provider allowlist applies to the final active model, whoever chose it.
     if let Some(allowed) = &policy.allowed_providers
-        && !allowed.iter().any(|name| name == active.entry.provider.as_str())
+        && !allowed
+            .iter()
+            .any(|name| name == active.entry.provider.as_str())
     {
         return Err(GatedConfigError::Field(ConfigFieldError {
             field_id: format!("{}.provider", active.profile_id),
@@ -750,7 +759,10 @@ pub fn resolve_gated(
     finish(active, env, config, policy, reports)
 }
 
-fn active_profile_id(env: &[(String, String)], config: &UserConfig) -> Result<String, GatedConfigError> {
+fn active_profile_id(
+    env: &[(String, String)],
+    config: &UserConfig,
+) -> Result<String, GatedConfigError> {
     Ok(resolve_active(env, config)?.profile_id)
 }
 
@@ -779,7 +791,9 @@ pub fn apply_to_fallback_candidate(
         return Ok(candidate);
     };
     if let Some(allowed) = policy.allowed_providers()
-        && !allowed.iter().any(|name| name == candidate.entry.provider.as_str())
+        && !allowed
+            .iter()
+            .any(|name| name == candidate.entry.provider.as_str())
     {
         return Err(candidate.profile_id);
     }
@@ -861,7 +875,9 @@ base_url = "http://gateway.internal:8080"
         );
         assert_eq!(
             policy.denied_tools(),
-            Some([crate::permissions::ToolPattern::parse("shell_exec").expect("pattern")].as_slice())
+            Some(
+                [crate::permissions::ToolPattern::parse("shell_exec").expect("pattern")].as_slice()
+            )
         );
         assert_eq!(policy.confine_writes_to(), Some("src"));
         assert_eq!(policy.max_write_bytes_per_turn(), Some(1024));
@@ -889,7 +905,11 @@ base_url = "http://gateway.internal:8080"
             16,
             "16 lowercase hex digits (a 64-bit hash)"
         );
-        assert!(a.policy_version().chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            a.policy_version()
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
 
         let changed = parse_policy(&policy_doc("locked_default = \"local\"\n"));
         assert_ne!(
@@ -901,7 +921,8 @@ base_url = "http://gateway.internal:8080"
         // Even a whitespace-only change is a byte-level difference, and
         // this is deliberately a content hash, not a semantic one — see
         // the field's own doc comment.
-        let whitespace_only = parse_policy(&format!("{}\n", policy_doc("locked_default = \"cloud\"\n")));
+        let whitespace_only =
+            parse_policy(&format!("{}\n", policy_doc("locked_default = \"cloud\"\n")));
         assert_ne!(a.policy_version(), whitespace_only.policy_version());
     }
 
@@ -926,20 +947,22 @@ base_url = "http://gateway.internal:8080"
                 .as_nanos()
         ));
         std::fs::write(&dir, policy_doc("locked_default = \"cloud\"\n")).expect("write");
-        let env = vec![(
-            MANAGED_CONFIG_ENV.to_string(),
-            dir.display().to_string(),
-        )];
+        let env = vec![(MANAGED_CONFIG_ENV.to_string(), dir.display().to_string())];
         let policy = load_policy(&env).expect("load");
-        assert_eq!(policy.and_then(|p| p.locked_default().map(str::to_string)).as_deref(), Some("cloud"));
+        assert_eq!(
+            policy
+                .and_then(|p| p.locked_default().map(str::to_string))
+                .as_deref(),
+            Some("cloud")
+        );
         // Unset: no policy.
         assert!(load_policy(&[]).expect("unset").is_none());
         // Set but absent: an error, not "no policy".
-        let env = vec![(MANAGED_CONFIG_ENV.to_string(), "/nonexistent/rapidlm/managed.toml".to_string())];
-        assert!(matches!(
-            load_policy(&env),
-            Err(ManagedConfigError::Io(_))
-        ));
+        let env = vec![(
+            MANAGED_CONFIG_ENV.to_string(),
+            "/nonexistent/rapidlm/managed.toml".to_string(),
+        )];
+        assert!(matches!(load_policy(&env), Err(ManagedConfigError::Io(_))));
         let _ = std::fs::remove_file(&dir);
     }
 
@@ -1013,13 +1036,24 @@ reasoning_effort = "low"
         let config = parse_config_document(doc, "user.toml").expect("parse");
         let policy = parse_policy(&policy_doc("min_reasoning_effort = \"high\"\n"));
         let gated = resolve_gated(&[], &config, Some(&policy)).expect("gated");
-        assert_eq!(gated.active.entry.reasoning_effort, Some(ReasoningEffort::High));
-        assert!(gated.reports.iter().any(|r| r.field_id == "local.reasoning_effort"));
+        assert_eq!(
+            gated.active.entry.reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+        assert!(
+            gated
+                .reports
+                .iter()
+                .any(|r| r.field_id == "local.reasoning_effort")
+        );
         // An effort already at or above the floor is left alone.
         let doc = doc.replace("reasoning_effort = \"low\"", "reasoning_effort = \"ultra\"");
         let config = parse_config_document(&doc, "user.toml").expect("parse");
         let gated = resolve_gated(&[], &config, Some(&policy)).expect("gated");
-        assert_eq!(gated.active.entry.reasoning_effort, Some(ReasoningEffort::Ultra));
+        assert_eq!(
+            gated.active.entry.reasoning_effort,
+            Some(ReasoningEffort::Ultra)
+        );
         assert!(gated.reports.is_empty());
     }
 
@@ -1031,9 +1065,18 @@ reasoning_effort = "low"
         // which path selected the active model — this pins its exact
         // semantics down directly, independent of either call site.
         assert!(below_floor(None, ReasoningEffort::High));
-        assert!(below_floor(Some(ReasoningEffort::Low), ReasoningEffort::High));
-        assert!(!below_floor(Some(ReasoningEffort::High), ReasoningEffort::High));
-        assert!(!below_floor(Some(ReasoningEffort::Ultra), ReasoningEffort::High));
+        assert!(below_floor(
+            Some(ReasoningEffort::Low),
+            ReasoningEffort::High
+        ));
+        assert!(!below_floor(
+            Some(ReasoningEffort::High),
+            ReasoningEffort::High
+        ));
+        assert!(!below_floor(
+            Some(ReasoningEffort::Ultra),
+            ReasoningEffort::High
+        ));
     }
 
     #[test]
@@ -1084,7 +1127,10 @@ reasoning_effort = "low"
 
         // No policy at all: the candidate passes through unchanged.
         let unchanged = apply_to_fallback_candidate(
-            candidates_from(&config, &primary).into_iter().next().unwrap(),
+            candidates_from(&config, &primary)
+                .into_iter()
+                .next()
+                .unwrap(),
             None,
         )
         .expect("no policy, always allowed");
@@ -1104,7 +1150,8 @@ reasoning_effort = "low"
 
     #[test]
     fn parse_rejects_an_invalid_denied_tools_pattern() {
-        let err = ManagedPolicy::parse(&policy_doc("denied_tools = [\"\"]\n")).expect_err("bad pattern");
+        let err =
+            ManagedPolicy::parse(&policy_doc("denied_tools = [\"\"]\n")).expect_err("bad pattern");
         assert!(err.to_string().contains("not a valid tool pattern"));
     }
 
@@ -1118,17 +1165,25 @@ reasoning_effort = "low"
     fn parse_rejects_an_absolute_or_traversing_confine_writes_to() {
         let absolute = ManagedPolicy::parse(&policy_doc("confine_writes_to = \"/etc\"\n"))
             .expect_err("absolute path");
-        assert!(absolute.to_string().contains("no '..' or absolute segments"));
+        assert!(
+            absolute
+                .to_string()
+                .contains("no '..' or absolute segments")
+        );
 
         let traversal = ManagedPolicy::parse(&policy_doc("confine_writes_to = \"../outside\"\n"))
             .expect_err("traversal");
-        assert!(traversal.to_string().contains("no '..' or absolute segments"));
+        assert!(
+            traversal
+                .to_string()
+                .contains("no '..' or absolute segments")
+        );
     }
 
     #[test]
     fn parse_rejects_a_zero_or_negative_byte_ceiling() {
-        let zero = ManagedPolicy::parse(&policy_doc("max_write_bytes_per_turn = 0\n"))
-            .expect_err("zero");
+        let zero =
+            ManagedPolicy::parse(&policy_doc("max_write_bytes_per_turn = 0\n")).expect_err("zero");
         assert!(zero.to_string().contains("must be a positive integer"));
 
         let negative = ManagedPolicy::parse(&policy_doc("max_fetch_bytes_per_turn = -1\n"))
@@ -1137,7 +1192,11 @@ reasoning_effort = "low"
 
         let zero_spawns = ManagedPolicy::parse(&policy_doc("max_subagent_spawns_per_turn = 0\n"))
             .expect_err("zero spawns");
-        assert!(zero_spawns.to_string().contains("must be a positive integer"));
+        assert!(
+            zero_spawns
+                .to_string()
+                .contains("must be a positive integer")
+        );
     }
 
     #[test]

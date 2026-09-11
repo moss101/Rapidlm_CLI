@@ -11,12 +11,12 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use capability_broker::{
-    normalize_network, CancellationToken, CanonicalNetHost, CanonicalNetworkTarget, Hostname,
-    IpClass, NetworkIntent, NetworkNormalizeError, NetworkResolver, NetworkScheme,
+    CancellationToken, CanonicalNetHost, CanonicalNetworkTarget, Hostname, IpClass, NetworkIntent,
+    NetworkNormalizeError, NetworkResolver, NetworkScheme, normalize_network,
 };
 
 /// Maximum allowlist rules on one [`EgressPolicy`].
@@ -1181,9 +1181,11 @@ mod tests {
         assert_eq!(lease.target().scheme(), NetworkScheme::Https);
         assert_eq!(lease.target().port(), 443);
         assert_eq!(lease.target().host().as_canonical_str(), "example.com");
-        assert!(lease
-            .bound_ips()
-            .contains(&"93.184.216.34".parse().unwrap()));
+        assert!(
+            lease
+                .bound_ips()
+                .contains(&"93.184.216.34".parse().unwrap())
+        );
         let consumed = match proxy
             .consume_connect(&lease, None, &fixture(), &CancellationToken::new())
             .expect("consume")
@@ -1200,9 +1202,10 @@ mod tests {
         );
         let log = proxy.audit_log().expect("audit");
         assert!(log.iter().any(|row| row.is_allow()));
-        assert!(!log
-            .iter()
-            .any(|row| row.host().is_some_and(|h| h.contains('/'))));
+        assert!(
+            !log.iter()
+                .any(|row| row.host().is_some_and(|h| h.contains('/')))
+        );
     }
 
     #[test]
@@ -1386,9 +1389,11 @@ mod tests {
             EgressOutcome::Allow(lease) => lease,
             EgressOutcome::Deny(deny) => panic!("authorize denied: {}", deny.reason()),
         };
-        assert!(lease
-            .bound_ips()
-            .contains(&"93.184.216.34".parse().unwrap()));
+        assert!(
+            lease
+                .bound_ips()
+                .contains(&"93.184.216.34".parse().unwrap())
+        );
         match proxy
             .consume_connect(&lease, None, &resolver, &CancellationToken::new())
             .expect("consume")

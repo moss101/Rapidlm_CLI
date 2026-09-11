@@ -101,7 +101,10 @@ fn git_project(project: &Path) {
         .output()
         .expect("git init");
     assert!(init.status.success(), "git init failed");
-    for (key, value) in [("user.email", "trustcli@example.com"), ("user.name", "trustcli")] {
+    for (key, value) in [
+        ("user.email", "trustcli@example.com"),
+        ("user.name", "trustcli"),
+    ] {
         let _ = Command::new("git")
             .args(["config", key, value])
             .current_dir(project)
@@ -131,7 +134,12 @@ fn run_trust(project: &Path, home: &Path, args: &[&str]) -> (Option<i32>, String
 /// Run `rapid exec <prompt>` against `project`/`home`/`config` — used only
 /// as the real, safely-observable trust-gated operation for the
 /// security-gate proof (workspace tools stay withheld until trusted).
-fn run_exec(project: &Path, home: &Path, config: &Path, prompt: &str) -> (Option<i32>, String, String) {
+fn run_exec(
+    project: &Path,
+    home: &Path,
+    config: &Path,
+    prompt: &str,
+) -> (Option<i32>, String, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
         .args(["exec", prompt])
         .current_dir(project)
@@ -200,7 +208,11 @@ fn grant_is_idempotent_and_creates_no_duplicate_record() {
     let (code, stdout, _) = run_trust(&project, &home, &["grant"]);
     assert_eq!(code, Some(0));
     assert!(stdout.starts_with("already trusted:"), "{stdout}");
-    assert_eq!(catalog_record_count(&home), 1, "a repeated grant must not duplicate the record");
+    assert_eq!(
+        catalog_record_count(&home),
+        1,
+        "a repeated grant must not duplicate the record"
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -333,11 +345,21 @@ fn malformed_catalog_fails_closed_for_status_and_leaves_the_file_untouched() {
     let before = std::fs::read_to_string(&catalog).expect("read corrupt catalog");
 
     let (code, _stdout, stderr) = run_trust(&project, &home, &["status"]);
-    assert_ne!(code, Some(0), "a corrupt catalog must never silently report untrusted/trusted");
-    assert!(!stderr.is_empty(), "a corrupt-catalog failure must be reported");
+    assert_ne!(
+        code,
+        Some(0),
+        "a corrupt catalog must never silently report untrusted/trusted"
+    );
+    assert!(
+        !stderr.is_empty(),
+        "a corrupt-catalog failure must be reported"
+    );
 
     let after = std::fs::read_to_string(&catalog).expect("read catalog after failed status");
-    assert_eq!(before, after, "a failed read must never rewrite/replace the corrupt file");
+    assert_eq!(
+        before, after,
+        "a failed read must never rewrite/replace the corrupt file"
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -391,7 +413,11 @@ fn security_gate_revoke_disables_workspace_tools_again() {
     let server = spawn_scripted_server(TERMINAL_BODY.to_owned());
     let config = write_config(&home, server);
     let (code, stdout, stderr) = run_exec(&project, &home, &config, "say pong");
-    assert_eq!(code, Some(0), "exec must actually reach the model, not fail before the gate: {stderr}");
+    assert_eq!(
+        code,
+        Some(0),
+        "exec must actually reach the model, not fail before the gate: {stderr}"
+    );
     assert!(stdout.contains("hello from scripted model"), "{stdout}");
     assert!(!stderr.contains("workspace tools are disabled"), "{stderr}");
 
@@ -400,7 +426,11 @@ fn security_gate_revoke_disables_workspace_tools_again() {
     let server = spawn_scripted_server(TERMINAL_BODY.to_owned());
     let config = write_config(&home, server);
     let (code, stdout, stderr) = run_exec(&project, &home, &config, "say pong");
-    assert_eq!(code, Some(0), "exec must actually reach the model, not fail before the gate: {stderr}");
+    assert_eq!(
+        code,
+        Some(0),
+        "exec must actually reach the model, not fail before the gate: {stderr}"
+    );
     assert!(stdout.contains("hello from scripted model"), "{stdout}");
     assert!(
         stderr.contains("workspace tools are disabled"),

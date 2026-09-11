@@ -74,11 +74,7 @@ impl ReminderFloor {
 
     /// The stronger of two floors.
     pub fn max_of(self, other: Self) -> Self {
-        if self >= other {
-            self
-        } else {
-            other
-        }
+        if self >= other { self } else { other }
     }
 }
 
@@ -116,32 +112,15 @@ pub struct ReminderRoster {
 /// Typed failures for roster parsing.
 #[derive(Debug)]
 pub enum ReminderError {
-    Parse {
-        reason: String,
-    },
-    SchemaMismatch {
-        found: String,
-    },
-    UnknownField {
-        field: String,
-    },
+    Parse { reason: String },
+    SchemaMismatch { found: String },
+    UnknownField { field: String },
     NameInvalid,
-    NameTooLong {
-        limit: usize,
-    },
-    TextTooLarge {
-        limit: usize,
-        observed: usize,
-    },
-    UnknownFloor {
-        name: String,
-    },
-    RosterTooManyFeeds {
-        limit: usize,
-    },
-    FeedTooManyReminders {
-        limit: usize,
-    },
+    NameTooLong { limit: usize },
+    TextTooLarge { limit: usize, observed: usize },
+    UnknownFloor { name: String },
+    RosterTooManyFeeds { limit: usize },
+    FeedTooManyReminders { limit: usize },
 }
 
 impl fmt::Display for ReminderError {
@@ -210,18 +189,15 @@ impl ReminderRoster {
     /// floor = "medium"            # optional, default baseline
     /// ```
     pub fn parse(toml_str: &str) -> Result<Self, ReminderError> {
-        let value: toml::Value =
-            toml::from_str(toml_str).map_err(|err| ReminderError::Parse {
-                reason: err.to_string(),
-            })?;
+        let value: toml::Value = toml::from_str(toml_str).map_err(|err| ReminderError::Parse {
+            reason: err.to_string(),
+        })?;
         let table = value.as_table().ok_or_else(|| ReminderError::Parse {
             reason: "top level must be a table".to_string(),
         })?;
         for key in table.keys() {
             if key != "schema" && key != "feed" {
-                return Err(ReminderError::UnknownField {
-                    field: key.clone(),
-                });
+                return Err(ReminderError::UnknownField { field: key.clone() });
             }
         }
         let schema = table
@@ -270,11 +246,9 @@ impl ReminderRoster {
             let requires = match feed.get("requires") {
                 None => None,
                 Some(requires) => {
-                    let requires = requires
-                        .as_str()
-                        .ok_or_else(|| ReminderError::Parse {
-                            reason: "feed requires must be a string".to_string(),
-                        })?;
+                    let requires = requires.as_str().ok_or_else(|| ReminderError::Parse {
+                        reason: "feed requires must be a string".to_string(),
+                    })?;
                     if !valid_name(requires) {
                         return Err(ReminderError::NameInvalid);
                     }
@@ -285,23 +259,18 @@ impl ReminderRoster {
             match feed.get("reminder") {
                 None => {}
                 Some(entries) => {
-                    let entries = entries
-                        .as_array()
-                        .ok_or_else(|| ReminderError::Parse {
-                            reason: "feed reminder must be an array of tables".to_string(),
-                        })?;
+                    let entries = entries.as_array().ok_or_else(|| ReminderError::Parse {
+                        reason: "feed reminder must be an array of tables".to_string(),
+                    })?;
                     if entries.len() > MAX_REMINDERS_PER_FEED {
                         return Err(ReminderError::FeedTooManyReminders {
                             limit: MAX_REMINDERS_PER_FEED,
                         });
                     }
                     for entry in entries {
-                        let entry =
-                            entry
-                                .as_table()
-                                .ok_or_else(|| ReminderError::Parse {
-                                    reason: "each reminder must be a table".to_string(),
-                                })?;
+                        let entry = entry.as_table().ok_or_else(|| ReminderError::Parse {
+                            reason: "each reminder must be a table".to_string(),
+                        })?;
                         for key in entry.keys() {
                             if !matches!(key.as_str(), "id" | "text" | "floor") {
                                 return Err(ReminderError::UnknownField {
@@ -309,21 +278,23 @@ impl ReminderRoster {
                                 });
                             }
                         }
-                        let id = entry
-                            .get("id")
-                            .and_then(toml::Value::as_str)
-                            .ok_or_else(|| ReminderError::Parse {
-                                reason: "reminder id must be a string".to_string(),
-                            })?;
+                        let id =
+                            entry
+                                .get("id")
+                                .and_then(toml::Value::as_str)
+                                .ok_or_else(|| ReminderError::Parse {
+                                    reason: "reminder id must be a string".to_string(),
+                                })?;
                         if !valid_name(id) {
                             return Err(ReminderError::NameInvalid);
                         }
-                        let text = entry
-                            .get("text")
-                            .and_then(toml::Value::as_str)
-                            .ok_or_else(|| ReminderError::Parse {
-                                reason: "reminder text must be a string".to_string(),
-                            })?;
+                        let text =
+                            entry
+                                .get("text")
+                                .and_then(toml::Value::as_str)
+                                .ok_or_else(|| ReminderError::Parse {
+                                    reason: "reminder text must be a string".to_string(),
+                                })?;
                         if text.len() > MAX_REMINDER_TEXT_BYTES {
                             return Err(ReminderError::TextTooLarge {
                                 limit: MAX_REMINDER_TEXT_BYTES,
@@ -333,11 +304,9 @@ impl ReminderRoster {
                         let floor = match entry.get("floor") {
                             None => ReminderFloor::Baseline,
                             Some(floor) => {
-                                let floor = floor
-                                    .as_str()
-                                    .ok_or_else(|| ReminderError::Parse {
-                                        reason: "reminder floor must be a string".to_string(),
-                                    })?;
+                                let floor = floor.as_str().ok_or_else(|| ReminderError::Parse {
+                                    reason: "reminder floor must be a string".to_string(),
+                                })?;
                                 ReminderFloor::parse(floor).ok_or_else(|| {
                                     ReminderError::UnknownFloor {
                                         name: floor.to_string(),
@@ -508,7 +477,10 @@ impl ActiveReminders {
         for r in &self.admitted {
             out.push_str(&format!(
                 "[{}/{} floor={}] {}\n",
-                r.feed, r.id, r.floor.as_str(), r.text
+                r.feed,
+                r.id,
+                r.floor.as_str(),
+                r.text
             ));
         }
         Some(out)
@@ -553,8 +525,9 @@ mod tests {
 
     #[test]
     fn parse_rejects_wrong_schema_unknown_fields_and_bad_names() {
-        let err = ReminderRoster::parse("schema = \"rapidlm.reminders.v0\"\n[[feed]]\nname = \"a\"\n")
-            .expect_err("schema");
+        let err =
+            ReminderRoster::parse("schema = \"rapidlm.reminders.v0\"\n[[feed]]\nname = \"a\"\n")
+                .expect_err("schema");
         assert!(matches!(err, ReminderError::SchemaMismatch { .. }));
         let bad_field = {
             // Injected before any [[feed]] header so the key is top-level.
@@ -577,7 +550,10 @@ mod tests {
     #[test]
     fn floor_parse_is_case_insensitive_and_max_of_takes_the_stronger() {
         assert_eq!(ReminderFloor::parse("HIGH"), Some(ReminderFloor::High));
-        assert_eq!(ReminderFloor::parse("baseline"), Some(ReminderFloor::Baseline));
+        assert_eq!(
+            ReminderFloor::parse("baseline"),
+            Some(ReminderFloor::Baseline)
+        );
         assert_eq!(ReminderFloor::parse("nope"), None);
         assert_eq!(
             ReminderFloor::Low.max_of(ReminderFloor::High),
@@ -592,10 +568,7 @@ mod tests {
     #[test]
     fn admit_selects_nominated_feeds_in_request_order() {
         let roster = ReminderRoster::parse(&roster_toml()).expect("parse");
-        let active = ActiveReminders::admit(
-            &roster,
-            &["safety".to_string(), "ops".to_string()],
-        );
+        let active = ActiveReminders::admit(&roster, &["safety".to_string(), "ops".to_string()]);
         assert_eq!(active.admitted().len(), 2);
         assert_eq!(active.admitted()[0].feed, "safety");
         assert_eq!(active.admitted()[1].feed, "ops");
@@ -635,9 +608,7 @@ mod tests {
         // One reminder is capped at 1024 bytes, so exceeding the 4096 budget
         // needs several: four fit, the fifth does not.
         let big = "x".repeat(1_000);
-        let mut toml = format!(
-            "schema = \"{REMINDERS_SCHEMA}\"\n[[feed]]\nname = \"wide\"\n"
-        );
+        let mut toml = format!("schema = \"{REMINDERS_SCHEMA}\"\n[[feed]]\nname = \"wide\"\n");
         for index in 1..=5 {
             toml.push_str(&format!(
                 "[[feed.reminder]]\nid = \"r{index}\"\ntext = \"{big}\"\n"
@@ -655,8 +626,7 @@ mod tests {
     #[test]
     fn render_is_deterministic_and_empty_admission_renders_nothing() {
         let roster = ReminderRoster::parse(&roster_toml()).expect("parse");
-        let active =
-            ActiveReminders::admit(&roster, &["ops".to_string(), "safety".to_string()]);
+        let active = ActiveReminders::admit(&roster, &["ops".to_string(), "safety".to_string()]);
         let rendered = active.render().expect("render");
         let expected = format!(
             "reminders schema={REMINDERS_SCHEMA} feeds=ops,safety\n\

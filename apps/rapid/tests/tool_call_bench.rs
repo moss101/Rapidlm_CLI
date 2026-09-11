@@ -265,17 +265,41 @@ fn bench_a_multi_phase_agentic_task() {
     }
     let server = spawn_scripted_server(vec![
         sse_tool_calls(&[
-            ("s1", "repo_search", r#"{"pattern":"target","head_limit":5}"#),
-            ("s2", "repo_search", r#"{"pattern":"needle","head_limit":5}"#),
+            (
+                "s1",
+                "repo_search",
+                r#"{"pattern":"target","head_limit":5}"#,
+            ),
+            (
+                "s2",
+                "repo_search",
+                r#"{"pattern":"needle","head_limit":5}"#,
+            ),
             ("r1", "repo_read", r#"{"path":"mod0.txt"}"#),
             ("r2", "repo_read", r#"{"path":"mod1.txt"}"#),
         ]),
         sse_tool_calls(&[
-            ("p1", "workspace_patch", r#"{"path":"mod0.txt","old":"target","new":"patched-0"}"#),
-            ("p2", "workspace_patch", r#"{"path":"mod1.txt","old":"target","new":"patched-1"}"#),
-            ("p3", "workspace_patch", r#"{"path":"mod2.txt","old":"target","new":"patched-2"}"#),
+            (
+                "p1",
+                "workspace_patch",
+                r#"{"path":"mod0.txt","old":"target","new":"patched-0"}"#,
+            ),
+            (
+                "p2",
+                "workspace_patch",
+                r#"{"path":"mod1.txt","old":"target","new":"patched-1"}"#,
+            ),
+            (
+                "p3",
+                "workspace_patch",
+                r#"{"path":"mod2.txt","old":"target","new":"patched-2"}"#,
+            ),
         ]),
-        sse_tool_calls(&[("sh1", "shell_exec", r#"{"argv":["./verify.sh"],"timeout_ms":30000}"#)]),
+        sse_tool_calls(&[(
+            "sh1",
+            "shell_exec",
+            r#"{"argv":["./verify.sh"],"timeout_ms":30000}"#,
+        )]),
         sse_tool_calls(&[("v1", "repo_read", r#"{"path":"mod0.txt"}"#)]),
         sse_terminal("all three modules patched and verified"),
     ]);
@@ -327,13 +351,16 @@ fn bench_a_multi_phase_agentic_task() {
     for (request, expected) in requests.iter().zip([0usize, 4, 7, 8, 9]) {
         let count = request.matches("\"role\":\"tool\"").count();
         assert_eq!(
-            count, expected,
+            count,
+            expected,
             "cumulative per-call tool messages on request: {}",
             request.lines().next().unwrap_or("")
         );
     }
     assert!(
-        !requests.iter().any(|request| request.contains("tool results:")),
+        !requests
+            .iter()
+            .any(|request| request.contains("tool results:")),
         "flat report must never appear"
     );
 }
@@ -368,9 +395,16 @@ fn bench_f_drained_notification_reaches_the_provider_request() {
         "bypassPermissions",
     );
     assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
-    assert!(run.stdout.contains("background job finished"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("background job finished"),
+        "{}",
+        run.stdout
+    );
     let requests = server.requests.lock().expect("requests");
-    assert!(requests.len() >= 3, "expected at least three provider requests");
+    assert!(
+        requests.len() >= 3,
+        "expected at least three provider requests"
+    );
     let third = &requests[2];
     std::fs::write("/tmp/bench-f-third-request.txt", third).expect("dump");
     for (index, request) in requests.iter().enumerate() {
@@ -404,8 +438,11 @@ fn bench_b_sixteen_calls_at_the_per_step_cap() {
     let server = spawn_scripted_server(vec![sse_tool_calls(&calls), sse_terminal("read them all")]);
     let project = TrustedProject::new("bench-b");
     for index in 0..16 {
-        std::fs::write(project.project.join(format!("f{index}.txt")), format!("body {index}\n"))
-            .expect("seed");
+        std::fs::write(
+            project.project.join(format!("f{index}.txt")),
+            format!("body {index}\n"),
+        )
+        .expect("seed");
     }
     let config = config_with(&server, &project);
     let run = run_bench(
@@ -430,8 +467,16 @@ fn bench_c_pagination_chain_over_a_long_file() {
     // honestly report its delivered window; page 2 (1001-1200) fits and
     // reaches EOF.
     let server = spawn_scripted_server(vec![
-        sse_tool_calls(&[("r1", "repo_read", r#"{"path":"long.txt","offset":1,"limit":1000}"#)]),
-        sse_tool_calls(&[("r2", "repo_read", r#"{"path":"long.txt","offset":1001,"limit":1000}"#)]),
+        sse_tool_calls(&[(
+            "r1",
+            "repo_read",
+            r#"{"path":"long.txt","offset":1,"limit":1000}"#,
+        )]),
+        sse_tool_calls(&[(
+            "r2",
+            "repo_read",
+            r#"{"path":"long.txt","offset":1001,"limit":1000}"#,
+        )]),
         sse_terminal("pagination complete"),
     ]);
     let project = TrustedProject::new("bench-c");
@@ -463,7 +508,10 @@ fn bench_c_pagination_chain_over_a_long_file() {
         "continuation hint missing: {}",
         requests[1]
     );
-    assert!(!requests[1].contains("line-1500"), "undelivered lines must not be claimed");
+    assert!(
+        !requests[1].contains("line-1500"),
+        "undelivered lines must not be claimed"
+    );
     // The second page fits and reaches EOF.
     assert!(requests[2].contains("line-1200"), "second page end present");
     assert!(requests[2].contains("[end of file"), "EOF marker reported");
@@ -476,9 +524,17 @@ fn bench_d_verify_pattern_read_edit_reread() {
     // edits; only degenerate repetition (same call back-to-back) is a loop.
     let server = spawn_scripted_server(vec![
         sse_tool_calls(&[("r1", "repo_read", r#"{"path":"notes.txt"}"#)]),
-        sse_tool_calls(&[("p1", "workspace_patch", r#"{"path":"notes.txt","old":"alpha","new":"beta"}"#)]),
+        sse_tool_calls(&[(
+            "p1",
+            "workspace_patch",
+            r#"{"path":"notes.txt","old":"alpha","new":"beta"}"#,
+        )]),
         sse_tool_calls(&[("r2", "repo_read", r#"{"path":"notes.txt"}"#)]),
-        sse_tool_calls(&[("p2", "workspace_patch", r#"{"path":"notes.txt","old":"beta","new":"gamma"}"#)]),
+        sse_tool_calls(&[(
+            "p2",
+            "workspace_patch",
+            r#"{"path":"notes.txt","old":"beta","new":"gamma"}"#,
+        )]),
         sse_tool_calls(&[("r3", "repo_read", r#"{"path":"notes.txt"}"#)]),
         sse_tool_calls(&[("r4", "repo_read", r#"{"path":"notes.txt"}"#)]),
         sse_terminal("verified through both edits"),
@@ -495,7 +551,11 @@ fn bench_d_verify_pattern_read_edit_reread() {
         "acceptEdits",
     );
     assert_no_loop_stop(&run, "D_verify_pattern");
-    assert!(run.stdout.contains("verified through both edits"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("verified through both edits"),
+        "{}",
+        run.stdout
+    );
     assert_eq!(
         std::fs::read_to_string(project.project.join("notes.txt")).expect("read"),
         "gamma\n",
@@ -508,8 +568,12 @@ fn bench_e_substantial_patch_payload() {
     // A realistic code rewrite: old block and new block of a few KB each.
     // The turn-layer 8 KiB argument budget must not make the advertised
     // per-text bounds unreachable.
-    let old_block: String = (0..60).map(|i| format!("old line {i:03} with some code\n")).collect();
-    let new_block: String = (0..60).map(|i| format!("new line {i:03} refactored\n")).collect();
+    let old_block: String = (0..60)
+        .map(|i| format!("old line {i:03} with some code\n"))
+        .collect();
+    let new_block: String = (0..60)
+        .map(|i| format!("new line {i:03} refactored\n"))
+        .collect();
     let arguments = format!(
         r#"{{"path":"big.rs","old":{},"new":{}}}"#,
         serde_json::json!(old_block),

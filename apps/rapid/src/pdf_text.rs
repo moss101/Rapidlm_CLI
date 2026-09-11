@@ -157,12 +157,16 @@ fn read_literal_string(bytes: &[char], start: usize) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::write::ZlibEncoder;
     use flate2::Compression;
+    use flate2::write::ZlibEncoder;
     use std::io::Write as _;
 
     fn wrap_stream(dict_extra: &str, content: &[u8]) -> Vec<u8> {
-        let mut pdf = format!("%PDF-1.4\n1 0 obj\n<< /Length {} {dict_extra} >>\nstream\n", content.len()).into_bytes();
+        let mut pdf = format!(
+            "%PDF-1.4\n1 0 obj\n<< /Length {} {dict_extra} >>\nstream\n",
+            content.len()
+        )
+        .into_bytes();
         pdf.extend_from_slice(content);
         pdf.extend_from_slice(b"\nendstream\nendobj\n%%EOF");
         pdf
@@ -232,29 +236,42 @@ mod tests {
         let mut pdf = b"%PDF-1.4\n".to_vec();
 
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(b"BT /F1 12 Tf (page one text) Tj ET").expect("deflate");
+        encoder
+            .write_all(b"BT /F1 12 Tf (page one text) Tj ET")
+            .expect("deflate");
         let compressed1 = encoder.finish().expect("finish");
         pdf.extend_from_slice(
-            format!("1 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n", compressed1.len())
-                .as_bytes(),
+            format!(
+                "1 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n",
+                compressed1.len()
+            )
+            .as_bytes(),
         );
         pdf.extend_from_slice(&compressed1);
         pdf.extend_from_slice(b"\nendstream\nendobj\n");
 
         let garbage = b"not valid zlib data at all, deliberately broken".to_vec();
         pdf.extend_from_slice(
-            format!("2 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n", garbage.len())
-                .as_bytes(),
+            format!(
+                "2 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n",
+                garbage.len()
+            )
+            .as_bytes(),
         );
         pdf.extend_from_slice(&garbage);
         pdf.extend_from_slice(b"\nendstream\nendobj\n");
 
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(b"BT /F1 12 Tf (page three text) Tj ET").expect("deflate");
+        encoder
+            .write_all(b"BT /F1 12 Tf (page three text) Tj ET")
+            .expect("deflate");
         let compressed3 = encoder.finish().expect("finish");
         pdf.extend_from_slice(
-            format!("3 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n", compressed3.len())
-                .as_bytes(),
+            format!(
+                "3 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n",
+                compressed3.len()
+            )
+            .as_bytes(),
         );
         pdf.extend_from_slice(&compressed3);
         pdf.extend_from_slice(b"\nendstream\nendobj\n%%EOF");

@@ -55,10 +55,10 @@ impl MonitorSpec {
         }
         match &kind {
             MonitorKind::LogRegex { pattern } if !valid_regex(pattern) => {
-                return Err(MonitorError::InvalidPattern)
+                return Err(MonitorError::InvalidPattern);
             }
             MonitorKind::FileEvent { path, .. } if !valid_text(path, MAX_OBS_BYTES) => {
-                return Err(MonitorError::InvalidPath)
+                return Err(MonitorError::InvalidPath);
             }
             _ => {}
         }
@@ -76,14 +76,10 @@ impl MonitorSpec {
     /// Pure predicate: does `observation` satisfy this monitor?
     pub fn observe(&self, observation: &MonitorObservation) -> MonitorVerdict {
         match (&self.kind, observation) {
-            (
-                MonitorKind::ExitCode { code: want },
-                MonitorObservation::ExitCode { code: got },
-            ) => verdict(*got == *want),
-            (
-                MonitorKind::LogRegex { pattern },
-                MonitorObservation::LogLine { text },
-            ) => {
+            (MonitorKind::ExitCode { code: want }, MonitorObservation::ExitCode { code: got }) => {
+                verdict(*got == *want)
+            }
+            (MonitorKind::LogRegex { pattern }, MonitorObservation::LogLine { text }) => {
                 if !valid_text(text, MAX_OBS_BYTES) {
                     return MonitorVerdict::not_matched(MonitorMissReason::BoundExceeded);
                 }
@@ -99,7 +95,10 @@ impl MonitorSpec {
             ) => verdict(*ready && *got == *want),
             (
                 MonitorKind::FileEvent { path: want, event },
-                MonitorObservation::FileEvent { path: got, event: got_event },
+                MonitorObservation::FileEvent {
+                    path: got,
+                    event: got_event,
+                },
             ) => verdict(got == want && *event == *got_event),
             _ => MonitorVerdict::not_matched(MonitorMissReason::KindMismatch),
         }
@@ -247,15 +246,26 @@ mod tests {
     #[test]
     fn exit_code_monitor_matches_only_exact_code() {
         let spec = MonitorSpec::new("m1", MonitorKind::ExitCode { code: 0 }).expect("spec");
-        assert!(spec.observe(&MonitorObservation::ExitCode { code: 0 }).matched_flag());
-        assert!(!spec.observe(&MonitorObservation::ExitCode { code: 1 }).matched_flag());
+        assert!(
+            spec.observe(&MonitorObservation::ExitCode { code: 0 })
+                .matched_flag()
+        );
+        assert!(
+            !spec
+                .observe(&MonitorObservation::ExitCode { code: 1 })
+                .matched_flag()
+        );
     }
 
     #[test]
     fn log_regex_monitor_matches_substring_and_bounds() {
-        let spec =
-            MonitorSpec::new("m2", MonitorKind::LogRegex { pattern: "ready".to_owned() })
-                .expect("spec");
+        let spec = MonitorSpec::new(
+            "m2",
+            MonitorKind::LogRegex {
+                pattern: "ready".to_owned(),
+            },
+        )
+        .expect("spec");
         assert!(
             spec.observe(&MonitorObservation::log_line("server ready on :8080").expect("l"))
                 .matched_flag()
@@ -278,17 +288,26 @@ mod tests {
     fn port_readiness_requires_port_and_ready() {
         let spec = MonitorSpec::new("m3", MonitorKind::PortReady { port: 8443 }).expect("spec");
         assert!(
-            spec.observe(&MonitorObservation::PortReady { port: 8443, ready: true })
+            spec.observe(&MonitorObservation::PortReady {
+                port: 8443,
+                ready: true
+            })
+            .matched_flag()
+        );
+        assert!(
+            !spec
+                .observe(&MonitorObservation::PortReady {
+                    port: 8443,
+                    ready: false
+                })
                 .matched_flag()
         );
         assert!(
             !spec
-                .observe(&MonitorObservation::PortReady { port: 8443, ready: false })
-                .matched_flag()
-        );
-        assert!(
-            !spec
-                .observe(&MonitorObservation::PortReady { port: 8080, ready: true })
+                .observe(&MonitorObservation::PortReady {
+                    port: 8080,
+                    ready: true
+                })
                 .matched_flag()
         );
     }
@@ -304,12 +323,16 @@ mod tests {
         )
         .expect("spec");
         assert!(
-            spec.observe(&MonitorObservation::file("/tmp/out.json", FileEventKind::Created).expect("f"))
-                .matched_flag()
+            spec.observe(
+                &MonitorObservation::file("/tmp/out.json", FileEventKind::Created).expect("f")
+            )
+            .matched_flag()
         );
         assert!(
             !spec
-                .observe(&MonitorObservation::file("/tmp/out.json", FileEventKind::Modified).expect("f"))
+                .observe(
+                    &MonitorObservation::file("/tmp/out.json", FileEventKind::Modified).expect("f")
+                )
                 .matched_flag()
         );
         assert!(
@@ -333,7 +356,12 @@ mod tests {
     #[test]
     fn invalid_pattern_and_bounds_fail_closed() {
         assert!(matches!(
-            MonitorSpec::new("m6", MonitorKind::LogRegex { pattern: "a\nb".to_owned() }),
+            MonitorSpec::new(
+                "m6",
+                MonitorKind::LogRegex {
+                    pattern: "a\nb".to_owned()
+                }
+            ),
             Err(MonitorError::InvalidPattern)
         ));
         assert!(matches!(

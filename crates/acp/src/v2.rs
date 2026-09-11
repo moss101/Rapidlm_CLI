@@ -615,9 +615,10 @@ fn validate_implementation(info: &ImplementationInfo) -> Result<(), V2Error> {
         return Err(V2Error::InvalidParams);
     }
     if let Some(title) = info.title.as_deref()
-        && (title.is_empty() || title.len() > MAX_IMPLEMENTATION_TITLE_BYTES) {
-            return Err(V2Error::InvalidParams);
-        }
+        && (title.is_empty() || title.len() > MAX_IMPLEMENTATION_TITLE_BYTES)
+    {
+        return Err(V2Error::InvalidParams);
+    }
     Ok(())
 }
 

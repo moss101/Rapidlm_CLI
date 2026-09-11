@@ -181,7 +181,10 @@ impl ToolPattern {
             // redirect-controlled) silently bypasses a `deny`/`ask` rule,
             // or even an admin `denied_tools` ceiling documented as
             // un-overridable by any setting.
-            Some(glob) => match (glob.strip_prefix("domain:"), subject.strip_prefix("domain:")) {
+            Some(glob) => match (
+                glob.strip_prefix("domain:"),
+                subject.strip_prefix("domain:"),
+            ) {
                 (Some(pattern_domain), Some(subject_domain)) => glob_match(
                     &pattern_domain.to_ascii_lowercase(),
                     &subject_domain.to_ascii_lowercase(),
@@ -367,7 +370,9 @@ pre-approve it with `rapid permissions allow <tool>`, or a `permissions.allow` e
             Self::DontAskDeny => "dontAsk mode silently refuses calls that are not pre-approved",
             Self::UntrustedProject => "the project is not trusted; every tool call is refused",
             Self::WriteScopeViolation => "outside the write scope this subagent was confined to",
-            Self::AdminToolDenied => "this tool is banned by managed policy; no setting can re-enable it",
+            Self::AdminToolDenied => {
+                "this tool is banned by managed policy; no setting can re-enable it"
+            }
             Self::AdminWriteScopeViolation => {
                 "outside the write scope managed policy confines this deployment to"
             }
@@ -446,7 +451,8 @@ impl PermissionLattice {
     /// bounds are enforced at load, never panic.
     pub fn with_rules(mut self, rules: Vec<ToolRule>) -> Self {
         self.rules.truncate(MAX_RULES);
-        self.rules.extend(rules.into_iter().take(MAX_RULES - self.rules.len()));
+        self.rules
+            .extend(rules.into_iter().take(MAX_RULES - self.rules.len()));
         self
     }
 
@@ -540,7 +546,11 @@ impl PermissionLattice {
         // everything else, including the write-scope ceiling below — the
         // one restriction nothing downstream (a rule, a grant, any mode,
         // including bypassPermissions) may ever widen past.
-        if self.denied_tools.iter().any(|pattern| pattern.matches(tool, subject)) {
+        if self
+            .denied_tools
+            .iter()
+            .any(|pattern| pattern.matches(tool, subject))
+        {
             return Decision::Deny(DecisionReason::AdminToolDenied);
         }
         // -0.5. Admin/managed-policy write-scope ceiling — same precedence
@@ -602,11 +612,7 @@ impl PermissionLattice {
             return Decision::Allow(DecisionReason::ReadOnlyAutoAllow);
         }
         // 3. Persisted per-project grants suppress the ask.
-        if self
-            .grants
-            .iter()
-            .any(|grant| grant.matches(tool, subject))
-        {
+        if self.grants.iter().any(|grant| grant.matches(tool, subject)) {
             return Decision::Allow(DecisionReason::PersistedGrant);
         }
         // 4. Mode table.
@@ -621,9 +627,7 @@ impl PermissionLattice {
                 }
             }
             PermissionMode::DontAsk => Decision::Deny(DecisionReason::DontAskDeny),
-            PermissionMode::BypassPermissions => {
-                Decision::Allow(DecisionReason::BypassAllow)
-            }
+            PermissionMode::BypassPermissions => Decision::Allow(DecisionReason::BypassAllow),
         }
     }
 }
@@ -668,20 +672,18 @@ pub fn parse_settings(text: &str) -> Result<ProjectSettings, SettingsError> {
     let object = value.as_object().ok_or(SettingsError::InvalidJson)?;
     let mut settings = ProjectSettings::default();
     if let Some(mode) = object.get("mode").and_then(serde_json::Value::as_str) {
-        settings.mode = Some(
-            PermissionMode::parse(mode).ok_or(SettingsError::InvalidRule)?,
-        );
+        settings.mode = Some(PermissionMode::parse(mode).ok_or(SettingsError::InvalidRule)?);
     }
     let Some(permissions) = object.get("permissions") else {
         return Ok(settings);
     };
     let permissions = permissions.as_object().ok_or(SettingsError::InvalidJson)?;
     if settings.mode.is_none()
-        && let Some(mode) = permissions.get("defaultMode").and_then(serde_json::Value::as_str)
+        && let Some(mode) = permissions
+            .get("defaultMode")
+            .and_then(serde_json::Value::as_str)
     {
-        settings.mode = Some(
-            PermissionMode::parse(mode).ok_or(SettingsError::InvalidRule)?,
-        );
+        settings.mode = Some(PermissionMode::parse(mode).ok_or(SettingsError::InvalidRule)?);
     }
     for (key, effect) in [
         ("deny", RuleEffect::Deny),
@@ -741,9 +743,7 @@ impl PermissionGrants {
         canonical_root: &str,
         pattern: ToolPattern,
     ) -> Result<bool, GrantsError> {
-        if !self.records.contains_key(canonical_root)
-            && self.records.len() >= MAX_GRANT_RECORDS
-        {
+        if !self.records.contains_key(canonical_root) && self.records.len() >= MAX_GRANT_RECORDS {
             return Err(GrantsError::TooManyRecords);
         }
         let entry = self.records.entry(canonical_root.to_owned()).or_default();
@@ -794,8 +794,7 @@ pub fn render_grants(grants: &PermissionGrants) -> Result<String, GrantsError> {
         })
         .collect();
     let document = serde_json::json!({ "schema": 1, "projects": projects });
-    let text = serde_json::to_string_pretty(&document)
-        .map_err(|_| GrantsError::InvalidJson)?;
+    let text = serde_json::to_string_pretty(&document).map_err(|_| GrantsError::InvalidJson)?;
     // `+ 1` for the trailing newline every writer appends. Bounding the
     // pre-newline text let a document rendering to exactly
     // `MAX_SETTINGS_BYTES` be written one byte over the limit its own
@@ -866,8 +865,8 @@ mod tests {
         let granted = ToolPattern::parse("workspace_write").expect("pattern");
 
         // Without a ceiling the grant does what it says.
-        let allowed = PermissionLattice::new(PermissionMode::Default)
-            .with_grants(vec![granted.clone()]);
+        let allowed =
+            PermissionLattice::new(PermissionMode::Default).with_grants(vec![granted.clone()]);
         assert_eq!(
             allowed.evaluate("workspace_write", "a.rs", ToolClass::FileEdit),
             Decision::Allow(DecisionReason::PersistedGrant)
@@ -936,7 +935,10 @@ mod tests {
             "granting an existing pattern must report no change, like `rapid trust grant`"
         );
         assert!(grants.revoke("/proj", &pattern));
-        assert!(!grants.revoke("/proj", &pattern), "revoking twice changes nothing");
+        assert!(
+            !grants.revoke("/proj", &pattern),
+            "revoking twice changes nothing"
+        );
         // A root left with no grants is dropped rather than persisted as an
         // empty record — visible in the rendered document, which is the only
         // thing that actually reaches disk.
@@ -1050,7 +1052,11 @@ limit its own loader enforces",
         let mut grants = PermissionGrants::default();
         let pattern = || ToolPattern::parse("workspace_write").expect("pattern");
         for index in 0..MAX_GRANT_RECORDS {
-            assert!(grants.allow(&format!("/proj/{index}"), pattern()).expect("under"));
+            assert!(
+                grants
+                    .allow(&format!("/proj/{index}"), pattern())
+                    .expect("under")
+            );
         }
         assert_eq!(
             grants.allow("/one/too/many", pattern()),
@@ -1154,9 +1160,13 @@ must never produce one"
             effect: RuleEffect::Deny,
             pattern: ToolPattern::parse("workspace_write(secrets/*)").expect("pattern"),
         };
-        let lattice =
-            PermissionLattice::new(PermissionMode::BypassPermissions).with_rules(vec![deny_secrets]);
-        for path in ["secrets/config.json", "Secrets/config.json", "SECRETS/config.json"] {
+        let lattice = PermissionLattice::new(PermissionMode::BypassPermissions)
+            .with_rules(vec![deny_secrets]);
+        for path in [
+            "secrets/config.json",
+            "Secrets/config.json",
+            "SECRETS/config.json",
+        ] {
             assert_eq!(
                 lattice.evaluate("workspace_write", path, ToolClass::FileEdit),
                 Decision::Deny(DecisionReason::DenyRule),
@@ -1183,7 +1193,10 @@ must never produce one"
     fn write_calls_ask_or_deny_per_mode() {
         let subject = "src/lib.rs";
         let cases = [
-            (PermissionMode::Default, Decision::Ask(DecisionReason::ModeAsk)),
+            (
+                PermissionMode::Default,
+                Decision::Ask(DecisionReason::ModeAsk),
+            ),
             (
                 PermissionMode::Plan,
                 Decision::Deny(DecisionReason::PlanModeDeny),
@@ -1224,9 +1237,10 @@ must never produce one"
         }
         // Plan mode allows reads.
         let plan = PermissionLattice::new(PermissionMode::Plan);
-        assert!(plan
-            .evaluate("repo_read", "src/lib.rs", ToolClass::ReadOnly)
-            .is_allowed());
+        assert!(
+            plan.evaluate("repo_read", "src/lib.rs", ToolClass::ReadOnly)
+                .is_allowed()
+        );
     }
 
     #[test]
@@ -1281,8 +1295,8 @@ must never produce one"
     fn write_scope_confines_file_edits_but_never_shell_exec() {
         // BypassPermissions would allow everything unconditionally — the
         // scope ceiling must still win over even the most permissive mode.
-        let lattice =
-            PermissionLattice::new(PermissionMode::BypassPermissions).with_write_scope("src/feature");
+        let lattice = PermissionLattice::new(PermissionMode::BypassPermissions)
+            .with_write_scope("src/feature");
 
         assert_eq!(
             lattice.evaluate("workspace_write", "src/feature/mod.rs", ToolClass::FileEdit),
@@ -1300,7 +1314,11 @@ must never produce one"
             "outside the scope: denied even under bypassPermissions"
         );
         assert_eq!(
-            lattice.evaluate("workspace_write", "src/feature-other/x.rs", ToolClass::FileEdit),
+            lattice.evaluate(
+                "workspace_write",
+                "src/feature-other/x.rs",
+                ToolClass::FileEdit
+            ),
             Decision::Deny(DecisionReason::WriteScopeViolation),
             "segment-aware: a sibling directory sharing the prefix string must not match"
         );
@@ -1381,8 +1399,8 @@ must never produce one"
 
     #[test]
     fn admin_write_scope_wins_over_bypass_permissions_and_write_scope_never_overwrites_it() {
-        let lattice = PermissionLattice::new(PermissionMode::BypassPermissions)
-            .with_admin_write_scope("src");
+        let lattice =
+            PermissionLattice::new(PermissionMode::BypassPermissions).with_admin_write_scope("src");
 
         assert_eq!(
             lattice.evaluate("workspace_write", "docs/readme.md", ToolClass::FileEdit),
@@ -1442,15 +1460,16 @@ must never produce one"
         );
 
         // bypassPermissions allows, except where a deny rule fires.
-        let lattice = PermissionLattice::new(PermissionMode::BypassPermissions).with_rules(vec![
-            ToolRule {
+        let lattice =
+            PermissionLattice::new(PermissionMode::BypassPermissions).with_rules(vec![ToolRule {
                 effect: RuleEffect::Deny,
                 pattern: ToolPattern::parse("shell_exec(rm *)").expect("rule"),
-            },
-        ]);
-        assert!(lattice
-            .evaluate("workspace_patch", "any.rs", ToolClass::FileEdit)
-            .is_allowed());
+            }]);
+        assert!(
+            lattice
+                .evaluate("workspace_patch", "any.rs", ToolClass::FileEdit)
+                .is_allowed()
+        );
         assert_eq!(
             lattice.evaluate("shell_exec", "rm -rf /", ToolClass::Other),
             Decision::Deny(DecisionReason::DenyRule)
@@ -1474,7 +1493,11 @@ must never produce one"
             },
         ]);
         assert_eq!(
-            lattice.evaluate("shell_exec", "git push --force origin main", ToolClass::Other),
+            lattice.evaluate(
+                "shell_exec",
+                "git push --force origin main",
+                ToolClass::Other
+            ),
             Decision::Deny(DecisionReason::DenyRule),
             "deny must win over allow and ask"
         );
@@ -1488,11 +1511,10 @@ must never produce one"
             Decision::Allow(DecisionReason::AllowRule)
         );
         // A deny rule beats read-only auto-allow too.
-        let lattice =
-            lattice.with_rules(vec![ToolRule {
-                effect: RuleEffect::Deny,
-                pattern: ToolPattern::parse("repo_read(.env*)").expect("deny"),
-            }]);
+        let lattice = lattice.with_rules(vec![ToolRule {
+            effect: RuleEffect::Deny,
+            pattern: ToolPattern::parse("repo_read(.env*)").expect("deny"),
+        }]);
         assert_eq!(
             lattice.evaluate("repo_read", ".env.local", ToolClass::ReadOnly),
             Decision::Deny(DecisionReason::DenyRule)
@@ -1522,12 +1544,10 @@ must never produce one"
 
     #[test]
     fn every_decision_carries_a_typed_reason() {
-        let lattice = PermissionLattice::new(PermissionMode::Default).with_rules(vec![
-            ToolRule {
-                effect: RuleEffect::Deny,
-                pattern: ToolPattern::parse("shell_exec(sudo *)").expect("rule"),
-            },
-        ]);
+        let lattice = PermissionLattice::new(PermissionMode::Default).with_rules(vec![ToolRule {
+            effect: RuleEffect::Deny,
+            pattern: ToolPattern::parse("shell_exec(sudo *)").expect("rule"),
+        }]);
         let decisions = [
             lattice.evaluate("shell_exec", "sudo rm x", ToolClass::Other),
             lattice.evaluate("shell_exec", "ls", ToolClass::Other),
@@ -1593,8 +1613,9 @@ must never produce one"
 
         // Unknown tools parse as patterns (deny intent survives), unknown keys
         // are ignored, and an empty document parses to defaults.
-        let compat = parse_settings(r#"{"permissions": {"deny": ["WebFetch(domain:x)"]}, "extra": 1}"#)
-            .expect("compat");
+        let compat =
+            parse_settings(r#"{"permissions": {"deny": ["WebFetch(domain:x)"]}, "extra": 1}"#)
+                .expect("compat");
         assert_eq!(compat.rules.len(), 1);
         let empty = parse_settings("{}").expect("empty");
         assert_eq!(empty, ProjectSettings::default());
@@ -1616,10 +1637,7 @@ must never produce one"
             .map(|index| format!("tool{index}"))
             .collect();
         let document = format!(r#"{{"permissions": {{"allow": {many:?}}}}}"#);
-        assert_eq!(
-            parse_settings(&document),
-            Err(SettingsError::TooManyRules)
-        );
+        assert_eq!(parse_settings(&document), Err(SettingsError::TooManyRules));
         let oversized = format!("\"{}\"", "x".repeat(MAX_SETTINGS_BYTES + 1));
         assert_eq!(parse_settings(&oversized), Err(SettingsError::TooLarge));
     }

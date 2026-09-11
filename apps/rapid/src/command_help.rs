@@ -124,9 +124,7 @@ pub(crate) fn inspector_is_supported(inspector: &Inspector) -> bool {
     //
     // `Mcp` and `Permissions` have no route at all and are answered inline
     // with a real report (see `open_unrouted_inspector`).
-    inspector
-        .route()
-        .is_some_and(tui::route_renders_content)
+    inspector.route().is_some_and(tui::route_renders_content)
         || matches!(inspector, Inspector::Mcp | Inspector::Permissions)
 }
 
@@ -396,8 +394,7 @@ parser about which operands are required",
             let name = entry.usage.split(' ').next().unwrap_or_default();
             let rest = entry.usage[name.len()..].trim();
             let bare_parses = tui::parse_command(name).is_ok();
-            let fully_optional = rest.is_empty()
-                || (rest.starts_with('[') && rest.ends_with(']'));
+            let fully_optional = rest.is_empty() || (rest.starts_with('[') && rest.ends_with(']'));
             assert!(
                 bare_parses || !fully_optional,
                 "`{}` presents every operand as optional, but `{name}` alone does not parse",
@@ -496,7 +493,9 @@ parser about which operands are required",
         // cancelled the thing named.
         use protocol::{AgentId, JobId};
 
-        let job: JobId = "01234567-89ab-7cde-89ab-0123456789ab".parse().expect("job id");
+        let job: JobId = "01234567-89ab-7cde-89ab-0123456789ab"
+            .parse()
+            .expect("job id");
         let agent: AgentId = "01234567-89ab-7cde-89ab-0123456789ab"
             .parse()
             .expect("agent id");
@@ -667,11 +666,14 @@ while `route_renders_content` claims {claims}"
 
     #[test]
     fn every_marker_is_the_same_width_so_the_command_names_stay_aligned() {
-        let widths: std::collections::BTreeSet<usize> =
-            [Availability::Full, Availability::Partial, Availability::None]
-                .into_iter()
-                .map(|availability| availability.prefix().len())
-                .collect();
+        let widths: std::collections::BTreeSet<usize> = [
+            Availability::Full,
+            Availability::Partial,
+            Availability::None,
+        ]
+        .into_iter()
+        .map(|availability| availability.prefix().len())
+        .collect();
         assert_eq!(
             widths.len(),
             1,

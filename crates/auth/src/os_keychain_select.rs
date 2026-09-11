@@ -26,20 +26,18 @@ pub fn select(os: &str) -> SelectedKeychain {
     }
 }
 /// Bind the selection to its concrete production type at runtime.
-pub fn production_backend(
-    os: &str,
-) -> Result<Box<dyn PlatformKeychain>, StoreError> {
+pub fn production_backend(os: &str) -> Result<Box<dyn PlatformKeychain>, StoreError> {
     match select(os) {
         #[cfg(target_os = "macos")]
         SelectedKeychain::MacosKeychain => Ok(Box::new(crate::os_keychain::MacosKeychain::new())),
         #[cfg(target_os = "windows")]
-        SelectedKeychain::WindowsCredentialManager => {
-            Ok(Box::new(crate::os_keychain_other::windows::WindowsCredentialManager))
-        }
+        SelectedKeychain::WindowsCredentialManager => Ok(Box::new(
+            crate::os_keychain_other::windows::WindowsCredentialManager,
+        )),
         #[cfg(target_os = "linux")]
-        SelectedKeychain::FreedesktopSecretService => {
-            Ok(Box::new(crate::os_keychain_other::linux::FreedesktopSecretService))
-        }
+        SelectedKeychain::FreedesktopSecretService => Ok(Box::new(
+            crate::os_keychain_other::linux::FreedesktopSecretService,
+        )),
         _ => Err(StoreError::PersistenceBlocked {
             reason: crate::store::PersistenceBlockReason::KeychainUnavailable,
         }),
@@ -51,7 +49,10 @@ mod tests {
     #[test]
     fn routes_each_os_to_its_native_backend_and_fails_unsupported() {
         assert_eq!(select("macos"), SelectedKeychain::MacosKeychain);
-        assert_eq!(select("windows"), SelectedKeychain::WindowsCredentialManager);
+        assert_eq!(
+            select("windows"),
+            SelectedKeychain::WindowsCredentialManager
+        );
         assert_eq!(select("linux"), SelectedKeychain::FreedesktopSecretService);
         assert_eq!(select("plan9"), SelectedKeychain::Unsupported);
     }

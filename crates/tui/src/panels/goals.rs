@@ -141,7 +141,10 @@ mod tests {
             3,
             42,
         );
-        let state = reduce(crate::state::AppState::new(), &UiEvent::Local(LocalUiEvent::SyncGoal(projection)));
+        let state = reduce(
+            crate::state::AppState::new(),
+            &UiEvent::Local(LocalUiEvent::SyncGoal(projection)),
+        );
         let model = GoalViewModel::from_state(&state);
         let row = &model.rows()[0];
         assert_eq!(row.id(), goal_id());

@@ -305,10 +305,11 @@ mod tests {
             .iter()
             .map(|(id, n)| (*id, n.label.as_str()))
             .collect();
-        let by_to: BTreeMap<&str, Vec<&str>> = graph.edges.iter().fold(BTreeMap::new(), |mut m, e| {
-            m.entry(labels[&e.to]).or_default().push(labels[&e.from]);
-            m
-        });
+        let by_to: BTreeMap<&str, Vec<&str>> =
+            graph.edges.iter().fold(BTreeMap::new(), |mut m, e| {
+                m.entry(labels[&e.to]).or_default().push(labels[&e.from]);
+                m
+            });
         assert_eq!(by_to["Draft plan"], vec!["Load repo context"]);
         assert_eq!(by_to["Verify claims"], vec!["Draft plan"]);
         assert_eq!(by_to["Load repo context"], vec!["Ship v3"]);
@@ -330,13 +331,14 @@ mod tests {
         let dup = PlaybookTemplate::new("dup")
             .push(PlaybookStep::new("a", NodeKind::Task, "one"))
             .push(PlaybookStep::new("a", NodeKind::Task, "two"));
-        assert_eq!(compile(&dup, GraphId::new()), Err(PlaybookError::DuplicateStepKey));
+        assert_eq!(
+            compile(&dup, GraphId::new()),
+            Err(PlaybookError::DuplicateStepKey)
+        );
 
         let unknown = PlaybookTemplate::new("unknown")
             .push(PlaybookStep::new("a", NodeKind::Task, "one"))
-            .push(
-                PlaybookStep::new("b", NodeKind::Task, "two").with_dependencies(["ghost"]),
-            );
+            .push(PlaybookStep::new("b", NodeKind::Task, "two").with_dependencies(["ghost"]));
         assert_eq!(
             compile(&unknown, GraphId::new()),
             Err(PlaybookError::UnknownDependency {
@@ -351,11 +353,17 @@ mod tests {
         let long_label = "x".repeat(MAX_LABEL_BYTES + 1);
         let oversized =
             PlaybookTemplate::new("big").push(PlaybookStep::new("a", NodeKind::Task, long_label));
-        assert_eq!(compile(&oversized, GraphId::new()), Err(PlaybookError::LabelTooLong));
+        assert_eq!(
+            compile(&oversized, GraphId::new()),
+            Err(PlaybookError::LabelTooLong)
+        );
 
-        let bad_key = PlaybookTemplate::new("bad")
-            .push(PlaybookStep::new("a b!", NodeKind::Task, "ok"));
-        assert_eq!(compile(&bad_key, GraphId::new()), Err(PlaybookError::InvalidKey));
+        let bad_key =
+            PlaybookTemplate::new("bad").push(PlaybookStep::new("a b!", NodeKind::Task, "ok"));
+        assert_eq!(
+            compile(&bad_key, GraphId::new()),
+            Err(PlaybookError::InvalidKey)
+        );
     }
 
     #[test]
@@ -363,7 +371,10 @@ mod tests {
         let cycle = PlaybookTemplate::new("cycle")
             .push(PlaybookStep::new("a", NodeKind::Task, "a").with_dependencies(["b"]))
             .push(PlaybookStep::new("b", NodeKind::Task, "b").with_dependencies(["a"]));
-        assert_eq!(compile(&cycle, GraphId::new()), Err(PlaybookError::DependencyCycle));
+        assert_eq!(
+            compile(&cycle, GraphId::new()),
+            Err(PlaybookError::DependencyCycle)
+        );
 
         let disconnected = PlaybookTemplate::new("split")
             .push(PlaybookStep::new("entry", NodeKind::Goal, "entry"))
@@ -378,12 +389,8 @@ mod tests {
     fn diamond_template_compiles_and_ready_set_grows_after_completion() {
         let template = PlaybookTemplate::new("diamond")
             .push(PlaybookStep::new("start", NodeKind::Goal, "start"))
-            .push(
-                PlaybookStep::new("left", NodeKind::Task, "left").with_dependencies(["start"]),
-            )
-            .push(
-                PlaybookStep::new("right", NodeKind::Task, "right").with_dependencies(["start"]),
-            )
+            .push(PlaybookStep::new("left", NodeKind::Task, "left").with_dependencies(["start"]))
+            .push(PlaybookStep::new("right", NodeKind::Task, "right").with_dependencies(["start"]))
             .push(
                 PlaybookStep::new("join", NodeKind::Artifact, "join")
                     .with_dependencies(["left", "right"]),

@@ -8,7 +8,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use capability_broker::{
-    CancellationToken, CanonicalAction, Capability, CapabilityLease, CanonicalHostPath,
+    CancellationToken, CanonicalAction, CanonicalHostPath, Capability, CapabilityLease,
     LeaseValidator, SecretHandle,
 };
 use protocol::{ErrorCode, LeaseId, RepoPath, RuntimeId, SandboxTier};
@@ -1382,10 +1382,10 @@ mod tests {
     use std::time::Instant;
 
     use capability_broker::{
-        evaluate, issue, request_approval, ActionRequest, ApprovalChoice, ApprovalResolution,
-        ApprovalScopeId, CanonicalAction, Capability, FilesystemScope, LeaseIssuer, LeaseValidator,
-        PolicyDocument, PolicyRevision, PolicySource, PolicyStack, PrincipalRef, ProcessScope,
-        ResourceDescriptor,
+        ActionRequest, ApprovalChoice, ApprovalResolution, ApprovalScopeId, CanonicalAction,
+        Capability, FilesystemScope, LeaseIssuer, LeaseValidator, PolicyDocument, PolicyRevision,
+        PolicySource, PolicyStack, PrincipalRef, ProcessScope, ResourceDescriptor, evaluate, issue,
+        request_approval,
     };
     use protocol::SessionId;
 

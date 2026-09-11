@@ -2,16 +2,16 @@
 
 pub mod color;
 pub mod commands;
-pub mod compositor;
 pub mod composer;
+pub mod compositor;
 pub mod layout;
 pub mod panels {
     pub mod agents;
-    pub mod goals;
     pub mod approval;
     pub mod context;
     pub mod control_room;
     pub mod diff;
+    pub mod goals;
     pub mod memory;
     pub mod model;
     pub mod runtime_views;
@@ -40,19 +40,13 @@ pub use composer::{
     ComposerCommand, ComposerError, ComposerEvent, ComposerModel, ComposerView, Motion,
 };
 pub use compositor::{
-    Screen, compute_screen_layout, paint_screen, route_renders_content, sidebar_lines,
-    ui_mode_for,
+    Screen, compute_screen_layout, paint_screen, route_renders_content, sidebar_lines, ui_mode_for,
 };
 pub use layout::{LayoutRects, Rect, UiMode, compute_layout, compute_layout_with_composer};
 pub use panels::agents::{
     AgentCancelIntent, AgentHandoffObservation, AgentInspectIntent, AgentMergeIntent,
     AgentMergeState, AgentRowView, AgentsFrame, AgentsPanelError, AgentsSelection, AgentsViewModel,
     MAX_AGENT_TEXT_BYTES, MAX_AGENTS, MAX_AGENTS_COLS, MAX_AGENTS_ROWS,
-};
-pub use panels::control_room::{
-    ControlRoomError, ControlRoomFrame, ControlRoomViewModel, MAX_PHASES, MAX_ROOM_COLS,
-    MAX_ROOM_ROWS, MAX_STREAMS, RoomGoal, RoomPhase, RoomPhaseState, RoomStream, goal_row,
-    phase_row, stream_row,
 };
 pub use panels::approval::{
     ApprovalActionSpec, ApprovalClock, ApprovalFrame, ApprovalLeaseFields, ApprovalModalChoice,
@@ -66,6 +60,11 @@ pub use panels::context::{
     ContextBlockView, ContextFrame, ContextGroup, ContextInspectError, ContextPinIntent,
     ContextSelection, ContextUnpinIntent, ContextViewModel, MAX_CONTEXT_BLOCKS, MAX_CONTEXT_COLS,
     MAX_CONTEXT_ROWS,
+};
+pub use panels::control_room::{
+    ControlRoomError, ControlRoomFrame, ControlRoomViewModel, MAX_PHASES, MAX_ROOM_COLS,
+    MAX_ROOM_ROWS, MAX_STREAMS, RoomGoal, RoomPhase, RoomPhaseState, RoomStream, goal_row,
+    phase_row, stream_row,
 };
 pub use panels::diff::{
     DegradeReason, DiffAttribution, DiffBodyKind, DiffError, DiffFile, DiffFileKind, DiffFrame,

@@ -168,9 +168,10 @@ impl ResultStore {
             return Err(ResultError::from(AgentModelError::ResultAgentMismatch));
         }
         if let Some(view) = result.workspace_view()
-            && view != agent.spec().workspace_view_id() {
-                return Err(ResultError::from(AgentModelError::ResultViewMismatch));
-            }
+            && view != agent.spec().workspace_view_id()
+        {
+            return Err(ResultError::from(AgentModelError::ResultViewMismatch));
+        }
 
         // The duplicate/bound check and the insert must share one lock
         // acquisition with agent.complete() in between: agent.complete()
@@ -1159,7 +1160,10 @@ mod tests {
         } else {
             (outcome2.is_ok(), agent1.state(), outcome1.err())
         };
-        assert!(winner_ok, "exactly one of the two racing completions must succeed");
+        assert!(
+            winner_ok,
+            "exactly one of the two racing completions must succeed"
+        );
         assert_eq!(loser_err, Some(ResultError::BoundExceeded));
         assert_eq!(
             loser_state,

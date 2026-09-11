@@ -58,9 +58,7 @@ impl GraphViewModel {
 
     /// Insert a node row; rejects empty identifiers and enforces the bound.
     pub fn push_node(&mut self, row: GraphNodeRow) -> bool {
-        if self.nodes.len() >= MAX_VIEW_ROWS
-            || self.nodes.iter().any(|n| n.id == row.id)
-        {
+        if self.nodes.len() >= MAX_VIEW_ROWS || self.nodes.iter().any(|n| n.id == row.id) {
             return false;
         }
         self.nodes.push(row);
@@ -140,7 +138,11 @@ impl ComputerViewModel {
 
     /// Human-readable status line; staleness must always be visible.
     pub fn status_line(&self) -> String {
-        let freshness = if self.observation_fresh { "fresh" } else { "STALE" };
+        let freshness = if self.observation_fresh {
+            "fresh"
+        } else {
+            "STALE"
+        };
         format!(
             "observation={freshness} takeover_gen={} actions={}",
             self.takeover_generation,
@@ -185,9 +187,7 @@ impl ResourcesViewModel {
     }
 
     pub fn push(&mut self, row: ResourceRow) -> bool {
-        if self.rows.len() >= MAX_VIEW_ROWS
-            || self.rows.iter().any(|r| r.class == row.class)
-        {
+        if self.rows.len() >= MAX_VIEW_ROWS || self.rows.iter().any(|r| r.class == row.class) {
             return false;
         }
         self.rows.push(row);
@@ -334,7 +334,10 @@ mod tests {
         let mut vm = GraphViewModel::new();
         assert!(vm.push_node(GraphNodeRow::new("b", "task", "pending", "B").unwrap()));
         assert!(vm.push_node(GraphNodeRow::new("a", "goal", "running", "A").unwrap()));
-        assert!(!vm.push_node(GraphNodeRow::new("a", "goal", "x", "dup").unwrap()), "duplicate id rejected");
+        assert!(
+            !vm.push_node(GraphNodeRow::new("a", "goal", "x", "dup").unwrap()),
+            "duplicate id rejected"
+        );
         assert!(vm.push_edge("b", "a"));
         assert_eq!(
             vm.rows().iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
@@ -357,7 +360,10 @@ mod tests {
         );
         vm.set_observation(false, 7);
         assert!(!vm.observation_fresh());
-        assert!(vm.status_line().contains("STALE"), "staleness must be visible");
+        assert!(
+            vm.status_line().contains("STALE"),
+            "staleness must be visible"
+        );
         assert!(!vm.push_action("", ComputerActionState::Pending));
     }
 
@@ -398,7 +404,11 @@ mod tests {
         assert!(!vm.push_checkpoint(20, "out of order"), "seq must increase");
         assert_eq!(vm.rewind_target(30).expect("target").label, "green tests");
         assert_eq!(vm.rewind_target(25).expect("exact").seq, 25);
-        assert_eq!(vm.rewind_target(5).map(|_| "some"), None, "no marker before first seq");
+        assert_eq!(
+            vm.rewind_target(5).map(|_| "some"),
+            None,
+            "no marker before first seq"
+        );
     }
 
     #[test]

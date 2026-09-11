@@ -187,9 +187,7 @@ impl PromptCron {
         if !succeeded && consecutive_failures >= MAX_CONSECUTIVE_EXECUTION_FAILURES {
             self.store.quarantine(
                 id,
-                &format!(
-                    "quarantined after {consecutive_failures} consecutive execution failures"
-                ),
+                &format!("quarantined after {consecutive_failures} consecutive execution failures"),
                 now_ms,
             )?;
             return Ok(ExecutionReport {
@@ -205,7 +203,9 @@ impl PromptCron {
 
     /// Crash recovery: requeue stale `firing` rows. Returns the count.
     pub fn requeue_orphaned(&self, now_ms: i64) -> Result<usize, CronError> {
-        Ok(self.store.requeue_orphaned(now_ms, FIRING_LEASE_TIMEOUT_MS)? as usize)
+        Ok(self
+            .store
+            .requeue_orphaned(now_ms, FIRING_LEASE_TIMEOUT_MS)? as usize)
     }
 
     /// One fire-loop tick:
@@ -437,7 +437,10 @@ mod tests {
             final_report.consecutive_failures,
             MAX_CONSECUTIVE_EXECUTION_FAILURES
         );
-        assert!(final_report.quarantined, "the threshold-crossing report must quarantine");
+        assert!(
+            final_report.quarantined,
+            "the threshold-crossing report must quarantine"
+        );
         let quarantined_job = cron.store().get(&job.id).expect("get");
         assert_eq!(
             quarantined_job.status,
@@ -485,7 +488,10 @@ mod tests {
             .expect("add");
         // Simulate a crash between claim and complete: claim through the
         // raw store at the job's first fire time and never complete.
-        let claimed = cron.store().claim_due(job.next_fire_at_ms, 10).expect("claim");
+        let claimed = cron
+            .store()
+            .claim_due(job.next_fire_at_ms, 10)
+            .expect("claim");
         assert_eq!(claimed.len(), 1);
         // A tick before the lease timeout does not steal the live lease.
         let early = cron
@@ -498,7 +504,11 @@ mod tests {
             .expect("sweep");
         assert_eq!(swept, 1);
         let report = cron
-            .poll(job.next_fire_at_ms + FIRING_LEASE_TIMEOUT_MS + 60_000, &live(), 10)
+            .poll(
+                job.next_fire_at_ms + FIRING_LEASE_TIMEOUT_MS + 60_000,
+                &live(),
+                10,
+            )
             .expect("poll after recovery");
         assert_eq!(report.fired.len(), 1);
     }

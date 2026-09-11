@@ -78,7 +78,10 @@ fn sandbox_exec_binary() -> Option<&'static str> {
 }
 
 fn first_existing(candidates: &[&'static str]) -> Option<&'static str> {
-    candidates.iter().copied().find(|path| Path::new(path).is_file())
+    candidates
+        .iter()
+        .copied()
+        .find(|path| Path::new(path).is_file())
 }
 
 fn cpu_limit_seconds(cpu_millis: u32) -> u64 {
@@ -198,8 +201,8 @@ impl SandboxBackend for SeatbeltBackend {
         check_cancel(cancel)?;
         let handle = SandboxHandle::new(SandboxTier::HostRestricted, lease.lease_id())?;
         let profile = render_profile(&write_roots, spec.network());
-        let profile_path = std::env::temp_dir()
-            .join(format!("rapidlm-seatbelt-{}.sb", handle.id().as_runtime()));
+        let profile_path =
+            std::env::temp_dir().join(format!("rapidlm-seatbelt-{}.sb", handle.id().as_runtime()));
         fs::write(&profile_path, profile.as_bytes()).map_err(|_| SandboxError::HealthFailed)?;
         let plan = SeatbeltPlan {
             sandbox_exec: PathBuf::from(sandbox_exec),
@@ -262,7 +265,11 @@ impl SandboxBackend for SeatbeltBackend {
         run_seatbelt(&plan, request, cancel)
     }
 
-    fn destroy(&self, handle: &SandboxHandle, cancel: &CancellationToken) -> Result<(), SandboxError> {
+    fn destroy(
+        &self,
+        handle: &SandboxHandle,
+        cancel: &CancellationToken,
+    ) -> Result<(), SandboxError> {
         check_cancel(cancel)?;
         if handle.tier() != SandboxTier::HostRestricted {
             return Err(SandboxError::UnknownHandle);
@@ -367,7 +374,11 @@ fn run_seatbelt(
         )
     }
     match outcome {
-        WaitOutcome::Finished { code, signal, output } => Ok(SandboxExecResult::new(
+        WaitOutcome::Finished {
+            code,
+            signal,
+            output,
+        } => Ok(SandboxExecResult::new(
             SandboxExit::new(
                 code,
                 signal,
@@ -593,12 +604,12 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    use crate::backend::SandboxMount;
     use capability_broker::{
         ActionRequest, ApprovalChoice, ApprovalResolution, ApprovalScopeId, CanonicalAction,
         FilesystemScope, LeaseIssuer, PolicyDocument, PolicySource, PolicyStack, PrincipalRef,
         ProcessScope, ResourceDescriptor, evaluate, issue, request_approval,
     };
-    use crate::backend::SandboxMount;
     use protocol::{RepoPath, SessionId};
 
     fn seatbelt_available() -> bool {
@@ -612,8 +623,10 @@ mod tests {
 
     impl TempWorkspace {
         fn new() -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("rapidlm-seatbelt-sbx-{}", protocol::RuntimeId::new()));
+            let path = std::env::temp_dir().join(format!(
+                "rapidlm-seatbelt-sbx-{}",
+                protocol::RuntimeId::new()
+            ));
             fs::create_dir_all(&path).expect("temp workspace");
             let canon = fs::canonicalize(&path).expect("canonicalize");
             let host =
@@ -622,8 +635,12 @@ mod tests {
         }
 
         fn mount(&self, target: &str, mode: MountMode) -> SandboxMount {
-            SandboxMount::bind(self.host.clone(), RepoPath::parse(target).expect("target"), mode)
-                .expect("mount")
+            SandboxMount::bind(
+                self.host.clone(),
+                RepoPath::parse(target).expect("target"),
+                mode,
+            )
+            .expect("mount")
         }
     }
 
@@ -717,7 +734,10 @@ capability = "fs.read"
         } else {
             fs_stack()
         };
-        let actual = CanonicalAction::Resource { capability, resource: resource.clone() };
+        let actual = CanonicalAction::Resource {
+            capability,
+            resource: resource.clone(),
+        };
         let request = ActionRequest::new(
             principal(),
             SessionId::new(),
@@ -743,7 +763,14 @@ capability = "fs.read"
             ApprovalResolution::Approved(approved) => approved,
             ApprovalResolution::Denied => panic!("expected approved"),
         };
-        issue(&issuer(), &approved, &policies, now, &CancellationToken::new()).expect("issue")
+        issue(
+            &issuer(),
+            &approved,
+            &policies,
+            now,
+            &CancellationToken::new(),
+        )
+        .expect("issue")
     }
 
     fn proc_lease() -> CapabilityLease {
@@ -873,8 +900,10 @@ capability = "fs.read"
 
         // A write to a real path outside the mounted root is denied by the
         // profile itself, not by this process's own policy layer.
-        let outside_target = std::env::temp_dir()
-            .join(format!("rapidlm-seatbelt-outside-{}.txt", protocol::RuntimeId::new()));
+        let outside_target = std::env::temp_dir().join(format!(
+            "rapidlm-seatbelt-outside-{}.txt",
+            protocol::RuntimeId::new()
+        ));
         let outside = SandboxExecRequest::new(
             [
                 "/bin/sh".to_owned(),
@@ -885,13 +914,17 @@ capability = "fs.read"
             4096,
         )
         .expect("request");
-        let result = backend.exec(&handle, &outside, &lease, &live).expect("exec");
+        let result = backend
+            .exec(&handle, &outside, &lease, &live)
+            .expect("exec");
         assert_ne!(result.exit().code(), Some(0));
         assert!(!outside_target.exists());
 
         backend.destroy(&handle, &live).expect("destroy");
         assert_eq!(
-            backend.exec(&handle, &inside, &lease, &live).expect_err("gone"),
+            backend
+                .exec(&handle, &inside, &lease, &live)
+                .expect_err("gone"),
             SandboxError::UnknownHandle
         );
     }
@@ -908,13 +941,27 @@ capability = "fs.read"
         let live = CancellationToken::new();
         let handle = backend.prepare(&spec(&ws), &lease, &live).expect("prepare");
         let request = SandboxExecRequest::new(
-            ["/usr/bin/curl", "-s", "-m", "3", "-o", "/dev/null", "https://example.com"],
+            [
+                "/usr/bin/curl",
+                "-s",
+                "-m",
+                "3",
+                "-o",
+                "/dev/null",
+                "https://example.com",
+            ],
             Duration::from_secs(10),
             4096,
         )
         .expect("request");
-        let result = backend.exec(&handle, &request, &lease, &live).expect("exec");
-        assert_ne!(result.exit().code(), Some(0), "curl must fail with network denied");
+        let result = backend
+            .exec(&handle, &request, &lease, &live)
+            .expect("exec");
+        assert_ne!(
+            result.exit().code(),
+            Some(0),
+            "curl must fail with network denied"
+        );
         backend.destroy(&handle, &live).expect("destroy");
     }
 
@@ -981,7 +1028,9 @@ capability = "fs.read"
             4096,
         )
         .expect("request");
-        let _ = backend.exec(&handle, &request, &lease, &live).expect("exec");
+        let _ = backend
+            .exec(&handle, &request, &lease, &live)
+            .expect("exec");
         backend.destroy(&handle, &live).expect("destroy");
 
         accept_thread.join().expect("accept thread");
@@ -1033,7 +1082,9 @@ capability = "fs.read"
 
         let timed = SandboxExecRequest::new(["/bin/sleep", "5"], Duration::from_millis(150), 1024)
             .expect("timed");
-        let result = backend.exec(&handle, &timed, &lease, &live).expect("timeout");
+        let result = backend
+            .exec(&handle, &timed, &lease, &live)
+            .expect("timeout");
         assert_eq!(result.exit().reason(), SandboxExitReason::TimedOut);
         assert!(result.exit().timed_out());
 
@@ -1042,7 +1093,9 @@ capability = "fs.read"
         let request = SandboxExecRequest::new(["/bin/sleep", "5"], Duration::from_secs(2), 1024)
             .expect("req");
         assert_eq!(
-            backend.exec(&handle, &request, &lease, &cancel).expect_err("pre-cancel"),
+            backend
+                .exec(&handle, &request, &lease, &cancel)
+                .expect_err("pre-cancel"),
             SandboxError::Cancelled
         );
 
@@ -1075,14 +1128,27 @@ capability = "fs.read"
         let live = CancellationToken::new();
         let handle = backend.prepare(&spec, &lease, &live).expect("prepare");
         let request = SandboxExecRequest::new(
-            ["/bin/sh", "-c", "i=0; while [ $i -lt 1500000 ]; do i=$((i+1)); done"],
+            [
+                "/bin/sh",
+                "-c",
+                "i=0; while [ $i -lt 1500000 ]; do i=$((i+1)); done",
+            ],
             Duration::from_secs(30),
             1024,
         )
         .expect("request");
-        let result = backend.exec(&handle, &request, &lease, &live).expect("exec");
-        assert_ne!(result.exit().code(), Some(0), "the CPU ceiling should kill it first");
-        assert!(!result.exit().timed_out(), "killed by the CPU limit, not the wall-clock timeout");
+        let result = backend
+            .exec(&handle, &request, &lease, &live)
+            .expect("exec");
+        assert_ne!(
+            result.exit().code(),
+            Some(0),
+            "the CPU ceiling should kill it first"
+        );
+        assert!(
+            !result.exit().timed_out(),
+            "killed by the CPU limit, not the wall-clock timeout"
+        );
         backend.destroy(&handle, &live).expect("destroy");
     }
 
@@ -1119,9 +1185,17 @@ capability = "fs.read"
             1024,
         )
         .expect("request");
-        let result = backend.exec(&handle, &request, &lease, &live).expect("exec");
-        assert!(result.exit().oom(), "the memory ceiling should have killed it");
-        assert!(!result.exit().timed_out(), "killed by the memory limit, not the wall-clock timeout");
+        let result = backend
+            .exec(&handle, &request, &lease, &live)
+            .expect("exec");
+        assert!(
+            result.exit().oom(),
+            "the memory ceiling should have killed it"
+        );
+        assert!(
+            !result.exit().timed_out(),
+            "killed by the memory limit, not the wall-clock timeout"
+        );
         backend.destroy(&handle, &live).expect("destroy");
     }
 
@@ -1157,12 +1231,17 @@ capability = "fs.read"
             1024,
         )
         .expect("request");
-        let result = backend.exec(&handle, &request, &lease, &live).expect("exec");
+        let result = backend
+            .exec(&handle, &request, &lease, &live)
+            .expect("exec");
         assert!(
             result.exit().policy_violation(),
             "the pid-count ceiling should have killed it"
         );
-        assert!(!result.exit().timed_out(), "killed by the pid ceiling, not the wall-clock timeout");
+        assert!(
+            !result.exit().timed_out(),
+            "killed by the pid ceiling, not the wall-clock timeout"
+        );
         backend.destroy(&handle, &live).expect("destroy");
     }
 
@@ -1181,15 +1260,22 @@ capability = "fs.read"
             SandboxExecRequest::new(["/bin/echo", "hi"], Duration::from_secs(3_600), 1024)
                 .expect("req");
         assert_eq!(
-            backend.exec(&handle, &wide_timeout, &lease, &live).expect_err("timeout"),
+            backend
+                .exec(&handle, &wide_timeout, &lease, &live)
+                .expect_err("timeout"),
             SandboxError::TimeoutInvalid
         );
 
-        let wide_output =
-            SandboxExecRequest::new(["/bin/echo", "hi"], Duration::from_secs(1), 64 * 1024 * 1024)
-                .expect("req");
+        let wide_output = SandboxExecRequest::new(
+            ["/bin/echo", "hi"],
+            Duration::from_secs(1),
+            64 * 1024 * 1024,
+        )
+        .expect("req");
         assert_eq!(
-            backend.exec(&handle, &wide_output, &lease, &live).expect_err("output"),
+            backend
+                .exec(&handle, &wide_output, &lease, &live)
+                .expect_err("output"),
             SandboxError::OutputLimitInvalid
         );
         backend.destroy(&handle, &live).expect("destroy");
@@ -1209,7 +1295,9 @@ capability = "fs.read"
         let request = SandboxExecRequest::new(["/bin/echo", "hi"], Duration::from_secs(1), 1024)
             .expect("req");
         assert_eq!(
-            backend.exec(&handle, &request, &other, &live).expect_err("retarget"),
+            backend
+                .exec(&handle, &request, &other, &live)
+                .expect_err("retarget"),
             SandboxError::LeaseInvalid
         );
         backend.destroy(&handle, &live).expect("destroy");

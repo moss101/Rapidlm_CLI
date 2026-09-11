@@ -418,7 +418,8 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
             .map_err(|_| ProviderError::Connection)?;
         tcp.set_write_timeout(Some(slice_timeout(self.timeout)))
             .map_err(|_| ProviderError::Connection)?;
-        tcp.set_nodelay(true).map_err(|_| ProviderError::Connection)?;
+        tcp.set_nodelay(true)
+            .map_err(|_| ProviderError::Connection)?;
 
         // TLS is negotiated lazily on first write/read against the Mozilla
         // root set; the same deadline/SSRF guards bound the handshake.
@@ -1697,7 +1698,8 @@ pub fn http_get(
         .map_err(|_| ProviderError::Connection)?;
     tcp.set_write_timeout(Some(slice_timeout(timeout)))
         .map_err(|_| ProviderError::Connection)?;
-    tcp.set_nodelay(true).map_err(|_| ProviderError::Connection)?;
+    tcp.set_nodelay(true)
+        .map_err(|_| ProviderError::Connection)?;
 
     let mut stream = match parsed.scheme {
         UrlScheme::Http => MaybeTlsStream::Plain(tcp),
@@ -1726,8 +1728,7 @@ pub fn http_get(
     );
     write_all_deadline(&mut stream, request.as_bytes(), cancel, deadline)?;
     // Headers get slack above the body cap; the body is truncated to the cap.
-    let response =
-        read_http_response_opts(&mut stream, max_bytes, cancel, deadline, true)?;
+    let response = read_http_response_opts(&mut stream, max_bytes, cancel, deadline, true)?;
     let mut body = response.body;
     if body.len() > max_bytes {
         body.truncate(max_bytes);
@@ -2681,17 +2682,14 @@ mod tests {
     #[test]
     fn reasoning_effort_is_emitted_only_when_set() {
         let plain = request(false, false);
-        let encoded =
-            encode_provider_payload(&plain, OpenAiApiStyle::ChatCompletions, &live())
-                .expect("encode plain");
+        let encoded = encode_provider_payload(&plain, OpenAiApiStyle::ChatCompletions, &live())
+            .expect("encode plain");
         assert!(encoded.get("reasoning_effort").is_none());
 
-        let effort = request(false, false).with_reasoning_effort(
-            crate::phase::ReasoningEffort::High,
-        );
-        let encoded =
-            encode_provider_payload(&effort, OpenAiApiStyle::ChatCompletions, &live())
-                .expect("encode effort");
+        let effort =
+            request(false, false).with_reasoning_effort(crate::phase::ReasoningEffort::High);
+        let encoded = encode_provider_payload(&effort, OpenAiApiStyle::ChatCompletions, &live())
+            .expect("encode effort");
         assert_eq!(encoded["reasoning_effort"], "high");
     }
 
@@ -3309,7 +3307,13 @@ mod tests {
             }
         });
         let url = format!("http://127.0.0.1:{}/x", addr.port());
-        let result = http_get(&url, false, 1024, Duration::from_secs(2), &CancellationToken::new());
+        let result = http_get(
+            &url,
+            false,
+            1024,
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        );
         assert!(
             matches!(result, Err(ProviderError::InvalidRequest)),
             "loopback must be refused even via the connect-time resolution, got {result:?}"
