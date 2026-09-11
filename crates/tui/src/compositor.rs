@@ -325,16 +325,31 @@ fn job_log_lines(state: &AppState, page: &JobLogView) -> Vec<String> {
 /// waiting on.
 fn job_row(job: &JobProjection) -> String {
     let lifecycle = format!("{:?}", job.state()).to_lowercase();
+    // The name a user can type first, then what it is. The `job-N` handle
+    // is what the transcript calls it and what `/jobs cancel` accepts;
+    // absent one (an older ledger), the id's random tail, which the
+    // commands accept too.
+    let name = match job.handle() {
+        Some(handle) => handle.to_owned(),
+        None => short_id(&job.id().to_string()),
+    };
     let what = job.command().unwrap_or("");
     let head = if what.is_empty() {
-        job.id().to_string()
+        name
     } else {
-        what.to_owned()
+        format!("{name}  {what}")
     };
     match job.exit_status() {
         Some(status) => format!("{head} [{lifecycle}] exit:{status}"),
         None => format!("{head} [{lifecycle}]"),
     }
+}
+
+/// The last dash-group of a UUID: the random tail of a UUIDv7, which is
+/// the part that distinguishes ids minted close together — and therefore
+/// the part `IdResolver` matches. Same convention as the agents panel.
+fn short_id(raw: &str) -> String {
+    raw.rsplit('-').next().unwrap_or(raw).to_owned()
 }
 
 /// The `/approvals` panel, on the same footing as [`job_lines`].
@@ -1111,8 +1126,11 @@ pre-approve it with `rapid permissions allow <tool>`";
             )),
         );
         let started = sidebar_lines(UiRoute::Jobs, &state, 60, 6, &cancel());
+        // The id's random tail, not the full UUID: it is the part that
+        // distinguishes UUIDv7s minted close together, the same convention
+        // the agents panel uses, and what `IdResolver` accepts back.
         assert!(
-            started[0].contains(job) && started[0].contains("started"),
+            started[0].contains("00000000002a") && started[0].contains("started"),
             "the job and its state must both be shown: {started:?}"
         );
 

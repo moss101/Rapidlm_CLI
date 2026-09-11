@@ -216,6 +216,8 @@ pub enum CommandError {
     UnknownCommand,
     InvalidArgs { command: &'static str },
     InvalidId { field: &'static str },
+    /// A short identifier matched more than one thing the session knows.
+    AmbiguousId { field: &'static str, matched: usize },
 }
 
 /// Local chrome or kernel-bound action. Never a shell string.
@@ -646,7 +648,126 @@ fn catalog_help() -> &'static str {
 /// Input that does not start with `/` is [`CommandError::NotACommand`] so the
 /// caller can submit it as a prompt. Unknown names and invalid arguments
 /// return [`CommandError`] with [`CommandError::help`].
+/// Fewest characters a short identifier may have before it is looked up.
+///
+/// Below this, `/jobs cancel a` would match whichever job happens to end in
+/// `a`; an accidental keystroke should be a parse error, not a cancellation.
+pub const MIN_SHORT_ID_CHARS: usize = 4;
+
+/// How a short identifier resolved against what the session knows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Resolution<T> {
+    Found(T),
+    /// More than one candidate matched; `matched` says how many.
+    Ambiguous { matched: usize },
+    Unknown,
+}
+
+/// Resolves the short identifiers panels display back to the typed ids
+/// commands need.
+///
+/// The rule this exists to keep: **a panel must never show an identifier
+/// the commands refuse.** `JobId` and `AgentId` are UUIDv7 — time-ordered,
+/// so ids minted seconds apart share their first ten hex characters and a
+/// git-style *prefix* would rarely disambiguate anything. What the panels
+/// show instead is the last dash-group, the random tail, and that is what
+/// this resolves: a full UUID always parses, and otherwise the text is
+/// matched as a suffix of the ids the session knows (plus, for jobs, the
+/// `job-N` handle the transcript uses). A unique match resolves; several
+/// is [`Resolution::Ambiguous`]; none is [`Resolution::Unknown`].
+pub trait IdResolver {
+    fn resolve_job(&self, text: &str) -> Resolution<JobId>;
+    fn resolve_agent(&self, text: &str) -> Resolution<AgentId>;
+}
+
+/// Resolves nothing: full UUIDs only. What [`parse_command`] uses, so a
+/// parse with no session behind it behaves exactly as it always did.
+pub struct NoResolver;
+
+impl IdResolver for NoResolver {
+    fn resolve_job(&self, _: &str) -> Resolution<JobId> {
+        Resolution::Unknown
+    }
+
+    fn resolve_agent(&self, _: &str) -> Resolution<AgentId> {
+        Resolution::Unknown
+    }
+}
+
+impl IdResolver for crate::state::AppState {
+    fn resolve_job(&self, text: &str) -> Resolution<JobId> {
+        resolve_short(text, self.jobs().values().map(|job| (job.id(), job.handle())))
+    }
+
+    fn resolve_agent(&self, text: &str) -> Resolution<AgentId> {
+        resolve_short(text, self.agents().keys().map(|id| (*id, None)))
+    }
+}
+
+/// One matching rule for every id type: exact handle, else a suffix of the
+/// canonical UUID text of at least [`MIN_SHORT_ID_CHARS`].
+fn resolve_short<'a, T: Copy + Display>(
+    text: &str,
+    known: impl Iterator<Item = (T, Option<&'a str>)>,
+) -> Resolution<T> {
+    let wanted = text.trim().to_ascii_lowercase();
+    if wanted.len() < MIN_SHORT_ID_CHARS {
+        return Resolution::Unknown;
+    }
+    let mut found = None;
+    let mut matched = 0usize;
+    for (id, handle) in known {
+        let by_handle = handle.is_some_and(|handle| handle.eq_ignore_ascii_case(&wanted));
+        if by_handle || id.to_string().ends_with(&wanted) {
+            matched += 1;
+            found = Some(id);
+        }
+    }
+    match (matched, found) {
+        (1, Some(id)) => Resolution::Found(id),
+        (0, _) => Resolution::Unknown,
+        (n, _) => Resolution::Ambiguous { matched: n },
+    }
+}
+
+/// An id type the parser can resolve from a short form. Types no panel
+/// displays short (knowledge, sessions) resolve nothing and stay full-UUID.
+trait ShortId: FromStr<Err = IdParseError> + Sized {
+    fn resolve(resolver: &dyn IdResolver, text: &str) -> Resolution<Self>;
+}
+
+impl ShortId for JobId {
+    fn resolve(resolver: &dyn IdResolver, text: &str) -> Resolution<Self> {
+        resolver.resolve_job(text)
+    }
+}
+
+impl ShortId for AgentId {
+    fn resolve(resolver: &dyn IdResolver, text: &str) -> Resolution<Self> {
+        resolver.resolve_agent(text)
+    }
+}
+
+impl ShortId for KnowledgeId {
+    fn resolve(_: &dyn IdResolver, _: &str) -> Resolution<Self> {
+        Resolution::Unknown
+    }
+}
+
+impl ShortId for SessionId {
+    fn resolve(_: &dyn IdResolver, _: &str) -> Resolution<Self> {
+        Resolution::Unknown
+    }
+}
+
+/// Parse with no session to resolve short ids against: full UUIDs only.
 pub fn parse_command(input: &str) -> Result<UiCommand, CommandError> {
+    parse_command_in(input, &NoResolver)
+}
+
+/// Parse a slash command, resolving the short identifiers the session's
+/// panels display through `resolver`.
+pub fn parse_command_in(input: &str, resolver: &dyn IdResolver) -> Result<UiCommand, CommandError> {
     if input.len() > MAX_COMMAND_BYTES {
         return Err(CommandError::TooLong);
     }
@@ -673,13 +794,13 @@ pub fn parse_command(input: &str) -> Result<UiCommand, CommandError> {
         Some("help") => parse_help(&args),
         Some("quit") => expect_none("quit", &args, UiCommand::Quit),
         Some("goal") => parse_goal(&args),
-        Some("agents") => parse_agents(&args),
-        Some("diff") => parse_diff(&args),
-        Some("apply") => parse_apply(&args),
+        Some("agents") => parse_agents(&args, resolver),
+        Some("diff") => parse_diff(&args, resolver),
+        Some("apply") => parse_apply(&args, resolver),
         Some("rollback") => parse_rollback(&args),
         Some("context") => parse_context(&args),
         Some("memory") => expect_none("memory", &args, UiCommand::OpenMemory),
-        Some("knowledge") => parse_knowledge(&args),
+        Some("knowledge") => parse_knowledge(&args, resolver),
         Some("playbook") => parse_playbook(&args),
         Some("trace") => parse_trace(&args),
         Some("insights") => parse_insights(&args),
@@ -687,14 +808,14 @@ pub fn parse_command(input: &str) -> Result<UiCommand, CommandError> {
         Some("takeover") => parse_takeover(&args),
         Some("control-return") => expect_none("control-return", &args, UiCommand::ControlReturn),
         Some("computer") => parse_computer(&args),
-        Some("jobs") => parse_jobs(&args),
+        Some("jobs") => parse_jobs(&args, resolver),
         Some("mcp") => parse_mcp(&args),
         Some("permissions") => parse_permissions(&args),
         Some("plugins") => parse_plugins(&args),
         Some("policy") => parse_policy(&args),
         Some("sandbox") => parse_sandbox(&args),
         Some("model") => parse_model(&args),
-        Some("resume") => parse_resume(&args),
+        Some("resume") => parse_resume(&args, resolver),
         Some("fork") => expect_none("fork", &args, UiCommand::Fork),
         Some("rewind") => parse_rewind(&args),
         Some("compact") => expect_none("compact", &args, UiCommand::Compact),
@@ -886,7 +1007,9 @@ impl CommandError {
             Self::Empty | Self::TooLong | Self::NotACommand | Self::UnknownCommand => {
                 catalog_help()
             }
-            Self::InvalidArgs { command } | Self::InvalidId { field: command } => {
+            Self::InvalidArgs { command }
+            | Self::InvalidId { field: command }
+            | Self::AmbiguousId { field: command, .. } => {
                 usage_for(command).unwrap_or_else(catalog_help)
             }
         }
@@ -1007,6 +1130,9 @@ impl Display for CommandError {
             Self::UnknownCommand => f.write_str("unknown command"),
             Self::InvalidArgs { .. } => f.write_str("invalid arguments"),
             Self::InvalidId { .. } => f.write_str("invalid identifier"),
+            Self::AmbiguousId { matched, .. } => {
+                write!(f, "ambiguous identifier: matches {matched} in this session")
+            }
         }
     }
 }
@@ -1090,40 +1216,40 @@ fn parse_goal_budget(args: &[&str]) -> Result<UiCommand, CommandError> {
     })
 }
 
-fn parse_agents(args: &[&str]) -> Result<UiCommand, CommandError> {
+fn parse_agents(args: &[&str], resolver: &dyn IdResolver) -> Result<UiCommand, CommandError> {
     match args {
         [] | ["list"] => Ok(UiCommand::AgentsList),
         ["show", rest @ ..] => Ok(UiCommand::AgentsShow {
-            id: optional_id("agents", rest)?,
+            id: optional_id("agents", rest, resolver)?,
         }),
         ["pause", rest @ ..] => Ok(UiCommand::AgentsPause {
-            id: optional_id("agents", rest)?,
+            id: optional_id("agents", rest, resolver)?,
         }),
         ["resume", rest @ ..] => Ok(UiCommand::AgentsResume {
-            id: optional_id("agents", rest)?,
+            id: optional_id("agents", rest, resolver)?,
         }),
         ["sleep", rest @ ..] => Ok(UiCommand::AgentsSleep {
-            id: optional_id("agents", rest)?,
+            id: optional_id("agents", rest, resolver)?,
         }),
         ["cancel", rest @ ..] => Ok(UiCommand::AgentsCancel {
-            id: optional_id("agents", rest)?,
+            id: optional_id("agents", rest, resolver)?,
         }),
         ["terminate", rest @ ..] => Ok(UiCommand::AgentsTerminate {
-            id: optional_id("agents", rest)?,
+            id: optional_id("agents", rest, resolver)?,
         }),
         _ => Err(invalid("agents")),
     }
 }
 
-fn parse_diff(args: &[&str]) -> Result<UiCommand, CommandError> {
+fn parse_diff(args: &[&str], resolver: &dyn IdResolver) -> Result<UiCommand, CommandError> {
     Ok(UiCommand::OpenDiff {
-        agent: optional_agent_flag("diff", args)?,
+        agent: optional_agent_flag("diff", args, resolver)?,
     })
 }
 
-fn parse_apply(args: &[&str]) -> Result<UiCommand, CommandError> {
+fn parse_apply(args: &[&str], resolver: &dyn IdResolver) -> Result<UiCommand, CommandError> {
     Ok(UiCommand::Apply {
-        agent: optional_agent_flag("apply", args)?,
+        agent: optional_agent_flag("apply", args, resolver)?,
     })
 }
 
@@ -1150,24 +1276,24 @@ fn parse_context(args: &[&str]) -> Result<UiCommand, CommandError> {
     }
 }
 
-fn parse_knowledge(args: &[&str]) -> Result<UiCommand, CommandError> {
+fn parse_knowledge(args: &[&str], resolver: &dyn IdResolver) -> Result<UiCommand, CommandError> {
     match args {
         [] | ["list"] => Ok(UiCommand::KnowledgeList),
         ["show", rest @ ..] => Ok(UiCommand::KnowledgeShow {
-            id: optional_id("knowledge", rest)?,
+            id: optional_id("knowledge", rest, resolver)?,
         }),
         ["suggest"] => Err(invalid("knowledge")),
         ["suggest", rest @ ..] => Ok(UiCommand::KnowledgeSuggest {
             text: join_text("knowledge", rest)?,
         }),
         ["approve", rest @ ..] => Ok(UiCommand::KnowledgeApprove {
-            id: require_id("knowledge", rest)?,
+            id: require_id("knowledge", rest, resolver)?,
         }),
         ["reject", rest @ ..] => Ok(UiCommand::KnowledgeReject {
-            id: require_id("knowledge", rest)?,
+            id: require_id("knowledge", rest, resolver)?,
         }),
         ["edit", rest @ ..] => Ok(UiCommand::KnowledgeEdit {
-            id: require_id("knowledge", rest)?,
+            id: require_id("knowledge", rest, resolver)?,
         }),
         _ => Err(invalid("knowledge")),
     }
@@ -1253,17 +1379,17 @@ fn parse_computer(args: &[&str]) -> Result<UiCommand, CommandError> {
     }
 }
 
-fn parse_jobs(args: &[&str]) -> Result<UiCommand, CommandError> {
+fn parse_jobs(args: &[&str], resolver: &dyn IdResolver) -> Result<UiCommand, CommandError> {
     match args {
         [] | ["list"] => Ok(UiCommand::JobsList),
         ["show", rest @ ..] => Ok(UiCommand::JobsShow {
-            id: optional_id("jobs", rest)?,
+            id: optional_id("jobs", rest, resolver)?,
         }),
         ["cancel", rest @ ..] => Ok(UiCommand::JobsCancel {
-            id: optional_id("jobs", rest)?,
+            id: optional_id("jobs", rest, resolver)?,
         }),
         ["logs", rest @ ..] => Ok(UiCommand::JobsLogs {
-            id: optional_id("jobs", rest)?,
+            id: optional_id("jobs", rest, resolver)?,
         }),
         _ => Err(invalid("jobs")),
     }
@@ -1363,9 +1489,9 @@ fn parse_model(args: &[&str]) -> Result<UiCommand, CommandError> {
     }
 }
 
-fn parse_resume(args: &[&str]) -> Result<UiCommand, CommandError> {
+fn parse_resume(args: &[&str], resolver: &dyn IdResolver) -> Result<UiCommand, CommandError> {
     Ok(UiCommand::Resume {
-        session: optional_id("resume", args)?,
+        session: optional_id("resume", args, resolver)?,
     })
 }
 
@@ -1432,40 +1558,53 @@ fn help_for(topic: Option<&str>) -> InlineHelp {
 fn optional_agent_flag(
     command: &'static str,
     args: &[&str],
+    resolver: &dyn IdResolver,
 ) -> Result<Option<AgentId>, CommandError> {
     match args {
         [] => Ok(None),
-        ["--agent", raw] => parse_typed_id(command, raw).map(Some),
+        ["--agent", raw] => parse_typed_id(command, raw, resolver).map(Some),
         _ => Err(invalid(command)),
     }
 }
 
-fn optional_id<T: FromStr<Err = IdParseError>>(
+fn optional_id<T: ShortId>(
     command: &'static str,
     args: &[&str],
+    resolver: &dyn IdResolver,
 ) -> Result<Option<T>, CommandError> {
     match args {
         [] => Ok(None),
-        [raw] => parse_typed_id(command, raw).map(Some),
+        [raw] => parse_typed_id(command, raw, resolver).map(Some),
         _ => Err(invalid(command)),
     }
 }
 
-fn require_id<T: FromStr<Err = IdParseError>>(
+fn require_id<T: ShortId>(
     command: &'static str,
     args: &[&str],
+    resolver: &dyn IdResolver,
 ) -> Result<T, CommandError> {
-    match optional_id(command, args)? {
+    match optional_id(command, args, resolver)? {
         Some(id) => Ok(id),
         None => Err(invalid(command)),
     }
 }
 
-fn parse_typed_id<T: FromStr<Err = IdParseError>>(
+/// A full UUID always parses; otherwise the text is resolved as the short
+/// form the panels display. See [`IdResolver`] for the rule.
+fn parse_typed_id<T: ShortId>(
     field: &'static str,
     raw: &str,
+    resolver: &dyn IdResolver,
 ) -> Result<T, CommandError> {
-    T::from_str(raw).map_err(|_| CommandError::InvalidId { field })
+    if let Ok(id) = T::from_str(raw) {
+        return Ok(id);
+    }
+    match T::resolve(resolver, raw) {
+        Resolution::Found(id) => Ok(id),
+        Resolution::Ambiguous { matched } => Err(CommandError::AmbiguousId { field, matched }),
+        Resolution::Unknown => Err(CommandError::InvalidId { field }),
+    }
 }
 
 fn require_ident(command: &'static str, args: &[&str]) -> Result<String, CommandError> {
@@ -1653,6 +1792,131 @@ mod tests {
             dispatch(parse_ok("/apply")),
             FrontendAction::Local(_)
         ));
+    }
+
+    /// Fold one `job.started` into `state`, as the producer records it.
+    fn with_job(
+        state: crate::state::AppState,
+        seq: u64,
+        id: &str,
+        handle: Option<&str>,
+    ) -> crate::state::AppState {
+        use crate::state::{UiEvent, reduce};
+        use event_ledger::event::{ActorKind, ActorRef, EventEnvelope, EventKind, RecordedAt};
+        use protocol::{EventId, RedactionClass, TraceId};
+
+        let session: SessionId = "019c0000-0000-7000-8000-000000000010".parse().expect("session");
+        let actor = ActorRef::new(ActorKind::System, "019c0000-0000-7000-8000-000000000016")
+            .expect("actor");
+        let kind = if seq == 1 { EventKind::SessionCreated } else { EventKind::JobStarted };
+        let mut payload = serde_json::json!({"job_id": id});
+        if seq == 1 {
+            payload = serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"});
+        } else if let Some(handle) = handle {
+            payload["handle"] = serde_json::Value::String(handle.to_owned());
+        }
+        let event = EventEnvelope::new(
+            format!("019c0000-0000-7000-8000-{seq:012x}").parse::<EventId>().expect("event id"),
+            session,
+            seq,
+            "2026-09-11T09:00:00.000Z".parse::<RecordedAt>().expect("recorded_at"),
+            actor,
+            TraceId::new(),
+            kind,
+            RedactionClass::Project,
+            payload,
+        );
+        reduce(state, &UiEvent::Kernel(event))
+    }
+
+    const JOB_A: &str = "019c0000-0000-7000-8000-0000000000aa";
+    const JOB_B: &str = "019c0000-0000-7000-8000-0000000000ab";
+
+    /// Two jobs that share every prefix and differ in the last character —
+    /// what UUIDv7 gives two jobs started in one session — one with the
+    /// handle the producer records.
+    fn session_with_two_jobs() -> crate::state::AppState {
+        let state = with_job(crate::state::AppState::new(), 1, "", None);
+        let state = with_job(state, 2, JOB_A, Some("job-1"));
+        with_job(state, 3, JOB_B, None)
+    }
+
+    #[test]
+    fn short_ids_resolve_by_handle_and_by_tail() {
+        // The rule: a panel must never show an identifier the commands
+        // refuse. Panels show a job's `job-N` handle and, failing one, the
+        // id's random tail — so both must parse.
+        let state = session_with_two_jobs();
+        let a: JobId = JOB_A.parse().expect("id");
+        let b: JobId = JOB_B.parse().expect("id");
+
+        assert_eq!(
+            parse_command_in("/jobs show job-1", &state),
+            Ok(UiCommand::JobsShow { id: Some(a) }),
+            "the transcript's handle resolves"
+        );
+        assert_eq!(
+            parse_command_in("/jobs show 0000000000ab", &state),
+            Ok(UiCommand::JobsShow { id: Some(b) }),
+            "the tail the panel shows resolves"
+        );
+        assert_eq!(
+            parse_command_in("/jobs cancel 00ab", &state),
+            Ok(UiCommand::JobsCancel { id: Some(b) }),
+            "a shorter suffix resolves while it is unique"
+        );
+        assert_eq!(
+            parse_command_in(&format!("/jobs show {a}"), &state),
+            Ok(UiCommand::JobsShow { id: Some(a) }),
+            "a full UUID always parses"
+        );
+
+        // Two UUIDv7s minted seconds apart share every leading character,
+        // so a git-style prefix would match both — which is why a prefix
+        // is not what is matched, and why this is refused rather than
+        // resolved to the first.
+        assert_eq!(
+            parse_command_in("/jobs show 019c0000-0000-7000-8000-0000000000a", &state),
+            Err(CommandError::InvalidId { field: "jobs" }),
+        );
+        // Below the minimum nothing resolves: an accidental `/jobs cancel
+        // ab` must be a parse error, not a cancellation.
+        assert_eq!(
+            parse_command_in("/jobs cancel ab", &state),
+            Err(CommandError::InvalidId { field: "jobs" }),
+        );
+        // With no session behind the parse, behavior is unchanged: full
+        // UUIDs only.
+        assert_eq!(
+            parse_command("/jobs show job-1"),
+            Err(CommandError::InvalidId { field: "jobs" }),
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_short_id_is_refused_with_the_count() {
+        // Two jobs whose tails share a suffix. The resolver must refuse
+        // rather than pick either — the command asking can be `cancel`.
+        let state = session_with_two_jobs();
+        let state = with_job(state, 4, "019c0000-0000-7000-8000-0000000100ab", None);
+        let e: JobId = "019c0000-0000-7000-8000-0000000100ab".parse().expect("id");
+
+        // `…0000000000ab` and `…0000000100ab` both end in `00ab`.
+        assert_eq!(
+            parse_command_in("/jobs cancel 00ab", &state),
+            Err(CommandError::AmbiguousId { field: "jobs", matched: 2 }),
+            "a shared suffix must be refused with the count, never picked from"
+        );
+        // More of the id disambiguates.
+        assert_eq!(
+            parse_command_in("/jobs cancel 100ab", &state),
+            Ok(UiCommand::JobsCancel { id: Some(e) }),
+        );
+        // And the refusal names the command, so the usage line it carries
+        // is the right one.
+        let err = parse_command_in("/jobs cancel 00ab", &state).expect_err("ambiguous");
+        assert!(err.help().contains("/jobs"), "{}", err.help());
+        assert_eq!(err.to_string(), "ambiguous identifier: matches 2 in this session");
     }
 
     #[test]

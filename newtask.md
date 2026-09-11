@@ -7703,6 +7703,51 @@ the argument for that style: neither defect is visible from the reducer.
 and the panel goes back to claiming a filtered view. The test also asserts a bare `/diff` carries no such
 notice, so the message belongs to the flag rather than to the panel.
 
+**Short ids: the commands accept what the panels show, done 2026-09-11.**
+
+`/jobs cancel <id>`, `/jobs show|logs <id>` and `/agents show <id>` demanded a 36-character UUID that
+nothing displayed — the jobs panel paints a job's *command* so a reader can tell which is the test run,
+and the transcript calls it `job-1`. A command answerable only by an input the product never shows is
+not much better than a broken one; the bare-`/jobs logs` default from 2026-09-10 worked around it for one
+case.
+
+**Not git-style prefixes, and the reason is worth keeping.** `JobId`/`AgentId` are UUIDv7 — time-ordered
+— so two ids minted seconds apart share their first ten hex characters and a prefix would rarely
+disambiguate anything. What the agents panel has always shown is the *last dash-group*, the random tail
+(`panels::agents::short_id`), which is the part that actually distinguishes ids from one session. So the
+rule is: **a panel must never show an identifier the commands refuse**, and what the commands now accept
+is exactly what is shown — a full UUID (always), the `job-N` handle, or a suffix of the id of at least
+`MIN_SHORT_ID_CHARS` (4). One match resolves; several is `CommandError::AmbiguousId { matched }` with the
+count, never the first one picked (the command asking can be `cancel`); none is the old `InvalidId`.
+
+**Shape.** `IdResolver` (`resolve_job`/`resolve_agent`) with `AppState` as the production implementation
+and `NoResolver` for a parse with no session behind it; `parse_command_in(input, &dyn IdResolver)` is
+what `dispatch_slash` calls, and `parse_command` delegates with `NoResolver`, so the ~15 other callers
+(tests, `command_help`, `session_actions`) are untouched and behave exactly as before. The resolver is
+threaded through the six `parse_*` functions that take typed ids and a private `ShortId` trait picks the
+resolver method per id type — `KnowledgeId` and `SessionId` resolve nothing, since no panel shows them
+short.
+
+**The handle was another dropped ledger fact.** `job.started` has carried `handle` since the producer
+existed — its comment says it is there "so a reader can correlate the panel row with what the transcript
+said" — and `upsert_job` read `command` from the same payload and dropped `handle` beside it. It is kept
+now, and the panel's row is `job-3  cargo test [running]`; without a handle (an older ledger) the row
+shows the id's tail, which resolves too.
+
+**Revert cycles 126-130.** 126 drops the handle again; 127 makes the resolver match nothing; **128 makes
+ambiguity pick the first match** — the one that matters, since it turns `/jobs cancel 00ab` into a
+cancellation of whichever job sorted first; 129 removes the minimum length so `/jobs cancel ab` resolves;
+130 has the panel stop showing the handle, caught by the end-to-end test's "the panel must show the name
+the command accepts" assertion. All failed as predicted.
+
+**One environmental note, distinguished deliberately from the 2026-09-10 watcher case.** During this
+work another session was running a full `cargo test --workspace` in `~/projects/modbit` (load average
+6.6), and `exec_tools::shell_exec_runs_argv_inside_the_root_with_bounded_output` — a two-line shell
+script with a **10-second** budget — timed out, then passed alone in 0.67s. That is not a narrow test
+window; a 10s budget for `echo` is generous, and the test was left alone. The watcher test had a 30ms
+window and was fixed. The rule stays "re-run in isolation, then decide whether the *test* is at fault",
+and the answer differs by case.
+
 ## Session boundary, 2026-09-10 — durable state for the next session
 
 Twenty-seven commits across two days, `dbeb2c2`..`4b28b59`, all pushed to `origin/main`. Baseline before
@@ -7751,10 +7796,9 @@ actually failed them.
    **The family is closed**: every slash command that parses an operand now either uses it or says why
    it cannot. `focus_inspector` is the one place that applies a named selection, and its arms are the
    inventory.
-2. **Typed-id prefixes.** `/jobs show <id>`, `/jobs cancel <id>` and every other id-taking command
-   require a full UUID that nothing prints — the panels deliberately show a job's *command* instead. A
-   bare `/jobs logs` works around this for one case; the general fix is prefix matching in
-   `optional_id`/`require_id`, which would serve jobs, agents and knowledge at once.
+2. ~~**Typed-id prefixes.**~~ **Done 2026-09-11** (entry above) — as suffix/handle matching, not
+   prefixes, for a UUIDv7 reason recorded there. `/resume <session>` and `/knowledge show <id>` still
+   take full UUIDs only, because no panel shows those short; `rapid resume`'s hints print full ids.
 3. **The unwired panel view models.** `crates/tui/src/panels/` is ~10.7k lines, of which the compositor
    uses two (`agents`, `goals`). See this session's entry for the two traps: `trace_jobs`'s log path
    needs an `ArtifactRef` producer that does not exist anywhere in the workspace, and wiring it as-is

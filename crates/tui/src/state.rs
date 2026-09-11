@@ -408,6 +408,14 @@ pub struct JobProjection {
     /// display string, so it can neither exceed the display bound nor
     /// survive a secret-classified event.
     command: Option<String>,
+    /// The `job-N` handle the model was given and the transcript uses.
+    ///
+    /// `job.started` has carried this since the producer existed — its own
+    /// comment says it is there "so a reader can correlate the panel row
+    /// with what the transcript said" — and the projection dropped it, so
+    /// the correlation never reached a reader. It is also the name a user
+    /// can actually type: `/jobs cancel job-3` resolves through it.
+    handle: Option<String>,
 }
 
 /// One file this session changed, as the `/diff` panel shows it.
@@ -1004,6 +1012,7 @@ fn upsert_job(
                 state: lifecycle,
                 exit_status: None,
                 command: None,
+                handle: None,
             },
         )?;
     }
@@ -1020,10 +1029,13 @@ fn upsert_job(
     if let Some(status) = optional_i32(payload, "exit_status")? {
         job.exit_status = Some(status);
     }
-    // Only `job.started` carries it; a later event for the same job must not
-    // blank out what the panel is already showing.
+    // Only `job.started` carries these; a later event for the same job must
+    // not blank out what the panel is already showing.
     if let Some(command) = optional_display(event, payload, "command")? {
         job.command = Some(command);
+    }
+    if let Some(handle) = optional_display(event, payload, "handle")? {
+        job.handle = Some(handle);
     }
     Ok(())
 }
@@ -1742,6 +1754,11 @@ impl JobProjection {
 
     pub fn command(&self) -> Option<&str> {
         self.command.as_deref()
+    }
+
+    /// The `job-N` handle, when the producer recorded one.
+    pub fn handle(&self) -> Option<&str> {
+        self.handle.as_deref()
     }
 }
 

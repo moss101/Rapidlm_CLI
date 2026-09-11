@@ -36,7 +36,7 @@ use tui::state::{
 use tui::{
     AppState, CommandError, FrontendAction, FrontendKind, Inspector, KernelAction, KernelApi,
     LocalAction, PermissionsIntent,
-    RecordingBackend, TerminalError, TerminalGuard, dispatch, parse_command, reduce,
+    RecordingBackend, TerminalError, TerminalGuard, dispatch, parse_command_in, reduce,
 };
 
 use crate::goal_host::{
@@ -1590,6 +1590,11 @@ fn command_error_text(err: &CommandError) -> String {
         }
         CommandError::TooLong => "command too long".to_owned(),
         CommandError::InvalidArgs { .. } | CommandError::InvalidId { .. } => err.help().to_owned(),
+        // The usage line cannot say which of several the user meant; the
+        // count can, and the panel shows the names to pick from.
+        CommandError::AmbiguousId { field, .. } => {
+            format!("{err} — /{field} lists them; give more of the id")
+        }
         CommandError::Empty | CommandError::NotACommand => String::new(),
     }
 }
@@ -4213,7 +4218,10 @@ impl SessionLoop<'_> {
     /// matters: it once did, silently, for every `CommandError` other than
     /// `Empty`).
     fn dispatch_slash(&mut self, command: &str) -> Result<LoopControl, InteractiveError> {
-        match parse_command(command) {
+        // Parsed against the session so the short ids the panels display
+        // (`job-3`, an id's random tail) resolve to the typed ids the
+        // commands take. A bare `parse_command` accepts full UUIDs only.
+        match parse_command_in(command, self.ui) {
             Ok(parsed) => match dispatch(parsed) {
                 FrontendAction::Quit => Ok(LoopControl::Quit(InteractiveOutcome::Quit)),
                 FrontendAction::Local(LocalAction::Open(inspector)) => {
@@ -11221,6 +11229,99 @@ was already finished"
             !painted.contains("no per-agent attribution"),
             "a bare /diff must not carry the flag's notice:\n{painted}"
         );
+    }
+
+    #[test]
+    fn jobs_cancel_accepts_the_handle_the_panel_shows() {
+        // The id `/jobs cancel <id>` demanded was a 36-character UUID that
+        // nothing displayed: the panel paints a job's *command* so a reader
+        // can tell which is the test run, and the transcript calls it
+        // `job-1`. A command answerable only by an input the product never
+        // shows is not much better than a broken one. The handle has been
+        // in the `job.started` payload since the producer existed — its own
+        // comment says it is there so a reader can correlate the row with
+        // the transcript — and the projection dropped it.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "start a slow one",
+            ScriptedModel::background_job_then_answer(&["/bin/sleep", "30"], "started"),
+        );
+        let job = session.state().jobs().values().next().expect("job").clone();
+        assert_eq!(job.state(), tui::state::JobLifecycle::Started);
+        let handle = job
+            .handle()
+            .expect("the projection must keep the handle the producer recorded")
+            .to_owned();
+        assert!(handle.starts_with("job-"), "the model-facing handle: {handle}");
+
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = session.state().clone();
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(Vec::new());
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight.clone(),
+            backings,
+        );
+
+        // The panel shows the handle, so the handle must be accepted —
+        // through the real parse -> dispatch -> cancel path.
+        let painted = tui::sidebar_lines(
+            tui::state::UiRoute::Jobs,
+            loop_state.ui,
+            70,
+            6,
+            &tui::state::CancellationToken::new(),
+        );
+        assert!(
+            painted[0].contains(&handle),
+            "the panel must show the name the command accepts: {painted:?}"
+        );
+        loop_state
+            .dispatch_slash(&format!("/jobs cancel {handle}"))
+            .expect("dispatch");
+        assert_eq!(
+            *loop_state.interrupt_count, 0,
+            "naming a job must never become a session interrupt"
+        );
+
+        // And the tail the panel would show without a handle resolves too.
+        let full = job.id().to_string();
+        let tail = full.rsplit('-').next().expect("uuid has dash groups");
+        let parsed = tui::parse_command_in(&format!("/jobs show {tail}"), loop_state.ui)
+            .expect("the id's tail must parse");
+        assert_eq!(
+            parsed,
+            tui::UiCommand::JobsShow { id: Some(job.id()) },
+            "the tail must resolve to the same job"
+        );
+
+        // Cancellation actually happened, as the supervisor reports it.
+        session.drain_until("the cancelled job to be reported", |state| {
+            state
+                .jobs()
+                .values()
+                .any(|job| matches!(job.state(), tui::state::JobLifecycle::Cancelled))
+        });
     }
 
     #[test]

@@ -31,8 +31,10 @@ pub mod terminal;
 pub mod transcript;
 
 pub use commands::{
-    CommandError, FrontendAction, HandoffDest, InlineHelp, Inspector, KernelAction, KernelApi,
-    CommandInfo, LocalAction, PermissionsIntent, PaletteEntry, TakeoverSurface, UiCommand, catalog, dispatch, parse_command, suggest,
+    CommandError, CommandInfo, FrontendAction, HandoffDest, IdResolver, InlineHelp, Inspector,
+    KernelAction, KernelApi, LocalAction, MIN_SHORT_ID_CHARS, NoResolver, PaletteEntry,
+    PermissionsIntent, Resolution, TakeoverSurface, UiCommand, catalog, dispatch, parse_command,
+    parse_command_in, suggest,
 };
 pub use composer::{
     ComposerCommand, ComposerError, ComposerEvent, ComposerModel, ComposerView, Motion,
