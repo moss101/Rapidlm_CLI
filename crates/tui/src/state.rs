@@ -420,10 +420,9 @@ pub struct JobProjection {
 
 /// One file this session changed, as the `/diff` panel shows it.
 ///
-/// Line counts rather than added/removed: nothing in this tree computes a
-/// line diff, and rendering `+n/-m` from a net change would claim a
-/// computation that did not happen. `before` is `None` for a file that did
-/// not exist.
+/// Line counts always — they are true for every write — and the unified
+/// hunks of the *latest* write when the producer could compute them.
+/// `before` is `None` for a file that did not exist.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChangedFile {
     pub path: String,
@@ -433,6 +432,15 @@ pub struct ChangedFile {
     /// a different situation from one touched once, and the last write's
     /// counts alone cannot say which happened.
     pub writes: u64,
+    /// Unified hunks of the most recent write, as the producer computed
+    /// them at the write site. `None` when it could not (binary content, a
+    /// change past its bounds) or when a write did not carry any.
+    ///
+    /// The latest write, not a cumulative diff: producing "what changed
+    /// since the session began" would need the original content kept
+    /// somewhere, and the ledger deliberately carries hunk text rather than
+    /// file copies. A file written more than once says so through `writes`.
+    pub hunks: Option<String>,
 }
 
 /// One hard context partition, as the `/context` panel shows it.
@@ -649,6 +657,10 @@ fn apply_kernel(
                 optional_u64(event.payload(), "lines_after")?,
             ) {
                 let before = optional_u64(event.payload(), "lines_before")?;
+                // Bounded and redaction-aware like `path`: this is file
+                // content, and a secret-classified write must not leave its
+                // hunks in the panel.
+                let hunks = optional_display(event, event.payload(), "hunks")?;
                 let entry = state
                     .changed_files
                     .entry(path.clone())
@@ -660,9 +672,14 @@ fn apply_kernel(
                         lines_before: before,
                         lines_after: after,
                         writes: 0,
+                        hunks: None,
                     });
                 entry.lines_after = after;
                 entry.writes = entry.writes.saturating_add(1);
+                // The latest write's hunks replace the previous write's —
+                // and a write that carried none clears them, since the row
+                // would otherwise describe an older state than its counts.
+                entry.hunks = hunks;
             }
         }
         EventKind::ContextCompiled => {

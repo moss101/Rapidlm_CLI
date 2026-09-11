@@ -7780,6 +7780,52 @@ propagates a generic error out of `dispatch_slash`); 133 lets bare `/resume` pic
 where it already is. The fork-message test pinned the string `rapid resume`; it now pins the property
 ("the way back must be given") via `/resume`.
 
+**`/diff` shows real hunks, done 2026-09-11.**
+
+The panel showed line counts because nothing in the tree computed a line diff and `+n/-m` from a net
+change would have claimed a computation that did not happen. The computation happens now.
+
+**In-tree, not a dependency — and why that is an ordinary choice, not a fork.** No diff crate exists
+anywhere in `Cargo.lock`, and the `workspace` crate's patch model is *semantic* (byte-range
+`ReplaceRange`/`CreateFile`/… ops the binary does not use), so the designed pipeline produces no line
+hunks either. The precedent that settles it: P4-032 chose the OS `security` CLI over adding a crypto
+crate ("no keychain/crypto dependency"), and the scheduler hand-rolls Kahn's algorithm. So
+`apps/rapid/src/line_diff.rs` is a classic Myers O(ND) forward search with a recorded trace — exact, ~200
+lines — bounded twice: `MAX_DIFF_LINES` (2000/side) and `MAX_DIFF_EDITS` (1000), past which it reports
+`TooLarge` and the panel falls back to counts. Output is unified text with three lines of context, capped
+at `MAX_UNIFIED_BYTES` (8 KB) and cut at a line boundary with a marker.
+
+**Where the "before" comes from.** The write site (`write_workspace_file`) already reads the old bytes for
+the line count, so both sides are in memory there; the hunks are computed at that moment and the ledger
+event carries the bounded text — never a second copy of the file. Binary on either side, `Identical`, or
+`TooLarge` all yield no hunks and the counts stand alone. `ChangedFile.hunks` holds the *latest* write's
+hunks (a cumulative "since the session began" diff would need the original content kept somewhere), and a
+rewritten file's row says `(N writes, latest shown)`.
+
+**Two bounds pinned, not assumed.** `MAX_UNIFIED_BYTES` + marker ≤ `MAX_DISPLAY_TEXT_BYTES`, because a
+payload string over the reducer's display bound is a protocol error that *freezes the session* — the same
+pin `MAX_RESULT_DETAIL_BYTES` has. And the reducer reads `hunks` through `optional_display`, so a
+secret-classified write leaves no hunks in the panel.
+
+**Hunk lines are file content** — the most direct route for an escape sequence to the terminal — and
+render through `sanitize_untrusted` like everything else (cycle 137 confirms the raw escape reaches the
+panel without it).
+
+**Self-review found a panic, and the first test for it was wrong.** `truncate` sliced the `String` at the
+byte cap; on a source file with a non-ASCII comment the cap can land inside a character, and that panics —
+in the write path. Fixed by backing off to a char boundary. The first regression test ran the whole differ
+over multibyte text and **passed with the naive slice restored (revert cycle 138)**: its cap happened to
+fall on a boundary. The test that carries the cycle now builds a string where byte 8192 is provably inside
+`日` and calls `truncate` directly; broken, it fails with "byte index 8192 is not a char boundary".
+
+**Revert cycles 134-138.** 134: the write site passes no hunks. 135: the reducer drops them. 136: the
+panel does not render them. 137: no sanitization. 138: the naive slice, as above.
+
+**Left for later, deliberately.** A cumulative diff per file (needs the original content, or the
+`workspace` journal wired), and per-agent attribution (`ChangedFile` still has no agent; `/diff --agent`
+still says so). The `panels::diff` view model remains unwired — it consumes `MergePreview`/`PatchSummary`
+from the semantic pipeline, a different shape from these hunks.
+
 ## Session boundary, 2026-09-10 — durable state for the next session
 
 Thirty-one commits across three days, `dbeb2c2`..`085aafc`, all pushed to `origin/main`. Baseline before
@@ -7820,7 +7866,7 @@ today: a test that hardcoded a derived answer (`/memory` is `None`) went stale t
 fact changed — which is the design working — and a draft that added a `LocalUiEvent` beside a kernel
 event for the same value was caught and removed before it shipped.
 
-**Verification.** Revert cycles 72-133 across the three days. The pattern that keeps earning its keep: a
+**Verification.** Revert cycles 72-138 across the three days. The pattern that keeps earning its keep: a
 cycle that *passes* means the test is wrong, not the code. Five did on 2026-09-09; two more did today —
 a fixture too small for the bound it was meant to prove (one line against a 200-line cap), and a state
 read taken before the supervisor thread could notice a kill. Both were rewritten until the broken code
@@ -7851,10 +7897,10 @@ actually failed them.
    session-wide and takes no id, and there is no running-agent registry — subagents run *inside* the
    parent turn, and `host_runtime`/`agent-pool` is not used by the binary at all. Background agents are
    a feature, not wiring.
-5. **Real diff hunks.** `/diff` shows files and line counts; hunks need a diff implementation (no LCS in
-   tree, no diff dependency) and the `workspace` crate's journal/transaction machinery is still unwired.
-   `/graph`, `/computer` and `/resources` are backed by subsystems the binary does not run, so each
-   needs its feature before its panel.
+5. ~~**Real diff hunks.**~~ **Done 2026-09-11** (entry above), in-tree Myers, latest write per file. What
+   remains here is a cumulative per-file diff and per-agent attribution, both needing state the write
+   path does not keep. `/graph`, `/computer` and `/resources` are backed by subsystems the binary does
+   not run, so each needs its feature before its panel.
 6. **Integration breadth**: daemon/ACP/SDK server, the MCP catalog subsystem and remote transports,
    knowledge/playbooks, distribution and installability. All are honestly absent today (roadmap in
    `docs/reference/cli-command-reference.md`, absent from `SUBCOMMANDS`), so none of them lies — they

@@ -274,14 +274,15 @@ pub(crate) trait JobEvents: Send + Sync {
 /// altering how it changes it — an observer on the write path, not a second
 /// write path.
 ///
-/// Line counts, not a diff: there is no LCS implementation in this tree and
-/// inventing one to render `+n/-m` would be claiming a computation that did
-/// not happen. Before/after counts are true and answer the question a
-/// reader has ("what did it touch, and did it grow").
+/// Line counts always, and unified hunks when a diff is possible: both
+/// sides are text and within `line_diff`'s bounds. The counts stay because
+/// they are true for every write — a binary file, a rewrite too large to
+/// diff — where the hunks are `None`, and the panel then says what it can.
 pub(crate) trait WorkspaceChanges: Send + Sync {
     /// `path` is workspace-relative. `before` is `None` when the file did
-    /// not exist.
-    fn wrote(&self, path: &str, before: Option<u64>, after: u64);
+    /// not exist. `hunks` is unified-diff text bounded by
+    /// `line_diff::MAX_UNIFIED_BYTES`, or `None` when no diff was computed.
+    fn wrote(&self, path: &str, before: Option<u64>, after: u64, hunks: Option<&str>);
 }
 
 /// Registry of background commands started by `shell.exec` with
@@ -1856,10 +1857,29 @@ impl WorkspaceTools {
         relative: &str,
         bytes: &[u8],
     ) -> Result<(), ToolStepError> {
-        let before = std::fs::read(target).ok().map(|old| line_count(&old));
+        let old = std::fs::read(target).ok();
+        let before = old.as_deref().map(line_count);
         atomic_write(target, bytes).map_err(|_| ToolStepError::Failed)?;
         if let Some(changes) = self.changes.as_ref() {
-            changes.wrote(relative, before, line_count(bytes));
+            // Diffed here, where both sides are already in memory, rather
+            // than stored for a later reader: the ledger carries a bounded
+            // hunk text and never a second copy of the file. Binary on
+            // either side, or a change past `line_diff`'s bounds, yields no
+            // hunks and the counts stand on their own.
+            let hunks = match (
+                old.as_deref().map(std::str::from_utf8).unwrap_or(Ok("")),
+                std::str::from_utf8(bytes),
+            ) {
+                (Ok(before_text), Ok(after_text)) => {
+                    match crate::line_diff::unified(before_text, after_text) {
+                        crate::line_diff::DiffOutcome::Unified(text) => Some(text),
+                        crate::line_diff::DiffOutcome::Identical
+                        | crate::line_diff::DiffOutcome::TooLarge => None,
+                    }
+                }
+                _ => None,
+            };
+            changes.wrote(relative, before, line_count(bytes), hunks.as_deref());
         }
         Ok(())
     }

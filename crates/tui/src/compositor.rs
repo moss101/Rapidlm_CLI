@@ -525,16 +525,17 @@ fn context_search_lines(
     lines
 }
 
-/// The `/diff` panel: which files this session changed.
+/// The `/diff` panel: what this session changed, as hunks where it can.
 ///
-/// **Line counts, not a diff.** Nothing in this tree computes a line diff —
-/// there is no LCS implementation and no diff dependency — so rendering
-/// `+n/-m` would claim a computation that did not happen. `140 -> 152 lines`
-/// is true, and answers what a reader opens this panel for: what did the
-/// agent touch, and did it grow or shrink.
+/// Each file gets its row — path, line counts, write count — and then the
+/// unified hunks of its latest write when the producer computed them. The
+/// counts stay on every row because they are true for every write; the
+/// hunks appear only when they are, so a binary file or a rewrite past the
+/// differ's bounds shows counts alone rather than an invented `+n/-m`.
 ///
-/// Paths are workspace-relative and come from tool calls, so they render
-/// through `sanitize_untrusted` like every other untrusted string.
+/// Every line is file content or a path from a tool call, so it renders
+/// through `sanitize_untrusted` like every other untrusted string — a
+/// source file is exactly where an escape sequence can be waiting.
 fn diff_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     // The notice belongs here, not in the transcript: opening this panel
@@ -548,26 +549,32 @@ fn diff_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
         lines.push(format!("--agent {agent}"));
         lines.push("  no per-agent attribution; showing every change".to_owned());
     }
-    let files: Vec<String> = state
-        .changed_files()
-        .values()
-        .map(|file| {
-            let path = sanitize_untrusted(&file.path);
-            let change = match file.lines_before {
-                None => format!("new, {} lines", file.lines_after),
-                Some(before) => format!("{before} -> {} lines", file.lines_after),
-            };
-            if file.writes > 1 {
-                format!("{path}  {change} ({} writes)", file.writes)
-            } else {
-                format!("{path}  {change}")
-            }
-        })
-        .collect();
-    if files.is_empty() {
+    if state.changed_files().is_empty() {
         lines.push("no files changed in this session".to_owned());
-    } else {
-        lines.extend(files);
+    }
+    for file in state.changed_files().values() {
+        let path = sanitize_untrusted(&file.path);
+        let change = match file.lines_before {
+            None => format!("new, {} lines", file.lines_after),
+            Some(before) => format!("{before} -> {} lines", file.lines_after),
+        };
+        if file.writes > 1 {
+            lines.push(format!("{path}  {change} ({} writes, latest shown)", file.writes));
+        } else {
+            lines.push(format!("{path}  {change}"));
+        }
+        if let Some(hunks) = file.hunks.as_deref() {
+            lines.extend(
+                hunks
+                    .lines()
+                    .map(|line| format!("  {}", sanitize_untrusted(line))),
+            );
+        }
+        // Stop folding once nothing more can be painted: a session that
+        // touched many files must not build lines the height will drop.
+        if lines.len() >= usize::from(height) {
+            break;
+        }
     }
     lines.truncate(usize::from(height));
     for line in &mut lines {
@@ -1269,6 +1276,70 @@ pre-approve it with `rapid permissions allow <tool>`";
         assert!(
             marker_row.contains("0000000000a2"),
             "and the row marker moves with it: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn diff_hunks_are_file_content_and_cannot_repaint_the_terminal() {
+        // A hunk line is a line of a source file the agent wrote — the most
+        // direct route for an escape sequence to reach the terminal. And a
+        // write that carried no hunks (binary, or past the differ's bounds)
+        // shows its counts alone rather than an invented diff.
+        use event_ledger::event::EventKind;
+
+        let mut state = reduce(
+            AppState::new(),
+            &UiEvent::Kernel(kernel_event(
+                1,
+                EventKind::SessionCreated,
+                serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
+            )),
+        );
+        state = reduce(
+            state,
+            &UiEvent::Kernel(kernel_event(
+                2,
+                EventKind::WorkspaceMutationDetected,
+                serde_json::json!({
+                    "path": "src/main.rs",
+                    "lines_before": 3,
+                    "lines_after": 3,
+                    "hunks": "@@ -1,3 +1,3 @@\n fn a() {}\n-fn b() {}\n+fn b() { \u{1b}[2J }\n fn c() {}\n",
+                }),
+            )),
+        );
+        state = reduce(
+            state,
+            &UiEvent::Kernel(kernel_event(
+                3,
+                EventKind::WorkspaceMutationDetected,
+                serde_json::json!({
+                    "path": "assets/logo.png",
+                    "lines_before": 40,
+                    "lines_after": 41,
+                }),
+            )),
+        );
+        let painted = sidebar_lines(UiRoute::Diff, &state, 70, 12, &cancel());
+        assert!(
+            !painted.iter().any(|line| line.contains('\u{1b}')),
+            "no escape sequence from a written file may reach the terminal: {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|line| line.contains("+fn b() {")),
+            "and the hunk is still readable: {painted:?}"
+        );
+        let logo = painted
+            .iter()
+            .position(|line| line.contains("assets/logo.png"))
+            .expect("the file without hunks still has its row");
+        assert!(
+            painted[logo].contains("40 -> 41 lines"),
+            "counts alone for a write that carried no hunks: {painted:?}"
+        );
+        assert!(
+            painted.get(logo + 1).is_none_or(|next| !next.starts_with("  @@")),
+            "and no hunk is invented under it: {painted:?}"
         );
     }
 

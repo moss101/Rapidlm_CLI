@@ -5576,7 +5576,7 @@ struct LedgerWorkspaceChanges {
 }
 
 impl crate::exec_tools::WorkspaceChanges for LedgerWorkspaceChanges {
-    fn wrote(&self, path: &str, before: Option<u64>, after: u64) {
+    fn wrote(&self, path: &str, before: Option<u64>, after: u64, hunks: Option<&str>) {
         let _ = self.client.append_turn_progress(
             self.session_id,
             &self.actor,
@@ -5588,6 +5588,11 @@ impl crate::exec_tools::WorkspaceChanges for LedgerWorkspaceChanges {
                 // as "new" rather than as a change from zero lines.
                 "lines_before": before,
                 "lines_after": after,
+                // Absent when no diff was computed. Bounded by the producer
+                // at `line_diff::MAX_UNIFIED_BYTES`, well under the reducer's
+                // display bound — a payload field over that bound is a
+                // protocol error that freezes the session.
+                "hunks": hunks,
             }),
         );
     }
@@ -10503,6 +10508,113 @@ the parent delivers nothing for the session the user is now in"
         // rather than "resuming" the session it is already on.
         loop_state.dispatch_slash("/resume").expect("dispatch");
         assert_eq!(loop_state.session_id, here);
+    }
+
+    #[test]
+    fn the_diff_panel_shows_real_hunks_of_what_the_agent_wrote() {
+        // `/diff` showed line counts because nothing in the tree computed a
+        // line diff and `+n/-m` from a net change would have claimed a
+        // computation that did not happen. The computation happens now, at
+        // the write site where both sides are already in memory, and the
+        // ledger carries the bounded hunk text — never a copy of the file.
+        let env = TempEnv::create();
+        std::fs::write(
+            env.project.join("lib.rs"),
+            "fn one() {}\nfn two() {}\nfn three() {}\nfn four() {}\nfn five() {}\n",
+        )
+        .expect("seed");
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "rename three",
+            ScriptedModel::write_then_answer(
+                "lib.rs",
+                "fn one() {}\nfn two() {}\nfn drei() {}\nfn four() {}\nfn five() {}\n",
+                "renamed",
+            ),
+        );
+        let changed = session.state().changed_files();
+        let file = changed.get("lib.rs").expect("the written file is projected");
+        let hunks = file
+            .hunks
+            .as_deref()
+            .expect("a text-to-text write must carry hunks");
+        assert!(
+            hunks.contains("-fn three() {}") && hunks.contains("+fn drei() {}"),
+            "the hunk must show the line that changed, both sides: {hunks}"
+        );
+        assert!(
+            hunks.contains(" fn two() {}") && hunks.contains(" fn four() {}"),
+            "with context around it: {hunks}"
+        );
+        assert!(
+            !hunks.contains("fn one()") || hunks.matches('\n').count() <= 8,
+            "and only the surrounding context, not the whole file: {hunks}"
+        );
+
+        // Through the real panel, which paints the hunks under the row.
+        let painted = tui::sidebar_lines(
+            tui::state::UiRoute::Diff,
+            session.state(),
+            70,
+            12,
+            &tui::state::CancellationToken::new(),
+        );
+        assert!(
+            painted[0].contains("lib.rs") && painted[0].contains("5 -> 5 lines"),
+            "the row keeps its counts: {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|line| line.contains("-fn three() {}"))
+                && painted.iter().any(|line| line.contains("+fn drei() {}")),
+            "the panel must paint the hunk: {painted:?}"
+        );
+
+        // A second write replaces the hunks with its own and says so.
+        session.run_turn(
+            "add six",
+            ScriptedModel::write_then_answer(
+                "lib.rs",
+                "fn one() {}\nfn two() {}\nfn drei() {}\nfn four() {}\nfn five() {}\nfn six() {}\n",
+                "added",
+            ),
+        );
+        let changed = session.state().changed_files();
+        let file = changed.get("lib.rs").expect("row");
+        let hunks = file.hunks.as_deref().expect("hunks");
+        // `fn drei` is context for this hunk now; the previous write's
+        // *change* to it must not be.
+        assert!(
+            hunks.contains("+fn six() {}")
+                && !hunks.contains("+fn drei")
+                && !hunks.contains("-fn three"),
+            "the latest write's hunks, not the previous write's: {hunks}"
+        );
+        let painted = tui::sidebar_lines(
+            tui::state::UiRoute::Diff,
+            session.state(),
+            70,
+            12,
+            &tui::state::CancellationToken::new(),
+        );
+        assert!(
+            painted[0].contains("2 writes, latest shown"),
+            "a rewritten file says which write is shown: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn hunks_always_fit_the_reducers_display_bound() {
+        // A payload string over `MAX_DISPLAY_TEXT_BYTES` is a protocol
+        // error that freezes the session. The producer's cap is well under
+        // it; pinned rather than assumed, like `MAX_RESULT_DETAIL_BYTES`.
+        let marker_room = 64;
+        assert!(
+            crate::line_diff::MAX_UNIFIED_BYTES + marker_room
+                <= tui::state::MAX_DISPLAY_TEXT_BYTES,
+            "hunk text ({}) plus its truncation marker must fit the display bound ({})",
+            crate::line_diff::MAX_UNIFIED_BYTES,
+            tui::state::MAX_DISPLAY_TEXT_BYTES
+        );
     }
 
     #[test]

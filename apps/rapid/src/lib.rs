@@ -14,6 +14,7 @@ pub mod findings_store;
 pub mod goal_claim;
 pub mod goal_host;
 pub mod headless;
+pub mod line_diff;
 pub mod hooks;
 pub mod host;
 pub mod host_runtime;
