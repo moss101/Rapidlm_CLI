@@ -7782,8 +7782,16 @@ where it already is. The fork-message test pinned the string `rapid resume`; it 
 
 ## Session boundary, 2026-09-10 — durable state for the next session
 
-Twenty-nine commits across three days, `dbeb2c2`..`6b1d928`, all pushed to `origin/main`. Baseline before
+Thirty-one commits across three days, `dbeb2c2`..`085aafc`, all pushed to `origin/main`. Baseline before
 them was `598c6fd`. Each has its own entry above; this is the current state and what is actually left.
+
+**How `085aafc`'s workspace gate was met, exactly.** Two other sessions ran full workspace suites in
+`~/projects/modbit` and `~/projects/zmodbit` throughout, with FSEvents at 80% CPU for days; the run took
+three hours. 78 of 80 binaries passed in it. `exec_tools::shell_exec_scrubs_a_registered_secret` timed
+out at its **60-second** default budget (an `echo`) and passed alone in 0.34s. `rustdoc` for `protocol`'s
+doc-tests wedged at 0% CPU with no child for 20 minutes and was killed so `--no-fail-fast` could finish;
+run alone it reports **zero** doc-tests — it hung on startup with nothing to run. Every binary has passed
+in this tree; not all in one run. Recorded rather than smoothed over.
 
 **2026-09-09** (`dbeb2c2`..`b967d0a`): `rapid resume`; every command resolving the same project as the
 TUI; listing no longer creating what it lists; one event ledger per project (option C, with the WAL
@@ -7812,7 +7820,7 @@ today: a test that hardcoded a derived answer (`/memory` is `None`) went stale t
 fact changed — which is the design working — and a draft that added a `LocalUiEvent` beside a kernel
 event for the same value was caught and removed before it shipped.
 
-**Verification.** Revert cycles 72-130 across the three days. The pattern that keeps earning its keep: a
+**Verification.** Revert cycles 72-133 across the three days. The pattern that keeps earning its keep: a
 cycle that *passes* means the test is wrong, not the code. Five did on 2026-09-09; two more did today —
 a fixture too small for the bound it was meant to prove (one line against a 200-line cap), and a state
 read taken before the supervisor thread could notice a kill. Both were rewritten until the broken code
