@@ -7750,7 +7750,7 @@ and the answer differs by case.
 
 ## Session boundary, 2026-09-10 — durable state for the next session
 
-Twenty-seven commits across two days, `dbeb2c2`..`4b28b59`, all pushed to `origin/main`. Baseline before
+Twenty-nine commits across three days, `dbeb2c2`..`6b1d928`, all pushed to `origin/main`. Baseline before
 them was `598c6fd`. Each has its own entry above; this is the current state and what is actually left.
 
 **2026-09-09** (`dbeb2c2`..`b967d0a`): `rapid resume`; every command resolving the same project as the
@@ -7758,6 +7758,10 @@ TUI; listing no longer creating what it lists; one event ledger per project (opt
 correction self-review caught in already-pushed code); `rapid --help` no longer documenting an invocation
 the parser rejects; `rapid insights` given a test that can fail; `/jobs` and `/approvals` rendering the
 projections they already had.
+
+**2026-09-11** (`6b1d928`): the commands accept the short ids the panels show — `job-3`, an id's
+random tail — with ambiguity refused by count, closing the last usability hole in the jobs/agents
+commands.
 
 **2026-09-10** (`81674b0`..`4b28b59`): background jobs journaled, session-lived, and cancellable; the
 status bar showing model, policy and compiled context instead of dashes; `/models`, `/memory` and
@@ -7776,7 +7780,7 @@ today: a test that hardcoded a derived answer (`/memory` is `None`) went stale t
 fact changed — which is the design working — and a draft that added a `LocalUiEvent` beside a kernel
 event for the same value was caught and removed before it shipped.
 
-**Verification.** Revert cycles 72-125 across the two days. The pattern that keeps earning its keep: a
+**Verification.** Revert cycles 72-130 across the three days. The pattern that keeps earning its keep: a
 cycle that *passes* means the test is wrong, not the code. Five did on 2026-09-09; two more did today —
 a fixture too small for the bound it was meant to prove (one line against a 200-line cap), and a state
 read taken before the supervisor thread could notice a kill. Both were rewritten until the broken code
