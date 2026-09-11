@@ -36,6 +36,15 @@ pub const CONTEXT_LINES: usize = 3;
 /// display bound with room to spare. Cut at a line boundary and marked.
 pub const MAX_UNIFIED_BYTES: usize = 8 * 1024;
 
+// The reducer reads `hunks` through `optional_display`, which errors — and
+// freezes the session — on a payload field over the display bound. The cap
+// plus the truncation marker must fit under it, and a build error is the
+// right place to learn otherwise.
+const _: () = assert!(
+    MAX_UNIFIED_BYTES + 64 <= tui::state::MAX_DISPLAY_TEXT_BYTES,
+    "hunk text plus its truncation marker must fit the reducer's display bound"
+);
+
 const TRUNCATION_MARKER: &str = "... (diff truncated)";
 
 /// What a diff attempt produced.

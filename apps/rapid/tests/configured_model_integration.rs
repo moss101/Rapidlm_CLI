@@ -8,7 +8,7 @@
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -448,7 +448,7 @@ fn exec_request_for(goal: &str) -> agent_runtime::AgentExecutionRequest {
     agent_runtime::AgentExecutionRequest::new(spec, SessionId::new())
 }
 
-fn bypass_tools(workspace: &PathBuf) -> rapid::exec_tools::ExecTools {
+fn bypass_tools(workspace: &Path) -> rapid::exec_tools::ExecTools {
     rapid::exec_tools::ExecTools::workspace_with_permissions(
         workspace,
         rapid::permissions::PermissionLattice::new(
@@ -467,7 +467,7 @@ fn openai_tool_results_reach_the_provider_one_tool_message_per_call() {
     let doc = config_doc(&format!("http://{}/v1", server.addr));
     let store: &'static InMemoryCredentialStore =
         Box::leak(Box::new(InMemoryCredentialStore::new()));
-    let mut model = ConfiguredModel::build(&active_from_doc(&doc), store).expect("build");
+    let model = ConfiguredModel::build(&active_from_doc(&doc), store).expect("build");
     let workspace = tool_workspace("tool-channel-openai");
     let mut tools = bypass_tools(&workspace);
     let preserved =
@@ -525,7 +525,7 @@ fn anthropic_tool_results_reach_the_provider_one_tool_result_per_call() {
     let active = resolve_active(&[("GW_API_KEY".to_owned(), "gw-key".to_owned())], &config)
         .expect("resolve");
     let store = InMemoryCredentialStore::new();
-    let mut model = ConfiguredModel::build(&active, &store).expect("build");
+    let model = ConfiguredModel::build(&active, &store).expect("build");
     let workspace = tool_workspace("tool-channel-anthropic");
     let mut tools = bypass_tools(&workspace);
     let preserved = PreservedLiveContext::new("goal", Vec::new(), "", "", 8192, 256).expect("p");
@@ -724,7 +724,7 @@ fn run_rapid_cron_in(
     project: &PathBuf,
     home: &PathBuf,
     config_path: &PathBuf,
-    db_path: &PathBuf,
+    db_path: &Path,
     args: &[&str],
 ) -> (Option<i32>, String, String) {
     let mut full_args = vec![

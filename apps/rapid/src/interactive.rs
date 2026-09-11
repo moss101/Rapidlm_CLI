@@ -3551,35 +3551,34 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     // surface. Memory index: .rapidlm/MEMORY.md is always loaded (bounded).
     if let (Some(active), Some((root, TrustStatus::Trusted))) =
         (child_model_config.as_ref(), workspace.as_ref())
+        && let Some(turn_budgets) = tools.turn_budget_handles()
     {
-        if let Some(turn_budgets) = tools.turn_budget_handles() {
-            let hooks = tools.hooks_config();
-            let shadow_diagnostics = tools.shadow_diagnostics_config();
-            let trace_calls = tools.trace_calls_enabled();
-            let turn_ceilings = tools.turn_ceilings().unwrap_or((
-                crate::exec_tools::MAX_TOTAL_WRITE_BYTES_PER_TURN,
-                crate::exec_tools::MAX_TOTAL_FETCH_BYTES_PER_TURN,
-            ));
-            let write_locks = tools.write_lock_handle().unwrap_or_default();
-            let job_budget = tools
-                .job_budget_handle()
-                .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
-            tools.set_subagent_runner(std::sync::Arc::new(LiveSubagentRunner {
-                active: active.clone(),
-                root: root.clone(),
-                permissions: permission_lattice.clone(),
-                turn_budgets,
-                write_locks,
-                job_budget,
-                job_events: tools.job_events(),
-                workspace_changes: tools.workspace_changes(),
-                hooks,
-                shadow_diagnostics,
-                trace_calls,
-                turn_ceilings,
-                redaction: tools.redaction_handle(),
-            }));
-        }
+        let hooks = tools.hooks_config();
+        let shadow_diagnostics = tools.shadow_diagnostics_config();
+        let trace_calls = tools.trace_calls_enabled();
+        let turn_ceilings = tools.turn_ceilings().unwrap_or((
+            crate::exec_tools::MAX_TOTAL_WRITE_BYTES_PER_TURN,
+            crate::exec_tools::MAX_TOTAL_FETCH_BYTES_PER_TURN,
+        ));
+        let write_locks = tools.write_lock_handle().unwrap_or_default();
+        let job_budget = tools
+            .job_budget_handle()
+            .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        tools.set_subagent_runner(std::sync::Arc::new(LiveSubagentRunner {
+            active: active.clone(),
+            root: root.clone(),
+            permissions: permission_lattice.clone(),
+            turn_budgets,
+            write_locks,
+            job_budget,
+            job_events: tools.job_events(),
+            workspace_changes: tools.workspace_changes(),
+            hooks,
+            shadow_diagnostics,
+            trace_calls,
+            turn_ceilings,
+            redaction: tools.redaction_handle(),
+        }));
     }
     let diag = parsed.verbose.then(|| StepDiag::stderr(&base_url));
     // `--json-schema`: wrap the tool driver with the synthetic-tool
@@ -3706,8 +3705,8 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                 decision.requested_model, decision.resolved_model
             ),
         }
-        if let Some(io) = jsonl_io.as_mut() {
-            if let Ok(record) = crate::headless::jsonl::JsonlRecord::router_decision(
+        if let Some(io) = jsonl_io.as_mut()
+            && let Ok(record) = crate::headless::jsonl::JsonlRecord::router_decision(
                 session_id,
                 next_jsonl_seq,
                 crate::headless::jsonl::now_rfc3339(),
@@ -3716,10 +3715,10 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
                 reason_tag,
                 decision.spent_usd_micros,
                 decision.policy_version.as_deref(),
-            ) {
-                let _ = io.records().write(&record);
-                next_jsonl_seq += 1;
-            }
+            )
+        {
+            let _ = io.records().write(&record);
+            next_jsonl_seq += 1;
         }
     }
     // `text` is the same content the plain-text path would have printed;
@@ -10884,20 +10883,6 @@ the parent delivers nothing for the session the user is now in"
     }
 
     #[test]
-    fn hunks_always_fit_the_reducers_display_bound() {
-        // A payload string over `MAX_DISPLAY_TEXT_BYTES` is a protocol
-        // error that freezes the session. The producer's cap is well under
-        // it; pinned rather than assumed, like `MAX_RESULT_DETAIL_BYTES`.
-        let marker_room = 64;
-        assert!(
-            crate::line_diff::MAX_UNIFIED_BYTES + marker_room <= tui::state::MAX_DISPLAY_TEXT_BYTES,
-            "hunk text ({}) plus its truncation marker must fit the display bound ({})",
-            crate::line_diff::MAX_UNIFIED_BYTES,
-            tui::state::MAX_DISPLAY_TEXT_BYTES
-        );
-    }
-
-    #[test]
     fn a_turn_s_workspace_writes_reach_the_diff_panel() {
         // `/diff` opened an empty panel for the most basic question a coding
         // CLI answers: what did the agent change? `apps/rapid` writes through
@@ -13180,23 +13165,6 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         fn drop(&mut self) {
             close_stream(&mut self.stream);
         }
-    }
-
-    #[test]
-    fn a_denial_detail_can_never_be_too_long_for_the_transcript_to_accept() {
-        // The transcript fold reads the reason through `optional_display`,
-        // which *errors* on a field over `MAX_DISPLAY_TEXT_BYTES` — the same
-        // treatment `tool` gets. That is only safe because every denial
-        // detail this binary produces went through `bounded_detail` first.
-        // If that cap were ever raised past the display bound, a long
-        // refusal would stop being rendered and start failing the fold, i.e.
-        // breaking the session. Pinned rather than assumed.
-        assert!(
-            crate::exec_tools::MAX_RESULT_DETAIL_BYTES <= tui::state::MAX_DISPLAY_TEXT_BYTES,
-            "a bounded tool detail ({}) must always fit the transcript's display bound ({})",
-            crate::exec_tools::MAX_RESULT_DETAIL_BYTES,
-            tui::state::MAX_DISPLAY_TEXT_BYTES
-        );
     }
 
     #[test]

@@ -1478,6 +1478,9 @@ impl PluginInstance {
         Ok(stack.split_off(stack.len() - arity))
     }
 
+    // One interpreter frame's worth of state, threaded explicitly so the
+    // recursion depth and fuel are visible at every call site.
+    #[allow(clippy::too_many_arguments)]
     fn call_inner(
         &mut self,
         func_idx: u32,

@@ -11,7 +11,7 @@
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -33,14 +33,14 @@ fn spawn_scripted_server(responses: Vec<String>) -> ScriptedServer {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let captured = requests.clone();
     thread::spawn(move || {
-        for (index, body) in responses.into_iter().enumerate() {
+        for body in responses {
             let (mut stream, _) = match listener.accept() {
                 Ok(accepted) => accepted,
                 Err(_) => return,
             };
             let raw = read_request(&mut stream);
             captured.lock().expect("capture lock").push(raw);
-            let reason = if index % 2 == 0 { "OK" } else { "OK" };
+            let reason = "OK";
             let response = format!(
                 "HTTP/1.1 200 {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -193,7 +193,6 @@ struct BenchRun {
     code: Option<i32>,
     stdout: String,
     stderr: String,
-    requests: Vec<String>,
     wall: Duration,
 }
 
@@ -221,7 +220,6 @@ fn run_bench(
         code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        requests: Vec::new(),
         wall,
     };
     println!(

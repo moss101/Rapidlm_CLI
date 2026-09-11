@@ -1904,7 +1904,7 @@ mod tests {
 
     #[test]
     fn tools_list_before_initialize_is_not_initialized() {
-        let mut transport = LoopbackTransport::new(TransportKind::Stdio, IoBounds::standard());
+        let transport = LoopbackTransport::new(TransportKind::Stdio, IoBounds::standard());
         let mut session = McpSession::new(
             transport,
             ImplementationInfo::rapidlm(),

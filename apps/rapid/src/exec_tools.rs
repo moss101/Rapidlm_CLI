@@ -174,6 +174,16 @@ pub const MAX_SHELL_TIMEOUT: Duration = Duration::from_secs(600);
 pub const MAX_SHELL_OUTPUT_BYTES: usize = 16 * 1024;
 /// Hard byte cap on model-visible per-call denial/failure detail text.
 pub const MAX_RESULT_DETAIL_BYTES: usize = 256;
+
+// The transcript fold reads a tool's detail through `optional_display`, which
+// *errors* on a field over the display bound — and that error freezes the
+// session. It is only safe because every detail this binary produces went
+// through `bounded_detail` first. Pinned at compile time rather than assumed:
+// raising the cap past the bound is a build error, not a frozen session.
+const _: () = assert!(
+    MAX_RESULT_DETAIL_BYTES <= tui::state::MAX_DISPLAY_TEXT_BYTES,
+    "a bounded tool detail must always fit the transcript's display bound"
+);
 /// Marker appended when output was cut by a byte cap.
 pub const TRUNCATION_MARKER: &str = "\n[truncated]";
 /// Directories `repo_search` never descends into.
@@ -240,6 +250,11 @@ impl JobState {
         }
     }
 }
+
+/// How `ask_user` reaches a human: given the rendered prompt and the options,
+/// returns the chosen option. The composition root supplies one that reads
+/// stdin and enforces the timeout; tests supply scripted answers.
+pub type AskSource = Arc<dyn Fn(&str, &[String], Duration) -> Result<String, String> + Send + Sync>;
 
 /// Where a background job's lifecycle is reported, beyond the model-facing
 /// `job_status`/`job_output` tools.
@@ -597,11 +612,11 @@ impl JobRegistry {
                         break;
                     }
                     if worker.cancelled.load(Ordering::SeqCst) {
-                        if let Ok(mut slot) = worker.child.lock() {
-                            if let Some(child) = slot.as_mut() {
-                                let _ = child.kill();
-                                let _ = child.wait();
-                            }
+                        if let Ok(mut slot) = worker.child.lock()
+                            && let Some(child) = slot.as_mut()
+                        {
+                            let _ = child.kill();
+                            let _ = child.wait();
                         }
                         if let Ok(mut state) = worker.state.lock() {
                             *state = JobState::Failed("cancelled at shutdown".to_owned());
@@ -612,11 +627,11 @@ impl JobRegistry {
                         break;
                     }
                     if started.elapsed() > timeout {
-                        if let Ok(mut slot) = worker.child.lock() {
-                            if let Some(child) = slot.as_mut() {
-                                let _ = child.kill();
-                                let _ = child.wait();
-                            }
+                        if let Ok(mut slot) = worker.child.lock()
+                            && let Some(child) = slot.as_mut()
+                        {
+                            let _ = child.kill();
+                            let _ = child.wait();
                         }
                         if let Ok(mut state) = worker.state.lock() {
                             *state = JobState::Failed("timed out".to_owned());
@@ -818,8 +833,7 @@ impl JobRegistry {
     fn snapshot(&self, id: &str) -> Option<String> {
         let jobs = self.table.jobs.lock().ok()?;
         jobs.get(id)
-            .map(|job| job.state.lock().ok().map(|state| state.as_text()))
-            .flatten()
+            .and_then(|job| job.state.lock().ok().map(|state| state.as_text()))
     }
 
     /// Bounded slice of spooled output starting at `offset`; returns the
@@ -1077,8 +1091,7 @@ pub struct WorkspaceTools {
     fetch_allowlist: Vec<String>,
     hooks: crate::hooks::HooksConfig,
     shadow_diagnostics: Option<crate::shadow_diagnostics::ShadowDiagnosticsConfig>,
-    ask_stdin:
-        Option<Arc<dyn Fn(&str, &[String], Duration) -> Result<String, String> + Send + Sync>>,
+    ask_stdin: Option<AskSource>,
     mcp: Arc<Mutex<Vec<McpConnection>>>,
     mcp_surface: Arc<Mutex<Vec<(String, String, mcp::transport::McpToolDescriptor)>>>,
     /// Resource ceiling (Modbit `WRK-017`'s concurrency axis) bounding the
@@ -1352,12 +1365,7 @@ impl WorkspaceTools {
     /// Attach the interactive answer source for ask_user. The closure
     /// receives the rendered prompt and the options; it returns the chosen
     /// option (composition root reads stdin and enforces the timeout).
-    pub fn set_ask_source(
-        &mut self,
-        source: std::sync::Arc<
-            dyn Fn(&str, &[String], Duration) -> Result<String, String> + Send + Sync,
-        >,
-    ) {
+    pub fn set_ask_source(&mut self, source: AskSource) {
         self.ask_stdin = Some(source);
     }
 
@@ -1837,22 +1845,22 @@ impl WorkspaceTools {
         }?;
         // Post-tool-use hooks observe the completed call; their output is
         // recorded on the result the model sees.
-        if !self.hooks.post_tool_use.is_empty() {
-            if let ToolStepResult::Succeeded { call_id, summary } = &result {
-                let recorded = crate::hooks::run_post_tool_hooks(
-                    &self.hooks.post_tool_use,
-                    call.tool(),
-                    summary,
-                    crate::hooks::HOOK_TIMEOUT,
-                );
-                if !recorded.is_empty() {
-                    return Ok(ToolStepResult::Succeeded {
-                        call_id: call_id.clone(),
-                        summary: self.redact_output(bounded_detail(&format!(
-                            "{summary}\n[post_tool_use: {recorded}]"
-                        ))),
-                    });
-                }
+        if !self.hooks.post_tool_use.is_empty()
+            && let ToolStepResult::Succeeded { call_id, summary } = &result
+        {
+            let recorded = crate::hooks::run_post_tool_hooks(
+                &self.hooks.post_tool_use,
+                call.tool(),
+                summary,
+                crate::hooks::HOOK_TIMEOUT,
+            );
+            if !recorded.is_empty() {
+                return Ok(ToolStepResult::Succeeded {
+                    call_id: call_id.clone(),
+                    summary: self.redact_output(bounded_detail(&format!(
+                        "{summary}\n[post_tool_use: {recorded}]"
+                    ))),
+                });
             }
         }
         Ok(result)
@@ -5347,6 +5355,10 @@ fn parse_repo_search_args(raw: &str) -> Result<RepoSearchArgs, ToolStepError> {
 
 /// Tool surface for one exec run: the workspace driver when the project is
 /// trusted, otherwise the fail-closed no-op surface that refuses every call.
+// One `ExecTools` exists per turn and is never held in bulk, so the size
+// difference between a stateless `Noop` and a `WorkspaceTools` carrying its
+// registries costs nothing worth boxing every access for.
+#[allow(clippy::large_enum_variant)]
 pub enum ExecTools {
     Noop(NoopTools),
     Workspace(WorkspaceTools),
@@ -5808,7 +5820,6 @@ impl ToolDriver for ExecTools {
         };
         let notices = tools.jobs.drain_notifications();
         notices
-            .into_iter()
             .into_iter()
             .map(|summary| {
                 let job_id = summary.split(':').next().unwrap_or("job").trim().to_owned();
@@ -6302,7 +6313,7 @@ mod tests {
         let call = ProposedToolCall::new(
             "c1",
             WORKSPACE_WRITE_TOOL,
-            &serde_json::to_string(
+            serde_json::to_string(
                 &serde_json::json!({"path": "a.txt", "content": "x".repeat(2000)}),
             )
             .expect("encode call"),
@@ -6440,7 +6451,7 @@ mod tests {
         let over = ProposedToolCall::new(
             "c2",
             WORKSPACE_WRITE_TOOL,
-            &serde_json::to_string(&serde_json::json!({
+            serde_json::to_string(&serde_json::json!({
                 "path": "b.txt",
                 "content": "x".repeat(1024),
             }))
@@ -6652,7 +6663,7 @@ mod tests {
         let over = ProposedToolCall::new(
             "c1",
             WORKSPACE_WRITE_TOOL,
-            &serde_json::to_string(
+            serde_json::to_string(
                 &serde_json::json!({"path": "b.txt", "content": "x".repeat(1024)}),
             )
             .expect("encode call"),
@@ -6677,7 +6688,7 @@ mod tests {
         let clean = ProposedToolCall::new(
             "c2",
             WORKSPACE_WRITE_TOOL,
-            &serde_json::to_string(
+            serde_json::to_string(
                 &serde_json::json!({"path": "c.txt", "content": "x".repeat(1024)}),
             )
             .expect("encode call"),
@@ -6799,7 +6810,7 @@ mod tests {
         let call = ProposedToolCall::new(
             "c1",
             WORKSPACE_WRITE_TOOL,
-            &serde_json::to_string(&serde_json::json!({"path": "config.rs", "content": content}))
+            serde_json::to_string(&serde_json::json!({"path": "config.rs", "content": content}))
                 .expect("encode call"),
         )
         .expect("call");
@@ -6841,7 +6852,7 @@ mod tests {
         let call = ProposedToolCall::new(
             "c1",
             WORKSPACE_WRITE_TOOL,
-            &serde_json::to_string(&serde_json::json!({"path": "config.rs", "content": &content}))
+            serde_json::to_string(&serde_json::json!({"path": "config.rs", "content": &content}))
                 .expect("encode call"),
         )
         .expect("call");
@@ -6870,7 +6881,7 @@ mod tests {
         let call2 = ProposedToolCall::new(
             "c2",
             WORKSPACE_WRITE_TOOL,
-            &serde_json::to_string(&serde_json::json!({"path": "config.rs", "content": &content}))
+            serde_json::to_string(&serde_json::json!({"path": "config.rs", "content": &content}))
                 .expect("encode call"),
         )
         .expect("call");
@@ -6892,7 +6903,7 @@ mod tests {
         let call = ProposedToolCall::new(
             "c1",
             WORKSPACE_WRITE_TOOL,
-            &serde_json::to_string(&serde_json::json!({
+            serde_json::to_string(&serde_json::json!({
                 "path": ".github/workflows/release.yml",
                 "content": content
             }))
@@ -6943,7 +6954,7 @@ mod tests {
         let call = ProposedToolCall::new(
             "c1",
             WORKSPACE_WRITE_TOOL,
-            &serde_json::to_string(&serde_json::json!({
+            serde_json::to_string(&serde_json::json!({
                 "path": ".rapidlm/MEMORY.md",
                 "content": &content
             }))
@@ -6972,7 +6983,7 @@ mod tests {
         let ordinary = ProposedToolCall::new(
             "c2",
             WORKSPACE_WRITE_TOOL,
-            &serde_json::to_string(&serde_json::json!({"path": "notes.md", "content": &content}))
+            serde_json::to_string(&serde_json::json!({"path": "notes.md", "content": &content}))
                 .expect("encode call"),
         )
         .expect("call");
@@ -6992,7 +7003,7 @@ mod tests {
         let retry = ProposedToolCall::new(
             "c3",
             WORKSPACE_WRITE_TOOL,
-            &serde_json::to_string(&serde_json::json!({
+            serde_json::to_string(&serde_json::json!({
                 "path": ".rapidlm/MEMORY.md",
                 "content": &content
             }))
@@ -7022,7 +7033,7 @@ mod tests {
         let seed = ProposedToolCall::new(
             "c1",
             WORKSPACE_WRITE_TOOL,
-            &serde_json::to_string(&serde_json::json!({
+            serde_json::to_string(&serde_json::json!({
                 "path": ".rapidlm/MEMORY.md",
                 "content": "- placeholder\n"
             }))
@@ -7039,7 +7050,7 @@ mod tests {
         let patch = ProposedToolCall::new(
             "c2",
             WORKSPACE_PATCH_TOOL,
-            &serde_json::to_string(&serde_json::json!({
+            serde_json::to_string(&serde_json::json!({
                 "path": ".rapidlm/MEMORY.md",
                 "old": "placeholder",
                 "new": format!("API token: {token}")
@@ -8165,7 +8176,7 @@ mod tests {
         let call = ProposedToolCall::new(
             "c1",
             WORKSPACE_WRITE_TOOL,
-            &serde_json::to_string(&serde_json::json!({"path": "good.txt", "content": &content}))
+            serde_json::to_string(&serde_json::json!({"path": "good.txt", "content": &content}))
                 .expect("encode call"),
         )
         .expect("call");
@@ -8857,7 +8868,7 @@ mod tests {
         // trailing whitespace on the second line — same tokens, different
         // whitespace, so the exact substring match must fail first.
         fs::write(
-            &root.0.join("code.rs"),
+            root.0.join("code.rs"),
             "fn f() {\n    let x = 1;\n    let y = 2;\n}\n",
         )
         .expect("seed");
@@ -8895,7 +8906,7 @@ mod tests {
     fn workspace_patch_reports_ambiguity_for_multiple_whitespace_insensitive_matches() {
         let root = TempRoot::new("patch-loose-ambiguous");
         fs::write(
-            &root.0.join("code.rs"),
+            root.0.join("code.rs"),
             "fn a() {\n    let x = 1;\n}\nfn b() {\n\tlet x = 1;\n}\n",
         )
         .expect("seed");
@@ -8942,7 +8953,7 @@ mod tests {
     fn workspace_patch_reports_the_closest_line_when_nothing_matches_even_loosely() {
         let root = TempRoot::new("patch-hint");
         fs::write(
-            &root.0.join("code.rs"),
+            root.0.join("code.rs"),
             "fn greet(name: &str) {\n    println!(\"hi\");\n}\n",
         )
         .expect("seed");
@@ -10608,11 +10619,10 @@ mod tests {
                 );
                 let validated = tools.validate(&status_call, &cancel).expect("validate");
                 tools.execute(&validated, &cancel).expect("execute")
-            } {
-                if summary.contains("completed exit 0") {
-                    completed = true;
-                    break;
-                }
+            } && summary.contains("completed exit 0")
+            {
+                completed = true;
+                break;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -10683,11 +10693,11 @@ mod tests {
         }
         let mut pid = None;
         for _ in 0..100 {
-            if let Ok(contents) = fs::read_to_string(&pid_path) {
-                if let Ok(parsed) = contents.trim().parse::<i32>() {
-                    pid = Some(parsed);
-                    break;
-                }
+            if let Ok(contents) = fs::read_to_string(&pid_path)
+                && let Ok(parsed) = contents.trim().parse::<i32>()
+            {
+                pid = Some(parsed);
+                break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -10749,11 +10759,10 @@ mod tests {
             let validated = tools.validate(&status_call, &cancel).expect("validate");
             if let ToolStepResult::Succeeded { summary, .. } =
                 tools.execute(&validated, &cancel).expect("execute")
+                && !summary.contains("running")
             {
-                if !summary.contains("running") {
-                    final_state = Some(summary);
-                    break;
-                }
+                final_state = Some(summary);
+                break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -10860,11 +10869,10 @@ mod tests {
             let validated = tools.validate(&status_call, &cancel).expect("validate");
             if let ToolStepResult::Succeeded { summary, .. } =
                 tools.execute(&validated, &cancel).expect("execute")
+                && summary.contains("completed exit 0")
             {
-                if summary.contains("completed exit 0") {
-                    completed = true;
-                    break;
-                }
+                completed = true;
+                break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -12169,11 +12177,11 @@ time.sleep(30)
 
         let mut pid = None;
         for _ in 0..100 {
-            if let Ok(contents) = fs::read_to_string(&pid_path) {
-                if let Ok(parsed) = contents.trim().parse::<i32>() {
-                    pid = Some(parsed);
-                    break;
-                }
+            if let Ok(contents) = fs::read_to_string(&pid_path)
+                && let Ok(parsed) = contents.trim().parse::<i32>()
+            {
+                pid = Some(parsed);
+                break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -12412,10 +12420,7 @@ for line in sys.stdin:
         // the driver so the test controls replay timing.
         let mut notices = Vec::new();
         for _ in 0..50 {
-            notices = {
-                let notices = tools.jobs.drain_notifications();
-                notices
-            };
+            notices = tools.jobs.drain_notifications();
             if !notices.is_empty() {
                 break;
             }
@@ -12613,7 +12618,8 @@ for line in sys.stdin:
         }
 
         // Interactive: a source returns the selected option.
-        let seen: Arc<StdMutex<Vec<(String, Vec<String>)>>> = Arc::default();
+        type Seen = Arc<StdMutex<Vec<(String, Vec<String>)>>>;
+        let seen: Seen = Arc::default();
         let source_seen = Arc::clone(&seen);
         tools.set_ask_source(Arc::new(
             move |_prompt: &str, options: &[String], _budget| {

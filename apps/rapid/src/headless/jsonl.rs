@@ -208,6 +208,9 @@ impl JsonlRecord {
     /// reported a real cost — same discipline as `session_finished`'s own
     /// `cost_usd_micros` field, and its usual source (`RouterDecisionRecord::
     /// spent_usd_micros`, `host.rs`) is itself built the same way.
+    // The arguments are the fields of one wire record, in its order; a
+    // builder here would hide that the record has exactly these.
+    #[allow(clippy::too_many_arguments)]
     pub fn router_decision(
         session_id: SessionId,
         seq: u64,

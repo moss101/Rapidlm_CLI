@@ -423,12 +423,12 @@ fn build_request(
                 .calls()
                 .iter()
                 .map(|call| {
-                    Ok(ToolCall::new(
+                    ToolCall::new(
                         ToolCallId::parse(call.call_id()).map_err(map_provider_error)?,
                         ToolName::parse(call.tool()).map_err(map_provider_error)?,
                         call.arguments(),
                     )
-                    .map_err(map_provider_error)?)
+                    .map_err(map_provider_error)
                 })
                 .collect::<Result<Vec<_>, ModelStepError>>()?;
             messages.push(
@@ -791,7 +791,7 @@ fn usage_total_tokens(usage: &NormalizedUsage) -> u64 {
 /// Rough char-count token estimate (~4 bytes/token for English/code text),
 /// used only as a fallback when a provider reports no usage at all.
 fn estimate_tokens(bytes: usize) -> u64 {
-    ((bytes as u64) + 3) / 4
+    (bytes as u64).div_ceil(4)
 }
 
 #[cfg(test)]

@@ -1167,7 +1167,7 @@ mod tests {
             let mut workers: Vec<JoinHandle<()>> = Vec::new();
             while !thread_cancel.is_cancelled() {
                 match listener.accept() {
-                    Ok((mut stream, _)) => {
+                    Ok((stream, _)) => {
                         // The accepted stream can inherit the listener's
                         // non-blocking state (platform-dependent), which makes
                         // the handler's first read fail while the client's

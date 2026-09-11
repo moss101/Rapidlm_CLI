@@ -905,7 +905,7 @@ pub fn run_cron(args: &[String]) -> Result<i32, P9CommandError> {
                     elide_prompt(&due.prompt),
                 );
                 let succeeded = match crate::interactive::exec_turn(
-                    &[due.prompt.clone()],
+                    std::slice::from_ref(&due.prompt),
                     Some(crate::permissions::PermissionMode::Plan),
                 ) {
                     Ok(code) => {

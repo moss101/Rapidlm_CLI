@@ -166,10 +166,12 @@ impl HostRuntime {
         monitor_id: &str,
         observation: &MonitorObservation,
     ) -> Result<MonitorVerdict, HostRuntimeError> {
-        let monitor = self
-            .monitors
-            .get_mut(monitor_id)
-            .ok_or({ HostRuntimeError::MonitorRegistration(MonitorError::InvalidId) })?;
+        let monitor =
+            self.monitors
+                .get_mut(monitor_id)
+                .ok_or(HostRuntimeError::MonitorRegistration(
+                    MonitorError::InvalidId,
+                ))?;
         let verdict = monitor.spec.observe(observation);
         monitor.last_verdict = Some(verdict);
         if verdict.matched_flag() {
@@ -203,10 +205,12 @@ impl HostRuntime {
         trigger_id: &str,
         now: u64,
     ) -> Result<FireDecision, HostRuntimeError> {
-        let trigger = self
-            .triggers
-            .get_mut(trigger_id)
-            .ok_or({ HostRuntimeError::TriggerRegistration(TriggerError::InvalidId) })?;
+        let trigger =
+            self.triggers
+                .get_mut(trigger_id)
+                .ok_or(HostRuntimeError::TriggerRegistration(
+                    TriggerError::InvalidId,
+                ))?;
         use process_supervisor::trigger::UnitTime;
         let decision = trigger
             .spec

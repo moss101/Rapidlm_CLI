@@ -336,10 +336,10 @@ impl ExecSpec {
         if self.cancel.is_cancelled() {
             return Err(SpawnError::Cancelled);
         }
-        if let Some(limit) = self.timeout {
-            if limit == Duration::ZERO || limit > MAX_PROC_TIMEOUT {
-                return Err(SpawnError::TimeoutInvalid);
-            }
+        if let Some(limit) = self.timeout
+            && (limit == Duration::ZERO || limit > MAX_PROC_TIMEOUT)
+        {
+            return Err(SpawnError::TimeoutInvalid);
         }
         match &self.stdin {
             StdinSpec::Empty => {}
@@ -1427,10 +1427,10 @@ capability = "fs.read"
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let grandchild_pid: u32 = loop {
-            if let Ok(text) = std::fs::read_to_string(&pidfile) {
-                if let Ok(pid) = text.trim().parse() {
-                    break pid;
-                }
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse()
+            {
+                break pid;
             }
             assert!(
                 Instant::now() < deadline,
