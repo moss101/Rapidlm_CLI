@@ -7828,8 +7828,9 @@ from the semantic pipeline, a different shape from these hunks.
 
 ## Session boundary, 2026-09-10 — durable state for the next session
 
-Thirty-one commits across three days, `dbeb2c2`..`085aafc`, all pushed to `origin/main`. Baseline before
+Thirty-three commits across three days, `dbeb2c2`..`f706e59`, all pushed to `origin/main`. Baseline before
 them was `598c6fd`. Each has its own entry above; this is the current state and what is actually left.
+`f706e59`'s workspace gate was a clean single run: exit 0, 80 of 80 binaries.
 
 **How `085aafc`'s workspace gate was met, exactly.** Two other sessions ran full workspace suites in
 `~/projects/modbit` and `~/projects/zmodbit` throughout, with FSEvents at 80% CPU for days; the run took
@@ -7845,9 +7846,10 @@ correction self-review caught in already-pushed code); `rapid --help` no longer 
 the parser rejects; `rapid insights` given a test that can fail; `/jobs` and `/approvals` rendering the
 projections they already had.
 
-**2026-09-11** (`6b1d928`..): the commands accept the short ids the panels show — `job-3`, an id's
-random tail — with ambiguity refused by count; `/resume [session]` works inside the TUI through the
-mechanism `/fork` already had.
+**2026-09-11** (`6b1d928`..`f706e59`): the commands accept the short ids the panels show — `job-3`, an
+id's random tail — with ambiguity refused by count; `/resume [session]` works inside the TUI through the
+mechanism `/fork` already had; `/diff` shows real hunks from an in-tree Myers diff computed at the write
+site.
 
 **2026-09-10** (`81674b0`..`4b28b59`): background jobs journaled, session-lived, and cancellable; the
 status bar showing model, policy and compiled context instead of dashes; `/models`, `/memory` and
