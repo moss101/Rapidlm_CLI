@@ -278,7 +278,8 @@ pub static CLI_USAGE: LazyLock<String> = LazyLock::new(|| {
     }
     out.push_str(
         "\nEvery command above answers `--help`; four of them (exec, trust, mcp, doctor)\n\
-         with full usage, the rest with a one-line summary.\n",
+         with full usage, the rest with a one-line summary.\n\
+         New here? docs/getting-started.md covers install, first run, and exit codes.\n",
     );
     out
 });
@@ -8207,6 +8208,51 @@ alignment below it: {line:?}",
             );
         }
         assert!(crate::p9_commands::completions_script("tcsh").is_none());
+    }
+
+    #[test]
+    fn getting_started_lists_exactly_the_exit_codes() {
+        // `docs/getting-started.md` tells a script author what each exit
+        // code means. The numbers and the wording both come from
+        // `JsonlExitCode::ALL`, and this is the check that keeps them there:
+        // a code added, removed or renumbered in the binary fails here until
+        // the table says so too.
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/getting-started.md");
+        let doc =
+            fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        let start = doc
+            .find("<!-- exit-codes:")
+            .expect("the exit-code table marker");
+        let end = doc[start..]
+            .find("\n## ")
+            .map(|offset| start + offset)
+            .expect("a heading follows the table");
+        let table = &doc[start..end];
+        let mut documented: Vec<(i32, String)> = Vec::new();
+        for line in table.lines() {
+            let Some(rest) = line.strip_prefix("| `") else {
+                continue;
+            };
+            let Some((number, meaning)) = rest.split_once("` | ") else {
+                continue;
+            };
+            let meaning = meaning.trim_end_matches(" |").trim();
+            documented.push((
+                number
+                    .parse()
+                    .unwrap_or_else(|_| panic!("exit code `{number}` is not a number")),
+                meaning.to_owned(),
+            ));
+        }
+        let shipped: Vec<(i32, String)> = crate::headless::jsonl::JsonlExitCode::ALL
+            .iter()
+            .map(|(code, meaning)| (code.as_i32(), (*meaning).to_owned()))
+            .collect();
+        assert_eq!(
+            documented, shipped,
+            "docs/getting-started.md's exit-code table must match JsonlExitCode::ALL, in order"
+        );
     }
 
     #[test]

@@ -462,6 +462,48 @@ impl JsonlIo<io::Stdout, io::Stderr> {
 }
 
 impl JsonlExitCode {
+    /// Every code, with the one-line meaning `docs/getting-started.md`
+    /// prints for it. The doc's table is checked against this list by
+    /// `getting_started_lists_exactly_the_exit_codes`, so the numbers a
+    /// script author reads cannot drift from the numbers the binary exits
+    /// with. `every_exit_code_is_in_all` keeps this list exhaustive.
+    pub const ALL: &[(JsonlExitCode, &str)] = &[
+        (Self::Success, "the run produced its final answer"),
+        (
+            Self::Usage,
+            "bad arguments, missing or invalid configuration, unknown session",
+        ),
+        (
+            Self::Policy,
+            "a policy or permission decision stopped the run",
+        ),
+        (Self::Provider, "the model provider failed or refused"),
+        (
+            Self::Runtime,
+            "the agent turn failed for a reason other than the provider",
+        ),
+        (
+            Self::GoalIncomplete,
+            "the run ended with its goal's completion criteria unmet",
+        ),
+        (
+            Self::Sandbox,
+            "the sandbox refused or could not run a command",
+        ),
+        (
+            Self::ResourceExhausted,
+            "a budget (tokens, cost, time, or turns) ran out",
+        ),
+        (
+            Self::NeedsContext,
+            "the model stopped to ask for something only you can supply; re-run with it",
+        ),
+        (
+            Self::Interrupted,
+            "interrupted (Ctrl-C or an external cancel)",
+        ),
+    ];
+
     pub const fn as_i32(self) -> i32 {
         self as i32
     }
@@ -590,6 +632,57 @@ impl Error for JsonlError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_exit_code_is_in_all() {
+        // A variant added to the enum must be added to `ALL` too, or the
+        // doc that is checked against `ALL` silently stops describing it.
+        // The match below is exhaustive over the enum, so a new variant is
+        // a compile error here — and this loop then requires it in `ALL`.
+        let every = [
+            JsonlExitCode::Success,
+            JsonlExitCode::Usage,
+            JsonlExitCode::Policy,
+            JsonlExitCode::Provider,
+            JsonlExitCode::Runtime,
+            JsonlExitCode::GoalIncomplete,
+            JsonlExitCode::Sandbox,
+            JsonlExitCode::ResourceExhausted,
+            JsonlExitCode::NeedsContext,
+            JsonlExitCode::Interrupted,
+        ];
+        for code in every {
+            match code {
+                JsonlExitCode::Success
+                | JsonlExitCode::Usage
+                | JsonlExitCode::Policy
+                | JsonlExitCode::Provider
+                | JsonlExitCode::Runtime
+                | JsonlExitCode::GoalIncomplete
+                | JsonlExitCode::Sandbox
+                | JsonlExitCode::ResourceExhausted
+                | JsonlExitCode::NeedsContext
+                | JsonlExitCode::Interrupted => {}
+            }
+            assert!(
+                JsonlExitCode::ALL.iter().any(|(listed, _)| *listed == code),
+                "{code:?} ({}) is missing from JsonlExitCode::ALL",
+                code.as_i32()
+            );
+        }
+        assert_eq!(
+            JsonlExitCode::ALL.len(),
+            every.len(),
+            "ALL must carry each code once"
+        );
+        let mut numbers: Vec<i32> = JsonlExitCode::ALL.iter().map(|(c, _)| c.as_i32()).collect();
+        numbers.dedup();
+        assert_eq!(
+            numbers.len(),
+            JsonlExitCode::ALL.len(),
+            "two codes share a number"
+        );
+    }
     use event_ledger::event::{ActorRef, EventEnvelope, RecordedAt};
     use protocol::{RedactionClass, TraceId};
     use serde_json::json;

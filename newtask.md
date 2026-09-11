@@ -7876,6 +7876,28 @@ the real release binary (smoke: `doctor` exits 1 on a fresh `HOME`, accepted; pa
 verified checksum), by the crash proof above, and by parsing the YAML. The Windows branch (`7z`,
 `sha256sum`, `rapid.exe`) is reasoned, not run.
 
+**`docs/getting-started.md`, done 2026-09-11.**
+
+With a Release pipeline that now produces something a user can download, the last mile of installability
+was that nothing told a user how to get the binary or what to do first: `00-README.md` is a design dossier
+("Status: implementation specification"), and the CLI reference is a target-surface table. The page covers
+install (a Release archive with its checksum, or `cargo install --path apps/rapid --locked`), first run
+(`doctor` → configure a model → `trust grant` → `exec` / the TUI), and exit codes.
+
+**Everything in it was run or is checked.** `cargo install --path apps/rapid --locked --root <tmp>` was
+run to completion and the installed binary answered `--help`. The first-run sequence is what a fresh
+`HOME` in a fresh directory actually shows (`doctor` exits 1 with the model unconfigured; `exec` warns
+that the project is untrusted, then exits 5). The exit-code table is not prose: it is checked, number and
+wording, against a new `JsonlExitCode::ALL` by `getting_started_lists_exactly_the_exit_codes` (revert
+cycle 141: renumbering a row fails it), and `ALL` is kept exhaustive by `every_exit_code_is_in_all`
+(cycle 142: dropping `Sandbox` from `ALL` fails with "Sandbox (7) is missing"). The exit-code taxonomy —
+including `9`, "the model stopped to ask for something only you can supply", which a script should branch
+on rather than retry — existed only as doc comments on the enum before this.
+
+`rapid --help`'s footer now names the page, so `every_doc_the_binary_points_a_user_at_exists` covers it.
+The page does not describe `docs/reference/error-codes.md`'s taxonomy, which is the *error* taxonomy
+(`ErrorCode`), a different thing from process exit codes.
+
 ## Session boundary, 2026-09-10 — durable state for the next session
 
 Thirty-eight commits across three days, `dbeb2c2`..`f69716a`, all pushed to `origin/main`. Baseline before
@@ -7931,7 +7953,7 @@ today: a test that hardcoded a derived answer (`/memory` is `None`) went stale t
 fact changed — which is the design working — and a draft that added a `LocalUiEvent` beside a kernel
 event for the same value was caught and removed before it shipped.
 
-**Verification.** Revert cycles 72-140 across the three days. The pattern that keeps earning its keep: a
+**Verification.** Revert cycles 72-142 across the three days. The pattern that keeps earning its keep: a
 cycle that *passes* means the test is wrong, not the code. Five did on 2026-09-09; two more did today —
 a fixture too small for the bound it was meant to prove (one line against a 200-line cap), and a state
 read taken before the supervisor thread could notice a kill. Both were rewritten until the broken code
