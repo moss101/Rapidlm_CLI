@@ -7826,11 +7826,72 @@ panel does not render them. 137: no sanitization. 138: the naive slice, as above
 still says so). The `panels::diff` view model remains unwired — it consumes `MergePreview`/`PatchSummary`
 from the semantic pipeline, a different shape from these hunks.
 
+**CI has not run since at least 2026-09-05, and the tree would fail it if it did — found 2026-09-11.**
+
+Every `ci.yml` run for the last sixty commits shows all four jobs failed in 3-13 seconds with: *"The job
+was not started because recent account payments have failed or your spending limit needs to be
+increased."* That is a GitHub billing state on the repository owner's account, not anything in this
+tree, and nothing here can change it — **it needs the owner** (`Settings → Billing & plans`). Until it is
+fixed, the green/red signal on `main` is meaningless: the jobs never start.
+
+What *is* in the tree's control is what happens the moment billing is restored. `ci.yml` enforces `cargo
+fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings`, and the tree
+had **1,537 rustfmt diffs across 164 files** and **51 clippy warnings** — debt accumulated across the
+whole workspace (`crates/workspace`, `crates/sandbox`, `crates/vcs`, files this session never touched)
+while the gate was not running. Restoring billing would have turned CI red for pre-existing reasons on
+the first push, with the real signal buried under 164 files of whitespace.
+
+So, in order and separately:
+
+1. **`style: cargo fmt --all`** — one mechanical commit, exactly the output of `cargo fmt --all` with the
+   pinned 1.97.1 toolchain and default rustfmt config (no `rustfmt.toml`), which is what CI runs. No
+   other change in it, so it can be verified as "is this exactly `cargo fmt`?" by re-running the command
+   on its parent. Semantics-preserving by construction; the full workspace suite was run on it anyway.
+2. **clippy `-D warnings` clean** — 54 warnings by the exact CI invocation (`--all-targets` finds more than
+   the per-crate count). 43 mechanical via `clippy --fix`; the rest by hand with the reason in place (an
+   `AskSource` alias, `#[allow(large_enum_variant)]` on the once-per-turn `ExecTools`, two
+   `too_many_arguments` allows, a dead bench field, a vestigial `if x {"OK"} else {"OK"}`). Two runtime
+   tests pinning constant relationships became `const _: () = assert!(...)` — clippy called one
+   "constant" and was right; a build error is the better place. Revert cycle 140 confirms the pin fails
+   the build.
+3. **The release workflow's smoke test could not fail.** `release-matrix.yml`'s "binary smoke" ended
+   every command with `|| true`, so it passed with a binary that crashed on startup — the same defect as
+   a test with no failing branch (`rapid insights`, 2026-09-09). Proven both ways with a stand-in `rapid`
+   that exits 101 on `doctor`: the old step exits 0 on it, the new one exits 1. The new step encodes
+   `doctor`'s documented contract — exit 0 or 1 both mean "ran to its report" (a fresh runner with no
+   model configured is *expected* to fail checks), anything else is a crash. The same workflow now
+   publishes a **GitHub Release** on a `v*` tag with each target's archive and SHA-256, via the runners'
+   built-in `gh` and the automatic `github.token` rather than a third-party action; previously it
+   uploaded only workflow artifacts, which expire and cannot be downloaded without repository access, so
+   there was no way for a user to obtain a binary. Toolchain pinned and `--locked` like `ci.yml`.
+4. **The binary pointed a new user at a file that does not exist.** `NOT_CONFIGURED_HINT` — the first
+   thing a user with no model configured reads — said "see docs/configuration.md". The document is
+   `docs/reference/model-configuration.md`. Fixed, and `every_doc_the_binary_points_a_user_at_exists`
+   now gathers every user-facing string (usage, hints, refusals, the annotated `/help`) and checks each
+   `docs/…md` it names against the repository, so a moved document fails a test instead of a first run.
+
+**A limit stated plainly:** the workflow changes cannot be executed here — Actions is blocked by the
+billing state above — so they are verified by running the same shell locally on this macOS host against
+the real release binary (smoke: `doctor` exits 1 on a fresh `HOME`, accepted; package: archive plus
+verified checksum), by the crash proof above, and by parsing the YAML. The Windows branch (`7z`,
+`sha256sum`, `rapid.exe`) is reasoned, not run.
+
 ## Session boundary, 2026-09-10 — durable state for the next session
 
-Thirty-three commits across three days, `dbeb2c2`..`f706e59`, all pushed to `origin/main`. Baseline before
+Thirty-eight commits across three days, `dbeb2c2`..`f69716a`, all pushed to `origin/main`. Baseline before
 them was `598c6fd`. Each has its own entry above; this is the current state and what is actually left.
-`f706e59`'s workspace gate was a clean single run: exit 0, 80 of 80 binaries.
+
+**Gates, exactly.** `f706e59` (real hunks): a clean single run, 80/80. `4534588` (fmt): a clean single
+run, 80/80. The four-commit CI-readiness batch ending `f69716a`: 78/80 in a run during which two other
+sessions' workspace suites and a `cargo check` were executing on this machine; the six failures were all
+timing-shaped (process-supervisor's 2-second pid-file wait, `context_retrieval`'s 8-second fail-open, a
+sandbox kill) and every one passed alone in under a second — `process-supervisor --lib` 106/106,
+`context_retrieval` 7/7. `cargo clippy --workspace --all-targets --locked -- -D warnings` exits 0 and
+`cargo fmt --all -- --check` is clean, which are the two CI gates that were failing.
+
+**For the owner, not for a session: GitHub Actions is not running.** Every `ci.yml` job since at least
+2026-09-05 was refused with "recent account payments have failed or your spending limit needs to be
+increased". Nothing in this tree can change that. When it is restored, the tree is ready for the gates.
 
 **How `085aafc`'s workspace gate was met, exactly.** Two other sessions ran full workspace suites in
 `~/projects/modbit` and `~/projects/zmodbit` throughout, with FSEvents at 80% CPU for days; the run took
@@ -7846,10 +7907,12 @@ correction self-review caught in already-pushed code); `rapid --help` no longer 
 the parser rejects; `rapid insights` given a test that can fail; `/jobs` and `/approvals` rendering the
 projections they already had.
 
-**2026-09-11** (`6b1d928`..`f706e59`): the commands accept the short ids the panels show — `job-3`, an
+**2026-09-11** (`6b1d928`..`f69716a`): the commands accept the short ids the panels show — `job-3`, an
 id's random tail — with ambiguity refused by count; `/resume [session]` works inside the TUI through the
 mechanism `/fork` already had; `/diff` shows real hunks from an in-tree Myers diff computed at the write
-site.
+site; and the tree made CI-ready — `cargo fmt --all` (163 files), clippy `-D warnings` clean, a release
+smoke test that can fail plus a GitHub Release a user can download, and the binary's dead documentation
+pointer fixed with a test that keeps every pointer live.
 
 **2026-09-10** (`81674b0`..`4b28b59`): background jobs journaled, session-lived, and cancellable; the
 status bar showing model, policy and compiled context instead of dashes; `/models`, `/memory` and
@@ -7868,7 +7931,7 @@ today: a test that hardcoded a derived answer (`/memory` is `None`) went stale t
 fact changed — which is the design working — and a draft that added a `LocalUiEvent` beside a kernel
 event for the same value was caught and removed before it shipped.
 
-**Verification.** Revert cycles 72-138 across the three days. The pattern that keeps earning its keep: a
+**Verification.** Revert cycles 72-140 across the three days. The pattern that keeps earning its keep: a
 cycle that *passes* means the test is wrong, not the code. Five did on 2026-09-09; two more did today —
 a fixture too small for the bound it was meant to prove (one line against a 200-line cap), and a state
 read taken before the supervisor thread could notice a kill. Both were rewritten until the broken code
