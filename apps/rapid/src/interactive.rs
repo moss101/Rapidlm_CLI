@@ -1737,7 +1737,6 @@ are supported, and they have no auth step"
         | KernelAction::SetPluginPermissions { .. } => {
             "plugin install/trust management is not wired into the interactive session yet"
         }
-        KernelAction::ResumeSession { .. } => "cross-process session resume is not wired yet",
         KernelAction::CompactSession => "on-demand transcript compaction is not wired yet",
         KernelAction::ApplyChangeSet { .. } | KernelAction::Rollback { .. } => {
             "no change-set apply/rollback backend exists yet"
@@ -4988,6 +4987,87 @@ denied\n",
     /// handle that is not in the table, or one whose job already finished,
     /// are different answers from "stopped it", and a user who is told
     /// "cancelled" believes the command is no longer running.
+    /// `/resume [session]`: move this TUI onto another session of this
+    /// project.
+    ///
+    /// This was refused as "cross-process session resume is not wired yet"
+    /// while `switch_to_session` — the exact mechanism, built so `/fork`
+    /// could move onto its child — sat beside it; the fork message even
+    /// told the user to leave the TUI and run `rapid resume` to get back.
+    /// Same guards as `/fork`, for the same reason: the switch drops the
+    /// stream a running turn is still emitting into.
+    ///
+    /// Bare `/resume` from inside a session means "the other one": the most
+    /// recently active session that is not this one, resolved by the same
+    /// `recorded_sessions`/`newest_usable` pair `rapid resume` uses, so the
+    /// two cannot disagree about what this project holds. An id the ledger
+    /// has never recorded is refused *before* switching, with the same hint
+    /// the CLI prints — `switch_to_session` would otherwise fail generically
+    /// after tearing down the current subscription.
+    fn resume_session(
+        &mut self,
+        session: Option<protocol::SessionId>,
+    ) -> Result<(), InteractiveError> {
+        if self.turn_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+            self.append_command_error(
+                "a turn is running; wait for it to finish before resuming another session"
+                    .to_owned(),
+            );
+            return self.drain();
+        }
+        if self.autonomous.is_some() {
+            self.append_command_error(
+                "an autonomous goal is running; stop it with /goal stop before resuming another \
+session"
+                    .to_owned(),
+            );
+            return self.drain();
+        }
+        let ledger_path = project_ledger_path(&self.root.join(PROJECT_MARKER));
+        let sessions = recorded_sessions(&ledger_path)?;
+        let current = self.session_id.to_string();
+        let target = match session {
+            Some(id) => id,
+            None => {
+                let others: Vec<_> = sessions
+                    .iter()
+                    .filter(|summary| summary.session_id != current)
+                    .cloned()
+                    .collect();
+                match newest_usable(others) {
+                    Some(id) => id,
+                    None => {
+                        self.append_command_error(
+                            "no other session is recorded in this project".to_owned(),
+                        );
+                        return self.drain();
+                    }
+                }
+            }
+        };
+        if target == self.session_id {
+            self.append_command_output(format!("already on session {target}"));
+            return self.drain();
+        }
+        if !sessions
+            .iter()
+            .any(|summary| summary.session_id == target.to_string())
+        {
+            let mut text = format!("no session {target} in this project\n");
+            if let Some(hint) = hint_lines(sessions) {
+                text.push_str(&hint);
+            }
+            self.append_command_error(text);
+            return self.drain();
+        }
+        let previous = self.session_id;
+        self.switch_to_session(target)?;
+        self.append_command_output(format!(
+            "now on session {target}\n`/resume {previous}` returns to the one you left\n"
+        ));
+        self.drain()
+    }
+
     fn cancel_job(&mut self, id: Option<protocol::JobId>) -> Result<(), InteractiveError> {
         let text = match (id, self.jobs.cancel(id)) {
             (Some(id), None) => format!("no job {id} in this session"),
@@ -5020,6 +5100,7 @@ denied\n",
             KernelAction::ResumeGoal => self.goal_lifecycle_command(GoalLifecycleKind::Resume)?,
             KernelAction::CancelGoal => self.goal_lifecycle_command(GoalLifecycleKind::Cancel)?,
             KernelAction::CancelJob { id } => self.cancel_job(id)?,
+            KernelAction::ResumeSession { session } => self.resume_session(session)?,
             KernelAction::RunGoal => self.start_autonomous_goal()?,
             KernelAction::StopGoal => {
                 if self.autonomous.is_some() {
@@ -5094,7 +5175,7 @@ denied\n",
                     self.switch_to_session(child_id)?;
                     self.append_command_output(format!(
                         "forked at seq {seq}: now on child session {child_id}\n\
-the parent is unchanged; `rapid resume {parent_id}` reopens it\n"
+the parent is unchanged; `/resume {parent_id}` returns to it\n"
                     ));
                 }
                 KernelApi::Rewind => {
@@ -10261,6 +10342,170 @@ the parent delivers nothing for the session the user is now in"
     }
 
     #[test]
+    fn resume_returns_to_the_session_you_left() {
+        // `/resume [session]` was refused as "cross-process session resume
+        // is not wired yet" while `switch_to_session` — the exact mechanism,
+        // built so `/fork` could move onto its child — sat beside it, and
+        // the fork message told the user to leave the TUI and run `rapid
+        // resume` to get back. The round trip is the test: fork, then
+        // `/resume <parent>`, then a bare `/resume` back to the child.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let parent_id = session.session_id;
+
+        let cancel = CancellationToken::new();
+        let snapshot = block_on(session.client.get_session(parent_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(parent_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let mut renderer = TuiRenderer::new(true);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            scripted_backing_queue(Vec::new()),
+        );
+
+        loop_state.dispatch_slash("/fork").expect("fork");
+        let child_id = loop_state.session_id;
+        assert_ne!(child_id, parent_id);
+
+        // Named: back to the parent, through the real parse -> dispatch ->
+        // kernel-action path.
+        loop_state
+            .dispatch_slash(&format!("/resume {parent_id}"))
+            .expect("resume");
+        assert_eq!(
+            loop_state.session_id, parent_id,
+            "naming the parent must move the session back onto it"
+        );
+        assert_eq!(
+            loop_state.ui.snapshot().map(|s| s.id()),
+            Some(parent_id),
+            "and the projection must be the parent's"
+        );
+        // The switch must be complete, not cosmetic: the parent's own events
+        // must reach the UI, which a subscription left on the child would
+        // never deliver.
+        session
+            .client
+            .append_turn_progress(
+                parent_id,
+                &session.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::ContextCompiled,
+                serde_json::json!({"included_tokens": 3, "context_limit": 9}),
+            )
+            .expect("the parent accepts its own events");
+        for _ in 0..30 {
+            loop_state.drain().expect("drain");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            loop_state.ui.context_usage(),
+            Some((3, 9)),
+            "the resumed session's events must reach the UI"
+        );
+        assert!(!loop_state.ui.actions_blocked(), "{:?}", loop_state.ui.protocol_error());
+
+        // Bare: "the other one" — the most recently active session that is
+        // not this one. Here that is the child, the only other session.
+        loop_state.dispatch_slash("/resume").expect("resume");
+        assert_eq!(
+            loop_state.session_id, child_id,
+            "a bare /resume must move to the other session"
+        );
+    }
+
+    #[test]
+    fn resuming_an_unknown_session_refuses_without_leaving_the_current_one() {
+        // `switch_to_session` would fail generically *after* replacing the
+        // stream, leaving the user on a session with a dead subscription.
+        // The id is checked against the ledger first, and the refusal
+        // carries the same hint `rapid resume` prints.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let here = session.session_id;
+
+        let cancel = CancellationToken::new();
+        let snapshot = block_on(session.client.get_session(here), &cancel).expect("session");
+        let mut stream = block_on(
+            session.client.subscribe(SubscribeEvents::new(here, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let mut renderer = TuiRenderer::new(true);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            scripted_backing_queue(Vec::new()),
+        );
+
+        loop_state
+            .dispatch_slash("/resume 019c0000-0000-7000-8000-00000000dead")
+            .expect("dispatch");
+        assert_eq!(loop_state.session_id, here, "an unknown id must not move the session");
+        let text = loop_state
+            .ui
+            .transcript()
+            .iter()
+            .map(|entry| format!("{entry:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("no session 019c0000-0000-7000-8000-00000000dead in this project"),
+            "the refusal must name the id: {text}"
+        );
+        assert!(
+            text.contains(&here.to_string()),
+            "and list the sessions this project does have: {text}"
+        );
+
+        // The session is still live: its own events still arrive.
+        session
+            .client
+            .append_turn_progress(
+                here,
+                &session.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::ContextCompiled,
+                serde_json::json!({"included_tokens": 5, "context_limit": 9}),
+            )
+            .expect("append");
+        for _ in 0..30 {
+            loop_state.drain().expect("drain");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(loop_state.ui.context_usage(), Some((5, 9)));
+
+        // And with only this session recorded, a bare /resume says so
+        // rather than "resuming" the session it is already on.
+        loop_state.dispatch_slash("/resume").expect("dispatch");
+        assert_eq!(loop_state.session_id, here);
+    }
+
+    #[test]
     fn a_turn_s_workspace_writes_reach_the_diff_panel() {
         // `/diff` opened an empty panel for the most basic question a coding
         // CLI answers: what did the agent change? `apps/rapid` writes through
@@ -11477,8 +11722,10 @@ was already finished"
             painted.contains("now on child session"),
             "the branch it moved onto must be named:\n{painted}"
         );
+        // In-TUI, not `rapid resume`: this used to point out of the TUI
+        // for something the TUI now does itself.
         assert!(
-            painted.contains("rapid resume"),
+            painted.contains("/resume"),
             "and the way back to the parent must be given, since the session \
 the user was in is no longer the one they are in:\n{painted}"
         );

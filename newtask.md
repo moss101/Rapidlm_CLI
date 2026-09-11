@@ -7748,6 +7748,38 @@ window; a 10s budget for `echo` is generous, and the test was left alone. The wa
 window and was fixed. The rule stays "re-run in isolation, then decide whether the *test* is at fault",
 and the answer differs by case.
 
+**`/resume [session]` works inside the TUI, done 2026-09-11.**
+
+Refused as "cross-process session resume is not wired yet" — while `switch_to_session`, the exact
+mechanism, sat beside it. It was built on 2026-09-10 so `/fork` could move onto its child, and the fork
+message then told the user to *leave the TUI* and run `rapid resume <parent>` to get back. The
+"cross-process" in the refusal was also simply wrong about what was being asked: `/resume` from inside a
+session is same-ledger session switching, which is all `switch_to_session` does.
+
+Found by a band-2 sweep of `kernel_action_is_supported` — the gate `/help` and `apply_kernel_action`
+share — reading each refusal against what the binary can now do. It is the "field nobody sets" shape from
+the dropped-operand family again, one level up: a *mechanism* nobody calls.
+
+**Shape.** `resume_session` mirrors `/fork`'s guards (no switch under a running turn or an autonomous
+goal, since the switch drops the stream a turn is emitting into), then reuses `rapid resume`'s own
+`recorded_sessions`/`newest_usable`/`hint_lines` so the TUI and CLI cannot disagree about what a project
+holds. Bare `/resume` means "the other one" — the most recently active session that is not this one. An
+id the ledger never recorded is refused *before* switching, with the CLI's hint; `switch_to_session`
+would otherwise fail generically after tearing down the current subscription, leaving the user on a
+session with a dead stream. The fork message now says `/resume <parent>`. `ResumeSession` joined the
+supported set, so `/help`'s annotation for `/resume` flipped to available by derivation, and the
+now-false refusal text was deleted rather than left as a dead arm.
+
+**Checked, not assumed:** the `LedgerJobEvents` sink is built per turn inside `execute_interactive_turn`
+from the loop's current `session_id`, so a background job started after a switch reports into the session
+the user is actually in. (This holds for `/fork` too.)
+
+**Revert cycles 131-133.** 131 never switches; 132 skips the existence check (an unknown id then
+propagates a generic error out of `dispatch_slash`); 133 lets bare `/resume` pick the newest session
+*including* the current one, which after the parent records an event is the parent — so it "resumes"
+where it already is. The fork-message test pinned the string `rapid resume`; it now pins the property
+("the way back must be given") via `/resume`.
+
 ## Session boundary, 2026-09-10 — durable state for the next session
 
 Twenty-nine commits across three days, `dbeb2c2`..`6b1d928`, all pushed to `origin/main`. Baseline before
@@ -7759,9 +7791,9 @@ correction self-review caught in already-pushed code); `rapid --help` no longer 
 the parser rejects; `rapid insights` given a test that can fail; `/jobs` and `/approvals` rendering the
 projections they already had.
 
-**2026-09-11** (`6b1d928`): the commands accept the short ids the panels show — `job-3`, an id's
-random tail — with ambiguity refused by count, closing the last usability hole in the jobs/agents
-commands.
+**2026-09-11** (`6b1d928`..): the commands accept the short ids the panels show — `job-3`, an id's
+random tail — with ambiguity refused by count; `/resume [session]` works inside the TUI through the
+mechanism `/fork` already had.
 
 **2026-09-10** (`81674b0`..`4b28b59`): background jobs journaled, session-lived, and cancellable; the
 status bar showing model, policy and compiled context instead of dashes; `/models`, `/memory` and

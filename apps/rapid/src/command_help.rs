@@ -67,7 +67,10 @@ pub(crate) fn kernel_action_is_supported(action: &KernelAction) -> bool {
         | KernelAction::ResumeGoal
         | KernelAction::CancelGoal
         | KernelAction::RunGoal
-        | KernelAction::StopGoal => true,
+        | KernelAction::StopGoal
+        // Same-ledger session switching: the mechanism `/fork` uses to move
+        // onto its child, pointed at a session the user names.
+        | KernelAction::ResumeSession { .. } => true,
         // No per-job or per-agent cancellation backend exists at all — see
         // `cancels_a_specific_target`.
         other if cancels_a_specific_target(other) => false,
