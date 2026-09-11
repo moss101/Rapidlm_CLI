@@ -1782,7 +1782,7 @@ are supported, and they have no auth step"
 /// onboarding: a small user TOML selects provider, model, and credential).
 pub(crate) const NOT_CONFIGURED_HINT: &str = "no model configured: add a [models] default and a [model.<id>] \
 table (provider, model, base_url) to ~/.rapidlm/config.toml or point RAPIDLM_CONFIG at one; \
-see docs/configuration.md";
+see docs/reference/model-configuration.md";
 
 /// Load `.rapidlm/reminders.toml` and admit the always-on feeds. Returns the
 /// rendered block plus the strongest reminder floor, or `None` when there is
@@ -11960,6 +11960,60 @@ was already finished"
                 .values()
                 .any(|job| matches!(job.state(), tui::state::JobLifecycle::Cancelled))
         });
+    }
+
+    #[test]
+    fn every_doc_the_binary_points_a_user_at_exists() {
+        // `NOT_CONFIGURED_HINT` told a user with no model configured to
+        // "see docs/configuration.md" — a file that does not exist. The
+        // first thing a new user reads was a dead end. Every user-facing
+        // string that names a `docs/` path is gathered here and each path
+        // checked against the repository, so a moved or renamed document
+        // fails a test instead of a first run.
+        let mut texts: Vec<String> = vec![
+            NOT_CONFIGURED_HINT.to_owned(),
+            CLI_USAGE.clone(),
+            RESUME_USAGE.to_owned(),
+            crate::command_help::annotated_catalog_help(),
+        ];
+        for entry in tui::catalog() {
+            if let Ok(command) = tui::parse_command(&format!("/{}", entry.name)) {
+                match tui::dispatch(command) {
+                    tui::FrontendAction::Kernel(action) => {
+                        texts.push(unsupported_command_text(&action));
+                    }
+                    tui::FrontendAction::Local(tui::LocalAction::Open(inspector)) => {
+                        texts.push(unrouted_inspector_text(&inspector));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("workspace root");
+        let mut named = std::collections::BTreeSet::new();
+        for text in &texts {
+            for token in text.split(|c: char| {
+                c.is_whitespace() || c == ';' || c == ',' || c == ')' || c == '(' || c == '`'
+            }) {
+                if token.starts_with("docs/") && token.ends_with(".md") {
+                    named.insert(token.to_owned());
+                }
+            }
+        }
+        assert!(
+            !named.is_empty(),
+            "the binary points users at documentation; this test must be finding those pointers"
+        );
+        for path in &named {
+            assert!(
+                root.join(path).is_file(),
+                "the binary points a user at `{path}`, which does not exist under {}",
+                root.display()
+            );
+        }
     }
 
     #[test]
