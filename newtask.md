@@ -8119,6 +8119,20 @@ stops at the first failing binary and `-D warnings` stops at the first crate. In
     informational (`continue-on-error` on that leg, `--no-fail-fast` everywhere);
     `docs/getting-started.md` says what the archive is. Item 9 in the remaining list is closed
     as a decision; the porting work is not scheduled.
+15. **`5dc9b22` — `.gitattributes`**: with Windows tests informational, the one step still gating
+    there — `protocol`'s byte-for-byte schema goldens — failed because the Windows runner's default
+    `core.autocrlf=true` rewrote every LF to CRLF on checkout. Every text file is now `eol=lf` on
+    every checkout. **The Windows job is green on that run** — the first time — and its
+    informational Test step is the tracked list: **3398 passed, 168 failed, across 13 of 54
+    binaries** (kernel 27, sandbox 34, workspace 9, plugin-host 3, process-supervisor 4, the
+    `rapid` lib 69, six integration binaries with 1-7 each, mostly `/tmp`, `sh -c`, symlinks and
+    Unix modes). That is the size of "full Windows support" if it is ever scheduled.
+16. **`e6fb656`**: the same run's macOS job hit its 45-minute timeout in event-ledger —
+    `lagged_live_subscriber_reconnects_without_duplicates_or_gaps` slept one send timeout and
+    assumed the worker had lagged; on a loaded runner it had not started, the reads drained the
+    buffer as fast as it filled, and `recv` waited forever. It now waits for the worker's
+    `lagged` flag. Reproduced locally with a 300ms worker-start delay: old form hung ten minutes
+    until killed, new form passes.
 
 **What the platform matrix has said so far, in one line each.** Linux: `kill(1)` argument parsing
 (the P0), symlinked `/bin`, case-sensitive names, `script(1)` dialect, `/private` and `/Users` by
@@ -8148,9 +8162,10 @@ product bugs and some twenty test defects** (the CI rounds entry above). The bug
 revert-cycle-proven test: `kill(-1)` on every Linux job timeout and cancel (`e89a2df`); a stale
 `expected_seq` ending sessions (`60f3050`); a Ctrl-C landing as a turn finished making the session
 permanently unreadable (`c5e1184`); and a hook that ignores its stdin reported as a failed spawn
-(`fa99666`). **As of `547eb59`: macOS and Ubuntu are green end to end, SDK green, Windows builds
-and lints as a gate with its tests informational.** The run on `547eb59` is the one to check first
-next session; a red Format, Lint, or macOS/Ubuntu Test step is the next task before anything else.
+(`fa99666`). **As of `e6fb656` the run is green on every job — SDK, Ubuntu, macOS, Windows —
+for the first time in the repository's history** (run 34710847905; Windows builds and lints as a
+gate with its tests informational). From here a red Format, Lint, or macOS/Ubuntu Test step is
+the next task before anything else, and the platform matrix is the cross-platform gate.
 
 **`92240bf` (rewind fix) had a clean single workspace run — exit 0, 80 of 80 — on 2026-09-12, which
 also covers `eababe4` below, resolving the partial-evidence note that follows.**
