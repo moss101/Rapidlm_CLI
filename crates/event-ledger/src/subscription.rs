@@ -643,8 +643,21 @@ mod tests {
             .expect("subscribe empty");
 
         append_n(&tmp.ledger, session, 16);
-        // Allow the live send timeout to fire so lag is deterministic.
-        thread::sleep(LIVE_SEND_TIMEOUT + TAIL_POLL_INTERVAL);
+        // Wait for the worker to actually lag — its buffer of two full, its
+        // send timed out, `lagged` set — before reading anything. A fixed
+        // sleep of one send timeout assumed the worker had started tailing
+        // within it; on a loaded runner it had not, so the reads below
+        // drained the buffer as fast as the worker filled it, no lag ever
+        // happened, and `recv` waited forever for a seventeenth event (CI's
+        // macOS job hit its 45-minute timeout there).
+        let lag_deadline = Instant::now() + Duration::from_secs(30);
+        while !stream.shared.lagged.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < lag_deadline,
+                "subscriber never lagged with a full buffer and no reader"
+            );
+            thread::sleep(TAIL_POLL_INTERVAL);
+        }
 
         let mut delivered = Vec::new();
         loop {
