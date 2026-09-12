@@ -7975,10 +7975,182 @@ that takes hours per attempt. The change is confined to `apps/rapid` (`interacti
 integration test); every other crate is untouched by it. The next session should run the full suite on a
 quiet machine before anything else, as before.
 
+**P0: every job timeout and cancel on Linux was `kill(-1)`, fixed 2026-09-12 (`e89a2df`).**
+
+CI's fifth run was the first in which the plugin-host command-hook tests got past lease
+verification on Linux, so the first in which a hook actually timed out there. The Ubuntu job ended
+mid-test with "The runner has received a shutdown signal" (exit 143): nineteen of the twenty hooks
+tests had passed, and the one in flight was `timeout_and_nonzero_exit_are_distinguishable`. Its
+timeout path is the supervisor's `terminate_tree`, which signalled the job's process group by
+executing `/bin/kill -TERM -<pgid>`.
+
+On Linux `/bin/kill` is procps-ng's. I read `src/kill.c` at tag `v4.0.4` (Ubuntu 24.04): the leading
+`-TERM` is consumed by `skill_sig_option`, and the remaining `-12345` reaches `getopt`, which reports
+`'1'` as an unknown option; the `'?'` arm then does `pid = '0' - optopt` — **`-1`** — and calls
+`kill(-1, SIGTERM)`: every process the user owns. Two hundred milliseconds later the escalation is
+`kill(-1, SIGKILL)`. On a developer's Mac, BSD `kill(1)` parses `-12345` as group 12345, which is why
+nothing had ever shown it, and the supervisor's own `unrelated_process_is_not_signaled` test — which
+would have caught it — had never run on Linux, because CI had never reached `process-supervisor`
+there. For a user on Ubuntu this meant: the first job that timed out, or the first `/jobs cancel`,
+took down their terminal, their editor and RapidLM itself.
+
+**One implementation, by syscall.** Five production sites did this — `cancel.rs`, `recovery.rs`, and
+the three sandbox backends (`host_restricted`, `container`, `gvisor`), each with its own
+`GroupSignal` enum, its own `KILL_PROGRAMS` table and its own three `platform_signal_group`
+functions. They are now one: `crates/process-signal`, a leaf crate both `process-supervisor` and
+`sandbox` depend on (neither could depend on the other), with `signal_process_group(pgid,
+GroupSignal)` calling `kill(-pgid, sig)` through `rustix` and `process_exists(pid)` for the
+recovery path's liveness poll, which was also an exec of `kill -0` every 10 ms. Group ids below 2
+are refused before any call (`0` is the caller's own group, `1` is `init`, and negated `1` is the
+broadcast). `ESRCH` is `Ok` — the tree is gone, which is what the caller wanted. Windows keeps
+`taskkill /PID /T [/F]`, now written once. `SignalKind` in the supervisor's public API is a re-export
+of `GroupSignal`, so callers are unchanged. The sandbox backends' three copies of
+`terminate_process_group` remain — the same TERM-grace-KILL loop three times — and are the next
+duplication to fold if that crate is touched again.
+
+**Tests.** `only_the_named_group_is_signalled` in the new crate is the shape of the bug: a bystander
+in its own group beside a leader-plus-grandchild group; TERM the group; the leader exits by signal,
+the grandchild is gone (`kill(-pgid, 0)` turns `ESRCH`), the bystander is still there, and so is the
+test process. The supervisor's `unrelated_process_is_not_signaled` and the sandbox and plugin-host
+timeout tests are the through-production proofs, and Linux CI now runs them. **No revert cycle can
+show this bug on macOS** — BSD `kill` is correct — so the cycle here is CI on Ubuntu: the run before
+this commit died in the hooks timeout test; the run after must complete `plugin-host`,
+`process-supervisor` and `sandbox`.
+
+**CI's first real runs in a week, five rounds, 2026-09-12** (`3d72e58`, `c0fa8e4`, `d711e41`,
+`cb0d918`, `60f3050`, `a151550`).
+
+Actions had been blocked on billing since 2026-09-05; the CI-readiness batch (`f69716a` and before) was
+written against a local `fmt`/`clippy`/`test` gate that a developer Mac can run. When the block lifted,
+the three-platform matrix found what a Mac cannot, one layer per round, because `cargo test --workspace`
+stops at the first failing binary and `-D warnings` stops at the first crate. In order:
+
+1. **SDK job**: no `typescript`, no `@types/node` in the SDK at all — `tsc` came from the runner image
+   and had never been reproducible locally. Pinned both; then the real errors: Node globals the bare
+   `lib: ["ES2022"]` did not know, `.ts` import extensions that the strip-types runner accepts but `tsc`
+   needs `allowImportingTsExtensions` + `rewriteRelativeImportExtensions` for, a default parameter
+   that inherited an `as const` type, an `instanceof` on a union with a string-literal member.
+2. **Lint on Linux and Windows**: one unused import in a Linux-only test module; and `crates/kernel`
+   did not compile on Windows — the Unix-socket IPC module carried half-finished `cfg(not(unix))`
+   placeholders. Nothing consumes the module yet, so it is `#[cfg(unix)]` at the crate root: absent on
+   Windows rather than pretend-present. Then `sandbox` and `process-supervisor` dead-code on Windows
+   from constants and helpers only Unix paths use; gated the same way. The Windows build cannot be
+   cross-checked from this Mac (`libsqlite3-sys` compiles C for the target); that verification is CI's.
+3. **Test on Linux**: `rules_loader` asserted a `sub/Claude.md` header read `CLAUDE.md`, true only on a
+   case-folding filesystem; the loader was right on both, the test pinned macOS. The live Secret
+   Service test failed `KeychainUnavailable` on a runner with no keyring daemon; it now skips there.
+   `plugin-host`'s command-hook tests failed `LeaseInvalid` because the test issued its lease through a
+   private resolver that used paths as typed, and the supervisor re-hashes through `LiveHostResolver`
+   (`canonicalize`) — on Ubuntu `/bin` → `/usr/bin`. **The lease check refused a real mismatch, in a
+   lease the test built wrong**; it now issues through the production resolver.
+4. **Test on macOS, a shared three-core runner**: `health_snapshot_is_non_blocking_under_contention`
+   asserted a throughput figure (50,000 iterations in 250ms) tuned on a fast machine; the property is
+   that `snapshot` never blocks, so a 5s bound. The llm-router scripted server did one `read` and
+   answered whatever arrived — the whole request on a fast machine, often just the headers on the
+   runner, after which it closed the socket mid-body and the client saw `Connection`; it now reads the
+   body `Content-Length` promises. And **one product bug** the Mac was too fast to show, `60f3050`:
+   `submit_turn` and `/fork` took `expected_seq` from the UI projection, which lags the ledger by the
+   live-tail poll; a turn finishing on its own thread appended its terminal events after the last drain,
+   so the next submit carried a stale seq and the kernel's optimistic check ended the whole session with
+   `SessionConflict`. Both now read the ledger's real tip just before the call (`session_tip`), which
+   still catches a genuine concurrent writer. `/fork` at the stale seq would also have silently branched
+   from before the last turn's end.
+5. `actions/checkout@v5` and `setup-node@v5` (Node 24), with setup-node's default package-manager
+   cache off because it runs `pnpm` before corepack has enabled it.
+6. **Round five, `499a078`**: Windows Lint reached `apps/rapid` and found that hooks ran blind
+   there — the `cfg(not(unix))` arm spawned the hook with no piped stdin and no output redirection,
+   so a Windows hook never received its payload and its printed reason was lost to the terminal.
+   The stdio wiring is now written once (`hook_shell` holds the only platform difference). Plus
+   two `auth` test-module lints. And the same round's Ubuntu job died mid-test — the P0 entry above.
+7. **Round six, `f974102`**: with `kill(-1)` gone the Ubuntu job reached the end of plugin-host and
+   two command-hook tests failed `run: Spawn` (`/usr/bin/false` with no stdin; `/usr/bin/printf`
+   with a payload) while the same `false` passes in the timeout test on the same runner. `Spawn`
+   said nothing more, so `HookError::Spawn(SpawnError)` and `SpawnError::Io(io::ErrorKind)` now
+   carry and display the cause — a user whose hook does not start gets a reason, and the next run
+   gets the variant. Windows: the two `exec_tools` symlink-escape tests and the adversarial suite's
+   Unix-only `World` pieces gated.
+8. **Round seven, `0a331df`**: plugin-host passed 119/119 on Linux — the two `Spawn` failures of
+   round six did not recur, so they are a **flake, cause still unknown**; the `Spawn(cause)`
+   diagnostics are in place for the next occurrence (a `BrokenPipe` would mean the stdin hand-off
+   raced a hook that exited without reading, which `write_stdin` currently reports as a spawn
+   failure and would be a real bug to fix there). Linux reached `process-supervisor`: eight `cancel`
+   tests failed `LeaseNotBound` from a third private `FrozenPathResolver` (a fourth was waiting in
+   `apps/rapid`'s `external_agents` test) — now `ExecSpec::canonical_command` is public and all
+   three tests derive the lease's action from it. Two `pty` tests got an empty typescript because
+   `PtySession` used BSD `script(1)` syntax and util-linux's takes `-c`; the Linux form is built with
+   strict single-quoting. Windows Lint flagged every helper shared by Unix-only tests in three
+   modules as dead: those modules carry `cfg_attr(not(unix), allow(dead_code, unused_imports))`.
+9. **Round eight, `fbde20b`**: Linux got through `process-supervisor` and `rapid` and stopped in
+   `sandbox` on a test that symlinked `/private` and `/Users` by name — now `/` and `$HOME`'s
+   parent, host-derived. macOS failed the llm-router fixture *again* ("captured request"), and
+   this time the real cause: the fixture's listener is non-blocking, and on BSD sockets the
+   accepted stream inherits the flag, so the first read raced the client's write and returned
+   `WouldBlock` — an empty request, no capture, a response to a client still writing. Round
+   four's whole-request read treated the symptom; the accepted stream is now set blocking.
+   Verified with a 12-line Rust program on this Mac. Windows: `sandbox` and `context-engine`
+   tests that were vacuous or uncompilable there gated as Unix tests.
+10. **Round nine, `43295d2`**: macOS green. Linux through `sandbox` and `scheduler` to the
+    security suite's own `/private` pin — same fix, link `/`. Windows: `capability-broker`'s
+    TOCTOU integration file is `#![cfg(unix)]` (its world always builds a symlink).
+11. **Round ten** — **Ubuntu fully green for the first time ever** (Format, Lint, all of Test), and
+    the first Windows Lint pass and Test run. Two real bugs from it:
+    - **P0, `c5e1184`**: macOS failed `first_ctrl_c_interrupts_then_second_exits` with
+      `StorageCorrupt`. `finish_turn` took the lease then appended its terminal event with no
+      `expected_seq`; `interrupt_sync` appends before it takes. Interleaved, the ledger held
+      `turn.interrupted` then `turn.completed` for one turn; the projection refuses the second, and
+      every read replays into that refusal — **one Ctrl-C landing as a fast turn finished made the
+      session permanently unreadable**. The terminal append is now guarded by the projection
+      (`active_turn == this turn`) at `expected_seq`, retried like `interrupt_sync`. Test builds the
+      interleaving's end state directly; revert cycle 149 fails with CI's exact error.
+    - **`2cf36b7`**: twelve Windows `local_daemon` failures — `fill_random` was a bare
+      `Err(Entropy)` off Unix, so no daemon token could ever be issued there; now `getrandom`
+      (already in the tree through `uuid`).
+
+12. **Round eleven, `a5f0129`**: Linux and Windows both failed one event-ledger test that
+    bounded 32 durable appends at 750ms — a disk-speed assertion; now a liveness bound on a thread
+    (only a blocked append can miss it). macOS green.
+13. **Round twelve, `fa99666`**: with the round-six diagnostics in place the plugin-host flake
+    named itself on macOS — `Spawn(Io(BrokenPipe))`. `write_stdin` treated every write error as
+    a spawn failure, killed the child's group and reported `Io`; a hook like `/usr/bin/env` or
+    `false` that exits without reading stdin was "failed to start", its output discarded, and
+    under `Block` the tool call blocked. `BrokenPipe` is now the child's choice. Deterministic
+    test (`exec 0<&-` child, largest payload); revert cycle 150 fails it.
+14. **`547eb59` — the Windows decision.** The owner chose build + lint as the gate and tests as
+    informational (`continue-on-error` on that leg, `--no-fail-fast` everywhere);
+    `docs/getting-started.md` says what the archive is. Item 9 in the remaining list is closed
+    as a decision; the porting work is not scheduled.
+
+**What the platform matrix has said so far, in one line each.** Linux: `kill(1)` argument parsing
+(the P0), symlinked `/bin`, case-sensitive names, `script(1)` dialect, `/private` and `/Users` by
+name. macOS runner: throughput assertions, a non-blocking accepted socket, two race windows a fast
+Mac never opens (stale `expected_seq`; interrupt-vs-finish). Windows: `cfg` holes in four crates,
+hooks with no stdio, no entropy source, and every Unix-only test helper.
+
+**What this says about the local gate.** Every one of these was invisible to the macOS-only,
+default-cfg gate that had been the whole gate for a week: three were `cfg` holes on a platform nobody
+built, three were tests pinned to one filesystem or one machine's speed, two were fixtures racing a
+slower client, and one was a real bug whose window is the poll interval. The platform matrix is now
+the gate for the cross-platform claims; the local suite remains the inner loop. **Nothing in the
+`a151550` round was verified locally**: the machine again froze `rustc` at `dlopen` of a freshly built
+proc-macro dylib — `fcntl` code-signature registration, uninterruptible, zero CPU, `amfid`
+idle-exited and not respawned, `syspolicyd` at 27% CPU for seven hours — on two attempts. The
+Gatekeeper assessment of every freshly built dylib from three concurrent cargo workspaces is the
+plausible cause and is a system setting, so the owner's; `fmt --check` is clean and the CI run on
+`a151550` is the evidence, recorded in the boundary below once it lands.
+
 ## Session boundary, 2026-09-10 — durable state for the next session
 
-Forty-five commits across four days, `dbeb2c2`..HEAD, all pushed to `origin/main`. Baseline before
+Sixty-one commits across four days, `dbeb2c2`..HEAD, all pushed to `origin/main`. Baseline before
 them was `598c6fd`. Each has its own entry above; this is the current state and what is actually left.
+
+**GitHub Actions is running again as of 2026-09-12, and its first fourteen runs found four
+product bugs and some twenty test defects** (the CI rounds entry above). The bugs, each with a
+revert-cycle-proven test: `kill(-1)` on every Linux job timeout and cancel (`e89a2df`); a stale
+`expected_seq` ending sessions (`60f3050`); a Ctrl-C landing as a turn finished making the session
+permanently unreadable (`c5e1184`); and a hook that ignores its stdin reported as a failed spawn
+(`fa99666`). **As of `547eb59`: macOS and Ubuntu are green end to end, SDK green, Windows builds
+and lints as a gate with its tests informational.** The run on `547eb59` is the one to check first
+next session; a red Format, Lint, or macOS/Ubuntu Test step is the next task before anything else.
 
 **`92240bf` (rewind fix) had a clean single workspace run — exit 0, 80 of 80 — on 2026-09-12, which
 also covers `eababe4` below, resolving the partial-evidence note that follows.**
@@ -8031,7 +8203,15 @@ table checked against source.
 
 **2026-09-12** (`92240bf`): `/rewind <seq>` left the session unable to accept input (`SessionConflict`
 on every submit) — now a fork at the sequence plus the switch `/fork` makes, with one shared busy-guard
-for `/fork`, `/resume` and `/rewind`.
+for `/fork`, `/resume` and `/rewind`. Then (`5e1480e`) headless `rapid exec` records its session in the
+project ledger through the TUI's own sequence. Then the CI rounds (`3d72e58`..`a151550`): the SDK
+typechecks with a pinned toolchain, the workspace lints and builds on Windows, and five tests and two
+fixtures were made true on Linux and a slow macOS runner — plus `60f3050`, the stale-seq
+`SessionConflict` that ended sessions whenever a submit raced the live-tail poll. Then the P0 that
+run exposed (`e89a2df`): on Linux every job timeout and cancel was `kill(-1)` — procps-ng's `kill(1)`
+parsing `-<pgid>` as the broadcast — now `kill(2)` through one leaf crate, `process-signal`, shared
+by the supervisor and the three sandbox backends. And Windows hooks ran with no stdin and no captured
+output (`499a078`).
 
 **2026-09-10** (`81674b0`..`4b28b59`): background jobs journaled, session-lived, and cancellable; the
 status bar showing model, policy and compiled context instead of dashes; `/models`, `/memory` and
@@ -8104,6 +8284,16 @@ actually failed them.
    are scope, not defects.
 8. **The both-ledgers case** still strands rows behind a printed notice (option C's accepted cost).
    Option D's merge is the follow-up if real installs turn out to hold both files.
+9. ~~**Windows: a product decision, not wiring.**~~ **Decided 2026-09-12** (`547eb59`): build +
+   lint are the gate, tests informational, docs honest. Windows *compiles and lints clean* on
+   every push; its Test step is visible in the job log. The porting work — ~150 Unix-fixture
+   sites (`/bin/sh`, `/tmp`, `PermissionsExt`, symlinks) across 34 files, plus `PtySession`
+   (`script(1)`), the Unix-native sandboxes, and `sh -c` shell exec — is not scheduled. Do not
+   spend rounds on Windows test gating; a Windows *lint* failure is still a red commit to fix.
+10. ~~**A Linux `Spawn` flake in plugin-host**~~ — **found and fixed 2026-09-12** (`fa99666`,
+    entry above): it was `BrokenPipe` on the stdin hand-off, exactly the suspected cause.
+11. **Duplication the P0 left behind**: the three sandbox backends still each carry an identical
+    `terminate_process_group` (TERM, grace, KILL, reap); and `PtySession` is exported and unused.
 
 **Two things to know before touching this area again.** The event ledger is in **WAL** mode
 (`event_ledger::migrations` sets and verifies it) — check `PRAGMA journal_mode` before reasoning about
@@ -8112,6 +8302,16 @@ touches a ~10k-line file; `cargo test -p rapid --lib` (~37s) and `-p tui` (under
 loop, and two cargo suites must never run at once in this repo. A workspace run also loads the machine
 enough to break timing-sensitive tests that pass alone — that is usually the test's fault, not the
 environment's, and `context_retrieval`'s watcher test was fixed rather than excused on 2026-09-10.
+
+**And one about this machine, which cost most of 2026-09-11 and 2026-09-12.** Freshly built binaries
+and `rustc` itself intermittently freeze at exec or at `dlopen` of a freshly built proc-macro dylib —
+`_dyld_start` or `fcntl` code-signature registration, state `U`, zero CPU, for five to twenty-plus
+minutes — while `syspolicyd` runs hot and `amfid` sits idle-exited. It correlates with other sessions
+running their own cargo suites in `~/projects/modbit`, `zmodbit` and `quansio-server` on the same
+machine. `pgrep -x cargo` (never `-f`, which matches the harness's own shell) and `lsof -p <pid> -d cwd`
+tell whose run is whose; kill only your own. When it stalls, do not wait on it: `fmt --check` does not
+invoke `rustc` and still runs; anything that does (`check`, `clippy`, `test`) may stall the same way,
+and CI is the gate until the machine is quiet.
 
 ## Session boundary, 2026-09-09 — durable state for the next session
 
