@@ -1526,6 +1526,12 @@ capability = "fs.read"
         assert!(!SandboxError::ForbiddenMount.as_str().contains(CANARY));
     }
 
+    // A symlink in the workspace pointing at the filesystem root, and a
+    // mount source spelled *through* it: lexically a temp path, canonically
+    // `/etc` (`/private/etc` on macOS, where `/etc` is itself a link) or the
+    // user's home. The rule is the same on every Unix; the paths are taken
+    // from the host rather than assumed, which is how the first Linux run
+    // found this test pinned to `/private` and `/Users`.
     #[cfg(unix)]
     #[test]
     fn intermediate_symlink_into_private_etc_or_home_is_forbidden() {
@@ -1535,9 +1541,9 @@ capability = "fs.read"
 
         let etc_ws = TempWorkspace::new();
         let via_etc = etc_ws.path.join("via");
-        std::os::unix::fs::symlink("/private", &via_etc).expect("symlink private");
+        std::os::unix::fs::symlink("/", &via_etc).expect("symlink root");
         let etc_escape = via_etc.join("etc");
-        assert!(etc_escape.is_dir(), "macOS /private/etc must exist");
+        assert!(etc_escape.is_dir(), "/etc must exist through the symlink");
         let etc_host =
             CanonicalHostPath::from_resolved(etc_escape.to_str().expect("utf8")).expect("etc host");
         assert!(
@@ -1561,9 +1567,10 @@ capability = "fs.read"
             .file_name()
             .and_then(|name| name.to_str())
             .expect("home name");
+        let home_parent = Path::new(&home).parent().expect("home parent");
         let home_ws = TempWorkspace::new();
         let via_users = home_ws.path.join("via");
-        std::os::unix::fs::symlink("/Users", &via_users).expect("symlink users");
+        std::os::unix::fs::symlink(home_parent, &via_users).expect("symlink home parent");
         let home_escape = via_users.join(home_name);
         assert!(home_escape.is_dir(), "HOME must exist through symlink");
         let home_host = CanonicalHostPath::from_resolved(home_escape.to_str().expect("utf8"))
@@ -1581,7 +1588,7 @@ capability = "fs.read"
         );
 
         let cwd_ws = TempWorkspace::new();
-        std::os::unix::fs::symlink("/private", cwd_ws.path.join("escape")).expect("cwd symlink");
+        std::os::unix::fs::symlink("/", cwd_ws.path.join("escape")).expect("cwd symlink");
         let cwd_spec = SandboxSpec::builder(SandboxTier::HostRestricted)
             .cwd(RepoPath::parse("src/escape/etc").expect("cwd"))
             .mount(cwd_ws.mount("src", MountMode::ReadWrite))
@@ -1777,6 +1784,7 @@ capability = "fs.read"
         backend.destroy(&handle, &live).expect("destroy");
     }
 
+    #[cfg(unix)]
     #[test]
     fn grandchild_does_not_survive_timeout_or_cancel() {
         let backend = HostRestrictedBackend::new();

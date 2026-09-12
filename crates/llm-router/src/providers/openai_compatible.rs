@@ -2341,6 +2341,14 @@ mod tests {
                     }
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            // The listener is non-blocking so the accept loop can
+                            // watch `shutdown`; on BSD sockets (macOS) an accepted
+                            // stream *inherits* that flag, and a read before the
+                            // request's bytes have arrived returns `WouldBlock` —
+                            // an empty request, no capture, and a response sent to
+                            // a client still writing. Reads here are blocking,
+                            // bounded by the timeout.
+                            let _ = stream.set_nonblocking(false);
                             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                             let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
                             let raw = read_whole_request(&mut stream);

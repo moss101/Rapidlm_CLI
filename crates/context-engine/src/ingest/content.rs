@@ -915,30 +915,30 @@ mod tests {
         assert!(seen_rs && seen_bin && seen_huge);
     }
 
+    // Unix symlink semantics; on Windows this test used to set up and then
+    // assert nothing, a pass that proved nothing.
+    #[cfg(unix)]
     #[test]
     fn load_file_does_not_follow_symlink() {
         let ws = TempWorkspace::new();
         ws.write_file("core/src/lib.rs", b"ok");
         let outside = ws.write_file("outside/secret.rs", b"secret");
         let leak = ws.path.join("core/leak.rs");
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&outside, &leak).expect("symlink");
-            let err = load_file_candidate(
-                &ws.path.join("core"),
-                &walk_one_named(&ws, "src/lib.rs").0,
-                &ContentLimits::default(),
-                &CancellationToken::new(),
-            );
-            // Regular file still loads. Symlink path is rejected if requested.
-            assert!(err.is_ok());
-            let leak_path = path("leak.rs");
-            let resolved = resolve_regular_file(&ws.path.join("core"), &leak_path);
-            assert_eq!(resolved.err(), Some(ContentError::NotRegularFile));
-        }
-        let _ = (outside, leak);
+        std::os::unix::fs::symlink(&outside, &leak).expect("symlink");
+        let err = load_file_candidate(
+            &ws.path.join("core"),
+            &walk_one_named(&ws, "src/lib.rs").0,
+            &ContentLimits::default(),
+            &CancellationToken::new(),
+        );
+        // Regular file still loads. Symlink path is rejected if requested.
+        assert!(err.is_ok());
+        let leak_path = path("leak.rs");
+        let resolved = resolve_regular_file(&ws.path.join("core"), &leak_path);
+        assert_eq!(resolved.err(), Some(ContentError::NotRegularFile));
     }
 
+    #[cfg(unix)]
     fn walk_one_named(ws: &TempWorkspace, want: &str) -> (FileCandidate, WorkspaceManifest) {
         let manifest = parse_manifest(ws);
         let repo = manifest.repo_by_alias("core").expect("repo");
