@@ -2343,9 +2343,7 @@ mod tests {
                         Ok((mut stream, _)) => {
                             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                             let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                            let mut buf = vec![0u8; 64 * 1024];
-                            let n = stream.read(&mut buf).unwrap_or(0);
-                            let raw = String::from_utf8_lossy(&buf[..n]);
+                            let raw = read_whole_request(&mut stream);
                             if let Some(captured_req) = parse_captured(&raw) {
                                 *captured_thread.lock().expect("capture lock") = Some(captured_req);
                             }
@@ -2414,6 +2412,49 @@ mod tests {
                 authorization_has_canary: self.authorization_has_canary,
             }
         }
+    }
+
+    /// Read one HTTP/1.1 request in full: the headers, then as many body
+    /// bytes as `Content-Length` promises. The fixture used to do a single
+    /// `read` and respond to whatever it got — which on a fast machine is
+    /// the whole request, and on a shared CI runner is often just the
+    /// headers. It then answered and closed the socket while the client
+    /// was still writing the body, and the client saw `Connection` on a
+    /// server that was up. Bounded by the socket's read timeout and a
+    /// fixed buffer; a client that sends less than it promised is cut off
+    /// there rather than waited on forever.
+    fn read_whole_request(stream: &mut std::net::TcpStream) -> String {
+        const CAP: usize = 256 * 1024;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = vec![0u8; 16 * 1024];
+        loop {
+            let n = match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() >= CAP {
+                break;
+            }
+            let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&buf[..end]);
+            let promised = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if buf.len() - (end + 4) >= promised {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
     }
 
     fn parse_captured(raw: &str) -> Option<CapturedRequest> {

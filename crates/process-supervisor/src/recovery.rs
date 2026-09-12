@@ -9,7 +9,9 @@ use std::error::Error;
 use std::fmt;
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use capability_broker::CancellationToken;
 use protocol::{ErrorCode, JobId};

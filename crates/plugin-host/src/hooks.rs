@@ -1933,33 +1933,13 @@ mod tests {
 
     use capability_broker::{
         ActionRequest, ApprovalChoice, ApprovalResolution, ApprovalScopeId, CanonicalAction,
-        CanonicalHostPath, ExecIntent, LeaseIssuer, LeaseUseGuard, LeaseValidator, PolicyDocument,
-        PolicyRevision, PolicySource, PolicyStack, Resolver, evaluate, issue, normalize_exec,
-        request_approval, validate_use,
+        CanonicalHostPath, ExecIntent, LeaseIssuer, LeaseUseGuard, LeaseValidator,
+        LiveHostResolver, PolicyDocument, PolicyRevision, PolicySource, PolicyStack, evaluate,
+        issue, normalize_exec, request_approval, validate_use,
     };
     use process_supervisor::{Invocation, SpawnError};
 
     const CANARY: &str = "canary-secret-PLAINTEXT-do-not-leak-7c1e9b";
-
-    struct FrozenPathResolver;
-
-    impl Resolver for FrozenPathResolver {
-        fn resolve_cwd(
-            &self,
-            requested: &str,
-        ) -> Result<CanonicalHostPath, capability_broker::CommandNormalizeError> {
-            CanonicalHostPath::from_resolved(requested)
-        }
-
-        fn resolve_executable(
-            &self,
-            requested: &str,
-            _cwd: &CanonicalHostPath,
-        ) -> Result<CanonicalHostPath, capability_broker::CommandNormalizeError> {
-            CanonicalHostPath::from_resolved(requested)
-                .map_err(|_| capability_broker::CommandNormalizeError::UnresolvedExecutable)
-        }
-    }
 
     fn principal() -> PrincipalRef {
         PrincipalRef::parse("agent").expect("principal")
@@ -2000,6 +1980,15 @@ capability = "proc.exec"
         LeaseIssuer::from_key([0x22; 32]).expect("issuer")
     }
 
+    // The lease must hash the *same* canonical command the supervisor will
+    // re-hash in `verify_lease_bound`, which resolves the executable and cwd
+    // through `LiveHostResolver` (`std::fs::canonicalize`). The previous
+    // test-only resolver used paths as typed and only agreed with production
+    // where nothing is a symlink: on Ubuntu `/bin` is a link to `/usr/bin`,
+    // so `/bin/sleep` hashed differently from its canonical form and every
+    // command hook failed `LeaseInvalid` the first time CI ran on Linux —
+    // the lease check refusing a real mismatch, in a lease the test built
+    // wrong.
     fn lease_guard(spec: &ExecSpec) -> LeaseUseGuard {
         let binding = spec.binding().expect("bound spec");
         let env_names = spec.env().keys().cloned();
@@ -2014,7 +2003,7 @@ capability = "proc.exec"
                 env_names,
             ),
         };
-        let command = normalize_exec(&intent, &FrozenPathResolver, spec.cancel()).expect("canon");
+        let command = normalize_exec(&intent, &LiveHostResolver, spec.cancel()).expect("canon");
         let actual = CanonicalAction::Command(command);
         let request = ActionRequest::new(
             binding.principal().clone(),
