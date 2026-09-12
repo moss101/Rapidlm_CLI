@@ -7933,8 +7933,11 @@ invalid-sequence test still passes, so the error surface is unchanged.
 
 ## Session boundary, 2026-09-10 — durable state for the next session
 
-Forty commits across three days, `dbeb2c2`..`eababe4`, all pushed to `origin/main`. Baseline before them
-was `598c6fd`. Each has its own entry above; this is the current state and what is actually left.
+Forty-two commits across four days, `dbeb2c2`..`92240bf`, all pushed to `origin/main`. Baseline before
+them was `598c6fd`. Each has its own entry above; this is the current state and what is actually left.
+
+**`92240bf` (rewind fix) had a clean single workspace run — exit 0, 80 of 80 — on 2026-09-12, which
+also covers `eababe4` below, resolving the partial-evidence note that follows.**
 
 **`eababe4` (getting-started) shipped on partial workspace evidence, and here is exactly what.** The
 machine entered a state where every freshly built binary — this repository's test binaries *and* the
@@ -7982,6 +7985,10 @@ smoke test that can fail plus a GitHub Release a user can download, and the bina
 pointer fixed with a test that keeps every pointer live; and `docs/getting-started.md`, with its exit-code
 table checked against source.
 
+**2026-09-12** (`92240bf`): `/rewind <seq>` left the session unable to accept input (`SessionConflict`
+on every submit) — now a fork at the sequence plus the switch `/fork` makes, with one shared busy-guard
+for `/fork`, `/resume` and `/rewind`.
+
 **2026-09-10** (`81674b0`..`4b28b59`): background jobs journaled, session-lived, and cancellable; the
 status bar showing model, policy and compiled context instead of dashes; `/models`, `/memory` and
 `/context` made real; `/diff` answering what the agent changed; `/fork` moving the session onto the
@@ -8026,19 +8033,31 @@ actually failed them.
    uses two (`agents`, `goals`). See this session's entry for the two traps: `trace_jobs`'s log path
    needs an `ArtifactRef` producer that does not exist anywhere in the workspace, and wiring it as-is
    would regress `/jobs` rows back to bare UUIDs.
-4. **`/agents cancel` and `/agents terminate`.** Still refused honestly. `KernelApi::Interrupt` is
+4. **Headless runs leave no record — the next task, investigated 2026-09-12.** `exec_turn` mints a
+   fresh `SessionId` for the execution request but never opens the ledger, creates a session, or
+   attaches the `LedgerJobEvents`/`LedgerWorkspaceChanges` sinks; it runs `run_live_exec` against an
+   in-memory `Vec<TurnEvent>`. So a `rapid exec` run that wrote files and ran commands is not in `rapid
+   sessions list`, cannot be `rapid resume`d, and has no `/diff`. The TUI records all of it. Both paths
+   bottom out in `run_live_exec`; the interactive wrapper (`execute_interactive_turn`, and the
+   submit → run → finish sequence in `run_interactive_turn_with_backing`) is the canonical one. The
+   change is for headless to use that same sequence with a tee sink, so it keeps its events for exit
+   codes and `--verbose` while the ledger gets the session — and to print the session id at the end so
+   the record is discoverable. It is a refactor of the most important production path (`exec_turn` is
+   ~400 lines with permission-mode resolution, `--json-schema` tool wrapping, the wall-time watchdog);
+   it wants a quiet machine and careful tests, which is why it was scoped and not started today.
+5. **`/agents cancel` and `/agents terminate`.** Still refused honestly. `KernelApi::Interrupt` is
    session-wide and takes no id, and there is no running-agent registry — subagents run *inside* the
    parent turn, and `host_runtime`/`agent-pool` is not used by the binary at all. Background agents are
    a feature, not wiring.
-5. ~~**Real diff hunks.**~~ **Done 2026-09-11** (entry above), in-tree Myers, latest write per file. What
+6. ~~**Real diff hunks.**~~ **Done 2026-09-11** (entry above), in-tree Myers, latest write per file. What
    remains here is a cumulative per-file diff and per-agent attribution, both needing state the write
    path does not keep. `/graph`, `/computer` and `/resources` are backed by subsystems the binary does
    not run, so each needs its feature before its panel.
-6. **Integration breadth**: daemon/ACP/SDK server, the MCP catalog subsystem and remote transports,
+7. **Integration breadth**: daemon/ACP/SDK server, the MCP catalog subsystem and remote transports,
    knowledge/playbooks, distribution and installability. All are honestly absent today (roadmap in
    `docs/reference/cli-command-reference.md`, absent from `SUBCOMMANDS`), so none of them lies — they
    are scope, not defects.
-7. **The both-ledgers case** still strands rows behind a printed notice (option C's accepted cost).
+8. **The both-ledgers case** still strands rows behind a printed notice (option C's accepted cost).
    Option D's merge is the follow-up if real installs turn out to hold both files.
 
 **Two things to know before touching this area again.** The event ledger is in **WAL** mode
