@@ -735,30 +735,10 @@ mod tests {
     fn supervised_cli_runner_drives_real_child_through_broker_lease() {
         use capability_broker::{
             ActionRequest, ApprovalChoice, ApprovalResolution, ApprovalScopeId, CanonicalAction,
-            ExecIntent, LeaseIssuer, LeaseValidator, PolicyDocument, PolicyRevision, PolicySource,
-            PolicyStack, Resolver, evaluate, issue, normalize_exec, request_approval, validate_use,
+            LeaseIssuer, LeaseValidator, PolicyDocument, PolicyRevision, PolicySource, PolicyStack,
+            evaluate, issue, request_approval, validate_use,
         };
         use std::time::Instant;
-
-        struct FrozenPathResolver;
-
-        impl Resolver for FrozenPathResolver {
-            fn resolve_cwd(
-                &self,
-                requested: &str,
-            ) -> Result<CanonicalHostPath, capability_broker::CommandNormalizeError> {
-                CanonicalHostPath::from_resolved(requested)
-            }
-
-            fn resolve_executable(
-                &self,
-                requested: &str,
-                _cwd: &CanonicalHostPath,
-            ) -> Result<CanonicalHostPath, capability_broker::CommandNormalizeError> {
-                CanonicalHostPath::from_resolved(requested)
-                    .map_err(|_| capability_broker::CommandNormalizeError::UnresolvedExecutable)
-            }
-        }
 
         let cancel = CancellationToken::new();
         let principal = PrincipalRef::parse("agent/main").expect("principal");
@@ -802,14 +782,9 @@ capability = "proc.exec"
         let guard = {
             let spec_ref = &spec;
             let binding = spec_ref.binding().expect("bound");
-            let env_names = spec_ref.env().keys().cloned();
-            let intent = match spec_ref.invocation() {
-                process_supervisor::Invocation::Argv { argv } => {
-                    ExecIntent::argv(argv.clone(), spec_ref.cwd().as_str().to_owned(), env_names)
-                }
-                _ => panic!("expected argv invocation"),
-            };
-            let command = normalize_exec(&intent, &FrozenPathResolver, &cancel).expect("canon");
+            // The lease is bound to the spec's own canonical command — the
+            // derivation `spawn` re-runs — not to a private rendering of it.
+            let command = spec_ref.canonical_command().expect("canon");
             let action = CanonicalAction::Command(command);
             let request = ActionRequest::new(
                 binding.principal().clone(),
@@ -850,14 +825,7 @@ capability = "proc.exec"
         let spec2 = runner.prepare(&task2, &cancel).expect("prepare2");
         let guard2 = {
             let binding = spec2.binding().expect("bound2");
-            let env_names = spec2.env().keys().cloned();
-            let intent = match spec2.invocation() {
-                process_supervisor::Invocation::Argv { argv } => {
-                    ExecIntent::argv(argv.clone(), spec2.cwd().as_str().to_owned(), env_names)
-                }
-                _ => panic!("expected argv invocation"),
-            };
-            let command = normalize_exec(&intent, &FrozenPathResolver, &cancel).expect("canon2");
+            let command = spec2.canonical_command().expect("canon2");
             let action = CanonicalAction::Command(command);
             let request = ActionRequest::new(
                 binding.principal().clone(),

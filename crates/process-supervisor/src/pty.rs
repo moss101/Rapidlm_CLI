@@ -46,6 +46,39 @@ impl fmt::Display for PtyError {
 
 impl Error for PtyError {}
 
+/// `script(1)` comes in two dialects. BSD's (macOS) takes the command as
+/// trailing positional arguments after the typescript file; util-linux's and
+/// busybox's (Linux) take one positional — the file — and the command as a
+/// `-c` string run through the shell. The Linux form is built by
+/// single-quoting every argv element (the one POSIX quoting that has no
+/// escapes inside it: `'` becomes `'\''`), so the shell sees exactly the
+/// argv it was given and nothing in it is interpreted. Passing BSD's form
+/// to util-linux's `script` produced an empty typescript and no error, which
+/// is how CI's first Linux run of this module found the difference.
+fn script_args(command: &mut Command, program: &str, args: &[&str]) {
+    #[cfg(target_os = "linux")]
+    {
+        let mut line = String::new();
+        for (i, word) in std::iter::once(program)
+            .chain(args.iter().copied())
+            .enumerate()
+        {
+            if i > 0 {
+                line.push(' ');
+            }
+            line.push('\'');
+            line.push_str(&word.replace('\'', "'\\''"));
+            line.push('\'');
+        }
+        command.args(["-q", "-c", line.as_str(), "/dev/null"]);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        command.args(["-q", "/dev/null", program]);
+        command.args(args);
+    }
+}
+
 impl PtySession {
     /// Spawn a command inside a newly allocated pseudo-terminal.
     ///
@@ -60,8 +93,7 @@ impl PtySession {
             return Err(PtyError::Cancelled);
         }
         let mut command = Command::new("script");
-        command.args(["-q", "/dev/null", program]);
-        command.args(args);
+        script_args(&mut command, program, args);
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());

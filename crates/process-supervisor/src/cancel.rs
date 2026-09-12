@@ -480,6 +480,10 @@ impl fmt::Display for TerminateReport {
     }
 }
 
+// Most of this module drives real processes and is `cfg(unix)` test by
+// test; the helpers and imports those tests share are dead on Windows, and
+// `-D warnings` there is not a finding about them.
+#[cfg_attr(not(unix), allow(dead_code, unused_imports))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,46 +600,7 @@ capability = "proc.exec"
     }
 
     fn spec_command(spec: &ExecSpec) -> capability_broker::CanonicalCommand {
-        use capability_broker::{ExecIntent, Resolver, normalize_exec};
-
-        struct FrozenPathResolver;
-        impl Resolver for FrozenPathResolver {
-            fn resolve_cwd(
-                &self,
-                requested: &str,
-            ) -> Result<
-                capability_broker::CanonicalHostPath,
-                capability_broker::CommandNormalizeError,
-            > {
-                capability_broker::CanonicalHostPath::from_resolved(requested)
-            }
-
-            fn resolve_executable(
-                &self,
-                requested: &str,
-                _cwd: &capability_broker::CanonicalHostPath,
-            ) -> Result<
-                capability_broker::CanonicalHostPath,
-                capability_broker::CommandNormalizeError,
-            > {
-                capability_broker::CanonicalHostPath::from_resolved(requested)
-                    .map_err(|_| capability_broker::CommandNormalizeError::UnresolvedExecutable)
-            }
-        }
-
-        let env_names = spec.env().keys().cloned();
-        let intent = match spec.invocation() {
-            crate::spawn::Invocation::Argv { argv } => {
-                ExecIntent::argv(argv.clone(), spec.cwd().as_str().to_owned(), env_names)
-            }
-            crate::spawn::Invocation::Shell { shell, script } => ExecIntent::shell(
-                shell.clone(),
-                script.clone(),
-                spec.cwd().as_str().to_owned(),
-                env_names,
-            ),
-        };
-        normalize_exec(&intent, &FrozenPathResolver, spec.cancel()).expect("canon")
+        spec.canonical_command().expect("canon")
     }
 
     fn temp_cwd() -> capability_broker::CanonicalHostPath {

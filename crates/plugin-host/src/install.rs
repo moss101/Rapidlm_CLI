@@ -1547,6 +1547,9 @@ mod tests {
         assert!(!installer.is_active("acme.fmt", &live()).expect("query"));
     }
 
+    // Unix symlink semantics; on Windows this test used to run its setup
+    // and then assert nothing, which is a pass that proves nothing.
+    #[cfg(unix)]
     #[test]
     fn symlink_install_target_is_rejected() {
         let tmp = TempRoot::create();
@@ -1554,21 +1557,18 @@ mod tests {
         let outside = tmp.dir.join("outside");
         fs::create_dir_all(&outside).expect("outside");
         let dest = installer.installed.join("acme.fmt");
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&outside, &dest).expect("symlink");
-            assert_eq!(
-                installer.install(&request(&package_bytes()), &live()),
-                Err(InstallError::UnsafePath)
-            );
-            assert!(
-                fs::symlink_metadata(&dest)
-                    .expect("meta")
-                    .file_type()
-                    .is_symlink()
-            );
-            assert!(outside.read_dir().expect("outside").next().is_none());
-        }
+        std::os::unix::fs::symlink(&outside, &dest).expect("symlink");
+        assert_eq!(
+            installer.install(&request(&package_bytes()), &live()),
+            Err(InstallError::UnsafePath)
+        );
+        assert!(
+            fs::symlink_metadata(&dest)
+                .expect("meta")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(outside.read_dir().expect("outside").next().is_none());
     }
 
     #[test]

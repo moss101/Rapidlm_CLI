@@ -392,7 +392,13 @@ impl ExecSpec {
         }
     }
 
-    fn canonical_command(&self) -> Result<CanonicalCommand, SpawnError> {
+    /// The canonical command a `proc.exec` lease must be bound to for this
+    /// spec — the same normalization `spawn` re-runs in `verify_lease_bound`,
+    /// through the live host resolver. A caller issuing a lease for a spec
+    /// must derive the action from here; a lease hashed from any other
+    /// rendering of the command (paths as typed, say, where `/bin` is a
+    /// symlink) is refused at spawn as `LeaseNotBound`.
+    pub fn canonical_command(&self) -> Result<CanonicalCommand, SpawnError> {
         let env_names = self.env.keys().cloned();
         let intent = match &self.invocation {
             Invocation::Argv { argv } => {
@@ -1036,6 +1042,10 @@ impl fmt::Display for ProcessGroupId {
     }
 }
 
+// Most of this module drives real processes and is `cfg(unix)` test by
+// test; the helpers and imports those tests share are dead on Windows, and
+// `-D warnings` there is not a finding about them.
+#[cfg_attr(not(unix), allow(dead_code, unused_imports))]
 #[cfg(test)]
 mod tests {
     use super::*;

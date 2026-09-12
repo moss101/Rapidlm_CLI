@@ -1930,6 +1930,10 @@ impl<'de> Deserialize<'de> for HookSpec {
     }
 }
 
+// Most of this module drives real processes and is `cfg(unix)` test by
+// test; the helpers and imports those tests share are dead on Windows, and
+// `-D warnings` there is not a finding about them.
+#[cfg_attr(not(unix), allow(dead_code, unused_imports))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1938,11 +1942,10 @@ mod tests {
 
     use capability_broker::{
         ActionRequest, ApprovalChoice, ApprovalResolution, ApprovalScopeId, CanonicalAction,
-        CanonicalHostPath, ExecIntent, LeaseIssuer, LeaseUseGuard, LeaseValidator,
-        LiveHostResolver, PolicyDocument, PolicyRevision, PolicySource, PolicyStack, evaluate,
-        issue, normalize_exec, request_approval, validate_use,
+        CanonicalHostPath, LeaseIssuer, LeaseUseGuard, LeaseValidator, PolicyDocument,
+        PolicyRevision, PolicySource, PolicyStack, evaluate, issue, request_approval, validate_use,
     };
-    use process_supervisor::{Invocation, SpawnError};
+    use process_supervisor::SpawnError;
 
     const CANARY: &str = "canary-secret-PLAINTEXT-do-not-leak-7c1e9b";
 
@@ -1986,29 +1989,13 @@ capability = "proc.exec"
     }
 
     // The lease must hash the *same* canonical command the supervisor will
-    // re-hash in `verify_lease_bound`, which resolves the executable and cwd
-    // through `LiveHostResolver` (`std::fs::canonicalize`). The previous
-    // test-only resolver used paths as typed and only agreed with production
-    // where nothing is a symlink: on Ubuntu `/bin` is a link to `/usr/bin`,
-    // so `/bin/sleep` hashed differently from its canonical form and every
-    // command hook failed `LeaseInvalid` the first time CI ran on Linux —
-    // the lease check refusing a real mismatch, in a lease the test built
-    // wrong.
+    // re-hash in `verify_lease_bound`; `ExecSpec::canonical_command` is that
+    // derivation. A private copy that used paths as typed agreed with it
+    // only where nothing is a symlink — on Ubuntu `/bin` is `/usr/bin`, and
+    // every command hook failed `LeaseInvalid` the first time CI ran there.
     fn lease_guard(spec: &ExecSpec) -> LeaseUseGuard {
         let binding = spec.binding().expect("bound spec");
-        let env_names = spec.env().keys().cloned();
-        let intent = match spec.invocation() {
-            Invocation::Argv { argv } => {
-                ExecIntent::argv(argv.clone(), spec.cwd().as_str().to_owned(), env_names)
-            }
-            Invocation::Shell { shell, script } => ExecIntent::shell(
-                shell.clone(),
-                script.clone(),
-                spec.cwd().as_str().to_owned(),
-                env_names,
-            ),
-        };
-        let command = normalize_exec(&intent, &LiveHostResolver, spec.cancel()).expect("canon");
+        let command = spec.canonical_command().expect("canon");
         let actual = CanonicalAction::Command(command);
         let request = ActionRequest::new(
             binding.principal().clone(),
