@@ -13,7 +13,7 @@ supported target and a SHA-256 beside it (`.github/workflows/release-matrix.yml`
 |---|---|
 | macOS, Apple silicon | `rapid-aarch64-apple-darwin.tar.gz` |
 | Linux, x86_64 | `rapid-x86_64-unknown-linux-gnu.tar.gz` |
-| Windows, x86_64 | `rapid-x86_64-pc-windows-msvc.zip` |
+| Windows, x86_64 | `rapid-x86_64-pc-windows-msvc.zip` — builds and lints on every push; the test suite is not yet run there, and job control, hooks and sandboxing are Unix-first (see below) |
 
 ```sh
 tar -xzf rapid-aarch64-apple-darwin.tar.gz     # or unzip the Windows archive
@@ -30,6 +30,14 @@ cargo install --path apps/rapid --locked
 
 `--locked` builds from exactly the lockfile that was tested. Nothing is fetched at
 runtime and nothing is written outside the directories named below.
+
+**Windows.** The archive is a real build of the same code, checked by CI's Windows job for
+compiling and linting clean on every push — but the test suite is exercised on macOS and Linux
+only, and the parts of RapidLM that drive processes are Unix-first: background jobs are signalled
+by process group, hooks run under `cmd /C` instead of `sh -c`, the PTY and sandbox tiers need
+Unix tools, and the daemon and its socket are Unix-only. Expect the model, transcript, files and
+settings to work and the process-heavy features to be incomplete until Windows gets its own test
+pass.
 
 ## First run
 
