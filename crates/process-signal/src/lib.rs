@@ -24,6 +24,8 @@
 //! one implementation without either depending on the other.
 
 use std::fmt;
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
 
 /// The two signals a termination sequence sends: `TERM` first, then `KILL`
 /// after the grace period.
@@ -73,6 +75,80 @@ pub fn signal_process_group(pgid: u32, signal: GroupSignal) -> Result<(), Signal
         return Err(SignalError::InvalidGroup);
     }
     platform::signal_group(pgid, signal)
+}
+
+/// Put the child `command` will spawn in its own process group — pgid ==
+/// pid on Unix, a new group on Windows — so that a group signal reaches
+/// exactly the tree it forks and nothing else. The counterpart of
+/// [`signal_process_group`]: without it the child shares the caller's
+/// group, and the "group" to signal would be the caller's own.
+pub fn isolate_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+}
+
+/// Grace between the group `TERM` and the group `KILL` in
+/// [`terminate_process_group`]: long enough for a cooperative child to
+/// flush and exit, short enough that a cancel feels immediate.
+pub const DEFAULT_TERM_GRACE: Duration = Duration::from_millis(80);
+
+/// How long [`terminate_process_group`] waits for the leader to exit after
+/// the group `KILL` before falling back to reaping the leader alone.
+pub const DEFAULT_KILL_WAIT: Duration = Duration::from_secs(2);
+
+/// Poll stride while waiting on the leader in [`terminate_process_group`].
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Stop a child spawned under [`isolate_process_group`] and everything it
+/// forked: `TERM` the group, wait up to `grace` for the leader to exit,
+/// then `KILL` the group *unconditionally* — a grandchild that trapped
+/// `TERM` (`trap "" TERM; sleep 10`) is still in the group after the
+/// leader has gone, and the group id stays valid while any member lives —
+/// wait up to `kill_wait`, and reap the leader. Whatever happens in
+/// between, the leader is killed and reaped before this returns, so the
+/// caller never leaves a zombie. Best-effort throughout: a signal failure
+/// is not an error here, since the leader is reaped regardless.
+pub fn terminate_process_group(child: &mut Child, grace: Duration, kill_wait: Duration) {
+    let pid = child.id();
+    if pid >= MIN_GROUP_ID {
+        let _ = signal_process_group(pid, GroupSignal::Term);
+        let _ = wait_leader(child, grace);
+        let _ = signal_process_group(pid, GroupSignal::Kill);
+        if wait_leader(child, kill_wait) {
+            return;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// [`terminate_process_group`] with [`DEFAULT_TERM_GRACE`] and
+/// [`DEFAULT_KILL_WAIT`].
+pub fn terminate_process_group_default(child: &mut Child) {
+    terminate_process_group(child, DEFAULT_TERM_GRACE, DEFAULT_KILL_WAIT);
+}
+
+/// `true` once the leader has been reaped within `budget`; `false` on the
+/// deadline or a `try_wait` error (the caller then escalates).
+fn wait_leader(child: &mut Child, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => std::thread::sleep(POLL_INTERVAL),
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// Whether a process with this pid exists — `kill(pid, 0)`, which delivers
@@ -212,6 +288,68 @@ mod tests {
             !process_exists(pid),
             "a reaped child still reported as alive"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_reaches_a_grandchild_that_traps_term() {
+        // The leader exits on TERM at once; its grandchild ignores TERM and
+        // would outlive a terminate that stopped once the leader was gone.
+        // The group KILL after the grace is what reaches it. The grandchild
+        // writes its pid to a file so the test can watch it die.
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-process-signal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = "(trap '' TERM; echo $$; exec sleep 30) & echo started; wait";
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", script])
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        isolate_process_group(&mut command);
+        let mut leader = command.spawn().expect("leader");
+        let mut lines = std::io::BufReader::new(leader.stdout.take().expect("stdout")).lines();
+        let mut grandchild: Option<u32> = None;
+        for _ in 0..2 {
+            let line = lines.next().expect("a line").expect("read");
+            if let Ok(pid) = line.trim().parse::<u32>() {
+                grandchild = Some(pid);
+            }
+        }
+        let grandchild = grandchild.expect("grandchild pid");
+        assert!(process_exists(grandchild));
+
+        let started = Instant::now();
+        terminate_process_group(
+            &mut leader,
+            Duration::from_millis(80),
+            Duration::from_secs(5),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "terminate waited the whole kill budget: {:?}",
+            started.elapsed()
+        );
+        let gone = Instant::now() + Duration::from_secs(5);
+        while process_exists(grandchild) {
+            assert!(
+                Instant::now() < gone,
+                "grandchild that trapped TERM survived the group KILL"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

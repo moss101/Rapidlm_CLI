@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use capability_broker::{CancellationToken, CanonicalHostPath, Capability, CapabilityLease};
-use process_signal::GroupSignal;
+use process_signal::{isolate_process_group, terminate_process_group_default};
 use protocol::{LeaseId, RepoPath, SandboxTier};
 
 use crate::backend::{
@@ -29,8 +29,6 @@ pub const MAX_LIVE_CONTAINER_SANDBOXES: usize = 64;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CANCEL_STRIDE: u32 = 8;
-const TERM_GRACE: Duration = Duration::from_millis(80);
-const KILL_WAIT: Duration = Duration::from_secs(2);
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Fixed bubblewrap paths. Never Docker, never `$PATH`.
@@ -873,12 +871,12 @@ fn probe_seccomp(program: &str, cancel: &CancellationToken) -> Result<bool, Sand
     match child.stdin.take() {
         Some(mut stdin) => {
             if stdin.write_all(&filter).is_err() {
-                terminate_process_group(&mut child);
+                terminate_process_group_default(&mut child);
                 return Ok(false);
             }
         }
         None => {
-            terminate_process_group(&mut child);
+            terminate_process_group_default(&mut child);
             return Ok(false);
         }
     }
@@ -890,18 +888,18 @@ fn wait_probe(child: &mut Child, cancel: &CancellationToken) -> Result<bool, San
     let mut polls = 0u32;
     loop {
         if polls.is_multiple_of(CANCEL_STRIDE) && cancel.is_cancelled() {
-            terminate_process_group(child);
+            terminate_process_group_default(child);
             return Err(SandboxError::Cancelled);
         }
         if started.elapsed() >= HEALTH_PROBE_TIMEOUT {
-            terminate_process_group(child);
+            terminate_process_group_default(child);
             return Ok(false);
         }
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status.success()),
             Ok(None) => thread::sleep(POLL_INTERVAL),
             Err(_) => {
-                terminate_process_group(child);
+                terminate_process_group_default(child);
                 return Ok(false);
             }
         }
@@ -952,12 +950,12 @@ fn run_container(
     match child.stdin.take() {
         Some(mut stdin) => {
             if stdin.write_all(&filter).is_err() {
-                terminate_process_group(&mut child);
+                terminate_process_group_default(&mut child);
                 return Err(SandboxError::HealthFailed);
             }
         }
         None => {
-            terminate_process_group(&mut child);
+            terminate_process_group_default(&mut child);
             return Err(SandboxError::HealthFailed);
         }
     }
@@ -1120,14 +1118,14 @@ fn wait_child(
     let stdout = match child.stdout.take() {
         Some(pipe) => pipe,
         None => {
-            terminate_process_group(child);
+            terminate_process_group_default(child);
             return WaitOutcome::Failed;
         }
     };
     let stderr = match child.stderr.take() {
         Some(pipe) => pipe,
         None => {
-            terminate_process_group(child);
+            terminate_process_group_default(child);
             return WaitOutcome::Failed;
         }
     };
@@ -1139,12 +1137,12 @@ fn wait_child(
     let pgid = child.id();
     let status = loop {
         if polls.is_multiple_of(CANCEL_STRIDE) && cancel.is_cancelled() {
-            terminate_process_group(child);
+            terminate_process_group_default(child);
             let output = join_output(stdout_thread, stderr_thread);
             return WaitOutcome::Cancelled { output, usage };
         }
         if started.elapsed() >= timeout {
-            terminate_process_group(child);
+            terminate_process_group_default(child);
             let output = join_output(stdout_thread, stderr_thread);
             return WaitOutcome::TimedOut { output, usage };
         }
@@ -1152,12 +1150,12 @@ fn wait_child(
             usage.pids_peak = usage.pids_peak.max(sample.0);
             usage.memory_peak_mb = usage.memory_peak_mb.max(sample.1);
             if sample.1 > u64::from(plan.memory_mb) {
-                terminate_process_group(child);
+                terminate_process_group_default(child);
                 let output = join_output(stdout_thread, stderr_thread);
                 return WaitOutcome::Oom { output, usage };
             }
             if sample.0 > plan.pids {
-                terminate_process_group(child);
+                terminate_process_group_default(child);
                 let output = join_output(stdout_thread, stderr_thread);
                 return WaitOutcome::PidsExceeded { output, usage };
             }
@@ -1166,7 +1164,7 @@ fn wait_child(
             Ok(Some(status)) => break status,
             Ok(None) => thread::sleep(POLL_INTERVAL),
             Err(_) => {
-                terminate_process_group(child);
+                terminate_process_group_default(child);
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
                 return WaitOutcome::Failed;
@@ -1219,53 +1217,6 @@ fn read_capped(mut pipe: impl Read, cap: usize) -> (Vec<u8>, bool) {
             Err(_) => return (buf, false),
         }
     }
-}
-
-fn isolate_process_group(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
-    }
-}
-
-fn terminate_process_group(child: &mut Child) {
-    let pid = child.id();
-    if pid >= 2 {
-        let _ = signal_group(pid, GroupSignal::Term);
-        let grace_deadline = Instant::now() + TERM_GRACE;
-        while Instant::now() < grace_deadline {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => thread::sleep(POLL_INTERVAL),
-                Err(_) => break,
-            }
-        }
-        let _ = signal_group(pid, GroupSignal::Kill);
-        let kill_deadline = Instant::now() + KILL_WAIT;
-        while Instant::now() < kill_deadline {
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => thread::sleep(POLL_INTERVAL),
-                Err(_) => break,
-            }
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-/// One group signal, by `kill(2)` — never `kill(1)`, whose procps-ng parser
-/// made `-<pgid>` the broadcast (see `process_signal`). An absent group is
-/// `Ok`; anything else is the backend's health failure.
-fn signal_group(pgid: u32, kind: GroupSignal) -> Result<(), SandboxError> {
-    process_signal::signal_process_group(pgid, kind).map_err(|_| SandboxError::HealthFailed)
 }
 
 fn sample_process_group(pgid: u32) -> Option<(u32, u64)> {

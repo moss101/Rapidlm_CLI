@@ -708,22 +708,8 @@ impl Prepared {
                 command.stdin(Stdio::piped());
             }
         }
-        isolate_process_group(&mut command);
+        process_signal::isolate_process_group(&mut command);
         command
-    }
-}
-
-fn isolate_process_group(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
 }
 

@@ -42,6 +42,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use capability_broker::{CancellationToken, CanonicalHostPath, Capability, CapabilityLease};
+use process_signal::{isolate_process_group, terminate_process_group_default};
 use protocol::{LeaseId, SandboxTier};
 
 use crate::backend::{
@@ -51,8 +52,7 @@ use crate::backend::{
     SandboxSpec,
 };
 use crate::backends::host_restricted::{
-    is_forbidden_host_source, isolate_process_group, resolve_cwd, resolve_existing_dir,
-    sample_process_group, terminate_process_group,
+    is_forbidden_host_source, resolve_cwd, resolve_existing_dir, sample_process_group,
 };
 
 /// Maximum prepared Seatbelt sandboxes retained by one backend.
@@ -492,20 +492,20 @@ fn wait_child(
             break Ok(status);
         }
         if cancel.is_cancelled() {
-            terminate_process_group(child);
+            terminate_process_group_default(child);
             break Err(Stop::Cancelled);
         }
         if Instant::now() >= deadline {
-            terminate_process_group(child);
+            terminate_process_group_default(child);
             break Err(Stop::Timeout);
         }
         if let Some((group_pids, memory_peak_mb)) = sample_process_group(pgid) {
             if memory_peak_mb > u64::from(memory_mb) {
-                terminate_process_group(child);
+                terminate_process_group_default(child);
                 break Err(Stop::Oom);
             }
             if group_pids > pids {
-                terminate_process_group(child);
+                terminate_process_group_default(child);
                 break Err(Stop::PidsExceeded);
             }
         }
