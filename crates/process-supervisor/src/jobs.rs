@@ -1375,6 +1375,9 @@ fn ensure_private_dir(path: &Path) -> Result<(), JobError> {
 }
 
 fn create_private_dir(path: &Path) -> Result<(), JobError> {
+    // Only the Unix mode bits mutate the builder; `mut` is scoped with them
+    // so a Windows build does not fail `-D unused_mut`.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {

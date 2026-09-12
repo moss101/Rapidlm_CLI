@@ -274,10 +274,20 @@ mod linux_live {
         )
         .unwrap();
         let c = CancellationToken::new();
+        let probe = kc.probe();
         assert!(matches!(
-            kc.probe().kind(),
+            probe.kind(),
             PlatformKeychainKind::FreedesktopSecretService
         ));
+        // A live round trip needs a running Secret Service (gnome-keyring
+        // on a session D-Bus). The plain `ci.yml` Linux job has none — only
+        // the release workflow installs one — and the first CI run failed
+        // here with `KeychainUnavailable`. Its absence is a fact about the
+        // host, not about this backend, and is reported rather than failed.
+        if !probe.is_available() {
+            eprintln!("skipped: no Secret Service is available on this host");
+            return;
+        }
         kc.put(&item, b"secret-1", &c).unwrap();
         assert_eq!(kc.get(&item, &c).unwrap(), b"secret-1".to_vec());
         kc.put(&item, b"rotated", &c).unwrap();

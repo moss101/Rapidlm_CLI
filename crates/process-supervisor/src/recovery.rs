@@ -30,7 +30,9 @@ const KILL_WAIT: Duration = Duration::from_secs(2);
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Hard ceiling for a `ps` observation payload.
+/// Hard ceiling for a `ps` observation payload. Used only by the
+/// `cfg(unix)` observation paths, and gated with them.
+#[cfg(unix)]
 const MAX_PS_OUTPUT_BYTES: usize = 4 * 1024;
 
 /// Absolute `kill(1)` paths. Never PATH-search an untrusted executable.
@@ -682,6 +684,8 @@ fn parse_etime(raw: &str) -> Option<u64> {
     days.checked_mul(86_400)?.checked_add(secs)
 }
 
+// Used only by the `cfg(unix)` liveness check; gated with it.
+#[cfg(unix)]
 fn unix_now_ms() -> Option<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -5292,7 +5292,11 @@ denied\n",
                     if self.refuse_if_busy("forking")? {
                         return Ok(());
                     }
-                    let seq = self.ui.snapshot().map(|s| s.seq()).unwrap_or(0);
+                    // The ledger's tip, for the same reason `submit_turn`
+                    // uses it: forking at the lagging projection's seq
+                    // would branch from *before* the last turn's terminal
+                    // events, silently leaving them out of the child.
+                    let seq = self.session_tip()?;
                     let child = block_on(
                         self.client.fork_session(ForkSession::new(
                             self.session_id,
@@ -5395,6 +5399,13 @@ the full history, where `/diff` lists every file it wrote\n"
         self.drain()
     }
 
+    /// The session's current sequence as the ledger has it — the number an
+    /// optimistic `expected_seq` must name. The UI projection's own seq lags
+    /// this by the live-tail poll interval and must not be used for it.
+    fn session_tip(&self) -> Result<u64, InteractiveError> {
+        Ok(block_on(self.client.get_session(self.session_id), self.cancel)?.seq())
+    }
+
     fn submit_turn(&mut self, text: &str) -> Result<(), InteractiveError> {
         if self.ui.actions_blocked() {
             return Ok(());
@@ -5411,7 +5422,19 @@ the full history, where `/diff` lists every file it wrote\n"
         {
             return Ok(());
         }
-        let expected_seq = self.ui.snapshot().map(|s| s.seq()).unwrap_or(0);
+        // The kernel's own tip, not the projection's seq. The projection
+        // lags the ledger by the live-tail poll interval (see
+        // `drain_kernel_events`), and a turn that just finished on its own
+        // thread appended its terminal events *after* the last drain and
+        // *before* clearing `turn_in_flight` — so the projection's seq is
+        // stale in exactly the window a user (or the autonomous loop)
+        // submits next. That stale seq hit `SessionConflict`, and the
+        // error ended the whole session. `expected_seq` exists to catch a
+        // concurrent *writer*, and this session's own lag is not one; the
+        // tip read here still catches a genuine one between this read and
+        // the submit. Found by the first CI run on a shared macOS runner,
+        // where the window is wide enough to hit every time.
+        let expected_seq = self.session_tip()?;
         let handle = block_on(
             self.client.submit_turn(SubmitTurn::new(
                 self.session_id,
