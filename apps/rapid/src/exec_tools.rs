@@ -77,6 +77,13 @@ pub const PLAN_PATH: &str = ".rapidlm/plan.md";
 pub const MAX_BACKGROUND_JOBS: usize = 16;
 /// Poll interval for background job supervision.
 pub const JOB_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How long a finished job's supervisor waits for its output readers to
+/// reach EOF before recording the job as done. The child has exited, so
+/// its pipes close and the readers finish in microseconds — unless a
+/// grandchild it left behind still holds the pipe, which is what the
+/// bound is for: the completion is never delayed past it, and the spool
+/// may still grow after it in that one case.
+pub const JOB_OUTPUT_SETTLE: Duration = Duration::from_millis(250);
 /// Hard byte cap on one background job's spooled output.
 pub const MAX_JOB_OUTPUT_BYTES: usize = 64 * 1024;
 /// Default wall-clock budget for one background job.
@@ -347,6 +354,19 @@ pub struct JobRegistry {
     events: Option<Arc<dyn JobEvents>>,
 }
 
+/// Wait up to `budget` for every output reader to finish — they do the
+/// moment the child's pipes close — polling rather than joining, so a pipe
+/// a grandchild still holds open cannot hold the job's completion hostage.
+fn settle_output(readers: &[std::thread::JoinHandle<()>], budget: Duration) {
+    let deadline = Instant::now() + budget;
+    while readers.iter().any(|reader| !reader.is_finished()) {
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 impl JobRegistry {
     /// Report this registry's jobs to `events` as well as to the model.
     pub(crate) fn set_events(&mut self, events: Arc<dyn JobEvents>) {
@@ -579,6 +599,16 @@ impl JobRegistry {
                             .flatten()
                     };
                     if let Some(status) = done {
+                        // The exit status is known, but the last bytes the
+                        // child wrote may still be in flight between the OS
+                        // pipe and the spool. Recording the job as done
+                        // before they land let `job_output`, `job_status`'s
+                        // reader, and an open `/jobs logs` view see a
+                        // completed job with its tail missing — the view
+                        // stops re-reading a finished job, so the tail was
+                        // never shown at all. Let the readers reach EOF
+                        // first, bounded.
+                        settle_output(&readers, JOB_OUTPUT_SETTLE);
                         // `kill_all` sets `cancelled` and *then* kills the
                         // child, so by the time this loop notices, a job we
                         // stopped looks like an ordinary exit — and the old
@@ -618,6 +648,7 @@ impl JobRegistry {
                             let _ = child.kill();
                             let _ = child.wait();
                         }
+                        settle_output(&readers, JOB_OUTPUT_SETTLE);
                         if let Ok(mut state) = worker.state.lock() {
                             *state = JobState::Failed("cancelled at shutdown".to_owned());
                         }
@@ -633,6 +664,7 @@ impl JobRegistry {
                             let _ = child.kill();
                             let _ = child.wait();
                         }
+                        settle_output(&readers, JOB_OUTPUT_SETTLE);
                         if let Ok(mut state) = worker.state.lock() {
                             *state = JobState::Failed("timed out".to_owned());
                         }

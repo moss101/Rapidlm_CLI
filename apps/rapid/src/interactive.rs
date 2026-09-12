@@ -5552,20 +5552,32 @@ the full history, where `/diff` lists every file it wrote\n"
     /// two readers stay in step.
     ///
     /// Costs nothing on an idle session: a job that has stopped can never
-    /// add to its spool again, so only a live job is re-read.
+    /// add to its spool again, so a page read *after* it stopped is final
+    /// and never re-read. A page read while it ran is re-read every tick,
+    /// and once more on the tick that sees it stop — the lines the job
+    /// wrote between the last live read and its exit are on that final
+    /// page and nowhere else. Skipping that read left a finished job's
+    /// last output off the screen for good (CI's Linux runner, where the
+    /// job's exit and its last line landed inside one tick).
     fn refresh_job_logs(&mut self) {
-        let Some(job) = self.ui.job_logs().map(tui::state::JobLogView::job) else {
+        let Some(view) = self.ui.job_logs() else {
             return;
         };
+        if view.is_complete() {
+            return;
+        }
+        let job = view.job();
         let still_running = self
             .ui
             .jobs()
             .get(&job)
             .is_some_and(|projected| !projected.state().is_terminal());
-        if !still_running {
-            return;
-        }
         let refreshed = self.job_log_page(job);
+        let refreshed = if still_running {
+            refreshed
+        } else {
+            refreshed.completed()
+        };
         *self.ui = reduce(
             self.ui.clone(),
             &UiEvent::Local(LocalUiEvent::SyncJobLogs(Some(refreshed))),
@@ -11789,6 +11801,122 @@ was already finished"
         assert!(
             !body.contains("333"),
             "and not an older one's output: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn an_open_logs_view_shows_the_lines_a_job_wrote_just_before_it_stopped() {
+        // Open the view while the job is running, then look away until the
+        // job has written its last line and exited. The first tick after
+        // that sees the job stop; the last line is in the spool and nowhere
+        // else, and a view that stops re-reading a finished job would keep
+        // showing the page it opened with. CI's Linux runner made exactly
+        // this happen: the job's exit and its last line inside one tick.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "start a job that writes once more before it exits",
+            ScriptedModel::background_job_then_answer(
+                &[
+                    "/bin/sh",
+                    "-c",
+                    "echo $((1000 + 1)); sleep 1; echo $((2000 + 2))",
+                ],
+                "started it",
+            ),
+        );
+        session.drain_until("the first line to be spooled", |state| {
+            !state.jobs().is_empty()
+        });
+
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = session.state().clone();
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(Vec::new());
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight.clone(),
+            backings,
+        );
+        loop_state.dispatch_slash("/jobs logs").expect("dispatch");
+        let job = loop_state.ui.job_logs().expect("view open").job();
+        assert!(
+            !loop_state
+                .ui
+                .job_logs()
+                .expect("view")
+                .lines()
+                .iter()
+                .any(|l| l.contains("2002")),
+            "the view opened before the last line existed"
+        );
+
+        // Look away: no ticks until the last line is spooled and the job
+        // has had time to be recorded as done.
+        let spooled = Instant::now() + Duration::from_secs(10);
+        while !loop_state
+            .jobs
+            .logs(job)
+            .is_some_and(|(text, _)| text.contains("2002"))
+        {
+            assert!(
+                Instant::now() < spooled,
+                "the job never wrote its last line"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(
+            crate::exec_tools::JOB_POLL_INTERVAL * 3 + crate::exec_tools::JOB_OUTPUT_SETTLE,
+        );
+
+        // Now tick until the projection sees the job stop; on that tick the
+        // view must already carry the last line.
+        let terminal_seen = Instant::now() + Duration::from_secs(10);
+        loop {
+            loop_state.drain().expect("drain");
+            let terminal = loop_state
+                .ui
+                .jobs()
+                .get(&job)
+                .is_some_and(|projected| projected.state().is_terminal());
+            if terminal {
+                break;
+            }
+            assert!(Instant::now() < terminal_seen, "the job never stopped");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let painted = tui::sidebar_lines(
+            tui::state::UiRoute::Jobs,
+            loop_state.ui,
+            70,
+            12,
+            &tui::state::CancellationToken::new(),
+        );
+        assert!(
+            painted.iter().any(|line| line.contains("2002")),
+            "the tick that saw the job stop must show what it wrote last: {painted:?}"
+        );
+        assert!(
+            loop_state.ui.job_logs().expect("view").is_complete(),
+            "a page read after the job stopped is final"
         );
     }
 

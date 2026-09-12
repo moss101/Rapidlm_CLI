@@ -1091,6 +1091,12 @@ pub struct JobLogView {
     lines: Vec<String>,
     /// The producer cut the output short of what the process actually wrote.
     truncated: bool,
+    /// This page was read after the job had already stopped, so it is the
+    /// whole log and need not be re-read. A page read while the job ran is
+    /// re-read on every tick — including the one tick after the job stops,
+    /// which is how the last lines it wrote get onto the screen.
+    #[serde(default)]
+    complete: bool,
 }
 
 impl JobLogView {
@@ -1104,7 +1110,19 @@ impl JobLogView {
             job,
             lines,
             truncated,
+            complete: false,
         }
+    }
+
+    /// Mark this page as read after the job stopped — the final one.
+    #[must_use]
+    pub fn completed(mut self) -> Self {
+        self.complete = true;
+        self
+    }
+
+    pub const fn is_complete(&self) -> bool {
+        self.complete
     }
 
     pub const fn job(&self) -> JobId {
