@@ -52,8 +52,9 @@ use crate::backend::{
     SandboxSpec,
 };
 use crate::backends::host_restricted::{
-    is_forbidden_host_source, resolve_cwd, resolve_existing_dir, sample_process_group,
+    is_forbidden_host_source, resolve_cwd, resolve_existing_dir,
 };
+use crate::backends::process_sample::{first_existing, sample_process_group};
 
 /// Maximum prepared Seatbelt sandboxes retained by one backend.
 pub const MAX_LIVE_SEATBELT_SANDBOXES: usize = 64;
@@ -74,13 +75,6 @@ exec "$@""#;
 fn sandbox_exec_binary() -> Option<&'static str> {
     ["/usr/bin/sandbox-exec", "/bin/sandbox-exec"]
         .into_iter()
-        .find(|path| Path::new(path).is_file())
-}
-
-fn first_existing(candidates: &[&'static str]) -> Option<&'static str> {
-    candidates
-        .iter()
-        .copied()
         .find(|path| Path::new(path).is_file())
 }
 

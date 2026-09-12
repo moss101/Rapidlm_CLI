@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 use capability_broker::{CancellationToken, CanonicalHostPath, Capability, CapabilityLease};
 use process_signal::{isolate_process_group, terminate_process_group_default};
+
+use crate::backends::process_sample::{first_existing, sample_process_group};
 use protocol::{LeaseId, RepoPath, RuntimeId, SandboxTier};
 
 use crate::backend::{
@@ -39,8 +41,6 @@ const RUNSC_PROGRAMS: &[&str] = &["/usr/bin/runsc", "/usr/local/bin/runsc", "/bi
 const TRUE_PROGRAMS: &[&str] = &["/usr/bin/true", "/bin/true"];
 const TEST_PROGRAMS: &[&str] = &["/usr/bin/test", "/bin/test"];
 const LS_PROGRAMS: &[&str] = &["/usr/bin/ls", "/bin/ls"];
-const PS_PROGRAMS: &[&str] = &["/bin/ps", "/usr/bin/ps"];
-const PGREP_PROGRAMS: &[&str] = &["/usr/bin/pgrep", "/bin/pgrep"];
 
 const PLATFORMS: &[&str] = &["systrap", "ptrace"];
 
@@ -994,13 +994,6 @@ fn is_host_network_flag(part: &str) -> bool {
         || lower == "--network=host=true"
 }
 
-fn first_existing(candidates: &[&'static str]) -> Option<&'static str> {
-    candidates
-        .iter()
-        .copied()
-        .find(|path| Path::new(path).is_file())
-}
-
 fn cpu_limit_seconds(cpu_millis: u32) -> u64 {
     u64::from(cpu_millis.div_ceil(1_000)).max(1)
 }
@@ -1906,99 +1899,6 @@ fn read_capped(mut pipe: impl Read, cap: usize) -> (Vec<u8>, bool) {
             Err(_) => return (buf, false),
         }
     }
-}
-
-fn sample_process_group(pgid: u32) -> Option<(u32, u64)> {
-    if pgid < 2 {
-        return None;
-    }
-    let pids = group_pids(pgid)?;
-    if pids.is_empty() {
-        return None;
-    }
-    let count = u32::try_from(pids.len()).unwrap_or(u32::MAX);
-    let mut rss_kb = 0u64;
-    for pid in &pids {
-        rss_kb = rss_kb.saturating_add(pid_rss_kb(*pid)?);
-    }
-    let memory_mb = rss_kb.div_ceil(1024);
-    Some((count, memory_mb))
-}
-
-fn group_pids(pgid: u32) -> Option<Vec<u32>> {
-    if let Some(pids) = pgrep_group(pgid) {
-        return Some(pids);
-    }
-    ps_group(pgid)
-}
-
-fn pgrep_group(pgid: u32) -> Option<Vec<u32>> {
-    let program = first_existing(PGREP_PROGRAMS)?;
-    let output = Command::new(program)
-        .args(["-g", &pgid.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .env_clear()
-        .output()
-        .ok()?;
-    let mut pids = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if let Ok(pid) = line.trim().parse::<u32>()
-            && pid >= 2
-        {
-            pids.push(pid);
-        }
-    }
-    if pids.is_empty() { None } else { Some(pids) }
-}
-
-fn ps_group(pgid: u32) -> Option<Vec<u32>> {
-    let program = first_existing(PS_PROGRAMS)?;
-    let output = Command::new(program)
-        .args(["-ax", "-o", "pid=,pgid="])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .env_clear()
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let mut pids = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let mut cols = line.split_whitespace();
-        let Some(pid) = cols.next().and_then(|c| c.parse::<u32>().ok()) else {
-            continue;
-        };
-        let Some(group) = cols.next().and_then(|c| c.parse::<u32>().ok()) else {
-            continue;
-        };
-        if group == pgid && pid >= 2 {
-            pids.push(pid);
-        }
-    }
-    if pids.is_empty() { None } else { Some(pids) }
-}
-
-fn pid_rss_kb(pid: u32) -> Option<u64> {
-    let program = first_existing(PS_PROGRAMS)?;
-    let output = Command::new(program)
-        .args(["-o", "rss=", "-p", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .env_clear()
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .next()
-        .and_then(|col| col.parse::<u64>().ok())
 }
 
 fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
