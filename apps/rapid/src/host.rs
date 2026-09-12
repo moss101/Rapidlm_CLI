@@ -55,6 +55,67 @@ pub const MAX_SYSTEM_PROMPT_BLOCK_BYTES: usize = 32 * 1024;
 /// 25 KB).
 pub const MAX_MEMORY_INDEX_LINES: usize = 200;
 pub const MAX_MEMORY_INDEX_BYTES: usize = 25 * 1024;
+
+/// Most prior turns a live turn carries into the model's context. Older
+/// turns are dropped first, and the compile's memory partition trims
+/// further under budget pressure (see `build_packet`). A session's full
+/// history stays in the ledger; this is what one turn re-reads of it.
+pub const MAX_CONVERSATION_TURNS: usize = 32;
+
+/// One earlier turn of the session as the model sees it on a later turn:
+/// what the user asked and how the turn ended. The transcript the user
+/// sees is a display projection; this is read from the ledger's own
+/// `turn.started`/`turn.*` terminal events, the record of what was said.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConversationTurn {
+    user: String,
+    outcome: ConversationOutcome,
+}
+
+/// How an earlier turn ended, as the model should understand it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConversationOutcome {
+    /// The assistant's final text, when it produced one.
+    Answered(Option<String>),
+    Failed(String),
+    Interrupted,
+}
+
+impl ConversationTurn {
+    pub fn new(user: impl Into<String>, outcome: ConversationOutcome) -> Self {
+        Self {
+            user: user.into(),
+            outcome,
+        }
+    }
+
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
+    pub fn outcome(&self) -> &ConversationOutcome {
+        &self.outcome
+    }
+
+    /// The block text: the user's words verbatim, then how the turn ended.
+    fn render(&self) -> String {
+        let mut text = String::with_capacity(self.user.len() + 64);
+        text.push_str("[user]\n");
+        text.push_str(&self.user);
+        text.push_str("\n[assistant]\n");
+        match &self.outcome {
+            ConversationOutcome::Answered(Some(answer)) => text.push_str(answer),
+            ConversationOutcome::Answered(None) => text.push_str("(finished without a reply)"),
+            ConversationOutcome::Failed(reason) => {
+                text.push_str("(the turn failed: ");
+                text.push_str(reason);
+                text.push(')');
+            }
+            ConversationOutcome::Interrupted => text.push_str("(the turn was interrupted)"),
+        }
+        text
+    }
+}
 /// Read cap for `.rapidlm/todos.json`, well above the legitimate maximum
 /// (`MAX_TODOS` entries at `MAX_TODO_CONTENT_BYTES` each plus JSON
 /// overhead) so any realistically-written file always parses; an oversized
@@ -129,6 +190,7 @@ pub struct PreservedLiveContext {
     todos_index: Option<String>,
     stall_warning: Option<String>,
     retrieved_context: Vec<CompileInput>,
+    conversation: Vec<ConversationTurn>,
 }
 
 impl PreservedLiveContext {
@@ -171,7 +233,23 @@ impl PreservedLiveContext {
             todos_index: None,
             stall_warning: None,
             retrieved_context: Vec::new(),
+            conversation: Vec::new(),
         })
+    }
+
+    /// Attach the session's earlier turns, oldest first. Only the newest
+    /// [`MAX_CONVERSATION_TURNS`] are kept here; the compile trims further.
+    pub fn with_conversation(mut self, turns: Vec<ConversationTurn>) -> Self {
+        let mut turns = turns;
+        if turns.len() > MAX_CONVERSATION_TURNS {
+            turns.drain(..turns.len() - MAX_CONVERSATION_TURNS);
+        }
+        self.conversation = turns;
+        self
+    }
+
+    pub fn conversation(&self) -> &[ConversationTurn] {
+        &self.conversation
     }
 
     /// Attach proactively-retrieved repo content for this turn (Context
@@ -1529,11 +1607,44 @@ pub fn load_todos_index(root: &Path) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// Locator prefix of the conversation blocks `build_packet` emits, one per
+/// earlier turn: `conversation/turn-<n>`, `n` counting from the oldest kept.
+pub const CONVERSATION_LOCATOR_PREFIX: &str = "conversation/turn-";
+
 /// Compile a live [`ContextPacket`] from preserved state + optional compaction
 /// summary. This is the single Context-Fabric rebuild path.
+///
+/// The session's earlier turns go in as one memory block each, in order.
+/// Memory is an optional partition, so under pressure the compiler drops
+/// blocks — by its own ranking, which for equal-scored blocks is not
+/// "oldest first". A conversation with a hole in the middle is worse than a
+/// shorter one, so when any conversation block was dropped the oldest turn
+/// is removed and the packet compiled again, until every turn that is
+/// carried fits. Bounded by the turn count; each compile is local and
+/// fast.
 pub fn build_packet(
     preserved: &PreservedLiveContext,
     summary: Option<&str>,
+) -> Result<ContextPacket, CompileError> {
+    let mut skip_oldest = 0;
+    loop {
+        let packet = build_packet_with(preserved, summary, skip_oldest)?;
+        let carried = preserved.conversation.len().saturating_sub(skip_oldest);
+        let dropped_turn = packet
+            .dropped()
+            .iter()
+            .any(|block| block.locator().starts_with(CONVERSATION_LOCATOR_PREFIX));
+        if !dropped_turn || carried == 0 {
+            return Ok(packet);
+        }
+        skip_oldest += 1;
+    }
+}
+
+fn build_packet_with(
+    preserved: &PreservedLiveContext,
+    summary: Option<&str>,
+    skip_oldest: usize,
 ) -> Result<ContextPacket, CompileError> {
     let mut ctx = CompileContext::new(preserved.context_limit, preserved.output_reserve)
         .task("live agent turn")
@@ -1576,6 +1687,12 @@ pub fn build_packet(
     if let Some(reminders) = preserved.reminders_block() {
         ctx = ctx.system(CompileInput::new("reminders/active", reminders.to_owned()));
     }
+    for (index, turn) in preserved.conversation.iter().enumerate().skip(skip_oldest) {
+        ctx = ctx.memory(CompileInput::new(
+            format!("{CONVERSATION_LOCATOR_PREFIX}{index}"),
+            turn.render(),
+        ));
+    }
     for block in preserved.retrieved_context() {
         ctx = ctx.retrieved(block.clone());
     }
@@ -1602,6 +1719,97 @@ mod tests {
                 summary: "ok".to_owned(),
             }],
         )
+    }
+
+    fn conversation_of(n: usize, words_per_turn: usize) -> Vec<ConversationTurn> {
+        (0..n)
+            .map(|i| {
+                let user = format!("turn {i} question ") + &"lorem ".repeat(words_per_turn);
+                let answer = format!("turn {i} answer ") + &"ipsum ".repeat(words_per_turn);
+                ConversationTurn::new(user, ConversationOutcome::Answered(Some(answer)))
+            })
+            .collect()
+    }
+
+    fn carried_turns(packet: &ContextPacket) -> Vec<usize> {
+        packet
+            .blocks()
+            .iter()
+            .filter_map(|block| {
+                block
+                    .locator()
+                    .strip_prefix(CONVERSATION_LOCATOR_PREFIX)
+                    .and_then(|n| n.parse().ok())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn conversation_blocks_are_carried_in_order_and_the_oldest_go_first_under_pressure() {
+        let turns = conversation_of(4, 120);
+        let mut previous = 0usize;
+        for context_limit in [900u32, 1_400, 2_000, 3_000, 6_000, 40_000] {
+            let preserved =
+                PreservedLiveContext::new("goal", Vec::new(), "", "", context_limit, 128)
+                    .expect("preserved")
+                    .with_conversation(turns.clone());
+            let packet = build_packet(&preserved, None).expect("compile");
+            let carried = carried_turns(&packet);
+            // Chronological, and a suffix of the history: never a hole.
+            let expected: Vec<usize> = (turns.len() - carried.len()..turns.len()).collect();
+            assert_eq!(carried, expected, "limit {context_limit}");
+            assert!(
+                carried.len() >= previous,
+                "more room never carries fewer turns"
+            );
+            previous = carried.len();
+            let rendered: Vec<&str> = packet
+                .blocks()
+                .iter()
+                .filter(|b| b.locator().starts_with(CONVERSATION_LOCATOR_PREFIX))
+                .map(|b| b.text())
+                .collect();
+            for (text, i) in rendered.iter().zip(&carried) {
+                assert!(
+                    text.contains(&format!("turn {i} question")),
+                    "block order follows turn order"
+                );
+            }
+        }
+        assert_eq!(previous, turns.len(), "at 40k tokens all four turns fit");
+    }
+
+    #[test]
+    fn a_conversation_turn_renders_the_user_verbatim_and_says_how_it_ended() {
+        let answered = ConversationTurn::new(
+            "rename it",
+            ConversationOutcome::Answered(Some("Renamed.".to_owned())),
+        )
+        .render();
+        assert_eq!(answered, "[user]\nrename it\n[assistant]\nRenamed.");
+        let failed =
+            ConversationTurn::new("try", ConversationOutcome::Failed("model down".to_owned()))
+                .render();
+        assert!(
+            failed.ends_with("(the turn failed: model down)"),
+            "{failed}"
+        );
+        let interrupted = ConversationTurn::new("go", ConversationOutcome::Interrupted).render();
+        assert!(
+            interrupted.ends_with("(the turn was interrupted)"),
+            "{interrupted}"
+        );
+        let silent = ConversationTurn::new("hm", ConversationOutcome::Answered(None)).render();
+        assert!(silent.ends_with("(finished without a reply)"), "{silent}");
+    }
+
+    #[test]
+    fn only_the_newest_turns_are_kept_past_the_cap() {
+        let preserved = PreservedLiveContext::new("goal", Vec::new(), "", "", 8192, 256)
+            .expect("preserved")
+            .with_conversation(conversation_of(MAX_CONVERSATION_TURNS + 5, 1));
+        assert_eq!(preserved.conversation().len(), MAX_CONVERSATION_TURNS);
+        assert!(preserved.conversation()[0].user().starts_with("turn 5 "));
     }
 
     #[test]

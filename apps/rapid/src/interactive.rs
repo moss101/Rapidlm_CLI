@@ -3168,6 +3168,92 @@ pub(crate) fn build_backing_model<'store>(
 /// budget). Used by both the top-level `exec` turn and `task_spawn`
 /// subagents so a child sees the same project rules and system prompt as its
 /// parent instead of running with neither.
+/// Ceiling on ledger events read back to reconstruct a session's earlier
+/// turns for the model. A session longer than this still gets its newest
+/// turns: the read starts far enough back to cover them, and
+/// `PreservedLiveContext::with_conversation` keeps only the newest
+/// `MAX_CONVERSATION_TURNS` anyway.
+const MAX_CONVERSATION_EVENTS: usize = 8192;
+
+/// The session's earlier turns, oldest first, read from the ledger's own
+/// `turn.started`/`turn.completed|failed|interrupted` events — the record
+/// of what was said, not the display transcript. A `turn.started` with no
+/// terminal event yet is the turn being executed now (or one lost to a
+/// crash) and is not carried; its prompt is the goal of this turn.
+///
+/// Best-effort: a session that cannot be read back yields no history and
+/// the turn runs with the prompt alone, as every turn did before this
+/// existed. Nothing here can fail a turn.
+fn conversation_history(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    cancel: &agent_runtime::CancellationToken,
+) -> Vec<crate::host::ConversationTurn> {
+    use crate::host::{ConversationOutcome, ConversationTurn};
+    // The kernel calls take the kernel's own token; the turn's token is the
+    // one that can actually be cancelled, and the read loop watches it.
+    let kernel_cancel = CancellationToken::new();
+    let Ok(snapshot) = block_on(client.get_session(session_id), &kernel_cancel) else {
+        return Vec::new();
+    };
+    let tip = snapshot.seq();
+    let after = tip.saturating_sub(MAX_CONVERSATION_EVENTS as u64);
+    let Ok(mut stream) = block_on(
+        client.subscribe(SubscribeEvents::new(session_id, after)),
+        &kernel_cancel,
+    ) else {
+        return Vec::new();
+    };
+    let text_of = |payload: &serde_json::Value, field: &str| -> Option<String> {
+        payload
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let mut turns: Vec<ConversationTurn> = Vec::new();
+    let mut open: Option<String> = None;
+    for _ in 0..MAX_CONVERSATION_EVENTS {
+        if stream.cursor() >= tip || cancel.is_cancelled() {
+            break;
+        }
+        let Ok(event) = stream.recv() else {
+            break;
+        };
+        match event.kind() {
+            EventKind::TurnStarted => {
+                open = text_of(event.payload(), "text");
+            }
+            EventKind::TurnCompleted => {
+                if let Some(user) = open.take() {
+                    turns.push(ConversationTurn::new(
+                        user,
+                        ConversationOutcome::Answered(text_of(event.payload(), "text")),
+                    ));
+                }
+            }
+            EventKind::TurnFailed => {
+                if let Some(user) = open.take() {
+                    let reason = text_of(event.payload(), "reason").unwrap_or_default();
+                    turns.push(ConversationTurn::new(
+                        user,
+                        ConversationOutcome::Failed(reason),
+                    ));
+                }
+            }
+            EventKind::TurnInterrupted => {
+                if let Some(user) = open.take() {
+                    turns.push(ConversationTurn::new(
+                        user,
+                        ConversationOutcome::Interrupted,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    turns
+}
+
 fn build_live_context(
     root: Option<&Path>,
     cwd: Option<&Path>,
@@ -6262,6 +6348,7 @@ fn build_interactive_turn_context(
     forced_mode: Option<crate::permissions::PermissionMode>,
     context_limit: u32,
     output_reserve: u32,
+    conversation: Vec<crate::host::ConversationTurn>,
 ) -> Result<(PreservedLiveContext, ExecTools), kernel::TurnOutcome> {
     let preserved = match build_live_context(
         Some(root),
@@ -6278,7 +6365,7 @@ fn build_interactive_turn_context(
             });
         }
     };
-    let preserved = preserve_memory_and_todos(preserved, root);
+    let preserved = preserve_memory_and_todos(preserved, root).with_conversation(conversation);
     let permission_lattice = match exec_permission_lattice(Some(root), forced_mode) {
         Ok(lattice) => lattice,
         Err(err) => {
@@ -6369,6 +6456,11 @@ fn run_interactive_turn_inner(
     };
     let (context_limit, output_reserve) = context_budget_for(&backing);
 
+    // The session's earlier turns, so "now fix the tests" on turn two means
+    // what it says: without this every turn ran on its prompt alone, and
+    // the model had no idea what the previous turn had been. Read from the
+    // ledger, which is what the resumed transcript is rebuilt from too.
+    let conversation = conversation_history(client, session_id, cancel);
     let (preserved, mut tools) = match build_interactive_turn_context(
         root,
         trusted,
@@ -6376,6 +6468,7 @@ fn run_interactive_turn_inner(
         None,
         context_limit,
         output_reserve,
+        conversation,
     ) {
         Ok(built) => built,
         Err(outcome) => return outcome,
@@ -6429,6 +6522,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     // and `exec_tools.rs`).
     let forced_mode = Some(crate::permissions::PermissionMode::BypassPermissions);
     let (context_limit, output_reserve) = budget;
+    let conversation = conversation_history(client, session_id, cancel);
     let (preserved, mut tools) = match build_interactive_turn_context(
         root,
         trusted,
@@ -6436,6 +6530,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         forced_mode,
         context_limit,
         output_reserve,
+        conversation,
     ) {
         Ok(built) => built,
         Err(outcome) => return outcome,
@@ -8727,6 +8822,80 @@ alignment below it: {line:?}",
         assert!(todos.contains("do the thing"), "{todos}");
 
         drop(std::fs::remove_dir_all(&root));
+    }
+
+    #[test]
+    fn the_second_turn_sees_what_the_first_turn_said() {
+        // A session is a conversation. Every turn used to run on its prompt
+        // alone — the transcript on screen was the user's memory, not the
+        // model's — so "now fix the tests" on turn two meant nothing to it.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "call the project Nightjar from now on",
+            ScriptedModel::terminal("Noted: the project is Nightjar."),
+        );
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        session.run_turn(
+            "what did I call the project?",
+            ScriptedModel::terminal("Nightjar.").capturing_blocks(seen.clone()),
+        );
+        let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+        let turns: Vec<&(String, String)> = seen
+            .iter()
+            .filter(|(locator, _)| locator.starts_with(crate::host::CONVERSATION_LOCATOR_PREFIX))
+            .collect();
+        assert_eq!(
+            turns.len(),
+            1,
+            "exactly the one earlier turn is carried: {:?}",
+            seen.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>()
+        );
+        let text = &turns[0].1;
+        assert!(
+            text.contains("call the project Nightjar from now on"),
+            "{text}"
+        );
+        assert!(text.contains("Noted: the project is Nightjar."), "{text}");
+        assert!(
+            !text.contains("what did I call the project?"),
+            "the turn being run is the goal, not history: {text}"
+        );
+        assert!(
+            seen.iter()
+                .any(|(_, text)| text.contains("what did I call the project?")),
+            "and the current prompt is still the goal"
+        );
+    }
+
+    #[test]
+    fn a_failed_and_an_interrupted_turn_are_carried_as_what_they_were() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("try something", ScriptedModel::failing());
+        session.run_turn("and then this worked", ScriptedModel::terminal("Done."));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        session.run_turn(
+            "recap",
+            ScriptedModel::terminal("Recap.").capturing_blocks(seen.clone()),
+        );
+        let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+        let turns: Vec<&str> = seen
+            .iter()
+            .filter(|(locator, _)| locator.starts_with(crate::host::CONVERSATION_LOCATOR_PREFIX))
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(turns.len(), 2, "{turns:?}");
+        assert!(
+            turns[0].contains("try something") && turns[0].contains("the turn failed"),
+            "{}",
+            turns[0]
+        );
+        assert!(
+            turns[1].contains("and then this worked") && turns[1].contains("Done."),
+            "{}",
+            turns[1]
+        );
     }
 
     #[test]
@@ -13197,9 +13366,21 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         /// backing`'s own thread (`B: LiveModelCall + Send`), so the sink
         /// must cross that boundary too.
         captured_system_prompt: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+        /// Set via `capturing_blocks`: every block of every `step()` call,
+        /// as `(locator, text)`, so a test can assert on what the compiled
+        /// context carried — the session's earlier turns, say.
+        captured_blocks: Option<std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>>,
     }
 
     impl ScriptedModel {
+        fn capturing_blocks(
+            mut self,
+            sink: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        ) -> Self {
+            self.captured_blocks = Some(sink);
+            self
+        }
+
         /// Route every future `step()` call's system-prompt text into
         /// `sink` (appended, oldest first) in addition to producing this
         /// model's already-scripted outputs.
@@ -13399,6 +13580,12 @@ cancelled and not turned into a turn interrupt:\n{painted}"
                     if block.source() == context_engine::compile::ContextSource::System {
                         sink.push(block.text().to_owned());
                     }
+                }
+            }
+            if let Some(sink) = &self.captured_blocks {
+                let mut sink = sink.lock().unwrap_or_else(|p| p.into_inner());
+                for block in blocks {
+                    sink.push((block.locator().to_owned(), block.text().to_owned()));
                 }
             }
             // Deterministic, not incidental: without this, whether a
