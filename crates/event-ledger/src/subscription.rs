@@ -601,6 +601,14 @@ mod tests {
 
     #[test]
     fn slow_subscriber_does_not_block_ledger_appends() {
+        // The property: a subscriber that never reads, with a buffer of 4,
+        // must not make the 32 appends behind it wait. An append path that
+        // *did* wait on the subscriber would not be slow — it would never
+        // return, with nothing draining a full buffer. So the appends run
+        // on their own thread and the bound is a deadline generous enough
+        // that only a blocked append can miss it; the earlier 750ms figure
+        // was a disk-speed assertion in disguise (a shared Linux runner
+        // took 785ms for 32 durable commits, a Windows one 2.7s).
         let tmp = TempLedger::create();
         let session = seed_session(&tmp.ledger);
         let cancel = live();
@@ -609,14 +617,18 @@ mod tests {
             .subscribe_bounded(session, 0, 4, &cancel)
             .expect("subscribe empty");
 
-        let started = Instant::now();
-        let seqs = append_n(&tmp.ledger, session, 32);
-        let elapsed = started.elapsed();
+        let ledger = tmp.ledger.clone();
+        let appends = std::thread::spawn(move || append_n(&ledger, session, 32));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !appends.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "appends still not finished after 60s: a subscriber that never reads is blocking the ledger"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let seqs = appends.join().expect("append thread");
         assert_eq!(seqs, (1..=32).collect::<Vec<_>>());
-        assert!(
-            elapsed < Duration::from_millis(750),
-            "slow subscriber blocked appends: {elapsed:?}"
-        );
         drop(stream);
     }
 
