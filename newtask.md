@@ -7898,6 +7898,39 @@ on rather than retry — existed only as doc comments on the enum before this.
 The page does not describe `docs/reference/error-codes.md`'s taxonomy, which is the *error* taxonomy
 (`ErrorCode`), a different thing from process exit codes.
 
+**`/rewind <seq>` left the session unable to accept input, fixed 2026-09-12.**
+
+Found by asking what a coding-agent user expects from "rewind" and reading what the command did. It asked
+the kernel for a *prefix projection* (`KernelApi::Rewind` replays events 1..seq into a snapshot and
+mutates nothing — the kernel test is literally named `rewind_returns_prefix_projection_without_mutating_
+stream`) and swapped that snapshot into the UI, leaving the ledger and the live subscription at the tip.
+The only rewind test covered the error path. The path a user takes — rewind, then keep working — was
+untested, and it was broken: **every `submit_turn` after a rewind failed with `SessionConflict`**, because
+the submit carried the projection's seq against the kernel's real tip. A "supported" command after which
+the session could not take input. (The freeze I first predicted — `apply_next` rejecting the next live
+event — never got the chance to happen; the conflict comes first.)
+
+**The fix is a derivation, again.** `ForkSession::new(source, at_seq, …)` takes any committed sequence
+and validates it exactly as `rewind` did (0 or past the tip → not found). `/fork` already forks at the tip
+and moves onto the child with `switch_to_session`. So `/rewind <seq>` is that same operation at a chosen
+sequence: fork at `seq`, switch. The child's tip *is* the rewound sequence, so the projection, the
+stream and the kernel agree, and the SDD's append-only rule ("history is never truncated; a repair
+creates a new revision") is what the design allows anyway. `/fork` is now the special case of `/rewind`
+at the tip. The kernel's `rewind` API remains as the preview it is; the binary no longer calls it.
+
+**The user is told what did not happen.** `crates/tui`'s own `RewindSessionIntent` doc says "the view
+does not restore files or truncate history" — and nothing had ever told the user. The rewind now prints
+that workspace files are not restored and that `/resume <parent>` returns to the full history, where
+`/diff` lists every file it wrote.
+
+**One guard, not three.** `/fork`, `/resume` and now `/rewind` all refuse to switch while a turn or an
+autonomous goal owns the session; `/resume` had been given a hand-copied version of `/fork`'s check on
+2026-09-11. `refuse_if_busy` is the single copy.
+
+**Revert cycle 143, in the natural order.** `the_session_still_works_after_a_rewind` was written first
+against the old code and failed with the `SessionConflict` above; with the fix it passes. The existing
+invalid-sequence test still passes, so the error surface is unchanged.
+
 ## Session boundary, 2026-09-10 — durable state for the next session
 
 Forty commits across three days, `dbeb2c2`..`eababe4`, all pushed to `origin/main`. Baseline before them
@@ -7966,7 +7999,7 @@ today: a test that hardcoded a derived answer (`/memory` is `None`) went stale t
 fact changed — which is the design working — and a draft that added a `LocalUiEvent` beside a kernel
 event for the same value was caught and removed before it shipped.
 
-**Verification.** Revert cycles 72-142 across the three days. The pattern that keeps earning its keep: a
+**Verification.** Revert cycles 72-143 across the four days. The pattern that keeps earning its keep: a
 cycle that *passes* means the test is wrong, not the code. Five did on 2026-09-09; two more did today —
 a fixture too small for the bound it was meant to prove (one line against a 200-line cap), and a state
 read taken before the supervisor thread could notice a kill. Both were rewritten until the broken code

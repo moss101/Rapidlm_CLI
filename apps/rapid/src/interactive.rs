@@ -24,9 +24,9 @@ use kernel::{
     ConfigText, CreateSession, DEFAULT_ROLLBACK_QUIESCE, ENV_PREFIX, EventStream, EventStreamError,
     ForkSession, GraphPhase, HealthSnapshot, HealthState, InProcessKernelClient, Interrupt,
     InterruptReason, KernelClient, LifecycleService, MAX_CONFIG_DOCUMENT_BYTES,
-    MAX_OVERRIDE_ENTRIES, ProjectIdentity, ProjectTrustError, ProjectTrustStore, RewindSession,
-    ServiceContext, ServiceError, ServiceFailureKind, ServiceGraph, ServiceId, ServiceStatus,
-    SubmitTurn, SubscribeEvents, TrustStatus, config_key_from_env_name, load_config,
+    MAX_OVERRIDE_ENTRIES, ProjectIdentity, ProjectTrustError, ProjectTrustStore, ServiceContext,
+    ServiceError, ServiceFailureKind, ServiceGraph, ServiceId, ServiceStatus, SubmitTurn,
+    SubscribeEvents, TrustStatus, config_key_from_env_name, load_config,
 };
 use protocol::{EventId, ProjectId, TraceContext, TraceId};
 use tui::state::{
@@ -5055,6 +5055,34 @@ denied\n",
     /// handle that is not in the table, or one whose job already finished,
     /// are different answers from "stopped it", and a user who is told
     /// "cancelled" believes the command is no longer running.
+    /// Refuse a session switch while a turn or an autonomous goal owns the
+    /// session, and say why. Returns `true` (after painting) if refused.
+    ///
+    /// One guard for `/fork`, `/resume` and `/rewind`: a switch mid-turn
+    /// would branch from a sequence the turn is still writing to and move
+    /// the session out from under a thread still emitting into it. Three
+    /// hand-copied versions of this check is how one of them drifts.
+    fn refuse_if_busy(&mut self, before: &str) -> Result<bool, InteractiveError> {
+        if self
+            .turn_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.append_command_error(format!(
+                "a turn is running; wait for it to finish before {before}"
+            ));
+            self.drain()?;
+            return Ok(true);
+        }
+        if self.autonomous.is_some() {
+            self.append_command_error(format!(
+                "an autonomous goal is running; stop it with /goal stop before {before}"
+            ));
+            self.drain()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// `/resume [session]`: move this TUI onto another session of this
     /// project.
     ///
@@ -5076,23 +5104,8 @@ denied\n",
         &mut self,
         session: Option<protocol::SessionId>,
     ) -> Result<(), InteractiveError> {
-        if self
-            .turn_in_flight
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            self.append_command_error(
-                "a turn is running; wait for it to finish before resuming another session"
-                    .to_owned(),
-            );
-            return self.drain();
-        }
-        if self.autonomous.is_some() {
-            self.append_command_error(
-                "an autonomous goal is running; stop it with /goal stop before resuming another \
-session"
-                    .to_owned(),
-            );
-            return self.drain();
+        if self.refuse_if_busy("resuming another session")? {
+            return Ok(());
         }
         let ledger_path = project_ledger_path(&self.root.join(PROJECT_MARKER));
         let sessions = recorded_sessions(&ledger_path)?;
@@ -5208,25 +5221,8 @@ session"
                     self.submit_turn("")?;
                 }
                 KernelApi::ForkSession => {
-                    // A fork mid-turn would branch from a sequence the turn
-                    // is still writing to, and the switch below would move
-                    // the session out from under a thread still emitting
-                    // into it.
-                    if self
-                        .turn_in_flight
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                    {
-                        self.append_command_error(
-                            "a turn is running; wait for it to finish before forking".to_owned(),
-                        );
-                        return self.drain();
-                    }
-                    if self.autonomous.is_some() {
-                        self.append_command_error(
-                            "an autonomous goal is running; stop it with /goal stop before forking"
-                                .to_owned(),
-                        );
-                        return self.drain();
+                    if self.refuse_if_busy("forking")? {
+                        return Ok(());
                     }
                     let seq = self.ui.snapshot().map(|s| s.seq()).unwrap_or(0);
                     let child = block_on(
@@ -5268,24 +5264,45 @@ the parent is unchanged; `/resume {parent_id}` returns to it\n"
                         );
                         return self.drain();
                     };
+                    if self.refuse_if_busy("rewinding")? {
+                        return Ok(());
+                    }
+                    // A rewind is a fork at the sequence, then the same
+                    // switch `/fork` makes onto its child. The previous
+                    // version asked the kernel for a *prefix projection*
+                    // (`KernelApi::Rewind`, which replays 1..seq and mutates
+                    // nothing) and swapped that into the UI — leaving the
+                    // ledger and the live subscription at the tip. Every
+                    // `submit_turn` after that carried the projection's seq
+                    // against the kernel's real tip and failed with
+                    // `SessionConflict`: a "supported" command after which the
+                    // session could not accept input. Forking is what the
+                    // append-only ledger allows (history is never truncated),
+                    // and the child's tip *is* the rewound sequence, so the
+                    // projection, the stream and the kernel agree again.
+                    //
                     // A rejected sequence (0, or past the session's last) is
-                    // the *ordinary* mistake here, and `?` used to propagate
-                    // the kernel's `SessionNotFound` all the way out of
-                    // `run`, ending the whole interactive session — the same
-                    // failure `command_error_text`'s own doc comment
-                    // describes fixing for parse errors, still live on this
-                    // path. It is a local command error like any other.
-                    let rewound = block_on(
-                        self.client
-                            .rewind(RewindSession::new(self.session_id, to_seq)),
+                    // the ordinary mistake here and stays a local command
+                    // error rather than the end of the session.
+                    let parent_id = self.session_id;
+                    let forked = block_on(
+                        self.client.fork_session(ForkSession::new(
+                            parent_id,
+                            to_seq,
+                            self.actor.clone(),
+                            TraceId::new(),
+                        )),
                         self.cancel,
                     );
-                    match rewound {
-                        Ok(result) => {
-                            *self.ui = reduce(
-                                self.ui.clone(),
-                                &UiEvent::Snapshot(result.snapshot().clone()),
-                            );
+                    match forked {
+                        Ok(child) => {
+                            let child_id = child.id();
+                            self.switch_to_session(child_id)?;
+                            self.append_command_output(format!(
+                                "rewound to seq {to_seq}: now on session {child_id}\n\
+workspace files are not restored by a rewind; `/resume {parent_id}` returns to \
+the full history, where `/diff` lists every file it wrote\n"
+                            ));
                         }
                         // A cancelled block_on is the session shutting down,
                         // not a bad sequence: that one still propagates.
@@ -12218,6 +12235,110 @@ the user was in is no longer the one they are in:\n{painted}"
         assert!(
             !painted.contains(&format!("now on child session {parent}")),
             "the child must be a different session than the one that forked:\n{painted}"
+        );
+    }
+
+    #[test]
+    fn the_session_still_works_after_a_rewind() {
+        // `/rewind <seq>` swaps in a prefix projection — the kernel replays
+        // events 1..seq into a snapshot and mutates nothing. The ledger and
+        // the live subscription stay at the tip. So the *next* event the
+        // session records has a seq far past the projection's, and the
+        // reducer's `apply_next` demands exactly `snapshot.seq + 1`. Only
+        // the error path of rewind was tested; this is the path a user
+        // actually takes — rewind, then keep working.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "first",
+            ScriptedModel::terminal_with_usage("first answer", 5, 1),
+        );
+        let tip = session.state().snapshot().map(|s| s.seq()).expect("a tip");
+        assert!(
+            tip > 2,
+            "the first turn must have recorded events: tip={tip}"
+        );
+
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = session.state().clone();
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(vec![ScriptedModel::terminal_with_usage(
+            "second answer",
+            5,
+            1,
+        )]);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight.clone(),
+            backings,
+        );
+
+        let parent_id = loop_state.session_id;
+        loop_state.dispatch_slash("/rewind 1").expect("rewind");
+        // A rewind is a fork at the sequence plus the switch `/fork` makes:
+        // the session is now a child whose tip *is* the rewound sequence,
+        // so the projection, the stream and the kernel agree.
+        assert_ne!(
+            loop_state.session_id, parent_id,
+            "a rewind moves onto a branch rather than mutating history"
+        );
+        assert_eq!(
+            loop_state.ui.snapshot().map(|s| s.seq()),
+            Some(1),
+            "the projection is at the rewound sequence"
+        );
+        assert!(
+            !loop_state.ui.actions_blocked(),
+            "{:?}",
+            loop_state.ui.protocol_error()
+        );
+
+        // Now keep working: a real turn through the real submit path.
+        loop_state.submit_turn("second").expect("submit");
+        for _ in 0..400 {
+            loop_state.drain().expect("drain");
+            if !turn_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for _ in 0..30 {
+            loop_state.drain().expect("drain");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !loop_state.ui.actions_blocked(),
+            "a turn after a rewind must not freeze the session: {:?}",
+            loop_state.ui.protocol_error()
+        );
+        let transcript = loop_state
+            .ui
+            .transcript()
+            .iter()
+            .map(|entry| format!("{entry:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            transcript.contains("second answer"),
+            "the turn after the rewind must reach the transcript: {transcript}"
         );
     }
 
