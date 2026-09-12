@@ -9,6 +9,9 @@ publish = false
 # protocol: SandboxTier / ErrorCode / RepoPath / LeaseId / RuntimeId are the
 # v1 wire and identity contracts used by backend selection and handles.
 protocol = { path = "../protocol" }
+# process-signal: the one `kill(2)`-based group signal every backend's
+# TERM-then-KILL sequence sends; no backend execs `kill(1)`.
+process-signal = { path = "../process-signal" }
 # capability-broker: CapabilityLease is re-checked at prepare/exec; CancellationToken
 # is the cooperative cancel contract; CanonicalHostPath / SecretHandle are
 # already-normalized mount sources and opaque secret ids.

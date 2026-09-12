@@ -12,6 +12,7 @@ members = [
     "crates/knowledge",
     "crates/tool-gateway",
     "crates/capability-broker",
+    "crates/process-signal",
     "crates/process-supervisor",
     "crates/sandbox",
     "crates/workspace",

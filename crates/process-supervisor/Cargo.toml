@@ -21,6 +21,9 @@ auth = { path = "../auth" }
 # (RLM-01-foundation-012). Spill temps live under the store root, not OS tempdir.
 # JobRegistry journals job.started/completed through EventLedger (RLM-02-kernel-ledger-005).
 event-ledger = { path = "../event-ledger" }
+# process-signal: the one `kill(2)`-based group signal; cancel and recovery
+# never exec `kill(1)` (procps-ng parsed `-<pgid>` as the broadcast).
+process-signal = { path = "../process-signal" }
 # serde: MIT/Apache-2.0; versioned job records and running tombstones on disk.
 serde = { version = "1", features = ["derive"] }
 # serde_json: MIT/Apache-2.0; ledger payloads and job-file encode/decode.

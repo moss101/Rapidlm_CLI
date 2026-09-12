@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+#[cfg(unix)]
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use capability_broker::CancellationToken;
+use process_signal::GroupSignal as Signal;
 use protocol::{ErrorCode, JobId};
 
 use crate::jobs::{JobLifetime, JobRegistry, MAX_LIVE_JOBS, ProcessIdentity, RunningTombstone};
@@ -37,17 +39,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(unix)]
 const MAX_PS_OUTPUT_BYTES: usize = 4 * 1024;
 
-/// Absolute `kill(1)` paths. Never PATH-search an untrusted executable.
-#[cfg(unix)]
-const KILL_PROGRAMS: &[&str] = &["/bin/kill", "/usr/bin/kill"];
-
 /// Absolute `ps(1)` paths used only to read pid/pgid/etime.
 #[cfg(unix)]
 const PS_PROGRAMS: &[&str] = &["/bin/ps", "/usr/bin/ps"];
-
-/// Absolute `taskkill.exe` path for Windows tree termination.
-#[cfg(windows)]
-const TASKKILL_PROGRAM: &str = r"C:\Windows\System32\taskkill.exe";
 
 /// A persisted running job presented to the reconciler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -713,66 +707,15 @@ fn host_terminate_group(
     }
 }
 
-#[derive(Clone, Copy)]
-enum Signal {
-    Term,
-    Kill,
-}
-
 fn signal_group(pgid: u32, kind: Signal) -> Result<(), RecoveryError> {
     if pgid < 2 {
         return Err(RecoveryError::InvalidIdentity);
     }
-    platform_signal_group(pgid, kind)
-}
-
-#[cfg(unix)]
-fn platform_signal_group(pgid: u32, kind: Signal) -> Result<(), RecoveryError> {
-    let flag = match kind {
-        Signal::Term => "-TERM",
-        Signal::Kill => "-KILL",
-    };
-    let target = format!("-{pgid}");
-    let program = kill_program()?;
-    let status = Command::new(program)
-        .args([flag, target.as_str()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_clear()
-        .status()
-        .map_err(|_| RecoveryError::SignalFailed)?;
-    if status.success() || process_absent(status) {
-        Ok(())
-    } else {
-        Err(RecoveryError::SignalFailed)
-    }
-}
-
-#[cfg(windows)]
-fn platform_signal_group(pgid: u32, kind: Signal) -> Result<(), RecoveryError> {
-    let pid = pgid.to_string();
-    let mut command = Command::new(TASKKILL_PROGRAM);
-    command.args(["/PID", &pid, "/T"]);
-    if matches!(kind, Signal::Kill) {
-        command.arg("/F");
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_clear();
-    let status = command.status().map_err(|_| RecoveryError::SignalFailed)?;
-    if status.success() || process_absent(status) {
-        Ok(())
-    } else {
-        Err(RecoveryError::SignalFailed)
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn platform_signal_group(_pgid: u32, _kind: Signal) -> Result<(), RecoveryError> {
-    Err(RecoveryError::UnsupportedPlatform)
+    process_signal::signal_process_group(pgid, kind).map_err(|err| match err {
+        process_signal::SignalError::InvalidGroup => RecoveryError::InvalidIdentity,
+        process_signal::SignalError::Failed => RecoveryError::SignalFailed,
+        process_signal::SignalError::Unsupported => RecoveryError::UnsupportedPlatform,
+    })
 }
 
 fn wait_until_absent(
@@ -794,42 +737,14 @@ fn wait_until_absent(
 }
 
 fn pid_alive(pid: u32) -> bool {
-    if pid < 2 {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        let Ok(program) = kill_program() else {
-            return false;
-        };
-        Command::new(program)
-            .args(["-0", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .env_clear()
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
+    process_signal::process_exists(pid)
 }
 
-fn process_absent(status: ExitStatus) -> bool {
-    matches!(status.code(), Some(1) | Some(128))
-}
-
+// `ps(1)` exits 1 when the pid is gone; used only by the `cfg(unix)`
+// observation path and gated with it.
 #[cfg(unix)]
-fn kill_program() -> Result<&'static str, RecoveryError> {
-    KILL_PROGRAMS
-        .iter()
-        .copied()
-        .find(|path| std::path::Path::new(path).is_file())
-        .ok_or(RecoveryError::SignalFailed)
+fn process_absent(status: ExitStatus) -> bool {
+    status.code() == Some(1)
 }
 
 #[cfg(unix)]

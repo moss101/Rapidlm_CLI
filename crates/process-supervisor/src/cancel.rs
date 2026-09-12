@@ -3,11 +3,13 @@
 //! `terminate_tree` signals only the [`ProcessGroupId`] recorded at spawn.
 //! It never accepts a raw PID from the caller. Process-group 0/1 are refused
 //! because `kill(-1)` is a broadcast. Timeout and user-cancel stay distinct.
+//! The signal itself is `kill(2)` through [`process_signal`], never
+//! `kill(1)` — see that crate for what procps-ng's parser made of `-<pgid>`.
 
 use std::error::Error;
 use std::fmt;
 use std::io::Read;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,14 +30,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Bound on waiting after SIGKILL before [`CancelError::TreeStillAlive`].
 const KILL_WAIT: Duration = Duration::from_secs(2);
 
-/// Absolute `kill(1)` paths. Never PATH-search an untrusted executable.
-#[cfg(unix)]
-const KILL_PROGRAMS: &[&str] = &["/bin/kill", "/usr/bin/kill"];
-
-/// Absolute `taskkill.exe` path for Windows tree termination.
-#[cfg(windows)]
-const TASKKILL_PROGRAM: &str = r"C:\Windows\System32\taskkill.exe";
-
 /// Why the supervisor is tearing the tree down.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum TerminationCause {
@@ -50,12 +44,8 @@ pub struct GracePeriod {
     cause: TerminationCause,
 }
 
-/// One recorded group signal.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum SignalKind {
-    Term,
-    Kill,
-}
+/// One recorded group signal — the same type the signal is sent with.
+pub use process_signal::GroupSignal as SignalKind;
 
 /// Recorded supervisor action. Only group signals are emitted today.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -408,71 +398,12 @@ pub(crate) fn signal_group(pgid: ProcessGroupId, kind: SignalKind) -> Result<(),
     platform_signal_group(pgid, kind)
 }
 
-#[cfg(unix)]
 fn platform_signal_group(pgid: ProcessGroupId, kind: SignalKind) -> Result<(), CancelError> {
-    let flag = match kind {
-        SignalKind::Term => "-TERM",
-        SignalKind::Kill => "-KILL",
-    };
-    // Negative pid is the process-group form of kill(1). The magnitude is
-    // the recorded group id, never attacker text.
-    let target = format!("-{}", pgid.as_u32());
-    let program = kill_program()?;
-    let status = Command::new(program)
-        .args([flag, target.as_str()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_clear()
-        .status()
-        .map_err(|_| CancelError::SignalFailed)?;
-    if status.success() || process_absent(status) {
-        Ok(())
-    } else {
-        Err(CancelError::SignalFailed)
-    }
-}
-
-#[cfg(windows)]
-fn platform_signal_group(pgid: ProcessGroupId, kind: SignalKind) -> Result<(), CancelError> {
-    // Spawn recorded the leader pid as the group id (CREATE_NEW_PROCESS_GROUP).
-    // `/T` terminates descendants; `/F` is the hard-kill escalation.
-    let pid = pgid.as_u32().to_string();
-    let mut command = Command::new(TASKKILL_PROGRAM);
-    command.args(["/PID", &pid, "/T"]);
-    if matches!(kind, SignalKind::Kill) {
-        command.arg("/F");
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_clear();
-    let status = command.status().map_err(|_| CancelError::SignalFailed)?;
-    if status.success() || process_absent(status) {
-        Ok(())
-    } else {
-        Err(CancelError::SignalFailed)
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn platform_signal_group(_pgid: ProcessGroupId, _kind: SignalKind) -> Result<(), CancelError> {
-    Err(CancelError::UnsupportedPlatform)
-}
-
-#[cfg(unix)]
-fn kill_program() -> Result<&'static str, CancelError> {
-    KILL_PROGRAMS
-        .iter()
-        .copied()
-        .find(|path| std::path::Path::new(path).is_file())
-        .ok_or(CancelError::SignalFailed)
-}
-
-fn process_absent(status: ExitStatus) -> bool {
-    // kill(1) uses 1 for ESRCH on BSD/GNU; taskkill uses 128 for not found.
-    matches!(status.code(), Some(1) | Some(128))
+    process_signal::signal_process_group(pgid.as_u32(), kind).map_err(|err| match err {
+        process_signal::SignalError::InvalidGroup => CancelError::InvalidProcessGroup,
+        process_signal::SignalError::Failed => CancelError::SignalFailed,
+        process_signal::SignalError::Unsupported => CancelError::UnsupportedPlatform,
+    })
 }
 
 #[cfg(unix)]
@@ -554,6 +485,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
     use std::time::Instant;
 
     use capability_broker::{

@@ -1,0 +1,13 @@
+[package]
+name = "process-signal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# rustix: safe `kill(2)` on Unix. Signalling a process group is a syscall
+# taking an integer; it is never `kill(1)` with an argument to parse (see the
+# crate doc for what procps-ng's parser does with `-<pgid>`).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }

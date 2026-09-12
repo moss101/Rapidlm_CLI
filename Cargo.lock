@@ -1122,12 +1122,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "process-signal"
+version = "0.1.0"
+dependencies = [
+ "rustix 1.1.4",
+]
+
+[[package]]
 name = "process-supervisor"
 version = "0.1.0"
 dependencies = [
  "auth",
  "capability-broker",
  "event-ledger",
+ "process-signal",
  "protocol",
  "rustix 0.38.44",
  "serde",
@@ -1496,6 +1504,7 @@ name = "sandbox"
 version = "0.1.0"
 dependencies = [
  "capability-broker",
+ "process-signal",
  "protocol",
 ]
 

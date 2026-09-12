@@ -16,6 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use capability_broker::{CancellationToken, CanonicalHostPath, Capability, CapabilityLease};
+use process_signal::GroupSignal;
 use protocol::{LeaseId, RepoPath, RuntimeId, SandboxTier};
 
 use crate::backend::{
@@ -40,10 +41,6 @@ const RUNSC_PROGRAMS: &[&str] = &["/usr/bin/runsc", "/usr/local/bin/runsc", "/bi
 const TRUE_PROGRAMS: &[&str] = &["/usr/bin/true", "/bin/true"];
 const TEST_PROGRAMS: &[&str] = &["/usr/bin/test", "/bin/test"];
 const LS_PROGRAMS: &[&str] = &["/usr/bin/ls", "/bin/ls"];
-// Used only by the `cfg(unix)` `platform_signal_group`; gated the same way
-// so a Windows build does not fail `-D dead_code` on a constant it cannot use.
-#[cfg(unix)]
-const KILL_PROGRAMS: &[&str] = &["/bin/kill", "/usr/bin/kill"];
 const PS_PROGRAMS: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 const PGREP_PROGRAMS: &[&str] = &["/usr/bin/pgrep", "/bin/pgrep"];
 
@@ -1953,68 +1950,11 @@ fn terminate_process_group(child: &mut Child) {
     let _ = child.wait();
 }
 
-#[derive(Clone, Copy)]
-enum GroupSignal {
-    Term,
-    Kill,
-}
-
+/// One group signal, by `kill(2)` — never `kill(1)`, whose procps-ng parser
+/// made `-<pgid>` the broadcast (see `process_signal`). An absent group is
+/// `Ok`; anything else is the backend's health failure.
 fn signal_group(pgid: u32, kind: GroupSignal) -> Result<(), SandboxError> {
-    if pgid < 2 {
-        return Err(SandboxError::HealthFailed);
-    }
-    platform_signal_group(pgid, kind)
-}
-
-#[cfg(unix)]
-fn platform_signal_group(pgid: u32, kind: GroupSignal) -> Result<(), SandboxError> {
-    let flag = match kind {
-        GroupSignal::Term => "-TERM",
-        GroupSignal::Kill => "-KILL",
-    };
-    let target = format!("-{pgid}");
-    let program = first_existing(KILL_PROGRAMS).ok_or(SandboxError::HealthFailed)?;
-    let status = Command::new(program)
-        .args([flag, target.as_str()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_clear()
-        .status()
-        .map_err(|_| SandboxError::HealthFailed)?;
-    if status.success() || matches!(status.code(), Some(1) | Some(128)) {
-        Ok(())
-    } else {
-        Err(SandboxError::HealthFailed)
-    }
-}
-
-#[cfg(windows)]
-fn platform_signal_group(pgid: u32, kind: GroupSignal) -> Result<(), SandboxError> {
-    const TASKKILL: &str = r"C:\Windows\System32\taskkill.exe";
-    let pid = pgid.to_string();
-    let mut command = Command::new(TASKKILL);
-    command.args(["/PID", &pid, "/T"]);
-    if matches!(kind, GroupSignal::Kill) {
-        command.arg("/F");
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_clear();
-    let status = command.status().map_err(|_| SandboxError::HealthFailed)?;
-    if status.success() || matches!(status.code(), Some(1) | Some(128)) {
-        Ok(())
-    } else {
-        Err(SandboxError::HealthFailed)
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn platform_signal_group(_pgid: u32, kind: GroupSignal) -> Result<(), SandboxError> {
-    let _ = kind;
-    Err(SandboxError::HealthFailed)
+    process_signal::signal_process_group(pgid, kind).map_err(|_| SandboxError::HealthFailed)
 }
 
 fn sample_process_group(pgid: u32) -> Option<(u32, u64)> {
