@@ -138,7 +138,10 @@ pub enum SpawnError {
     StdinTooLarge,
     LeaseNotBound,
     ShellGrantRequired,
-    Io,
+    /// The OS refused the spawn or the stdin hand-off; the kind says which
+    /// way (`NotFound`, `PermissionDenied`, `BrokenPipe`, ...) without
+    /// echoing the path or payload.
+    Io(std::io::ErrorKind),
 }
 
 impl ExecBinding {
@@ -479,7 +482,7 @@ pub fn spawn(spec: ExecSpec, lease: LeaseUseGuard) -> Result<JobHandle, SpawnErr
 
     let consumed = lease.consume();
     let mut command = prepared.command(&spec.stdin);
-    let mut child = command.spawn().map_err(|_| SpawnError::Io)?;
+    let mut child = command.spawn().map_err(|err| SpawnError::Io(err.kind()))?;
     let pid = child.id();
     if let Err(err) = write_stdin(&mut child, &spec.stdin) {
         // `child.kill()` only signals the leader PID. `isolate_process_group`
@@ -723,9 +726,10 @@ fn write_stdin(child: &mut Child, stdin: &StdinSpec) -> Result<(), SpawnError> {
         StdinSpec::Empty => Ok(()),
         StdinSpec::Bytes(bytes) => {
             let Some(pipe) = child.stdin.as_mut() else {
-                return Err(SpawnError::Io);
+                return Err(SpawnError::Io(std::io::ErrorKind::BrokenPipe));
             };
-            pipe.write_all(bytes).map_err(|_| SpawnError::Io)?;
+            pipe.write_all(bytes)
+                .map_err(|err| SpawnError::Io(err.kind()))?;
             let _ = child.stdin.take();
             Ok(())
         }
@@ -934,7 +938,7 @@ impl SpawnError {
             Self::StdinTooLarge => "stdin exceeds bound",
             Self::LeaseNotBound => "lease is not bound to this exec spec",
             Self::ShellGrantRequired => "shell-string mode requires a distinct shell grant",
-            Self::Io => "process spawn failed",
+            Self::Io(_) => "process spawn failed",
         }
     }
 
@@ -945,7 +949,7 @@ impl SpawnError {
             Self::SecretNotMaterialized => Some(ErrorCode::PolicyDenied),
             Self::LeaseNotBound => Some(ErrorCode::PolicyLeaseInvalid),
             Self::ShellGrantRequired => Some(ErrorCode::PolicyDenied),
-            Self::Io => Some(ErrorCode::InternalUnexpected),
+            Self::Io(_) => Some(ErrorCode::InternalUnexpected),
             _ => Some(ErrorCode::ToolInvalidArguments),
         }
     }
@@ -953,7 +957,11 @@ impl SpawnError {
 
 impl fmt::Display for SpawnError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(self.as_str())?;
+        if let Self::Io(kind) = self {
+            write!(f, ": {kind}")?;
+        }
+        Ok(())
     }
 }
 

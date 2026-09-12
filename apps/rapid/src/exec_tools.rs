@@ -8279,6 +8279,9 @@ mod tests {
         }
     }
 
+    // Symlink semantics under test are the Unix ones; a Windows twin
+    // needs a runner that can create links and its own assertions.
+    #[cfg(unix)]
     #[test]
     fn symlinked_leaf_escape_is_refused_on_read_and_write() {
         // `resolve_in_root` canonicalizes the parent directory, but a
@@ -8320,6 +8323,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_intermediate_directory_creates_nothing_outside_the_root() {
         // `resolve_in_root` canonicalizes the parent directory and rejects it

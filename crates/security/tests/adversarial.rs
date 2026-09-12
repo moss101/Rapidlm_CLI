@@ -15,15 +15,19 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use auth::SecretRef;
+// The two symlink tests (`t003_*`) and the `World` fields only they read
+// are Unix-only; their imports are gated with them so a Windows lint does
+// not fail on what it cannot run.
 use capability_broker::{
     ActionRequest, ApprovalChoice, ApprovalResolution, ApprovalScopeId, CancellationToken,
     CanonicalAction, CanonicalHostPath, Capability, CapabilityLease, DecisionWithTrace, ExecIntent,
-    FilesystemRoot, FsIntent, FsNormalizeError, FsResolver, Hostname, LeaseIssuer, LeaseValidator,
-    NetworkIntent, NetworkNormalizeError, NetworkResolver, PolicyDocument, PolicyError,
-    PolicyRevision, PolicySource, PolicyStack, PrincipalRef, ProcessScope, Resolver,
-    ResourceDescriptor, evaluate, issue, normalize_exec, normalize_fs, request_approval,
+    Hostname, LeaseIssuer, LeaseValidator, NetworkIntent, NetworkNormalizeError, NetworkResolver,
+    PolicyDocument, PolicyError, PolicyRevision, PolicySource, PolicyStack, PrincipalRef,
+    ProcessScope, Resolver, ResourceDescriptor, evaluate, issue, normalize_exec, request_approval,
     validate_use,
 };
+#[cfg(unix)]
+use capability_broker::{FilesystemRoot, FsIntent, FsNormalizeError, FsResolver, normalize_fs};
 use protocol::{ErrorCode, RepoPath, SandboxTier, SessionId};
 use sandbox::{
     ContainerBackend, GvisorBackend, HostRestrictedBackend, IsolationStrength, MountMode,
@@ -669,11 +673,13 @@ fn assert_no_canary(label: &str, rendered: &str) {
 struct World {
     tmp: PathBuf,
     view_a: PathBuf,
+    #[cfg(unix)]
     view_a_host: CanonicalHostPath,
     canary_file: PathBuf,
     policies: PolicyStack,
     validator: LeaseValidator,
     commands: FixedResolver,
+    #[cfg(unix)]
     fs: LiveFs,
     net: MapResolver,
 }
@@ -686,6 +692,7 @@ impl World {
         let canary_file = tmp.join("denied.canary");
         std::fs::create_dir_all(view_a.join("src")).expect("view");
         std::fs::write(view_a.join("src").join("safe.txt"), b"approved\n").expect("safe");
+        #[cfg(unix)]
         let view_a_host = CanonicalHostPath::from_resolved(
             std::fs::canonicalize(&view_a)
                 .unwrap_or_else(|_| view_a.clone())
@@ -698,15 +705,18 @@ impl World {
             LeaseIssuer::from_key(ISSUER_KEY).expect("issuer"),
             PolicyRevision::of_stack(&policies),
         );
+        #[cfg(unix)]
         let fs = LiveFs::new(&view_a, &tmp);
         Self {
             tmp,
             view_a,
+            #[cfg(unix)]
             view_a_host,
             canary_file,
             policies,
             validator,
             commands: FixedResolver,
+            #[cfg(unix)]
             fs,
             net: MapResolver::fixture(),
         }
@@ -786,6 +796,7 @@ impl World {
         (self.approve_and_issue(&request, now), action)
     }
 
+    #[cfg(unix)]
     fn proc_lease(&self) -> CapabilityLease {
         let now = Instant::now();
         let action = CanonicalAction::Resource {
@@ -959,11 +970,13 @@ impl Resolver for FixedResolver {
     }
 }
 
+#[cfg(unix)]
 struct LiveFs {
     repo_root: CanonicalHostPath,
     host_base: CanonicalHostPath,
 }
 
+#[cfg(unix)]
 impl LiveFs {
     fn new(repo_root: &Path, host_base: &Path) -> Self {
         Self {
@@ -975,6 +988,7 @@ impl LiveFs {
     }
 }
 
+#[cfg(unix)]
 fn canonical_text(path: &Path) -> String {
     std::fs::create_dir_all(path).expect("mkdir");
     std::fs::canonicalize(path)
@@ -984,6 +998,7 @@ fn canonical_text(path: &Path) -> String {
         .to_owned()
 }
 
+#[cfg(unix)]
 impl FsResolver for LiveFs {
     fn repo_root(&self) -> &CanonicalHostPath {
         &self.repo_root

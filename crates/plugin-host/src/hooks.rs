@@ -348,7 +348,9 @@ pub enum HookError {
     LeaseRequired,
     LeaseInvalid,
     PayloadTooLarge,
-    Spawn,
+    /// The supervisor refused or failed to start the hook process; the
+    /// inner value says why, and its `Display` names no argv or payload.
+    Spawn(process_supervisor::SpawnError),
     Wait,
 }
 
@@ -1514,8 +1516,7 @@ fn map_spawn(err: process_supervisor::SpawnError) -> HookError {
         | process_supervisor::SpawnError::EmptyExecutable
         | process_supervisor::SpawnError::RelativeExecutable
         | process_supervisor::SpawnError::UnresolvedExecutable => HookError::InvalidArgv,
-        process_supervisor::SpawnError::Io => HookError::Spawn,
-        _ => HookError::Spawn,
+        other => HookError::Spawn(other),
     }
 }
 
@@ -1757,7 +1758,7 @@ impl HookError {
             | Self::SecretNotMaterialized
             | Self::UnsupportedKind => Some(ErrorCode::PluginCapabilityDenied),
             Self::LeaseRequired | Self::LeaseInvalid => Some(ErrorCode::PolicyLeaseInvalid),
-            Self::Spawn | Self::Wait => Some(ErrorCode::InternalUnexpected),
+            Self::Spawn(_) | Self::Wait => Some(ErrorCode::InternalUnexpected),
             _ => Some(ErrorCode::ConfigInvalid),
         }
     }
@@ -1804,7 +1805,7 @@ impl HookError {
             Self::LeaseRequired => "hook command requires a proc.exec lease",
             Self::LeaseInvalid => "hook lease is not bound to this command",
             Self::PayloadTooLarge => "hook event payload exceeds the stdin bound",
-            Self::Spawn => "hook process spawn failed",
+            Self::Spawn(_) => "hook process spawn failed",
             Self::Wait => "hook process wait failed",
         }
     }
@@ -1812,7 +1813,11 @@ impl HookError {
 
 impl fmt::Display for HookError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(self.as_str())?;
+        if let Self::Spawn(cause) = self {
+            write!(f, ": {cause}")?;
+        }
+        Ok(())
     }
 }
 
