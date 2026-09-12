@@ -3168,16 +3168,24 @@ pub(crate) fn build_backing_model<'store>(
 /// budget). Used by both the top-level `exec` turn and `task_spawn`
 /// subagents so a child sees the same project rules and system prompt as its
 /// parent instead of running with neither.
-/// Ceiling on ledger events read back to reconstruct a session's earlier
-/// turns for the model. A session longer than this still gets its newest
-/// turns: the read starts far enough back to cover them, and
+/// Ceiling on ledger events read back per session to reconstruct its
+/// earlier turns for the model. A session longer than this still gets its
+/// newest turns: the read starts far enough back to cover them, and
 /// `PreservedLiveContext::with_conversation` keeps only the newest
 /// `MAX_CONVERSATION_TURNS` anyway.
 const MAX_CONVERSATION_EVENTS: usize = 8192;
 
+/// How many forks back a conversation is followed. A forked session's own
+/// ledger starts at `session.forked`; what was said before the fork is in
+/// its parent, through `source_seq`, and in that parent's parent before
+/// that. `/rewind` forks, so a rewound session remembers the turns up to
+/// the point it was rewound to — and nothing after, which is the point.
+const MAX_FORK_DEPTH: usize = 8;
+
 /// The session's earlier turns, oldest first, read from the ledger's own
 /// `turn.started`/`turn.completed|failed|interrupted` events — the record
-/// of what was said, not the display transcript. A `turn.started` with no
+/// of what was said, not the display transcript — following `session.forked`
+/// back through the parents it branched from. A `turn.started` with no
 /// terminal event yet is the turn being executed now (or one lost to a
 /// crash) and is not carried; its prompt is the goal of this turn.
 ///
@@ -3189,28 +3197,51 @@ fn conversation_history(
     session_id: protocol::SessionId,
     cancel: &agent_runtime::CancellationToken,
 ) -> Vec<crate::host::ConversationTurn> {
+    let mut turns = Vec::new();
+    conversation_through(client, session_id, None, cancel, MAX_FORK_DEPTH, &mut turns);
+    turns
+}
+
+/// Append `session_id`'s turns through `through` (its tip when `None`) to
+/// `turns`, after its fork parent's — recursion bounded by `depth`.
+fn conversation_through(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    through: Option<u64>,
+    cancel: &agent_runtime::CancellationToken,
+    depth: usize,
+    turns: &mut Vec<crate::host::ConversationTurn>,
+) {
     use crate::host::{ConversationOutcome, ConversationTurn};
+    use event_ledger::event::EventKind;
+    use protocol::RedactionClass;
     // The kernel calls take the kernel's own token; the turn's token is the
     // one that can actually be cancelled, and the read loop watches it.
     let kernel_cancel = CancellationToken::new();
-    let Ok(snapshot) = block_on(client.get_session(session_id), &kernel_cancel) else {
-        return Vec::new();
+    let tip = match through {
+        Some(seq) => seq,
+        None => match block_on(client.get_session(session_id), &kernel_cancel) {
+            Ok(snapshot) => snapshot.seq(),
+            Err(_) => return,
+        },
     };
-    let tip = snapshot.seq();
     let after = tip.saturating_sub(MAX_CONVERSATION_EVENTS as u64);
     let Ok(mut stream) = block_on(
         client.subscribe(SubscribeEvents::new(session_id, after)),
         &kernel_cancel,
     ) else {
-        return Vec::new();
+        return;
     };
-    let text_of = |payload: &serde_json::Value, field: &str| -> Option<String> {
-        payload
+    let text_of = |event: &event_ledger::event::ErasedEventEnvelope, field: &str| {
+        if event.redaction() == RedactionClass::Secret {
+            return None;
+        }
+        event
+            .payload()
             .get(field)
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
     };
-    let mut turns: Vec<ConversationTurn> = Vec::new();
     let mut open: Option<String> = None;
     for _ in 0..MAX_CONVERSATION_EVENTS {
         if stream.cursor() >= tip || cancel.is_cancelled() {
@@ -3220,20 +3251,43 @@ fn conversation_history(
             break;
         };
         match event.kind() {
+            EventKind::SessionForked if depth > 0 => {
+                // What was said before the fork lives in the parent; carry it
+                // first so this session's own turns follow it in order.
+                let parent = event
+                    .payload()
+                    .get("parent_session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|raw| raw.parse::<protocol::SessionId>().ok());
+                let source_seq = event
+                    .payload()
+                    .get("source_seq")
+                    .and_then(serde_json::Value::as_u64);
+                if let (Some(parent), Some(source_seq)) = (parent, source_seq) {
+                    conversation_through(
+                        client,
+                        parent,
+                        Some(source_seq),
+                        cancel,
+                        depth - 1,
+                        turns,
+                    );
+                }
+            }
             EventKind::TurnStarted => {
-                open = text_of(event.payload(), "text");
+                open = text_of(&event, "text");
             }
             EventKind::TurnCompleted => {
                 if let Some(user) = open.take() {
                     turns.push(ConversationTurn::new(
                         user,
-                        ConversationOutcome::Answered(text_of(event.payload(), "text")),
+                        ConversationOutcome::Answered(text_of(&event, "text")),
                     ));
                 }
             }
             EventKind::TurnFailed => {
                 if let Some(user) = open.take() {
-                    let reason = text_of(event.payload(), "reason").unwrap_or_default();
+                    let reason = text_of(&event, "reason").unwrap_or_default();
                     turns.push(ConversationTurn::new(
                         user,
                         ConversationOutcome::Failed(reason),
@@ -3251,7 +3305,6 @@ fn conversation_history(
             _ => {}
         }
     }
-    turns
 }
 
 fn build_live_context(
@@ -8869,6 +8922,55 @@ alignment below it: {line:?}",
     }
 
     #[test]
+    fn a_rewound_session_remembers_the_turns_before_the_rewind_and_not_after() {
+        // `/rewind <seq>` forks at that seq and switches to the child. The
+        // child's own ledger starts at `session.forked`; what was said
+        // before lives in the parent, and the model on the child must have
+        // it — up to the rewind point only.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("first: name it Nightjar", ScriptedModel::terminal("Named."));
+        let cancel = CancellationToken::new();
+        let after_first =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        session.run_turn(
+            "second: rename it Kestrel",
+            ScriptedModel::terminal("Renamed."),
+        );
+
+        // Rewind to just after the first turn.
+        let child = block_on(
+            session.client.fork_session(ForkSession::new(
+                session.session_id,
+                after_first.seq(),
+                session.actor.clone(),
+                TraceId::new(),
+            )),
+            &cancel,
+        )
+        .expect("fork");
+        session.session_id = child.id();
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        session.run_turn(
+            "what is it called?",
+            ScriptedModel::terminal("Nightjar.").capturing_blocks(seen.clone()),
+        );
+        let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+        let turns: Vec<&str> = seen
+            .iter()
+            .filter(|(locator, _)| locator.starts_with(crate::host::CONVERSATION_LOCATOR_PREFIX))
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(turns.len(), 1, "{turns:?}");
+        assert!(turns[0].contains("name it Nightjar"), "{}", turns[0]);
+        assert!(
+            !seen.iter().any(|(_, text)| text.contains("Kestrel")),
+            "the turn after the rewind point is gone"
+        );
+    }
+
+    #[test]
     fn a_failed_and_an_interrupted_turn_are_carried_as_what_they_were() {
         let env = TempEnv::create();
         let mut session = ScriptedSession::create(&env);
@@ -13369,14 +13471,14 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         /// Set via `capturing_blocks`: every block of every `step()` call,
         /// as `(locator, text)`, so a test can assert on what the compiled
         /// context carried — the session's earlier turns, say.
-        captured_blocks: Option<std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>>,
+        captured_blocks: Option<CapturedBlocks>,
     }
 
+    /// `(locator, text)` of every block a `ScriptedModel` was handed.
+    type CapturedBlocks = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
     impl ScriptedModel {
-        fn capturing_blocks(
-            mut self,
-            sink: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
-        ) -> Self {
+        fn capturing_blocks(mut self, sink: CapturedBlocks) -> Self {
             self.captured_blocks = Some(sink);
             self
         }
