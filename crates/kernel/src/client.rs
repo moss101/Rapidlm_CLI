@@ -84,12 +84,13 @@ pub struct SubmitTurn {
 /// parallel constant rather than a shared one.
 pub const MAX_TURN_TEXT_BYTES: usize = 32 * 1024;
 
-/// Bound on `interrupt_sync`'s read-then-append retry loop against a
-/// concurrent writer to the same session (see its own doc comment). Each
-/// attempt is a local, fast (sub-millisecond to low-millisecond) SQLite
-/// read+append, not a network call, so a generous bound costs little in the
-/// rare case it's actually needed.
-const MAX_INTERRUPT_APPEND_ATTEMPTS: u32 = 20;
+/// Bound on the read-then-append retry loops that record a turn's terminal
+/// event — `interrupt_sync`'s and `finish_turn`'s — against a concurrent
+/// writer to the same session (see their doc comments). Each attempt is a
+/// local, fast (sub-millisecond to low-millisecond) SQLite read+append, not
+/// a network call, so a generous bound costs little in the rare case it's
+/// actually needed.
+const MAX_TERMINAL_APPEND_ATTEMPTS: u32 = 20;
 
 /// Truncate `text` to `MAX_TURN_TEXT_BYTES`, backing off to the nearest
 /// UTF-8 char boundary so a multibyte character is never split.
@@ -627,6 +628,18 @@ impl InProcessKernelClient {
     /// and releases the lease itself, and may well win this race, since it
     /// runs on the frontend's own input-handling thread rather than waiting
     /// on the turn's execution to actually notice cancellation).
+    ///
+    /// Taking the lease and appending the terminal event are two steps, and
+    /// `interrupt_sync` appends *before* it takes: this call could take the
+    /// lease, lose the race to that append, and then record a second
+    /// terminal event — `turn.interrupted` followed by `turn.completed` for
+    /// one turn. The projection refuses the second (`TurnNotActive`), and
+    /// since every read of the session replays its events, that made the
+    /// session permanently unreadable ("Session store is corrupt") after a
+    /// Ctrl-C that landed as a fast turn was finishing. So the append here
+    /// is made only while the projection still shows this turn active, at
+    /// its `expected_seq`; a `SequenceConflict` re-reads, and a turn no
+    /// longer active means its terminal event is already recorded.
     pub fn finish_turn(&self, req: FinishTurn) -> Result<(), ApiError> {
         let Some(live) = self.take_live_turn(req.session_id) else {
             return Ok(());
@@ -639,62 +652,90 @@ impl InProcessKernelClient {
             self.store_live_turn(req.session_id, live);
             return Ok(());
         }
-        let options = AppendOptions {
-            redaction: RedactionClass::Project,
-            trace_id: req.trace_id,
-            expected_seq: None,
-        };
-        let append_result: Result<(), LedgerError> = match req.outcome {
-            TurnOutcome::Completed { text } => self
-                .ledger
-                .append(
-                    req.session_id,
-                    req.actor,
-                    EventKind::TurnCompleted,
-                    TurnCompletedPayload {
-                        turn_id: req.turn_id,
-                        text,
-                    },
-                    &options,
-                    &ledger_live(),
-                )
-                .map(|_| ()),
-            TurnOutcome::Failed { reason } => self
-                .ledger
-                .append(
-                    req.session_id,
-                    req.actor,
-                    EventKind::TurnFailed,
-                    TurnFailedPayload {
-                        turn_id: req.turn_id,
-                        reason,
-                    },
-                    &options,
-                    &ledger_live(),
-                )
-                .map(|_| ()),
-            TurnOutcome::Interrupted => self
-                .ledger
-                .append(
-                    req.session_id,
-                    req.actor,
-                    EventKind::TurnInterrupted,
-                    TurnInterruptedPayload {
-                        turn_id: req.turn_id,
-                        reason: InterruptReason::ClientRequested,
-                    },
-                    &options,
-                    &ledger_live(),
-                )
-                .map(|_| ()),
-        };
+        let append_result = self.append_terminal(&req);
         // The lease is released regardless of whether the ledger append
         // above succeeded: a stuck lease (the original bug this exists to
         // fix) is worse than a turn whose terminal ledger event is missing
         // because of a real storage error — occupancy must not survive a
         // finished turn.
         live.lease.complete();
-        append_result.map_err(|err| ledger_api(err, req.trace_id))
+        append_result
+    }
+
+    /// `finish_turn`'s append: the terminal event for `req.outcome`, only
+    /// while the projection still shows `req.turn_id` active, at the seq it
+    /// was read at. `Ok(())` without appending once the turn is no longer
+    /// active — another path recorded its end first.
+    fn append_terminal(&self, req: &FinishTurn) -> Result<(), ApiError> {
+        let trace = req.trace_id;
+        for _ in 0..MAX_TERMINAL_APPEND_ATTEMPTS {
+            let snapshot = self
+                .sessions
+                .get_session(req.session_id, &live())
+                .map_err(|err| session_api(err, trace))?;
+            if snapshot.active_turn() != Some(req.turn_id) {
+                return Ok(());
+            }
+            let options = AppendOptions {
+                redaction: RedactionClass::Project,
+                trace_id: trace,
+                expected_seq: Some(snapshot.seq()),
+            };
+            let appended: Result<(), LedgerError> = match &req.outcome {
+                TurnOutcome::Completed { text } => self
+                    .ledger
+                    .append(
+                        req.session_id,
+                        req.actor.clone(),
+                        EventKind::TurnCompleted,
+                        TurnCompletedPayload {
+                            turn_id: req.turn_id,
+                            text: text.clone(),
+                        },
+                        &options,
+                        &ledger_live(),
+                    )
+                    .map(|_| ()),
+                TurnOutcome::Failed { reason } => self
+                    .ledger
+                    .append(
+                        req.session_id,
+                        req.actor.clone(),
+                        EventKind::TurnFailed,
+                        TurnFailedPayload {
+                            turn_id: req.turn_id,
+                            reason: reason.clone(),
+                        },
+                        &options,
+                        &ledger_live(),
+                    )
+                    .map(|_| ()),
+                TurnOutcome::Interrupted => self
+                    .ledger
+                    .append(
+                        req.session_id,
+                        req.actor.clone(),
+                        EventKind::TurnInterrupted,
+                        TurnInterruptedPayload {
+                            turn_id: req.turn_id,
+                            reason: InterruptReason::ClientRequested,
+                        },
+                        &options,
+                        &ledger_live(),
+                    )
+                    .map(|_| ()),
+            };
+            match appended {
+                Ok(_) => return Ok(()),
+                Err(LedgerError::SequenceConflict { .. }) => continue,
+                Err(err) => return Err(ledger_api(err, trace)),
+            }
+        }
+        Err(api_error(
+            ErrorCode::SessionConflict,
+            "Session conflict",
+            trace,
+        ))
     }
 
     fn interrupt_sync(&self, req: Interrupt) -> Result<(), ApiError> {
@@ -713,7 +754,7 @@ impl InProcessKernelClient {
         // recorded — an adversarial review of the interactive turn-
         // execution feature traced this precisely. Retried in a bounded
         // loop, re-reading the snapshot fresh each attempt, instead.
-        for attempt in 0..MAX_INTERRUPT_APPEND_ATTEMPTS {
+        for attempt in 0..MAX_TERMINAL_APPEND_ATTEMPTS {
             let snapshot = self
                 .sessions
                 .get_session(req.session_id, &live())
@@ -1423,6 +1464,95 @@ mod tests {
         );
         let after = block_on(tmp.client.get_session(session_id)).expect("session");
         assert!(after.active_turn().is_none(), "turn must be interrupted");
+    }
+
+    #[test]
+    fn an_interrupt_that_lands_while_finish_turn_holds_the_lease_does_not_corrupt_the_session() {
+        // The race: `finish_turn` takes the live turn, then `interrupt_sync`
+        // — which appends *before* it takes — records `turn.interrupted`,
+        // then `finish_turn` records `turn.completed`. Two terminal events
+        // for one turn; the projection refuses the second, and every later
+        // read of the session replays into that refusal: "Session store is
+        // corrupt", forever, from one Ctrl-C. CI's macOS runner hit it in
+        // `first_ctrl_c_interrupts_then_second_exits`.
+        //
+        // The interleaving's end state is built directly: the interrupt's
+        // event is appended the way `interrupt_sync` appends it, while the
+        // lease is still held so `finish_turn` still believes it owns the
+        // turn's end.
+        let tmp = TempClient::create();
+        let created = block_on(tmp.client.create_session(create_req())).expect("create");
+        let handle = block_on(tmp.client.submit_turn(SubmitTurn::new(
+            created.id(),
+            created.seq(),
+            actor(),
+            TraceId::new(),
+            "hello",
+        )))
+        .expect("submit");
+        let session_id = created.id();
+        let turn_id = handle.turn_id();
+
+        tmp.client
+            .ledger
+            .append(
+                session_id,
+                actor(),
+                EventKind::TurnInterrupted,
+                TurnInterruptedPayload {
+                    turn_id,
+                    reason: InterruptReason::ClientRequested,
+                },
+                &AppendOptions {
+                    redaction: RedactionClass::Project,
+                    trace_id: TraceId::new(),
+                    expected_seq: Some(handle.seq()),
+                },
+                &ledger_live(),
+            )
+            .expect("the interrupt's terminal event");
+
+        tmp.client
+            .finish_turn(FinishTurn::new(
+                session_id,
+                turn_id,
+                actor(),
+                TraceId::new(),
+                TurnOutcome::Completed {
+                    text: Some("done".to_owned()),
+                },
+            ))
+            .expect("finish after interrupt is not an error");
+
+        let after = block_on(tmp.client.get_session(session_id))
+            .expect("the session is still readable after the race");
+        assert!(after.active_turn().is_none());
+        let mut stream =
+            block_on(tmp.client.subscribe(SubscribeEvents::new(session_id, 0))).expect("subscribe");
+        let mut terminals = Vec::new();
+        for _ in 0..after.seq() {
+            let event = stream.recv().expect("event");
+            if matches!(
+                event.kind(),
+                EventKind::TurnCompleted | EventKind::TurnInterrupted | EventKind::TurnFailed
+            ) {
+                terminals.push(event.kind());
+            }
+        }
+        assert_eq!(
+            terminals,
+            vec![EventKind::TurnInterrupted],
+            "exactly one terminal event, the one that landed first"
+        );
+        // And the lease is released: the next turn can start.
+        block_on(tmp.client.submit_turn(SubmitTurn::new(
+            session_id,
+            after.seq(),
+            actor(),
+            TraceId::new(),
+            "again",
+        )))
+        .expect("a new turn after the race");
     }
 
     #[test]
