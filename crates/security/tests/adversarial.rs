@@ -215,13 +215,13 @@ fn t003_sandbox_mount_symlink_to_sensitive_path_is_forbidden() {
     let lease = world.proc_lease();
     let live = CancellationToken::new();
 
-    let via = world.tmp.join("via-private");
-    std::os::unix::fs::symlink("/private", &via).expect("symlink private");
+    // Link to the filesystem root and spell `/etc` through it: lexically a
+    // temp path, canonically `/etc` (`/private/etc` on macOS, where `/etc`
+    // is itself a link). Host-derived, not `/private` by name.
+    let via = world.tmp.join("via-root");
+    std::os::unix::fs::symlink("/", &via).expect("symlink root");
     let etc_escape = via.join("etc");
-    assert!(
-        etc_escape.is_dir(),
-        "/private/etc must exist through symlink"
-    );
+    assert!(etc_escape.is_dir(), "/etc must exist through the symlink");
     let etc_host =
         CanonicalHostPath::from_resolved(etc_escape.to_str().expect("utf8")).expect("host");
     let spec = SandboxSpec::builder(SandboxTier::HostRestricted)
@@ -243,7 +243,7 @@ fn t003_sandbox_mount_symlink_to_sensitive_path_is_forbidden() {
         SandboxError::ForbiddenMount
     );
 
-    std::os::unix::fs::symlink("/private", world.view_a.join("escape")).expect("cwd symlink");
+    std::os::unix::fs::symlink("/", world.view_a.join("escape")).expect("cwd symlink");
     let cwd_spec = SandboxSpec::builder(SandboxTier::HostRestricted)
         .cwd(RepoPath::parse("src/escape/etc").expect("cwd"))
         .mount(

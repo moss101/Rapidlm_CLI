@@ -4,6 +4,11 @@
 //! view, expiry, or remaining uses between approval and execution. Every
 //! mismatch must return `policy.lease_invalid` before a canary file write or
 //! canary-server connect.
+//!
+//! The world every test here builds includes a symlink (the approved
+//! filesystem target, retargeted at the canary by one mutation), so the
+//! whole file is Unix-only rather than each test asserting less on Windows.
+#![cfg(unix)]
 
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener, TcpStream};
