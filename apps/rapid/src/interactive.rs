@@ -11814,14 +11814,18 @@ was already finished"
         // this happen: the job's exit and its last line inside one tick.
         let env = TempEnv::create();
         let mut session = ScriptedSession::create(&env);
+        // The job writes its last line only once the test says so, by
+        // creating this file — a fixed sleep let a slow runner reach the
+        // dispatch below after the job had already finished.
+        let go = env.project.join("go");
+        let script = format!(
+            "echo $((1000 + 1)); while [ ! -e '{}' ]; do sleep 0.02; done; echo $((2000 + 2))",
+            go.display()
+        );
         session.run_turn(
             "start a job that writes once more before it exits",
             ScriptedModel::background_job_then_answer(
-                &[
-                    "/bin/sh",
-                    "-c",
-                    "echo $((1000 + 1)); sleep 1; echo $((2000 + 2))",
-                ],
+                &["/bin/sh", "-c", script.as_str()],
                 "started it",
             ),
         );
@@ -11869,8 +11873,9 @@ was already finished"
             "the view opened before the last line existed"
         );
 
-        // Look away: no ticks until the last line is spooled and the job
-        // has had time to be recorded as done.
+        // Let the job finish, and look away: no ticks until the last line
+        // is spooled and the job has had time to be recorded as done.
+        std::fs::write(&go, b"").expect("release the job");
         let spooled = Instant::now() + Duration::from_secs(10);
         while !loop_state
             .jobs
