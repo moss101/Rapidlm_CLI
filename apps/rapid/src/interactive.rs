@@ -319,16 +319,23 @@ fn render_subcommand_line(entry: &Subcommand) -> String {
 /// errors. Documents the prompt argument, the exec flags, and the env vars
 /// that shape a headless run.
 pub const EXEC_USAGE: &str = "\
-usage: rapid exec <prompt> [--verbose] [--max-wall-time <seconds>] [--json-schema <path>] [--jsonl]
+usage: rapid exec <prompt> [--resume <session-id> | --continue] [--verbose]
+                  [--max-wall-time <seconds>] [--json-schema <path>] [--jsonl]
 
 Run one headless agent turn with the configured model. The final response is
 printed to stdout; diagnostics go to stderr; a non-zero exit code reports a
-failed turn.
+failed turn. Each run is recorded as a session in this project's ledger;
+`--resume`/`--continue` run the turn as the next turn of a recorded session
+instead, so the model sees what was said before — the same history an
+interactive turn sees, and the same session `rapid resume` reopens.
 
 Arguments:
   <prompt>    Task prompt for the agent (required)
 
 Options:
+  --resume <session-id>   Continue this recorded session (an id `rapid
+                          sessions list` or a previous run printed)
+  --continue              Continue the session with the most recent activity
   --verbose               Per-attempt model and turn diagnostics on stderr
   --max-wall-time <secs>  Cancel the turn if it runs longer than this many
                           seconds (cooperative: the same signal Ctrl-C sends)
@@ -1900,6 +1907,19 @@ struct ExecArgs {
     /// separate, unbuilt `rapid run <goal/playbook>` durable-graph command
     /// the contract's own doc comment was originally scoped to.
     jsonl: bool,
+    /// Run as the next turn of a recorded session rather than a new one.
+    resume: ExecResume,
+}
+
+/// Which session a `rapid exec` turn is recorded in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExecResume {
+    /// A fresh session, as every run before `--resume` existed.
+    Fresh,
+    /// `--resume <id>`: this session, which must be in the project's ledger.
+    Session(protocol::SessionId),
+    /// `--continue`: the session with the most recent activity.
+    MostRecent,
 }
 
 fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
@@ -1907,11 +1927,24 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
     let mut max_wall_time = None;
     let mut json_schema = None;
     let mut jsonl = false;
+    let mut resume = ExecResume::Fresh;
     let mut words: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--verbose" {
             verbose = true;
+        } else if args[i] == "--resume" {
+            i += 1;
+            let id = args.get(i)?.parse::<protocol::SessionId>().ok()?;
+            if resume != ExecResume::Fresh {
+                return None;
+            }
+            resume = ExecResume::Session(id);
+        } else if args[i] == "--continue" {
+            if resume != ExecResume::Fresh {
+                return None;
+            }
+            resume = ExecResume::MostRecent;
         } else if args[i] == "--max-wall-time" {
             i += 1;
             let secs: u64 = args.get(i)?.parse().ok()?;
@@ -1936,6 +1969,7 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
         max_wall_time,
         json_schema,
         jsonl,
+        resume,
     })
 }
 
@@ -3654,15 +3688,57 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     // is run; `None` means the directory, home, or trust catalog could not
     // be resolved at all, and the run says so at the end rather than
     // leaving the user to look for a session that was never written.
-    let recording = match &workspace {
-        Some((root, _)) => match ExecRecording::open(root) {
+    let recording = match (&workspace, &parsed.resume) {
+        (Some((root, _)), ExecResume::Fresh) => match ExecRecording::open(root) {
             Ok(recording) => Some(recording),
             Err(reason) => {
                 eprintln!("warning: this run is not being recorded: {reason}");
                 None
             }
         },
-        None => None,
+        // A resume that cannot be honored is an error, not a fresh session
+        // run in its place: the user asked for a conversation, and a turn
+        // that silently forgot it would be the old behavior under a flag
+        // that promises otherwise.
+        (Some((root, _)), resume) => match ExecRecording::open_existing(root, resume) {
+            Ok(recording) => Some(recording),
+            Err(InteractiveError::UnknownSession(id)) => {
+                eprintln!("rapid exec: session {id} has not been recorded in this project");
+                let ledger_path = project_ledger_path(&root.join(PROJECT_MARKER));
+                if let Some(hint) = known_sessions_hint(&ledger_path) {
+                    eprint!("{hint}");
+                }
+                return Err(InteractiveError::Usage);
+            }
+            Err(InteractiveError::Usage) => {
+                eprintln!(
+                    "rapid exec: no session has been recorded in this project yet; \
+run without --continue to start one"
+                );
+                return Err(InteractiveError::Usage);
+            }
+            Err(err) => return Err(err),
+        },
+        (None, ExecResume::Fresh) => None,
+        (None, _) => {
+            eprintln!(
+                "rapid exec: --resume/--continue need a project; none could be resolved here"
+            );
+            return Err(InteractiveError::Usage);
+        }
+    };
+    // The session's earlier turns, if this is one: the same history an
+    // interactive turn carries, read the same way.
+    let preserved = match &recording {
+        Some(recording) if parsed.resume != ExecResume::Fresh => {
+            let history_cancel = agent_runtime::CancellationToken::new();
+            preserved.with_conversation(conversation_history(
+                &recording.client,
+                recording.session_id,
+                &history_cancel,
+            ))
+        }
+        _ => preserved,
     };
     let turn_text = prompt.clone();
     let spec = AgentSpec::builder(
@@ -4018,8 +4094,14 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     // by listing sessions and guessing — and a run outside a project says
     // why there is none, rather than leaving the user to look for it.
     match (&recording, recorded_turn, &workspace) {
+        (Some(recording), Some(_), _) if parsed.resume != ExecResume::Fresh => eprintln!(
+            "session {} continued; `rapid exec --continue` runs its next turn, `rapid resume {}` \
+reopens it",
+            recording.session_id, recording.session_id
+        ),
         (Some(recording), Some(_), _) => eprintln!(
-            "session {} recorded in this project; `rapid resume {}` reopens it",
+            "session {} recorded in this project; `rapid exec --continue` runs its next turn, \
+`rapid resume {}` reopens it",
             recording.session_id, recording.session_id
         ),
         // `exec_workspace` falls back to the current directory as its own
@@ -5780,6 +5862,48 @@ impl ExecRecording {
         Ok(Self {
             client,
             session_id: snapshot.id(),
+            actor,
+            seq: snapshot.seq(),
+        })
+    }
+
+    /// Continue a session already in this project's ledger: `--resume <id>`
+    /// or `--continue`. The turn is submitted at the session's current tip,
+    /// exactly as an interactive turn on a resumed session is.
+    /// `UnknownSession` names an id the ledger has never seen, so the caller
+    /// can offer the ids it does have; `Usage` is `--continue` with nothing
+    /// recorded yet. A ledger that cannot be opened at all says why on
+    /// stderr and is `Io`.
+    fn open_existing(root: &Path, resume: &ExecResume) -> Result<Self, InteractiveError> {
+        let ledger_path = project_ledger_path(&root.join(PROJECT_MARKER));
+        let session_id = match resume {
+            ExecResume::Fresh => return Err(InteractiveError::Internal),
+            ExecResume::Session(id) => *id,
+            ExecResume::MostRecent => {
+                most_recent_session(&ledger_path)?.ok_or(InteractiveError::Usage)?
+            }
+        };
+        let client = InProcessKernelClient::open(&ledger_path).map_err(|err| {
+            eprintln!(
+                "rapid exec: cannot open this project's sessions: {}: {err}",
+                ledger_path.display()
+            );
+            InteractiveError::Io
+        })?;
+        let actor = human_actor()?;
+        let cancel = CancellationToken::new();
+        let snapshot = match block_on(client.get_session(session_id), &cancel) {
+            Ok(snapshot) => snapshot,
+            Err(InteractiveError::Kernel(api))
+                if api.code() == protocol::ErrorCode::SessionNotFound =>
+            {
+                return Err(InteractiveError::UnknownSession(session_id));
+            }
+            Err(err) => return Err(err),
+        };
+        Ok(Self {
+            client,
+            session_id,
             actor,
             seq: snapshot.seq(),
         })

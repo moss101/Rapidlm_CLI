@@ -807,6 +807,95 @@ fn binary_exec_records_its_session_in_the_project_ledger() {
 }
 
 #[test]
+fn binary_exec_continue_runs_the_next_turn_of_the_recorded_session() {
+    // `--continue` is a conversation across runs: the second run's model
+    // request must carry what the first run asked and answered, and both
+    // turns must land in one session, not two.
+    let server = spawn_scripted_server(vec![
+        (200, terminal_body("Noted: the codename is Nightjar.")),
+        (200, terminal_body("It is Nightjar.")),
+    ]);
+    let env = TrustedProject::new("bin-continue");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["exec", "the codename is Nightjar; remember it"],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(
+        stdout.contains("Noted: the codename is Nightjar."),
+        "{stdout}"
+    );
+    let first_session = stderr
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("session ")
+                .and_then(|rest| rest.split_whitespace().next())
+        })
+        .unwrap_or_else(|| panic!("the first run must name its session:\n{stderr}"))
+        .to_owned();
+
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["exec", "--continue", "what is the codename?"],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("It is Nightjar."), "{stdout}");
+    assert!(
+        stderr.contains(&format!("session {first_session} continued")),
+        "the second run continues the first run's session:\n{stderr}"
+    );
+
+    let requests = server.requests.lock().expect("requests");
+    assert_eq!(requests.len(), 2, "one model call per run");
+    let second = &requests[1];
+    assert!(
+        second.contains("the codename is Nightjar; remember it")
+            && second.contains("Noted: the codename is Nightjar."),
+        "the second run's model request must carry the first run's turn:\n{second}"
+    );
+    assert!(
+        !requests[0].contains("what is the codename?"),
+        "and the first run's request was its own prompt only"
+    );
+
+    // `--resume <id>` with an id this project never recorded refuses,
+    // naming the ids it does have, rather than starting a fresh session
+    // under a flag that promised a conversation.
+    let (code, _, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &[
+            "exec",
+            "--resume",
+            "018f3c8a-7e2b-7a10-8c4d-0123456789ab",
+            "anything",
+        ],
+    );
+    assert_ne!(code, Some(0));
+    assert!(
+        stderr.contains("has not been recorded in this project") && stderr.contains(&first_session),
+        "{stderr}"
+    );
+    assert_eq!(
+        server.requests.lock().expect("requests").len(),
+        2,
+        "no model call was made"
+    );
+}
+
+#[test]
 fn binary_exec_in_a_bare_directory_records_there_like_the_tui_does() {
     // A directory with no `.rapidlm` or `.git` above it is its own project
     // root — the TUI's rule, and now the headless run's: the session goes
