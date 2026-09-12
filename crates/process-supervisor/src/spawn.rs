@@ -727,6 +727,16 @@ fn isolate_process_group(command: &mut Command) {
     }
 }
 
+/// Hand the child its stdin bytes and close the pipe.
+///
+/// A child that closes its stdin — or exits — before reading all of it
+/// turns the write into `BrokenPipe`. That is not a failure to spawn: the
+/// child is running or has run, and what it did with its input is its
+/// business; its exit status and output are the truth. Treating it as one
+/// killed the child's group and reported `Spawn` for a hook like
+/// `/usr/bin/env` or `false` that never reads stdin — deterministically on
+/// a fast Linux runner, where the child is gone before the write, and
+/// rarely on a Mac. Every other write error is still the spawn's.
 fn write_stdin(child: &mut Child, stdin: &StdinSpec) -> Result<(), SpawnError> {
     match stdin {
         StdinSpec::Empty => Ok(()),
@@ -734,8 +744,11 @@ fn write_stdin(child: &mut Child, stdin: &StdinSpec) -> Result<(), SpawnError> {
             let Some(pipe) = child.stdin.as_mut() else {
                 return Err(SpawnError::Io(std::io::ErrorKind::BrokenPipe));
             };
-            pipe.write_all(bytes)
-                .map_err(|err| SpawnError::Io(err.kind()))?;
+            match pipe.write_all(bytes) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Err(err) => return Err(SpawnError::Io(err.kind())),
+            }
             let _ = child.stdin.take();
             Ok(())
         }
@@ -1378,6 +1391,66 @@ capability = "fs.read"
             .wait_with_output()
             .expect("wait");
         assert_eq!(output.stdout, b"hello-stdin");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_closes_stdin_without_reading_it_is_not_a_spawn_failure() {
+        // The deterministic form of the race CI showed as
+        // `Spawn(Io(BrokenPipe))`: the child closes its stdin before the
+        // parent writes, so the write can only hit `EPIPE`. Spawned with
+        // stdin piped like `spawn` does, then handed its bytes through the
+        // same `write_stdin`.
+        let sh = require_bin("/bin/sh");
+        let mut child = Command::new(&sh)
+            .args(["-c", "exec 0<&-; sleep 2"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("child");
+        // Give the shell time to close its stdin; the payload is the largest
+        // one `spawn` accepts so that, even if the close has not happened
+        // yet, the write cannot complete into the pipe buffer alone.
+        std::thread::sleep(Duration::from_millis(300));
+        let payload = StdinSpec::Bytes(vec![b'x'; MAX_STDIN_BYTES]);
+        let result = write_stdin(&mut child, &payload);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            result,
+            Ok(()),
+            "a closed read end is the child's choice, not a spawn failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_shaped_child_that_never_reads_stdin_runs_to_its_own_exit() {
+        // Through `spawn` itself: `/usr/bin/env` exits without touching its
+        // stdin. On a fast machine it is gone before the payload is written.
+        // Whatever the timing, the spawn succeeds and the child's own exit
+        // is what gets reported — run enough times to meet the race.
+        let env_bin = require_bin("/usr/bin/env");
+        for _ in 0..20 {
+            let spec = ExecSpec::argv(
+                [env_bin.as_str()],
+                temp_cwd(),
+                None::<(String, SecretOrValue)>,
+                StdinSpec::Bytes(vec![b'{'; 512]),
+                None,
+                4096,
+                CancellationToken::new(),
+            )
+            .expect("spec")
+            .bind(test_binding())
+            .expect("bind");
+            let output = spawn(spec.clone(), lease_guard(&spec))
+                .expect("a child that ignores stdin still spawns")
+                .wait_with_output()
+                .expect("wait");
+            assert!(output.status.success(), "{:?}", output.status);
+        }
     }
 
     #[cfg(unix)]
