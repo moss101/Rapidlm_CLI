@@ -25,6 +25,14 @@ pub mod turn {
 pub mod cancel;
 
 pub mod client;
+/// Unix-socket IPC only. The module carried half-finished `cfg(not(unix))`
+/// placeholders that never compiled — the client's frame I/O needs `Read` +
+/// `Write` on a stream type the placeholder did not provide, and the server
+/// called `cfg(unix)`-only functions from un-gated code — and no CI job had
+/// run on Windows to say so. Nothing in the binary consumes this module yet
+/// (`rapid daemon`/`rapid acp` are roadmap), so on other platforms it is
+/// absent rather than pretend-present.
+#[cfg(unix)]
 pub mod ipc;
 pub mod recovery;
 

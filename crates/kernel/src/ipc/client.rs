@@ -374,10 +374,6 @@ impl DaemonClient {
                 shared.unary = Some(stream);
             }
         }
-        #[cfg(not(unix))]
-        {
-            let _ = stream;
-        }
     }
 
     fn drop_unary(&self) {
@@ -433,15 +429,6 @@ impl DaemonClient {
                 ListenSpec::TcpLoopback { .. } | ListenSpec::WebSocketLoopback { .. } => Err(
                     DaemonClientError::Transport(IpcError::NetworkTransportDisabled),
                 ),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            match &self.spec {
-                ListenSpec::TcpLoopback { .. } | ListenSpec::WebSocketLoopback { .. } => Err(
-                    DaemonClientError::Transport(IpcError::NetworkTransportDisabled),
-                ),
-                _ => Err(DaemonClientError::Transport(IpcError::UnsupportedEndpoint)),
             }
         }
     }
@@ -648,10 +635,6 @@ impl DaemonEventStream {
                         .map_err(DaemonClientError::Transport)?;
                     self.conn = Some(StreamConn { stream, request_id });
                 }
-                #[cfg(not(unix))]
-                {
-                    let _ = (stream, request_id);
-                }
                 Ok(())
             }
             Inbound::Err { id, error } => {
@@ -673,10 +656,6 @@ impl DaemonEventStream {
                 .map_err(DaemonClientError::Transport)?;
             decode_inbound(&bytes)
         }
-        #[cfg(not(unix))]
-        {
-            Err(DaemonClientError::Transport(IpcError::UnsupportedEndpoint))
-        }
     }
 
     fn event_id_matches(&self, id: &str) -> bool {
@@ -687,21 +666,12 @@ impl DaemonEventStream {
                 .map(|conn| conn.request_id == id)
                 .unwrap_or(false)
         }
-        #[cfg(not(unix))]
-        {
-            let _ = id;
-            false
-        }
     }
 
     fn conn_is_none(&self) -> bool {
         #[cfg(unix)]
         {
             self.conn.is_none()
-        }
-        #[cfg(not(unix))]
-        {
-            true
         }
     }
 
@@ -836,9 +806,6 @@ impl Drop for DaemonEventStream {
 
 #[cfg(unix)]
 type UnaryStream = std::os::unix::net::UnixStream;
-
-#[cfg(not(unix))]
-struct UnaryStream;
 
 fn validate_limits(limits: IpcLimits) -> Result<(), DaemonClientError> {
     if limits.max_frame_bytes() == 0 || limits.max_frame_bytes() > MAX_FRAME_BYTES {

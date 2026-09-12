@@ -363,11 +363,6 @@ where
                 {
                     Self::bind_unix(path, client, cancel, limits)
                 }
-                #[cfg(not(unix))]
-                {
-                    let _ = (client, cancel, limits);
-                    Err(IpcError::UnsupportedEndpoint)
-                }
             }
         }
     }
@@ -389,11 +384,6 @@ where
         #[cfg(unix)]
         {
             self.serve_unix()
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = self;
-            Err(IpcError::UnsupportedEndpoint)
         }
     }
 

@@ -261,7 +261,7 @@ mod windows_live {
 #[cfg(all(test, target_os = "linux"))]
 mod linux_live {
     use super::*;
-    use crate::store::{CredentialKind, PlatformKeychain as _};
+    use crate::store::CredentialKind;
     #[test]
     fn secret_service_round_trip() {
         let kc = linux::FreedesktopSecretService;
