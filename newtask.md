@@ -8017,6 +8017,29 @@ show this bug on macOS** — BSD `kill` is correct — so the cycle here is CI o
 this commit died in the hooks timeout test; the run after must complete `plugin-host`,
 `process-supervisor` and `sandbox`.
 
+**A finished job's last output could be missing, fixed 2026-09-12 (`4f9be70`).** CI's Linux
+runner failed `an_open_logs_view_follows_a_job_that_is_still_writing` on the lifecycle refactor,
+which touched nothing near it. Two causes. The job supervisor recorded a job as done — registry
+state and the ledger's `job.completed` — as soon as `try_wait` returned, and only *then* joined
+the threads draining the child's pipes into the spool; so `job_output` read right after
+`job_status` said "completed" could miss the tail, and so could anything reading on the completion
+event. Now the readers reach EOF before completion is recorded, bounded by `JOB_OUTPUT_SETTLE`
+(250ms — a pipe a grandchild still holds cannot hold the completion hostage). And the `/jobs logs`
+view re-read the spool every tick while the job ran and never again once it stopped — but the tick
+that sees it stop is the one whose spool holds the last lines. `JobLogView::complete` marks a page
+read after the job stopped; a live page is re-read every tick and once more on the tick that sees
+it stop. Test: open the view, release the job (its last line waits on a file the test creates —
+a fixed sleep let macOS's runner reach the dispatch after the job had finished, `400d310`), look
+away until the last line is spooled and the job has exited, then the first tick that sees it stop
+must show that line. **No local revert cycle** — this machine was frozen — the argument is in the
+test's shape: the only refresh between opening and the terminal tick is the one that tick makes,
+and the old code skipped it. Green on Ubuntu and macOS.
+
+**Sampler and lifecycle folded (`5e4849f`, `64576c8`).** `isolate`/`terminate` live beside
+`signal` in `process-signal`; the `ps`/`pgrep` sampler is one `backends::process_sample` module,
+on the tolerant form (gvisor's copy dropped a whole sample for one vanished pid — its memory limit
+skipped a tick under churn). Both shipped on `fmt --check` and CI, this machine being frozen.
+
 **CI's first real runs in a week, five rounds, 2026-09-12** (`3d72e58`, `c0fa8e4`, `d711e41`,
 `cb0d918`, `60f3050`, `a151550`).
 
@@ -8154,7 +8177,7 @@ plausible cause and is a system setting, so the owner's; `fmt --check` is clean 
 
 ## Session boundary, 2026-09-10 — durable state for the next session
 
-Sixty-one commits across four days, `dbeb2c2`..HEAD, all pushed to `origin/main`. Baseline before
+Sixty-eight commits across four days, `dbeb2c2`..HEAD, all pushed to `origin/main`. Baseline before
 them was `598c6fd`. Each has its own entry above; this is the current state and what is actually left.
 
 **GitHub Actions is running again as of 2026-09-12, and its first fourteen runs found four
@@ -8307,8 +8330,15 @@ actually failed them.
    spend rounds on Windows test gating; a Windows *lint* failure is still a red commit to fix.
 10. ~~**A Linux `Spawn` flake in plugin-host**~~ — **found and fixed 2026-09-12** (`fa99666`,
     entry above): it was `BrokenPipe` on the stdin hand-off, exactly the suspected cause.
-11. **Duplication the P0 left behind**: the three sandbox backends still each carry an identical
-    `terminate_process_group` (TERM, grace, KILL, reap); and `PtySession` is exported and unused.
+11. ~~**Duplication the P0 left behind**~~ — **folded 2026-09-12** (`5e4849f`): `isolate_process_group`
+    (four copies) and `terminate_process_group` with its constants (three copies) now live beside
+    `signal_process_group` in `process-signal`, the three steps of one lifecycle; a test pins the
+    unconditional group KILL that reaches a `trap '' TERM` grandchild. Still three copies, and
+    *not* identical: `sample_process_group`/`group_pids`/`pid_rss_kb` (the `ps`-based memory and
+    pid-count sampling) — gvisor's drops the whole sample when any one pid's rss is unreadable
+    (a pid that exited between the listing and the `ps`), where the other two count it as 0, so
+    gvisor's memory limit skips a tick under process churn. Unify on the tolerant form. And
+    `PtySession` is exported and unused.
 
 **Two things to know before touching this area again.** The event ledger is in **WAL** mode
 (`event_ledger::migrations` sets and verifies it) — check `PRAGMA journal_mode` before reasoning about
