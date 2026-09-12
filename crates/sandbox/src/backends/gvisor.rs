@@ -40,6 +40,9 @@ const RUNSC_PROGRAMS: &[&str] = &["/usr/bin/runsc", "/usr/local/bin/runsc", "/bi
 const TRUE_PROGRAMS: &[&str] = &["/usr/bin/true", "/bin/true"];
 const TEST_PROGRAMS: &[&str] = &["/usr/bin/test", "/bin/test"];
 const LS_PROGRAMS: &[&str] = &["/usr/bin/ls", "/bin/ls"];
+// Used only by the `cfg(unix)` `platform_signal_group`; gated the same way
+// so a Windows build does not fail `-D dead_code` on a constant it cannot use.
+#[cfg(unix)]
 const KILL_PROGRAMS: &[&str] = &["/bin/kill", "/usr/bin/kill"];
 const PS_PROGRAMS: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 const PGREP_PROGRAMS: &[&str] = &["/usr/bin/pgrep", "/bin/pgrep"];

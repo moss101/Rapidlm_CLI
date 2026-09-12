@@ -36,6 +36,9 @@ const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const BWRAP_PROGRAMS: &[&str] = &["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"];
 const POSIX_SH: &[&str] = &["/bin/sh", "/usr/bin/sh"];
 const TRUE_PROGRAMS: &[&str] = &["/usr/bin/true", "/bin/true"];
+// Used only by the `cfg(unix)` `platform_signal_group`; gated the same way
+// so a Windows build does not fail `-D dead_code` on a constant it cannot use.
+#[cfg(unix)]
 const KILL_PROGRAMS: &[&str] = &["/bin/kill", "/usr/bin/kill"];
 const PS_PROGRAMS: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 const PGREP_PROGRAMS: &[&str] = &["/usr/bin/pgrep", "/bin/pgrep"];

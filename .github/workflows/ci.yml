@@ -76,6 +76,11 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
+          # v5 turns package-manager caching on by default and, reading
+          # `packageManager: pnpm@…` from package.json, runs `pnpm` to prime
+          # it — before the corepack step below has enabled pnpm. Off; the
+          # pinned pnpm comes from corepack, as it always has.
+          package-manager-cache: false
 
       - name: Enable pinned pnpm
         run: |

@@ -61,6 +61,9 @@ const SENSITIVE_PREFIXES: &[&str] = &[
     "/run/docker",
 ];
 
+// Used only by the `cfg(unix)` `platform_signal_group`; gated the same way
+// so a Windows build does not fail `-D dead_code` on a constant it cannot use.
+#[cfg(unix)]
 const KILL_PROGRAMS: &[&str] = &["/bin/kill", "/usr/bin/kill"];
 const POSIX_SH: &[&str] = &["/bin/sh", "/usr/bin/sh"];
 const PS_PROGRAMS: &[&str] = &["/bin/ps", "/usr/bin/ps"];

@@ -1105,7 +1105,15 @@ mod tests {
             })
             .collect();
 
-        let deadline = Instant::now() + Duration::from_millis(250);
+        // The property is that `snapshot` never *blocks* behind the writers:
+        // a blocked reader never returns, so a wall-clock bound catches it
+        // whatever its size. The bound used to be 250ms for 50,000
+        // iterations — 5µs each, a throughput figure tuned on a fast dev
+        // machine — and the first CI run on a shared macOS runner, with four
+        // spinning writers competing for its cores, missed it. Five seconds
+        // still fails a snapshot that waits on a writer even once per
+        // iteration, without asserting anything about the runner's speed.
+        let deadline = Instant::now() + Duration::from_secs(5);
         for _ in 0..50_000 {
             let health = state.snapshot();
             let snap = HealthSnapshot::new(sid("config"), health);

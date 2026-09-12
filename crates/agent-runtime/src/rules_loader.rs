@@ -500,9 +500,19 @@ mod tests {
         assert!(text.contains("# AGENTS/AGENTS.md"));
         assert!(text.contains("# AGENTS/CLAUDE.md"));
         assert!(text.contains("# AGENTS/sub/AGENT.md"));
-        // On a case-insensitive filesystem sub/Claude.md is admitted once,
-        // under the first convention name that matched (canonical spelling).
-        assert!(text.contains("# AGENTS/sub/CLAUDE.md"));
+        // `sub/Claude.md` is admitted exactly once, under whichever
+        // convention spelling matched on this filesystem: `CLAUDE.md` (first
+        // in `INSTRUCTION_FILE_NAMES`, matched by case folding) on macOS and
+        // Windows, the on-disk `Claude.md` on a case-sensitive Linux. This
+        // used to assert the folded spelling alone and failed the first time
+        // CI ran on Linux — the loader was right on both; the test was not.
+        let folded = text.matches("# AGENTS/sub/CLAUDE.md").count();
+        let literal = text.matches("# AGENTS/sub/Claude.md").count();
+        assert_eq!(
+            folded + literal,
+            1,
+            "sub/Claude.md must appear exactly once, folded={folded} literal={literal}:\n{text}"
+        );
         let root_pos = text.find("root agents").expect("root");
         let sub_pos = text.find("sub agent").expect("sub");
         assert!(root_pos < sub_pos);
