@@ -1308,7 +1308,10 @@ class FrameQueue implements AsyncIterable<string> {
         this.#waiters.push(resolve);
       });
       if (next.done) {
-        if (this.#done instanceof TransportError) {
+        // `#done` is `TransportError | "closed" | null`; `instanceof` is not
+        // allowed on a union with a primitive member, so narrow the other two
+        // away first.
+        if (this.#done !== null && this.#done !== "closed") {
           throw this.#done;
         }
         return;

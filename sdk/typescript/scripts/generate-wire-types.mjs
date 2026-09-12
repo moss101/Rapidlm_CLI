@@ -502,7 +502,9 @@ const CANCEL_STRIDE = 16;
 const PROTOTYPE_KEYS = ["__proto__", "constructor", "prototype"] as const;
 
 type DecodeCtx = {
-  signal?: AbortSignal;
+  // "| undefined" is load-bearing under exactOptionalPropertyTypes: beginDecode
+  // builds this from options?.signal, which is AbortSignal | undefined.
+  signal?: AbortSignal | undefined;
   nodes: number;
   maxBytes: number;
 };
@@ -989,7 +991,7 @@ export function decodeEvent(input: unknown, options?: DecodeOptions): Event {
     kind: asClosed(expectField(obj, "kind", ""), EVENT_KINDS, "kind"),
     redaction: asClosed(expectField(obj, "redaction", ""), REDACTION_CLASSES, "redaction"),
     payload: decodeJsonValue(expectField(obj, "payload", ""), "payload", ctx, 0),
-  };
+  } as Event;
 }
 
 export function encodeEvent(value: Event): Event {
@@ -1004,7 +1006,7 @@ export function encodeEvent(value: Event): Event {
     kind: value.kind,
     redaction: value.redaction,
     payload: encodeJsonValue(value.payload),
-  };
+  } as Event;
 }
 
 function encodeActor(actor: ActorRef): ActorRef {
@@ -1581,7 +1583,7 @@ function encodedJsonBytes(value: unknown): number {
 function beginDecode(
   input: unknown,
   options?: DecodeOptions,
-  defaultMax = MAX_DECODE_BYTES,
+  defaultMax: number = MAX_DECODE_BYTES,
 ): DecodeCtx {
   if (options?.signal?.aborted) {
     fail("cancelled", "", "decode cancelled");
