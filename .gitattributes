@@ -1,0 +1,6 @@
+# Golden files are compared byte-for-byte by tests (`crates/protocol/tests/
+# schema_fixtures.rs` and others), and a Windows checkout with git's default
+# `core.autocrlf=true` rewrote every LF to CRLF and failed them. Every text
+# file is LF on every platform; git's own content detection keeps binaries
+# untouched.
+* text=auto eol=lf
