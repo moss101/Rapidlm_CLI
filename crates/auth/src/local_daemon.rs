@@ -1014,18 +1014,12 @@ fn ct_eq(left: &[u8], right: &[u8]) -> bool {
     acc == 0
 }
 
+/// The OS CSPRNG — `getrandom(2)` / `/dev/urandom` on Unix, `BCryptGenRandom`
+/// on Windows — through the same crate `uuid` already draws ids from. The
+/// Windows arm used to be a bare `Err(Entropy)`, so no daemon token could
+/// ever be issued there; the first Windows test run said so twelve times.
 fn fill_random(buf: &mut [u8]) -> Result<(), DaemonAuthError> {
-    #[cfg(unix)]
-    {
-        let mut file = File::open("/dev/urandom").map_err(|_| DaemonAuthError::Entropy)?;
-        file.read_exact(buf).map_err(|_| DaemonAuthError::Entropy)?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = buf;
-        Err(DaemonAuthError::Entropy)
-    }
+    getrandom::fill(buf).map_err(|_| DaemonAuthError::Entropy)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

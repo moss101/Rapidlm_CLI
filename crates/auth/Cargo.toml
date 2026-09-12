@@ -21,6 +21,9 @@ serde_json = "1"
 # the daemon token is never sent on the wire or logged. std has no SHA-256.
 # Also used for leaf certificate fingerprints (pin comparison).
 sha2 = "0.10"
+# getrandom: MIT/Apache-2.0; the OS CSPRNG for daemon tokens on every
+# platform (already in the tree through `uuid`).
+getrandom = "0.4"
 
 [dev-dependencies]
 # rcgen: MIT/Apache-2.0; generate local test CA/leaf fixtures only. No
