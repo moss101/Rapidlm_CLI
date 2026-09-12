@@ -89,6 +89,29 @@ pub enum PreHookOutcome {
     Denied { reason: String },
 }
 
+/// The shell a hook line runs under, with the environment cleared down to
+/// what a shell needs to find programs and a temp directory. Which shell
+/// and which variables is the only platform difference in running a hook.
+fn hook_shell(command: &str) -> Command {
+    #[cfg(unix)]
+    let (shell, flag, keep): (&str, &str, &[&str]) =
+        ("sh", "-c", &["PATH", "HOME", "LANG", "TMPDIR"]);
+    #[cfg(not(unix))]
+    let (shell, flag, keep): (&str, &str, &[&str]) = (
+        "cmd",
+        "/C",
+        &["PATH", "USERPROFILE", "TEMP", "TMP", "SystemRoot"],
+    );
+    let mut builder = Command::new(shell);
+    builder.arg(flag).arg(command).env_clear();
+    for key in keep {
+        if let Ok(value) = std::env::var(key) {
+            let _ = builder.env(key, value);
+        }
+    }
+    builder
+}
+
 /// Run one hook command with `input_json` on stdin; returns
 /// `(exit_ok, stderr)`. A missing/failed spawn counts as failed with a
 /// static reason (never a panic).
@@ -106,32 +129,23 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> (bool, S
         Ok(file) => file,
         Err(err) => return (false, format!("hook output file failed: {err}")),
     };
-    #[cfg(unix)]
-    let spawn = {
-        let mut command_builder = Command::new("sh");
-        command_builder.arg("-c").arg(command).env_clear();
-        for key in ["PATH", "HOME", "LANG", "TMPDIR"] {
-            if let Ok(value) = std::env::var(key) {
-                let _ = command_builder.env(key, value);
-            }
+    let stdout_file = match output_file.try_clone() {
+        Ok(file) => file,
+        Err(err) => {
+            let _ = std::fs::remove_file(&output_path);
+            return (false, format!("hook output file failed: {err}"));
         }
-        command_builder
-            .stdin(Stdio::piped())
-            .stdout(Stdio::from(output_file.try_clone().expect("clone")))
-            .stderr(Stdio::from(output_file))
-            .spawn()
     };
-    #[cfg(not(unix))]
-    let spawn = {
-        let mut command_builder = Command::new("cmd");
-        command_builder.arg("/C").arg(command).env_clear();
-        for key in ["PATH", "USERPROFILE", "TEMP", "TMP", "SystemRoot"] {
-            if let Ok(value) = std::env::var(key) {
-                let _ = command_builder.env(key, value);
-            }
-        }
-        command_builder.spawn()
-    };
+    // The stdio wiring is the contract — input JSON on stdin, everything the
+    // hook prints into the file — and is the same on every platform. Only
+    // the shell differs. (The Windows arm used to spawn bare: no stdin, so
+    // the hook never received its payload, and no redirection, so its
+    // output went to the TUI's own terminal and the file read back empty.)
+    let spawn = hook_shell(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(output_file))
+        .spawn();
     let mut child = match spawn {
         Ok(child) => child,
         Err(err) => {

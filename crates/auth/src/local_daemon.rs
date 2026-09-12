@@ -1119,6 +1119,10 @@ mod tests {
     fn issue_stores_owner_only_os_user_bound_token() {
         let (tmp, auth, handle) = issued();
         assert_eq!(handle.path(), auth.token_path());
+        assert!(
+            handle.path().starts_with(&tmp.dir),
+            "token lives in the runtime dir"
+        );
         assert_eq!(handle.byte_len(), TOKEN_BYTES);
         assert_eq!(handle.binding().uid(), auth.binding().uid());
         assert!(auth.has_token().expect("has token"));

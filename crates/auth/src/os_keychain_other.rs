@@ -232,7 +232,7 @@ pub mod linux {
 #[cfg(all(test, target_os = "windows"))]
 mod windows_live {
     use super::*;
-    use crate::store::{CredentialKind, PlatformKeychain as _};
+    use crate::store::CredentialKind;
     #[test]
     fn credential_manager_round_trip() {
         let kc = super::windows::WindowsCredentialManager;
