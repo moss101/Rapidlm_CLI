@@ -691,6 +691,150 @@ fn binary_exec_applies_workspace_patch_end_to_end_in_accept_edits_mode() {
     }
 }
 
+/// Run any `rapid` subcommand in the same project/home/config a
+/// `run_rapid_in` exec used, so what that run recorded can be read back
+/// through the binary rather than by opening its files.
+fn run_rapid_args_in(
+    project: &Path,
+    home: &Path,
+    config_path: &Path,
+    args: &[&str],
+) -> (Option<i32>, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
+        .args(args)
+        .current_dir(project)
+        .env("HOME", home)
+        .env_remove("RAPIDLM_HOME")
+        .env_remove("RAPIDLM_MODEL")
+        .env_remove("RAPIDLM_PERMISSION_MODE")
+        .env("RAPIDLM_CONFIG", config_path)
+        .output()
+        .expect("run rapid");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn binary_exec_records_its_session_in_the_project_ledger() {
+    // A headless run used to mint a `SessionId` for its execution request
+    // and never open the ledger: a run that wrote a file was not in `rapid
+    // sessions list`, could not be `rapid resume`d, and had no `/diff`. The
+    // TUI recorded all of it. Everything asserted here is read back through
+    // the binary's own commands, the way a user would.
+    let server = spawn_scripted_server(vec![
+        (200, patch_tool_call_body()),
+        (200, terminal_body("patched notes.txt")),
+    ]);
+    let env = TrustedProject::new("bin-recorded");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let (code, stdout, stderr) =
+        run_rapid_in(&env.project, &env.home, &config_path, Some("acceptEdits"));
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("patched notes.txt"), "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(env.project.join("notes.txt")).expect("patched"),
+        "beta\n"
+    );
+
+    // The run names the session it recorded, on stderr, so stdout stays
+    // the answer.
+    let session_id = stderr
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("session ")
+                .and_then(|rest| rest.split_whitespace().next())
+        })
+        .unwrap_or_else(|| panic!("the run must name the session it recorded:\n{stderr}"));
+    assert!(
+        stderr.contains(&format!("`rapid resume {session_id}` reopens it")),
+        "{stderr}"
+    );
+
+    // It is in this project's session list.
+    let (code, listed, err) =
+        run_rapid_args_in(&env.project, &env.home, &config_path, &["sessions", "list"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(listed.contains("count=1"), "one recorded session: {listed}");
+    assert!(
+        listed.contains(&format!("session={session_id}")),
+        "the listed session is the one the run named: {listed}"
+    );
+
+    // And the record carries what the run did: the prompt, the write with
+    // its hunk, and how the turn ended.
+    let export = env.project.join("export.jsonl");
+    let (code, _, err) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &[
+            "inspect-export",
+            session_id,
+            export.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(code, Some(0), "{err}");
+    let exported = std::fs::read_to_string(&export).expect("export written");
+    assert!(
+        exported.contains("turn.started")
+            && exported.contains("patch notes.txt by replacing alpha with beta"),
+        "the prompt must be in the record: {exported}"
+    );
+    assert!(
+        exported.contains("workspace.mutation_detected")
+            && exported.contains("notes.txt")
+            && exported.contains("+beta"),
+        "the write and its hunk must be in the record: {exported}"
+    );
+    assert!(
+        exported.contains("turn.completed"),
+        "the turn's end must be in the record: {exported}"
+    );
+    // And the turn's own progress — the model round trips and the tool
+    // request — which reach the ledger only through the forwarding sink.
+    assert!(
+        exported.contains("model.completed") && exported.contains("tool.requested"),
+        "the turn's progress events must be in the record: {exported}"
+    );
+}
+
+#[test]
+fn binary_exec_in_a_bare_directory_records_there_like_the_tui_does() {
+    // A directory with no `.rapidlm` or `.git` above it is its own project
+    // root — the TUI's rule, and now the headless run's: the session goes
+    // into that directory's own `.rapidlm/`, untrusted or not, so a run
+    // made anywhere can be listed and resumed from there.
+    let server = spawn_scripted_server(vec![(200, terminal_body("hello"))]);
+    let home = temp_dir("bin-bare-home");
+    let scratch = temp_dir("bin-bare-scratch");
+    let config_path = home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let (code, stdout, stderr) =
+        run_rapid_args_in(&scratch, &home, &config_path, &["exec", "say hello"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("hello"), "{stdout}");
+    assert!(
+        stderr.contains("recorded in this project"),
+        "a run in a bare directory is recorded in it:\n{stderr}"
+    );
+    let (code, listed, err) =
+        run_rapid_args_in(&scratch, &home, &config_path, &["sessions", "list"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(listed.contains("count=1"), "{listed}");
+}
+
 #[test]
 fn binary_exec_in_default_mode_denies_the_patch_and_keeps_disk_intact() {
     let server = spawn_scripted_server(vec![

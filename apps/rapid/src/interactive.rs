@@ -3509,6 +3509,23 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         preserved
     };
     let preserved = preserved.with_reminders_block(reminder_block);
+    // The run's own session in the project ledger. `exec_workspace` resolves
+    // a project for any directory (the nearest marked ancestor, else the
+    // directory itself — the TUI's rule), so a run is recorded wherever it
+    // is run; `None` means the directory, home, or trust catalog could not
+    // be resolved at all, and the run says so at the end rather than
+    // leaving the user to look for a session that was never written.
+    let recording = match &workspace {
+        Some((root, _)) => match ExecRecording::open(root) {
+            Ok(recording) => Some(recording),
+            Err(reason) => {
+                eprintln!("warning: this run is not being recorded: {reason}");
+                None
+            }
+        },
+        None => None,
+    };
+    let turn_text = prompt.clone();
     let spec = AgentSpec::builder(
         protocol::AgentId::new(),
         AgentRole::Coder,
@@ -3518,13 +3535,39 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     .permissions_profile("work")
     .build()
     .map_err(|_| InteractiveError::Internal)?;
-    let session_id = protocol::SessionId::new();
+    let session_id = recording
+        .as_ref()
+        .map(|recording| recording.session_id)
+        .unwrap_or_else(protocol::SessionId::new);
     let request = AgentExecutionRequest::new(spec, session_id);
     let cancel = agent_runtime::CancellationToken::new();
     if let Some(max_wall_time) = parsed.max_wall_time {
         spawn_wall_time_watchdog(cancel.clone(), max_wall_time);
     }
     let mut events: Vec<agent_runtime::TurnEvent> = Vec::new();
+    // The turn's start goes through the kernel's `SubmitTurn` exactly as an
+    // interactive turn's does — that is what carries the prompt into the
+    // ledger — and the tools get the same ledger-backed observers, so what
+    // this run writes and runs reaches `/diff` and `/jobs` on resume.
+    let recorded_turn = match &recording {
+        Some(recording) => match recording.start_turn(&turn_text) {
+            Ok(turn_id) => {
+                attach_ledger_sinks(&mut tools, &recording.client, session_id, &recording.actor);
+                Some(turn_id)
+            }
+            Err(reason) => {
+                eprintln!("warning: this run is not being recorded: {reason}");
+                None
+            }
+        },
+        None => None,
+    };
+    let mut sink = RecordedEvents {
+        events: &mut events,
+        ledger: recorded_turn
+            .and(recording.as_ref())
+            .map(ExecRecording::sink),
+    };
 
     // Scrub the active model's own resolved credential from captured
     // shell_exec output: a command that reads back a config file
@@ -3635,7 +3678,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             backing,
             &request,
             &mut wrapped,
-            &mut events,
+            &mut sink,
             &cancel,
             ContextRetryPolicy::default(),
             diag,
@@ -3647,12 +3690,15 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             backing,
             &request,
             &mut tools,
-            &mut events,
+            &mut sink,
             &cancel,
             ContextRetryPolicy::default(),
             diag,
         )
     };
+    if let (Some(recording), Some(turn_id)) = (&recording, recorded_turn) {
+        recording.finish_turn(turn_id, &run_result);
+    }
     if let (Ok(outcome), Some(goal_path), Some(goal_id)) = (&run_result, &goal_path, goal_id) {
         let active_ms = u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         accrue_turn_usage(
@@ -3827,6 +3873,28 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         .map(|record| io.records().write(&record));
     } else if let Some(text) = &text {
         println!("{text}");
+    }
+    // Where the record went, on stderr so stdout stays the answer. A run that
+    // was recorded names the session — the id is otherwise only discoverable
+    // by listing sessions and guessing — and a run outside a project says
+    // why there is none, rather than leaving the user to look for it.
+    match (&recording, recorded_turn, &workspace) {
+        (Some(recording), Some(_), _) => eprintln!(
+            "session {} recorded in this project; `rapid resume {}` reopens it",
+            recording.session_id, recording.session_id
+        ),
+        // `exec_workspace` falls back to the current directory as its own
+        // project root, exactly as the TUI does, so this is not "outside a
+        // project" — it is a directory, home, or trust catalog that could
+        // not be resolved at all, and the tools were withheld for the same
+        // reason (see the warning printed above).
+        (_, _, None) => eprintln!(
+            "not recorded: the project root, home directory, or trust catalog could not be \
+resolved, so there is nowhere to record to"
+        ),
+        // The ledger could not be opened or the turn not started: the
+        // warning was printed where it happened.
+        _ => {}
     }
     Ok(code.as_i32())
 }
@@ -5497,6 +5565,116 @@ struct InteractiveTurnSink<'a> {
     actor: &'a ActorRef,
 }
 
+/// A headless run's own session in the project ledger.
+///
+/// `rapid exec` used to mint a `SessionId` for its execution request and
+/// never open the ledger: a run that wrote files and started jobs was not in
+/// `rapid sessions list`, could not be `rapid resume`d, and had no `/diff`.
+/// The interactive path recorded all of it. This is the same session, turn
+/// and sinks the TUI uses, opened for one turn.
+///
+/// Fail-open: a project whose ledger cannot be opened still gets its run —
+/// recording is a record, not a precondition — and the user is told the run
+/// was not recorded rather than left to discover an absent session.
+struct ExecRecording {
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: ActorRef,
+    /// The session tip after creation, which `SubmitTurn` must name.
+    seq: u64,
+}
+
+impl ExecRecording {
+    fn open(root: &Path) -> Result<Self, String> {
+        let ledger_path = project_ledger_path(&root.join(PROJECT_MARKER));
+        if let Some(parent) = ledger_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
+        }
+        let client = InProcessKernelClient::open(&ledger_path)
+            .map_err(|err| format!("{}: {err}", ledger_path.display()))?;
+        let actor = human_actor().map_err(|err| err.to_string())?;
+        let cancel = CancellationToken::new();
+        let snapshot = block_on(
+            client.create_session(CreateSession::new(
+                ProjectId::new(),
+                actor.clone(),
+                TraceId::new(),
+            )),
+            &cancel,
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(Self {
+            client,
+            session_id: snapshot.id(),
+            actor,
+            seq: snapshot.seq(),
+        })
+    }
+
+    /// Record the turn's start — the kernel's own `SubmitTurn`, which is
+    /// what carries the prompt into the ledger — and hand back the turn id
+    /// `finish_turn` needs.
+    fn start_turn(&self, text: &str) -> Result<protocol::TurnId, String> {
+        let cancel = CancellationToken::new();
+        let handle = block_on(
+            self.client.submit_turn(SubmitTurn::new(
+                self.session_id,
+                self.seq,
+                self.actor.clone(),
+                TraceId::new(),
+                text,
+            )),
+            &cancel,
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(handle.turn_id())
+    }
+
+    fn sink(&self) -> InteractiveTurnSink<'_> {
+        InteractiveTurnSink {
+            client: &self.client,
+            session_id: self.session_id,
+            actor: &self.actor,
+        }
+    }
+
+    fn finish_turn<E: std::fmt::Display>(
+        &self,
+        turn_id: protocol::TurnId,
+        run_result: &Result<crate::host::ExecOutcome, E>,
+    ) {
+        if let Ok(outcome) = run_result {
+            record_context_compiled(&self.client, self.session_id, &self.actor, outcome);
+        }
+        let _ = self.client.finish_turn(kernel::FinishTurn::new(
+            self.session_id,
+            turn_id,
+            self.actor.clone(),
+            TraceId::new(),
+            kernel_turn_outcome(run_result),
+        ));
+    }
+}
+
+/// The headless turn's event sink: every event into the run's own `Vec`, and
+/// — when the run is recorded — the same event into the ledger through the
+/// same `InteractiveTurnSink` an interactive turn uses. One sink type for
+/// both cases, so `run_live_exec`'s two call sites in `exec_turn` need no
+/// branching.
+struct RecordedEvents<'a> {
+    events: &'a mut Vec<agent_runtime::TurnEvent>,
+    ledger: Option<InteractiveTurnSink<'a>>,
+}
+
+impl agent_runtime::TurnEventSink for RecordedEvents<'_> {
+    fn emit(&mut self, event: agent_runtime::TurnEvent) -> Result<(), agent_runtime::TurnError> {
+        if let Some(ledger) = self.ledger.as_mut() {
+            ledger.emit(event.clone())?;
+        }
+        self.events.emit(event)
+    }
+}
+
 impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
     fn emit(&mut self, event: agent_runtime::TurnEvent) -> Result<(), agent_runtime::TurnError> {
         use agent_runtime::TurnEvent;
@@ -6281,21 +6459,7 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
             };
         }
     };
-    // Background jobs report into the same ledger the turn writes to, so
-    // they reach the `/jobs` panel through the ordinary subscription rather
-    // than a second channel.
-    tools.set_job_events(std::sync::Arc::new(LedgerJobEvents {
-        client: client.clone(),
-        session_id,
-        actor: actor.clone(),
-    }));
-    // Workspace writes reach `/diff` the same way: through the ledger, not a
-    // second channel.
-    tools.set_workspace_changes(std::sync::Arc::new(LedgerWorkspaceChanges {
-        client: client.clone(),
-        session_id,
-        actor: actor.clone(),
-    }));
+    attach_ledger_sinks(tools, client, session_id, actor);
     let request = AgentExecutionRequest::new(spec, session_id);
     let mut sink = InteractiveTurnSink {
         client,
@@ -6316,33 +6480,8 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
         ContextRetryPolicy::default(),
         None,
     );
-    // Compiled-context usage, appended on the same terms as a background
-    // job's lifecycle: through `append_turn_progress`, at the session tip, so
-    // it reaches the status line by the ordinary subscription rather than a
-    // second channel. Emitted for every completed turn — a failed turn still
-    // filled a context, and the figure is what the model was last given.
-    if let Ok(outcome) = &run_result
-        && let Some((used, limit)) = outcome.context_tokens
-    {
-        let _ = client.append_turn_progress(
-            session_id,
-            actor,
-            TraceId::new(),
-            event_ledger::event::EventKind::ContextCompiled,
-            serde_json::json!({
-                "included_tokens": used,
-                "context_limit": limit,
-                // Per-class breakdown for the `/context` panel: the totals
-                // cannot say which class is consuming the window.
-                "partitions": outcome
-                    .context_partitions
-                    .iter()
-                    .map(|(class, used, cap)| {
-                        serde_json::json!({"class": class, "used": used, "cap": cap})
-                    })
-                    .collect::<Vec<_>>(),
-            }),
-        );
+    if let Ok(outcome) = &run_result {
+        record_context_compiled(client, session_id, actor, outcome);
     }
     if let (Ok(outcome), Some(goal_id)) = (&run_result, goal_id) {
         let active_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -6355,19 +6494,77 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
         );
     }
 
+    kernel_turn_outcome(&run_result)
+}
+
+/// Attach the ledger-backed observers a recorded session needs, so that
+/// background jobs reach `/jobs` and workspace writes reach `/diff` through
+/// the ordinary subscription rather than a second channel.
+///
+/// One function for the interactive and the headless path: a headless run
+/// used to attach nothing, so `rapid exec` left no record of what it wrote
+/// or ran.
+fn attach_ledger_sinks(
+    tools: &mut ExecTools,
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+) {
+    tools.set_job_events(std::sync::Arc::new(LedgerJobEvents {
+        client: client.clone(),
+        session_id,
+        actor: actor.clone(),
+    }));
+    tools.set_workspace_changes(std::sync::Arc::new(LedgerWorkspaceChanges {
+        client: client.clone(),
+        session_id,
+        actor: actor.clone(),
+    }));
+}
+
+/// Compiled-context usage, appended on the same terms as a background job's
+/// lifecycle: through `append_turn_progress`, at the session tip, so it
+/// reaches the status line by the ordinary subscription rather than a second
+/// channel. Emitted for every completed turn — a failed turn still filled a
+/// context, and the figure is what the model was last given. The per-class
+/// rows are for the `/context` panel: the totals cannot say which class is
+/// consuming the window.
+fn record_context_compiled(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    outcome: &crate::host::ExecOutcome,
+) {
+    let Some((used, limit)) = outcome.context_tokens else {
+        return;
+    };
+    let _ = client.append_turn_progress(
+        session_id,
+        actor,
+        TraceId::new(),
+        event_ledger::event::EventKind::ContextCompiled,
+        serde_json::json!({
+            "included_tokens": used,
+            "context_limit": limit,
+            "partitions": outcome
+                .context_partitions
+                .iter()
+                .map(|(class, used, cap)| {
+                    serde_json::json!({"class": class, "used": used, "cap": cap})
+                })
+                .collect::<Vec<_>>(),
+        }),
+    );
+}
+
+/// Map `run_live_exec`'s terminal status onto the kernel's own
+/// `TurnOutcome` — the one mapping the ledger's `turn.*` terminal event is
+/// derived from, for an interactive turn and a headless one alike.
+fn kernel_turn_outcome<E: std::fmt::Display>(
+    run_result: &Result<crate::host::ExecOutcome, E>,
+) -> kernel::TurnOutcome {
     match run_result {
-        Ok(outcome) => match context_required_question(&outcome) {
-            // Not `Failed`: the model correctly recognized it needed
-            // something only the user can supply and asked for it, cleanly
-            // — the same shape of outcome as an ordinary completion (the
-            // kernel's own `TurnOutcome` has no third "stopped, but not a
-            // failure" shape, and none of its other two variants fit either:
-            // `Interrupted` is specifically for cancellation, not this). The
-            // question becomes the turn's own assistant-visible text so the
-            // *existing* transcript/session-ready pipeline shows it and
-            // returns to input-ready with no special-cased UI path and no
-            // failure banner — the user's next message is an ordinary new
-            // turn, not a resumption of this one.
+        Ok(outcome) => match context_required_question(outcome) {
             Some(question) => kernel::TurnOutcome::Completed {
                 text: Some(question.to_owned()),
             },
@@ -6376,14 +6573,6 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
                     text: Some(outcome.result.summary().to_owned()),
                 },
                 AgentTerminalStatus::Cancelled => kernel::TurnOutcome::Interrupted,
-                AgentTerminalStatus::Failed => kernel::TurnOutcome::Failed {
-                    reason: outcome.result.summary().to_owned(),
-                },
-                // `#[non_exhaustive]`: a future variant this match hasn't
-                // been taught yet. The summary text is still real and safe
-                // to show; treating it as failed rather than silently
-                // succeeding is the conservative direction for an
-                // unrecognized status.
                 _ => kernel::TurnOutcome::Failed {
                     reason: outcome.result.summary().to_owned(),
                 },
@@ -6395,17 +6584,6 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
     }
 }
 
-/// The model's own question when a turn stopped because it genuinely needs
-/// something only the user can supply (`TurnStopReason::ContextRequired`,
-/// reachable today via `ask_user` with no interactive answer source) — the
-/// bounded `error` half of `failure_detail`, reused for this stop reason
-/// exactly as it already is for `ToolFailed` (see `TurnFailureDetail`'s own
-/// doc comment). `None` for every other outcome, including every other
-/// failure — never guessed from `outcome.result.summary()`'s prose, and
-/// never confused with `TurnStopReason::ContextBoundExceeded` (the model's
-/// context *window* overflowing — a host/context-owner repair, not a
-/// question for the user; `execute_with_context_recovery` already handles
-/// that one entirely on its own, before this function ever sees the result).
 fn context_required_question(outcome: &crate::host::ExecOutcome) -> Option<&str> {
     if outcome.stop_reason != Some(agent_runtime::TurnStopReason::ContextRequired) {
         return None;

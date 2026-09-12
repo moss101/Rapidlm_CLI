@@ -7931,9 +7931,53 @@ autonomous goal owns the session; `/resume` had been given a hand-copied version
 against the old code and failed with the `SessionConflict` above; with the fix it passes. The existing
 invalid-sequence test still passes, so the error surface is unchanged.
 
+**Headless `rapid exec` records its session, done 2026-09-12.**
+
+`exec_turn` minted a `SessionId` for its execution request and never opened the ledger: a run that
+wrote files and started jobs was not in `rapid sessions list`, could not be `rapid resume`d, and had no
+`/diff`. Its `Vec<TurnEvent>` sink was write-only — the turn's events were collected and discarded. The
+TUI recorded all of it. Both paths bottom out in `run_live_exec`; the difference was entirely in the
+wrapper.
+
+**One implementation, shared.** Three pieces of `execute_interactive_turn` became functions both paths
+call: `attach_ledger_sinks` (the `LedgerJobEvents`/`LedgerWorkspaceChanges` observers),
+`record_context_compiled`, and `kernel_turn_outcome` (the `run_live_exec` → `TurnOutcome` mapping the
+ledger's terminal `turn.*` event derives from). `ExecRecording` opens the project ledger, creates the
+session, records the turn's start through the kernel's own `SubmitTurn` (which is what carries the
+prompt into the ledger), and finishes it with `finish_turn` — the TUI's sequence, run synchronously.
+`RecordedEvents` is the headless sink: every event into the run's `Vec`, and the same event into the
+ledger through the same `InteractiveTurnSink` the TUI uses. One sink type, so `exec_turn`'s two
+`run_live_exec` call sites (plain and `--json-schema`-wrapped) need no branching. The `session_id` the
+`--jsonl` records already carried is now a real, resumable one. The run ends with `session <id> recorded
+in this project; \`rapid resume <id>\` reopens it` on stderr — stdout stays the answer.
+
+**Fail-open.** A ledger that cannot be opened or a turn that cannot be started prints a warning and the
+run proceeds unrecorded; recording is a record, not a precondition.
+
+**A wrong assumption, caught by its own test.** The first draft had an "outside a project" branch and a
+test for it. There is no such place: `exec_workspace` → `detect_project_root` falls back to the current
+directory as its own root, the TUI's rule, so a run in a bare directory is recorded in that directory's
+`.rapidlm/`. The message for the genuinely unreachable-project case (cwd, home, or trust catalog
+unresolvable) now says that, and the test asserts the true behavior.
+
+**Verified at the CLI boundary.** `binary_exec_records_its_session_in_the_project_ledger` drives the
+real binary against a scripted model server, then reads everything back through `rapid sessions list`
+and `rapid inspect-export`: the prompt in `turn.started`, `notes.txt` with its `+beta` hunk in
+`workspace.mutation_detected`, `model.completed` and `tool.requested` from the forwarding sink,
+`turn.completed`. **Revert cycles 144-147**, each failing on exactly the assertion for the piece
+removed: never open the ledger; sinks not attached; turn never finished; tee not forwarding.
+
+**Gate, exactly.** `cargo test -p rapid --lib` 720/720, the integration file 15/15, `cargo clippy -p
+rapid --all-targets --locked -- -D warnings` exit 0, `fmt --check` clean. **No full workspace run for
+this commit**: the machine spent the day freezing freshly built binaries and `rustc` itself at launch
+(uninterruptible wait, zero CPU) while two other sessions ran their suites, and a workspace run under
+that takes hours per attempt. The change is confined to `apps/rapid` (`interactive.rs` and one
+integration test); every other crate is untouched by it. The next session should run the full suite on a
+quiet machine before anything else, as before.
+
 ## Session boundary, 2026-09-10 — durable state for the next session
 
-Forty-two commits across four days, `dbeb2c2`..`92240bf`, all pushed to `origin/main`. Baseline before
+Forty-five commits across four days, `dbeb2c2`..HEAD, all pushed to `origin/main`. Baseline before
 them was `598c6fd`. Each has its own entry above; this is the current state and what is actually left.
 
 **`92240bf` (rewind fix) had a clean single workspace run — exit 0, 80 of 80 — on 2026-09-12, which
@@ -8006,7 +8050,7 @@ today: a test that hardcoded a derived answer (`/memory` is `None`) went stale t
 fact changed — which is the design working — and a draft that added a `LocalUiEvent` beside a kernel
 event for the same value was caught and removed before it shipped.
 
-**Verification.** Revert cycles 72-143 across the four days. The pattern that keeps earning its keep: a
+**Verification.** Revert cycles 72-147 across the four days. The pattern that keeps earning its keep: a
 cycle that *passes* means the test is wrong, not the code. Five did on 2026-09-09; two more did today —
 a fixture too small for the bound it was meant to prove (one line against a 200-line cap), and a state
 read taken before the supervisor thread could notice a kill. Both were rewritten until the broken code
@@ -8033,7 +8077,8 @@ actually failed them.
    uses two (`agents`, `goals`). See this session's entry for the two traps: `trace_jobs`'s log path
    needs an `ArtifactRef` producer that does not exist anywhere in the workspace, and wiring it as-is
    would regress `/jobs` rows back to bare UUIDs.
-4. **Headless runs leave no record — the next task, investigated 2026-09-12.** `exec_turn` mints a
+4. ~~**Headless runs leave no record**~~ — **done 2026-09-12** (entry above). What follows is the
+   investigation that scoped it, kept for the design reasoning. `exec_turn` mints a
    fresh `SessionId` for the execution request but never opens the ledger, creates a session, or
    attaches the `LedgerJobEvents`/`LedgerWorkspaceChanges` sinks; it runs `run_live_exec` against an
    in-memory `Vec<TurnEvent>`. So a `rapid exec` run that wrote files and ran commands is not in `rapid
