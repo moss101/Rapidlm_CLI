@@ -8017,6 +8017,32 @@ show this bug on macOS** — BSD `kill` is correct — so the cycle here is CI o
 this commit died in the hooks timeout test; the run after must complete `plugin-host`,
 `process-supervisor` and `sandbox`.
 
+**`/agents cancel|terminate` stop a running subagent, and `/agents` shows one, 2026-09-13
+(`11c7266`).** Item 5 in the remaining list. Both commands were refused honestly — no
+running-agent registry — and the `/agents` panel, which projects `agent.*` ledger events, was empty
+for the one kind of agent the binary runs: a `task_spawn` child left no event at all. Now
+`task_spawn` runs each child on its own token, registered by a fresh `AgentId` in the session's
+`SubagentRegistry` (shared into every turn's tools like the job table and the MCP registry, through
+`SessionShared`), with a `ParentCancelBridge` carrying the parent turn's cancellation to the child
+(the tokens have no parent/child link; a poller does it, stopped when the child returns); and it
+reports the child to an `AgentEvents` sink the way jobs and writes are reported — `LedgerAgentEvents`
+appends `agent.spawned {agent_id, role, state: "running", current_operation: task}` and exactly one
+terminal event (`agent.result` succeeded, `agent.state_changed {state: "failed", blocker}`, or
+`agent.cancelled`), in that order, because the kernel projection refuses a terminal event for an
+agent it does not have and a session that replays into a refused event is unreadable.
+`/agents cancel <id>` cancels the child's token: the child's `task_spawn` call returns a cancelled
+report and the parent turn goes on; the bare form cancels every running child; terminate is cancel
+(an in-process child has no harsher stop). `command_help`'s `cancels_a_specific_target` — every
+cancel form names a real target now — is gone. **Tests**: through the loop, a scripted parent
+delegates to a runner that runs until cancelled; the panel shows the child Running with its role
+and task; `/agents cancel <id>` prints the confirmation, the child ends Cancelled in the panel, the
+parent finishes; cancelling again and the bare form say what there is to cancel; revert cycle 162
+(no registry) and 163 (no parent bridge — the caller's cancellation must still reach an in-flight
+child, the test `task_spawn_stops_a_running_child_when_the_caller_is_cancelled` replacing one that
+pinned token identity). Known bound: a process killed between a child's `agent.spawned` and its
+terminal event leaves that agent active in the projection; harmless until `MAX_ACTIVE_AGENTS`
+(256) of them, which no realistic session reaches.
+
 **MCP servers are started once per interactive session, not once per turn, 2026-09-13
 (`6ae511b`).** Found by the self-review of `6b0ce30`: with the integrations wired into the TUI
 turn, every turn spawned each configured server, ran its `initialize`/`tools/list` handshake, and
@@ -8409,18 +8435,18 @@ Test step is the next task before anything else, and the platform matrix is the 
 gate.
 
 **2026-09-13** (`94d0f59`..`bf8d067`, fourteen commits, every one green on all four CI jobs
-through `1079c27`; `bf8d067`'s run was queued at the boundary): a turn carries the session's
+through `1bfd543`): a turn carries the session's
 earlier turns to the model, following forks; `rapid exec --resume`/`--continue`; `/compact` and a
 real overflow recovery (`b0700b9`, reviewed and hardened in `07d8285`); the transcript after
 `/rewind`/`/fork`/`/resume` onto a fork (`127218d`); the interactive turn on the same setup as a
 headless one — hooks, MCP, retrieval, reminders, fallback chain, ceilings, subagents (`6b0ce30`,
 reviewed and hardened in `4619864`, which also found and fixed the lagged-subscription P1);
 `[phases] compact` and the compaction hooks (`4619864`); MCP servers per session, not per turn
-(`6ae511b`). Two self-reviews, both with real findings, both entries above. **Next in order:**
-`/agents cancel`/`terminate` (item 5 — a running-agent registry is a feature, and `task_spawn`
-children now run in the TUI, so the registry has something to hold); a session-scoped MCP server
-that dies is not reconnected; `interactive_reminders` is not trust-gated (parity with headless,
-worth deciding); the unwired panel view models (item 3); the both-ledgers merge (item 8).
+(`6ae511b`); `/agents cancel|terminate` and subagents in the `/agents` panel (`11c7266`).
+Two self-reviews, both with real findings, both entries above. **Next in order:** a
+session-scoped MCP server that dies is not reconnected; `interactive_reminders` is not trust-gated
+(parity with headless, worth deciding); the unwired panel view models (item 3); the both-ledgers
+merge (item 8); hooks run in the process cwd rather than the project root (both paths).
 
 **`92240bf` (rewind fix) had a clean single workspace run — exit 0, 80 of 80 — on 2026-09-12, which
 also covers `eababe4` below, resolving the partial-evidence note that follows.**
