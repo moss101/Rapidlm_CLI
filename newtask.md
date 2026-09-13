@@ -8408,23 +8408,19 @@ conversation-history and `exec --continue` work. From here a red Format, Lint, o
 Test step is the next task before anything else, and the platform matrix is the cross-platform
 gate.
 
-**2026-09-13** (`94d0f59`..`127218d`): a turn carries the session's earlier turns to the model,
-following forks; `rapid exec --resume`/`--continue`; `/compact` and a real overflow recovery
-(`b0700b9`, reviewed and hardened in `07d8285`); the transcript after `/rewind`/`/fork`/`/resume`
-onto a fork (`127218d`). **Next, found while closing those: the interactive turn is second-class.**
-`run_interactive_turn_inner`'s own doc comment says it — no hooks, no MCP servers, no proactive
-retrieval, no reminders, no fallback chain, no managed-policy ceilings, no subagent runner (so
-`task_spawn` fails in the TUI) — all of which `exec_turn` sets up from the same settings files.
-The same project configuration works headless and silently does nothing in the TUI. The fix is
-an extraction: `exec_turn`'s trusted-tools setup (`set_trace_calls`, managed ceilings and
-`policy_version`, `load_project_integrations` → allowlist/hooks/shadow/MCP with the rejection
-warnings, the credential canary, `LiveSubagentRunner`) and its context setup (reminders,
-retrieval) into functions both paths call, and `resolve_model_plan`/`build_backing_model` in
-place of the TUI's single-model `resolve_interactive_backing`. Session-start/end hooks are
-per-run in headless; in the TUI they belong at session start and exit, a separate step. After
-that: `/agents cancel` (item 5, a feature), `[phases] compact` routing (needs the managed gate over
-the phase model), `pre_compact`/`post_compact` hooks (the registry has the events; nothing fires
-them).
+**2026-09-13** (`94d0f59`..`bf8d067`, fourteen commits, every one green on all four CI jobs
+through `1079c27`; `bf8d067`'s run was queued at the boundary): a turn carries the session's
+earlier turns to the model, following forks; `rapid exec --resume`/`--continue`; `/compact` and a
+real overflow recovery (`b0700b9`, reviewed and hardened in `07d8285`); the transcript after
+`/rewind`/`/fork`/`/resume` onto a fork (`127218d`); the interactive turn on the same setup as a
+headless one — hooks, MCP, retrieval, reminders, fallback chain, ceilings, subagents (`6b0ce30`,
+reviewed and hardened in `4619864`, which also found and fixed the lagged-subscription P1);
+`[phases] compact` and the compaction hooks (`4619864`); MCP servers per session, not per turn
+(`6ae511b`). Two self-reviews, both with real findings, both entries above. **Next in order:**
+`/agents cancel`/`terminate` (item 5 — a running-agent registry is a feature, and `task_spawn`
+children now run in the TUI, so the registry has something to hold); a session-scoped MCP server
+that dies is not reconnected; `interactive_reminders` is not trust-gated (parity with headless,
+worth deciding); the unwired panel view models (item 3); the both-ledgers merge (item 8).
 
 **`92240bf` (rewind fix) had a clean single workspace run — exit 0, 80 of 80 — on 2026-09-12, which
 also covers `eababe4` below, resolving the partial-evidence note that follows.**
