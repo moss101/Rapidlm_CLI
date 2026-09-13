@@ -8017,6 +8017,21 @@ show this bug on macOS** — BSD `kill` is correct — so the cycle here is CI o
 this commit died in the hooks timeout test; the run after must complete `plugin-host`,
 `process-supervisor` and `sandbox`.
 
+**MCP servers are started once per interactive session, not once per turn, 2026-09-13
+(`6ae511b`).** Found by the self-review of `6b0ce30`: with the integrations wired into the TUI
+turn, every turn spawned each configured server, ran its `initialize`/`tools/list` handshake, and
+killed it at turn end — the start-up cost on every turn, and any state the server held (an open
+browser, a database handle) gone between turns. `exec_tools::McpRegistry` is the session's
+connections and tool surface (the two `Arc`s `WorkspaceTools` already kept, now shareable like the
+job table); `share_mcp` hands them to each turn's tools before `configure_trusted_integrations`,
+and `register_mcp_servers` skips a name the registry already has. `SessionShared { notices, mcp }`
+is what the session's turn and compaction threads now receive, one handle instead of a parameter
+per concern. The children are reaped when the last handle drops — the session's end. Headless is
+unchanged (one process, one run). Test (unix, python3): a settings file with an MCP server that
+logs each start and counts its calls; two scripted turns each call `mcp__demo__count` and complete;
+the start log has one line; revert cycle 161 (two). Not covered: a server that dies mid-session is
+not reconnected — its tool reports the failure, as before.
+
 **A lagged live subscription ended the interactive session — fixed 2026-09-13
 (`4619864`), found by a test that appended more events than one tick reads.** The live channel
 holds 64 events (`event_ledger::subscription::DEFAULT_LIVE_BOUND`); a burst that outruns the
