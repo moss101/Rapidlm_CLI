@@ -36,6 +36,13 @@ pub struct HooksConfig {
     /// Fires when a `task_spawn` child finishes (success or failure).
     /// Notification-style, same as `session_start`.
     pub subagent_stop: Vec<String>,
+    /// Fires before a `/compact` asks the model for its summary, with how
+    /// many turns are about to be folded. Notification-style: it observes,
+    /// it never gates.
+    pub pre_compact: Vec<String>,
+    /// Fires after a `/compact` recorded its summary, with the turns folded
+    /// and the summary's size. Notification-style, same as `pre_compact`.
+    pub post_compact: Vec<String>,
 }
 
 impl HooksConfig {
@@ -50,6 +57,8 @@ impl HooksConfig {
             ("session_end", &mut config.session_end),
             ("subagent_start", &mut config.subagent_start),
             ("subagent_stop", &mut config.subagent_stop),
+            ("pre_compact", &mut config.pre_compact),
+            ("post_compact", &mut config.post_compact),
         ] {
             let Some(entries) = object.get(key).and_then(serde_json::Value::as_array) else {
                 continue;
@@ -70,6 +79,30 @@ impl HooksConfig {
         Some(config)
     }
 
+    /// Every stage, in declaration order — the one list a merge or a cap
+    /// walks, so a stage added to the struct cannot be left out of either
+    /// (which is how `pre_compact`/`post_compact` parsed and then vanished
+    /// in the project-settings merge).
+    pub fn stages_mut(&mut self) -> [&mut Vec<String>; 8] {
+        [
+            &mut self.pre_tool_use,
+            &mut self.post_tool_use,
+            &mut self.session_start,
+            &mut self.session_end,
+            &mut self.subagent_start,
+            &mut self.subagent_stop,
+            &mut self.pre_compact,
+            &mut self.post_compact,
+        ]
+    }
+
+    /// Append every stage of `other` to this config.
+    pub fn extend(&mut self, mut other: HooksConfig) {
+        for (stage, more) in self.stages_mut().into_iter().zip(other.stages_mut()) {
+            stage.append(more);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pre_tool_use.is_empty()
             && self.post_tool_use.is_empty()
@@ -77,6 +110,8 @@ impl HooksConfig {
             && self.session_end.is_empty()
             && self.subagent_start.is_empty()
             && self.subagent_stop.is_empty()
+            && self.pre_compact.is_empty()
+            && self.post_compact.is_empty()
     }
 }
 

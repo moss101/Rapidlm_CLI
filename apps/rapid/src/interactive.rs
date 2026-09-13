@@ -2487,32 +2487,32 @@ fn apply_managed_ceilings(tools: &mut ExecTools) -> Option<String> {
 }
 
 /// The per-run hooks a trusted project declares, handed back by
-/// [`configure_trusted_tools`] for the caller to fire at its own start and
-/// end — a headless run's, or an interactive session's.
+/// [`configure_trusted_integrations`] for the caller to fire at its own
+/// start and end — a headless run's, or an interactive session's.
 #[derive(Default)]
 struct SessionHooks {
     session_start: Vec<String>,
     session_end: Vec<String>,
 }
 
-/// Everything a trusted project's settings add to a turn's tools, the same
-/// for a headless run and an interactive turn: the `web_fetch` allowlist,
-/// tool hooks, shadow diagnostics, MCP servers (a configured server that
-/// will not run is reported through `warn`, never dropped silently), the
-/// active model's own credential scrubbed from captured output, and the
-/// subagent runner behind `task_spawn` (with a configured model). Settings
-/// are merged across every file in `PROJECT_SETTINGS_FILES` the same way
-/// `exec_permission_lattice` merges permission rules.
+/// What a trusted project's settings add to a turn's tools before any
+/// model is known, the same for a headless run and an interactive turn:
+/// the `web_fetch` allowlist, tool hooks, shadow diagnostics and MCP servers
+/// (a configured server that will not run is reported through `warn`,
+/// never dropped silently). Settings are merged across every file in
+/// `PROJECT_SETTINGS_FILES` the same way `exec_permission_lattice` merges
+/// permission rules. Runs before model resolution so a `session_start`
+/// hook's output (an index, a memory file) is visible to the turn's
+/// context, and so MCP start-up is not charged to a wall-time budget that
+/// starts later.
 ///
 /// The interactive turn used to get none of this — its doc comment listed
 /// hooks, MCP and retrieval among what the "first working version" left
 /// out — so the same `.rapidlm/settings.json` worked headless and silently
 /// did nothing in the TUI.
-fn configure_trusted_tools(
+fn configure_trusted_integrations(
     tools: &mut ExecTools,
     root: &Path,
-    active: Option<&crate::user_config::ActiveModel>,
-    permission_lattice: &crate::permissions::PermissionLattice,
     warn: &mut dyn FnMut(&str),
 ) -> SessionHooks {
     if !matches!(tools, ExecTools::Workspace(_)) {
@@ -2554,7 +2554,38 @@ fn configure_trusted_tools(
     if !mcp_servers.is_empty() {
         tools.register_mcp_servers(&mcp_servers);
     }
+    session_hooks
+}
 
+/// The ledger observers a recorded turn's tools carry — background jobs to
+/// `/jobs`, workspace writes to `/diff` — identified by where they record.
+struct LedgerSinks<'a> {
+    client: &'a InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &'a ActorRef,
+}
+
+/// What a trusted project adds to a turn's tools once the model is known:
+/// the active model's own credential scrubbed from captured output, and the
+/// subagent runner behind `task_spawn` (with a configured model). The
+/// ledger sinks are attached here first, by construction: the runner
+/// snapshots the tools' sinks for its children, so a runner built before
+/// they were attached spawned children whose writes and jobs never reached
+/// `/diff` or `/jobs` — which is exactly what the first interactive wiring
+/// of this did.
+fn configure_trusted_model_tools(
+    tools: &mut ExecTools,
+    root: &Path,
+    active: Option<&crate::user_config::ActiveModel>,
+    permission_lattice: &crate::permissions::PermissionLattice,
+    sinks: Option<LedgerSinks<'_>>,
+) {
+    if let Some(sinks) = sinks {
+        attach_ledger_sinks(tools, sinks.client, sinks.session_id, sinks.actor);
+    }
+    if !matches!(tools, ExecTools::Workspace(_)) {
+        return;
+    }
     // Scrub the active model's own resolved credential from captured
     // shell_exec output: a command that reads back a config file
     // containing it (a real, plausible thing to run, not a contrived
@@ -2607,7 +2638,6 @@ fn configure_trusted_tools(
             redaction: tools.redaction_handle(),
         }));
     }
-    session_hooks
 }
 
 /// Read and merge every `PROJECT_SETTINGS_FILES` entry under `root`. List-
@@ -2643,12 +2673,7 @@ pub(crate) fn load_project_integrations(root: &Path) -> ProjectIntegrations {
             );
         }
         if let Some(file_hooks) = crate::hooks::HooksConfig::parse(&value) {
-            hooks.pre_tool_use.extend(file_hooks.pre_tool_use);
-            hooks.post_tool_use.extend(file_hooks.post_tool_use);
-            hooks.session_start.extend(file_hooks.session_start);
-            hooks.session_end.extend(file_hooks.session_end);
-            hooks.subagent_start.extend(file_hooks.subagent_start);
-            hooks.subagent_stop.extend(file_hooks.subagent_stop);
+            hooks.extend(file_hooks);
         }
         if shadow.is_none() {
             shadow = crate::shadow_diagnostics::ShadowDiagnosticsConfig::parse(&value);
@@ -2657,14 +2682,7 @@ pub(crate) fn load_project_integrations(root: &Path) -> ProjectIntegrations {
     // Each file's own HooksConfig::parse already capped itself at
     // MAX_HOOKS_PER_STAGE; re-cap after merging two files' worth so the
     // combined per-stage bound still holds.
-    for stage in [
-        &mut hooks.pre_tool_use,
-        &mut hooks.post_tool_use,
-        &mut hooks.session_start,
-        &mut hooks.session_end,
-        &mut hooks.subagent_start,
-        &mut hooks.subagent_stop,
-    ] {
+    for stage in hooks.stages_mut() {
         stage.truncate(crate::hooks::MAX_HOOKS_PER_STAGE);
     }
     ProjectIntegrations {
@@ -3143,6 +3161,11 @@ pub(crate) struct ModelPlan {
     /// The primary exactly as the config resolved it, *before* the reminder
     /// floor was applied — what a spawned child agent inherits.
     pub primary_config: Option<crate::user_config::ActiveModel>,
+    /// The `[phases] compact` override, resolved and gated through the same
+    /// managed policy as a fallback entry, when the config names one that
+    /// differs from the primary. `None` means compaction runs on the
+    /// conversation model.
+    pub compact: Option<crate::user_config::ActiveModel>,
     /// No model config was found at all; the typed fallback applies.
     pub unconfigured: bool,
 }
@@ -3173,6 +3196,7 @@ pub(crate) fn resolve_model_plan(
     // (no borrows yet) so the credential-store count is known upfront.
     let mut models: Vec<crate::user_config::ActiveModel> = Vec::new();
     let mut primary_config: Option<crate::user_config::ActiveModel> = None;
+    let mut compact: Option<crate::user_config::ActiveModel> = None;
     let mut unconfigured = false;
     match crate::user_config::select_active_model_gated(process_env) {
         Ok(ModelSelection::Configured { active, warnings }) => {
@@ -3204,6 +3228,41 @@ pub(crate) fn resolve_model_plan(
                     warn(&format!("warning: {warning}"));
                 }
                 models.extend(gated);
+                // `[phases] compact`: parsed and validated since the
+                // phases table existed, honoured by nobody until now.
+                // Resolved against the same raw config and gated the same
+                // way a fallback entry is — never let through a
+                // restriction the primary has to honour.
+                let routed_elsewhere = primary
+                    .phase_route
+                    .override_for(llm_router::provider::ModelPurpose::Compact)
+                    .is_some_and(|profile| profile.as_str() != primary.profile_id);
+                if routed_elsewhere {
+                    match crate::user_config::resolve_purpose_model(
+                        process_env,
+                        &config,
+                        llm_router::provider::ModelPurpose::Compact,
+                    ) {
+                        Ok(candidate) => {
+                            let (gated, warnings) =
+                                gate_fallback_candidates(process_env, vec![candidate]).map_err(
+                                    |err| ModelPlanError::ManagedPolicy(format!("{err}")),
+                                )?;
+                            for warning in warnings {
+                                warn(&format!("warning: {warning}"));
+                            }
+                            compact = gated.into_iter().next();
+                            if compact.is_none() {
+                                warn(
+                                    "warning: phases.compact is not on the managed provider allowlist; compaction runs on the conversation model",
+                                );
+                            }
+                        }
+                        Err(err) => warn(&format!(
+                            "warning: phases.compact not resolved ({err}); compaction runs on the conversation model"
+                        )),
+                    }
+                }
             }
             models.insert(0, primary);
         }
@@ -3216,6 +3275,7 @@ pub(crate) fn resolve_model_plan(
     Ok(ModelPlan {
         models,
         primary_config,
+        compact,
         unconfigured,
     })
 }
@@ -3768,11 +3828,27 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         );
     }
 
-    // Trusted-project integrations — allowlist, hooks, shadow diagnostics,
-    // MCP servers, the credential canary, the subagent runner — are applied
-    // by `configure_trusted_tools` once the model is resolved below (the
-    // runner needs it); the per-run session hooks it returns are fired
-    // here, around the run.
+    // Trusted-project integrations: web_fetch allowlist, hooks, shadow
+    // diagnostics, MCP servers — before the model and the context, so a
+    // `session_start` hook's output is visible to this run and MCP start-up
+    // is not charged to the wall-time budget.
+    if let Some((root, TrustStatus::Trusted)) = workspace.as_ref() {
+        let mut warn = |line: &str| eprintln!("{line}");
+        let session_hooks = configure_trusted_integrations(&mut tools, root, &mut warn);
+        if !session_hooks.session_start.is_empty() {
+            // Fire-and-forget: a session_start hook observes the run
+            // starting, it never gates it (no PreHookOutcome here).
+            let _ = crate::hooks::run_notify_hooks(
+                &session_hooks.session_start,
+                "session_start",
+                serde_json::json!({}),
+                crate::hooks::HOOK_TIMEOUT,
+            );
+        }
+        // Fired by SessionEndHookGuard's Drop impl, on whatever exit path
+        // this turn actually takes.
+        session_end_guard.hooks = session_hooks.session_end;
+    }
     // Reminder feeds: load the project roster if present and admit the
     // always-on feeds (the CLI host grants no capabilities, so feeds gated
     // on a capability stay inactive). A broken roster warns and the turn
@@ -3998,26 +4074,15 @@ run without --continue to start one"
     };
 
     if let Some((root, TrustStatus::Trusted)) = workspace.as_ref() {
-        let session_hooks = configure_trusted_tools(
+        // The ledger sinks were attached with the recorded turn above;
+        // `None` here leaves them as they are.
+        configure_trusted_model_tools(
             &mut tools,
             root,
             child_model_config.as_ref(),
             &permission_lattice,
-            &mut warn,
+            None,
         );
-        if !session_hooks.session_start.is_empty() {
-            // Fire-and-forget: a session_start hook observes the run
-            // starting, it never gates it (no PreHookOutcome here).
-            let _ = crate::hooks::run_notify_hooks(
-                &session_hooks.session_start,
-                "session_start",
-                serde_json::json!({}),
-                crate::hooks::HOOK_TIMEOUT,
-            );
-        }
-        // Fired by SessionEndHookGuard's Drop impl, on whatever exit path
-        // this turn actually takes.
-        session_end_guard.hooks = session_hooks.session_end;
     }
     let diag = parsed.verbose.then(|| StepDiag::stderr(&base_url));
     // `--json-schema`: wrap the tool driver with the synthetic-tool
@@ -4447,6 +4512,23 @@ fn run_started_session(
     let mut interrupt_count = 0;
     let mut saw_ctrl_c = false;
 
+    // A trusted project's session hooks, on the same per-run terms as a
+    // headless run's: `session_start` now — before the alt screen, so a
+    // slow hook is not a blank screen — and `session_end` on every exit
+    // path (the guard's `Drop`), neither gating anything.
+    let mut session_end_guard = SessionEndHookGuard::default();
+    if resolved.trust.is_trusted() {
+        let hooks = load_project_integrations(&resolved.root).hooks;
+        if !hooks.session_start.is_empty() {
+            let _ = crate::hooks::run_notify_hooks(
+                &hooks.session_start,
+                "session_start",
+                serde_json::json!({}),
+                crate::hooks::HOOK_TIMEOUT,
+            );
+        }
+        session_end_guard.hooks = hooks.session_end;
+    }
     let acquire = match options.terminal {
         Some(backend) => TerminalGuard::acquire_with(FrontendKind::Interactive, backend),
         None => TerminalGuard::acquire(FrontendKind::Interactive),
@@ -4496,22 +4578,6 @@ fn run_started_session(
     // that started them, and dropping this at the end of `run_started_session`
     // is what kills them. See `SessionLoop::jobs`.
     let session_jobs = crate::exec_tools::JobRegistry::default();
-    // A trusted project's session hooks, on the same per-run terms as a
-    // headless run's: `session_start` now, `session_end` on every exit
-    // path (the guard's `Drop`), neither gating anything.
-    let mut session_end_guard = SessionEndHookGuard::default();
-    if resolved.trust.is_trusted() {
-        let hooks = load_project_integrations(&resolved.root).hooks;
-        if !hooks.session_start.is_empty() {
-            let _ = crate::hooks::run_notify_hooks(
-                &hooks.session_start,
-                "session_start",
-                serde_json::json!({}),
-                crate::hooks::HOOK_TIMEOUT,
-            );
-        }
-        session_end_guard.hooks = hooks.session_end;
-    }
     let loop_result = SessionLoop {
         client: &client,
         stream: &mut stream,
@@ -4529,6 +4595,7 @@ fn run_started_session(
         renderer: &mut renderer,
         autonomous: None,
         compaction: None,
+        notices: SessionNotices::default(),
         #[cfg(test)]
         scripted_backings: None,
     }
@@ -4609,6 +4676,9 @@ struct SessionLoop<'a> {
     /// `turn_in_flight` does (one model call per session at a time) and is
     /// cleared by `settle_compaction` once the thread reports back.
     compaction: Option<CompactionInFlight>,
+    /// What the turn and compaction threads have to say to the user — see
+    /// [`SessionNotices`]; drained into the transcript on every tick.
+    notices: SessionNotices,
     /// Test-only seam: when set, `submit_turn` runs the next queued scripted
     /// backing instead of resolving a real model from process env/config —
     /// the same idea as `run_interactive_turn_with_backing`'s existing
@@ -4635,6 +4705,23 @@ impl crate::host::LiveModelCall for Box<dyn crate::host::LiveModelCall + Send> {
         cancel: &agent_runtime::CancellationToken,
     ) -> Result<agent_runtime::ModelStepOutput, agent_runtime::ModelStepError> {
         (**self).step(blocks, input, cancel)
+    }
+}
+
+/// Warnings a turn or compaction thread has for the user — a model config
+/// warning, an MCP server that would not start, a reminder roster that did
+/// not load. Headless prints these to stderr; under the TUI's alt screen a
+/// raw stderr write only corrupts the frame, so the threads leave them
+/// here and the loop puts them in the transcript on its next tick.
+type SessionNotices = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// Leave `line` for the loop to show. Bounded: a turn that has a lot to
+/// say keeps its first lines, not an unbounded backlog.
+fn notify(notices: &SessionNotices, line: &str) {
+    const MAX_PENDING_NOTICES: usize = 64;
+    let mut pending = notices.lock().unwrap_or_else(|p| p.into_inner());
+    if pending.len() < MAX_PENDING_NOTICES {
+        pending.push(line.to_owned());
     }
 }
 
@@ -5983,6 +6070,7 @@ the full history, where `/diff` lists every file it wrote\n"
                     backing,
                     budget,
                     self.jobs.clone(),
+                    std::sync::Arc::clone(&self.notices),
                 );
                 return self.drain();
             }
@@ -5997,6 +6085,7 @@ the full history, where `/diff` lists every file it wrote\n"
                 turn_cancel,
                 std::sync::Arc::clone(&self.turn_in_flight),
                 self.jobs.clone(),
+                std::sync::Arc::clone(&self.notices),
             );
         }
         self.drain()
@@ -6044,6 +6133,7 @@ the full history, where `/diff` lists every file it wrote\n"
                 self.session_id,
                 self.actor.clone(),
                 self.root.to_path_buf(),
+                self.trusted,
                 cancel.clone(),
                 std::sync::Arc::clone(&outcome),
                 backing,
@@ -6061,12 +6151,23 @@ the full history, where `/diff` lists every file it wrote\n"
             self.session_id,
             self.actor.clone(),
             self.root.to_path_buf(),
+            self.trusted,
             cancel.clone(),
             std::sync::Arc::clone(&outcome),
+            std::sync::Arc::clone(&self.notices),
         );
         self.compaction = Some(CompactionInFlight { cancel, outcome });
         self.append_command_output("compacting... (Ctrl-C cancels)".to_owned());
         self.drain()
+    }
+
+    /// Move what the threads left in [`SessionNotices`] into the transcript.
+    fn surface_notices(&mut self) {
+        let pending: Vec<String> =
+            std::mem::take(&mut *self.notices.lock().unwrap_or_else(|p| p.into_inner()));
+        for line in pending {
+            self.append_command_output(line);
+        }
     }
 
     /// Collect a finished compaction's report and free the model slot. The
@@ -6111,6 +6212,7 @@ the full history, where `/diff` lists every file it wrote\n"
 
     fn drain(&mut self) -> Result<(), InteractiveError> {
         self.settle_compaction();
+        self.surface_notices();
         drain_kernel_events(
             self.client,
             self.stream,
@@ -6632,6 +6734,7 @@ fn spawn_interactive_turn(
     // The *session's* job table, so a background job outlives the turn that
     // started it. See `JobRegistry::share_table`.
     jobs: crate::exec_tools::JobRegistry,
+    notices: SessionNotices,
 ) {
     std::thread::spawn(move || {
         // A panic anywhere in `run_interactive_turn`'s own call chain (model
@@ -6656,6 +6759,7 @@ fn spawn_interactive_turn(
                 &text,
                 &kernel_cancel,
                 &jobs,
+                &notices,
             )
         }));
         let _ = client.finish_turn(kernel::FinishTurn::new(
@@ -6689,6 +6793,7 @@ fn spawn_interactive_turn_with_backing<B: crate::host::LiveModelCall + Send + 's
     budget: (u32, u32),
     // The session's job table — see `spawn_interactive_turn`'s own parameter.
     jobs: crate::exec_tools::JobRegistry,
+    notices: SessionNotices,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let outcome = catching_panics(std::panic::AssertUnwindSafe(|| {
@@ -6703,6 +6808,7 @@ fn spawn_interactive_turn_with_backing<B: crate::host::LiveModelCall + Send + 's
                 backing,
                 budget,
                 &jobs,
+                &notices,
             )
         }));
         let _ = client.finish_turn(kernel::FinishTurn::new(
@@ -6799,6 +6905,7 @@ fn run_interactive_turn(
     text: &str,
     kernel_cancel: &kernel::CancelToken,
     jobs: &crate::exec_tools::JobRegistry,
+    notices: &SessionNotices,
 ) -> kernel::TurnOutcome {
     let bridge = CancelBridge::start(kernel_cancel);
     let outcome = run_interactive_turn_inner(
@@ -6810,6 +6917,7 @@ fn run_interactive_turn(
         text,
         &bridge.token,
         jobs,
+        notices,
     );
     bridge.stop();
     outcome
@@ -6831,6 +6939,7 @@ fn run_interactive_turn_with_backing<B: crate::host::LiveModelCall>(
     backing: B,
     budget: (u32, u32),
     jobs: &crate::exec_tools::JobRegistry,
+    notices: &SessionNotices,
 ) -> kernel::TurnOutcome {
     let bridge = CancelBridge::start(kernel_cancel);
     let outcome = run_interactive_turn_inner_with_backing(
@@ -6844,6 +6953,7 @@ fn run_interactive_turn_with_backing<B: crate::host::LiveModelCall>(
         backing,
         budget,
         jobs,
+        notices,
     );
     bridge.stop();
     outcome
@@ -6970,15 +7080,11 @@ fn interactive_reminders(
 }
 
 /// Actually resolve a model, build workspace tools, and run one turn through
-/// the same `run_live_exec` entry the headless `rapid exec` path uses.
-///
-/// Deliberately simpler than `exec_turn`'s full setup for a first working
-/// version of interactive execution: a single configured model (no fallback
-/// chain, no managed-policy ceilings) and no proactive context retrieval,
-/// reminders, hooks, or MCP servers. All of that is real and worth adding —
-/// omitted here to land working end-to-end turn execution first, not
-/// silently dropped as an oversight. Memory index and todo index (2026-09-05)
-/// are the first of these to be wired in — see `preserve_memory_and_todos`.
+/// the same `run_live_exec` entry the headless `rapid exec` path uses — and
+/// on the same setup: the `[models] fallback` chain and managed-policy
+/// ceilings, the project's hooks, MCP servers, reminders and proactive
+/// retrieval, the memory and todo indices, the subagent runner. Each piece
+/// is the function `exec_turn` calls for the same thing.
 #[allow(clippy::too_many_arguments)]
 fn run_interactive_turn_inner(
     client: &InProcessKernelClient,
@@ -6989,17 +7095,19 @@ fn run_interactive_turn_inner(
     text: &str,
     cancel: &agent_runtime::CancellationToken,
     jobs: &crate::exec_tools::JobRegistry,
+    notices: &SessionNotices,
 ) -> kernel::TurnOutcome {
-    // Warnings go where the interactive turn's always have: stderr, which
-    // the alt screen hides but the session log keeps.
-    let mut warn = |line: &str| {
-        crate::exec_diag::stderr_line(line);
-    };
+    let mut warn = |line: &str| notify(notices, line);
     let (mut tools, permission_lattice) = match build_interactive_turn_tools(root, trusted, None) {
         Ok(built) => built,
         Err(outcome) => return outcome,
     };
     let policy_version = apply_managed_ceilings(&mut tools);
+    // Session-start/end hooks are per run; the interactive session fires
+    // its own at start and exit, not per turn.
+    if trusted {
+        let _ = configure_trusted_integrations(&mut tools, root, &mut warn);
+    }
     // Reminders ahead of the model: the floor picks its reasoning effort.
     let (reminder_floor, reminder_block) = interactive_reminders(root, &mut warn);
     // The model, resolved the way a headless run resolves it — env
@@ -7034,17 +7142,17 @@ fn run_interactive_turn_inner(
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
     };
-    if trusted {
-        // Session-start/end hooks are per run; the interactive session
-        // fires its own at start and exit, not per turn.
-        let _ = configure_trusted_tools(
-            &mut tools,
-            root,
-            session_model.primary(),
-            &permission_lattice,
-            &mut warn,
-        );
-    }
+    configure_trusted_model_tools(
+        &mut tools,
+        root,
+        session_model.primary(),
+        &permission_lattice,
+        Some(LedgerSinks {
+            client,
+            session_id,
+            actor,
+        }),
+    );
     // Background jobs go in the session's table, not this turn's: see
     // `SessionLoop::jobs`.
     tools.share_job_table(jobs);
@@ -7073,6 +7181,11 @@ struct SessionModel {
     models: Vec<crate::user_config::ActiveModel>,
     stores: Vec<auth::InMemoryCredentialStore>,
     primary: Option<crate::user_config::ActiveModel>,
+    /// `[phases] compact`, when it routes elsewhere — with its own store.
+    compact: Option<(
+        crate::user_config::ActiveModel,
+        auth::InMemoryCredentialStore,
+    )>,
     unconfigured: bool,
     policy_version: Option<String>,
 }
@@ -7096,9 +7209,25 @@ impl SessionModel {
             models: plan.models,
             stores,
             primary: plan.primary_config,
+            compact: plan
+                .compact
+                .map(|active| (active, auth::InMemoryCredentialStore::new())),
             unconfigured: plan.unconfigured,
             policy_version,
         })
+    }
+
+    /// The model a `/compact` runs on: the `[phases] compact` override when
+    /// one is configured and allowed, else the conversation model (with its
+    /// fallback chain). The in-turn overflow recovery always uses the turn's
+    /// own model — it summarises with the backing it already holds.
+    fn compaction_backing(&self, warn: &mut dyn FnMut(&str)) -> Result<SelectedModel<'_>, String> {
+        if let Some((active, store)) = &self.compact {
+            return ConfiguredModel::build(active, store)
+                .map(|model| SelectedModel::Configured(Box::new(model)))
+                .map_err(|err| format!("model configuration error (phases.compact): {err}"));
+        }
+        self.backing(None, warn)
     }
 
     /// The configured primary model — what subagents run on and whose
@@ -7132,27 +7261,30 @@ impl SessionModel {
 /// the summary, record it. Reports through `outcome` on every path — a
 /// panic included, so the loop's model slot is always freed (the same
 /// guarantee `spawn_interactive_turn` gives the turn lease).
+#[allow(clippy::too_many_arguments)]
 fn spawn_compaction(
     client: InProcessKernelClient,
     session_id: protocol::SessionId,
     actor: ActorRef,
     root: PathBuf,
+    trusted: bool,
     cancel: agent_runtime::CancellationToken,
     outcome: CompactionOutcomeSlot,
+    notices: SessionNotices,
 ) {
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut warn = |line: &str| {
-                crate::exec_diag::stderr_line(line);
-            };
+            let mut warn = |line: &str| notify(&notices, line);
             let session_model = SessionModel::resolve(
                 agent_runtime::reminders::ReminderFloor::Baseline,
                 None,
                 &mut warn,
             )?;
-            let backing = session_model.backing(None, &mut warn)?;
+            let backing = session_model.compaction_backing(&mut warn)?;
             let budget = context_budget_for(&backing);
-            run_compaction(&client, session_id, &actor, &root, backing, budget, &cancel)
+            run_compaction(
+                &client, session_id, &actor, &root, trusted, backing, budget, &cancel,
+            )
         }))
         .unwrap_or_else(|_| Err("compaction panicked".to_owned()));
         *outcome.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
@@ -7168,6 +7300,7 @@ fn spawn_compaction_with_backing<B: crate::host::LiveModelCall + Send + 'static>
     session_id: protocol::SessionId,
     actor: ActorRef,
     root: PathBuf,
+    trusted: bool,
     cancel: agent_runtime::CancellationToken,
     outcome: CompactionOutcomeSlot,
     backing: B,
@@ -7175,7 +7308,9 @@ fn spawn_compaction_with_backing<B: crate::host::LiveModelCall + Send + 'static>
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_compaction(&client, session_id, &actor, &root, backing, budget, &cancel)
+            run_compaction(
+                &client, session_id, &actor, &root, trusted, backing, budget, &cancel,
+            )
         }))
         .unwrap_or_else(|_| Err("compaction panicked".to_owned()));
         *outcome.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
@@ -7188,11 +7323,13 @@ fn spawn_compaction_with_backing<B: crate::host::LiveModelCall + Send + 'static>
 /// though not a turn), and the `context.compacted` event appended at the
 /// session's tip — the record every later turn reads the summary from. The
 /// error is the text the loop shows.
+#[allow(clippy::too_many_arguments)]
 fn run_compaction<B: crate::host::LiveModelCall>(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
     actor: &ActorRef,
     root: &Path,
+    trusted: bool,
     backing: B,
     budget: (u32, u32),
     cancel: &agent_runtime::CancellationToken,
@@ -7210,6 +7347,26 @@ fn run_compaction<B: crate::host::LiveModelCall>(
         return Ok(CompactionReport::NothingToCompact {
             compacted_before: history.summary.is_some(),
         });
+    }
+    // `pre_compact`/`post_compact` hooks: project settings run shell
+    // commands, so a trusted project only — the same gate every other hook
+    // is behind. Notification-style: they observe, never gate.
+    let hooks = if trusted {
+        load_project_integrations(root).hooks
+    } else {
+        crate::hooks::HooksConfig::default()
+    };
+    if !hooks.pre_compact.is_empty() {
+        let _ = crate::hooks::run_notify_hooks(
+            &hooks.pre_compact,
+            "pre_compact",
+            serde_json::json!({
+                "session_id": session_id.to_string(),
+                "turns": history.turns.len(),
+                "trigger": "manual",
+            }),
+            crate::hooks::HOOK_TIMEOUT,
+        );
     }
     let (context_limit, output_reserve) = budget;
     let summary = crate::host::run_live_compaction(
@@ -7244,6 +7401,20 @@ fn run_compaction<B: crate::host::LiveModelCall>(
             "source": "compact",
         }),
     )?;
+    if !hooks.post_compact.is_empty() {
+        let _ = crate::hooks::run_notify_hooks(
+            &hooks.post_compact,
+            "post_compact",
+            serde_json::json!({
+                "session_id": session_id.to_string(),
+                "turns": summary.turns,
+                "summary_bytes": summary.text.len(),
+                "tokens": summary.tokens,
+                "trigger": "manual",
+            }),
+            crate::hooks::HOOK_TIMEOUT,
+        );
+    }
     Ok(CompactionReport::Compacted {
         turns: summary.turns,
         tokens: summary.tokens,
@@ -7308,6 +7479,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     backing: B,
     budget: (u32, u32),
     jobs: &crate::exec_tools::JobRegistry,
+    notices: &SessionNotices,
 ) -> kernel::TurnOutcome {
     // `BypassPermissions`, not the real env/settings-resolved mode: see
     // `build_interactive_turn_context`'s own doc comment on `forced_mode`
@@ -7319,15 +7491,16 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     // and `exec_tools.rs`).
     let forced_mode = Some(crate::permissions::PermissionMode::BypassPermissions);
     let (context_limit, output_reserve) = budget;
-    let mut warn = |line: &str| {
-        crate::exec_diag::stderr_line(line);
-    };
+    let mut warn = |line: &str| notify(notices, line);
     let (mut tools, permission_lattice) =
         match build_interactive_turn_tools(root, trusted, forced_mode) {
             Ok(built) => built,
             Err(outcome) => return outcome,
         };
     let _policy_version = apply_managed_ceilings(&mut tools);
+    if trusted {
+        let _ = configure_trusted_integrations(&mut tools, root, &mut warn);
+    }
     let (_reminder_floor, reminder_block) = interactive_reminders(root, &mut warn);
     let history = conversation_history(client, session_id, cancel);
     let history_through = history.through_seq;
@@ -7343,11 +7516,19 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
     };
-    if trusted {
-        // No configured model behind a scripted backing: no subagent
-        // runner and no credential canary, everything else as production.
-        let _ = configure_trusted_tools(&mut tools, root, None, &permission_lattice, &mut warn);
-    }
+    // No configured model behind a scripted backing: no subagent runner
+    // and no credential canary, everything else as production.
+    configure_trusted_model_tools(
+        &mut tools,
+        root,
+        None,
+        &permission_lattice,
+        Some(LedgerSinks {
+            client,
+            session_id,
+            actor,
+        }),
+    );
     // Same session-scoped job table the production path uses.
     tools.share_job_table(jobs);
     execute_interactive_turn(
@@ -7414,7 +7595,6 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
             };
         }
     };
-    attach_ledger_sinks(tools, client, session_id, actor);
     let request = AgentExecutionRequest::new(spec, session_id);
     let mut sink = InteractiveTurnSink {
         client,
@@ -7652,17 +7832,38 @@ fn inherit_transcript(
     }
 }
 
+/// Ceiling on parent events one inheritance folds — a safety bound on a
+/// finite ledger, not a working budget: the fold must reach `source_seq`,
+/// because the transcript projection keeps its *newest* entries, and
+/// stopping short would show a rewound session its oldest turns while the
+/// ones just before the rewind point went missing.
+const MAX_INHERITED_EVENTS: usize = 1_000_000;
+
 /// The transcript `session_id` inherits: empty unless its first event is
 /// `session.forked`, in which case the parent's own inheritance (recursion
 /// bounded by `depth`) followed by the parent's events through `source_seq`
 /// folded through the same reducer the live session uses — the display
 /// projection of the past, carried across exactly as it would have been
-/// painted.
+/// painted. A parent that cannot be folded to the end says so in the
+/// transcript rather than ending it silently.
 fn inherited_transcript(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
     cancel: &CancellationToken,
     depth: usize,
+) -> Vec<TranscriptEntry> {
+    inherited_transcript_bounded(client, session_id, cancel, depth, MAX_INHERITED_EVENTS)
+}
+
+/// [`inherited_transcript`] with the per-parent event ceiling as a
+/// parameter, so a test can show what the ceiling does without a
+/// million-event parent.
+fn inherited_transcript_bounded(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    cancel: &CancellationToken,
+    depth: usize,
+    max_events: usize,
 ) -> Vec<TranscriptEntry> {
     use event_ledger::event::EventKind;
     if depth == 0 || cancel.is_cancelled() {
@@ -7692,22 +7893,40 @@ fn inherited_transcript(
     let (Some(parent), Some(source_seq)) = (parent, source_seq) else {
         return Vec::new();
     };
-    let mut entries = inherited_transcript(client, parent, cancel, depth - 1);
+    let mut entries = inherited_transcript_bounded(client, parent, cancel, depth - 1, max_events);
+    // Never past the parent's own tip: a fork record naming a seq the
+    // parent does not have would otherwise wait for an event that never
+    // comes.
+    let Ok(parent_tip) = block_on(client.get_session(parent), cancel).map(|s| s.seq()) else {
+        return entries;
+    };
+    let through = source_seq.min(parent_tip);
     let Ok(mut parent_stream) = block_on(client.subscribe(SubscribeEvents::new(parent, 0)), cancel)
     else {
         return entries;
     };
     let mut projected = AppState::new();
-    for _ in 0..MAX_REPLAYED_EVENTS {
-        if parent_stream.cursor() >= source_seq || cancel.is_cancelled() {
+    let mut folded = 0usize;
+    while folded < max_events {
+        if parent_stream.cursor() >= through || cancel.is_cancelled() {
             break;
         }
         let Ok(event) = parent_stream.recv() else {
             break;
         };
         projected = reduce(projected, &UiEvent::Kernel(event));
+        folded += 1;
     }
     entries.extend(projected.transcript().iter().cloned());
+    if let Some(err) = projected.protocol_error() {
+        entries.push(TranscriptEntry::CommandError {
+            text: format!("the transcript before this fork could not be fully read: {err}"),
+        });
+    } else if parent_stream.cursor() < through {
+        entries.push(TranscriptEntry::CommandError {
+            text: "the transcript before this fork was not fully read".to_owned(),
+        });
+    }
     entries
 }
 
@@ -7733,6 +7952,7 @@ fn replay_history(
     through: u64,
     cancel: &CancellationToken,
 ) -> Result<(), InteractiveError> {
+    let mut reconnects = 0;
     for _ in 0..MAX_REPLAYED_EVENTS {
         if stream.cursor() >= through {
             break;
@@ -7740,6 +7960,17 @@ fn replay_history(
         cancel.check().map_err(|_| InteractiveError::Cancelled)?;
         match stream.recv() {
             Ok(event) => *ui = reduce(ui.clone(), &UiEvent::Kernel(event)),
+            // Same contract as `drain_kernel_events`: a lag mid-replay is
+            // resumed from its cursor, not the end of the session.
+            Err(EventStreamError::Lagged { resume_cursor })
+                if reconnects < MAX_LAG_RECONNECTS_PER_TICK =>
+            {
+                reconnects += 1;
+                *stream = block_on(
+                    client.subscribe(SubscribeEvents::new(session_id, resume_cursor)),
+                    cancel,
+                )?;
+            }
             Err(err) => return Err(InteractiveError::Stream(err)),
         }
     }
@@ -7754,6 +7985,20 @@ fn replay_history(
     Ok(())
 }
 
+/// How many times one drain re-subscribes after the live channel lagged
+/// before giving up on the tick. Each reconnect replays from the cursor the
+/// lag reported, so nothing is lost; the bound only keeps a channel that
+/// overflows faster than it can be read from spinning here.
+const MAX_LAG_RECONNECTS_PER_TICK: usize = 8;
+
+/// One tick's worth of the live subscription folded into `ui`.
+///
+/// The live channel is bounded (`event_ledger::subscription::DEFAULT_LIVE_
+/// BOUND`, 64 events) and disconnects with a resume cursor when a burst
+/// outruns the tick — a tool-heavy turn, a job's output, an autonomous run
+/// — which used to end the whole interactive session as a stream error.
+/// The ledger's own contract is that a subscription from the resume cursor
+/// continues without duplicates or gaps, so that is what happens here.
 fn drain_kernel_events(
     client: &InProcessKernelClient,
     stream: &mut EventStream,
@@ -7761,6 +8006,7 @@ fn drain_kernel_events(
     session_id: protocol::SessionId,
     cancel: &CancellationToken,
 ) -> Result<(), InteractiveError> {
+    let mut reconnects = 0;
     for i in 0..MAX_EVENTS_PER_TICK {
         cancel.check().map_err(|_| InteractiveError::Cancelled)?;
         match stream.try_recv() {
@@ -7768,6 +8014,15 @@ fn drain_kernel_events(
                 *ui = reduce(ui.clone(), &UiEvent::Kernel(event));
             }
             Ok(None) => break,
+            Err(EventStreamError::Lagged { resume_cursor })
+                if reconnects < MAX_LAG_RECONNECTS_PER_TICK =>
+            {
+                reconnects += 1;
+                *stream = block_on(
+                    client.subscribe(SubscribeEvents::new(session_id, resume_cursor)),
+                    cancel,
+                )?;
+            }
             Err(err) => return Err(InteractiveError::Stream(err)),
         }
         if i + 1 == MAX_EVENTS_PER_TICK {
@@ -8706,6 +8961,107 @@ max_tokens = 500
              pair, which is exactly the point: min/min would give (8000, 500), and \
              naively using only the primary would give (50000, 6000), both wrong"
         );
+    }
+
+    #[test]
+    fn the_phases_compact_override_is_resolved_and_gated_like_a_fallback_entry() {
+        // `[phases] compact` was parsed and validated since the phases
+        // table existed and honoured by nobody. It names the model a
+        // `/compact` runs on — through the same managed gate a fallback
+        // entry passes, never around it.
+        let doc = r#"
+[models]
+default = "main"
+
+[model.main]
+provider = "anthropic"
+model = "claude-sonnet-5"
+base_url = "https://api.anthropic.com"
+
+[model.cheap]
+provider = "openai-compatible"
+model = "llama3.2"
+base_url = "http://127.0.0.1:11434/v1"
+
+[phases]
+compact = "cheap"
+"#;
+        let config_path = std::env::temp_dir().join(format!(
+            "rapidlm-phases-compact-{}-{}.toml",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&config_path, doc).expect("write config");
+        let env = vec![(
+            crate::user_config::CONFIG_PATH_ENV.to_owned(),
+            config_path.display().to_string(),
+        )];
+        let mut warnings = Vec::new();
+        let plan = resolve_model_plan(
+            &env,
+            agent_runtime::reminders::ReminderFloor::Baseline,
+            &mut |line| warnings.push(line.to_owned()),
+        )
+        .expect("plan");
+        assert_eq!(plan.models[0].profile_id, "main");
+        assert_eq!(
+            plan.compact.as_ref().map(|m| m.profile_id.as_str()),
+            Some("cheap"),
+            "{warnings:?}"
+        );
+
+        // A managed allowlist that excludes the compact model's provider:
+        // compaction falls back to the conversation model, with a warning.
+        let policy_path = std::env::temp_dir().join(format!(
+            "rapidlm-phases-compact-policy-{}-{}.toml",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(
+            &policy_path,
+            format!(
+                "schema = \"{}\"\n[policy]\nallowed_providers = [\"anthropic\"]\n",
+                crate::managed_config::MANAGED_SCHEMA
+            ),
+        )
+        .expect("write policy");
+        let gated_env = vec![
+            (
+                crate::user_config::CONFIG_PATH_ENV.to_owned(),
+                config_path.display().to_string(),
+            ),
+            (
+                crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                policy_path.display().to_string(),
+            ),
+        ];
+        let mut warnings = Vec::new();
+        let plan = resolve_model_plan(
+            &gated_env,
+            agent_runtime::reminders::ReminderFloor::Baseline,
+            &mut |line| warnings.push(line.to_owned()),
+        )
+        .expect("plan");
+        assert_eq!(plan.compact, None, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("phases.compact") && w.contains("allowlist")),
+            "{warnings:?}"
+        );
+
+        // No override, or one naming the primary: nothing routed elsewhere.
+        let same = doc.replace("compact = \"cheap\"", "compact = \"main\"");
+        std::fs::write(&config_path, same).expect("write config");
+        let plan = resolve_model_plan(
+            &env,
+            agent_runtime::reminders::ReminderFloor::Baseline,
+            &mut |_| {},
+        )
+        .expect("plan");
+        assert_eq!(plan.compact, None);
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_file(&policy_path);
     }
 
     #[test]
@@ -10377,6 +10733,7 @@ alignment below it: {line:?}",
             renderer,
             autonomous: None,
             compaction: None,
+            notices: SessionNotices::default(),
             scripted_backings: Some(backings),
         }
     }
@@ -12147,6 +12504,53 @@ question the panel answers"
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn slash_compact_fires_the_projects_pre_and_post_compact_hooks() {
+        // The hook registry has carried `CompactPre`/`CompactPost` since
+        // P9-012 with nothing firing them. Both observe a `/compact` now,
+        // with the turn count and, after, the summary's size — on a trusted
+        // project only, like every hook.
+        let env = TempEnv::create();
+        let root = fs::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        // Hooks run in the process's working directory, as headless hooks
+        // do: absolute targets.
+        let pre_path = root.join("pre.json");
+        let post_path = root.join("post.json");
+        fs::write(
+            root.join(PROJECT_MARKER).join("settings.json"),
+            format!(
+                r#"{{"hooks":{{"pre_compact":["cat > {}"],"post_compact":["cat > {}"]}}}}"#,
+                pre_path.display(),
+                post_path.display()
+            ),
+        )
+        .expect("settings");
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("one", ScriptedModel::terminal("uno"));
+        session.run_turn("two", ScriptedModel::terminal("dos"));
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state =
+            locals.session_loop(&session, vec![ScriptedModel::terminal("the two turns")]);
+        loop_state.dispatch_slash("/compact").expect("compact");
+        drain_until_compaction_settles(&mut loop_state, true);
+
+        let pre: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join("pre.json")).expect("pre hook ran"))
+                .expect("json on stdin");
+        assert_eq!(pre["event"], "pre_compact");
+        assert_eq!(pre["turns"], 2);
+        assert_eq!(pre["trigger"], "manual");
+        let post: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join("post.json")).expect("post hook ran"),
+        )
+        .expect("json on stdin");
+        assert_eq!(post["event"], "post_compact");
+        assert_eq!(post["turns"], 2);
+        assert_eq!(post["summary_bytes"], "the two turns".len());
+    }
+
     #[test]
     fn slash_compact_folds_the_earlier_turns_into_a_summary_the_next_turn_carries() {
         // `/compact` said "not wired yet" while a long session silently
@@ -12700,6 +13104,174 @@ question the panel answers"
         assert!(
             !shown.iter().any(|line| line.contains("second")),
             "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn a_burst_of_events_that_outruns_a_tick_does_not_end_the_session() {
+        // The live channel holds 64 events; a tool-heavy turn or a job's
+        // output can land more than that between two ticks. That returned
+        // `Lagged` from the drain, and the drain returned it as the end of
+        // the session. The subscription names the cursor to resume from,
+        // and the ledger promises no gaps or duplicates from it.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        let cancel = CancellationToken::new();
+        for _ in 0..300 {
+            session
+                .client
+                .append_turn_progress(
+                    session.session_id,
+                    &session.actor,
+                    TraceId::new(),
+                    event_ledger::event::EventKind::ContextIndexed,
+                    serde_json::json!({}),
+                )
+                .expect("event");
+        }
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        for _ in 0..200 {
+            loop_state
+                .drain()
+                .expect("a lagged stream is resumed, not fatal");
+            if loop_state.ui.snapshot().map(|s| s.seq()) == Some(tip) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            loop_state.ui.snapshot().map(|s| s.seq()),
+            Some(tip),
+            "every event reached the projection: {:?}",
+            loop_state.ui.protocol_error()
+        );
+        assert!(!loop_state.ui.actions_blocked());
+    }
+
+    #[test]
+    fn a_long_parent_is_inherited_to_its_newest_turns_not_its_oldest() {
+        // The replay bound that keeps a resumed session's first paint quick
+        // was the wrong bound for inheritance: the transcript projection
+        // keeps its newest entries, so folding only the parent's first N
+        // events showed a rewound session its oldest turns while the ones
+        // just before the rewind point went missing — silently. The fold
+        // now reaches the fork point, and a ceiling it cannot reach is said
+        // in the transcript rather than swallowed.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("the oldest turn", ScriptedModel::terminal("oldest answer"));
+        for _ in 0..30 {
+            session
+                .client
+                .append_turn_progress(
+                    session.session_id,
+                    &session.actor,
+                    TraceId::new(),
+                    event_ledger::event::EventKind::ContextIndexed,
+                    serde_json::json!({}),
+                )
+                .expect("filler event");
+        }
+        session.run_turn("the newest turn", ScriptedModel::terminal("newest answer"));
+        let cancel = CancellationToken::new();
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        let child = block_on(
+            session.client.fork_session(ForkSession::new(
+                session.session_id,
+                tip,
+                session.actor.clone(),
+                TraceId::new(),
+            )),
+            &cancel,
+        )
+        .expect("fork");
+
+        // The production ceiling: everything through the fork point.
+        let inherited =
+            inherited_transcript(&session.client, child.id(), &cancel, MAX_INHERIT_DEPTH);
+        let shown: Vec<String> = inherited.iter().map(|e| format!("{e:?}")).collect();
+        assert!(
+            shown.iter().any(|line| line.contains("oldest answer"))
+                && shown.iter().any(|line| line.contains("newest answer")),
+            "{shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|line| line.contains("fully read")),
+            "{shown:?}"
+        );
+
+        // A ceiling the parent exceeds (the old replay bound, in
+        // miniature): the fold stops short and says so, instead of
+        // presenting the oldest turns as the whole past.
+        let truncated = inherited_transcript_bounded(
+            &session.client,
+            child.id(),
+            &cancel,
+            MAX_INHERIT_DEPTH,
+            12,
+        );
+        let shown: Vec<String> = truncated.iter().map(|e| format!("{e:?}")).collect();
+        assert!(
+            !shown.iter().any(|line| line.contains("newest answer")),
+            "{shown:?}"
+        );
+        assert!(
+            shown.iter().any(|line| line.contains("was not fully read")),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn a_turn_threads_warnings_reach_the_transcript_not_the_alt_screen() {
+        // A turn's warnings — a reminder roster that does not parse, an MCP
+        // server that will not start, no model configured — used to be raw
+        // stderr writes, which the alt screen turns into a staircase. They
+        // are the user's to read, so they go in the transcript.
+        let env = TempEnv::create();
+        let root = fs::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        fs::write(
+            root.join(PROJECT_MARKER).join("reminders.toml"),
+            "this is not = toml [[",
+        )
+        .expect("broken roster");
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state =
+            locals.session_loop(&session, vec![ScriptedModel::terminal("ran anyway")]);
+        loop_state.submit_turn("hello").expect("submit");
+        for _ in 0..300 {
+            loop_state.drain().expect("drain");
+            if !loop_state.model_busy()
+                && command_outputs(loop_state.ui)
+                    .iter()
+                    .any(|t| t.starts_with("warning: reminders not loaded"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let outputs = command_outputs(loop_state.ui);
+        assert!(
+            outputs
+                .iter()
+                .any(|t| t.starts_with("warning: reminders not loaded")),
+            "{outputs:?}"
+        );
+        settle_last_turn(&mut loop_state);
+        assert!(
+            loop_state.ui.transcript().iter().any(|entry| matches!(
+                entry,
+                TranscriptEntry::Assistant { text } if text == "ran anyway"
+            )),
+            "the turn still ran: {:?}",
+            loop_state.ui.transcript()
         );
     }
 
@@ -15491,6 +16063,7 @@ cancelled and not turned into a turn interrupt:\n{painted}"
                 backing,
                 budget,
                 self.jobs.clone(),
+                SessionNotices::default(),
             );
             join.join()
                 .expect("the turn thread must not panic (catching_panics wraps its body)");
@@ -16287,6 +16860,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             renderer: &mut renderer,
             autonomous: None,
             compaction: None,
+            notices: SessionNotices::default(),
             #[cfg(test)]
             scripted_backings: None,
         };
@@ -16615,6 +17189,7 @@ pre-approve it with `rapid permissions allow <tool>`";
                 renderer: &mut renderer,
                 autonomous: None,
                 compaction: None,
+                notices: SessionNotices::default(),
                 #[cfg(test)]
                 scripted_backings: None,
             };
@@ -16645,6 +17220,7 @@ pre-approve it with `rapid permissions allow <tool>`";
                 renderer: &mut renderer,
                 autonomous: None,
                 compaction: None,
+                notices: SessionNotices::default(),
                 #[cfg(test)]
                 scripted_backings: None,
             };
