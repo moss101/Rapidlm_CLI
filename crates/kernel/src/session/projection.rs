@@ -66,6 +66,12 @@ pub struct SessionSnapshot {
     seq: u64,
     created_at: String,
     updated_at: String,
+    /// Seq of the latest `context.compacted` event, when one is recorded —
+    /// where a reader of the session's conversation starts, so a compaction
+    /// older than its read window is not lost. In-process only: not a wire
+    /// field (the snapshot schema is unchanged), so a snapshot decoded from
+    /// the wire reads `None` and such a reader scans instead.
+    last_compaction: Option<u64>,
 }
 
 /// Session lifecycle observed by the projection.
@@ -247,6 +253,7 @@ fn apply_first(event: &ErasedEventEnvelope) -> Result<SessionSnapshot, Projectio
                 seq: event.seq(),
                 created_at: recorded_at.clone(),
                 updated_at: recorded_at,
+                last_compaction: None,
             })
         }
         _ => Err(invariant(ProjectionInvariant::SessionNotCreated)),
@@ -370,6 +377,9 @@ fn apply_next(
         | EventKind::AgentCancelled
         | EventKind::AgentPoolBackgroundParked => {
             remove_agent(&mut snapshot, parse_id(event.payload(), "agent_id")?)?;
+        }
+        EventKind::ContextCompacted => {
+            snapshot.last_compaction = Some(event.seq());
         }
         _ => {}
     }
@@ -719,6 +729,12 @@ fn invariant(kind: ProjectionInvariant) -> ProjectionError {
 impl SessionSnapshot {
     pub fn schema(&self) -> u16 {
         self.schema
+    }
+
+    /// Seq of the latest `context.compacted` recorded on this session, when
+    /// the snapshot was projected in-process — see the field's own note.
+    pub fn last_compaction(&self) -> Option<u64> {
+        self.last_compaction
     }
 
     pub fn id(&self) -> SessionId {
@@ -1093,6 +1109,7 @@ impl<'de> Visitor<'de> for SnapshotVisitor {
             seq: seq.ok_or_else(|| de::Error::missing_field("seq"))?,
             created_at: created_at.ok_or_else(|| de::Error::missing_field("created_at"))?,
             updated_at: updated_at.ok_or_else(|| de::Error::missing_field("updated_at"))?,
+            last_compaction: None,
         })
     }
 }
@@ -1323,6 +1340,35 @@ mod tests {
         let snapshot = replay_ok(&[event]);
         assert_eq!(snapshot.status(), SessionStatus::Ready);
         assert!(snapshot.top_level_goal().is_none());
+    }
+
+    #[test]
+    fn the_latest_compaction_is_remembered_in_process_and_not_on_the_wire() {
+        let events = [
+            created(),
+            envelope(
+                2,
+                EventKind::ContextCompacted,
+                UPDATED_AT,
+                serde_json::json!({"summary": "one", "through_seq": 1}),
+            ),
+            envelope(
+                3,
+                EventKind::ContextCompacted,
+                UPDATED_AT,
+                serde_json::json!({"summary": "two", "through_seq": 2}),
+            ),
+        ];
+        let snapshot = replay_ok(&events);
+        assert_eq!(snapshot.last_compaction(), Some(3));
+        assert_eq!(snapshot.status(), SessionStatus::Ready);
+        // The wire snapshot is unchanged: the field is not serialized, and a
+        // decoded snapshot reads `None`.
+        let json = serde_json::to_string(&snapshot).expect("encode");
+        assert!(!json.contains("last_compaction"));
+        let decoded: SessionSnapshot = serde_json::from_str(&json).expect("decode");
+        assert_eq!(decoded.last_compaction(), None);
+        assert_eq!(decoded.seq(), snapshot.seq());
     }
 
     #[test]

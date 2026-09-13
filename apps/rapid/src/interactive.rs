@@ -3237,18 +3237,41 @@ fn conversation_history(
     session_id: protocol::SessionId,
     cancel: &agent_runtime::CancellationToken,
 ) -> crate::host::ConversationHistory {
+    conversation_history_within(client, session_id, cancel, MAX_CONVERSATION_EVENTS)
+}
+
+/// [`conversation_history`] with the read window as a parameter, so a test
+/// can put a compaction outside it without appending thousands of events.
+fn conversation_history_within(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    cancel: &agent_runtime::CancellationToken,
+    window: usize,
+) -> crate::host::ConversationHistory {
     let mut history = HistoryAccumulator::default();
+    // The tip this read covers through, read once and named in the result:
+    // a `/compact` records it as the summary's `through_seq`, so a turn
+    // that lands after this read — only another process could — is
+    // carried as a turn, whether it landed before or after the summary
+    // was written.
+    let kernel_cancel = CancellationToken::new();
+    let Ok(snapshot) = block_on(client.get_session(session_id), &kernel_cancel) else {
+        return crate::host::ConversationHistory::default();
+    };
+    let through_seq = snapshot.seq();
     conversation_through(
         client,
         session_id,
-        None,
+        Some((through_seq, snapshot.last_compaction())),
         cancel,
         MAX_FORK_DEPTH,
+        window,
         &mut history,
     );
     crate::host::ConversationHistory {
         summary: history.summary,
         turns: history.turns.into_iter().map(|turn| turn.turn).collect(),
+        through_seq,
     }
 }
 
@@ -3287,14 +3310,23 @@ impl HistoryAccumulator {
     }
 }
 
-/// Append `session_id`'s turns through `through` (its tip when `None`) to
-/// `history`, after its fork parent's — recursion bounded by `depth`.
+/// Append `session_id`'s turns through `through` — `(tip, latest
+/// compaction seq)`, the session's own when `None` — to `history`, after
+/// its fork parent's; recursion bounded by `depth`, the read by `window`.
+///
+/// A compaction older than the window is not lost: the projection
+/// remembers where the latest one is (`SessionSnapshot::last_compaction`),
+/// and that one event is read first, so the summary is carried even when
+/// the turns between it and the window are not (they are older than
+/// anything the window would carry anyway).
+#[allow(clippy::too_many_arguments)]
 fn conversation_through(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
-    through: Option<u64>,
+    through: Option<(u64, Option<u64>)>,
     cancel: &agent_runtime::CancellationToken,
     depth: usize,
+    window: usize,
     history: &mut HistoryAccumulator,
 ) {
     use crate::host::{ConversationOutcome, ConversationTurn};
@@ -3303,19 +3335,12 @@ fn conversation_through(
     // The kernel calls take the kernel's own token; the turn's token is the
     // one that can actually be cancelled, and the read loop watches it.
     let kernel_cancel = CancellationToken::new();
-    let tip = match through {
-        Some(seq) => seq,
+    let (tip, last_compaction) = match through {
+        Some(through) => through,
         None => match block_on(client.get_session(session_id), &kernel_cancel) {
-            Ok(snapshot) => snapshot.seq(),
+            Ok(snapshot) => (snapshot.seq(), snapshot.last_compaction()),
             Err(_) => return,
         },
-    };
-    let after = tip.saturating_sub(MAX_CONVERSATION_EVENTS as u64);
-    let Ok(mut stream) = block_on(
-        client.subscribe(SubscribeEvents::new(session_id, after)),
-        &kernel_cancel,
-    ) else {
-        return;
     };
     let text_of = |event: &event_ledger::event::ErasedEventEnvelope, field: &str| {
         if event.redaction() == RedactionClass::Secret {
@@ -3327,8 +3352,50 @@ fn conversation_through(
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
     };
+    let fold = |history: &mut HistoryAccumulator,
+                event: &event_ledger::event::ErasedEventEnvelope| {
+        // Without a summary the event folds nothing: better the turns than
+        // a hole where they were. The bound is the writer's
+        // (`MAX_COMPACTION_SUMMARY`); text beyond it is not this build's,
+        // and folding the turns on the strength of a summary the packet
+        // will then refuse would be the same hole.
+        let Some(summary) = text_of(event, "summary")
+            .filter(|text| !text.is_empty() && text.len() <= crate::host::MAX_COMPACTION_SUMMARY)
+        else {
+            return;
+        };
+        let through_seq = event
+            .payload()
+            .get("through_seq")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(event.seq());
+        history.compact(session_id, through_seq, summary);
+    };
+    let after = tip.saturating_sub(window as u64);
+    // The latest compaction, when it is older than the window: read that
+    // one event before the window, so its summary stands for everything
+    // the window does not reach — including the parent's turns already
+    // read.
+    if let Some(seq) = last_compaction
+        && seq <= tip
+        && seq <= after
+        && let Ok(mut stream) = block_on(
+            client.subscribe(SubscribeEvents::new(session_id, seq.saturating_sub(1))),
+            &kernel_cancel,
+        )
+        && let Ok(event) = stream.recv()
+        && event.kind() == EventKind::ContextCompacted
+    {
+        fold(history, &event);
+    }
+    let Ok(mut stream) = block_on(
+        client.subscribe(SubscribeEvents::new(session_id, after)),
+        &kernel_cancel,
+    ) else {
+        return;
+    };
     let mut open: Option<String> = None;
-    for _ in 0..MAX_CONVERSATION_EVENTS {
+    for _ in 0..window {
         if stream.cursor() >= tip || cancel.is_cancelled() {
             break;
         }
@@ -3349,12 +3416,19 @@ fn conversation_through(
                     .get("source_seq")
                     .and_then(serde_json::Value::as_u64);
                 if let (Some(parent), Some(source_seq)) = (parent, source_seq) {
+                    // The parent's own latest compaction is only usable if
+                    // it is not past the fork point; `None` means "scan".
+                    let parent_compaction = block_on(client.get_session(parent), &kernel_cancel)
+                        .ok()
+                        .and_then(|snapshot| snapshot.last_compaction())
+                        .filter(|seq| *seq <= source_seq);
                     conversation_through(
                         client,
                         parent,
-                        Some(source_seq),
+                        Some((source_seq, parent_compaction)),
                         cancel,
                         depth - 1,
+                        window,
                         history,
                     );
                 }
@@ -3393,18 +3467,7 @@ fn conversation_through(
                     );
                 }
             }
-            EventKind::ContextCompacted => {
-                // Without a summary the event folds nothing: better the
-                // turns than a hole where they were.
-                if let Some(summary) = text_of(&event, "summary") {
-                    let through_seq = event
-                        .payload()
-                        .get("through_seq")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(event.seq());
-                    history.compact(session_id, through_seq, summary);
-                }
-            }
+            EventKind::ContextCompacted => fold(history, &event),
             _ => {}
         }
     }
@@ -3798,11 +3861,13 @@ run without --continue to start one"
     };
     // The session's earlier turns, if this is one: the same history an
     // interactive turn carries, read the same way.
+    let mut history_through = 0;
     let preserved = match &recording {
         Some(recording) if parsed.resume != ExecResume::Fresh => {
             let history_cancel = agent_runtime::CancellationToken::new();
             let history =
                 conversation_history(&recording.client, recording.session_id, &history_cancel);
+            history_through = history.through_seq;
             preserved
                 .with_conversation(history.turns)
                 .with_compaction_summary(history.summary)
@@ -3981,7 +4046,7 @@ run without --continue to start one"
         )
     };
     if let (Some(recording), Some(turn_id)) = (&recording, recorded_turn) {
-        recording.finish_turn(turn_id, &run_result);
+        recording.finish_turn(turn_id, &run_result, history_through);
     }
     if let (Ok(outcome), Some(goal_path), Some(goal_id)) = (&run_result, &goal_path, goal_id) {
         let active_ms = u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -4526,9 +4591,16 @@ type CompactionOutcomeSlot =
 /// What a finished compaction reports back: the summary itself reaches the
 /// loop through the ledger, as `context.compacted`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct CompactionReport {
-    turns: usize,
-    tokens: u64,
+enum CompactionReport {
+    Compacted {
+        turns: usize,
+        tokens: u64,
+    },
+    /// No completed turns to fold — since the last compaction, when there
+    /// was one.
+    NothingToCompact {
+        compacted_before: bool,
+    },
 }
 
 /// Everything the main loop needs to keep driving one autonomous goal
@@ -4556,6 +4628,21 @@ struct AutonomousGoalState {
 
 impl SessionLoop<'_> {
     fn run(mut self, inputs: &mut InputSource) -> Result<InteractiveOutcome, InteractiveError> {
+        let result = self.run_until_quit(inputs);
+        // A compaction still out when the session ends is not a turn, so
+        // the exit path's kernel interrupt cannot reach it; its own token
+        // can, and its thread stops at the next check instead of holding
+        // a model call open until the process is gone.
+        if let Some(compaction) = &self.compaction {
+            compaction.cancel.cancel();
+        }
+        result
+    }
+
+    fn run_until_quit(
+        &mut self,
+        inputs: &mut InputSource,
+    ) -> Result<InteractiveOutcome, InteractiveError> {
         loop {
             self.cancel
                 .check()
@@ -5872,24 +5959,9 @@ the full history, where `/diff` lists every file it wrote\n"
         if self.refuse_if_busy("compacting")? {
             return Ok(());
         }
-        let history = conversation_history(
-            self.client,
-            self.session_id,
-            &agent_runtime::CancellationToken::new(),
-        );
-        if history.turns.is_empty() {
-            self.append_command_output(if history.summary.is_some() {
-                "nothing to compact: no turns since the last compaction".to_owned()
-            } else {
-                "nothing to compact: the session has no completed turns yet".to_owned()
-            });
-            return self.drain();
-        }
-        // The seq the summary covers through: the ledger's tip now, read
-        // before the thread starts, so a turn recorded after it — only
-        // another process could — is carried as a turn, not lost.
-        let through_seq = self.session_tip()?;
-        let turns = history.turns.len();
+        // The history is read on the thread too — a turn reads it on its
+        // own thread for the same reason: the read walks the ledger, and
+        // the loop must keep painting.
         let cancel = agent_runtime::CancellationToken::new();
         let outcome = CompactionOutcomeSlot::default();
         #[cfg(test)]
@@ -5904,8 +5976,6 @@ the full history, where `/diff` lists every file it wrote\n"
                 self.session_id,
                 self.actor.clone(),
                 self.root.to_path_buf(),
-                history,
-                through_seq,
                 cancel.clone(),
                 std::sync::Arc::clone(&outcome),
                 backing,
@@ -5915,7 +5985,7 @@ the full history, where `/diff` lists every file it wrote\n"
                 ),
             );
             self.compaction = Some(CompactionInFlight { cancel, outcome });
-            self.append_command_output(format!("compacting {turns} turn(s)... (Ctrl-C cancels)"));
+            self.append_command_output("compacting... (Ctrl-C cancels)".to_owned());
             return self.drain();
         }
         spawn_compaction(
@@ -5923,20 +5993,18 @@ the full history, where `/diff` lists every file it wrote\n"
             self.session_id,
             self.actor.clone(),
             self.root.to_path_buf(),
-            history,
-            through_seq,
             cancel.clone(),
             std::sync::Arc::clone(&outcome),
         );
         self.compaction = Some(CompactionInFlight { cancel, outcome });
-        self.append_command_output(format!("compacting {turns} turn(s)... (Ctrl-C cancels)"));
+        self.append_command_output("compacting... (Ctrl-C cancels)".to_owned());
         self.drain()
     }
 
     /// Collect a finished compaction's report and free the model slot. The
     /// summary itself arrives through the ordinary subscription, as the
-    /// `context.compacted` event the thread appended; this only has to say
-    /// when it did not.
+    /// `context.compacted` event the thread appended; this says what the
+    /// thread found, and when it did not get that far.
     fn settle_compaction(&mut self) {
         let finished = match &self.compaction {
             Some(in_flight) => in_flight
@@ -5951,10 +6019,18 @@ the full history, where `/diff` lists every file it wrote\n"
         };
         self.compaction = None;
         match result {
-            Ok(report) => self.append_command_output(format!(
-                "compacted {} turn(s) in {} tokens; later turns carry the summary",
-                report.turns, report.tokens
-            )),
+            Ok(CompactionReport::Compacted { turns, tokens }) => {
+                self.append_command_output(format!(
+                    "compacted {turns} turn(s) in {tokens} tokens; later turns carry the summary"
+                ));
+            }
+            Ok(CompactionReport::NothingToCompact { compacted_before }) => {
+                self.append_command_output(if compacted_before {
+                    "nothing to compact: no turns since the last compaction".to_owned()
+                } else {
+                    "nothing to compact: the session has no completed turns yet".to_owned()
+                });
+            }
             Err(reason) => self.append_command_error(format!("compaction failed: {reason}")),
         }
     }
@@ -6156,9 +6232,16 @@ impl ExecRecording {
         &self,
         turn_id: protocol::TurnId,
         run_result: &Result<crate::host::ExecOutcome, E>,
+        history_through: u64,
     ) {
         if let Ok(outcome) = run_result {
-            record_context_compiled(&self.client, self.session_id, &self.actor, outcome);
+            record_turn_context(
+                &self.client,
+                self.session_id,
+                &self.actor,
+                outcome,
+                history_through,
+            );
         }
         let _ = self.client.finish_turn(kernel::FinishTurn::new(
             self.session_id,
@@ -6821,6 +6904,7 @@ fn run_interactive_turn_inner(
     // the model had no idea what the previous turn had been. Read from the
     // ledger, which is what the resumed transcript is rebuilt from too.
     let history = conversation_history(client, session_id, cancel);
+    let history_through = history.through_seq;
     let (preserved, mut tools) = match build_interactive_turn_context(
         root,
         trusted,
@@ -6841,7 +6925,16 @@ fn run_interactive_turn_inner(
     tools.share_job_table(jobs);
 
     execute_interactive_turn(
-        client, session_id, actor, root, text, preserved, &mut tools, backing, cancel,
+        client,
+        session_id,
+        actor,
+        root,
+        text,
+        preserved,
+        &mut tools,
+        backing,
+        cancel,
+        history_through,
     )
 }
 
@@ -6892,14 +6985,11 @@ fn resolve_interactive_backing(
 /// the summary, record it. Reports through `outcome` on every path — a
 /// panic included, so the loop's model slot is always freed (the same
 /// guarantee `spawn_interactive_turn` gives the turn lease).
-#[allow(clippy::too_many_arguments)]
 fn spawn_compaction(
     client: InProcessKernelClient,
     session_id: protocol::SessionId,
     actor: ActorRef,
     root: PathBuf,
-    history: crate::host::ConversationHistory,
-    through_seq: u64,
     cancel: agent_runtime::CancellationToken,
     outcome: CompactionOutcomeSlot,
 ) {
@@ -6908,17 +6998,7 @@ fn spawn_compaction(
             let credential_store = auth::InMemoryCredentialStore::new();
             let (backing, _) = resolve_interactive_backing(&credential_store)?;
             let budget = context_budget_for(&backing);
-            run_compaction(
-                &client,
-                session_id,
-                &actor,
-                &root,
-                &history,
-                through_seq,
-                backing,
-                budget,
-                &cancel,
-            )
+            run_compaction(&client, session_id, &actor, &root, backing, budget, &cancel)
         }))
         .unwrap_or_else(|_| Err("compaction panicked".to_owned()));
         *outcome.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
@@ -6934,8 +7014,6 @@ fn spawn_compaction_with_backing<B: crate::host::LiveModelCall + Send + 'static>
     session_id: protocol::SessionId,
     actor: ActorRef,
     root: PathBuf,
-    history: crate::host::ConversationHistory,
-    through_seq: u64,
     cancel: agent_runtime::CancellationToken,
     outcome: CompactionOutcomeSlot,
     backing: B,
@@ -6943,45 +7021,46 @@ fn spawn_compaction_with_backing<B: crate::host::LiveModelCall + Send + 'static>
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_compaction(
-                &client,
-                session_id,
-                &actor,
-                &root,
-                &history,
-                through_seq,
-                backing,
-                budget,
-                &cancel,
-            )
+            run_compaction(&client, session_id, &actor, &root, backing, budget, &cancel)
         }))
         .unwrap_or_else(|_| Err("compaction panicked".to_owned()));
         *outcome.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
     })
 }
 
-/// One compaction, end to end: the summary through the shared
-/// `run_live_compaction` entry, its tokens accrued to the active goal (a
-/// model call the goal's budget must see, though not a turn), and the
-/// `context.compacted` event appended at the session's tip — the record
-/// every later turn reads the summary from. The error is the text the loop
-/// shows.
-#[allow(clippy::too_many_arguments)]
+/// One compaction, end to end: the history read from the ledger, the
+/// summary through the shared `run_live_compaction` entry, its tokens
+/// accrued to the active goal (a model call the goal's budget must see,
+/// though not a turn), and the `context.compacted` event appended at the
+/// session's tip — the record every later turn reads the summary from. The
+/// error is the text the loop shows.
 fn run_compaction<B: crate::host::LiveModelCall>(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
     actor: &ActorRef,
     root: &Path,
-    history: &crate::host::ConversationHistory,
-    through_seq: u64,
     backing: B,
     budget: (u32, u32),
     cancel: &agent_runtime::CancellationToken,
 ) -> Result<CompactionReport, String> {
+    let history = conversation_history(client, session_id, cancel);
+    // The read stops early when cancelled, and an early-stopped read looks
+    // like an empty one: say cancelled, not "nothing to compact".
+    if cancel.is_cancelled() {
+        return Err(
+            crate::host::CompactionError::Model(agent_runtime::ModelStepError::Cancelled)
+                .to_string(),
+        );
+    }
+    if history.turns.is_empty() {
+        return Ok(CompactionReport::NothingToCompact {
+            compacted_before: history.summary.is_some(),
+        });
+    }
     let (context_limit, output_reserve) = budget;
     let summary = crate::host::run_live_compaction(
         backing,
-        history,
+        &history,
         context_limit,
         output_reserve,
         cancel,
@@ -6998,25 +7077,55 @@ fn run_compaction<B: crate::host::LiveModelCall>(
             summary.cost_usd_micros.unwrap_or(0),
         );
     }
+    record_compaction(
+        client,
+        session_id,
+        actor,
+        &summary.text,
+        history.through_seq,
+        summary.turns,
+        serde_json::json!({
+            "tokens": summary.tokens,
+            "cost_usd_micros": summary.cost_usd_micros,
+            "source": "compact",
+        }),
+    )?;
+    Ok(CompactionReport::Compacted {
+        turns: summary.turns,
+        tokens: summary.tokens,
+    })
+}
+
+/// Append `context.compacted`: `summary` stands for every turn of this
+/// session recorded through `through_seq` (and every turn of the sessions
+/// it was forked from). `extra` carries the writer's own fields — what the
+/// call cost, which path wrote it.
+fn record_compaction(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    summary: &str,
+    through_seq: u64,
+    turns: usize,
+    extra: serde_json::Value,
+) -> Result<(), String> {
+    let mut payload = serde_json::json!({
+        "summary": summary,
+        "through_seq": through_seq,
+        "turns": turns,
+    });
+    if let (Some(payload), Some(extra)) = (payload.as_object_mut(), extra.as_object()) {
+        payload.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
     client
         .append_turn_progress(
             session_id,
             actor,
             TraceId::new(),
             event_ledger::event::EventKind::ContextCompacted,
-            serde_json::json!({
-                "summary": summary.text,
-                "through_seq": through_seq,
-                "turns": summary.turns,
-                "tokens": summary.tokens,
-                "cost_usd_micros": summary.cost_usd_micros,
-            }),
+            payload,
         )
-        .map_err(|err| format!("the summary was written but could not be recorded: {err}"))?;
-    Ok(CompactionReport {
-        turns: summary.turns,
-        tokens: summary.tokens,
-    })
+        .map_err(|err| format!("the summary was written but could not be recorded: {err}"))
 }
 
 /// Test-only-but-real sibling of `run_interactive_turn_inner`: identical
@@ -7057,6 +7166,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     let forced_mode = Some(crate::permissions::PermissionMode::BypassPermissions);
     let (context_limit, output_reserve) = budget;
     let history = conversation_history(client, session_id, cancel);
+    let history_through = history.through_seq;
     let (preserved, mut tools) = match build_interactive_turn_context(
         root,
         trusted,
@@ -7072,7 +7182,16 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     // Same session-scoped job table the production path uses.
     tools.share_job_table(jobs);
     execute_interactive_turn(
-        client, session_id, actor, root, text, preserved, &mut tools, backing, cancel,
+        client,
+        session_id,
+        actor,
+        root,
+        text,
+        preserved,
+        &mut tools,
+        backing,
+        cancel,
+        history_through,
     )
 }
 
@@ -7106,6 +7225,9 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
     tools: &mut ExecTools,
     backing: B,
     cancel: &agent_runtime::CancellationToken,
+    // The seq the turn's history was read through — see
+    // `record_turn_context`.
+    history_through: u64,
 ) -> kernel::TurnOutcome {
     let spec = match AgentSpec::builder(
         protocol::AgentId::new(),
@@ -7145,7 +7267,7 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
         None,
     );
     if let Ok(outcome) = &run_result {
-        record_context_compiled(client, session_id, actor, outcome);
+        record_turn_context(client, session_id, actor, outcome, history_through);
     }
     if let (Ok(outcome), Some(goal_id)) = (&run_result, goal_id) {
         let active_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -7193,12 +7315,32 @@ fn attach_ledger_sinks(
 /// context, and the figure is what the model was last given. The per-class
 /// rows are for the `/context` panel: the totals cannot say which class is
 /// consuming the window.
-fn record_context_compiled(
+///
+/// A summary the turn's overflow recovery wrote is recorded here too, as
+/// `context.compacted` covering the history the turn was given
+/// (`history_through`): without it the next turn would read the same turns,
+/// overflow on them the same way and pay for the same recovery, silently,
+/// on every turn until someone ran `/compact`.
+fn record_turn_context(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
     actor: &ActorRef,
     outcome: &crate::host::ExecOutcome,
+    history_through: u64,
 ) {
+    if let Some(recovered) = &outcome.recovered {
+        // Best-effort, like the usage event below: the turn's own outcome
+        // does not depend on this landing.
+        let _ = record_compaction(
+            client,
+            session_id,
+            actor,
+            &recovered.text,
+            history_through,
+            recovered.turns,
+            serde_json::json!({"source": "overflow-recovery"}),
+        );
+    }
     let Some((used, limit)) = outcome.context_tokens else {
         return;
     };
@@ -11675,9 +11817,7 @@ question the panel answers"
 
             let outputs = command_outputs(loop_state.ui);
             assert!(
-                outputs
-                    .iter()
-                    .any(|t| t.starts_with("compacting 2 turn(s)")),
+                outputs.iter().any(|t| t.starts_with("compacting")),
                 "{outputs:?}"
             );
             assert!(
@@ -11797,29 +11937,145 @@ question the panel answers"
         let env = TempEnv::create();
         let session = ScriptedSession::create(&env);
         let mut locals = LoopLocals::for_session(&session);
-        let backings = scripted_backing_queue(vec![ScriptedModel::terminal("unused")]);
-        let mut loop_state = autonomous_session_loop(
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut loop_state = locals.session_loop(
             &session,
-            &mut locals.stream,
-            &mut locals.ui,
-            &locals.cancel,
-            &mut locals.interrupt_count,
-            &mut locals.saw_ctrl_c,
-            &mut locals.renderer,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            backings.clone(),
+            vec![ScriptedModel::terminal("unused").capturing_blocks(seen.clone())],
         );
         loop_state.dispatch_slash("/compact").expect("compact");
-        assert!(loop_state.compaction.is_none());
+        drain_until_compaction_settles(&mut loop_state, false);
         assert_eq!(
             command_outputs(loop_state.ui),
-            vec!["nothing to compact: the session has no completed turns yet"]
+            vec![
+                "compacting... (Ctrl-C cancels)",
+                "nothing to compact: the session has no completed turns yet"
+            ]
         );
-        assert_eq!(
-            backings.lock().unwrap_or_else(|p| p.into_inner()).len(),
-            1,
+        assert!(
+            seen.lock().unwrap_or_else(|p| p.into_inner()).is_empty(),
             "no model call was made"
         );
+    }
+
+    #[test]
+    fn a_turn_that_overflowed_records_the_summary_its_recovery_wrote() {
+        // The in-turn overflow recovery folds the earlier turns into a
+        // summary; if that summary were kept only in the turn's own packet,
+        // the next turn would read the same turns, overflow the same way
+        // and pay for the same recovery — every turn, silently. So the
+        // turn records it, and the next turn carries it.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        // Long enough answers that a summary is genuinely smaller than the
+        // turns it stands for — a recovery whose summary would not shrink
+        // the packet sets it aside, by design.
+        let long_answer = |lead: &str| format!("{lead} {}", "and so on, ".repeat(120));
+        session.run_turn(
+            "name it Nightjar",
+            ScriptedModel::terminal(&long_answer("Named.")),
+        );
+        session.run_turn(
+            "add tests",
+            ScriptedModel::terminal(&long_answer("Added two.")),
+        );
+
+        session.run_turn(
+            "run them",
+            ScriptedModel::overflow_then_summary_then_answer(
+                "Nightjar; two tests added.",
+                "Both pass.",
+            ),
+        );
+        assert!(
+            session.transcript().iter().any(|entry| matches!(
+                entry,
+                TranscriptEntry::Compacted { turns: 2, summary }
+                    if summary == "Nightjar; two tests added."
+            )),
+            "the recovery's summary is recorded and shown: {:?}",
+            session.transcript()
+        );
+        let history = conversation_history(
+            &session.client,
+            session.session_id,
+            &agent_runtime::CancellationToken::new(),
+        );
+        assert_eq!(
+            history.summary.as_deref(),
+            Some("Nightjar; two tests added.")
+        );
+        let carried: Vec<&str> = history.turns.iter().map(|t| t.user()).collect();
+        assert_eq!(
+            carried,
+            vec!["run them"],
+            "the overflowing turn itself is after the summary, so it is still a turn"
+        );
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        session.run_turn(
+            "and lint",
+            ScriptedModel::terminal("Clean.").capturing_blocks(seen.clone()),
+        );
+        let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            seen.iter()
+                .any(|(l, t)| l == crate::host::COMPACTION_LOCATOR
+                    && t == "Nightjar; two tests added."),
+            "{:?}",
+            seen.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>()
+        );
+        let turns: Vec<&str> = seen
+            .iter()
+            .filter(|(l, _)| l.starts_with(crate::host::CONVERSATION_LOCATOR_PREFIX))
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert_eq!(turns.len(), 1, "{turns:?}");
+        assert!(turns[0].contains("run them"), "{turns:?}");
+    }
+
+    #[test]
+    fn a_compaction_older_than_the_read_window_still_reaches_the_turn() {
+        // The reader walks a bounded window of the newest events. A
+        // compaction older than that used to fall out of it — and the
+        // summary was the session's whole memory of everything before.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("one", ScriptedModel::terminal("uno"));
+        let cancel = CancellationToken::new();
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        session
+            .client
+            .append_turn_progress(
+                session.session_id,
+                &session.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::ContextCompacted,
+                serde_json::json!({"summary": "the first turn", "through_seq": tip, "turns": 1}),
+            )
+            .expect("record");
+        session.run_turn("two", ScriptedModel::terminal("dos"));
+        session.run_turn("three", ScriptedModel::terminal("tres"));
+        // A window that reaches back only to the newest turn's events.
+        let history = conversation_history_within(
+            &session.client,
+            session.session_id,
+            &agent_runtime::CancellationToken::new(),
+            6,
+        );
+        assert_eq!(history.summary.as_deref(), Some("the first turn"));
+        let carried: Vec<&str> = history.turns.iter().map(|t| t.user()).collect();
+        assert_eq!(carried, vec!["three"], "only what the window reaches");
+        // The full window reads the same summary and both later turns.
+        let history = conversation_history(
+            &session.client,
+            session.session_id,
+            &agent_runtime::CancellationToken::new(),
+        );
+        assert_eq!(history.summary.as_deref(), Some("the first turn"));
+        let carried: Vec<&str> = history.turns.iter().map(|t| t.user()).collect();
+        assert_eq!(carried, vec!["two", "three"]);
     }
 
     #[test]
@@ -11965,6 +12221,10 @@ question the panel answers"
         let tip = block_on(session.client.get_session(session.session_id), &cancel)
             .expect("session")
             .seq();
+        assert_eq!(
+            history.through_seq, tip,
+            "the history names the tip it was read through"
+        );
         let child = block_on(
             session.client.fork_session(ForkSession::new(
                 session.session_id,
@@ -14424,6 +14684,27 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             }
         }
 
+        /// Refuse the first packet as too large, answer the recovery's
+        /// compaction request with `summary`, then answer the retried step.
+        fn overflow_then_summary_then_answer(summary: &str, answer: &str) -> Self {
+            Self {
+                outputs: VecDeque::from(vec![
+                    Err(ModelStepError::BoundExceeded),
+                    Ok(ModelStepOutput::Terminal {
+                        text: summary.to_owned(),
+                        tokens: 1,
+                        cost_usd_micros: None,
+                    }),
+                    Ok(ModelStepOutput::Terminal {
+                        text: answer.to_owned(),
+                        tokens: 1,
+                        cost_usd_micros: None,
+                    }),
+                ]),
+                ..Default::default()
+            }
+        }
+
         /// Start a background `shell_exec` job, then answer — the shape a
         /// model uses to kick off a long build and keep working.
         fn background_job_then_answer(argv: &[&str], answer: &str) -> Self {
@@ -15501,6 +15782,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             tool_calls: 0,
             tokens: 0,
             cost_usd_micros: None,
+            recovered: None,
             context_tokens: None,
             context_partitions: Vec::new(),
         }
