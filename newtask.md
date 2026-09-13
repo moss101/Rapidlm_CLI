@@ -8017,6 +8017,34 @@ show this bug on macOS** — BSD `kill` is correct — so the cycle here is CI o
 this commit died in the hooks timeout test; the run after must complete `plugin-host`,
 `process-supervisor` and `sandbox`.
 
+**An interactive turn runs on the same setup as a headless one, 2026-09-13 (`6b0ce30`).**
+`run_interactive_turn_inner`'s own doc comment listed what its "first working version" left out —
+hooks, MCP servers, proactive retrieval, reminders — and the list was longer than that: no
+`[models] fallback` chain (one `ConfiguredModel`, no `resolve_model_plan`), no managed-policy
+ceilings, no shadow diagnostics, no `web_fetch` allowlist, no subagent runner (so `task_spawn`
+failed in the TUI with "no runner"), no reminder-floor reasoning effort. The same
+`.rapidlm/settings.json`, `reminders.toml` and repo index worked under `rapid exec` and silently
+did nothing in the TUI — the product's primary surface. **Extracted from `exec_turn`, behaviour
+preserved there**: `apply_managed_ceilings` (ceilings + `policy_version`), `configure_trusted_tools`
+(allowlist, hooks, shadow, MCP with the rejection warnings through the caller's `warn`, the
+credential canary, `LiveSubagentRunner`; returns the per-run `session_start`/`session_end` lists
+for the caller to fire), `interactive_reminders`, and the retrieval step inside
+`build_interactive_turn_context`; `SessionModel` wraps `resolve_model_plan` + `build_backing_model`
+for the TUI turn and for `/compact` (the fallback chain's routing-decision log is dropped there —
+the TUI has nowhere to show it yet; headless writes it to `--jsonl`). The interactive session
+fires `session_start` at start and `session_end` on every exit path, per run like headless. One
+ordering change on headless stderr: MCP rejection warnings now print after model resolution
+(the runner needs the model), which no test pinned. **Test** through the real turn path (unix):
+a project whose `pre_tool_use` hook denies with a reason, a reminder roster and a repo file —
+the write is denied in the transcript with the hook's own words, and the packet carries
+`reminders/active` and a `retrieved:` block; revert cycle 159. Not covered by a test: MCP
+registration and `task_spawn` in the TUI (both need a configured model or a server binary; the
+code is the same function headless runs) — recorded, not claimed. Also this round: CI's Linux
+runner failed `autonomous_goal_stops_on_context_required…` once — the loop decides to stop on
+`tool.context_required` and the assertion on the answer text ran before `turn.completed` was
+delivered; the test now settles on the ledger's own terminal entry (`settle_last_turn`), not a
+sleep.
+
 **The transcript after `/rewind` (and `/fork`, and `/resume` onto a fork) shows the past,
 2026-09-13 (`127218d`).** A fork's ledger starts at `session.forked`, so the display came up
 empty — a session with no past rather than one rewound to a point in it — while the model, since
