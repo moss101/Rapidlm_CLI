@@ -8449,16 +8449,18 @@ conversation-history and `exec --continue` work. From here a red Format, Lint, o
 Test step is the next task before anything else, and the platform matrix is the cross-platform
 gate.
 
-**2026-09-13** (`94d0f59`..`bf8d067`, fourteen commits, every one green on all four CI jobs
-through `1bfd543`): a turn carries the session's
+**2026-09-13** (`94d0f59`..`e9b8812`, twenty commits, every one green on all four CI jobs):
+a turn carries the session's
 earlier turns to the model, following forks; `rapid exec --resume`/`--continue`; `/compact` and a
 real overflow recovery (`b0700b9`, reviewed and hardened in `07d8285`); the transcript after
 `/rewind`/`/fork`/`/resume` onto a fork (`127218d`); the interactive turn on the same setup as a
 headless one — hooks, MCP, retrieval, reminders, fallback chain, ceilings, subagents (`6b0ce30`,
 reviewed and hardened in `4619864`, which also found and fixed the lagged-subscription P1);
 `[phases] compact` and the compaction hooks (`4619864`); MCP servers per session, not per turn
-(`6ae511b`); `/agents cancel|terminate` and subagents in the `/agents` panel (`11c7266`).
-Two self-reviews, both with real findings, both entries above. **Next in order:** a
+(`6ae511b`); `/agents cancel|terminate` and subagents in the `/agents` panel (`11c7266`,
+reviewed and hardened in `b2a15e7`). Three self-reviews, all with real findings, all entries
+above. The machine froze `rustc` for tens of minutes several times today whenever the other
+workspaces compiled; two commits shipped on CI verification alone and say so in their entries. **Next in order:** a
 session-scoped MCP server that dies is not reconnected; `interactive_reminders` is not trust-gated
 (parity with headless, worth deciding); the unwired panel view models (item 3); the both-ledgers
 merge (item 8); hooks run in the process cwd rather than the project root (both paths).
