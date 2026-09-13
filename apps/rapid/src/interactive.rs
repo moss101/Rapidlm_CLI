@@ -15834,6 +15834,7 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         }
 
         /// Call `tool` with `arguments` (a JSON object), then answer.
+        #[cfg_attr(not(unix), allow(dead_code))]
         fn call_then_answer(tool: &str, arguments: serde_json::Value, answer: &str) -> Self {
             let call = ProposedToolCall::new(
                 "c1",
