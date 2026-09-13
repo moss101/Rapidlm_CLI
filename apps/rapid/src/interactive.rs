@@ -4373,7 +4373,8 @@ fn run_started_session(
     if options.resume.is_some() {
         // Fold the replayed history before the first paint, so a resumed
         // session shows its transcript immediately instead of filling in
-        // over the next few ticks.
+        // over the next few ticks — what was said before a fork included.
+        inherit_transcript(&client, &mut ui, session_id, &options.cancel);
         replay_history(
             &client,
             &mut stream,
@@ -5501,6 +5502,11 @@ denied\n",
             self.client.subscribe(SubscribeEvents::new(target, 0)),
             self.cancel,
         )?;
+        // A fork's own ledger starts at `session.forked`: what was said
+        // before it is the parent's, and a rewind that showed an empty
+        // transcript looked like a session with no past rather than one
+        // rewound to a point in it.
+        inherit_transcript(self.client, &mut fresh, target, self.cancel);
         replay_history(
             self.client,
             &mut stream,
@@ -7457,6 +7463,90 @@ fn interrupt_session(
 /// nothing: the stream keeps its place, so a history longer than this budget
 /// finishes arriving over the following frames instead of all at once.
 const MAX_REPLAYED_EVENTS: usize = 4096;
+
+/// How many forks back a transcript is inherited — the same depth
+/// `conversation_history` follows for the model, so what the user sees and
+/// what the model is given agree on where the past begins.
+const MAX_INHERIT_DEPTH: usize = MAX_FORK_DEPTH;
+
+/// Put what was said before `session_id` forked in front of `ui`'s
+/// transcript: the parent's transcript through the fork point, and that
+/// parent's inheritance before it. A session that was not forked, or whose
+/// parent cannot be read, inherits nothing — best-effort, like the model's
+/// own history read; nothing here can fail the session.
+fn inherit_transcript(
+    client: &InProcessKernelClient,
+    ui: &mut AppState,
+    session_id: protocol::SessionId,
+    cancel: &CancellationToken,
+) {
+    let inherited = inherited_transcript(client, session_id, cancel, MAX_INHERIT_DEPTH);
+    if !inherited.is_empty() {
+        *ui = reduce(
+            ui.clone(),
+            &UiEvent::Local(LocalUiEvent::InheritTranscript(inherited)),
+        );
+    }
+}
+
+/// The transcript `session_id` inherits: empty unless its first event is
+/// `session.forked`, in which case the parent's own inheritance (recursion
+/// bounded by `depth`) followed by the parent's events through `source_seq`
+/// folded through the same reducer the live session uses — the display
+/// projection of the past, carried across exactly as it would have been
+/// painted.
+fn inherited_transcript(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    cancel: &CancellationToken,
+    depth: usize,
+) -> Vec<TranscriptEntry> {
+    use event_ledger::event::EventKind;
+    if depth == 0 || cancel.is_cancelled() {
+        return Vec::new();
+    }
+    let Ok(mut stream) = block_on(
+        client.subscribe(SubscribeEvents::new(session_id, 0)),
+        cancel,
+    ) else {
+        return Vec::new();
+    };
+    let Ok(first) = stream.recv() else {
+        return Vec::new();
+    };
+    if first.kind() != EventKind::SessionForked {
+        return Vec::new();
+    }
+    let parent = first
+        .payload()
+        .get("parent_session_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| raw.parse::<protocol::SessionId>().ok());
+    let source_seq = first
+        .payload()
+        .get("source_seq")
+        .and_then(serde_json::Value::as_u64);
+    let (Some(parent), Some(source_seq)) = (parent, source_seq) else {
+        return Vec::new();
+    };
+    let mut entries = inherited_transcript(client, parent, cancel, depth - 1);
+    let Ok(mut parent_stream) = block_on(client.subscribe(SubscribeEvents::new(parent, 0)), cancel)
+    else {
+        return entries;
+    };
+    let mut projected = AppState::new();
+    for _ in 0..MAX_REPLAYED_EVENTS {
+        if parent_stream.cursor() >= source_seq || cancel.is_cancelled() {
+            break;
+        }
+        let Ok(event) = parent_stream.recv() else {
+            break;
+        };
+        projected = reduce(projected, &UiEvent::Kernel(event));
+    }
+    entries.extend(projected.transcript().iter().cloned());
+    entries
+}
 
 /// Fold a resumed session's replayed history into `ui` before the first
 /// paint.
@@ -12246,6 +12336,95 @@ question the panel answers"
         );
         let carried: Vec<&str> = child_history.turns.iter().map(|t| t.user()).collect();
         assert_eq!(carried, vec!["two"]);
+    }
+
+    #[test]
+    fn a_rewound_session_shows_the_transcript_up_to_the_rewind_point() {
+        // `/rewind` forks at the seq and switches to the child, whose own
+        // ledger starts at `session.forked` — so the transcript came up
+        // empty, a session with no past rather than one rewound to a point
+        // in it. The model already remembered the turns up to the rewind
+        // (`a_rewound_session_remembers_…`); now the screen agrees.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("first", ScriptedModel::terminal("first answer"));
+        let cancel = CancellationToken::new();
+        let after_first = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        session.run_turn("second", ScriptedModel::terminal("second answer"));
+
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        loop_state
+            .dispatch_slash(&format!("/rewind {after_first}"))
+            .expect("rewind");
+        let child_id = loop_state.session_id;
+        assert_ne!(child_id, session.session_id);
+        let shown: Vec<String> = loop_state
+            .ui
+            .transcript()
+            .iter()
+            .map(|entry| format!("{entry:?}"))
+            .collect();
+        let position = |needle: &str| shown.iter().position(|line| line.contains(needle));
+        assert!(
+            position("\"first\"").is_some() && position("first answer").is_some(),
+            "the turn before the rewind point is shown: {shown:?}"
+        );
+        assert!(
+            position("second").is_none(),
+            "and nothing after it: {shown:?}"
+        );
+        assert!(
+            position("rewound to seq").is_some(),
+            "the command's own confirmation follows the inherited past: {shown:?}"
+        );
+        assert!(
+            position("first answer") < position("rewound to seq"),
+            "{shown:?}"
+        );
+
+        // Coming back to the child through `/resume` shows the same past.
+        let parent_id = session.session_id;
+        loop_state
+            .dispatch_slash(&format!("/resume {parent_id}"))
+            .expect("resume parent");
+        assert_eq!(loop_state.session_id, parent_id);
+        loop_state
+            .dispatch_slash(&format!("/resume {child_id}"))
+            .expect("resume child");
+        assert_eq!(loop_state.session_id, child_id);
+        let shown: Vec<String> = loop_state
+            .ui
+            .transcript()
+            .iter()
+            .map(|entry| format!("{entry:?}"))
+            .collect();
+        assert!(
+            shown.iter().any(|line| line.contains("first answer"))
+                && !shown.iter().any(|line| line.contains("second")),
+            "{shown:?}"
+        );
+
+        // A grandchild inherits through both forks.
+        loop_state.dispatch_slash("/fork").expect("fork");
+        let grandchild = loop_state.session_id;
+        assert_ne!(grandchild, child_id);
+        let shown: Vec<String> = loop_state
+            .ui
+            .transcript()
+            .iter()
+            .map(|entry| format!("{entry:?}"))
+            .collect();
+        assert!(
+            shown.iter().any(|line| line.contains("first answer")),
+            "{shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|line| line.contains("second")),
+            "{shown:?}"
+        );
     }
 
     #[test]

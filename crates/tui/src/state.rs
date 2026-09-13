@@ -136,6 +136,15 @@ pub enum LocalUiEvent {
     /// arguments, or a refused domain mutation. Never a turn/tool failure —
     /// see [`TranscriptEntry::CommandError`].
     AppendCommandError(String),
+    /// What was said before this session forked, projected from the
+    /// session it was forked from (through the fork point, and that
+    /// session's own parent before it). A forked session's ledger starts at
+    /// `session.forked`, so its own events carry none of it; the kernel path
+    /// cannot fold a parent's events (their seqs and session id are the
+    /// parent's), so the parent's *projection* is carried across instead.
+    /// Placed before whatever the transcript already holds, since it is
+    /// older than anything this session recorded.
+    InheritTranscript(Vec<TranscriptEntry>),
 }
 
 /// Typed fold failure. Display never echoes untrusted payload text.
@@ -911,6 +920,14 @@ fn apply_local(mut state: AppState, event: &LocalUiEvent) -> Result<AppState, Ui
                 &mut state,
                 TranscriptEntry::CommandError { text: text.clone() },
             );
+        }
+        LocalUiEvent::InheritTranscript(entries) => {
+            let mut inherited = entries.clone();
+            inherited.append(&mut state.transcript);
+            // The same bound as `push_transcript`, dropping the oldest.
+            let overflow = inherited.len().saturating_sub(MAX_TRANSCRIPT_ENTRIES);
+            inherited.drain(..overflow);
+            state.transcript = inherited;
         }
     }
     Ok(state)
@@ -2239,6 +2256,60 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn an_inherited_transcript_goes_before_the_sessions_own_entries_within_the_bound() {
+        let state = reduce(
+            AppState::new(),
+            &UiEvent::Local(LocalUiEvent::AppendCommandOutput("own".to_owned())),
+        );
+        let state = reduce(
+            state,
+            &UiEvent::Local(LocalUiEvent::InheritTranscript(vec![
+                TranscriptEntry::User {
+                    text: "before the fork".to_owned(),
+                },
+                TranscriptEntry::Assistant {
+                    text: "answered before the fork".to_owned(),
+                },
+            ])),
+        );
+        assert_eq!(
+            state.transcript(),
+            &[
+                TranscriptEntry::User {
+                    text: "before the fork".to_owned()
+                },
+                TranscriptEntry::Assistant {
+                    text: "answered before the fork".to_owned()
+                },
+                TranscriptEntry::CommandOutput {
+                    text: "own".to_owned()
+                },
+            ]
+        );
+        // Bounded like every other transcript write: the oldest go first.
+        let many: Vec<TranscriptEntry> = (0..MAX_TRANSCRIPT_ENTRIES + 5)
+            .map(|i| TranscriptEntry::User {
+                text: format!("inherited {i}"),
+            })
+            .collect();
+        let state = reduce(
+            state,
+            &UiEvent::Local(LocalUiEvent::InheritTranscript(many)),
+        );
+        assert_eq!(state.transcript().len(), MAX_TRANSCRIPT_ENTRIES);
+        assert_eq!(
+            state.transcript().last(),
+            Some(&TranscriptEntry::CommandOutput {
+                text: "own".to_owned()
+            })
+        );
+        assert!(!matches!(
+            state.transcript().first(),
+            Some(TranscriptEntry::User { text }) if text == "inherited 0"
+        ));
     }
 
     #[test]
