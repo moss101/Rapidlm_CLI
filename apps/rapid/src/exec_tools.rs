@@ -1318,6 +1318,11 @@ pub struct WorkspaceTools {
     hooks: crate::hooks::HooksConfig,
     shadow_diagnostics: Option<crate::shadow_diagnostics::ShadowDiagnosticsConfig>,
     ask_stdin: Option<AskSource>,
+    /// The durable approval sink (`approvals.rs`). `Some` only where a human
+    /// is actually reachable through this surface (the interactive TUI, an
+    /// ACP/SDK session); headless exec stays `None`, which keeps `Ask`
+    /// decisions on their fail-closed typed denial.
+    approval_sink: Option<Arc<dyn crate::approvals::ApprovalSink>>,
     mcp: Arc<Mutex<Vec<McpConnection>>>,
     mcp_surface: Arc<Mutex<Vec<(String, String, mcp::transport::McpToolDescriptor)>>>,
     /// Resource ceiling (Modbit `WRK-017`'s concurrency axis) bounding the
@@ -1401,6 +1406,7 @@ impl WorkspaceTools {
             hooks: crate::hooks::HooksConfig::default(),
             shadow_diagnostics: None,
             ask_stdin: None,
+            approval_sink: None,
             mcp: Arc::new(Mutex::new(Vec::new())),
             mcp_surface: Arc::new(Mutex::new(Vec::new())),
             subagent_spawns: Arc::new(AtomicU64::new(0)),
@@ -1630,6 +1636,14 @@ impl WorkspaceTools {
     /// option (composition root reads stdin and enforces the timeout).
     pub fn set_ask_source(&mut self, source: AskSource) {
         self.ask_stdin = Some(source);
+    }
+
+    /// Attach the durable approval sink. When present, an `Ask` decision
+    /// records a pending approval (action, scope, diff — `approvals.rs`) and
+    /// stops the turn for a human decision instead of denying; when absent,
+    /// `Ask` keeps its typed denial.
+    pub fn set_approval_source(&mut self, sink: Arc<dyn crate::approvals::ApprovalSink>) {
+        self.approval_sink = Some(sink);
     }
 
     /// Read-only driver for subagent explore/plan scopes: write-classified
@@ -1983,16 +1997,82 @@ impl WorkspaceTools {
         outcome
     }
 
-    fn execute_call_traced(
+    /// Execute a call the human has already approved — the resume path of a
+    /// pending approval (`approvals.rs`). Every other gate still applies
+    /// (argument bounds, read-only scopes, hooks, redaction, nested-spawn
+    /// caps): only the lattice's `Ask` is bypassed, because the ask was
+    /// answered. Managed-policy bans and write-scope ceilings are re-checked
+    /// here so a remembered grant or a one-shot approval can never widen
+    /// past them.
+    pub fn execute_preapproved(
         &self,
         call: &ValidatedToolCall,
         cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         cancel.check().map_err(|_| ToolStepError::Cancelled)?;
-        // Permission gate: deny and headless-ask are typed model-visible
-        // denials, never silent passes.
+        // Re-checked, not trusted: a one-shot approval resolved after the
+        // project's managed policy changed must still fail closed.
         let decision = self.permission_for(call);
-        if !decision.is_allowed() {
+        if let crate::permissions::Decision::Deny(reason) = decision {
+            return Ok(ToolStepResult::Denied {
+                call_id: call.call_id().to_owned(),
+                detail: Some(bounded_detail(&format!(
+                    "{} denied: {}",
+                    call.tool(),
+                    reason.explanation()
+                ))),
+            });
+        }
+        self.execute_call_traced_flagged(call, cancel, true)
+    }
+
+    fn execute_call_traced(
+        &self,
+        call: &ValidatedToolCall,
+        cancel: &CancellationToken,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        self.execute_call_traced_flagged(call, cancel, false)
+    }
+
+    /// The one executor body. `preapproved` is the resume path of a pending
+    /// approval: the lattice's `Ask` is skipped because the ask was answered,
+    /// while `execute_preapproved`'s own re-check has already re-applied
+    /// every `Deny` class — explicit deny rules, managed-policy bans, write
+    /// scopes, untrusted project — so approval can never widen past them.
+    fn execute_call_traced_flagged(
+        &self,
+        call: &ValidatedToolCall,
+        cancel: &CancellationToken,
+        preapproved: bool,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        cancel.check().map_err(|_| ToolStepError::Cancelled)?;
+        // Permission gate: deny and headless-ask are typed model-visible
+        // denials, never silent passes. `ask_user` is exempt from the Ask
+        // side of the gate — the tool *is* the model talking to the human —
+        // while an explicit deny rule on it is still honored.
+        let ask_is_the_call = call.tool() == ASK_USER_TOOL;
+        let decision = self.permission_for(call);
+        let gate_bypassed = preapproved || (ask_is_the_call && !decision.is_denied());
+        if !decision.is_allowed() && !gate_bypassed {
+            // An `Ask` with a live approval surface becomes a durable pending
+            // approval, not a denial: record the request (action, scope,
+            // diff), then stop the turn for a human decision. Recording is
+            // fail-closed — if the journaling fails, the call stays denied.
+            if matches!(decision, crate::permissions::Decision::Ask(_)) {
+                if let Some(sink) = self.approval_sink.as_ref() {
+                    let request = crate::approvals::build_request(
+                        call.tool(),
+                        call.call_id(),
+                        call.arguments(),
+                        &self.root,
+                    );
+                    if let Ok(_token) = sink.request(&request) {
+                        return Ok(ToolStepResult::ApprovalRequired {
+                            call_id: call.call_id().to_owned(),
+                        });
+                    }
+                }
+            }
             return Ok(ToolStepResult::Denied {
                 call_id: call.call_id().to_owned(),
                 detail: Some(bounded_detail(&format!(
@@ -5743,6 +5823,36 @@ impl ExecTools {
     pub(crate) fn set_job_events(&mut self, events: Arc<dyn JobEvents>) {
         if let Self::Workspace(tools) = self {
             tools.set_job_events(events);
+        }
+    }
+
+    /// Attach the durable approval sink (no-op on the no-op surface — an
+    /// untrusted project refuses every call long before any approval).
+    pub fn set_approval_source(&mut self, sink: Arc<dyn crate::approvals::ApprovalSink>) {
+        if let Self::Workspace(tools) = self {
+            tools.set_approval_source(sink);
+        }
+    }
+
+    /// Attach the interactive answer source for `ask_user` (no-op on the
+    /// no-op surface). The continuation path uses a one-shot source carrying
+    /// the operator's recorded answer.
+    pub fn set_ask_source(&mut self, source: AskSource) {
+        if let Self::Workspace(tools) = self {
+            tools.set_ask_source(source);
+        }
+    }
+
+    /// Execute a call the human has already approved — the pending-approval
+    /// resume path (`approvals.rs`). Refused on the no-op surface.
+    pub fn execute_preapproved(
+        &self,
+        call: &ValidatedToolCall,
+        cancel: &CancellationToken,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        match self {
+            Self::Workspace(tools) => tools.execute_preapproved(call, cancel),
+            Self::Noop(_) => Err(ToolStepError::Invalid),
         }
     }
 

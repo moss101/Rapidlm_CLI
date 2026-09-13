@@ -219,6 +219,42 @@ fn resolve(env: &PermissionsEnv) -> Result<Project, String> {
     })
 }
 
+/// Record one persisted grant programmatically — the "approve and remember"
+/// path of the pending-approval flow (`approvals.rs`). Same store, lock,
+/// bounds and owner-only rules as the `rapid permissions allow` writer; the
+/// only difference is the caller (the session loop, on an explicit
+/// approve-and-remember decision) and the pattern's provenance.
+pub(crate) fn record_persisted_grant(
+    project_root: &Path,
+    user_home: &Path,
+    pattern: &str,
+) -> Result<bool, String> {
+    let parsed =
+        ToolPattern::parse(pattern).ok_or_else(|| format!("invalid grant pattern: {pattern}"))?;
+    let canonical = std::fs::canonicalize(project_root).map_err(|err| {
+        format!(
+            "{} could not be canonicalized: {err}",
+            project_root.display()
+        )
+    })?;
+    let project = Project {
+        canonical_root: canonical.to_string_lossy().into_owned(),
+        display_root: canonical,
+        store_path: user_home.join(PERMISSIONS_STORE_NAME),
+        // Unused by load/save; recorded for construction completeness only.
+        trust: Ok(TrustStatus::Trusted),
+    };
+    let _lock = GrantsLock::acquire(&project.store_path)?;
+    let mut grants = load(&project)?;
+    let changed = grants
+        .allow(&project.canonical_root, parsed)
+        .map_err(|err| format!("the grant store rejected the pattern: {err:?}"))?;
+    if changed {
+        save(&project, &grants, None)?;
+    }
+    Ok(changed)
+}
+
 fn trust_of(root: &Path, home: &Path, cancel: &CancellationToken) -> Result<TrustStatus, String> {
     let identity = ProjectIdentity::new(root, None)
         .map_err(|err| format!("project identity could not be derived: {err}"))?;

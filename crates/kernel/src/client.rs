@@ -11,12 +11,14 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use event_ledger::event::{ActorRef, ErasedEventEnvelope, EventKind};
+use event_ledger::journal::{JournalError, OperationJournal, WaitState};
 use event_ledger::ledger::{AppendOptions, EventLedger, LedgerError};
 use event_ledger::subscription::{EventStream as LedgerEventStream, SubscriptionError};
 use protocol::{
     ApiError, ErrorCode, RedactionClass, SessionId, TraceId, TurnId, UNKNOWN_INTERNAL_MESSAGE,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::CancellationToken;
 use crate::cancel::{CancelOwner, CancelToken, CancellationTree};
@@ -47,6 +49,22 @@ pub trait KernelClient: Send + Sync {
         req: SubscribeEvents,
     ) -> impl Future<Output = Result<EventStream, ApiError>> + Send;
     fn approve(&self, req: ResolveApproval) -> impl Future<Output = Result<(), ApiError>> + Send;
+    fn record_approval(
+        &self,
+        req: RecordApproval,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send;
+    fn pending_approvals(
+        &self,
+        session_id: SessionId,
+    ) -> impl Future<Output = Result<Vec<PendingApproval>, ApiError>> + Send;
+    /// The suspended-turn detail recorded for a pending approval — the
+    /// opaque payload the requesting surface wrote alongside its
+    /// `approval.requested`, which its resume path replays.
+    fn approval_detail(
+        &self,
+        session_id: SessionId,
+        token: &str,
+    ) -> impl Future<Output = Result<Option<String>, ApiError>> + Send;
     fn fork_session(
         &self,
         req: ForkSession,
@@ -61,6 +79,7 @@ pub trait KernelClient: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct InProcessKernelClient {
     ledger: EventLedger,
+    journal: OperationJournal,
     sessions: SessionService,
     turns: TurnSubmissionGuard,
     runtime: Arc<Runtime>,
@@ -126,6 +145,10 @@ pub struct Interrupt {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum InterruptReason {
     ClientRequested,
+    /// The turn paused itself: a tool call needs human approval before it may
+    /// run. Not an error — the turn's effects so far are durable, its lease is
+    /// released while it waits, and resolution (`ResolveApproval`) resumes it.
+    ApprovalPending,
 }
 
 /// Resume an event subscription after `from_seq` (first event is `from_seq + 1`).
@@ -135,7 +158,9 @@ pub struct SubscribeEvents {
     from_seq: u64,
 }
 
-/// Resolve a pending approval. Appends `approval.resolved` at `expected_seq`.
+/// Resolve a pending approval. Appends `approval.resolved` at `expected_seq`,
+/// and — when the request names one — marks the matching durable wait record
+/// terminal so a duplicate resolution fails closed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolveApproval {
     session_id: SessionId,
@@ -143,6 +168,14 @@ pub struct ResolveApproval {
     decision: ApprovalDecision,
     actor: ActorRef,
     trace_id: TraceId,
+    /// The wait token the pending `approval.requested` carried. Empty for a
+    /// resolution recorded without a matching wait row.
+    wait_token: String,
+    /// Approve-and-remember: the approver wants the grant persisted beyond
+    /// this one call. The kernel records the intent on `approval.resolved`;
+    /// translating it into a scoped persisted grant is the surface's job
+    /// (the grant store is project-level and user-owned).
+    remember: bool,
 }
 
 /// Decision recorded on `approval.resolved`.
@@ -150,6 +183,22 @@ pub struct ResolveApproval {
 pub enum ApprovalDecision {
     Approved,
     Denied,
+}
+
+/// The manual `Serialize` above writes the decision as its `as_str` wire form
+/// ("approved"/"denied"); this is the exact inverse. The derived forms would
+/// disagree with it and every read-back of an `approval.resolved` would fail.
+impl<'de> Deserialize<'de> for ApprovalDecision {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        match text.as_str() {
+            "approved" => Ok(Self::Approved),
+            "denied" => Ok(Self::Denied),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown approval decision: {other}"
+            ))),
+        }
+    }
 }
 
 /// Read the committed projection through `to_seq` without mutating the stream.
@@ -242,9 +291,20 @@ struct TurnFailedPayload {
 /// terminal ledger event and release the turn's lease.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TurnOutcome {
-    Completed { text: Option<String> },
-    Failed { reason: String },
+    Completed {
+        text: Option<String>,
+    },
+    Failed {
+        reason: String,
+    },
     Interrupted,
+    /// The turn paused on pending human input (a tool approval or a
+    /// clarification). Releases the turn's lease exactly like every other
+    /// terminal outcome — a waiting turn must never hold the session's
+    /// execution slot — and records `turn.interrupted` with the
+    /// [`InterruptReason::ApprovalPending`] reason so transcripts and
+    /// projections can show the pause as a wait, not a failure.
+    Waiting,
 }
 
 /// Report how a turn finished. A no-op if this turn's lease was already
@@ -276,11 +336,6 @@ impl FinishTurn {
             outcome,
         }
     }
-}
-
-#[derive(Serialize)]
-struct ApprovalResolvedPayload {
-    decision: ApprovalDecision,
 }
 
 impl SubmitTurn {
@@ -371,6 +426,7 @@ impl InterruptReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ClientRequested => "client_requested",
+            Self::ApprovalPending => "approval_pending",
         }
     }
 }
@@ -406,7 +462,24 @@ impl ResolveApproval {
             decision,
             actor,
             trace_id,
+            wait_token: String::new(),
+            remember: false,
         }
+    }
+
+    /// Name the wait token of the pending `approval.requested` this resolves,
+    /// so the durable wait record is marked terminal (duplicate resolutions
+    /// of the same token then fail closed).
+    pub fn with_wait_token(mut self, wait_token: impl Into<String>) -> Self {
+        self.wait_token = bounded_payload_str(&wait_token.into(), MAX_APPROVAL_TOKEN_BYTES);
+        self
+    }
+
+    /// Approve-and-remember: record that the approver wants a persisted,
+    /// scoped grant for this tool/scope beyond the one call.
+    pub const fn remembering(mut self) -> Self {
+        self.remember = true;
+        self
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -427,6 +500,206 @@ impl ResolveApproval {
 
     pub fn trace_id(&self) -> TraceId {
         self.trace_id
+    }
+
+    pub fn wait_token(&self) -> &str {
+        &self.wait_token
+    }
+
+    pub const fn remember(&self) -> bool {
+        self.remember
+    }
+}
+
+/// Byte cap on a wait token. Tokens are minted by the requesting surface
+/// (`approval-<ulid>`-shaped); the cap rejects runaway inputs at the boundary
+/// without being a security boundary itself.
+pub const MAX_APPROVAL_TOKEN_BYTES: usize = 128;
+
+/// Byte caps for the call/tool identity fields of an `approval.requested` —
+/// kernel-local bounds (kernel does not depend on agent-runtime, whose own
+/// constants bound the same fields at their source).
+const MAX_APPROVAL_CALL_ID_BYTES: usize = 128;
+const MAX_APPROVAL_TOOL_BYTES: usize = 128;
+
+/// Byte caps for the human-facing fields of an `approval.requested`. The diff
+/// preview and the suspension detail dominate; the detail cap matches
+/// `agent_runtime::MAX_SUSPENSION_HISTORY_BYTES` plus JSON overhead.
+pub const MAX_APPROVAL_SUMMARY_BYTES: usize = 512;
+pub const MAX_APPROVAL_SCOPE_BYTES: usize = 512;
+pub const MAX_APPROVAL_SCOPE_ENTRIES: usize = 16;
+pub const MAX_APPROVAL_DIFF_BYTES: usize = 16 * 1024;
+pub const MAX_APPROVAL_DETAIL_BYTES: usize = 384 * 1024;
+
+fn bounded_payload_str(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_owned();
+    }
+    let mut end = cap;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+/// Record a pending approval: append `approval.requested` with everything a
+/// surface needs to present the call (action summary, scope, bounded diff)
+/// plus the suspended-turn detail the resume path replays, and create the
+/// durable wait row. The turn that requested it is already finishing —
+/// recording a pending approval never holds the execution lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordApproval {
+    session_id: SessionId,
+    expected_seq: u64,
+    actor: ActorRef,
+    trace_id: TraceId,
+    token: String,
+    call_id: String,
+    tool: String,
+    summary: String,
+    scope: Vec<String>,
+    diff: String,
+    detail: String,
+}
+
+impl RecordApproval {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_id: SessionId,
+        expected_seq: u64,
+        actor: ActorRef,
+        trace_id: TraceId,
+        token: impl Into<String>,
+        call_id: impl Into<String>,
+        tool: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id,
+            expected_seq,
+            actor,
+            trace_id,
+            token: bounded_payload_str(&token.into(), MAX_APPROVAL_TOKEN_BYTES),
+            call_id: bounded_payload_str(&call_id.into(), MAX_APPROVAL_CALL_ID_BYTES),
+            tool: bounded_payload_str(&tool.into(), MAX_APPROVAL_TOOL_BYTES),
+            summary: bounded_payload_str(&summary.into(), MAX_APPROVAL_SUMMARY_BYTES),
+            scope: Vec::new(),
+            diff: String::new(),
+            detail: String::new(),
+        }
+    }
+
+    pub fn with_scope(mut self, scope: Vec<String>) -> Self {
+        self.scope = scope
+            .into_iter()
+            .take(MAX_APPROVAL_SCOPE_ENTRIES)
+            .map(|entry| bounded_payload_str(&entry, MAX_APPROVAL_SCOPE_BYTES))
+            .collect();
+        self
+    }
+
+    pub fn with_diff(mut self, diff: impl Into<String>) -> Self {
+        self.diff = bounded_payload_str(&diff.into(), MAX_APPROVAL_DIFF_BYTES);
+        self
+    }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = bounded_payload_str(&detail.into(), MAX_APPROVAL_DETAIL_BYTES);
+        self
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn expected_seq(&self) -> u64 {
+        self.expected_seq
+    }
+
+    pub fn actor(&self) -> &ActorRef {
+        &self.actor
+    }
+
+    pub fn trace_id(&self) -> TraceId {
+        self.trace_id
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub fn scope(&self) -> &[String] {
+        &self.scope
+    }
+
+    pub fn diff(&self) -> &str {
+        &self.diff
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+/// Wire payload of `approval.requested`. `Serialize` for the append,
+/// `Deserialize` for the pending-approval reader and a restarted process
+/// reconstructing what it must still ask a human about.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalRequestedPayload {
+    pub token: String,
+    pub call_id: String,
+    pub tool: String,
+    pub summary: String,
+    #[serde(default)]
+    pub scope: Vec<String>,
+    #[serde(default)]
+    pub diff: String,
+    /// Opaque-to-the-kernel suspended-turn detail: the requesting surface's
+    /// own serialized resume state.
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// Wire payload of `approval.resolved`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalResolvedPayload {
+    pub decision: ApprovalDecision,
+    #[serde(default)]
+    pub wait_token: String,
+    #[serde(default)]
+    pub remember: bool,
+}
+
+/// One unresolved `approval.requested`, read back from the ledger.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingApproval {
+    seq: u64,
+    payload: ApprovalRequestedPayload,
+}
+
+impl PendingApproval {
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    pub fn payload(&self) -> &ApprovalRequestedPayload {
+        &self.payload
+    }
+
+    pub fn token(&self) -> &str {
+        &self.payload.token
     }
 }
 
@@ -487,8 +760,10 @@ impl InProcessKernelClient {
     pub fn from_ledger(ledger: EventLedger) -> Self {
         let sessions = SessionService::new(ledger.clone());
         let turns = TurnSubmissionGuard::new(sessions.clone());
+        let journal = OperationJournal::new(ledger.clone());
         Self {
             ledger,
+            journal,
             sessions,
             turns,
             runtime: Arc::new(Runtime {
@@ -710,7 +985,7 @@ impl InProcessKernelClient {
                         &ledger_live(),
                     )
                     .map(|_| ()),
-                TurnOutcome::Interrupted => self
+                TurnOutcome::Interrupted | TurnOutcome::Waiting { .. } => self
                     .ledger
                     .append(
                         req.session_id,
@@ -718,7 +993,10 @@ impl InProcessKernelClient {
                         EventKind::TurnInterrupted,
                         TurnInterruptedPayload {
                             turn_id: req.turn_id,
-                            reason: InterruptReason::ClientRequested,
+                            reason: match &req.outcome {
+                                TurnOutcome::Waiting { .. } => InterruptReason::ApprovalPending,
+                                _ => InterruptReason::ClientRequested,
+                            },
                         },
                         &options,
                         &ledger_live(),
@@ -888,12 +1166,154 @@ impl InProcessKernelClient {
                 EventKind::ApprovalResolved,
                 ApprovalResolvedPayload {
                     decision: req.decision,
+                    wait_token: req.wait_token.clone(),
+                    remember: req.remember,
                 },
                 &options,
                 &ledger_live(),
             )
             .map_err(|err| ledger_api(err, trace))?;
+        // Mark the durable wait row terminal. A resolution that names no
+        // token (recorded before the wait machinery, or from a surface that
+        // tracks its own pending set) skips this; a duplicate resolution of
+        // an already-terminal wait fails closed so one approval cannot be
+        // spent twice.
+        if !req.wait_token.is_empty() {
+            let state = match req.decision {
+                ApprovalDecision::Approved => WaitState::Approved,
+                ApprovalDecision::Denied => WaitState::Denied,
+            };
+            self.journal
+                .resolve_wait(req.session_id, &req.wait_token, state, &journal_live())
+                .map_err(|err| match err {
+                    JournalError::WaitNotFound { .. } => api_error(
+                        ErrorCode::SessionNotFound,
+                        "no pending approval waits under that token",
+                        trace,
+                    ),
+                    JournalError::Conflict => api_error(
+                        ErrorCode::SessionConflict,
+                        "approval already resolved",
+                        trace,
+                    ),
+                    other => journal_api(other, trace),
+                })?;
+        }
         Ok(())
+    }
+
+    fn record_approval_sync(&self, req: RecordApproval) -> Result<(), ApiError> {
+        let trace = req.trace_id;
+        self.sessions
+            .get_session(req.session_id, &live())
+            .map_err(|err| session_api(err, trace))?;
+        // The wait row exists before the event: a duplicate token fails
+        // closed here rather than after an event was already published.
+        self.journal
+            .request_wait(req.session_id, req.token.clone(), &journal_live())
+            .map_err(|err| journal_api(err, trace))?;
+        let options = AppendOptions {
+            redaction: RedactionClass::Project,
+            trace_id: req.trace_id,
+            expected_seq: Some(req.expected_seq),
+        };
+        let payload = ApprovalRequestedPayload {
+            token: req.token.clone(),
+            call_id: req.call_id.clone(),
+            tool: req.tool.clone(),
+            summary: req.summary.clone(),
+            scope: req.scope.clone(),
+            diff: req.diff.clone(),
+            detail: req.detail.clone(),
+        };
+        if let Err(err) = self.ledger.append(
+            req.session_id,
+            req.actor,
+            EventKind::ApprovalRequested,
+            payload,
+            &options,
+            &ledger_live(),
+        ) {
+            // The event did not land; release the wait row so a retry of the
+            // same token is not blocked by a half-recorded request.
+            let _ = self.journal.resolve_wait(
+                req.session_id,
+                &req.token,
+                WaitState::Expired,
+                &journal_live(),
+            );
+            return Err(ledger_api(err, trace));
+        }
+        Ok(())
+    }
+
+    /// The newest suspension detail recorded for `token`'s pending approval.
+    /// Progress events for the same call can be appended more than once (a
+    /// resumed turn that suspends again on the same call); newest wins.
+    fn approval_detail_sync(
+        &self,
+        session_id: SessionId,
+        token: &str,
+    ) -> Result<Option<String>, ApiError> {
+        let trace = TraceId::new();
+        let last = self
+            .ledger
+            .last_seq(session_id, &ledger_live())
+            .map_err(|err| ledger_api(err, trace))?;
+        let mut detail = None;
+        for seq in 1..=last {
+            let event = self
+                .ledger
+                .get(session_id, seq, &ledger_live())
+                .map_err(|err| ledger_api(err, trace))?;
+            if event.kind() == EventKind::ToolApprovalRequired {
+                let payload = event.payload();
+                let event_token = payload.get("approval_token").and_then(Value::as_str);
+                if event_token == Some(token) {
+                    detail = payload
+                        .get("suspension")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+            }
+        }
+        Ok(detail)
+    }
+
+    /// Every `approval.requested` still awaiting resolution, in ledger order.
+    /// Resolution is paired by wait token, so an approval resolved under a
+    /// different token leaves its request listed — the same rule the wait
+    /// table enforces.
+    fn pending_approvals_sync(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<PendingApproval>, ApiError> {
+        let trace = TraceId::new();
+        let last = self
+            .ledger
+            .last_seq(session_id, &ledger_live())
+            .map_err(|err| ledger_api(err, trace))?;
+        let mut pending: Vec<PendingApproval> = Vec::new();
+        for seq in 1..=last {
+            let event = self
+                .ledger
+                .get(session_id, seq, &ledger_live())
+                .map_err(|err| ledger_api(err, trace))?;
+            if event.kind() == EventKind::ApprovalRequested {
+                if let Ok(payload) =
+                    serde_json::from_value::<ApprovalRequestedPayload>(event.payload().clone())
+                {
+                    pending.push(PendingApproval { seq, payload });
+                }
+            } else if event.kind() == EventKind::ApprovalResolved {
+                if let Ok(resolved) =
+                    serde_json::from_value::<ApprovalResolvedPayload>(event.payload().clone())
+                {
+                    pending.retain(|request| request.payload.token != resolved.wait_token);
+                }
+            }
+        }
+        Ok(pending)
     }
 
     fn fork_session_sync(&self, req: ForkSession) -> Result<SessionSnapshot, ApiError> {
@@ -1026,6 +1446,25 @@ impl KernelClient for InProcessKernelClient {
         self.approve_sync(req)
     }
 
+    async fn record_approval(&self, req: RecordApproval) -> Result<(), ApiError> {
+        self.record_approval_sync(req)
+    }
+
+    async fn pending_approvals(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<PendingApproval>, ApiError> {
+        self.pending_approvals_sync(session_id)
+    }
+
+    async fn approval_detail(
+        &self,
+        session_id: SessionId,
+        token: &str,
+    ) -> Result<Option<String>, ApiError> {
+        self.approval_detail_sync(session_id, token)
+    }
+
     async fn fork_session(&self, req: ForkSession) -> Result<SessionSnapshot, ApiError> {
         self.fork_session_sync(req)
     }
@@ -1123,6 +1562,29 @@ fn live() -> CancellationToken {
 
 fn ledger_live() -> event_ledger::ledger::CancellationToken {
     event_ledger::ledger::CancellationToken::new()
+}
+
+fn journal_live() -> event_ledger::journal::CancellationToken {
+    event_ledger::journal::CancellationToken::new()
+}
+
+/// Map a journal (operation/wait table) failure onto the client API error set.
+fn journal_api(err: JournalError, trace: TraceId) -> ApiError {
+    match err {
+        JournalError::Cancelled => api_error(
+            ErrorCode::InternalUnexpected,
+            UNKNOWN_INTERNAL_MESSAGE,
+            trace,
+        ),
+        JournalError::NotFound { .. } => {
+            api_error(ErrorCode::SessionNotFound, "Session not found", trace)
+        }
+        _ => api_error(
+            ErrorCode::InternalUnexpected,
+            UNKNOWN_INTERNAL_MESSAGE,
+            trace,
+        ),
+    }
 }
 
 fn lock_sessions(

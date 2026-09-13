@@ -26,8 +26,9 @@ use crate::context_recovery::{
 use crate::role_profile::RoleToolSurface;
 use crate::turn::{FailureCause, TurnFailureDetail};
 use crate::turn::{
-    MAX_MODEL_STEPS, ModelDriver, ToolDriver, TurnBudget, TurnError, TurnEventSink, TurnResult,
-    TurnSpec, TurnStatus, TurnStopReason, run_turn,
+    MAX_MODEL_STEPS, ModelDriver, ToolDriver, ToolStepExchange, TurnBudget, TurnError,
+    TurnEventSink, TurnResult, TurnSpec, TurnStatus, TurnStopReason, TurnSuspension,
+    run_turn_seeded,
 };
 
 /// Maximum accepted callable tools on one execution (mirrors turn ceiling).
@@ -210,6 +211,7 @@ pub trait AgentExecutor {
                 failure_detail: None,
                 stop_reason: None,
                 tool_calls: 0,
+                suspension: None,
             })
     }
 }
@@ -256,6 +258,9 @@ pub struct AgentOutcome {
     pub failure_detail: Option<TurnFailureDetail>,
     pub stop_reason: Option<TurnStopReason>,
     pub tool_calls: u32,
+    /// Pending human input when the turn suspended on an approval or a
+    /// clarification — everything a host needs to resume the exact turn.
+    pub suspension: Option<TurnSuspension>,
 }
 
 /// Default executor: runs a turn and assembles a canonical `AgentResult`.
@@ -306,11 +311,32 @@ impl TurnAgentExecutor {
         T: ToolDriver,
         E: TurnEventSink,
     {
+        Self::run_once_seeded(request, model, tools, events, Vec::new(), cancel)
+    }
+
+    /// [`Self::run_once`] continued from prior completed exchanges — the
+    /// resume path for a turn that suspended on an approval or a
+    /// clarification. `seed_history` is the suspension's recorded history
+    /// with the pending call's placeholder result already replaced by its
+    /// post-resolution outcome.
+    fn run_once_seeded<M, T, E>(
+        request: &AgentExecutionRequest,
+        model: &mut M,
+        tools: &mut T,
+        events: &mut E,
+        seed_history: Vec<ToolStepExchange>,
+        cancel: &CancellationToken,
+    ) -> Result<(TurnResult, AgentResult), AgentExecutionError>
+    where
+        M: ModelDriver,
+        T: ToolDriver,
+        E: TurnEventSink,
+    {
         if cancel.is_cancelled() {
             return Err(AgentExecutionError::Cancelled);
         }
         let spec = request.spec();
-        let turn = run_turn(
+        let turn = run_turn_seeded(
             TurnSpec::new(
                 TurnId::new(),
                 request.session_id(),
@@ -320,6 +346,7 @@ impl TurnAgentExecutor {
                 tools,
                 events,
             ),
+            seed_history,
             cancel,
         )
         .map_err(|err| match err {
@@ -415,10 +442,48 @@ impl AgentExecutor for TurnAgentExecutor {
         T: ToolDriver,
         E: TurnEventSink,
     {
+        self.recovering_with_seed(
+            request,
+            controller,
+            policy,
+            model,
+            tools,
+            events,
+            cancel,
+            Vec::new(),
+        )
+    }
+}
+
+impl TurnAgentExecutor {
+    /// [`AgentExecutor::execute_with_context_recovery`] continued from prior
+    /// completed exchanges — the resume path for a turn that suspended on an
+    /// approval or a clarification. `seed_history` is the suspension's own
+    /// recorded history with the pending call's placeholder already replaced
+    /// by its post-resolution outcome.
+    #[allow(clippy::too_many_arguments)]
+    pub fn recovering_with_seed<C, M, T, E>(
+        &mut self,
+        request: &AgentExecutionRequest,
+        controller: &mut C,
+        policy: ContextRetryPolicy,
+        model: &mut M,
+        tools: &mut T,
+        events: &mut E,
+        cancel: &CancellationToken,
+        seed_history: Vec<ToolStepExchange>,
+    ) -> Result<AgentOutcome, AgentExecutionError>
+    where
+        C: ContextController,
+        M: ModelDriver,
+        T: ToolDriver,
+        E: TurnEventSink,
+    {
         let mut lineage = request.context_lineage().to_vec();
         let mut attempt: u32 = 0;
         loop {
-            let (turn, result) = Self::run_once(request, model, tools, events, cancel)?;
+            let (turn, result) =
+                Self::run_once_seeded(request, model, tools, events, seed_history.clone(), cancel)?;
             let cause = turn.failure_cause();
             let overflow = turn.status() == TurnStatus::Failed
                 && turn.reason() == Some(TurnStopReason::ContextBoundExceeded);
@@ -433,6 +498,7 @@ impl AgentExecutor for TurnAgentExecutor {
                         failure_detail: turn.failure_detail().cloned(),
                         stop_reason: turn.reason(),
                         tool_calls: turn.usage().tool_calls(),
+                        suspension: turn.suspension().cloned(),
                     })
                     .map_err(|_| AgentExecutionError::AgentResult);
             }

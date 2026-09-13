@@ -13,9 +13,9 @@
     "max_cost": null
   },
   "usage": {
-    "turns": 0,
-    "tokens": 0,
-    "active_ms": 0,
+    "turns": 40,
+    "tokens": 168,
+    "active_ms": 40,
     "cost": 0
   },
   "evidence_requirements": []

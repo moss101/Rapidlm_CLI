@@ -9,6 +9,7 @@ use std::error::Error;
 use std::fmt;
 
 use protocol::{AgentId, ArtifactId, ErrorCode, SessionId, TurnId};
+use serde::{Deserialize, Serialize};
 
 use crate::agent::model::CancellationToken;
 use crate::loop_guard::ToolCallLoopDetector;
@@ -85,7 +86,7 @@ pub enum TurnEventKind {
 /// conflated: promoting ordinary window overflow to "ask the user" would be
 /// wrong exactly as often as compaction would be wrong for a genuine
 /// information gap.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum TurnStopReason {
     Cancelled,
@@ -97,6 +98,115 @@ pub enum TurnStopReason {
     EmptyResponse,
     ContextBoundExceeded,
     ContextRequired,
+}
+
+/// Why a turn suspended awaiting a human, rather than failing.
+///
+/// A [`TurnStopReason::ApprovalRequired`] or [`TurnStopReason::ContextRequired`]
+/// stop is not a malfunction: the turn is *paused* until an operator resolves
+/// the pending tool approval or answers the model's question. The host owns
+/// that wait (durable, across restarts) and resumes the exact turn afterward,
+/// so the stop must carry everything the resume needs: the completed tool
+/// exchanges so far — including the batch holding the pending call's
+/// placeholder result — and which call is pending. Side effects already
+/// committed before the suspension are inside `history` and are never
+/// re-executed; the pending call itself has not run and is executed exactly
+/// once, on resume.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct TurnSuspension {
+    reason: TurnStopReason,
+    call_id: String,
+    /// Completed exchanges of this turn in order, ending with the batch that
+    /// holds the pending call's `ApprovalRequired`/`ContextRequired` result.
+    /// Callers synthesize a `Failed` placeholder for any batch call that
+    /// errored at the step layer, so providers always see one result per
+    /// proposed `call_id`.
+    history: Vec<ToolStepExchange>,
+    /// Exchanges dropped from the front of `history` by the byte bound —
+    /// model-visible as "earlier steps omitted", never silently lost.
+    omitted_earlier_steps: u32,
+}
+
+/// Byte budget for a suspension's serialized history. Tool results are each
+/// bounded far below this (`MAX_RESULT_DETAIL_BYTES`); the bound exists so a
+/// pathological turn cannot balloon the durable payload a host stores per
+/// suspension, not because real turns approach it.
+pub const MAX_SUSPENSION_HISTORY_BYTES: usize = 256 * 1024;
+
+impl TurnSuspension {
+    /// Build a suspension from the loop's state at the stop. `batch_calls` /
+    /// `batch_results` are this step's proposed calls and their per-call
+    /// outcomes in proposal order; an `Err` outcome becomes a synthesized
+    /// `Failed` placeholder so the recorded exchange stays one-result-per-call.
+    /// Public because the approval flow's tests exercise the exact construction
+    /// the loop performs.
+    pub fn new(
+        reason: TurnStopReason,
+        call_id: String,
+        prior_history: &[ToolStepExchange],
+        batch_calls: &[ProposedToolCall],
+        batch_results: &[Result<ToolStepResult, ToolStepError>],
+    ) -> Self {
+        let batch: Vec<ToolStepResult> = batch_results
+            .iter()
+            .map(|outcome| {
+                outcome
+                    .clone()
+                    .unwrap_or_else(|err| ToolStepResult::Failed {
+                        call_id: String::new(),
+                        handled: false,
+                        detail: Some(err.as_str().to_owned()),
+                    })
+            })
+            .collect();
+        let mut history = prior_history.to_vec();
+        history.push(ToolStepExchange::new(batch_calls.to_vec(), batch));
+        // Enforce the byte bound by dropping whole exchanges from the front —
+        // never a partial exchange, which would desync calls from results.
+        let mut omitted = 0u32;
+        while Self::history_bytes(&history) > MAX_SUSPENSION_HISTORY_BYTES && history.len() > 1 {
+            history.remove(0);
+            omitted += 1;
+        }
+        Self {
+            reason,
+            call_id,
+            history,
+            omitted_earlier_steps: omitted,
+        }
+    }
+
+    fn history_bytes(history: &[ToolStepExchange]) -> usize {
+        history
+            .iter()
+            .map(|exchange| {
+                let mut bytes = 0usize;
+                for call in exchange.calls() {
+                    bytes += call.call_id.len() + call.tool().len() + call.arguments().len();
+                }
+                for result in exchange.results() {
+                    bytes += result.serialized_size();
+                }
+                bytes
+            })
+            .sum()
+    }
+
+    pub const fn reason(&self) -> TurnStopReason {
+        self.reason
+    }
+
+    pub fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
+    pub fn history(&self) -> &[ToolStepExchange] {
+        &self.history
+    }
+
+    pub const fn omitted_earlier_steps(&self) -> u32 {
+        self.omitted_earlier_steps
+    }
 }
 
 /// Bounded detail attached to a stop that needs one: [`TurnStopReason::
@@ -247,7 +357,7 @@ pub struct TurnUsage {
 }
 
 /// Model-proposed tool call. Structural bounds are enforced before dispatch.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct ProposedToolCall {
     call_id: String,
     tool: String,
@@ -268,7 +378,7 @@ pub struct ValidatedToolCall {
 /// results, kept as an ordered pair. The full sequence of exchanges within a
 /// turn is the model's working memory — each request carries every prior
 /// exchange (bounded by the request layer), not just the latest one.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct ToolStepExchange {
     calls: Vec<ProposedToolCall>,
     results: Vec<ToolStepResult>,
@@ -389,7 +499,7 @@ pub enum ModelStepOutput {
 /// (e.g. `ask_user`'s own `question` argument, already capped by its parser)
 /// — carried here, not reconstructed from prose downstream, so the specific
 /// question a user sees is the model's own, not a generic substitute.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum ToolStepResult {
     Succeeded {
         call_id: String,
@@ -411,6 +521,29 @@ pub enum ToolStepResult {
         call_id: String,
         question: String,
     },
+}
+
+impl ToolStepResult {
+    /// Bounded size estimate for suspension budgeting: the fields a recorded
+    /// exchange persists, not a full JSON serialization.
+    pub fn serialized_size(&self) -> usize {
+        match self {
+            Self::Succeeded { call_id, summary } => call_id.len() + summary.len(),
+            Self::Failed {
+                call_id,
+                detail: Some(detail),
+                ..
+            } => call_id.len() + detail.len(),
+            Self::Failed { call_id, .. } => call_id.len(),
+            Self::Denied {
+                call_id,
+                detail: Some(detail),
+            } => call_id.len() + detail.len(),
+            Self::Denied { call_id, .. } => call_id.len(),
+            Self::ApprovalRequired { call_id } => call_id.len(),
+            Self::ContextRequired { call_id, question } => call_id.len() + question.len(),
+        }
+    }
 }
 
 /// One kernel-shaped lifecycle event emitted by the loop.
@@ -558,6 +691,11 @@ pub struct TurnResult {
     failure_cause: Option<FailureCause>,
     /// Failing-tool detail when the turn stopped on [`TurnStopReason::ToolFailed`].
     failure_detail: Option<TurnFailureDetail>,
+    /// Pending human input when the turn stopped on
+    /// [`TurnStopReason::ApprovalRequired`] / [`TurnStopReason::ContextRequired`]:
+    /// everything a host needs to resume the exact turn without repeating
+    /// committed side effects. `None` for every other stop.
+    suspension: Option<TurnSuspension>,
 }
 
 /// Collaborators and identity for one [`run_turn`].
@@ -695,6 +833,9 @@ struct LoopState {
     /// leftover-state stops with no call at hand — can name it.
     failure_detail: Option<TurnFailureDetail>,
     loop_detector: ToolCallLoopDetector,
+    /// Set once by the batch dispatcher when the turn suspends on an approval
+    /// or a clarification; `fail`/`interrupt` copy it into the `TurnResult`.
+    suspension: Option<TurnSuspension>,
 }
 
 enum StepDecision {
@@ -878,6 +1019,24 @@ impl ProposedToolCall {
         Ok(call)
     }
 
+    /// Reconstruct a call that already passed [`Self::new`] once — the resume
+    /// path replaying a recorded suspension's history. Deliberately
+    /// non-validating: the bounds were enforced when the call was first
+    /// accepted, and re-validating a replay could reject what a prior turn
+    /// lawfully ran (bounds may tighten between processes). Never feed this
+    /// fresh model input; that path must go through `new`.
+    pub fn replay(
+        call_id: impl Into<String>,
+        tool: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            tool: tool.into(),
+            arguments: arguments.into(),
+        }
+    }
+
     pub fn call_id(&self) -> &str {
         &self.call_id
     }
@@ -1014,6 +1173,12 @@ impl TurnResult {
     pub fn failure_detail(&self) -> Option<&TurnFailureDetail> {
         self.failure_detail.as_ref()
     }
+
+    /// Pending human input when the turn suspended on an approval or a
+    /// clarification; `None` for every other stop.
+    pub fn suspension(&self) -> Option<&TurnSuspension> {
+        self.suspension.as_ref()
+    }
 }
 
 impl<'a, M, T, E> TurnSpec<'a, M, T, E> {
@@ -1077,6 +1242,25 @@ where
     T: ToolDriver,
     E: TurnEventSink,
 {
+    run_turn_seeded(spec, Vec::new(), cancel)
+}
+
+/// [`run_turn`] continued from prior completed exchanges: the resume path for
+/// a turn that suspended on an approval or a clarification. `seed_history` is
+/// the suspension's own recorded history — including the exchange holding the
+/// pending call's placeholder result, which the host replaces with the real
+/// post-resolution outcome before calling this — so the model's working
+/// memory is exactly what it was when the turn paused.
+pub fn run_turn_seeded<M, T, E>(
+    spec: TurnSpec<'_, M, T, E>,
+    seed_history: Vec<ToolStepExchange>,
+    cancel: &CancellationToken,
+) -> Result<TurnResult, TurnError>
+where
+    M: ModelDriver,
+    T: ToolDriver,
+    E: TurnEventSink,
+{
     check_cancel(cancel)?;
     let mut state = LoopState {
         turn_id: spec.turn_id,
@@ -1085,6 +1269,7 @@ where
         unhandled_tool_failure: false,
         failure_detail: None,
         loop_detector: ToolCallLoopDetector::new(),
+        suspension: None,
     };
     let TurnSpec {
         model,
@@ -1100,7 +1285,7 @@ where
         },
     )?;
 
-    let mut history: Vec<ToolStepExchange> = Vec::new();
+    let mut history = seed_history;
     loop {
         // Absorb completed background-job notifications so the model learns
         // their outcome without polling.
@@ -1332,7 +1517,7 @@ where
                 )?));
             }
             let proposed = calls.clone();
-            match run_tool_steps(state, tools, events, calls, cancel)? {
+            match run_tool_steps(state, tools, events, calls, history, cancel)? {
                 ToolBatchOutcome::Stopped(stop) => Ok(StepDecision::Stop(stop)),
                 ToolBatchOutcome::Completed(results) => Ok(StepDecision::Continue(
                     ToolStepExchange::new(proposed, results),
@@ -1369,6 +1554,7 @@ fn run_tool_steps<T, E>(
     tools: &mut T,
     events: &mut E,
     calls: Vec<ProposedToolCall>,
+    history: &[ToolStepExchange],
     cancel: &CancellationToken,
 ) -> Result<ToolBatchOutcome, TurnError>
 where
@@ -1472,7 +1658,7 @@ where
     // any) so an accepted prefix still runs, as the per-call loop did.
     let mut results = Vec::new();
     if !prepared.is_empty() {
-        match dispatch_prepared(state, tools, events, prepared, cancel)? {
+        match dispatch_prepared(state, tools, events, prepared, history, cancel)? {
             ToolBatchOutcome::Stopped(stop) => return Ok(ToolBatchOutcome::Stopped(stop)),
             ToolBatchOutcome::Completed(completed) => results = completed,
         }
@@ -1499,12 +1685,16 @@ where
 
 /// Phase 2: mark the batch started and dispatch it to the driver at once
 /// (independent calls may run concurrently inside the driver). Phase 3
-/// accounts per-call outcomes in proposal order.
+/// accounts per-call outcomes in proposal order. `history` — every completed
+/// exchange before this batch — is recorded into a [`TurnSuspension`] when the
+/// batch suspends the turn on an approval or a clarification, so the host can
+/// resume the exact turn later.
 fn dispatch_prepared<T, E>(
     state: &mut LoopState,
     tools: &mut T,
     events: &mut E,
     prepared: Vec<(ProposedToolCall, ValidatedToolCall)>,
+    history: &[ToolStepExchange],
     cancel: &CancellationToken,
 ) -> Result<ToolBatchOutcome, TurnError>
 where
@@ -1539,8 +1729,13 @@ where
     // after it. The stop reason reported is still the FIRST bad outcome
     // encountered, by original index, matching prior behavior.
     let mut results = Vec::new();
+    // One entry per proposal, in proposal order: the recorded `results` skip
+    // step-level errors, so the suspension builder keeps its own full-length
+    // copy (errors included) to synthesize placeholders from.
+    let mut batch: Vec<Result<ToolStepResult, ToolStepError>> = Vec::new();
     let mut stop_outcome: Option<ToolBatchOutcome> = None;
     for ((call, _), outcome) in prepared.iter().zip(outcomes) {
+        batch.push(outcome.clone());
         let result = match outcome {
             Ok(result) => result,
             Err(ToolStepError::Cancelled) => {
@@ -1572,6 +1767,19 @@ where
 
         if matches!(result, ToolStepResult::ApprovalRequired { .. }) {
             if stop_outcome.is_none() {
+                // Record the suspension BEFORE failing: the stop must carry
+                // every already-committed result of this batch (the pending
+                // call's placeholder included) so a resume never repeats a
+                // committed side effect nor re-runs the pending call blindly.
+                if state.suspension.is_none() {
+                    state.suspension = Some(TurnSuspension::new(
+                        TurnStopReason::ApprovalRequired,
+                        call.call_id.clone(),
+                        history,
+                        &prepared_calls(&prepared),
+                        &batch,
+                    ));
+                }
                 stop_outcome = Some(ToolBatchOutcome::Stopped(fail(
                     state,
                     events,
@@ -1588,6 +1796,18 @@ where
             // is not a malfunction).
             state.failure_detail = Some(TurnFailureDetail::new(call.tool.clone(), question));
             if stop_outcome.is_none() {
+                // Same suspension contract as the approval arm: the question
+                // is pending human input, and the answer arrives on a resume
+                // of this exact exchange.
+                if state.suspension.is_none() {
+                    state.suspension = Some(TurnSuspension::new(
+                        TurnStopReason::ContextRequired,
+                        call.call_id.clone(),
+                        history,
+                        &prepared_calls(&prepared),
+                        &batch,
+                    ));
+                }
                 stop_outcome = Some(ToolBatchOutcome::Stopped(fail(
                     state,
                     events,
@@ -1613,6 +1833,12 @@ where
         return Ok(stop_outcome);
     }
     Ok(ToolBatchOutcome::Completed(results))
+}
+
+/// The batch's proposed calls, in proposal order — the calls side of the
+/// suspension's final recorded exchange.
+fn prepared_calls(prepared: &[(ProposedToolCall, ValidatedToolCall)]) -> Vec<ProposedToolCall> {
+    prepared.iter().map(|(call, _)| call.clone()).collect()
 }
 
 fn emit_tool_result<E: TurnEventSink>(
@@ -1702,6 +1928,7 @@ fn complete<E: TurnEventSink>(
         terminal_output: terminal_text.map(BoundedAssistantOutput::new),
         failure_cause: None,
         failure_detail: None,
+        suspension: None,
     })
 }
 
@@ -1752,6 +1979,7 @@ fn fail_with_cause<E: TurnEventSink>(
         terminal_output: None,
         failure_cause: cause,
         failure_detail: detail,
+        suspension: state.suspension.clone(),
     })
 }
 
@@ -1771,6 +1999,7 @@ fn interrupt<E: TurnEventSink>(state: &LoopState, events: &mut E) -> Result<Turn
         terminal_output: None,
         failure_cause: None,
         failure_detail: None,
+        suspension: None,
     })
 }
 

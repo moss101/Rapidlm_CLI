@@ -26,8 +26,9 @@ use agent_runtime::{
     AgentExecutionError, AgentExecutionRequest, AgentExecutor, AgentOutcome, AgentResult,
     CancellationToken, ContextController, ContextOverflow, ContextRecoveryDecision,
     ContextRetryPolicy, ContextRevision, FailureCause, ModelDriver, ModelStepError, ModelStepInput,
-    ModelStepOutput, ProposedToolCall, ToolDriver, ToolStepError, ToolStepResult,
-    TurnAgentExecutor, TurnEventSink, TurnFailureDetail, TurnStopReason, ValidatedToolCall,
+    ModelStepOutput, ProposedToolCall, ToolDriver, ToolStepError, ToolStepExchange, ToolStepResult,
+    TurnAgentExecutor, TurnEventSink, TurnFailureDetail, TurnStopReason, TurnSuspension,
+    ValidatedToolCall,
 };
 use context_engine::compile::{
     CompileContext, CompileError, CompileInput, ContextBlock, ContextPacket, compile,
@@ -761,6 +762,36 @@ impl<B: LiveModelCall> LiveContextHost<B> {
             tools,
             events,
             cancel,
+        )
+    }
+
+    /// [`Self::execute`] continued from prior completed exchanges — the
+    /// resume path for a turn that suspended on an approval or a
+    /// clarification. `seed_history` is the suspension's recorded history
+    /// with the pending call's placeholder result already replaced by its
+    /// post-resolution outcome.
+    pub fn execute_seeded<T, E>(
+        &mut self,
+        request: &AgentExecutionRequest,
+        tools: &mut T,
+        events: &mut E,
+        cancel: &CancellationToken,
+        seed_history: Vec<ToolStepExchange>,
+    ) -> Result<AgentOutcome, AgentExecutionError>
+    where
+        T: ToolDriver,
+        E: TurnEventSink,
+    {
+        self.controller.cancel = cancel.clone();
+        TurnAgentExecutor.recovering_with_seed(
+            request,
+            &mut self.controller,
+            self.policy,
+            &mut self.model,
+            tools,
+            events,
+            cancel,
+            seed_history,
         )
     }
 
@@ -1580,6 +1611,11 @@ pub struct ExecOutcome {
     /// status line's `ctx:` item and any context panel want the one that
     /// actually applied.
     pub context_tokens: Option<(u32, u32)>,
+    /// Pending human input when the turn suspended on an approval or a
+    /// clarification. The host records it durably and finishes the turn as
+    /// `TurnOutcome::Waiting`; the resume path replays it. `None` for every
+    /// other stop.
+    pub suspension: Option<TurnSuspension>,
 }
 
 /// Production entry used by the CLI `exec`/`goal` command: build the
@@ -1650,6 +1686,63 @@ where
         recovered,
         context_tokens,
         context_partitions,
+        suspension: outcome.suspension,
+    })
+}
+
+/// [`run_live_exec`] continued from prior completed exchanges — the resume
+/// path for a turn that suspended on an approval or a clarification. The
+/// packet, model and tools are rebuilt exactly as a fresh turn; only the
+/// tool-exchange history is the suspension's own record.
+#[allow(clippy::too_many_arguments)]
+pub fn run_live_exec_seeded<B, T, E>(
+    preserved: PreservedLiveContext,
+    backing: B,
+    request: &AgentExecutionRequest,
+    tools: &mut T,
+    events: &mut E,
+    cancel: &CancellationToken,
+    policy: ContextRetryPolicy,
+    diag: Option<StepDiag>,
+    seed_history: Vec<ToolStepExchange>,
+) -> Result<ExecOutcome, AgentExecutionError>
+where
+    B: LiveModelCall,
+    T: ToolDriver,
+    E: TurnEventSink,
+{
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let cost = CostAccumulator::new();
+    let turn_diag = diag.clone();
+    let supervised = SupervisedModel {
+        inner: backing,
+        counter: std::sync::Arc::clone(&counter),
+        cost: cost.clone(),
+        diag,
+    };
+    let mut host = LiveContextHost::build(preserved, supervised, policy)
+        .map_err(|_| AgentExecutionError::InvalidRequest)?;
+    let outcome = host.execute_seeded(request, tools, events, cancel, seed_history)?;
+    let context_tokens = host.context_usage();
+    let context_partitions = host.context_partitions();
+    let recovered = host
+        .live_context()
+        .try_borrow()
+        .ok()
+        .and_then(|live| live.recovered().cloned());
+    let tokens = counter.load(std::sync::atomic::Ordering::Relaxed);
+    Ok(ExecOutcome {
+        result: outcome.result,
+        failure_cause: outcome.failure_cause,
+        failure_detail: outcome.failure_detail,
+        stop_reason: outcome.stop_reason,
+        tool_calls: outcome.tool_calls,
+        tokens,
+        cost_usd_micros: cost.total(),
+        recovered,
+        context_tokens,
+        context_partitions,
+        suspension: outcome.suspension,
     })
 }
 

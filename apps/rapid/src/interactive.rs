@@ -4788,6 +4788,11 @@ struct AutonomousGoalState {
 
 impl SessionLoop<'_> {
     fn run(mut self, inputs: &mut InputSource) -> Result<InteractiveOutcome, InteractiveError> {
+        // Anything a previous process left waiting — an approval or a
+        // clarification that outlived it — is offered again, unchanged, on
+        // the first tick. This is the restart-recovery half of the durable
+        // approval flow; `/approvals` resolves them.
+        self.surface_pending_approvals();
         let result = self.run_until_quit(inputs);
         // A compaction still out when the session ends is not a turn, so
         // the exit path's kernel interrupt cannot reach it; its own token
@@ -4927,6 +4932,13 @@ impl SessionLoop<'_> {
     /// matters: it once did, silently, for every `CommandError` other than
     /// `Empty`).
     fn dispatch_slash(&mut self, command: &str) -> Result<LoopControl, InteractiveError> {
+        // `/approvals` is handled locally: it drives the pending-approval
+        // flow (list / approve / remember / deny / answer), which is session
+        // state plus the kernel's approval APIs, not a TUI panel route.
+        if let Some(rest) = command.strip_prefix("/approvals") {
+            self.run_approvals_command(rest)?;
+            return Ok(LoopControl::Continue);
+        }
         // Parsed against the session so the short ids the panels display
         // (`job-3`, an id's random tail) resolve to the typed ids the
         // commands take. A bare `parse_command` accepts full UUIDs only.
@@ -5252,6 +5264,262 @@ denied\n",
             return;
         }
         self.append_command_error(unrouted_inspector_text(&inspector));
+    }
+
+    /// `/approvals`: the human side of the durable approval flow.
+    ///
+    /// Bare (or `list`): every pending approval — tool, action summary,
+    /// scope, and the index/token to resolve it by.
+    /// `approve <n|token> [remember]`: execute the pending call and continue
+    /// the paused turn; `remember` also records a scoped persisted grant.
+    /// `deny <n|token>`: feed the paused turn a typed denial and continue.
+    /// `answer <n|token> <text>`: answer a pending `ask_user` clarification
+    /// and continue the paused turn with it.
+    fn run_approvals_command(&mut self, rest: &str) -> Result<(), InteractiveError> {
+        let pending = crate::approvals::pending_approvals(self.client, self.session_id);
+        let args = rest.trim();
+        if pending.is_empty() {
+            self.append_command_output(
+                "no pending approvals; nothing is waiting on you".to_owned(),
+            );
+            return Ok(());
+        }
+        if args.is_empty() || args == "list" {
+            let mut lines = vec![format!("{} pending approval(s):", pending.len())];
+            for (index, item) in pending.iter().enumerate() {
+                let payload = item.payload();
+                let mut line = format!(
+                    "{}. [{}] {} — {}",
+                    index + 1,
+                    short_token(&payload.token),
+                    payload.tool,
+                    payload.summary
+                );
+                if !payload.scope.is_empty() {
+                    line.push_str(&format!(" (scope: {})", payload.scope.join(", ")));
+                }
+                lines.push(line);
+                if !payload.diff.is_empty() {
+                    lines.push(String::new());
+                    lines.push(format!("    {} diff:", payload.tool));
+                    for diff_line in payload.diff.lines().take(40) {
+                        lines.push(format!("    {diff_line}"));
+                    }
+                    if payload.diff.lines().count() > 40 {
+                        lines.push("    … (diff truncated)".to_owned());
+                    }
+                    lines.push(String::new());
+                }
+            }
+            lines.push(
+                "resolve with /approvals approve <n> [remember], /approvals deny <n>, or /approvals answer <n> <text> for a question"
+                    .to_owned(),
+            );
+            self.append_command_output(lines.join("\n"));
+            return Ok(());
+        }
+        let mut parts = args.splitn(3, ' ');
+        let action = parts.next().unwrap_or_default();
+        let selector = parts.next().unwrap_or_default();
+        let index = if let Some(position) = pending
+            .iter()
+            .position(|item| item.payload().token == selector)
+        {
+            Some(position)
+        } else {
+            match selector.parse::<usize>() {
+                Ok(n) if (1..=pending.len()).contains(&n) => Some(n - 1),
+                _ => {
+                    self.append_command_error(format!(
+                        "/approvals: no pending approval matches '{selector}' (run /approvals to list)"
+                    ));
+                    return Ok(());
+                }
+            }
+        };
+        let index = index.expect("selector match guarantees a valid index");
+        let item = &pending[index];
+        let token = item.payload().token.clone();
+        let call_id = item.payload().call_id.clone();
+        let is_question = item.payload().tool == "ask_user";
+        let extra = parts.next().unwrap_or_default().to_owned();
+        match action {
+            "approve" => {
+                let remember = extra == "remember";
+                if remember && item.payload().tool == "shell_exec" {
+                    self.append_command_error(
+                        "/approvals: `remember` is not offered for shell_exec — a remembered shell grant from one command would match that command with anything appended. Pre-approve a scoped pattern instead: `rapid permissions allow 'shell_exec(git *)'`"
+                            .to_owned(),
+                    );
+                    return Ok(());
+                }
+                if remember {
+                    if let Some(pattern) = remembered_pattern(item.payload()) {
+                        match crate::permissions_cli::record_persisted_grant(
+                            self.root,
+                            self.user_home,
+                            &pattern,
+                        ) {
+                            Ok(true) => {
+                                self.append_command_output(format!(
+                                    "remembered: {pattern} is approved for this project (rapid permissions revoke {pattern} to undo)"
+                                ));
+                            }
+                            Ok(false) => {}
+                            Err(reason) => {
+                                self.append_command_error(format!(
+                                    "/approvals: the remembered grant could not be recorded: {reason}; approving once instead"
+                                ));
+                            }
+                        }
+                    }
+                }
+                self.resolve_pending(&token, &call_id, kernel::ApprovalDecision::Approved, None)
+            }
+            "deny" => {
+                self.resolve_pending(&token, &call_id, kernel::ApprovalDecision::Denied, None)
+            }
+            "answer" => {
+                if !is_question {
+                    self.append_command_error(
+                        "/approvals: that pending item is a tool approval, not a question; use approve or deny".to_owned(),
+                    );
+                    return Ok(());
+                }
+                // `splitn(3)` gave us action/selector/rest; `rest` (`extra`)
+                // is the answer text when the selector was numeric, and empty
+                // when the selector was the token itself (a token contains no
+                // space, so the answer rode in `extra` either way — the
+                // token-selector form leaves nothing in `extra` only when no
+                // answer was given at all).
+                let _ = extra;
+                let answer = args
+                    .strip_prefix("answer ")
+                    .and_then(|remainder| remainder.split_once(' '))
+                    .map(|(_, answer)| answer.trim().to_owned())
+                    .unwrap_or_default();
+                if answer.trim().is_empty() {
+                    self.append_command_error(
+                        "/approvals: an answer needs text: /approvals answer <n> <text>".to_owned(),
+                    );
+                    return Ok(());
+                }
+                self.resolve_pending(
+                    &token,
+                    &call_id,
+                    kernel::ApprovalDecision::Approved,
+                    Some(answer),
+                )
+            }
+            other => {
+                self.append_command_error(format!(
+                    "/approvals: unknown action '{other}' (approve <n> [remember] | deny <n> | answer <n> <text> | list)"
+                ));
+                Ok(())
+            }
+        }
+    }
+
+    /// Resolve one pending approval and spawn its continuation turn. The
+    /// kernel records the resolution (durable, restart-safe); the loop then
+    /// submits the continuation turn exactly like a user submission —
+    /// releasing nothing and holding nothing while the decision was pending.
+    fn resolve_pending(
+        &mut self,
+        token: &str,
+        call_id: &str,
+        decision: kernel::ApprovalDecision,
+        answer: Option<String>,
+    ) -> Result<(), InteractiveError> {
+        if self.model_busy() {
+            self.append_command_error(
+                "/approvals: a turn or compaction is running; resolve when it settles".to_owned(),
+            );
+            return Ok(());
+        }
+        let tip = self.session_tip()?;
+        let mut request = kernel::ResolveApproval::new(
+            self.session_id,
+            tip,
+            decision,
+            self.actor.clone(),
+            TraceId::new(),
+        )
+        .with_wait_token(token);
+        if answer.is_some() {
+            request = request.remembering();
+        }
+        block_on(self.client.approve(request), self.cancel)?;
+        let Some(suspended) =
+            crate::approvals::recorded_suspension(self.client, self.session_id, token)
+        else {
+            self.append_command_error(
+                "/approvals: resolved, but the paused turn's resumable state could not be loaded (it was recorded by an older run); continue as a new message".to_owned(),
+            );
+            return Ok(());
+        };
+        let continuation = match (decision, answer) {
+            (_, Some(answer)) => ContinuationDecision::Answer(answer),
+            (kernel::ApprovalDecision::Approved, None) => ContinuationDecision::Execute,
+            (kernel::ApprovalDecision::Denied, None) => ContinuationDecision::Deny,
+        };
+        let expected_seq = self.session_tip()?;
+        let handle = block_on(
+            self.client.submit_turn(kernel::SubmitTurn::new(
+                self.session_id,
+                expected_seq,
+                self.actor.clone(),
+                TraceId::new(),
+                "",
+            )),
+            self.cancel,
+        )?;
+        if let Some(turn_cancel) = self.client.turn_cancel_token(self.session_id) {
+            self.turn_in_flight
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            spawn_continuation_turn(
+                self.client.clone(),
+                self.session_id,
+                handle.turn_id(),
+                self.actor.clone(),
+                self.root.to_path_buf(),
+                self.trusted,
+                turn_cancel,
+                std::sync::Arc::clone(&self.turn_in_flight),
+                self.jobs.clone(),
+                self.shared.clone(),
+                token.to_owned(),
+                call_id.to_owned(),
+                continuation,
+            );
+        }
+        self.drain()
+    }
+
+    /// Surface anything already waiting when a session opens — the
+    /// restart-recovery half of the durable approval flow: a pending approval
+    /// recorded by a previous process is offered again, unchanged.
+    fn surface_pending_approvals(&mut self) {
+        let pending = crate::approvals::pending_approvals(self.client, self.session_id);
+        if pending.is_empty() {
+            return;
+        }
+        let mut lines = vec![format!(
+            "{} approval(s) from a previous run are still waiting on you:",
+            pending.len()
+        )];
+        for (index, item) in pending.iter().enumerate() {
+            let payload = item.payload();
+            lines.push(format!(
+                "{}. [{}] {} — {}",
+                index + 1,
+                short_token(&payload.token),
+                payload.tool,
+                payload.summary
+            ));
+        }
+        lines.push("run /approvals to resolve them".to_owned());
+        self.append_command_output(lines.join("\n"));
     }
 
     fn append_command_output(&mut self, text: String) {
@@ -5795,6 +6063,8 @@ denied\n",
         self.append_command_output(format!(
             "now on session {target}\n`/resume {previous}` returns to the one you left\n"
         ));
+        // A different session may carry its own unresolved approvals.
+        self.surface_pending_approvals();
         self.drain()
     }
 
@@ -7265,6 +7535,18 @@ fn run_interactive_turn_inner(
     // Background jobs go in the session's table, not this turn's: see
     // `SessionLoop::jobs`.
     tools.share_job_table(jobs);
+    // The durable approval sink: an `Ask` decision on this surface records a
+    // pending approval (action, scope, diff) and pauses the turn for a human
+    // decision instead of denying. Headless exec builds its tools without
+    // one, which keeps its `Ask` fail-closed — same lattice, no resolver.
+    tools.set_approval_source(std::sync::Arc::new(
+        crate::approvals::LedgerApprovalSink::new(
+            client.clone(),
+            session_id,
+            actor.clone(),
+            root.to_path_buf(),
+        ),
+    ));
 
     execute_interactive_turn(
         client,
@@ -7278,6 +7560,420 @@ fn run_interactive_turn_inner(
         cancel,
         history_through,
     )
+}
+
+/// The resolution a pending approval's continuation carries: the human
+/// decision, translated into what happens to the pending call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ContinuationDecision {
+    /// Execute the pending call exactly once, then continue the model loop.
+    Execute,
+    /// Feed the pending call's placeholder a typed denial and continue —
+    /// the model must see the refusal, not just the transcript.
+    Deny,
+    /// Re-run `ask_user` with the operator's answer as a one-shot answer
+    /// source, then continue.
+    Answer(String),
+}
+
+/// Spawn the continuation of a turn that paused on a pending approval. A
+/// fresh kernel turn records it; the loop body (`run_continuation_turn`)
+/// replays the suspension, resolves the pending call per `decision`, and
+/// continues the model loop from the recorded history.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+fn spawn_continuation_turn(
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    turn_id: protocol::TurnId,
+    actor: ActorRef,
+    root: PathBuf,
+    trusted: bool,
+    kernel_cancel: kernel::CancelToken,
+    turn_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    jobs: crate::exec_tools::JobRegistry,
+    shared: SessionShared,
+    token: String,
+    call_id: String,
+    decision: ContinuationDecision,
+) {
+    std::thread::spawn(move || {
+        let outcome = catching_panics(std::panic::AssertUnwindSafe(|| {
+            run_continuation_turn(
+                &client,
+                session_id,
+                &actor,
+                &root,
+                trusted,
+                &kernel_cancel,
+                &jobs,
+                &shared,
+                token,
+                call_id,
+                decision,
+            )
+        }));
+        // `finish_turn` releases the continuation's own kernel lease; a no-op
+        // if a racing `interrupt` released it first.
+        let _ = client.finish_turn(kernel::FinishTurn::new(
+            session_id,
+            turn_id,
+            actor,
+            TraceId::new(),
+            outcome,
+        ));
+        turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+fn run_continuation_turn(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    kernel_cancel: &kernel::CancelToken,
+    jobs: &crate::exec_tools::JobRegistry,
+    shared: &SessionShared,
+    token: String,
+    call_id: String,
+    decision: ContinuationDecision,
+) -> kernel::TurnOutcome {
+    let bridge = CancelBridge::start(kernel_cancel);
+    let outcome = run_continuation_turn_inner(
+        client,
+        session_id,
+        actor,
+        root,
+        trusted,
+        &bridge.token,
+        jobs,
+        shared,
+        token,
+        call_id,
+        decision,
+    );
+    bridge.stop();
+    outcome
+}
+
+/// The continuation turn body: identical tool/context/model setup to
+/// [`run_interactive_turn_inner`], but the model loop starts from the
+/// suspension's recorded history with the pending call's placeholder result
+/// replaced by its post-resolution outcome — so no committed side effect is
+/// repeated and the model's working memory is exactly what it was when the
+/// turn paused.
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn run_continuation_turn_inner_with_backing<B: crate::host::LiveModelCall>(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    cancel: &agent_runtime::CancellationToken,
+    jobs: &crate::exec_tools::JobRegistry,
+    shared: &SessionShared,
+    token: String,
+    call_id: String,
+    decision: ContinuationDecision,
+    backing: B,
+    budget: (u32, u32),
+) -> kernel::TurnOutcome {
+    continuation_turn_inner(
+        client, session_id, actor, root, trusted, cancel, jobs, shared, token, call_id, decision,
+        backing, budget,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_continuation_turn_inner(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    cancel: &agent_runtime::CancellationToken,
+    jobs: &crate::exec_tools::JobRegistry,
+    shared: &SessionShared,
+    token: String,
+    call_id: String,
+    decision: ContinuationDecision,
+) -> kernel::TurnOutcome {
+    let mut warn = |line: &str| notify(&shared.notices, line);
+    let (reminder_floor, _reminder_block) = interactive_reminders(root, &mut warn);
+    let session_model = match SessionModel::resolve(reminder_floor, None, &mut warn) {
+        Ok(model) => model,
+        Err(reason) => return kernel::TurnOutcome::Failed { reason },
+    };
+    let backing = match session_model.backing(None, &mut warn) {
+        Ok(backing) => backing,
+        Err(reason) => return kernel::TurnOutcome::Failed { reason },
+    };
+    let budget = context_budget_for(&backing);
+    continuation_turn_inner(
+        client, session_id, actor, root, trusted, cancel, jobs, shared, token, call_id, decision,
+        backing, budget,
+    )
+}
+
+/// The continuation turn body shared by the production path (real resolved
+/// model) and the test seam (scripted backing) — the same two-wrapper shape
+/// `run_interactive_turn_inner` uses.
+#[allow(clippy::too_many_arguments)]
+fn continuation_turn_inner<B: crate::host::LiveModelCall>(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    cancel: &agent_runtime::CancellationToken,
+    jobs: &crate::exec_tools::JobRegistry,
+    shared: &SessionShared,
+    token: String,
+    call_id: String,
+    decision: ContinuationDecision,
+    backing: B,
+    budget: (u32, u32),
+) -> kernel::TurnOutcome {
+    let Some(suspended) = crate::approvals::recorded_suspension(client, session_id, &token) else {
+        return kernel::TurnOutcome::Failed {
+            reason:
+                "the paused turn's resumable state could not be loaded; ask again as a new message"
+                    .to_owned(),
+        };
+    };
+    let mut warn = |line: &str| notify(&shared.notices, line);
+    let (mut tools, permission_lattice) = match build_interactive_turn_tools(root, trusted, None) {
+        Ok(built) => built,
+        Err(outcome) => return outcome,
+    };
+    let _policy_version = apply_managed_ceilings(&mut tools);
+    tools.share_mcp(&shared.mcp);
+    tools.share_subagents(&shared.agents);
+    if trusted {
+        let _ = configure_trusted_integrations(&mut tools, root, &mut warn);
+    }
+    let (_reminder_floor, reminder_block) = interactive_reminders(root, &mut warn);
+    let (context_limit, output_reserve) = budget;
+    let history = conversation_history(client, session_id, cancel);
+    let history_through = history.through_seq;
+    let preserved = match build_interactive_turn_context(
+        root,
+        trusted,
+        &suspended.task,
+        context_limit,
+        output_reserve,
+        history,
+        reminder_block,
+    ) {
+        Ok(preserved) => preserved,
+        Err(outcome) => return outcome,
+    };
+    configure_trusted_model_tools(
+        &mut tools,
+        root,
+        None,
+        &permission_lattice,
+        Some(LedgerSinks {
+            client,
+            session_id,
+            actor,
+        }),
+    );
+    tools.share_job_table(jobs);
+    tools.set_approval_source(std::sync::Arc::new(
+        crate::approvals::LedgerApprovalSink::new(
+            client.clone(),
+            session_id,
+            actor.clone(),
+            root.to_path_buf(),
+        ),
+    ));
+    if let ContinuationDecision::Answer(answer) = &decision {
+        // One-shot answer source: the re-run of the pending `ask_user` reads
+        // the operator's answer and succeeds; any later `ask_user` in this
+        // turn suspends again the ordinary way. Consumed on first use.
+        let answer = std::sync::Mutex::new(Some(answer.clone()));
+        tools.set_ask_source(std::sync::Arc::new(move |_prompt, _options, _timeout| {
+            let mut slot = answer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.take()
+                .ok_or_else(|| "the recorded answer was already used".to_owned())
+        }));
+    }
+
+    // Rebuild the recorded exchanges and resolve the pending placeholder.
+    let mut seed = suspended.history.clone();
+    let resolved = {
+        let Some((exchange, index)) = seed.find_result_mut(&call_id) else {
+            return kernel::TurnOutcome::Failed {
+                reason: "the paused tool call is missing from the recorded turn state".to_owned(),
+            };
+        };
+        let Some(recorded) = exchange
+            .calls
+            .iter()
+            .find(|call| call.call_id == call_id)
+            .cloned()
+        else {
+            return kernel::TurnOutcome::Failed {
+                reason: "the paused tool call is missing from the recorded turn state".to_owned(),
+            };
+        };
+        let outcome = match &decision {
+            ContinuationDecision::Deny => Ok(agent_runtime::ToolStepResult::Denied {
+                call_id: call_id.clone(),
+                detail: Some("denied by the operator".to_owned()),
+            }),
+            ContinuationDecision::Answer(_) => {
+                let proposed = agent_runtime::ProposedToolCall::replay(
+                    recorded.call_id.clone(),
+                    recorded.tool.clone(),
+                    recorded.arguments.clone(),
+                );
+                match agent_runtime::ToolDriver::validate(&mut tools, &proposed, cancel) {
+                    Ok(validated) => {
+                        agent_runtime::ToolDriver::execute(&mut tools, &validated, cancel)
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            ContinuationDecision::Execute => {
+                let proposed = agent_runtime::ProposedToolCall::replay(
+                    recorded.call_id.clone(),
+                    recorded.tool.clone(),
+                    recorded.arguments.clone(),
+                );
+                match agent_runtime::ToolDriver::validate(&mut tools, &proposed, cancel) {
+                    Ok(validated) => tools.execute_preapproved(&validated, cancel),
+                    Err(err) => Err(err),
+                }
+            }
+        };
+        let result = match outcome {
+            Ok(result) => result,
+            Err(agent_runtime::ToolStepError::Cancelled) => {
+                return kernel::TurnOutcome::Interrupted;
+            }
+            Err(err) => agent_runtime::ToolStepResult::Failed {
+                call_id: call_id.clone(),
+                handled: true,
+                detail: Some(err.as_str().to_owned()),
+            },
+        };
+        let results = &mut exchange.results;
+        let slot = results
+            .iter()
+            .position(|result| result.call_id == call_id)
+            .unwrap_or_else(|| index.min(results.len().saturating_sub(1)));
+        let kind = match &result {
+            agent_runtime::ToolStepResult::Succeeded { .. } => "succeeded",
+            agent_runtime::ToolStepResult::Failed { .. } => "failed",
+            agent_runtime::ToolStepResult::Denied { .. } => "denied",
+            agent_runtime::ToolStepResult::ApprovalRequired { .. } => "approval_required",
+            agent_runtime::ToolStepResult::ContextRequired { .. } => "context_required",
+        };
+        let summary = match &result {
+            agent_runtime::ToolStepResult::Succeeded { summary, .. } => summary.clone(),
+            _ => String::new(),
+        };
+        let detail = match &result {
+            agent_runtime::ToolStepResult::Failed { detail, .. }
+            | agent_runtime::ToolStepResult::Denied { detail, .. } => detail.clone(),
+            _ => None,
+        };
+        let question = match &result {
+            agent_runtime::ToolStepResult::ContextRequired { question, .. } => question.clone(),
+            _ => String::new(),
+        };
+        results[slot] = crate::approvals::SuspendedResult {
+            kind: kind.to_owned(),
+            call_id: call_id.clone(),
+            summary,
+            detail,
+            handled: matches!(
+                result,
+                agent_runtime::ToolStepResult::Failed { handled: true, .. }
+            ),
+            question,
+        };
+        seed.to_agent()
+    };
+
+    let spec = match AgentSpec::builder(
+        protocol::AgentId::new(),
+        AgentRole::Coder,
+        suspended.task.clone(),
+        protocol::WorkspaceViewId::new(),
+    )
+    .permissions_profile("work")
+    .build()
+    {
+        Ok(spec) => spec,
+        Err(err) => {
+            return kernel::TurnOutcome::Failed {
+                reason: format!("invalid continuation request: {err}"),
+            };
+        }
+    };
+    let request = AgentExecutionRequest::new(spec, session_id);
+    let mut sink = InteractiveTurnSink {
+        client,
+        session_id,
+        actor,
+    };
+    let run_result = crate::host::run_live_exec_seeded(
+        preserved,
+        backing,
+        &request,
+        &mut tools,
+        &mut sink,
+        cancel,
+        ContextRetryPolicy::default(),
+        None,
+        resolved,
+    );
+    if let Ok(outcome) = &run_result {
+        record_turn_context(client, session_id, actor, outcome, history_through);
+    }
+    kernel_turn_outcome(&run_result)
+}
+
+/// Display short form of a wait token: stable, enough to disambiguate a
+/// session's handful of pendings on screen; the full token is what the
+/// resolver accepts.
+fn short_token(token: &str) -> String {
+    let mut end = 12.min(token.len());
+    while end > 0 && !token.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = &token[..end];
+    if end < token.len() {
+        format!("{cut}…")
+    } else {
+        cut.to_owned()
+    }
+}
+
+/// The persisted-grant pattern an approve-and-remember decision records:
+/// path-scoped for the file tools (a remembered write grant covers the file
+/// or subtree it named, nothing else), plain-tool for bounded read-class
+/// tools, and `None` for `shell_exec` — a remembered shell grant derived
+/// from one command would match that command with anything appended, so
+/// standing shell approvals stay with the user's own
+/// `rapid permissions allow 'shell_exec(pattern)'` entries.
+fn remembered_pattern(payload: &kernel::ApprovalRequestedPayload) -> Option<String> {
+    match payload.tool.as_str() {
+        "workspace_write" | "workspace_patch" | "workspace_read" | "repo_read" => payload
+            .scope
+            .first()
+            .map(|path| format!("{}({}*)", payload.tool, path)),
+        "shell_exec" => None,
+        tool => Some(tool.to_owned()),
+    }
 }
 
 /// The session's model as one interactive turn (or a `/compact`) resolves
@@ -7730,6 +8426,66 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
         None,
     );
     if let Ok(outcome) = &run_result {
+        // Persist the suspension before the turn's terminal event: a resume
+        // (this process or a restarted one) replays it from the ledger.
+        if let Some(suspension) = &outcome.suspension {
+            let mut token =
+                crate::approvals::pending_token_for_call(client, session_id, suspension.call_id());
+            // A clarification (the model's own `ask_user`) suspends without a
+            // permission `Ask`, so no approval was pre-recorded: record the
+            // question as a pending approval now so the same durable wait —
+            // listing, resolution, restart survival — serves both flows.
+            if token.is_none()
+                && suspension.reason() == agent_runtime::TurnStopReason::ContextRequired
+            {
+                let question = outcome
+                    .failure_detail
+                    .as_ref()
+                    .map(|detail| detail.error().to_owned())
+                    .unwrap_or_else(|| "the model asked a question".to_owned());
+                let sink = crate::approvals::LedgerApprovalSink::new(
+                    client.clone(),
+                    session_id,
+                    actor.clone(),
+                    root.to_path_buf(),
+                );
+                let request = crate::approvals::ApprovalRequest {
+                    tool: "ask_user".to_owned(),
+                    call_id: suspension.call_id().to_owned(),
+                    summary: question,
+                    scope: Vec::new(),
+                    diff: String::new(),
+                };
+                if let Ok(recorded) = crate::approvals::ApprovalSink::request(&sink, &request) {
+                    token = Some(recorded);
+                }
+            }
+            if let Some(token) = token {
+                let suspended = crate::approvals::SuspendedTurn {
+                    task: text.to_owned(),
+                    call_id: suspension.call_id().to_owned(),
+                    reason: suspension.reason().as_str().to_owned(),
+                    omitted_earlier_steps: suspension.omitted_earlier_steps(),
+                    history: crate::approvals::SuspendedHistory::from_agent(suspension.history()),
+                };
+                let tool = crate::approvals::requested_payload(client, session_id, &token)
+                    .map(|payload| payload.tool)
+                    .unwrap_or_default();
+                // No in-thread notice channel reaches this body (`shared`
+                // is the loop's); a failed record leaves the approval
+                // pending but unresumable, and the resume path's own
+                // "could not be loaded" failure is the visible feedback.
+                let _ = crate::approvals::record_suspension(
+                    client,
+                    session_id,
+                    actor,
+                    &token,
+                    suspension.call_id(),
+                    &tool,
+                    &suspended,
+                );
+            }
+        }
         record_turn_context(client, session_id, actor, outcome, history_through);
     }
     if let (Ok(outcome), Some(goal_id)) = (&run_result, goal_id) {
@@ -7847,6 +8603,14 @@ fn kernel_turn_outcome<E: std::fmt::Display>(
                     text: Some(outcome.result.summary().to_owned()),
                 },
                 AgentTerminalStatus::Cancelled => kernel::TurnOutcome::Interrupted,
+                // An approval pause is not a failure: the turn's effects are
+                // durable, its lease is released, and a decision resumes it
+                // as a continuation turn.
+                _ if outcome.stop_reason
+                    == Some(agent_runtime::TurnStopReason::ApprovalRequired) =>
+                {
+                    kernel::TurnOutcome::Waiting
+                }
                 _ => kernel::TurnOutcome::Failed {
                     reason: outcome.result.summary().to_owned(),
                 },
@@ -17210,6 +17974,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             cost_usd_micros: None,
             recovered: None,
             context_tokens: None,
+            suspension: None,
             context_partitions: Vec::new(),
         }
     }

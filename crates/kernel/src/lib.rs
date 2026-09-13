@@ -41,9 +41,11 @@ pub use cancel::{
     MAX_CANCEL_DEPTH,
 };
 pub use client::{
-    ApprovalDecision, EventStream, EventStreamError, FinishTurn, InProcessKernelClient, Interrupt,
-    InterruptReason, KernelClient, ResolveApproval, RewindResult, RewindSession, SubmitTurn,
-    SubscribeEvents, TurnHandle, TurnOutcome,
+    ApprovalDecision, ApprovalRequestedPayload, ApprovalResolvedPayload, EventStream,
+    EventStreamError, FinishTurn, InProcessKernelClient, Interrupt, InterruptReason, KernelClient,
+    MAX_APPROVAL_DIFF_BYTES, MAX_APPROVAL_SUMMARY_BYTES, PendingApproval, RecordApproval,
+    ResolveApproval, RewindResult, RewindSession, SubmitTurn, SubscribeEvents, TurnHandle,
+    TurnOutcome,
 };
 pub use config::loader::{
     CancellationToken, ConfigLoadError, ConfigLoadResult, ConfigOrigin, ConfigOverride,
