@@ -8041,7 +8041,22 @@ parent finishes; cancelling again and the bare form say what there is to cancel;
 child, the test `task_spawn_stops_a_running_child_when_the_caller_is_cancelled` replacing one that
 pinned token identity). Known bound: a process killed between a child's `agent.spawned` and its
 terminal event leaves that agent active in the projection; harmless until `MAX_ACTIVE_AGENTS`
-(256) of them, which no realistic session reaches.
+(256) of them, which no realistic session reaches. **Self-review of `11c7266` (fixed in
+`b2a15e7`, all taken):** the live runner reports a cancelled child as an error string, so
+`/agents cancel` recorded the child as *failed* — the `subagent_stop` hook got `ok:false` and the
+parent a failed tool result it might answer by spawning the same child again; `task_spawn` now
+reads a child stopped by its token as cancelled whatever the runner made of it. A swallowed
+`agent.spawned` append followed by a landed terminal event made the session unreadable (the
+projection refuses a terminal for an agent it never saw) — `AgentEvents::spawned` reports whether
+it landed and no terminal is sent otherwise. A runner that panicked left the child registered and
+"running" for the session with no terminal record — `ChildLifecycle` releases both on every path
+out, a panic included. A session-long MCP registry turned one bad start (or a server that died)
+into a session-long outage — an offline or exited connection is dropped and connected again on the
+next registration; the registry's locks tolerate poison. The TUI's agent projection refused every
+event once 1024 rows existed (rows were never removed; 32 delegation-heavy turns) — the oldest
+ended row is evicted instead. Tests for each; **this commit was verified by CI only** — the machine
+froze `rustc` on `tui` for thirty minutes with three other workspaces compiling, `fmt --check` is
+clean, and the code was read twice.
 
 **MCP servers are started once per interactive session, not once per turn, 2026-09-13
 (`6ae511b`).** Found by the self-review of `6b0ce30`: with the integrations wired into the TUI
