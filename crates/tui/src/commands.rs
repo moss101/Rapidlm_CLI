@@ -609,7 +609,7 @@ const CATALOG: &[CommandSpec] = &[
         name: "compact",
         aliases: &[],
         usage: "/compact",
-        summary: "request kernel transcript compaction",
+        summary: "fold the session's earlier turns into a model-written summary",
     },
 ];
 

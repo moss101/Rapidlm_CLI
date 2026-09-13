@@ -188,6 +188,7 @@
     { "kind": "context.retrieved", "family": "context" },
     { "kind": "context.compiled", "family": "context" },
     { "kind": "context.memory_written", "family": "context" },
+    { "kind": "context.compacted", "family": "context" },
     { "kind": "evidence.recorded", "family": "evidence" },
     { "kind": "evidence.validated", "family": "evidence" },
     { "kind": "evidence.rejected", "family": "evidence" },

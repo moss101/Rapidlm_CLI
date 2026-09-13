@@ -70,7 +70,10 @@ pub(crate) fn kernel_action_is_supported(action: &KernelAction) -> bool {
         | KernelAction::StopGoal
         // Same-ledger session switching: the mechanism `/fork` uses to move
         // onto its child, pointed at a session the user names.
-        | KernelAction::ResumeSession { .. } => true,
+        | KernelAction::ResumeSession { .. }
+        // A model-written summary recorded as `context.compacted` — see
+        // `SessionLoop::compact_session`.
+        | KernelAction::CompactSession => true,
         // No per-job or per-agent cancellation backend exists at all — see
         // `cancels_a_specific_target`.
         other if cancels_a_specific_target(other) => false,

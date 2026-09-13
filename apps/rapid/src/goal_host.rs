@@ -684,6 +684,29 @@ pub fn accrue_turn_usage(
     cost_usd_micros: u64,
     active_ms: u64,
 ) -> bool {
+    accrue_usage(goal_path, goal_id, tokens, cost_usd_micros, Some(active_ms))
+}
+
+/// Attribute a model call that was not a turn — a `/compact` summary — to
+/// the active goal: tokens and cost only. Same lock, same checks, same
+/// best-effort contract as [`accrue_turn_usage`]; the goal's turn count and
+/// active time are untouched, since no turn ran.
+pub fn accrue_model_usage(
+    goal_path: &Path,
+    goal_id: protocol::GoalId,
+    tokens: u64,
+    cost_usd_micros: u64,
+) -> bool {
+    accrue_usage(goal_path, goal_id, tokens, cost_usd_micros, None)
+}
+
+fn accrue_usage(
+    goal_path: &Path,
+    goal_id: protocol::GoalId,
+    tokens: u64,
+    cost_usd_micros: u64,
+    turn_active_ms: Option<u64>,
+) -> bool {
     let mut host = GoalHost::new();
     let result = host.update(goal_path, |host| {
         let Some(snapshot) = host.snapshot() else {
@@ -696,7 +719,9 @@ pub fn accrue_turn_usage(
         let mut guard = agent_runtime::GoalBudgetGuard::from_snapshot(&snapshot);
         let cancel = CancellationToken::new();
         let _ = guard.after_model(tokens, cost_usd_micros, &cancel);
-        let _ = guard.after_turn(active_ms, &cancel);
+        if let Some(active_ms) = turn_active_ms {
+            let _ = guard.after_turn(active_ms, &cancel);
+        }
         *host = GoalHost::from_snapshot(guard.apply(snapshot));
         Ok(())
     });

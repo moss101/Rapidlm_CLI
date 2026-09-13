@@ -190,6 +190,10 @@ pub fn render_block_parts(entry: &crate::state::TranscriptEntry) -> (RenderBlock
         TranscriptEntry::CommandError { text } => {
             (RenderBlockKind::Error, format!("(command error: {text})"))
         }
+        TranscriptEntry::Compacted { turns, summary } => (
+            RenderBlockKind::System,
+            format!("(context compacted: {turns} turn(s) folded into this summary)\n{summary}"),
+        ),
     }
 }
 

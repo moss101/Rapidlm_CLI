@@ -97,7 +97,9 @@ rapid                                             # the interactive TUI
 Inside the TUI, `/help` lists every slash command and marks which ones work in this
 build. `/models`, `/context`, `/jobs` and `/diff` show what the session resolved,
 compiled, is running and has changed; `/resume` reopens an earlier session of this
-project.
+project. Every turn carries the session's earlier turns; when they grow long,
+`/compact` has the model fold them into a summary that later turns — and
+`rapid exec --continue` — read in their place.
 
 ## Exit codes
 

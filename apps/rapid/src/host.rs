@@ -4,9 +4,10 @@
 //! runs the recovery-capable executor. It couples:
 //!
 //!   - a live [`ContextPacket`] (the single Context-Fabric authority), rebuilt
-//!     via `context_engine::compile` + policy-verified `compact_with_policy` on
-//!     overflow (fail-closed: a compaction that doesn't shrink enough is a typed
-//!     `StillOverHard`, never a silently still-oversized packet);
+//!     via `context_engine::compile` on overflow with the conversation folded
+//!     into a model-written summary (fail-closed: a rebuild that is not
+//!     strictly smaller than the packet the provider refused is
+//!     `NotRecoverable`, never a silently identical retry);
 //!   - a [`LiveModelCall`] backing (the provider adapter) that reads that packet;
 //!   - the existing [`ContextController`]/[`ContextRetryPolicy`] recovery seam.
 //!
@@ -27,10 +28,6 @@ use agent_runtime::{
     ContextRetryPolicy, ContextRevision, FailureCause, ModelDriver, ModelStepError, ModelStepInput,
     ModelStepOutput, ProposedToolCall, ToolDriver, ToolStepError, ToolStepResult,
     TurnAgentExecutor, TurnEventSink, TurnFailureDetail, TurnStopReason, ValidatedToolCall,
-};
-use context_engine::CancellationToken as CeCancel;
-use context_engine::compact_policy::{
-    CompactPolicyError, CompactionPolicy, CompactionStrategy, compact_with_policy,
 };
 use context_engine::compile::{
     CompileContext, CompileError, CompileInput, ContextBlock, ContextPacket, compile,
@@ -116,6 +113,16 @@ impl ConversationTurn {
         text
     }
 }
+
+/// A session's earlier conversation as one turn re-reads it: the turns since
+/// the last compaction, and the summary that compaction left of everything
+/// before them. Both empty for a session that has said nothing yet.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ConversationHistory {
+    pub summary: Option<String>,
+    pub turns: Vec<ConversationTurn>,
+}
+
 /// Read cap for `.rapidlm/todos.json`, well above the legitimate maximum
 /// (`MAX_TODOS` entries at `MAX_TODO_CONTENT_BYTES` each plus JSON
 /// overhead) so any realistically-written file always parses; an oversized
@@ -191,6 +198,9 @@ pub struct PreservedLiveContext {
     stall_warning: Option<String>,
     retrieved_context: Vec<CompileInput>,
     conversation: Vec<ConversationTurn>,
+    /// What an earlier compaction folded the turns before `conversation`
+    /// into — see [`Self::with_compaction_summary`].
+    compaction_summary: Option<String>,
 }
 
 impl PreservedLiveContext {
@@ -234,6 +244,7 @@ impl PreservedLiveContext {
             stall_warning: None,
             retrieved_context: Vec::new(),
             conversation: Vec::new(),
+            compaction_summary: None,
         })
     }
 
@@ -250,6 +261,28 @@ impl PreservedLiveContext {
 
     pub fn conversation(&self) -> &[ConversationTurn] {
         &self.conversation
+    }
+
+    /// Attach the summary an earlier compaction left of the turns before
+    /// [`Self::with_conversation`]'s — `context.compacted`'s own text. It
+    /// enters the packet ahead of the turns it stands for, kept in
+    /// preference to them under pressure, and switches the system prompt's
+    /// post-compaction section on. Empty or oversized text attaches
+    /// nothing: the summary is model output, and its bound is the
+    /// writer's (`MAX_COMPACTION_SUMMARY`), so exceeding it here means the
+    /// ledger carries something this build did not write.
+    pub fn with_compaction_summary(mut self, summary: Option<String>) -> Self {
+        let within_bounds = summary
+            .as_ref()
+            .is_none_or(|text| !text.is_empty() && text.len() <= MAX_COMPACTION_SUMMARY);
+        if within_bounds {
+            self.compaction_summary = summary;
+        }
+        self
+    }
+
+    pub fn compaction_summary(&self) -> Option<&str> {
+        self.compaction_summary.as_deref()
     }
 
     /// Attach proactively-retrieved repo content for this turn (Context
@@ -409,9 +442,14 @@ pub trait LiveModelCall {
 
 /// A [`ModelDriver`] bound to the host-owned live context. Reads the (possibly
 /// rebuilt) packet on every step, so overflow recovery changes what it sees.
+///
+/// The backing is shared with the [`LiveRecoveryController`], which needs
+/// the same model to write the summary an overflow recovery folds the
+/// conversation into. The two never run at once — the executor calls one
+/// or the other — so the `RefCell` is never contended.
 pub struct LiveContextModelDriver<B> {
     live: Rc<RefCell<LiveContext>>,
-    backing: B,
+    backing: Rc<RefCell<B>>,
 }
 
 impl<B: LiveModelCall> ModelDriver for LiveContextModelDriver<B> {
@@ -439,70 +477,123 @@ impl<B: LiveModelCall> ModelDriver for LiveContextModelDriver<B> {
             }
         }
         let live = self.live.borrow();
-        self.backing.step(live.packet().blocks(), input, cancel)
+        self.backing
+            .borrow_mut()
+            .step(live.packet().blocks(), input, cancel)
     }
 }
 
 /// Rebuilds the live context via the Context Fabric on a typed overflow.
-pub struct LiveRecoveryController {
+///
+/// The provider has refused the packet, so the compiler's own estimate —
+/// which admitted it — is what was wrong, and the only recovery that means
+/// anything is a packet that is genuinely smaller. Each recovery folds the
+/// largest optional content the packet still carries, in order: the
+/// conversation turns (and the earlier summary they follow) into one
+/// model-written summary; then the retrieved repo context, which the model
+/// can re-read with its tools; then the summary itself. Every step is
+/// checked against the packet it replaces and refused as `NotRecoverable`
+/// when it is not strictly smaller — the executor's retry bound caps the
+/// sequence, and a packet with nothing optional left is not recoverable at
+/// all rather than retried as it was.
+pub struct LiveRecoveryController<B> {
     live: Rc<RefCell<LiveContext>>,
+    backing: Rc<RefCell<B>>,
+    /// The turn's own token, set by [`LiveContextHost::execute`]: the
+    /// recovery's model call must stop when the turn does.
+    cancel: CancellationToken,
 }
 
-impl ContextController for LiveRecoveryController {
+/// What one overflow recovery does with the packet's optional content —
+/// one value, decided from what the packet still carries.
+enum RecoveryFold {
+    /// The turns (and any earlier summary) become a model-written summary;
+    /// if the model cannot write one, the earlier summary is kept and the
+    /// turns are dropped unsummarised.
+    Conversation,
+    /// No turns to fold: the retrieved context goes, the summary stays.
+    Retrieved,
+    /// Only the summary is left: it goes too.
+    Summary,
+    /// Nothing optional is in the packet.
+    Nothing,
+}
+
+impl<B: LiveModelCall> ContextController for LiveRecoveryController<B> {
     fn recover_from_overflow(&mut self, _request: ContextOverflow) -> ContextRecoveryDecision {
-        // Compact via compact_with_policy, not the raw compactor: this is the
-        // fail-closed post-compaction verification path — the replacement's
-        // re-estimated size is checked against the hard threshold before it
-        // is ever accepted, typed StillOverHard rather than a silent
-        // still-oversized summary. (Checking only the summary's own byte
-        // length, as before, doesn't verify shrinkage against the budget at
-        // all; that machinery existed in context-engine but had no caller.)
-        let new_summary = {
+        if self.cancel.is_cancelled() {
+            return ContextRecoveryDecision::Cancelled;
+        }
+        let (fold, before, prior, turns, context_limit, output_reserve) = {
             let live = self.live.borrow();
-            let hard_tokens = live
-                .preserved()
-                .context_limit
-                .saturating_sub(live.preserved().output_reserve)
-                .max(1);
-            let soft_tokens = hard_tokens.saturating_mul(4) / 5;
-            let soft_tokens = soft_tokens.clamp(1, hard_tokens.saturating_sub(1).max(1));
-            let policy = match CompactionPolicy::new(
-                soft_tokens,
-                hard_tokens,
-                CompactionStrategy::ModelPreferred,
-            ) {
-                Ok(policy) => policy,
-                Err(_) => return ContextRecoveryDecision::NotRecoverable,
-            };
-            let outcome = match compact_with_policy(live.packet(), &policy, None, &CeCancel::new())
-            {
-                Ok(outcome) => outcome,
-                Err(
-                    CompactPolicyError::StillOverHard { .. }
-                    | CompactPolicyError::InvalidPacket
-                    | CompactPolicyError::Cancelled,
-                ) => {
-                    return ContextRecoveryDecision::NotRecoverable;
-                }
-            };
-            let summary = outcome
-                .compacted
-                .as_ref()
-                .map(|compacted| compacted.summary().to_owned())
-                .unwrap_or_default();
-            if summary.is_empty() || summary.len() > MAX_COMPACTION_SUMMARY {
-                None
+            let preserved = live.preserved();
+            let prior = live
+                .summary()
+                .or(preserved.compaction_summary())
+                .map(str::to_owned);
+            let fold = if !preserved.conversation().is_empty() {
+                RecoveryFold::Conversation
+            } else if !preserved.retrieved_context().is_empty() {
+                RecoveryFold::Retrieved
+            } else if prior.is_some() {
+                RecoveryFold::Summary
             } else {
-                Some(summary)
+                RecoveryFold::Nothing
+            };
+            (
+                fold,
+                live.packet().partitions().included_tokens(),
+                prior,
+                preserved.conversation().to_vec(),
+                preserved.context_limit,
+                preserved.output_reserve,
+            )
+        };
+        let new_summary = match fold {
+            RecoveryFold::Nothing => return ContextRecoveryDecision::NotRecoverable,
+            RecoveryFold::Conversation => {
+                let summarised = summarize_conversation(
+                    &mut *self.backing.borrow_mut(),
+                    prior.as_deref(),
+                    &turns,
+                    context_limit,
+                    output_reserve,
+                    &self.cancel,
+                );
+                match summarised {
+                    Ok(summary) => Some(summary.text),
+                    Err(CompactionError::Model(ModelStepError::Cancelled)) => {
+                        return ContextRecoveryDecision::Cancelled;
+                    }
+                    // The model could not write the summary: the turns
+                    // are dropped unsummarised and whatever summary the
+                    // packet already carried stays — a smaller packet with
+                    // less history, the same trade the memory partition
+                    // makes under pressure, rather than a failed turn.
+                    Err(_) => prior,
+                }
             }
+            RecoveryFold::Retrieved => prior,
+            RecoveryFold::Summary => None,
         };
         let new_packet = {
-            let live = self.live.borrow();
-            match build_packet(live.preserved(), new_summary.as_deref()) {
+            let mut live = self.live.borrow_mut();
+            live.preserved.conversation.clear();
+            live.preserved.retrieved_context.clear();
+            // The carried summary has been folded in (or dropped); from
+            // here `live.summary` alone says what the packet carries.
+            live.preserved.compaction_summary = None;
+            match build_packet(&live.preserved, new_summary.as_deref()) {
                 Ok(packet) => packet,
                 Err(_) => return ContextRecoveryDecision::NotRecoverable,
             }
         };
+        // Fail closed on the rebuilt packet itself, not an estimate of it:
+        // a retry of something no smaller than what the provider refused
+        // is the silent no-op this exists to replace.
+        if new_packet.partitions().included_tokens() >= before {
+            return ContextRecoveryDecision::NotRecoverable;
+        }
         {
             let mut live = self.live.borrow_mut();
             live.packet = new_packet;
@@ -525,7 +616,7 @@ impl ContextController for LiveRecoveryController {
 pub struct LiveContextHost<B> {
     live: Rc<RefCell<LiveContext>>,
     model: LiveContextModelDriver<B>,
-    controller: LiveRecoveryController,
+    controller: LiveRecoveryController<B>,
     policy: ContextRetryPolicy,
 }
 
@@ -581,12 +672,15 @@ impl<B: LiveModelCall> LiveContextHost<B> {
             preserved,
             summary: None,
         }));
+        let backing = Rc::new(RefCell::new(backing));
         let model = LiveContextModelDriver {
             live: Rc::clone(&live),
-            backing,
+            backing: Rc::clone(&backing),
         };
         let controller = LiveRecoveryController {
             live: Rc::clone(&live),
+            backing,
+            cancel: CancellationToken::new(),
         };
         Ok(Self {
             live,
@@ -610,6 +704,7 @@ impl<B: LiveModelCall> LiveContextHost<B> {
         T: ToolDriver,
         E: TurnEventSink,
     {
+        self.controller.cancel = cancel.clone();
         TurnAgentExecutor.execute_with_context_recovery(
             request,
             &mut self.controller,
@@ -1611,8 +1706,27 @@ pub fn load_todos_index(root: &Path) -> Option<String> {
 /// earlier turn: `conversation/turn-<n>`, `n` counting from the oldest kept.
 pub const CONVERSATION_LOCATOR_PREFIX: &str = "conversation/turn-";
 
+/// Locator of the compaction-summary block: the one memory block that
+/// stands for every turn older than the `conversation/` blocks.
+pub const COMPACTION_LOCATOR: &str = "context/compaction";
+
+/// Locator of the short system block that tells the model its history is a
+/// summary — present exactly when [`COMPACTION_LOCATOR`]'s block is.
+pub const POST_COMPACTION_LOCATOR: &str = "system/post-compaction";
+
+/// The summary block's score: above the compiler's default for a memory
+/// block (300, what a conversation turn gets), so under pressure the
+/// summary outlives any one turn and, within the partition, reads before
+/// them. A score of 0 would mean "use the default", not "lowest".
+const COMPACTION_SUMMARY_SCORE: u32 = 400;
+
 /// Compile a live [`ContextPacket`] from preserved state + optional compaction
 /// summary. This is the single Context-Fabric rebuild path.
+///
+/// `summary` is the summary an in-turn overflow recovery produced, and it
+/// supersedes the one the preserved context carried in from the ledger
+/// (the recovery summarised that one along with the turns): `None` here
+/// means "whatever was carried", not "none".
 ///
 /// The session's earlier turns go in as one memory block each, in order.
 /// Memory is an optional partition, so under pressure the compiler drops
@@ -1680,9 +1794,24 @@ fn build_packet_with(
         ctx = ctx.goal_block(CompileInput::new("criterion", criterion.clone()));
     }
     if let Some(summary) = summary
-        && !summary.is_empty()
+        .or(preserved.compaction_summary())
+        .filter(|text| !text.is_empty())
     {
-        ctx = ctx.memory(CompileInput::new("context/compaction", summary.to_owned()));
+        // Ahead of the turns it stands for (the compiler orders equal-
+        // source blocks by score, then input order) and kept in preference
+        // to them under pressure: one summary of the older history is
+        // worth more than any one of the newer turns.
+        ctx = ctx.memory(
+            CompileInput::new(COMPACTION_LOCATOR, summary.to_owned())
+                .score(COMPACTION_SUMMARY_SCORE),
+        );
+        ctx = ctx.system(CompileInput::new(
+            POST_COMPACTION_LOCATOR,
+            format!(
+                "## After compaction\n{}",
+                agent_runtime::POST_COMPACTION_SYSTEM_PROMPT
+            ),
+        ));
     }
     if let Some(reminders) = preserved.reminders_block() {
         ctx = ctx.system(CompileInput::new("reminders/active", reminders.to_owned()));
@@ -1697,6 +1826,238 @@ fn build_packet_with(
         ctx = ctx.retrieved(block.clone());
     }
     compile(&ctx)
+}
+
+/// What the compaction model call is told. The history follows as the
+/// request's remaining messages; the reply is the summary and nothing else.
+const COMPACTION_INSTRUCTIONS: &str = "\
+You are compacting the history of a coding-agent session so the agent can \
+continue with a summary in place of the transcript. After this instruction \
+come the messages that make up that history: an earlier summary, if one \
+exists, then the turns since it, each as what the user asked and how the \
+turn ended.
+Write one summary that preserves, in this order: what the user wants overall \
+and every constraint or preference they stated; what was done, naming the \
+files, commands and results that matter; decisions and their reasons; what is \
+unresolved, including questions the user has not answered; and what the next \
+step was going to be. Keep identifiers (paths, names, error messages, \
+numbers) exact. Do not invent, do not editorialise, do not address the user. \
+Reply with the summary only, as plain text, in under 600 words.";
+
+/// The user-role request the history is attached to.
+const COMPACTION_TASK: &str =
+    "Summarise the session history that follows, as instructed. Reply with the summary only.";
+
+/// What one compaction produced and cost.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompactionSummary {
+    pub text: String,
+    /// Turns the summary folded in (not counting the earlier summary).
+    pub turns: usize,
+    pub tokens: u64,
+    pub cost_usd_micros: Option<u64>,
+}
+
+/// Why a compaction produced no summary. Display never echoes history text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompactionError {
+    /// No turns and no earlier summary: there is nothing to fold.
+    NothingToCompact,
+    /// Not even the newest turn fits the model's window beside the
+    /// instructions.
+    Compile(CompileError),
+    /// The model step failed; the step's own typed error.
+    Model(ModelStepError),
+    /// The model answered with no text, or with tool calls where none were
+    /// offered.
+    NoSummary,
+}
+
+impl std::fmt::Display for CompactionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NothingToCompact => f.write_str("nothing to compact"),
+            Self::Compile(err) => write!(f, "history does not fit the model's window ({err})"),
+            Self::Model(ModelStepError::Cancelled) => f.write_str("cancelled"),
+            Self::Model(ModelStepError::ProviderFailed { cause }) => {
+                write!(f, "the model call failed ({})", cause_tag(*cause))
+            }
+            Self::Model(err) => write!(f, "the model call failed ({err})"),
+            Self::NoSummary => f.write_str("the model returned no summary"),
+        }
+    }
+}
+
+impl std::error::Error for CompactionError {}
+
+/// Fold `turns` (and the earlier summary they follow, if any) into one
+/// summary with a single model call — the one summarizer, run by `/compact`
+/// and by the in-turn overflow recovery alike.
+///
+/// The request is compiled through the same compiler a turn's packet is,
+/// with the whole leftover budget given to the history: when it still does
+/// not fit, the oldest turns are left out first, the same suffix rule
+/// `build_packet` applies. Whatever is left out is lost to the summary —
+/// it did not fit the window, so no summary could have covered it.
+///
+/// The reply is trimmed and capped at [`MAX_COMPACTION_SUMMARY`] bytes on a
+/// character boundary. `tokens`/`cost_usd_micros` are the step's own; the
+/// caller accounts for them exactly once.
+pub fn summarize_conversation<B: LiveModelCall>(
+    backing: &mut B,
+    prior_summary: Option<&str>,
+    turns: &[ConversationTurn],
+    context_limit: u32,
+    output_reserve: u32,
+    cancel: &CancellationToken,
+) -> Result<CompactionSummary, CompactionError> {
+    let prior_summary = prior_summary.filter(|text| !text.is_empty());
+    if turns.is_empty() && prior_summary.is_none() {
+        return Err(CompactionError::NothingToCompact);
+    }
+    if cancel.is_cancelled() {
+        return Err(CompactionError::Model(ModelStepError::Cancelled));
+    }
+    let mut skip_oldest = 0;
+    let packet = loop {
+        let packet = compile_compaction_request(
+            prior_summary,
+            turns,
+            skip_oldest,
+            context_limit,
+            output_reserve,
+        )
+        .map_err(CompactionError::Compile)?;
+        let dropped_turn = packet
+            .dropped()
+            .iter()
+            .any(|block| block.locator().starts_with(CONVERSATION_LOCATOR_PREFIX));
+        if !dropped_turn || skip_oldest >= turns.len() {
+            break packet;
+        }
+        skip_oldest += 1;
+    };
+    // Every turn dropped, and the earlier summary with it (or there was
+    // none): the request would carry no history at all — the instructions
+    // alone used the window, which is what the compiler's own variant for
+    // an over-budget mandatory set names.
+    let carries_history = packet
+        .blocks()
+        .iter()
+        .any(|block| block.source() == context_engine::compile::ContextSource::Memory);
+    if !carries_history {
+        return Err(CompactionError::Compile(
+            CompileError::MandatoryExceedsBudget,
+        ));
+    }
+    let output = backing
+        .step(packet.blocks(), &ModelStepInput::without_tools(0), cancel)
+        .map_err(CompactionError::Model)?;
+    let (text, tokens, cost_usd_micros) = match output {
+        ModelStepOutput::Terminal {
+            text,
+            tokens,
+            cost_usd_micros,
+        } => (text, tokens, cost_usd_micros),
+        // Tool calls, where none were offered: not a summary.
+        ModelStepOutput::ToolCalls { .. } => return Err(CompactionError::NoSummary),
+    };
+    let text = bounded_summary(text.trim());
+    if text.is_empty() {
+        return Err(CompactionError::NoSummary);
+    }
+    Ok(CompactionSummary {
+        text,
+        turns: turns.len().saturating_sub(skip_oldest),
+        tokens,
+        cost_usd_micros,
+    })
+}
+
+/// The compaction request: instructions, the earlier summary, then the
+/// turns from `skip_oldest` on — the memory partition given the whole
+/// leftover budget, since the history is the request.
+fn compile_compaction_request(
+    prior_summary: Option<&str>,
+    turns: &[ConversationTurn],
+    skip_oldest: usize,
+    context_limit: u32,
+    output_reserve: u32,
+) -> Result<ContextPacket, CompileError> {
+    let limits = context_engine::compile::CompileLimits::new()
+        .retrieved_share_bps(0)
+        .memory_share_bps(10_000)
+        .read_set_share_bps(0);
+    let mut ctx = CompileContext::new(context_limit, output_reserve)
+        .limits(limits)
+        .system(CompileInput::new(
+            "system/compaction",
+            COMPACTION_INSTRUCTIONS.to_owned(),
+        ))
+        .task(COMPACTION_TASK);
+    if let Some(prior) = prior_summary {
+        ctx = ctx.memory(
+            CompileInput::new(COMPACTION_LOCATOR, prior.to_owned()).score(COMPACTION_SUMMARY_SCORE),
+        );
+    }
+    for (index, turn) in turns.iter().enumerate().skip(skip_oldest) {
+        ctx = ctx.memory(CompileInput::new(
+            format!("{CONVERSATION_LOCATOR_PREFIX}{index}"),
+            turn.render(),
+        ));
+    }
+    compile(&ctx)
+}
+
+/// Cap a summary at [`MAX_COMPACTION_SUMMARY`] bytes without splitting a
+/// character. The instructions ask for far less; this is the ceiling.
+fn bounded_summary(text: &str) -> String {
+    if text.len() <= MAX_COMPACTION_SUMMARY {
+        return text.to_owned();
+    }
+    let mut end = MAX_COMPACTION_SUMMARY;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+/// Production entry for `/compact`: the summarizer behind the same
+/// supervised step layer a turn's model calls go through (bounded transient
+/// retries, `--verbose` diagnostics), so a rate-limited provider is retried
+/// here exactly as it is mid-turn, and the tokens the call cost are reported
+/// once, in the result.
+pub fn run_live_compaction<B: LiveModelCall>(
+    backing: B,
+    history: &ConversationHistory,
+    context_limit: u32,
+    output_reserve: u32,
+    cancel: &CancellationToken,
+    diag: Option<StepDiag>,
+) -> Result<CompactionSummary, CompactionError> {
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let cost = CostAccumulator::new();
+    let mut supervised = SupervisedModel {
+        inner: backing,
+        counter: std::sync::Arc::clone(&counter),
+        cost: cost.clone(),
+        diag,
+    };
+    let summary = summarize_conversation(
+        &mut supervised,
+        history.summary.as_deref(),
+        &history.turns,
+        context_limit,
+        output_reserve,
+        cancel,
+    )?;
+    // The supervised layer's own tally, not the step's: a retried step
+    // costs every attempt.
+    Ok(CompactionSummary {
+        tokens: counter.load(std::sync::atomic::Ordering::Relaxed),
+        cost_usd_micros: cost.total(),
+        ..summary
+    })
 }
 
 #[cfg(test)]
@@ -1871,13 +2232,26 @@ mod tests {
     struct ScriptedBacking {
         outputs: Rc<RefCell<VecDeque<Result<ModelStepOutput, ModelStepError>>>>,
         saw_blocks: Rc<RefCell<Vec<usize>>>,
+        /// Every step's blocks as `(locator, text)`, one entry per step —
+        /// what the model was actually handed, so a test can say what a
+        /// recovery or a compaction put in front of it.
+        seen: SeenBlocks,
     }
+
+    /// One `(locator, text)` list per step.
+    type SeenBlocks = Rc<RefCell<Vec<Vec<(String, String)>>>>;
     impl ScriptedBacking {
         fn new(outputs: Vec<Result<ModelStepOutput, ModelStepError>>) -> Self {
             Self {
                 outputs: Rc::new(RefCell::new(outputs.into())),
                 saw_blocks: Rc::new(RefCell::new(Vec::new())),
+                seen: Rc::new(RefCell::new(Vec::new())),
             }
+        }
+
+        /// The `(locator, text)` blocks of step `index` (0-based).
+        fn step_blocks(&self, index: usize) -> Vec<(String, String)> {
+            self.seen.borrow().get(index).cloned().unwrap_or_default()
         }
     }
     impl Clone for ScriptedBacking {
@@ -1885,6 +2259,7 @@ mod tests {
             Self {
                 outputs: Rc::clone(&self.outputs),
                 saw_blocks: Rc::clone(&self.saw_blocks),
+                seen: Rc::clone(&self.seen),
             }
         }
     }
@@ -1899,6 +2274,12 @@ mod tests {
                 return Err(ModelStepError::Cancelled);
             }
             self.saw_blocks.borrow_mut().push(blocks.len());
+            self.seen.borrow_mut().push(
+                blocks
+                    .iter()
+                    .map(|block| (block.locator().to_owned(), block.text().to_owned()))
+                    .collect(),
+            );
             self.outputs
                 .borrow_mut()
                 .pop_front()
@@ -2406,7 +2787,7 @@ mod tests {
         ]);
         let mut driver = LiveContextModelDriver {
             live: Rc::clone(&live),
-            backing,
+            backing: Rc::new(RefCell::new(backing)),
         };
 
         // No history yet: no stall block.
@@ -2683,26 +3064,503 @@ mod tests {
         );
     }
 
+    fn ok(text: &str) -> Result<ModelStepOutput, ModelStepError> {
+        Ok(ModelStepOutput::Terminal {
+            text: text.to_owned(),
+            tokens: 1,
+            cost_usd_micros: None,
+        })
+    }
+
+    fn locators(blocks: &[(String, String)]) -> Vec<&str> {
+        blocks.iter().map(|(locator, _)| locator.as_str()).collect()
+    }
+
+    fn with_history(turns: usize) -> PreservedLiveContext {
+        preserved().with_conversation(conversation_of(turns, 40))
+    }
+
     #[test]
-    fn overflow_rebuilds_live_context_and_recovers() {
-        let host = LiveContextHost::build(
-            preserved(),
-            overflow_then_terminal("after rebuild"),
-            ContextRetryPolicy::new(2),
-        )
-        .expect("host");
-        let result = run_session(host).expect("execute").result;
-        assert_eq!(
-            result.status(),
-            agent_runtime::AgentTerminalStatus::Succeeded
+    fn a_carried_summary_enters_the_packet_ahead_of_the_turns_with_the_post_compaction_prompt() {
+        let preserved =
+            with_history(2).with_compaction_summary(Some("what came before".to_owned()));
+        let packet = build_packet(&preserved, None).expect("packet");
+        let locators: Vec<&str> = packet.blocks().iter().map(|b| b.locator()).collect();
+        let summary_at = locators
+            .iter()
+            .position(|l| *l == COMPACTION_LOCATOR)
+            .expect("summary block");
+        let first_turn_at = locators
+            .iter()
+            .position(|l| l.starts_with(CONVERSATION_LOCATOR_PREFIX))
+            .expect("turn block");
+        assert!(
+            summary_at < first_turn_at,
+            "the summary stands for the older history, so it reads first: {locators:?}"
         );
+        let post = packet
+            .blocks()
+            .iter()
+            .find(|b| b.locator() == POST_COMPACTION_LOCATOR)
+            .expect("post-compaction system block");
+        assert_eq!(
+            post.source(),
+            context_engine::compile::ContextSource::System
+        );
+        assert!(
+            post.text()
+                .contains(agent_runtime::POST_COMPACTION_SYSTEM_PROMPT)
+        );
+
+        // A recovery's own summary supersedes the carried one.
+        let packet = build_packet(&preserved, Some("newer")).expect("packet");
+        let texts: Vec<&str> = packet
+            .blocks()
+            .iter()
+            .filter(|b| b.locator() == COMPACTION_LOCATOR)
+            .map(|b| b.text())
+            .collect();
+        assert_eq!(texts, vec!["newer"]);
+
+        // No summary: neither block.
+        let packet = build_packet(&with_history(2), None).expect("packet");
+        assert!(
+            packet.blocks().iter().all(
+                |b| b.locator() != COMPACTION_LOCATOR && b.locator() != POST_COMPACTION_LOCATOR
+            )
+        );
+
+        // Bounds: empty and oversized summaries attach nothing.
+        assert_eq!(
+            preserved
+                .clone()
+                .with_compaction_summary(Some(String::new()))
+                .compaction_summary(),
+            Some("what came before")
+        );
+        assert_eq!(
+            preserved
+                .clone()
+                .with_compaction_summary(Some("x".repeat(MAX_COMPACTION_SUMMARY + 1)))
+                .compaction_summary(),
+            Some("what came before")
+        );
+        assert_eq!(
+            preserved.with_compaction_summary(None).compaction_summary(),
+            None
+        );
+    }
+
+    #[test]
+    fn summarize_conversation_sends_the_history_and_returns_the_reply() {
+        let backing = ScriptedBacking::new(vec![Ok(ModelStepOutput::Terminal {
+            text: "  Nightjar; tests still red.  ".to_owned(),
+            tokens: 77,
+            cost_usd_micros: Some(5),
+        })]);
+        let turns = conversation_of(2, 3);
+        let summary = summarize_conversation(
+            &mut backing.clone(),
+            Some("earlier"),
+            &turns,
+            8192,
+            256,
+            &CancellationToken::new(),
+        )
+        .expect("summary");
+        assert_eq!(summary.text, "Nightjar; tests still red.");
+        assert_eq!(summary.turns, 2);
+        assert_eq!((summary.tokens, summary.cost_usd_micros), (77, Some(5)));
+
+        let request = backing.step_blocks(0);
+        let locators = locators(&request);
+        let earlier_at = locators
+            .iter()
+            .position(|l| *l == COMPACTION_LOCATOR)
+            .expect("earlier summary in the request");
+        let turn0_at = locators
+            .iter()
+            .position(|l| *l == "conversation/turn-0")
+            .expect("turn 0");
+        let turn1_at = locators
+            .iter()
+            .position(|l| *l == "conversation/turn-1")
+            .expect("turn 1");
+        assert!(earlier_at < turn0_at && turn0_at < turn1_at, "{locators:?}");
+        assert!(
+            request
+                .iter()
+                .any(|(l, t)| l == "system/compaction" && t.contains("Reply with the summary only")),
+            "{locators:?}"
+        );
+        assert!(
+            request.iter().any(|(_, t)| t.contains("turn 1 question")),
+            "the turns go in as the model would see them on a turn"
+        );
+    }
+
+    #[test]
+    fn summarize_conversation_refuses_nothing_and_a_reply_that_is_not_a_summary() {
+        let mut nothing = ScriptedBacking::new(vec![ok("unused")]);
+        assert_eq!(
+            summarize_conversation(
+                &mut nothing,
+                None,
+                &[],
+                8192,
+                256,
+                &CancellationToken::new()
+            ),
+            Err(CompactionError::NothingToCompact)
+        );
+        assert!(
+            nothing.seen.borrow().is_empty(),
+            "no model call for nothing"
+        );
+
+        let call = ProposedToolCall::new("c1", "repo_read", "{}").expect("call");
+        let mut tools = ScriptedBacking::new(vec![Ok(ModelStepOutput::ToolCalls {
+            calls: vec![call],
+            tokens: 1,
+            cost_usd_micros: None,
+        })]);
+        assert_eq!(
+            summarize_conversation(
+                &mut tools,
+                None,
+                &conversation_of(1, 2),
+                8192,
+                256,
+                &CancellationToken::new()
+            ),
+            Err(CompactionError::NoSummary)
+        );
+
+        let mut blank = ScriptedBacking::new(vec![ok("   \n ")]);
+        assert_eq!(
+            summarize_conversation(
+                &mut blank,
+                None,
+                &conversation_of(1, 2),
+                8192,
+                256,
+                &CancellationToken::new()
+            ),
+            Err(CompactionError::NoSummary)
+        );
+
+        let mut failing = ScriptedBacking::new(vec![Err(ModelStepError::Failed)]);
+        assert_eq!(
+            summarize_conversation(
+                &mut failing,
+                None,
+                &conversation_of(1, 2),
+                8192,
+                256,
+                &CancellationToken::new()
+            ),
+            Err(CompactionError::Model(ModelStepError::Failed))
+        );
+    }
+
+    #[test]
+    fn summarize_conversation_leaves_the_oldest_turns_out_when_they_do_not_fit() {
+        // A tiny window: the newest turns still get summarised, the oldest
+        // are left out — a suffix, the same rule the turn packet applies —
+        // and the count reports what was actually folded.
+        let backing = ScriptedBacking::new(vec![ok("summary")]);
+        let turns = conversation_of(6, 40);
+        let summary = summarize_conversation(
+            &mut backing.clone(),
+            None,
+            &turns,
+            1_400,
+            64,
+            &CancellationToken::new(),
+        )
+        .expect("summary");
+        let carried: Vec<usize> = backing
+            .step_blocks(0)
+            .iter()
+            .filter_map(|(l, _)| l.strip_prefix(CONVERSATION_LOCATOR_PREFIX)?.parse().ok())
+            .collect();
+        assert!(!carried.is_empty() && carried.len() < 6, "{carried:?}");
+        let expected: Vec<usize> = (6 - carried.len()..6).collect();
+        assert_eq!(carried, expected, "a suffix of the history, newest kept");
+        assert_eq!(summary.turns, carried.len());
+    }
+
+    #[test]
+    fn a_summary_is_capped_on_a_character_boundary() {
+        let long = "é".repeat(MAX_COMPACTION_SUMMARY);
+        let capped = bounded_summary(&long);
+        assert!(capped.len() <= MAX_COMPACTION_SUMMARY);
+        assert!(capped.chars().all(|c| c == 'é'));
+        assert_eq!(bounded_summary("short"), "short");
+    }
+
+    #[test]
+    fn run_live_compaction_counts_the_tokens_of_every_attempt() {
+        // Through the supervised layer, a transient failure is retried and
+        // the reported tokens are the tally of what the call cost.
+        let backing = ScriptedBacking::new(vec![
+            Err(ModelStepError::ProviderFailed {
+                cause: FailureCause::Transient {
+                    retry_after_ms: None,
+                },
+            }),
+            Ok(ModelStepOutput::Terminal {
+                text: "summary".to_owned(),
+                tokens: 40,
+                cost_usd_micros: Some(3),
+            }),
+        ]);
+        let history = ConversationHistory {
+            summary: None,
+            turns: conversation_of(1, 2),
+        };
+        let summary = run_live_compaction(
+            backing.clone(),
+            &history,
+            8192,
+            256,
+            &CancellationToken::new(),
+            None,
+        )
+        .expect("summary");
+        assert_eq!(summary.text, "summary");
+        assert_eq!((summary.tokens, summary.cost_usd_micros), (40, Some(3)));
+        assert_eq!(backing.seen.borrow().len(), 2, "retried once");
+    }
+
+    #[test]
+    fn overflow_folds_the_conversation_into_a_summary_the_model_wrote() {
+        // The provider refused the packet. The recovery asks the same model
+        // to summarise the session's earlier turns, and the retried step
+        // is handed that summary where the turns were — a packet that is
+        // genuinely smaller, not the same one plus a stats line.
+        let backing = ScriptedBacking::new(vec![
+            Err(ModelStepError::BoundExceeded),
+            ok("The user named the project Nightjar and asked for tests."),
+            ok("after rebuild"),
+        ]);
+        let host =
+            LiveContextHost::build(with_history(3), backing.clone(), ContextRetryPolicy::new(2))
+                .expect("host");
+        let result = run_session(host).expect("execute").result;
         assert_eq!(result.summary(), "after rebuild");
-        // Lineage records the recovery transition without raw context contents.
         assert_eq!(result.context_lineage().len(), 1);
         assert_eq!(
             result.context_lineage()[0].source(),
             "context/live-recovery"
         );
+
+        let refused = backing.step_blocks(0);
+        assert_eq!(
+            locators(&refused)
+                .iter()
+                .filter(|l| l.starts_with(CONVERSATION_LOCATOR_PREFIX))
+                .count(),
+            3,
+            "the refused packet carried the turns: {:?}",
+            locators(&refused)
+        );
+
+        let summarising = backing.step_blocks(1);
+        assert!(
+            summarising.iter().any(|(l, t)| l == "system/compaction" && t.contains("Reply with the summary only")),
+            "the second call is the compaction request: {:?}",
+            locators(&summarising)
+        );
+        assert_eq!(
+            locators(&summarising)
+                .iter()
+                .filter(|l| l.starts_with(CONVERSATION_LOCATOR_PREFIX))
+                .count(),
+            3,
+            "and it carries every turn to summarise"
+        );
+        assert!(
+            summarising
+                .iter()
+                .all(|(l, _)| l != "rules/agents" && l != "criterion"),
+            "the compaction request is the history and the instructions, not the turn's packet: {:?}",
+            locators(&summarising)
+        );
+
+        let retried = backing.step_blocks(2);
+        let summary = retried
+            .iter()
+            .find(|(l, _)| l == COMPACTION_LOCATOR)
+            .map(|(_, t)| t.as_str());
+        assert_eq!(
+            summary,
+            Some("The user named the project Nightjar and asked for tests."),
+            "the retried step sees the summary: {:?}",
+            locators(&retried)
+        );
+        assert!(
+            retried
+                .iter()
+                .all(|(l, _)| !l.starts_with(CONVERSATION_LOCATOR_PREFIX)),
+            "and none of the turns it stands for: {:?}",
+            locators(&retried)
+        );
+        assert!(
+            retried
+                .iter()
+                .any(|(l, t)| l == POST_COMPACTION_LOCATOR && t.contains("summary")),
+            "and is told its history is a summary: {:?}",
+            locators(&retried)
+        );
+        assert!(
+            retried.iter().any(|(l, _)| l == "rules/agents")
+                && retried.iter().any(|(l, _)| l == "task"),
+            "everything mandatory survives the rebuild: {:?}",
+            locators(&retried)
+        );
+    }
+
+    #[test]
+    fn an_overflow_with_nothing_optional_to_fold_is_not_recoverable() {
+        // No turns, no retrieved context, no summary: a rebuild would be
+        // the packet the provider just refused. That was retried as-is
+        // until the bound ran out; now it is refused outright, as what it
+        // is.
+        let host = LiveContextHost::build(
+            preserved(),
+            overflow_then_terminal("never"),
+            ContextRetryPolicy::new(2),
+        )
+        .expect("host");
+        let err = run_session(host).expect_err("not recoverable");
+        assert_eq!(
+            err,
+            AgentExecutionError::ContextRecovery(
+                agent_runtime::ContextRecoveryError::NotRecoverable
+            )
+        );
+    }
+
+    #[test]
+    fn a_fold_that_does_not_shrink_the_packet_is_not_recoverable() {
+        // One tiny turn, and a model that answers the compaction request
+        // with a summary longer than the turn it replaces: the rebuilt
+        // packet is bigger than the one the provider refused, and sending
+        // it would be the silent no-op retry this recovery exists to end.
+        let backing = ScriptedBacking::new(vec![
+            Err(ModelStepError::BoundExceeded),
+            ok(&"long summary ".repeat(300)),
+            ok("never sent"),
+        ]);
+        let tiny = preserved().with_conversation(vec![ConversationTurn::new(
+            "hi",
+            ConversationOutcome::Answered(Some("yo".to_owned())),
+        )]);
+        let host = LiveContextHost::build(tiny, backing.clone(), ContextRetryPolicy::new(2))
+            .expect("host");
+        let err = run_session(host).expect_err("not recoverable");
+        assert_eq!(
+            err,
+            AgentExecutionError::ContextRecovery(
+                agent_runtime::ContextRecoveryError::NotRecoverable
+            )
+        );
+        assert_eq!(
+            backing.seen.borrow().len(),
+            2,
+            "the refused step and the compaction call; no retry of a bigger packet"
+        );
+    }
+
+    #[test]
+    fn a_summarizer_failure_drops_the_turns_and_keeps_the_summary_already_carried() {
+        // The model could not write the summary (a provider failure on the
+        // compaction call). The turns still go — a smaller packet with
+        // less history beats a failed turn, the trade the memory partition
+        // already makes — and the summary the session carried in from an
+        // earlier compaction stays, since it is the only account of the
+        // older history left.
+        let backing = ScriptedBacking::new(vec![
+            Err(ModelStepError::BoundExceeded),
+            Err(ModelStepError::Failed),
+            ok("after rebuild"),
+        ]);
+        let preserved = with_history(2).with_compaction_summary(Some("older summary".to_owned()));
+        let host = LiveContextHost::build(preserved, backing.clone(), ContextRetryPolicy::new(2))
+            .expect("host");
+        let result = run_session(host).expect("execute").result;
+        assert_eq!(result.summary(), "after rebuild");
+        let retried = backing.step_blocks(2);
+        assert_eq!(
+            retried
+                .iter()
+                .find(|(l, _)| l == COMPACTION_LOCATOR)
+                .map(|(_, t)| t.as_str()),
+            Some("older summary")
+        );
+        assert!(
+            retried
+                .iter()
+                .all(|(l, _)| !l.starts_with(CONVERSATION_LOCATOR_PREFIX)),
+            "{:?}",
+            locators(&retried)
+        );
+    }
+
+    #[test]
+    fn a_cancelled_summarizer_call_ends_the_turn_as_cancelled() {
+        // Ctrl-C while the recovery's compaction call is out: the turn ends
+        // as cancelled, not as a context-recovery failure with a reason
+        // nobody asked for.
+        let cancel = CancellationToken::new();
+        let cancel_on_second_step = {
+            let cancel = cancel.clone();
+            move |step: usize| {
+                if step == 1 {
+                    cancel.cancel();
+                }
+            }
+        };
+        struct CancelOnStep<F: FnMut(usize)> {
+            inner: ScriptedBacking,
+            steps: usize,
+            hook: F,
+        }
+        impl<F: FnMut(usize)> LiveModelCall for CancelOnStep<F> {
+            fn step(
+                &mut self,
+                blocks: &[ContextBlock],
+                input: &ModelStepInput<'_>,
+                cancel: &CancellationToken,
+            ) -> Result<ModelStepOutput, ModelStepError> {
+                (self.hook)(self.steps);
+                self.steps += 1;
+                self.inner.step(blocks, input, cancel)
+            }
+        }
+        let backing = CancelOnStep {
+            inner: ScriptedBacking::new(vec![
+                Err(ModelStepError::BoundExceeded),
+                ok("never"),
+                ok("never"),
+            ]),
+            steps: 0,
+            hook: cancel_on_second_step,
+        };
+        let mut host = LiveContextHost::build(with_history(2), backing, ContextRetryPolicy::new(2))
+            .expect("host");
+        let request = AgentExecutionRequest::new(spec(), SessionId::new());
+        let mut events = Vec::new();
+        let err = host
+            .execute(
+                &request,
+                &mut CountingTools { executed: 0 },
+                &mut events,
+                &cancel,
+            )
+            .expect_err("cancelled");
+        assert_eq!(err, AgentExecutionError::Cancelled);
     }
 
     #[test]
@@ -2724,18 +3582,28 @@ mod tests {
 
     #[test]
     fn repeated_overflow_fails_closed_with_typed_limit() {
-        let host = LiveContextHost::build(
-            preserved(),
-            ScriptedBacking::new(vec![
-                Err(ModelStepError::BoundExceeded),
-                Err(ModelStepError::BoundExceeded),
-                Err(ModelStepError::BoundExceeded),
-            ]),
-            ContextRetryPolicy::new(2),
-        )
-        .expect("host");
+        // Each recovery makes the packet strictly smaller — the turns
+        // become a summary, then the summary goes — and the executor's
+        // bound still caps the sequence.
+        let backing = ScriptedBacking::new(vec![
+            Err(ModelStepError::BoundExceeded),
+            ok("summary"),
+            Err(ModelStepError::BoundExceeded),
+            Err(ModelStepError::BoundExceeded),
+        ]);
+        let host =
+            LiveContextHost::build(with_history(2), backing.clone(), ContextRetryPolicy::new(2))
+                .expect("host");
         let err = run_session(host).expect_err("bounded stop");
         assert_eq!(err, AgentExecutionError::ContextRetryExceeded);
+        let last = backing.step_blocks(3);
+        assert!(
+            last.iter().all(
+                |(l, _)| l != COMPACTION_LOCATOR && !l.starts_with(CONVERSATION_LOCATOR_PREFIX)
+            ),
+            "the second recovery dropped the summary too: {:?}",
+            locators(&last)
+        );
     }
 
     #[test]
@@ -2826,8 +3694,12 @@ mod tests {
         let request = AgentExecutionRequest::new(spec(), SessionId::new());
         let mut events = Vec::new();
         let outcome = run_live_exec(
-            preserved(),
-            overflow_then_terminal("wired recovery"),
+            with_history(1),
+            ScriptedBacking::new(vec![
+                Err(ModelStepError::BoundExceeded),
+                ok("summary"),
+                ok("wired recovery"),
+            ]),
             &request,
             &mut CountingTools { executed: 0 },
             &mut events,
@@ -2838,8 +3710,8 @@ mod tests {
         .expect("execute");
         assert_eq!(outcome.result.summary(), "wired recovery");
         assert_eq!(
-            outcome.tokens, 1,
-            "terminal step's provider tokens are reported"
+            outcome.tokens, 2,
+            "the recovery's summary call and the terminal step are both counted, once each"
         );
         assert_eq!(outcome.failure_cause, None, "success carries no cause");
         assert_eq!(outcome.result.context_lineage().len(), 1);
@@ -2884,13 +3756,15 @@ mod tests {
     fn transient_step_failure_retries_then_succeeds() {
         let request = AgentExecutionRequest::new(spec(), SessionId::new());
         let mut events = Vec::new();
-        // Sequence: transient blip → context overflow (recovery) → terminal ok.
+        // Sequence: transient blip → context overflow (recovery: the
+        // conversation is summarised) → terminal ok.
         let mut outputs = vec![Err(ModelStepError::ProviderFailed {
             cause: FailureCause::Transient {
                 retry_after_ms: None,
             },
         })];
         outputs.push(Err(ModelStepError::BoundExceeded));
+        outputs.push(ok("summary"));
         outputs.push(Ok(ModelStepOutput::Terminal {
             text: "after transient blip".to_owned(),
             tokens: 2,
@@ -2899,7 +3773,7 @@ mod tests {
         let backing = ScriptedBacking::new(outputs);
         let witness = backing.clone();
         let outcome = run_live_exec(
-            preserved(),
+            with_history(1),
             backing,
             &request,
             &mut CountingTools { executed: 0 },
@@ -2917,10 +3791,10 @@ mod tests {
         assert_eq!(outcome.failure_cause, None);
         assert_eq!(
             witness.saw_blocks.borrow().len(),
-            3,
-            "transient step retried (plus one context recovery)"
+            4,
+            "transient step retried, plus the recovery's summary call"
         );
-        assert_eq!(outcome.tokens, 2);
+        assert_eq!(outcome.tokens, 3, "the summary call's token counted once");
     }
 
     #[test]

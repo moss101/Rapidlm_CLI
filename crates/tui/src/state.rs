@@ -391,6 +391,15 @@ pub enum TranscriptEntry {
     CommandError {
         text: String,
     },
+    /// The session's earlier turns were folded into a summary
+    /// (`context.compacted`): `turns` is how many, `summary` is what the
+    /// model will remember of them from now on. Its own variant, not
+    /// [`Self::Assistant`] — the summary is model output but not a reply —
+    /// and not [`Self::CommandOutput`], which is never model output.
+    Compacted {
+        turns: u64,
+        summary: String,
+    },
 }
 
 /// One tool call's lifecycle, as reflected into the transcript. Not the
@@ -797,6 +806,16 @@ fn apply_kernel(
         }
         EventKind::TurnInterrupted => {
             push_transcript(&mut state, TranscriptEntry::TurnInterrupted);
+        }
+        EventKind::ContextCompacted => {
+            // The summary is what the model carries from here; showing it
+            // is how the user learns what was kept. Bounded and redaction-
+            // aware through the same accessor every other displayed field
+            // uses; a compaction with no displayable summary shows nothing.
+            if let Some(summary) = optional_display(event, event.payload(), "summary")? {
+                let turns = optional_u64(event.payload(), "turns")?.unwrap_or(0);
+                push_transcript(&mut state, TranscriptEntry::Compacted { turns, summary });
+            }
         }
         _ => {}
     }
@@ -2220,6 +2239,47 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_context_compacted_event_puts_the_summary_in_the_transcript() {
+        let state = reduce(AppState::new(), &created());
+        let compacted = |seq, payload| {
+            UiEvent::Kernel(envelope(
+                seq,
+                EventKind::ContextCompacted,
+                UPDATED_AT,
+                payload,
+            ))
+        };
+        let state = reduce(
+            state,
+            &compacted(
+                2,
+                serde_json::json!({"summary": "Named it Nightjar.", "turns": 3, "through_seq": 9}),
+            ),
+        );
+        assert_eq!(
+            state.transcript(),
+            &[TranscriptEntry::Compacted {
+                turns: 3,
+                summary: "Named it Nightjar.".to_owned(),
+            }]
+        );
+        // No summary: nothing to show, and not an error either.
+        let state = reduce(state, &compacted(3, serde_json::json!({"turns": 1})));
+        assert_eq!(state.transcript().len(), 1);
+        assert!(state.protocol_error().is_none());
+        // A secret-classified summary never reaches the screen.
+        let state = reduce(
+            state,
+            &UiEvent::Kernel(secret_envelope(
+                4,
+                EventKind::ContextCompacted,
+                serde_json::json!({"summary": "sk-live-…", "turns": 1}),
+            )),
+        );
+        assert_eq!(state.transcript().len(), 1);
     }
 
     #[test]
