@@ -8017,6 +8017,37 @@ show this bug on macOS** — BSD `kill` is correct — so the cycle here is CI o
 this commit died in the hooks timeout test; the run after must complete `plugin-host`,
 `process-supervisor` and `sandbox`.
 
+**`rapid exec --resume <session>` / `--continue`, 2026-09-13 (`3982049`).** Headless conversations
+across runs: the turn is submitted as the next turn of the recorded session (at its tip, as an
+interactive turn on a resumed session is), and the model carries the earlier runs' prompts and
+answers through the same `conversation_history`. A resume that cannot be honored is an error —
+unknown id (with the ids that exist, as `rapid resume` prints them), nothing recorded yet, no
+project — never a fresh session under a flag that promised a conversation. Test drives the real
+binary twice and reads the second run's model request off the scripted server. Item 12 in the
+remaining list. (`ff4f9c0`: the test hung on every platform for 35 minutes — it re-locked its own
+`requests` mutex with the guard still in scope; a `sample` of the hung process named the line.
+The feature was verified by hand against a scripted server meanwhile.)
+
+**A turn now sees the session's earlier turns, 2026-09-12 (`ece295c`).** Found while checking
+the gap analysis's Gate 1 against the code: `build_live_context` carried the prompt, system
+prompt, rules, memory and todo indices — and nothing of the conversation. Every interactive turn
+ran on its prompt alone; the transcript on screen was the user's memory, not the model's; a
+resumed session resumed only its display. The doc comment listing what the "first working
+version" left out did not list this. **Derived, not duplicated**: the turns come from the ledger's
+own `turn.started`/terminal events (the same events the resumed transcript is rebuilt from), not
+from the display projection. `PreservedLiveContext::with_conversation` (newest 32),
+`build_packet` emits one memory block per turn in order, and — because the compiler's own drop
+order within a partition is not "oldest first" — retries without the oldest turn until no
+conversation block is dropped: chronological, a suffix, never a hole. **Forks followed**
+(`94d0f59`): a child session's ledger starts at `session.forked` with none of the parent's
+events, so a rewound session remembered nothing; the reader now follows `parent_session_id`
+through `source_seq`, eight deep — a rewound session remembers exactly the turns up to the rewind
+point. (The *display* transcript after `/rewind` still starts empty — `replay_history` does not
+follow forks; same fix, display side, when it is next touched.) Revert cycles 151-152. Compaction
+is still unwired (`CompactSession => "not wired yet"`); with history in place it is now the next thing a
+long session needs. Headless `exec` is unchanged (fresh session); `exec --resume` is the natural
+follow-up and the reader is in place for it.
+
 **A finished job's last output could be missing, fixed 2026-09-12 (`4f9be70`).** CI's Linux
 runner failed `an_open_logs_view_follows_a_job_that_is_still_writing` on the lifecycle refactor,
 which touched nothing near it. Two causes. The job supervisor recorded a job as done — registry
@@ -8177,7 +8208,7 @@ plausible cause and is a system setting, so the owner's; `fmt --check` is clean 
 
 ## Session boundary, 2026-09-10 — durable state for the next session
 
-Sixty-eight commits across four days, `dbeb2c2`..HEAD, all pushed to `origin/main`. Baseline before
+Seventy-three commits across five days, `dbeb2c2`..HEAD, all pushed to `origin/main`. Baseline before
 them was `598c6fd`. Each has its own entry above; this is the current state and what is actually left.
 
 **GitHub Actions is running again as of 2026-09-12, and its first fourteen runs found four
@@ -8187,8 +8218,15 @@ revert-cycle-proven test: `kill(-1)` on every Linux job timeout and cancel (`e89
 permanently unreadable (`c5e1184`); and a hook that ignores its stdin reported as a failed spawn
 (`fa99666`). **As of `e6fb656` the run is green on every job — SDK, Ubuntu, macOS, Windows —
 for the first time in the repository's history** (run 34710847905; Windows builds and lints as a
-gate with its tests informational). From here a red Format, Lint, or macOS/Ubuntu Test step is
-the next task before anything else, and the platform matrix is the cross-platform gate.
+gate with its tests informational), and green again on `ff4f9c0` (2026-09-13) after the
+conversation-history and `exec --continue` work. From here a red Format, Lint, or macOS/Ubuntu
+Test step is the next task before anything else, and the platform matrix is the cross-platform
+gate.
+
+**2026-09-13** (`94d0f59`..`ff4f9c0`): a turn carries the session's earlier turns to the model,
+following forks; `rapid exec --resume`/`--continue`. Next in order: compaction (item 13, with the
+design and the overflow-recovery finding recorded there), then the transcript display after
+`/rewind`, then `/agents cancel`.
 
 **`92240bf` (rewind fix) had a clean single workspace run — exit 0, 80 of 80 — on 2026-09-12, which
 also covers `eababe4` below, resolving the partial-evidence note that follows.**
@@ -8330,6 +8368,23 @@ actually failed them.
    spend rounds on Windows test gating; a Windows *lint* failure is still a red commit to fix.
 10. ~~**A Linux `Spawn` flake in plugin-host**~~ — **found and fixed 2026-09-12** (`fa99666`,
     entry above): it was `BrokenPipe` on the stdin hand-off, exactly the suspected cause.
+12. ~~**`rapid exec --resume <session>` / `--continue`**~~ — **done 2026-09-13** (`3982049`, entry
+    above).
+13. **Compaction — and the in-turn overflow recovery is a no-op today.** Read while scoping this:
+    `LiveRecoveryController::recover_from_overflow` calls `compact_with_policy(packet, policy,
+    None, ..)` — no summarizer — and the deterministic "summary" `compact_packet` produces without
+    one is a stats line (`included=N dropped=M tokens=…`), content-free. The rebuilt packet is the
+    same inputs plus that line, so a provider overflow retries the same size until
+    `ContextRetryPolicy` gives up. `KernelAction::CompactSession` says "not wired yet". Both want the
+    same thing: a real summarizer — a model call over the conversation — and a place to keep its
+    output. Design that fits what exists: a `context.compacted` ledger event `{summary,
+    through_seq}` (an `EventKind` addition: `event.rs`, the schema fixtures, `headless/jsonl.rs`'s
+    type map, `recovery/classify.rs`, the TUI reducer's notice); `conversation_history` resets its
+    turns at the last one and carries the summary; `PreservedLiveContext` carries it into the
+    compile's existing `context/compaction` memory slot; `/compact` runs the model once with a
+    summarization prompt and `ExecTools::noop()` — not as a turn — and appends the event; the
+    overflow path uses the same summarizer. With history now carried, a long session hits the
+    memory partition and loses its oldest turns silently; this is the answer. Half a day.
 11. ~~**Duplication the P0 left behind**~~ — **folded 2026-09-12** (`5e4849f`): `isolate_process_group`
     (four copies) and `terminate_process_group` with its constants (three copies) now live beside
     `signal_process_group` in `process-signal`, the three steps of one lifecycle; a test pins the
