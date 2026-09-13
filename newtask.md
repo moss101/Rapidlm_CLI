@@ -8017,6 +8017,39 @@ show this bug on macOS** — BSD `kill` is correct — so the cycle here is CI o
 this commit died in the hooks timeout test; the run after must complete `plugin-host`,
 `process-supervisor` and `sandbox`.
 
+**A lagged live subscription ended the interactive session — fixed 2026-09-13
+(`4619864`), found by a test that appended more events than one tick reads.** The live channel
+holds 64 events (`event_ledger::subscription::DEFAULT_LIVE_BOUND`); a burst that outruns the
+loop's tick — a tool-heavy turn, a job's output, an autonomous run — disconnected the stream with
+`Lagged { resume_cursor }`, and `drain_kernel_events` returned that as `InteractiveError::Stream`:
+the end of the whole session, on a condition the ledger documents as resumable without gaps or
+duplicates. The drain (and the startup replay) now re-subscribe from the cursor, eight times per
+tick at most. Test appends 300 events between two ticks and asserts the projection reaches the
+tip; revert cycle 160. **In the same commit, the self-review of `6b0ce30`/`127218d` (all taken):**
+the TUI's subagent runner captured the ledger sinks before they were attached, so a subagent's
+writes and jobs never reached `/diff`/`/jobs` — the sinks are attached inside
+`configure_trusted_model_tools` first, by construction; the extraction had moved `exec_turn`'s
+integrations after model resolution (session hooks past several exits and after `turn.started`, a
+`session_start` hook's files invisible to the packet, MCP start-up charged to `--max-wall-time`) —
+split into `configure_trusted_integrations` (early, as before) and `configure_trusted_model_tools`
+(after the model), the old order restored; a turn's warnings were raw stderr writes under the alt
+screen (a staircase) — `SessionNotices` carries them from the turn and compaction threads into the
+transcript; `inherited_transcript` folded only the parent's first 4096 events, showing a rewound
+session its oldest turns while the ones before the rewind point went missing — it folds through
+the fork point now (a safety ceiling of a million, reported in the transcript when hit), is bounded
+by the parent's own tip (a fork record past it hung the loop), and says so when the reducer stops
+it; `session_start` fires before the alt screen is acquired; the stale "first working version" doc
+comment is gone. Also: `[phases] compact` is honoured for `/compact` (resolved against the same
+config and gated through the same managed policy as a fallback entry — `ModelPlan::compact`,
+`SessionModel::compaction_backing`; the in-turn recovery keeps the turn's own model);
+`pre_compact`/`post_compact` hooks fire around `/compact` with the turn count and the summary's
+size (`HooksConfig::stages_mut` is now the one list a merge or cap walks — the first version of
+this parsed both stages and lost them in the project-settings merge, which enumerated stages by
+hand). Hooks still run in the process's working directory, as headless hooks do. Not done: MCP
+connections are per turn in the TUI as in headless (spawned, handshaken and killed each turn —
+server state does not survive a turn; a session-scoped connection is the follow-up), and
+`interactive_reminders` is not trust-gated, matching headless.
+
 **An interactive turn runs on the same setup as a headless one, 2026-09-13 (`6b0ce30`).**
 `run_interactive_turn_inner`'s own doc comment listed what its "first working version" left out —
 hooks, MCP servers, proactive retrieval, reminders — and the list was longer than that: no
