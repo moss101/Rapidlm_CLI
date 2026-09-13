@@ -2463,6 +2463,153 @@ pub(crate) struct ProjectIntegrations {
     pub(crate) mcp: crate::mcp_config::McpProjectConfig,
 }
 
+/// Narrow the turn's disk/network/subagent ceilings to the managed policy's
+/// (Modbit `CAP-001`/`WRK-017`) — narrow-only, so a missing or default
+/// policy is a no-op — and return the policy's version for the router-
+/// decision log. Re-loads the policy rather than threading it out of
+/// `exec_permission_lattice`: that call already fails the whole turn closed
+/// on an unreadable policy, so a load failure here means the file changed
+/// underneath the turn, and skipping the (non-security-critical) narrowing
+/// is safer than failing a turn whose lattice already resolved.
+fn apply_managed_ceilings(tools: &mut ExecTools) -> Option<String> {
+    let policy =
+        crate::managed_config::load_policy(&std::env::vars().collect::<Vec<_>>()).ok()??;
+    if let Some(max) = policy.max_write_bytes_per_turn() {
+        tools.narrow_write_ceiling(max);
+    }
+    if let Some(max) = policy.max_fetch_bytes_per_turn() {
+        tools.narrow_fetch_ceiling(max);
+    }
+    if let Some(max) = policy.max_subagent_spawns_per_turn() {
+        tools.narrow_subagent_spawn_ceiling(max);
+    }
+    Some(policy.policy_version().to_owned())
+}
+
+/// The per-run hooks a trusted project declares, handed back by
+/// [`configure_trusted_tools`] for the caller to fire at its own start and
+/// end — a headless run's, or an interactive session's.
+#[derive(Default)]
+struct SessionHooks {
+    session_start: Vec<String>,
+    session_end: Vec<String>,
+}
+
+/// Everything a trusted project's settings add to a turn's tools, the same
+/// for a headless run and an interactive turn: the `web_fetch` allowlist,
+/// tool hooks, shadow diagnostics, MCP servers (a configured server that
+/// will not run is reported through `warn`, never dropped silently), the
+/// active model's own credential scrubbed from captured output, and the
+/// subagent runner behind `task_spawn` (with a configured model). Settings
+/// are merged across every file in `PROJECT_SETTINGS_FILES` the same way
+/// `exec_permission_lattice` merges permission rules.
+///
+/// The interactive turn used to get none of this — its doc comment listed
+/// hooks, MCP and retrieval among what the "first working version" left
+/// out — so the same `.rapidlm/settings.json` worked headless and silently
+/// did nothing in the TUI.
+fn configure_trusted_tools(
+    tools: &mut ExecTools,
+    root: &Path,
+    active: Option<&crate::user_config::ActiveModel>,
+    permission_lattice: &crate::permissions::PermissionLattice,
+    warn: &mut dyn FnMut(&str),
+) -> SessionHooks {
+    if !matches!(tools, ExecTools::Workspace(_)) {
+        return SessionHooks::default();
+    }
+    let ProjectIntegrations {
+        fetch_allowlist: allowlist,
+        hooks: merged_hooks,
+        shadow: shadow_config,
+        mcp: mcp_config,
+    } = load_project_integrations(root);
+    tools.set_fetch_allowlist(allowlist);
+    let session_hooks = SessionHooks {
+        session_start: merged_hooks.session_start.clone(),
+        session_end: merged_hooks.session_end.clone(),
+    };
+    if !merged_hooks.is_empty() {
+        tools.set_hooks(merged_hooks);
+    }
+    if let Some(shadow) = shadow_config {
+        tools.set_shadow_diagnostics(shadow);
+    }
+    for rejection in mcp_config.rejections() {
+        // Bounded — see `mcp_config::MAX_REPORTED_REJECTIONS`: nothing
+        // limits how many entries a settings file declares, and this runs
+        // on every turn.
+        warn(&format!(
+            "warning: MCP server {:?} in {} not registered: {}",
+            rejection.name, rejection.file, rejection.issue
+        ));
+    }
+    if mcp_config.rejections_omitted() > 0 {
+        warn(&format!(
+            "warning: {} further MCP server(s) not registered; run `rapid mcp list` for the full report",
+            mcp_config.rejections_omitted()
+        ));
+    }
+    let mcp_servers = mcp_config.configs();
+    if !mcp_servers.is_empty() {
+        tools.register_mcp_servers(&mcp_servers);
+    }
+
+    // Scrub the active model's own resolved credential from captured
+    // shell_exec output: a command that reads back a config file
+    // containing it (a real, plausible thing to run, not a contrived
+    // scenario — `~/.rapidlm/config.toml` stores it in plaintext) must not
+    // hand it back to the model verbatim. Best-effort: a registration
+    // failure (e.g. the credential is empty or oversized) just means
+    // nothing gets scrubbed, not a turn failure.
+    if let Some(plaintext) = active.and_then(|active| active.credential.plaintext.as_deref())
+        && let Ok(refer) = auth::SecretRef::from_alias("active-model-credential")
+    {
+        let mut registry = security::SecretRedactionRegistry::new();
+        let cancel = security::RedactionCancellation::new();
+        if registry
+            .register_canary(&refer, plaintext.as_bytes(), &cancel)
+            .is_ok()
+        {
+            tools.set_redaction(registry.snapshot());
+        }
+    }
+    // Subagents: with a configured model, task_spawn runs child agents with
+    // the same provider config and a depth-restricted read-only-capable tool
+    // surface.
+    if let Some(active) = active
+        && let Some(turn_budgets) = tools.turn_budget_handles()
+    {
+        let hooks = tools.hooks_config();
+        let shadow_diagnostics = tools.shadow_diagnostics_config();
+        let trace_calls = tools.trace_calls_enabled();
+        let turn_ceilings = tools.turn_ceilings().unwrap_or((
+            crate::exec_tools::MAX_TOTAL_WRITE_BYTES_PER_TURN,
+            crate::exec_tools::MAX_TOTAL_FETCH_BYTES_PER_TURN,
+        ));
+        let write_locks = tools.write_lock_handle().unwrap_or_default();
+        let job_budget = tools
+            .job_budget_handle()
+            .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        tools.set_subagent_runner(std::sync::Arc::new(LiveSubagentRunner {
+            active: active.clone(),
+            root: root.to_path_buf(),
+            permissions: permission_lattice.clone(),
+            turn_budgets,
+            write_locks,
+            job_budget,
+            job_events: tools.job_events(),
+            workspace_changes: tools.workspace_changes(),
+            hooks,
+            shadow_diagnostics,
+            trace_calls,
+            turn_ceilings,
+            redaction: tools.redaction_handle(),
+        }));
+    }
+    session_hooks
+}
+
 /// Read and merge every `PROJECT_SETTINGS_FILES` entry under `root`. List-
 /// shaped config (fetch allowlist, each hook stage, MCP servers) merges
 /// across every file that exists — the same precedence
@@ -3598,21 +3745,7 @@ pub(crate) fn exec_turn(
     // (already-accepted, see above) window for the file to have changed
     // between reads and the log naming a policy that wasn't the one
     // actually applied.
-    let mut policy_version: Option<String> = None;
-    if let Ok(Some(policy)) =
-        crate::managed_config::load_policy(&std::env::vars().collect::<Vec<_>>())
-    {
-        if let Some(max) = policy.max_write_bytes_per_turn() {
-            tools.narrow_write_ceiling(max);
-        }
-        if let Some(max) = policy.max_fetch_bytes_per_turn() {
-            tools.narrow_fetch_ceiling(max);
-        }
-        if let Some(max) = policy.max_subagent_spawns_per_turn() {
-            tools.narrow_subagent_spawn_ceiling(max);
-        }
-        policy_version = Some(policy.policy_version().to_owned());
-    }
+    let policy_version = apply_managed_ceilings(&mut tools);
     // Observability for the fail-closed default: when headless exec runs
     // without workspace tools (or under a mode that refuses every call), say
     // so up front and name the levers, instead of leaving the run to fail
@@ -3635,65 +3768,11 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         );
     }
 
-    // Trusted-project integrations: web_fetch allowlist, hooks, MCP servers.
-    // Merged across every file in PROJECT_SETTINGS_FILES the same way
-    // exec_permission_lattice already merges permission rules — a
-    // `.claude/settings.json`-only project (no `.rapidlm/settings.json` at
-    // all) previously got permission-rule compat but silently lost hooks/
-    // mcp/shadow-diagnostics/fetch-allowlist, since this block only ever
-    // read the one RapidLM-native file name.
-    if let (Some((root, TrustStatus::Trusted)), ExecTools::Workspace(_)) = (&workspace, &mut tools)
-    {
-        let ProjectIntegrations {
-            fetch_allowlist: allowlist,
-            hooks: merged_hooks,
-            shadow: shadow_config,
-            mcp: mcp_config,
-        } = load_project_integrations(root);
-        tools.set_fetch_allowlist(allowlist);
-        if !merged_hooks.session_start.is_empty() {
-            // Fire-and-forget: a session_start hook observes the run
-            // starting, it never gates it (no PreHookOutcome here).
-            let _ = crate::hooks::run_notify_hooks(
-                &merged_hooks.session_start,
-                "session_start",
-                serde_json::json!({}),
-                crate::hooks::HOOK_TIMEOUT,
-            );
-        }
-        // Captured now (before `merged_hooks` moves into `set_hooks` below);
-        // fired later by SessionEndHookGuard's Drop impl, on whatever exit
-        // path this turn actually takes.
-        session_end_guard.hooks = merged_hooks.session_end.clone();
-        if !merged_hooks.is_empty() {
-            tools.set_hooks(merged_hooks);
-        }
-        if let Some(shadow) = shadow_config {
-            tools.set_shadow_diagnostics(shadow);
-        }
-        for rejection in mcp_config.rejections() {
-            // Never a silent drop: a configured server that will not run is
-            // reported on stderr the same way a broken reminder roster or a
-            // failed fallback model is. Bounded — see
-            // `mcp_config::MAX_REPORTED_REJECTIONS`: nothing limits how many
-            // entries a settings file declares, and this runs on every turn.
-            eprintln!(
-                "warning: MCP server {:?} in {} not registered: {}",
-                rejection.name, rejection.file, rejection.issue
-            );
-        }
-        if mcp_config.rejections_omitted() > 0 {
-            eprintln!(
-                "warning: {} further MCP server(s) not registered; run `rapid mcp list` for the full report",
-                mcp_config.rejections_omitted()
-            );
-        }
-        let mcp_servers = mcp_config.configs();
-        if !mcp_servers.is_empty() {
-            tools.register_mcp_servers(&mcp_servers);
-        }
-    }
-
+    // Trusted-project integrations — allowlist, hooks, shadow diagnostics,
+    // MCP servers, the credential canary, the subagent runner — are applied
+    // by `configure_trusted_tools` once the model is resolved below (the
+    // runner needs it); the per-run session hooks it returns are fired
+    // here, around the run.
     // Reminder feeds: load the project roster if present and admit the
     // always-on feeds (the CLI host grants no capabilities, so feeds gated
     // on a capability stay inactive). A broken roster warns and the turn
@@ -3918,60 +3997,27 @@ run without --continue to start one"
             .map(ExecRecording::sink),
     };
 
-    // Scrub the active model's own resolved credential from captured
-    // shell_exec output: a command that reads back a config file
-    // containing it (a real, plausible thing to run, not a contrived
-    // scenario — `~/.rapidlm/config.toml` stores it in plaintext) must not
-    // hand it back to the model verbatim. Best-effort: a registration
-    // failure (e.g. the credential is empty or oversized) just means
-    // nothing gets scrubbed, not a turn failure.
-    if let (Some(active), Some((_, TrustStatus::Trusted))) =
-        (child_model_config.as_ref(), workspace.as_ref())
-        && let Some(plaintext) = active.credential.plaintext.as_deref()
-        && let Ok(refer) = auth::SecretRef::from_alias("active-model-credential")
-    {
-        let mut registry = security::SecretRedactionRegistry::new();
-        let cancel = security::RedactionCancellation::new();
-        if registry
-            .register_canary(&refer, plaintext.as_bytes(), &cancel)
-            .is_ok()
-        {
-            tools.set_redaction(registry.snapshot());
+    if let Some((root, TrustStatus::Trusted)) = workspace.as_ref() {
+        let session_hooks = configure_trusted_tools(
+            &mut tools,
+            root,
+            child_model_config.as_ref(),
+            &permission_lattice,
+            &mut warn,
+        );
+        if !session_hooks.session_start.is_empty() {
+            // Fire-and-forget: a session_start hook observes the run
+            // starting, it never gates it (no PreHookOutcome here).
+            let _ = crate::hooks::run_notify_hooks(
+                &session_hooks.session_start,
+                "session_start",
+                serde_json::json!({}),
+                crate::hooks::HOOK_TIMEOUT,
+            );
         }
-    }
-    // Subagents: with a configured model, task_spawn runs child agents with
-    // the same provider config and a depth-restricted read-only-capable tool
-    // surface. Memory index: .rapidlm/MEMORY.md is always loaded (bounded).
-    if let (Some(active), Some((root, TrustStatus::Trusted))) =
-        (child_model_config.as_ref(), workspace.as_ref())
-        && let Some(turn_budgets) = tools.turn_budget_handles()
-    {
-        let hooks = tools.hooks_config();
-        let shadow_diagnostics = tools.shadow_diagnostics_config();
-        let trace_calls = tools.trace_calls_enabled();
-        let turn_ceilings = tools.turn_ceilings().unwrap_or((
-            crate::exec_tools::MAX_TOTAL_WRITE_BYTES_PER_TURN,
-            crate::exec_tools::MAX_TOTAL_FETCH_BYTES_PER_TURN,
-        ));
-        let write_locks = tools.write_lock_handle().unwrap_or_default();
-        let job_budget = tools
-            .job_budget_handle()
-            .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
-        tools.set_subagent_runner(std::sync::Arc::new(LiveSubagentRunner {
-            active: active.clone(),
-            root: root.clone(),
-            permissions: permission_lattice.clone(),
-            turn_budgets,
-            write_locks,
-            job_budget,
-            job_events: tools.job_events(),
-            workspace_changes: tools.workspace_changes(),
-            hooks,
-            shadow_diagnostics,
-            trace_calls,
-            turn_ceilings,
-            redaction: tools.redaction_handle(),
-        }));
+        // Fired by SessionEndHookGuard's Drop impl, on whatever exit path
+        // this turn actually takes.
+        session_end_guard.hooks = session_hooks.session_end;
     }
     let diag = parsed.verbose.then(|| StepDiag::stderr(&base_url));
     // `--json-schema`: wrap the tool driver with the synthetic-tool
@@ -4450,6 +4496,22 @@ fn run_started_session(
     // that started them, and dropping this at the end of `run_started_session`
     // is what kills them. See `SessionLoop::jobs`.
     let session_jobs = crate::exec_tools::JobRegistry::default();
+    // A trusted project's session hooks, on the same per-run terms as a
+    // headless run's: `session_start` now, `session_end` on every exit
+    // path (the guard's `Drop`), neither gating anything.
+    let mut session_end_guard = SessionEndHookGuard::default();
+    if resolved.trust.is_trusted() {
+        let hooks = load_project_integrations(&resolved.root).hooks;
+        if !hooks.session_start.is_empty() {
+            let _ = crate::hooks::run_notify_hooks(
+                &hooks.session_start,
+                "session_start",
+                serde_json::json!({}),
+                crate::hooks::HOOK_TIMEOUT,
+            );
+        }
+        session_end_guard.hooks = hooks.session_end;
+    }
     let loop_result = SessionLoop {
         client: &client,
         stream: &mut stream,
@@ -6827,11 +6889,11 @@ fn build_interactive_turn_context(
     root: &Path,
     trusted: bool,
     text: &str,
-    forced_mode: Option<crate::permissions::PermissionMode>,
     context_limit: u32,
     output_reserve: u32,
     history: crate::host::ConversationHistory,
-) -> Result<(PreservedLiveContext, ExecTools), kernel::TurnOutcome> {
+    reminder_block: Option<String>,
+) -> Result<PreservedLiveContext, kernel::TurnOutcome> {
     let preserved = match build_live_context(
         Some(root),
         Some(root),
@@ -6849,7 +6911,30 @@ fn build_interactive_turn_context(
     };
     let preserved = preserve_memory_and_todos(preserved, root)
         .with_conversation(history.turns)
-        .with_compaction_summary(history.summary);
+        .with_compaction_summary(history.summary)
+        .with_reminders_block(reminder_block);
+    // Proactive context retrieval, as `exec_turn` does it: only for a
+    // trusted project (it walks the tree and writes an incremental index
+    // under .rapidlm/index/), and failing open inside retrieve() itself.
+    Ok(if trusted {
+        let retrieved = crate::context_retrieval::retrieve(root, text, RETRIEVAL_BUDGET_TOKENS);
+        preserved.with_retrieved_context(retrieved)
+    } else {
+        preserved
+    })
+}
+
+/// The tools half of one interactive turn: the permission lattice (mode,
+/// project-settings rules, persisted grants — `forced_mode` overriding every
+/// other mode source, see `run_interactive_turn_inner_with_backing`), and
+/// workspace tools only for a trusted project. Everything a trusted
+/// project's settings add on top is `configure_trusted_tools`, once the
+/// model is known.
+fn build_interactive_turn_tools(
+    root: &Path,
+    trusted: bool,
+    forced_mode: Option<crate::permissions::PermissionMode>,
+) -> Result<(ExecTools, crate::permissions::PermissionLattice), kernel::TurnOutcome> {
     let permission_lattice = match exec_permission_lattice(Some(root), forced_mode) {
         Ok(lattice) => lattice,
         Err(err) => {
@@ -6859,12 +6944,29 @@ fn build_interactive_turn_context(
         }
     };
     let tools = if trusted {
-        ExecTools::workspace_with_permissions(root, permission_lattice)
+        ExecTools::workspace_with_permissions(root, permission_lattice.clone())
             .unwrap_or_else(|_| ExecTools::noop())
     } else {
         ExecTools::noop()
     };
-    Ok((preserved, tools))
+    Ok((tools, permission_lattice))
+}
+
+/// The reminder roster's block and floor for an interactive turn, read the
+/// way `exec_turn` reads them: a broken roster warns and the turn continues
+/// without reminders.
+fn interactive_reminders(
+    root: &Path,
+    warn: &mut dyn FnMut(&str),
+) -> (agent_runtime::reminders::ReminderFloor, Option<String>) {
+    match load_active_reminders(Some(root)) {
+        Ok(Some((block, floor))) => (floor, Some(block)),
+        Ok(None) => (agent_runtime::reminders::ReminderFloor::Baseline, None),
+        Err(err) => {
+            warn(&format!("warning: reminders not loaded: {err}"));
+            (agent_runtime::reminders::ReminderFloor::Baseline, None)
+        }
+    }
 }
 
 /// Actually resolve a model, build workspace tools, and run one turn through
@@ -6888,19 +6990,28 @@ fn run_interactive_turn_inner(
     cancel: &agent_runtime::CancellationToken,
     jobs: &crate::exec_tools::JobRegistry,
 ) -> kernel::TurnOutcome {
-    // Model resolved *before* context construction below — not after — so
-    // the context budget (`context_budget_for`) is derived from the model
-    // that will actually run this turn, never a hard-coded placeholder sized
-    // before the model was even known. `redaction_snapshot` is captured here
-    // too (it depends on the resolved credential, not on `tools`, which
-    // doesn't exist yet) and applied to `tools` once `build_interactive_
-    // turn_context` returns it below.
-    //
-    // One store, fully built before `ConfiguredModel` borrows from it — the
-    // borrow must not outlive it, matching `exec_turn`'s own ordering.
-    let credential_store = auth::InMemoryCredentialStore::new();
-    let (backing, redaction_snapshot) = match resolve_interactive_backing(&credential_store) {
-        Ok(resolved) => resolved,
+    // Warnings go where the interactive turn's always have: stderr, which
+    // the alt screen hides but the session log keeps.
+    let mut warn = |line: &str| {
+        crate::exec_diag::stderr_line(line);
+    };
+    let (mut tools, permission_lattice) = match build_interactive_turn_tools(root, trusted, None) {
+        Ok(built) => built,
+        Err(outcome) => return outcome,
+    };
+    let policy_version = apply_managed_ceilings(&mut tools);
+    // Reminders ahead of the model: the floor picks its reasoning effort.
+    let (reminder_floor, reminder_block) = interactive_reminders(root, &mut warn);
+    // The model, resolved the way a headless run resolves it — env
+    // overrides, user config, the `[models] fallback` chain, the managed
+    // policy — and *before* context construction, so the context budget is
+    // derived from the model that will actually run this turn.
+    let session_model = match SessionModel::resolve(reminder_floor, policy_version, &mut warn) {
+        Ok(model) => model,
+        Err(reason) => return kernel::TurnOutcome::Failed { reason },
+    };
+    let backing = match session_model.backing(None, &mut warn) {
+        Ok(backing) => backing,
         Err(reason) => return kernel::TurnOutcome::Failed { reason },
     };
     let (context_limit, output_reserve) = context_budget_for(&backing);
@@ -6911,20 +7022,28 @@ fn run_interactive_turn_inner(
     // ledger, which is what the resumed transcript is rebuilt from too.
     let history = conversation_history(client, session_id, cancel);
     let history_through = history.through_seq;
-    let (preserved, mut tools) = match build_interactive_turn_context(
+    let preserved = match build_interactive_turn_context(
         root,
         trusted,
         text,
-        None,
         context_limit,
         output_reserve,
         history,
+        reminder_block,
     ) {
-        Ok(built) => built,
+        Ok(preserved) => preserved,
         Err(outcome) => return outcome,
     };
-    if let Some(snapshot) = redaction_snapshot {
-        tools.set_redaction(snapshot);
+    if trusted {
+        // Session-start/end hooks are per run; the interactive session
+        // fires its own at start and exit, not per turn.
+        let _ = configure_trusted_tools(
+            &mut tools,
+            root,
+            session_model.primary(),
+            &permission_lattice,
+            &mut warn,
+        );
     }
     // Background jobs go in the session's table, not this turn's: see
     // `SessionLoop::jobs`.
@@ -6944,47 +7063,69 @@ fn run_interactive_turn_inner(
     )
 }
 
-/// Resolve the session's model from process env/config the way an
-/// interactive turn does — one place for the turn and for `/compact`, so
-/// the summary is written by the model the conversation runs on. Returns
-/// the redaction snapshot for the model's own credential beside it (a turn
-/// scrubs that from captured `shell_exec` output; a compaction runs no
-/// tools and ignores it). The error is the turn-failure reason text.
-fn resolve_interactive_backing(
-    credential_store: &auth::InMemoryCredentialStore,
-) -> Result<(SelectedModel<'_>, Option<security::RedactionSnapshot>), String> {
-    let mut redaction_snapshot: Option<security::RedactionSnapshot> = None;
-    let backing = match crate::user_config::select_from_process_env_gated() {
-        Ok(ModelSelection::Configured { active, warnings }) => {
-            for warning in warnings {
-                crate::exec_diag::stderr_line(&format!("warning: {warning}"));
-            }
-            // Scrub the active model's own resolved credential from
-            // captured shell_exec output — see exec_turn's own identical
-            // seeding for why this is a real, plausible leak vector, not a
-            // contrived one. Best-effort: a registration failure just means
-            // nothing gets scrubbed, not a turn failure.
-            if let Some(plaintext) = active.credential.plaintext.as_deref()
-                && let Ok(refer) = auth::SecretRef::from_alias("active-model-credential")
-            {
-                let mut registry = security::SecretRedactionRegistry::new();
-                let cancel = security::RedactionCancellation::new();
-                if registry
-                    .register_canary(&refer, plaintext.as_bytes(), &cancel)
-                    .is_ok()
-                {
-                    redaction_snapshot = Some(registry.snapshot());
-                }
-            }
-            match ConfiguredModel::build(&active, credential_store) {
-                Ok(model) => SelectedModel::Configured(Box::new(model)),
-                Err(err) => return Err(format!("model configuration error: {err}")),
-            }
-        }
-        Ok(ModelSelection::Unconfigured { .. }) => SelectedModel::Unconfigured(UnconfiguredModel),
-        Err(err) => return Err(format!("model configuration error: {err}")),
-    };
-    Ok((backing, redaction_snapshot))
+/// The session's model as one interactive turn (or a `/compact`) resolves
+/// it: the same `resolve_model_plan`/`build_backing_model` pair a headless
+/// run and `rapid doctor` use — env overrides, user config, the `[models]
+/// fallback` chain, the managed policy — so the TUI runs on exactly the
+/// model configuration the headless path would. Owns the credential stores
+/// the backing borrows from.
+struct SessionModel {
+    models: Vec<crate::user_config::ActiveModel>,
+    stores: Vec<auth::InMemoryCredentialStore>,
+    primary: Option<crate::user_config::ActiveModel>,
+    unconfigured: bool,
+    policy_version: Option<String>,
+}
+
+impl SessionModel {
+    /// The error is the turn-failure reason text.
+    fn resolve(
+        reminder_floor: agent_runtime::reminders::ReminderFloor,
+        policy_version: Option<String>,
+        warn: &mut dyn FnMut(&str),
+    ) -> Result<Self, String> {
+        let process_env: Vec<(String, String)> = std::env::vars().collect();
+        let plan = resolve_model_plan(&process_env, reminder_floor, warn)
+            .map_err(|err| err.to_string())?;
+        let stores = plan
+            .models
+            .iter()
+            .map(|_| auth::InMemoryCredentialStore::new())
+            .collect();
+        Ok(Self {
+            models: plan.models,
+            stores,
+            primary: plan.primary_config,
+            unconfigured: plan.unconfigured,
+            policy_version,
+        })
+    }
+
+    /// The configured primary model — what subagents run on and whose
+    /// credential is scrubbed from captured output.
+    fn primary(&self) -> Option<&crate::user_config::ActiveModel> {
+        self.primary.as_ref()
+    }
+
+    /// Build the backing. The routing-decision log a fallback chain keeps
+    /// is dropped here: the interactive session has nowhere to surface it
+    /// yet (headless writes it to `--jsonl`).
+    fn backing(
+        &self,
+        diag: Option<StepDiag>,
+        warn: &mut dyn FnMut(&str),
+    ) -> Result<SelectedModel<'_>, String> {
+        build_backing_model(
+            &self.models,
+            &self.stores,
+            self.unconfigured,
+            diag,
+            self.policy_version.clone(),
+            warn,
+        )
+        .map(|(backing, _decisions)| backing)
+        .map_err(|err| err.to_string())
+    }
 }
 
 /// Spawn the thread a `/compact` runs on: resolve the session's model, write
@@ -7001,8 +7142,15 @@ fn spawn_compaction(
 ) {
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let credential_store = auth::InMemoryCredentialStore::new();
-            let (backing, _) = resolve_interactive_backing(&credential_store)?;
+            let mut warn = |line: &str| {
+                crate::exec_diag::stderr_line(line);
+            };
+            let session_model = SessionModel::resolve(
+                agent_runtime::reminders::ReminderFloor::Baseline,
+                None,
+                &mut warn,
+            )?;
+            let backing = session_model.backing(None, &mut warn)?;
             let budget = context_budget_for(&backing);
             run_compaction(&client, session_id, &actor, &root, backing, budget, &cancel)
         }))
@@ -7171,20 +7319,35 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     // and `exec_tools.rs`).
     let forced_mode = Some(crate::permissions::PermissionMode::BypassPermissions);
     let (context_limit, output_reserve) = budget;
+    let mut warn = |line: &str| {
+        crate::exec_diag::stderr_line(line);
+    };
+    let (mut tools, permission_lattice) =
+        match build_interactive_turn_tools(root, trusted, forced_mode) {
+            Ok(built) => built,
+            Err(outcome) => return outcome,
+        };
+    let _policy_version = apply_managed_ceilings(&mut tools);
+    let (_reminder_floor, reminder_block) = interactive_reminders(root, &mut warn);
     let history = conversation_history(client, session_id, cancel);
     let history_through = history.through_seq;
-    let (preserved, mut tools) = match build_interactive_turn_context(
+    let preserved = match build_interactive_turn_context(
         root,
         trusted,
         text,
-        forced_mode,
         context_limit,
         output_reserve,
         history,
+        reminder_block,
     ) {
-        Ok(built) => built,
+        Ok(preserved) => preserved,
         Err(outcome) => return outcome,
     };
+    if trusted {
+        // No configured model behind a scripted backing: no subagent
+        // runner and no credential canary, everything else as production.
+        let _ = configure_trusted_tools(&mut tools, root, None, &permission_lattice, &mut warn);
+    }
     // Same session-scoped job table the production path uses.
     tools.share_job_table(jobs);
     execute_interactive_turn(
@@ -10127,10 +10290,48 @@ alignment below it: {line:?}",
             }
             loop_state.step_autonomous_goal().expect("step");
             if loop_state.autonomous.is_none() {
+                settle_last_turn(loop_state);
                 return;
             }
         }
         panic!("autonomous goal loop did not reach a terminal state in time");
+    }
+
+    /// Once the loop has stopped, keep draining until the last turn's
+    /// terminal entry has reached the transcript. The loop decides to stop
+    /// on what it has seen so far — a `tool.context_required`, say — and
+    /// the turn's own `turn.completed` is delivered by the subscription's
+    /// worker thread, which can still be behind at that moment (CI's Linux
+    /// runner, where an assertion on the answer text ran ahead of it).
+    /// Keyed to the ledger's own record, not to a sleep.
+    fn settle_last_turn(loop_state: &mut SessionLoop) {
+        for _ in 0..300 {
+            loop_state.drain().expect("drain");
+            let transcript = loop_state.ui.transcript();
+            let last_user = transcript
+                .iter()
+                .rposition(|entry| matches!(entry, TranscriptEntry::User { .. }));
+            let terminal_after = |from: usize| {
+                transcript[from..].iter().any(|entry| {
+                    matches!(
+                        entry,
+                        TranscriptEntry::Assistant { .. }
+                            | TranscriptEntry::TurnFailed { .. }
+                            | TranscriptEntry::TurnInterrupted
+                    )
+                })
+            };
+            match last_user {
+                None => return,
+                Some(at) if terminal_after(at) => return,
+                Some(_) => {}
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "the last turn's terminal entry never reached the transcript: {:?}",
+            loop_state.ui.transcript()
+        );
     }
 
     fn scripted_backing_queue(models: Vec<ScriptedModel>) -> ScriptedBackingQueue {
@@ -11869,6 +12070,81 @@ question the panel answers"
                 _ => None,
             })
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_interactive_turn_runs_the_projects_hooks_reminders_and_retrieval() {
+        // The same `.rapidlm/settings.json`, `reminders.toml` and repo that
+        // `rapid exec` honours were silently ignored by an interactive
+        // turn: no hooks, no reminders, no proactive retrieval. One setup
+        // now serves both paths.
+        let env = TempEnv::create();
+        let root = fs::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        // A pre-tool hook that denies every call, naming itself.
+        fs::write(
+            root.join(PROJECT_MARKER).join("settings.json"),
+            r#"{"hooks":{"pre_tool_use":["echo 'house rule: no writes today' >&2; exit 1"]}}"#,
+        )
+        .expect("settings");
+        fs::write(
+            root.join(PROJECT_MARKER).join("reminders.toml"),
+            "schema = \"rapidlm.reminders.v1\"\n\
+             [[feed]]\n\
+             name = \"house-style\"\n\
+             [[feed.reminder]]\n\
+             id = \"surrounding-code\"\n\
+             text = \"match the surrounding code\"\n",
+        )
+        .expect("roster");
+        fs::write(
+            root.join("lru.py"),
+            "class LRUCache:\n    def get(self, key):\n        return self._data.get(key)\n",
+        )
+        .expect("seed");
+
+        let mut session = ScriptedSession::create(&env);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        session.run_turn(
+            "how does LRUCache eviction work? write notes.txt about it",
+            ScriptedModel::write_then_answer("notes.txt", "eviction notes", "done")
+                .capturing_blocks(seen.clone()),
+        );
+
+        // The hook denied the write: no file, and the denial in the
+        // transcript with the hook's own reason.
+        assert!(
+            !root.join("notes.txt").exists(),
+            "the pre_tool_use hook must deny the write in an interactive turn"
+        );
+        assert!(
+            session.transcript().iter().any(|entry| matches!(
+                entry,
+                TranscriptEntry::ToolActivity {
+                    tool,
+                    status: ToolActivityStatus::Denied,
+                    detail: Some(detail),
+                } if tool == crate::exec_tools::WORKSPACE_WRITE_TOOL
+                    && detail.contains("house rule: no writes today")
+            )),
+            "{:?}",
+            session.transcript()
+        );
+
+        // Reminders and retrieval reached the packet.
+        let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+        let locators: Vec<&str> = seen.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(
+            seen.iter()
+                .any(|(l, t)| l == "reminders/active" && t.contains("match the surrounding code")),
+            "{locators:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|(l, t)| l.starts_with("retrieved:") && t.contains("LRUCache")),
+            "{locators:?}"
+        );
     }
 
     #[test]
