@@ -856,18 +856,20 @@ fn binary_exec_continue_runs_the_next_turn_of_the_recorded_session() {
         "the second run continues the first run's session:\n{stderr}"
     );
 
-    let requests = server.requests.lock().expect("requests");
-    assert_eq!(requests.len(), 2, "one model call per run");
-    let second = &requests[1];
-    assert!(
-        second.contains("the codename is Nightjar; remember it")
-            && second.contains("Noted: the codename is Nightjar."),
-        "the second run's model request must carry the first run's turn:\n{second}"
-    );
-    assert!(
-        !requests[0].contains("what is the codename?"),
-        "and the first run's request was its own prompt only"
-    );
+    {
+        let requests = server.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2, "one model call per run");
+        let second = &requests[1];
+        assert!(
+            second.contains("the codename is Nightjar; remember it")
+                && second.contains("Noted: the codename is Nightjar."),
+            "the second run's model request must carry the first run's turn:\n{second}"
+        );
+        assert!(
+            !requests[0].contains("what is the codename?"),
+            "and the first run's request was its own prompt only"
+        );
+    }
 
     // `--resume <id>` with an id this project never recorded refuses,
     // naming the ids it does have, rather than starting a fresh session
