@@ -121,7 +121,7 @@ nor a failure to retry — re-run with the missing input.
 | `7` | the sandbox refused or could not run a command |
 | `8` | a budget (tokens, cost, time, or turns) ran out |
 | `9` | the model stopped to ask for something only you can supply; re-run with it |
-| `10` | a workflow run paused for a human decision (`rapid run --resume`) |
+| `10` | a workflow run paused for a human decision; resume with --resume |
 | `130` | interrupted (Ctrl-C or an external cancel) |
 
 ## Where to next
