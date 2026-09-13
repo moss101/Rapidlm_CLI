@@ -6673,19 +6673,25 @@ struct LedgerAgentEvents {
 }
 
 impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
-    fn spawned(&self, agent: protocol::AgentId, agent_type: &str, task: &str) {
-        let _ = self.client.append_turn_progress(
-            self.session_id,
-            &self.actor,
-            TraceId::new(),
-            event_ledger::event::EventKind::AgentSpawned,
-            serde_json::json!({
-                "agent_id": agent.to_string(),
-                "role": agent_type,
-                "state": "running",
-                "current_operation": task,
-            }),
-        );
+    fn spawned(&self, agent: protocol::AgentId, agent_type: &str, task: &str) -> bool {
+        // Whether it landed matters here as it does not for a job's start:
+        // the projection refuses `agent.result`/`agent.cancelled` for an
+        // agent it never saw spawned, and a refused event makes the
+        // session unreadable on every replay after it.
+        self.client
+            .append_turn_progress(
+                self.session_id,
+                &self.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::AgentSpawned,
+                serde_json::json!({
+                    "agent_id": agent.to_string(),
+                    "role": agent_type,
+                    "state": "running",
+                    "current_operation": task,
+                }),
+            )
+            .is_ok()
     }
 
     fn finished(

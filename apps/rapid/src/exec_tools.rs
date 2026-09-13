@@ -321,10 +321,71 @@ pub enum SubagentEnd {
 /// runs. An observer on `task_spawn`, not a second way of running one.
 pub(crate) trait AgentEvents: Send + Sync {
     /// A child is about to run: its id, the requested agent type, and its
-    /// task (bounded by the caller).
-    fn spawned(&self, agent: protocol::AgentId, agent_type: &str, task: &str);
+    /// task (bounded by the caller). Returns whether the record landed —
+    /// a terminal record for a child that was never recorded as spawned is
+    /// refused by the session projection on every replay, so the caller
+    /// must not send one.
+    fn spawned(&self, agent: protocol::AgentId, agent_type: &str, task: &str) -> bool;
     /// The child has ended; `detail` is the failure text for a failure.
     fn finished(&self, agent: protocol::AgentId, end: SubagentEnd, detail: Option<&str>);
+}
+
+/// The registration and record of one running child, released exactly once
+/// on every path out of `task_spawn` — the ordinary return, and a panic in
+/// the runner that `batch_dispatch` turns into a failed call: without this
+/// a panicking child stayed registered (cancellable, "running" in the
+/// panel) for the session, and its `agent.spawned` never got its terminal
+/// record.
+struct ChildLifecycle<'a> {
+    registry: &'a SubagentRegistry,
+    events: Option<&'a Arc<dyn AgentEvents>>,
+    agent: protocol::AgentId,
+    recorded: bool,
+    ended: bool,
+}
+
+impl<'a> ChildLifecycle<'a> {
+    fn begin(
+        registry: &'a SubagentRegistry,
+        events: Option<&'a Arc<dyn AgentEvents>>,
+        agent: protocol::AgentId,
+        cancel: CancellationToken,
+        agent_type: &str,
+        task: &str,
+    ) -> Self {
+        registry.register(agent, cancel);
+        let recorded = events.is_some_and(|events| events.spawned(agent, agent_type, task));
+        Self {
+            registry,
+            events,
+            agent,
+            recorded,
+            ended: false,
+        }
+    }
+
+    fn end(mut self, end: SubagentEnd, detail: Option<&str>) {
+        self.finish(end, detail);
+    }
+
+    fn finish(&mut self, end: SubagentEnd, detail: Option<&str>) {
+        if self.ended {
+            return;
+        }
+        self.ended = true;
+        self.registry.unregister(self.agent);
+        if self.recorded
+            && let Some(events) = self.events
+        {
+            events.finished(self.agent, end, detail);
+        }
+    }
+}
+
+impl Drop for ChildLifecycle<'_> {
+    fn drop(&mut self) {
+        self.finish(SubagentEnd::Failed, Some("the subagent runner panicked"));
+    }
 }
 
 /// Longest task text an `agent.spawned` event carries.
@@ -1387,15 +1448,29 @@ impl WorkspaceTools {
         for server in servers {
             // Registered already — by an earlier turn of a session sharing
             // its registry (see `share_mcp`) — is registered: never a
-            // second child for the same name.
-            let already = self
-                .mcp
-                .lock()
-                .expect("mcp")
-                .iter()
-                .any(|connection| connection.server == server.name);
-            if already {
-                continue;
+            // second child for the same name while it is up. A server that
+            // did not come up, or whose process has since exited, is
+            // dropped and connected again: a session-long registry must
+            // not turn one bad start into a session-long outage.
+            {
+                let mut connections = self.mcp.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(at) = connections
+                    .iter()
+                    .position(|connection| connection.server == server.name)
+                {
+                    let exited = connections[at]
+                        .child
+                        .as_mut()
+                        .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))));
+                    if connections[at].online && !exited {
+                        continue;
+                    }
+                    connections.remove(at);
+                    self.mcp_surface
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .retain(|(_, name, _)| name != &server.name);
+                }
             }
             match connect_mcp_server(server) {
                 Ok(connected) => {
@@ -1404,14 +1479,17 @@ impl WorkspaceTools {
                     // what would reap it on a panic below.
                     let tools = connected.tools.clone();
                     let (session, child) = connected.into_connection();
-                    self.mcp.lock().expect("mcp").push(McpConnection {
-                        server: server.name.clone(),
-                        online: true,
-                        offline_reason: None,
-                        session: Some(Mutex::new(session)),
-                        child: Some(child),
-                    });
-                    let mut surface = self.mcp_surface.lock().expect("mcp surface");
+                    self.mcp
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(McpConnection {
+                            server: server.name.clone(),
+                            online: true,
+                            offline_reason: None,
+                            session: Some(Mutex::new(session)),
+                            child: Some(child),
+                        });
+                    let mut surface = self.mcp_surface.lock().unwrap_or_else(|p| p.into_inner());
                     for tool in &tools {
                         surface.push((
                             format!("mcp__{}__{}", server.name, tool.name),
@@ -1422,25 +1500,31 @@ impl WorkspaceTools {
                 }
                 Err(err) => {
                     let reason = err.to_string();
-                    self.mcp_surface.lock().expect("mcp surface").push((
-                        format!("mcp__{}__offline", server.name),
-                        server.name.clone(),
-                        mcp::transport::McpToolDescriptor {
-                            name: "offline".to_owned(),
-                            description: Some(format!(
-                                "server {} is unavailable: {reason}",
-                                server.name
-                            )),
-                            input_schema: serde_json::json!({}),
-                        },
-                    ));
-                    self.mcp.lock().expect("mcp").push(McpConnection {
-                        server: server.name.clone(),
-                        online: false,
-                        offline_reason: Some(reason),
-                        session: None,
-                        child: None,
-                    });
+                    self.mcp_surface
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push((
+                            format!("mcp__{}__offline", server.name),
+                            server.name.clone(),
+                            mcp::transport::McpToolDescriptor {
+                                name: "offline".to_owned(),
+                                description: Some(format!(
+                                    "server {} is unavailable: {reason}",
+                                    server.name
+                                )),
+                                input_schema: serde_json::json!({}),
+                            },
+                        ));
+                    self.mcp
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(McpConnection {
+                            server: server.name.clone(),
+                            online: false,
+                            offline_reason: Some(reason),
+                            session: None,
+                            child: None,
+                        });
                 }
             }
         }
@@ -3408,16 +3492,15 @@ read with job_output, in this turn or a later one — the job is stopped when th
         // through the registry — either stops this one child.
         let agent_id = protocol::AgentId::new();
         let child_cancel = CancellationToken::new();
-        self.subagent_registry
-            .register(agent_id, child_cancel.clone());
+        let lifecycle = ChildLifecycle::begin(
+            &self.subagent_registry,
+            self.agent_events.as_ref(),
+            agent_id,
+            child_cancel.clone(),
+            &args.agent_type,
+            &bounded_text(args.prompt.as_bytes(), MAX_AGENT_TASK_BYTES),
+        );
         let bridge = ParentCancelBridge::start(cancel, child_cancel.clone());
-        if let Some(events) = &self.agent_events {
-            events.spawned(
-                agent_id,
-                &args.agent_type,
-                &bounded_text(args.prompt.as_bytes(), MAX_AGENT_TASK_BYTES),
-            );
-        }
         let outcome = runner.run(
             &args.prompt,
             &args.agent_type,
@@ -3425,16 +3508,33 @@ read with job_output, in this turn or a later one — the job is stopped when th
             &child_cancel,
         );
         bridge.stop();
-        self.subagent_registry.unregister(agent_id);
-        if let Some(events) = &self.agent_events {
-            let (end, detail) = match &outcome {
-                Ok(report) if report.status == "cancelled" => (SubagentEnd::Cancelled, None),
-                Ok(report) if report.status == "succeeded" => (SubagentEnd::Succeeded, None),
-                Ok(report) => (SubagentEnd::Failed, Some(report.status.as_str())),
-                Err(reason) => (SubagentEnd::Failed, Some(reason.as_str())),
-            };
-            events.finished(agent_id, end, detail);
-        }
+        // A child stopped by its token ended cancelled whatever the runner
+        // made of it: the live runner reports a cancelled turn as an error
+        // string, and that must not read as a failure the parent should
+        // retry.
+        let outcome = match outcome {
+            Err(reason) if child_cancel.is_cancelled() => Ok(SubagentReport {
+                summary: reason,
+                status: "cancelled".to_owned(),
+                tool_calls: 0,
+                tokens: 0,
+                cost_usd_micros: None,
+                stop_reason: Some("cancelled".to_owned()),
+                claims: Vec::new(),
+                blockers: Vec::new(),
+                open_questions: Vec::new(),
+                patch_summary: None,
+                artifacts: Vec::new(),
+            }),
+            other => other,
+        };
+        let (end, detail) = match &outcome {
+            Ok(report) if report.status == "cancelled" => (SubagentEnd::Cancelled, None),
+            Ok(report) if report.status == "succeeded" => (SubagentEnd::Succeeded, None),
+            Ok(report) => (SubagentEnd::Failed, Some(report.status.as_str())),
+            Err(reason) => (SubagentEnd::Failed, Some(reason.as_str())),
+        };
+        lifecycle.end(end, detail);
         if !self.hooks.subagent_stop.is_empty() {
             let (status, ok) = match &outcome {
                 Ok(report) => (report.status.clone(), true),
@@ -5069,8 +5169,6 @@ pub struct McpServerConfig {
     pub env: Vec<(String, String)>,
 }
 
-/// A live stdio MCP connection: the supervised child, its JSON-RPC session,
-/// and the tools it advertised at registration.
 /// A session's MCP connections, shared into every turn's tools the way
 /// `JobRegistry` shares the session's job table: a server is spawned and
 /// handshaken once per session, not once per turn, so its state (an open
@@ -5083,18 +5181,9 @@ pub struct McpRegistry {
     surface: Arc<Mutex<Vec<(String, String, mcp::transport::McpToolDescriptor)>>>,
 }
 
-impl McpRegistry {
-    /// Names of the servers registered so far, online or not.
-    pub fn servers(&self) -> Vec<String> {
-        self.connections
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .map(|connection| connection.server.clone())
-            .collect()
-    }
-}
-
+/// A live stdio MCP connection: the supervised child, its JSON-RPC session,
+/// and the tools it advertised at registration — or, when it is not up, the
+/// reason. Held by the surface, or by the session through [`McpRegistry`].
 struct McpConnection {
     server: String,
     online: bool,
@@ -11647,6 +11736,206 @@ mod tests {
         }
     }
 
+    /// Records what a turn reported about its subagents; `spawned` lands
+    /// unless told not to.
+    struct RecordingAgentEvents {
+        seen: Arc<StdMutexAlias<Vec<String>>>,
+        spawned_lands: bool,
+    }
+    type StdMutexAlias<T> = std::sync::Mutex<T>;
+    impl crate::exec_tools::AgentEvents for RecordingAgentEvents {
+        fn spawned(&self, agent: protocol::AgentId, agent_type: &str, task: &str) -> bool {
+            self.seen
+                .lock()
+                .expect("lock")
+                .push(format!("spawned {agent} {agent_type} {task}"));
+            self.spawned_lands
+        }
+        fn finished(&self, agent: protocol::AgentId, end: SubagentEnd, detail: Option<&str>) {
+            self.seen
+                .lock()
+                .expect("lock")
+                .push(format!("finished {agent} {end:?} {detail:?}"));
+        }
+    }
+
+    fn cancelled_report_runner() -> Arc<dyn SubagentRunner> {
+        // The live runner's shape for a cancelled child: an error string,
+        // not a report — see `LiveSubagentRunner::run`.
+        struct ErrsWhenCancelled;
+        impl crate::exec_tools::SubagentRunner for ErrsWhenCancelled {
+            fn run(
+                &self,
+                _prompt: &str,
+                _agent_type: &str,
+                _write_scope: Option<&str>,
+                cancel: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                for _ in 0..2_000 {
+                    if cancel.is_cancelled() {
+                        return Err("subagent turn cancelled".to_owned());
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err("never cancelled".to_owned())
+            }
+        }
+        Arc::new(ErrsWhenCancelled)
+    }
+
+    #[test]
+    fn a_child_stopped_by_its_token_is_reported_cancelled_not_failed() {
+        // The live runner reports a cancelled turn as an error string. Read
+        // as a failure, `/agents cancel` recorded the child as failed, told
+        // the `subagent_stop` hook `ok:false`, and handed the parent a
+        // failed tool result it might answer by spawning the same child
+        // again.
+        let root = TempRoot::new("spawn-cancel-report");
+        let mut tools = permissive_workspace(&root.0);
+        tools.subagents = Some(cancelled_report_runner());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        tools.set_agent_events(Arc::new(RecordingAgentEvents {
+            seen: Arc::clone(&seen),
+            spawned_lands: true,
+        }));
+        let registry = SubagentRegistry::default();
+        tools.share_subagents(&registry);
+        let cancel = CancellationToken::new();
+        let call = make_call("c1", TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
+        let validated = tools.validate(&call, &cancel).expect("v");
+        // `/agents cancel` by id, from another thread once the child shows
+        // in the registry.
+        let canceller = {
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                for _ in 0..2_000 {
+                    if let Some(id) = registry.running().first().copied() {
+                        assert!(registry.cancel(id));
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                panic!("the child never registered");
+            })
+        };
+        let result = tools.execute(&validated, &cancel).expect("e");
+        canceller.join().expect("canceller");
+        match result {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("status=cancelled"), "{summary}");
+            }
+            other => panic!("expected the cancelled report, got {other:?}"),
+        }
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(
+            seen[0].starts_with("spawned ") && seen[0].contains(" explore x"),
+            "{seen:?}"
+        );
+        assert!(seen[1].contains("Cancelled"), "{seen:?}");
+        assert!(registry.running().is_empty());
+    }
+
+    #[test]
+    fn a_spawn_record_that_did_not_land_gets_no_terminal_record() {
+        // The projection refuses a terminal event for an agent it never saw
+        // spawned, and a refused event makes the session unreadable on
+        // every replay after it — so a terminal record is sent only when
+        // the spawn record landed.
+        let root = TempRoot::new("spawn-unrecorded");
+        let mut tools = permissive_workspace(&root.0);
+        tools.subagents = Some(succeeding_runner());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        tools.set_agent_events(Arc::new(RecordingAgentEvents {
+            seen: Arc::clone(&seen),
+            spawned_lands: false,
+        }));
+        let cancel = CancellationToken::new();
+        let call = make_call("c1", TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
+        let validated = tools.validate(&call, &cancel).expect("v");
+        tools.execute(&validated, &cancel).expect("e");
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].starts_with("spawned "), "{seen:?}");
+    }
+
+    #[test]
+    fn a_runner_that_panics_still_ends_its_childs_record_and_registration() {
+        // `batch_dispatch` turns a worker panic into a failed call and the
+        // turn goes on; without the lifecycle guard the child stayed
+        // registered — cancellable, "running" in the panel — for the
+        // session, and its spawn record never got a terminal one.
+        struct Panics;
+        impl crate::exec_tools::SubagentRunner for Panics {
+            fn run(
+                &self,
+                _prompt: &str,
+                _agent_type: &str,
+                _write_scope: Option<&str>,
+                _cancel: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                panic!("the child blew up");
+            }
+        }
+        let root = TempRoot::new("spawn-panic");
+        let mut tools = permissive_workspace(&root.0);
+        tools.subagents = Some(Arc::new(Panics));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        tools.set_agent_events(Arc::new(RecordingAgentEvents {
+            seen: Arc::clone(&seen),
+            spawned_lands: true,
+        }));
+        let registry = SubagentRegistry::default();
+        tools.share_subagents(&registry);
+        let cancel = CancellationToken::new();
+        let call = make_call("c1", TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
+        let validated = tools.validate(&call, &cancel).expect("v");
+        let outcome = tools.execute_batch(&[validated], &cancel);
+        assert_eq!(outcome.len(), 1);
+        assert!(
+            matches!(
+                &outcome[0],
+                Err(ToolStepError::Failed) | Ok(ToolStepResult::Failed { .. })
+            ),
+            "{outcome:?}"
+        );
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(
+            seen[1].contains("Failed") && seen[1].contains("panicked"),
+            "{seen:?}"
+        );
+        assert!(registry.running().is_empty());
+    }
+
+    fn succeeding_runner() -> Arc<dyn SubagentRunner> {
+        struct Succeeds;
+        impl crate::exec_tools::SubagentRunner for Succeeds {
+            fn run(
+                &self,
+                _prompt: &str,
+                _agent_type: &str,
+                _write_scope: Option<&str>,
+                _cancel: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                Ok(SubagentReport {
+                    summary: "done".to_owned(),
+                    status: "succeeded".to_owned(),
+                    tool_calls: 0,
+                    tokens: 1,
+                    cost_usd_micros: None,
+                    stop_reason: None,
+                    claims: Vec::new(),
+                    blockers: Vec::new(),
+                    open_questions: Vec::new(),
+                    patch_summary: None,
+                    artifacts: Vec::new(),
+                })
+            }
+        }
+        Arc::new(Succeeds)
+    }
+
     #[test]
     fn sibling_subagent_style_patches_sharing_write_locks_never_lose_a_write() {
         const N: usize = 32;
@@ -12148,6 +12437,93 @@ for line in sys.stdin:
             }
             other => panic!("expected MCP success, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_mcp_server_that_did_not_come_up_is_connected_again_on_the_next_registration() {
+        // A session-long registry must not turn one bad start into a
+        // session-long outage: a server registered offline (its command
+        // absent at the first turn) is dropped and connected again when the
+        // next turn registers it, and a server that is up is left alone.
+        const SERVER_SCRIPT: &str = r#"#!/usr/bin/env python3
+import sys, json
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "demo", "version": "1.0"}}})
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": "echo", "description": "echoes", "inputSchema": {"type": "object"}}]}})
+"#;
+        let root = TempRoot::new("mcp-reconnect");
+        let script_path = root.0.join("mcp-echo-server.py");
+        fs::write(&script_path, SERVER_SCRIPT).expect("write server");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let registry = McpRegistry::default();
+        let surface_names = |tools: &WorkspaceTools| -> Vec<String> {
+            tools
+                .tool_surface()
+                .iter()
+                .map(|tool| tool.name().to_owned())
+                .filter(|name| name.starts_with("mcp__"))
+                .collect()
+        };
+
+        // Turn 1: the command is absent, the server registers offline.
+        let broken = vec![McpServerConfig {
+            name: "demo".to_owned(),
+            command: "rapidlm-definitely-not-a-program".to_owned(),
+            args: Vec::new(),
+            env: Vec::new(),
+        }];
+        let mut first = permissive_workspace(&root.0);
+        first.share_mcp(&registry);
+        first.register_mcp_servers(&broken);
+        assert_eq!(surface_names(&first), vec!["mcp__demo__offline".to_owned()]);
+        drop(first);
+
+        // Turn 2: the same name, now runnable — connected, not left offline.
+        let fixed = vec![McpServerConfig {
+            name: "demo".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script_path.display().to_string()],
+            env: Vec::new(),
+        }];
+        let mut second = permissive_workspace(&root.0);
+        second.share_mcp(&registry);
+        second.register_mcp_servers(&fixed);
+        assert_eq!(surface_names(&second), vec!["mcp__demo__echo".to_owned()]);
+        drop(second);
+
+        // Turn 3: up already — the same connection, no second child.
+        let mut third = permissive_workspace(&root.0);
+        third.share_mcp(&registry);
+        third.register_mcp_servers(&fixed);
+        assert_eq!(surface_names(&third), vec!["mcp__demo__echo".to_owned()]);
+        assert_eq!(
+            registry
+                .connections
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len(),
+            1
+        );
     }
 
     #[test]

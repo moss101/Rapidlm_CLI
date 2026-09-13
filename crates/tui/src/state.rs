@@ -317,6 +317,13 @@ pub enum AgentLifecycle {
     Cancelled,
 }
 
+impl AgentLifecycle {
+    /// Whether the agent has ended.
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+}
+
 /// Agent row keyed by [`AgentId`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentProjection {
@@ -1268,7 +1275,22 @@ fn upsert_approval(
 
 fn insert_agent(state: &mut AppState, agent: AgentProjection) -> Result<(), UiStateError> {
     if state.agents.len() >= MAX_PROJECTED_AGENTS && !state.agents.contains_key(&agent.id) {
-        return Err(UiStateError::AgentLimit);
+        // A live view, not the record: the oldest agent that has already
+        // ended makes room for a new one, the way the transcript drops its
+        // oldest entry. Refusing the event instead blocked every action for
+        // the rest of the session once a delegation-heavy run had spawned
+        // this many children.
+        let evictable = state
+            .agents
+            .iter()
+            .find(|(_, row)| row.state.is_terminal())
+            .map(|(id, _)| *id);
+        match evictable {
+            Some(id) => {
+                state.agents.remove(&id);
+            }
+            None => return Err(UiStateError::AgentLimit),
+        }
     }
     state.agents.insert(agent.id, agent);
     Ok(())
@@ -2310,6 +2332,62 @@ mod tests {
             state.transcript().first(),
             Some(TranscriptEntry::User { text }) if text == "inherited 0"
         ));
+    }
+
+    #[test]
+    fn a_full_agent_projection_evicts_an_ended_agent_for_a_new_one() {
+        // Rows were never removed, so a delegation-heavy session hit the
+        // bound and every event after it was refused — the whole session
+        // blocked on a display limit. A live view drops its oldest ended
+        // row instead.
+        let mut state = reduce(AppState::new(), &created());
+        let agent_id = |n: usize| -> String { format!("019c0000-0000-7000-8000-{n:012x}") };
+        let mut seq = 2;
+        for n in 1..=MAX_PROJECTED_AGENTS {
+            state = reduce(
+                state,
+                &UiEvent::Kernel(envelope(
+                    seq,
+                    EventKind::AgentSpawned,
+                    UPDATED_AT,
+                    serde_json::json!({"agent_id": agent_id(n), "role": "explore"}),
+                )),
+            );
+            seq += 1;
+            state = reduce(
+                state,
+                &UiEvent::Kernel(envelope(
+                    seq,
+                    EventKind::AgentResult,
+                    UPDATED_AT,
+                    serde_json::json!({"agent_id": agent_id(n), "state": "succeeded"}),
+                )),
+            );
+            seq += 1;
+        }
+        assert_eq!(state.agents().len(), MAX_PROJECTED_AGENTS);
+        assert!(state.protocol_error().is_none());
+        state = reduce(
+            state,
+            &UiEvent::Kernel(envelope(
+                seq,
+                EventKind::AgentSpawned,
+                UPDATED_AT,
+                serde_json::json!({"agent_id": agent_id(MAX_PROJECTED_AGENTS + 1), "role": "explore"}),
+            )),
+        );
+        assert!(
+            state.protocol_error().is_none(),
+            "{:?}",
+            state.protocol_error()
+        );
+        assert!(!state.actions_blocked());
+        assert_eq!(state.agents().len(), MAX_PROJECTED_AGENTS);
+        let newest: AgentId = agent_id(MAX_PROJECTED_AGENTS + 1).parse().expect("id");
+        assert!(
+            state.agents().contains_key(&newest),
+            "the new agent is shown"
+        );
     }
 
     #[test]
