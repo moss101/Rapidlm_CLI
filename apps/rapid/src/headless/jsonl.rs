@@ -99,6 +99,9 @@ pub enum JsonlExitCode {
     /// instead of treating it as either a clean success or a failure to
     /// retry/alert on.
     NeedsContext = 9,
+    /// A workflow run paused on a human decision (`rapid run`): nothing is
+    /// wrong — the run is durably parked and `--resume` continues it.
+    NeedsApproval = 10,
     Interrupted = 130,
 }
 
@@ -499,6 +502,10 @@ impl JsonlExitCode {
             "the model stopped to ask for something only you can supply; re-run with it",
         ),
         (
+            Self::NeedsApproval,
+            "a workflow run paused for a human decision; resume with --resume",
+        ),
+        (
             Self::Interrupted,
             "interrupted (Ctrl-C or an external cancel)",
         ),
@@ -649,6 +656,7 @@ mod tests {
             JsonlExitCode::Sandbox,
             JsonlExitCode::ResourceExhausted,
             JsonlExitCode::NeedsContext,
+            JsonlExitCode::NeedsApproval,
             JsonlExitCode::Interrupted,
         ];
         for code in every {
@@ -662,6 +670,7 @@ mod tests {
                 | JsonlExitCode::Sandbox
                 | JsonlExitCode::ResourceExhausted
                 | JsonlExitCode::NeedsContext
+                | JsonlExitCode::NeedsApproval
                 | JsonlExitCode::Interrupted => {}
             }
             assert!(

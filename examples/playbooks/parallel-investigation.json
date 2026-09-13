@@ -1,0 +1,45 @@
+{
+  "name": "parallel-investigation",
+  "steps": [
+    {
+      "key": "goal",
+      "kind": "goal",
+      "label": "Understand how errors are handled across the codebase"
+    },
+    {
+      "key": "explore-errors",
+      "kind": "task",
+      "label": "Survey error/Result usage in the workspace and summarize patterns in .rapidlm/notes/errors.md",
+      "depends_on": [
+        "goal"
+      ]
+    },
+    {
+      "key": "explore-logging",
+      "kind": "task",
+      "label": "Survey logging/diagnostics usage in the workspace and summarize in .rapidlm/notes/logging.md",
+      "depends_on": [
+        "goal"
+      ]
+    },
+    {
+      "key": "integrate",
+      "kind": "task",
+      "label": "Merge the two surveys into one coherent picture of error handling and diagnostics. Write it to .rapidlm/notes/diagnostics.md",
+      "depends_on": [
+        "explore-errors",
+        "explore-logging"
+      ]
+    },
+    {
+      "key": "verify-summary",
+      "kind": "verification",
+      "label": "The integrated note exists and is non-trivial",
+      "depends_on": [
+        "integrate"
+      ],
+      "command": "test -s .rapidlm/notes/diagnostics.md",
+      "max_attempts": 1
+    }
+  ]
+}

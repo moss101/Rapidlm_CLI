@@ -1,0 +1,48 @@
+{
+  "name": "bugfix-flow",
+  "steps": [
+    {
+      "key": "diagnose",
+      "kind": "task",
+      "label": "Reproduce the failing behavior and identify the root cause. Write the diagnosis to .rapidlm/notes/diagnosis.md"
+    },
+    {
+      "key": "patch",
+      "kind": "task",
+      "label": "Fix the root cause identified in the diagnosis. Keep the change minimal.",
+      "depends_on": [
+        "diagnose"
+      ]
+    },
+    {
+      "key": "regression-test",
+      "kind": "task",
+      "label": "Add a regression test that fails without the fix and passes with it.",
+      "depends_on": [
+        "patch"
+      ]
+    },
+    {
+      "key": "verify",
+      "kind": "verification",
+      "label": "Run the test suite",
+      "depends_on": [
+        "regression-test"
+      ],
+      "command": "cargo test --workspace --lib",
+      "watch": [
+        "src/**/*.rs",
+        "tests/**/*.rs"
+      ],
+      "max_attempts": 1
+    },
+    {
+      "key": "ship-approval",
+      "kind": "approval",
+      "label": "Approve the fix for commit",
+      "depends_on": [
+        "verify"
+      ]
+    }
+  ]
+}

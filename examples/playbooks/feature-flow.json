@@ -1,0 +1,47 @@
+{
+  "name": "feature-flow",
+  "steps": [
+    {
+      "key": "plan",
+      "kind": "plan",
+      "label": "Write a short implementation plan for the feature into .rapidlm/notes/plan.md"
+    },
+    {
+      "key": "implement",
+      "kind": "task",
+      "label": "Implement the feature following the plan. Stay within the plan's scope.",
+      "depends_on": [
+        "plan"
+      ]
+    },
+    {
+      "key": "tests",
+      "kind": "task",
+      "label": "Add tests covering the new behavior, both happy path and edge cases.",
+      "depends_on": [
+        "implement"
+      ]
+    },
+    {
+      "key": "verify",
+      "kind": "verification",
+      "label": "Run the full test suite",
+      "depends_on": [
+        "tests"
+      ],
+      "command": "cargo test --workspace --lib",
+      "watch": [
+        "src/**/*.rs"
+      ],
+      "max_attempts": 1
+    },
+    {
+      "key": "review-diff",
+      "kind": "task",
+      "label": "Review the workspace diff for accidental changes, debug leftovers, and style problems. Summarize the review.",
+      "depends_on": [
+        "verify"
+      ]
+    }
+  ]
+}

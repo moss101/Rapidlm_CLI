@@ -572,6 +572,13 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         handler: SubcommandHandler::Native(exec_subcommand),
     },
     Subcommand {
+        name: "run",
+        operands: "<playbook.json> | --resume <run-id> | --status <run-id> | --resolve <run-id> approve|deny|answer <text> | --retry <run-id> <step>",
+        summary: "execute (and resume) a playbook workflow",
+        own_help: true,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_run_command),
+    },
+    Subcommand {
         name: "trust",
         operands: "grant|status|revoke",
         summary: "explicit project-trust control plane",
@@ -849,7 +856,7 @@ fn printable(text: &str) -> String {
 /// One reader, shared by the "resume where I left off" default and the
 /// unknown-id hint, so the two can never disagree about what this project
 /// contains.
-fn recorded_sessions(
+pub(crate) fn recorded_sessions(
     ledger_path: &Path,
 ) -> Result<Vec<event_ledger::ledger::SessionSummary>, InteractiveError> {
     if !ledger_path.exists() {
@@ -8883,6 +8890,91 @@ fn kernel_turn_outcome<E: std::fmt::Display>(
         Err(err) => kernel::TurnOutcome::Failed {
             reason: err.to_string(),
         },
+    }
+}
+
+/// The workspace a `rapid run` workflow executes against: `(root, trusted)`.
+/// `None` when no project root resolves. Same resolution as `rapid exec`.
+pub(crate) fn workflow_workspace_root() -> Option<(PathBuf, bool)> {
+    let cancel = CancellationToken::new();
+    exec_workspace(&cancel).map(|(root, status)| (root, status == kernel::TrustStatus::Trusted))
+}
+
+/// One workflow agent step: run a real turn for `task` against `root` and
+/// return its bounded terminal output. The same assembly the interactive
+/// and headless paths use — tools under the permission lattice, the model
+/// resolved from env/config with its fallback chain, context compiled
+/// against the model's own window — minus session conveniences (no
+/// conversation history: each step is its own scoped turn).
+pub(crate) fn run_workflow_agent_step(
+    root: &Path,
+    trusted: bool,
+    task: &str,
+) -> Result<String, String> {
+    let mut warn: &mut dyn FnMut(&str) = &mut |_| {};
+    let (mut tools, permission_lattice) = build_interactive_turn_tools(root, trusted, None)
+        .map_err(|outcome| "workflow step could not build its tools".to_owned())?;
+    let _policy_version = apply_managed_ceilings(&mut tools);
+    tools.share_mcp(&Default::default());
+    let (_reminder_floor, reminder_block) = interactive_reminders(root, &mut warn);
+    let session_model = SessionModel::resolve(_reminder_floor, None, &mut warn)
+        .map_err(|reason| format!("model resolution failed: {reason}"))?;
+    let backing = session_model
+        .backing(None, &mut warn)
+        .map_err(|reason| format!("model construction failed: {reason}"))?;
+    let (context_limit, output_reserve) = context_budget_for(&backing);
+    let preserved = build_interactive_turn_context(
+        root,
+        trusted,
+        task,
+        context_limit,
+        output_reserve,
+        crate::host::ConversationHistory {
+            summary: None,
+            turns: Vec::new(),
+            through_seq: 0,
+        },
+        reminder_block,
+    )
+    .map_err(|_| "workflow step could not build its context".to_owned())?;
+    configure_trusted_model_tools(
+        &mut tools,
+        root,
+        session_model.primary(),
+        &permission_lattice,
+        None,
+    );
+    let spec = AgentSpec::builder(
+        protocol::AgentId::new(),
+        AgentRole::Coder,
+        task.to_owned(),
+        protocol::WorkspaceViewId::new(),
+    )
+    .permissions_profile("work")
+    .build()
+    .map_err(|err| format!("invalid workflow step request: {err}"))?;
+    let request = AgentExecutionRequest::new(spec, protocol::SessionId::new());
+    let mut events: Vec<agent_runtime::TurnEvent> = Vec::new();
+    let run_result = crate::host::run_live_exec(
+        preserved,
+        backing,
+        &request,
+        &mut tools,
+        &mut events,
+        &agent_runtime::CancellationToken::new(),
+        ContextRetryPolicy::default(),
+        None,
+    );
+    match run_result {
+        Ok(outcome) => {
+            let summary = outcome.result.summary().to_owned();
+            if outcome.result.status() == AgentTerminalStatus::Succeeded {
+                Ok(summary)
+            } else {
+                Err(summary)
+            }
+        }
+        Err(err) => Err(err.to_string()),
     }
 }
 

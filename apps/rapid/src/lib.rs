@@ -34,6 +34,7 @@ pub mod shadow_diagnostics;
 pub mod structured_output;
 pub mod user_config;
 pub mod web_fetch;
+pub mod workflow;
 
 pub use interactive::{
     CLI_USAGE, InteractiveError, InteractiveInput, InteractiveOptions, InteractiveOutcome,

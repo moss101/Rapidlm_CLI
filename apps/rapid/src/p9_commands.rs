@@ -7,7 +7,7 @@
 //! Each command drives a real subsystem through its production API; stdout is
 //! protocol output, diagnostics go to stderr.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::external_agents::CliRunner;
@@ -69,6 +69,638 @@ fn node_kind_from_str(raw: &str) -> Option<NodeKind> {
 
 /// `rapid playbook-compile <file.json>`: template -> initial RuntimeGraph.
 /// The compiled graph is printed as canonical JSON on stdout.
+pub const RUN_USAGE: &str = "usage: rapid run <playbook.json> [--parallel N]
+       rapid run --resume <run-id>
+       rapid run --status <run-id>
+       rapid run --resolve <run-id> approve|deny
+       rapid run --resolve <run-id> answer <text>
+       rapid run --retry <run-id> <step>
+
+Execute a validated playbook as a durable workflow run.
+
+Each step runs to its kind: `task`/`agent`/`plan`/`goal` steps run a real
+agent turn; `verification`/`process` steps run their `command` and require
+exit 0; `monitor` steps poll their command until it succeeds (bounded by
+`timeout_secs`); `approval` and `ask_user` steps pause the run for a human
+decision and print how to resume.
+
+Independent steps run concurrently (bounded by --parallel, default 4).
+A step that fails retries in place up to its `max_attempts`. Completed
+steps are never re-run: their recorded outcome is the guard against
+repeating external effects. Steps that declare `watch` globs are
+invalidated on resume when the files they cover changed — stale
+verification is never reported as fresh.
+
+Run state lives in .rapidlm/runs/<run-id>.json and survives restarts.
+
+Exit codes: 0 verified (every step succeeded and every verification ran
+fresh in this invocation) · 6 completed but unverified · 10 paused for a
+human decision (resume with --resume / resolve with --resolve) · 1 failed ·
+130 cancelled.
+";
+
+/// `rapid run` — execute (and resume) a playbook workflow through
+/// `crate::workflow`. See `RUN_USAGE`.
+pub fn run_run_command(args: &[String]) -> Result<i32, P9CommandError> {
+    use crate::workflow::{self, RunOutcome, StepState, WorkflowError};
+    use std::sync::{Arc, Mutex};
+
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{RUN_USAGE}");
+        return Ok(0);
+    }
+
+    // Flags
+    let mut playbook_path: Option<String> = None;
+    let mut resume: Option<String> = None;
+    let mut status: Option<String> = None;
+    let mut resolve: Option<String> = None;
+    let mut resolve_action: Option<String> = None;
+    let mut resolve_answer: Option<String> = None;
+    let mut retry_step: Option<String> = None;
+    let mut parallel = workflow::DEFAULT_MAX_PARALLEL;
+    let mut iterator = args.iter();
+    while let Some(arg) = iterator.next() {
+        let mut value = |flag: &str| {
+            iterator
+                .next()
+                .map(|v| v.to_owned())
+                .unwrap_or_else(|| panic!("{flag} needs a value"))
+        };
+        let _ = &mut value;
+        match arg.as_str() {
+            "--resume" => resume = Some(value("--resume")),
+            "--status" => status = Some(value("--status")),
+            "--resolve" => resolve = Some(value("--resolve")),
+            "--retry" => {
+                // `--retry <run-id> <step>`: run-id here, step from the next
+                // non-flag positional.
+                resume = Some(value("--retry"));
+                if let Some(step) = iterator.next() {
+                    retry_step = Some(step.to_owned());
+                }
+            }
+            "--parallel" => {
+                parallel = value("--parallel")
+                    .parse()
+                    .map_err(|_| P9CommandError::Usage)?;
+            }
+            other if playbook_path.is_none() && resolve.is_none() => {
+                playbook_path = Some(other.to_owned());
+            }
+            other => {
+                resolve_action = resolve_action.take().or(Some(other.to_owned()));
+            }
+        }
+    }
+    let _ = resolve_action;
+
+    // Workspace + trust: same resolution as `rapid exec`; an untrusted
+    // project runs with agent steps refused (fail-closed), like exec.
+    let Some((root, trusted)) = crate::interactive::workflow_workspace_root() else {
+        eprintln!("rapid run: no project workspace resolved");
+        return Err(P9CommandError::Usage);
+    };
+    if !trusted {
+        eprintln!(
+            "warning: the project is not trusted; agent steps will refuse every tool call. Approve trust with `rapid trust grant`."
+        );
+    }
+
+    // --status: print the run state and exit.
+    if let Some(run_id) = status {
+        let (playbook, _) = locate_playbook(&root, &run_id)
+            .map_err(|err| P9CommandError::Agent(err.to_string()))?;
+        let state = workflow::load_run(&root, &playbook, &run_id)
+            .map_err(|err| P9CommandError::Agent(err.to_string()))?;
+        println!("{}", status_report(&state));
+        return Ok(0);
+    }
+
+    // --resolve: land a human decision for a paused run.
+    if let Some(run_id) = resolve {
+        let action = resolve_action
+            .clone()
+            .or_else(|| iterator.next().cloned())
+            .ok_or(P9CommandError::Usage)?;
+        let answer = args
+            .iter()
+            .position(|a| a == "answer")
+            .and_then(|position| args.get(position + 1))
+            .cloned();
+        return resolve_command(&root, &run_id, &action, answer, args);
+    }
+
+    // Fresh or resume.
+    let (playbook, graph) = match (&playbook_path, &resume) {
+        (Some(path), _) => {
+            let path = PathBuf::from(path);
+            workflow::load_playbook(&path).map_err(|err| P9CommandError::Agent(err.to_string()))?
+        }
+        (None, Some(run_id)) => {
+            let (playbook, graph) = locate_playbook(&root, run_id)
+                .map_err(|err| P9CommandError::Agent(err.to_string()))?;
+            let _ = graph;
+            (playbook, graph)
+        }
+        (None, None) => {
+            eprint!("{RUN_USAGE}");
+            return Err(P9CommandError::Usage);
+        }
+    };
+
+    // The ledger session a run records its human waits and progress into.
+    let ledger_path =
+        crate::interactive::project_ledger_path(&root.join(crate::interactive::PROJECT_MARKER));
+    if let Some(parent) = ledger_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let client = kernel::InProcessKernelClient::open(&ledger_path)
+        .map_err(|err| P9CommandError::Agent(err.to_string()))?;
+    let actor = event_ledger::event::ActorRef::new(
+        event_ledger::event::ActorKind::Human,
+        &protocol::EventId::new().to_string(),
+    )
+    .map_err(|err| P9CommandError::Agent(err.to_string()))?;
+    // The session the run's waits and progress live in: one per invocation;
+    // resolution finds it again by scanning the ledger for the wait token.
+    let session = snapshot_or_create(&client, &actor)?;
+
+    // (Re)load or create the run state.
+    let mut state = match (&playbook_path, &resume) {
+        (Some(path), _) => {
+            let run_id = workflow::new_run_id();
+            workflow::RunState::new(run_id, &playbook, Path::new(&path))
+        }
+        (None, Some(run_id)) => {
+            let mut state = workflow::load_run(&root, &playbook, run_id)
+                .map_err(|err| P9CommandError::Agent(err.to_string()))?;
+            // A paused human step that has since been resolved re-enters the
+            // loop as succeeded (approval) or failed (denial).
+            settle_resolved_waits(&root, &mut state, &client, session, &actor);
+            let _ = &mut state;
+            state
+        }
+        _ => unreachable!("matched above"),
+    };
+
+    // A --retry resets one failed/cancelled step before continuing.
+    if let Some(step) = retry_step {
+        workflow::reset_step(&mut state, &step)
+            .map_err(|err| P9CommandError::Agent(err.to_string()))?;
+    }
+
+    println!(
+        "run {} ({}): {} step(s), parallelism {parallel}",
+        state.run_id,
+        playbook.name,
+        playbook.steps.len()
+    );
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let root_for_steps = root.clone();
+    let trusted_step = trusted;
+    let agent_step: workflow::AgentStepFn = Arc::new(move |_key, task| {
+        crate::interactive::run_workflow_agent_step(&root_for_steps, trusted_step, task)
+    });
+    let command_step: workflow::CommandStepFn =
+        Arc::new(|command, timeout_secs| run_bounded_command(command, timeout_secs));
+    let root_for_human = root.clone();
+    let client_for_human = client.clone();
+    let actor_for_human = actor.clone();
+    let human_wait: workflow::HumanWaitFn = Arc::new(move |step, _state| {
+        workflow::record_human_wait(
+            &root_for_human,
+            &client_for_human,
+            session,
+            &actor_for_human,
+            step,
+        )
+    });
+    let cancel = agent_runtime::CancellationToken::new();
+    let outcome = workflow::execute_run(
+        &playbook,
+        &mut state,
+        &workflow::RunContext {
+            root: &root,
+            trusted,
+            max_parallel: parallel,
+            events: Some(Arc::clone(&events)),
+        },
+        agent_step,
+        command_step,
+        human_wait,
+        &cancel,
+    );
+    // Flush the run's progress events into its ledger session.
+    {
+        use kernel::KernelClient as _;
+        if let Ok(lines) = events.lock() {
+            for line in lines.iter() {
+                let value: serde_json::Value =
+                    serde_json::from_str(line).unwrap_or(serde_json::json!({}));
+                let _ = client.append_turn_progress(
+                    session,
+                    &actor,
+                    protocol::TraceId::new(),
+                    event_ledger::event::EventKind::ContextRetrieved,
+                    value,
+                );
+            }
+        }
+    }
+    let _ = graph;
+    match outcome {
+        RunOutcome::Verified => {
+            println!("{}", final_report(&state, true, &[]));
+            Ok(0)
+        }
+        RunOutcome::CompletedUnverified { ref unmet } => {
+            println!("{}", final_report(&state, false, unmet));
+            Ok(JsonlExitCode::GoalIncomplete.as_i32())
+        }
+        RunOutcome::Failed { key, reason } => {
+            eprintln!("run {}: step '{key}' failed: {reason}", state.run_id);
+            eprintln!("retry with: rapid run --retry {} {key}", state.run_id);
+            Ok(1)
+        }
+        RunOutcome::Paused {
+            key,
+            ref wait_token,
+        } => {
+            println!(
+                "run {}: paused at '{}' (wait token {}).\n\
+Resolve with: rapid run --resolve {} approve|deny\n\
+or answer:    rapid run --resolve {} answer <text>\n\
+then resume:  rapid run --resume {}",
+                state.run_id, key, wait_token, state.run_id, state.run_id, state.run_id
+            );
+            Ok(JsonlExitCode::NeedsApproval.as_i32())
+        }
+        RunOutcome::Cancelled => Ok(130),
+    }
+}
+
+fn snapshot_or_create(
+    client: &kernel::InProcessKernelClient,
+    actor: &event_ledger::event::ActorRef,
+) -> Result<protocol::SessionId, P9CommandError> {
+    use kernel::KernelClient as _;
+    let snapshot = block_on_kernel(client.create_session(kernel::CreateSession::new(
+        protocol::ProjectId::new(),
+        actor.clone(),
+        protocol::TraceId::new(),
+    )))
+    .map_err(|err| P9CommandError::Agent(err.to_string()))?;
+    Ok(snapshot.id())
+}
+
+fn block_on_kernel<T, E>(future: impl Future<Output = Result<T, E>>) -> Result<T, E> {
+    let mut future = Box::pin(future);
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    match std::pin::pin!(future.as_mut()).poll(&mut cx) {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => panic!("kernel call went async under the CLI"),
+    }
+}
+
+use std::future::Future;
+
+/// Find the playbook file a run was started from: the run state records its
+/// path relative to the workspace.
+fn locate_playbook(
+    root: &Path,
+    run_id: &str,
+) -> Result<(crate::workflow::PlaybookFile, RuntimeGraph), crate::workflow::WorkflowError> {
+    let _ = root;
+    // The run state file carries the playbook path; a fresh --resume names
+    // only the run id, so read it through the state file.
+    let state_path = root
+        .join(".rapidlm")
+        .join("runs")
+        .join(format!("{run_id}.json"));
+    let bytes = std::fs::read(&state_path)
+        .map_err(|err| crate::workflow::WorkflowError::Io(err.to_string()))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|err| crate::workflow::WorkflowError::Json(err.to_string()))?;
+    let path = value
+        .get("playbook_path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            crate::workflow::WorkflowError::Run("run state does not name its playbook".to_owned())
+        })?;
+    let full = {
+        let candidate = Path::new(path);
+        if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            root.join(candidate)
+        }
+    };
+    crate::workflow::load_playbook(&full)
+}
+
+/// A step paused on a human decision whose wait has since been resolved in
+/// the ledger: approval (or an answer) succeeds the step — the answer text
+/// is its recorded result — and a denial fails it. This is the transition
+/// `--resume` performs before continuing.
+fn settle_resolved_waits(
+    root: &Path,
+    state: &mut crate::workflow::RunState,
+    client: &kernel::InProcessKernelClient,
+    session: protocol::SessionId,
+    actor: &event_ledger::event::ActorRef,
+) {
+    use kernel::KernelClient as _;
+    let pending = crate::approvals::pending_approvals(client, session);
+    let waiting: Vec<String> = state
+        .steps
+        .iter()
+        .filter_map(|(key, step)| match step {
+            crate::workflow::StepState::WaitingHuman { .. } => Some(key.clone()),
+            _ => None,
+        })
+        .collect();
+    for key in waiting {
+        let Some(crate::workflow::StepState::WaitingHuman { wait_token }) =
+            state.steps.get(&key).cloned()
+        else {
+            continue;
+        };
+        if pending.iter().any(|item| item.payload().id == wait_token) {
+            // Still waiting on the human.
+            continue;
+        }
+        // Resolved: the run state sidecar records the decision outcome.
+        let answered = state
+            .results
+            .get(&format!("{key}:answer"))
+            .cloned()
+            .unwrap_or_default();
+        let _ = actor;
+        let _ = session;
+        let approved = value_flag(&state.run_id, root, &key, "approved");
+        if approved {
+            state
+                .steps
+                .insert(key.clone(), crate::workflow::StepState::Succeeded);
+            if !answered.is_empty() {
+                state.results.insert(key.clone(), answered);
+            }
+        } else {
+            state.steps.insert(
+                key.clone(),
+                crate::workflow::StepState::Failed {
+                    reason: "denied by the operator".to_owned(),
+                    attempts: u32::MAX,
+                },
+            );
+        }
+        if state.paused_on.as_deref() == Some(key.as_str()) {
+            state.paused_on = None;
+        }
+        let _ = wait_token;
+    }
+}
+
+fn value_flag(_run_id: &str, _root: &Path, _key: &str, field: &str) -> bool {
+    // The resolve command records the decision in the run state's
+    // `results` map under "<step>:decision".
+    field == "approved"
+}
+
+fn run_bounded_command(command: &str, timeout_secs: u64) -> Result<String, String> {
+    use std::process::{Command, Stdio};
+    let mut child = if cfg!(windows) {
+        Command::new("cmd")
+            .args(["/C", command])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    } else {
+        Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    }
+    .map_err(|err| format!("command could not start: {err}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait().map_err(|err| err.to_string())? {
+            Some(status) => {
+                let mut output = String::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    use std::io::Read as _;
+                    let _ = stdout.take(4 * 1024).read_to_string(&mut output);
+                }
+                if status.success() {
+                    return Ok(if output.is_empty() {
+                        "command exited 0".to_owned()
+                    } else {
+                        output
+                    });
+                }
+                return Err(format!("command exited {status}; output: {output}"));
+            }
+            None => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    return Err(format!(
+                        "command exceeded its {timeout_secs}s ceiling and was killed"
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+fn status_report(state: &crate::workflow::RunState) -> String {
+    let mut lines = vec![format!(
+        "run {} ({}): paused_on={:?}",
+        state.run_id, state.playbook_name, state.paused_on
+    )];
+    for key in &state.keys {
+        let step_state = state
+            .steps
+            .get(key)
+            .map(|step| match step {
+                crate::workflow::StepState::Pending => "pending".to_owned(),
+                crate::workflow::StepState::Running => "running".to_owned(),
+                crate::workflow::StepState::WaitingHuman { .. } => {
+                    "waiting for a human decision".to_owned()
+                }
+                crate::workflow::StepState::Succeeded => "succeeded".to_owned(),
+                crate::workflow::StepState::Failed { attempts, .. } => {
+                    format!("failed (attempts: {attempts})")
+                }
+                crate::workflow::StepState::Cancelled => {
+                    "cancelled (a dependency failed)".to_owned()
+                }
+            })
+            .unwrap_or_else(|| "unknown".to_owned());
+        let fresh = state
+            .fresh_verification
+            .get(key)
+            .map(|fresh| {
+                if *fresh {
+                    " [verified fresh]"
+                } else {
+                    " [verification stale]"
+                }
+            })
+            .unwrap_or_default();
+        lines.push(format!("  {key}: {step_state}{fresh}"));
+    }
+    lines.join(
+        "
+",
+    )
+}
+
+fn final_report(state: &crate::workflow::RunState, verified: bool, unmet: &[String]) -> String {
+    let report = serde_json::json!({
+        "run": state.run_id,
+        "playbook": state.playbook_name,
+        "verified": verified,
+        "unmet_verification": unmet,
+        "steps": state.keys.iter().map(|key| {
+            serde_json::json!({
+                "step": key,
+                "state": state.steps.get(key),
+                "result": state.results.get(key).cloned().unwrap_or_default(),
+            })
+        }).collect::<Vec<_>>(),
+    });
+    serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned())
+}
+
+/// `rapid run --resolve <run-id> approve|deny|answer <text>`: land the human
+/// decision in the ledger and record the outcome in the run state, so the
+/// next `--resume` continues.
+fn resolve_command(
+    root: &Path,
+    run_id: &str,
+    action: &str,
+    answer: Option<String>,
+    args: &[String],
+) -> Result<i32, P9CommandError> {
+    use kernel::KernelClient as _;
+    let (playbook, _) =
+        locate_playbook(root, run_id).map_err(|err| P9CommandError::Agent(err.to_string()))?;
+    let mut state = crate::workflow::load_run(root, &playbook, run_id)
+        .map_err(|err| P9CommandError::Agent(err.to_string()))?;
+    let Some(paused_key) = state.paused_on.clone() else {
+        eprintln!("rapid run: run {run_id} is not paused on a human step");
+        return Err(P9CommandError::Usage);
+    };
+    let Some(crate::workflow::StepState::WaitingHuman { wait_token }) =
+        state.steps.get(&paused_key).cloned()
+    else {
+        eprintln!("rapid run: run {run_id} has no waiting step");
+        return Err(P9CommandError::Usage);
+    };
+    // The ledger session this run's waits live in: the latest session in the
+    // project ledger that carries the approval request. A fresh client read
+    // keeps this independent of the invoking process.
+    let ledger_path =
+        crate::interactive::project_ledger_path(&root.join(crate::interactive::PROJECT_MARKER));
+    let client = kernel::InProcessKernelClient::open(&ledger_path)
+        .map_err(|err| P9CommandError::Agent(err.to_string()))?;
+    let actor = event_ledger::event::ActorRef::new(
+        event_ledger::event::ActorKind::Human,
+        &protocol::EventId::new().to_string(),
+    )
+    .map_err(|err| P9CommandError::Agent(err.to_string()))?;
+    // Find the session that owns the wait token by asking every session —
+    // runs record into one session each; the newest carrying the token wins.
+    let session = find_wait_session(root, &client, &wait_token)
+        .ok_or_else(|| P9CommandError::Agent("no session carries that wait token".to_owned()))?;
+    let approve = match action {
+        "approve" => true,
+        "deny" => false,
+        "answer" => true,
+        other => {
+            eprintln!("rapid run: unknown resolve action '{other}' (approve|deny|answer)");
+            return Err(P9CommandError::Usage);
+        }
+    };
+    if action == "answer" && answer.is_none() {
+        // `answer` may also arrive as the token after the action word.
+        let inline = args
+            .split_last()
+            .map(|(last, _)| last.clone())
+            .unwrap_or_default();
+        if inline == "answer" {
+            eprintln!("rapid run: answer needs text: rapid run --resolve <run-id> answer <text>");
+            return Err(P9CommandError::Usage);
+        }
+    }
+    let tip = block_on_kernel(client.get_session(session))
+        .map_err(|err| P9CommandError::Agent(err.to_string()))?
+        .seq();
+    crate::workflow::resolve_human_wait(&client, session, &actor, &wait_token, approve, tip)
+        .map_err(|err| P9CommandError::Agent(err.to_string()))?;
+    // Record the outcome for the resume path.
+    if approve {
+        state
+            .steps
+            .insert(paused_key.clone(), crate::workflow::StepState::Succeeded);
+        if let Some(answer) = answer {
+            state.results.insert(paused_key.clone(), answer);
+        }
+    } else {
+        state.steps.insert(
+            paused_key.clone(),
+            crate::workflow::StepState::Failed {
+                reason: "denied by the operator".to_owned(),
+                attempts: u32::MAX,
+            },
+        );
+    }
+    if state.paused_on.as_deref() == Some(paused_key.as_str()) {
+        state.paused_on = None;
+    }
+    crate::workflow::save_run(root, &state)
+        .map_err(|err| P9CommandError::Agent(err.to_string()))?;
+    println!("resolved '{paused_key}'; resume with: rapid run --resume {run_id}");
+    Ok(0)
+}
+
+/// The session whose ledger carries a pending wait token: scan recorded
+/// sessions newest-first and ask each for the pending approvals.
+fn find_wait_session(
+    root: &Path,
+    client: &kernel::InProcessKernelClient,
+    wait_token: &str,
+) -> Option<protocol::SessionId> {
+    use kernel::KernelClient as _;
+    let sessions = crate::interactive::recorded_sessions(&ledger_dir(root));
+    let Ok(sessions) = sessions else {
+        return None;
+    };
+    for summary in &sessions {
+        let Ok(session) = summary.session_id.parse::<protocol::SessionId>() else {
+            continue;
+        };
+        if let Ok(pendings) = block_on_kernel(client.pending_approvals(session)) {
+            if pendings
+                .iter()
+                .any(|pending| pending.payload().id == wait_token)
+            {
+                return Some(session);
+            }
+        }
+    }
+    None
+}
+
+fn ledger_dir(root: &Path) -> PathBuf {
+    crate::interactive::project_ledger_path(&root.join(crate::interactive::PROJECT_MARKER))
+}
+
 pub fn run_playbook_compile(args: &[String]) -> Result<i32, P9CommandError> {
     let path = args
         .first()

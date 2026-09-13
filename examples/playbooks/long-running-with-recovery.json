@@ -1,0 +1,39 @@
+{
+  "name": "long-running-with-recovery",
+  "steps": [
+    {
+      "key": "prepare",
+      "kind": "task",
+      "label": "Prepare the migration: list every call site needing the change in .rapidlm/notes/migration-plan.md"
+    },
+    {
+      "key": "gate",
+      "kind": "approval",
+      "label": "Approve the migration plan before any code changes",
+      "depends_on": [
+        "prepare"
+      ]
+    },
+    {
+      "key": "migrate",
+      "kind": "task",
+      "label": "Apply the migration per the approved plan.",
+      "depends_on": [
+        "gate"
+      ]
+    },
+    {
+      "key": "verify",
+      "kind": "verification",
+      "label": "Workspace still compiles and tests pass",
+      "depends_on": [
+        "migrate"
+      ],
+      "command": "cargo check --workspace",
+      "watch": [
+        "src/**/*.rs"
+      ],
+      "max_attempts": 2
+    }
+  ]
+}
