@@ -4595,7 +4595,7 @@ fn run_started_session(
         renderer: &mut renderer,
         autonomous: None,
         compaction: None,
-        notices: SessionNotices::default(),
+        shared: SessionShared::default(),
         #[cfg(test)]
         scripted_backings: None,
     }
@@ -4676,9 +4676,10 @@ struct SessionLoop<'a> {
     /// `turn_in_flight` does (one model call per session at a time) and is
     /// cleared by `settle_compaction` once the thread reports back.
     compaction: Option<CompactionInFlight>,
-    /// What the turn and compaction threads have to say to the user — see
-    /// [`SessionNotices`]; drained into the transcript on every tick.
-    notices: SessionNotices,
+    /// What the turn and compaction threads share with the loop — the
+    /// notices they leave for the user (drained into the transcript on every
+    /// tick) and the session's MCP connections. See [`SessionShared`].
+    shared: SessionShared,
     /// Test-only seam: when set, `submit_turn` runs the next queued scripted
     /// backing instead of resolving a real model from process env/config —
     /// the same idea as `run_interactive_turn_with_backing`'s existing
@@ -4714,6 +4715,17 @@ impl crate::host::LiveModelCall for Box<dyn crate::host::LiveModelCall + Send> {
 /// raw stderr write only corrupts the frame, so the threads leave them
 /// here and the loop puts them in the transcript on its next tick.
 type SessionNotices = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// What every turn and compaction thread of a session shares with the
+/// loop and with each other: the notices channel and the session's MCP
+/// connections (spawned once, reused by every turn — see
+/// [`crate::exec_tools::McpRegistry`]). Cloned into each thread; the
+/// clones are handles.
+#[derive(Clone, Default)]
+struct SessionShared {
+    notices: SessionNotices,
+    mcp: crate::exec_tools::McpRegistry,
+}
 
 /// Leave `line` for the loop to show. Bounded: a turn that has a lot to
 /// say keeps its first lines, not an unbounded backlog.
@@ -6070,7 +6082,7 @@ the full history, where `/diff` lists every file it wrote\n"
                     backing,
                     budget,
                     self.jobs.clone(),
-                    std::sync::Arc::clone(&self.notices),
+                    self.shared.clone(),
                 );
                 return self.drain();
             }
@@ -6085,7 +6097,7 @@ the full history, where `/diff` lists every file it wrote\n"
                 turn_cancel,
                 std::sync::Arc::clone(&self.turn_in_flight),
                 self.jobs.clone(),
-                std::sync::Arc::clone(&self.notices),
+                self.shared.clone(),
             );
         }
         self.drain()
@@ -6154,7 +6166,7 @@ the full history, where `/diff` lists every file it wrote\n"
             self.trusted,
             cancel.clone(),
             std::sync::Arc::clone(&outcome),
-            std::sync::Arc::clone(&self.notices),
+            self.shared.clone(),
         );
         self.compaction = Some(CompactionInFlight { cancel, outcome });
         self.append_command_output("compacting... (Ctrl-C cancels)".to_owned());
@@ -6163,8 +6175,13 @@ the full history, where `/diff` lists every file it wrote\n"
 
     /// Move what the threads left in [`SessionNotices`] into the transcript.
     fn surface_notices(&mut self) {
-        let pending: Vec<String> =
-            std::mem::take(&mut *self.notices.lock().unwrap_or_else(|p| p.into_inner()));
+        let pending: Vec<String> = std::mem::take(
+            &mut *self
+                .shared
+                .notices
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
         for line in pending {
             self.append_command_output(line);
         }
@@ -6734,7 +6751,7 @@ fn spawn_interactive_turn(
     // The *session's* job table, so a background job outlives the turn that
     // started it. See `JobRegistry::share_table`.
     jobs: crate::exec_tools::JobRegistry,
-    notices: SessionNotices,
+    shared: SessionShared,
 ) {
     std::thread::spawn(move || {
         // A panic anywhere in `run_interactive_turn`'s own call chain (model
@@ -6759,7 +6776,7 @@ fn spawn_interactive_turn(
                 &text,
                 &kernel_cancel,
                 &jobs,
-                &notices,
+                &shared,
             )
         }));
         let _ = client.finish_turn(kernel::FinishTurn::new(
@@ -6793,7 +6810,7 @@ fn spawn_interactive_turn_with_backing<B: crate::host::LiveModelCall + Send + 's
     budget: (u32, u32),
     // The session's job table — see `spawn_interactive_turn`'s own parameter.
     jobs: crate::exec_tools::JobRegistry,
-    notices: SessionNotices,
+    shared: SessionShared,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let outcome = catching_panics(std::panic::AssertUnwindSafe(|| {
@@ -6808,7 +6825,7 @@ fn spawn_interactive_turn_with_backing<B: crate::host::LiveModelCall + Send + 's
                 backing,
                 budget,
                 &jobs,
-                &notices,
+                &shared,
             )
         }));
         let _ = client.finish_turn(kernel::FinishTurn::new(
@@ -6905,7 +6922,7 @@ fn run_interactive_turn(
     text: &str,
     kernel_cancel: &kernel::CancelToken,
     jobs: &crate::exec_tools::JobRegistry,
-    notices: &SessionNotices,
+    shared: &SessionShared,
 ) -> kernel::TurnOutcome {
     let bridge = CancelBridge::start(kernel_cancel);
     let outcome = run_interactive_turn_inner(
@@ -6917,7 +6934,7 @@ fn run_interactive_turn(
         text,
         &bridge.token,
         jobs,
-        notices,
+        shared,
     );
     bridge.stop();
     outcome
@@ -6939,7 +6956,7 @@ fn run_interactive_turn_with_backing<B: crate::host::LiveModelCall>(
     backing: B,
     budget: (u32, u32),
     jobs: &crate::exec_tools::JobRegistry,
-    notices: &SessionNotices,
+    shared: &SessionShared,
 ) -> kernel::TurnOutcome {
     let bridge = CancelBridge::start(kernel_cancel);
     let outcome = run_interactive_turn_inner_with_backing(
@@ -6953,7 +6970,7 @@ fn run_interactive_turn_with_backing<B: crate::host::LiveModelCall>(
         backing,
         budget,
         jobs,
-        notices,
+        shared,
     );
     bridge.stop();
     outcome
@@ -7095,14 +7112,17 @@ fn run_interactive_turn_inner(
     text: &str,
     cancel: &agent_runtime::CancellationToken,
     jobs: &crate::exec_tools::JobRegistry,
-    notices: &SessionNotices,
+    shared: &SessionShared,
 ) -> kernel::TurnOutcome {
-    let mut warn = |line: &str| notify(notices, line);
+    let mut warn = |line: &str| notify(&shared.notices, line);
     let (mut tools, permission_lattice) = match build_interactive_turn_tools(root, trusted, None) {
         Ok(built) => built,
         Err(outcome) => return outcome,
     };
     let policy_version = apply_managed_ceilings(&mut tools);
+    // The session's MCP connections, before the integrations connect any:
+    // a server the session already has is reused, not spawned again.
+    tools.share_mcp(&shared.mcp);
     // Session-start/end hooks are per run; the interactive session fires
     // its own at start and exit, not per turn.
     if trusted {
@@ -7270,11 +7290,11 @@ fn spawn_compaction(
     trusted: bool,
     cancel: agent_runtime::CancellationToken,
     outcome: CompactionOutcomeSlot,
-    notices: SessionNotices,
+    shared: SessionShared,
 ) {
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut warn = |line: &str| notify(&notices, line);
+            let mut warn = |line: &str| notify(&shared.notices, line);
             let session_model = SessionModel::resolve(
                 agent_runtime::reminders::ReminderFloor::Baseline,
                 None,
@@ -7479,7 +7499,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     backing: B,
     budget: (u32, u32),
     jobs: &crate::exec_tools::JobRegistry,
-    notices: &SessionNotices,
+    shared: &SessionShared,
 ) -> kernel::TurnOutcome {
     // `BypassPermissions`, not the real env/settings-resolved mode: see
     // `build_interactive_turn_context`'s own doc comment on `forced_mode`
@@ -7491,13 +7511,14 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     // and `exec_tools.rs`).
     let forced_mode = Some(crate::permissions::PermissionMode::BypassPermissions);
     let (context_limit, output_reserve) = budget;
-    let mut warn = |line: &str| notify(notices, line);
+    let mut warn = |line: &str| notify(&shared.notices, line);
     let (mut tools, permission_lattice) =
         match build_interactive_turn_tools(root, trusted, forced_mode) {
             Ok(built) => built,
             Err(outcome) => return outcome,
         };
     let _policy_version = apply_managed_ceilings(&mut tools);
+    tools.share_mcp(&shared.mcp);
     if trusted {
         let _ = configure_trusted_integrations(&mut tools, root, &mut warn);
     }
@@ -10733,7 +10754,7 @@ alignment below it: {line:?}",
             renderer,
             autonomous: None,
             compaction: None,
-            notices: SessionNotices::default(),
+            shared: session.shared.clone(),
             scripted_backings: Some(backings),
         }
     }
@@ -12549,6 +12570,107 @@ question the panel answers"
         assert_eq!(post["event"], "post_compact");
         assert_eq!(post["turns"], 2);
         assert_eq!(post["summary_bytes"], "the two turns".len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_interactive_sessions_mcp_servers_are_started_once_and_serve_every_turn() {
+        // Each turn used to spawn, handshake and kill every configured MCP
+        // server — the start-up cost on every turn, and any state the
+        // server held gone between them. The session owns the connections
+        // now; a turn reuses them.
+        const SERVER_SCRIPT: &str = r#"#!/usr/bin/env python3
+import sys, json, os
+with open(os.environ["MCP_STARTS_LOG"], "a") as log:
+    log.write("started\n")
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+calls = 0
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "demo", "version": "1.0"}}})
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": "count", "description": "how many calls this process has served",
+             "inputSchema": {"type": "object"}}]}})
+    elif method == "tools/call":
+        calls += 1
+        send({"jsonrpc": "2.0", "id": rid, "result": {"content": [
+            {"type": "text", "text": "call number " + str(calls)}]}})
+"#;
+        let env = TempEnv::create();
+        let root = fs::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let script_path = root.join("mcp-count-server.py");
+        fs::write(&script_path, SERVER_SCRIPT).expect("write server");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let starts_log = root.join("mcp-starts.log");
+        fs::write(
+            root.join(PROJECT_MARKER).join("settings.json"),
+            serde_json::json!({
+                "mcpServers": {
+                    "demo": {
+                        "command": "python3",
+                        "args": [script_path.display().to_string()],
+                        "env": {"MCP_STARTS_LOG": starts_log.display().to_string()}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("settings");
+
+        let mut session = ScriptedSession::create(&env);
+        for turn in 1..=2 {
+            session.run_turn(
+                &format!("turn {turn}"),
+                ScriptedModel::call_then_answer(
+                    "mcp__demo__count",
+                    serde_json::json!({}),
+                    &format!("answered {turn}"),
+                ),
+            );
+        }
+        let completed = session
+            .transcript()
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    TranscriptEntry::ToolActivity {
+                        tool,
+                        status: ToolActivityStatus::Completed,
+                        ..
+                    } if tool == "mcp__demo__count"
+                )
+            })
+            .count();
+        assert_eq!(
+            completed,
+            2,
+            "the MCP tool served both turns: {:?}",
+            session.transcript()
+        );
+        let starts = fs::read_to_string(&starts_log).unwrap_or_default();
+        assert_eq!(
+            starts.lines().count(),
+            1,
+            "one server process for the session, not one per turn: {starts:?}"
+        );
     }
 
     #[test]
@@ -15711,6 +15833,31 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             }
         }
 
+        /// Call `tool` with `arguments` (a JSON object), then answer.
+        fn call_then_answer(tool: &str, arguments: serde_json::Value, answer: &str) -> Self {
+            let call = ProposedToolCall::new(
+                "c1",
+                tool,
+                serde_json::to_string(&arguments).expect("encode args"),
+            )
+            .expect("call");
+            Self {
+                outputs: VecDeque::from(vec![
+                    Ok(ModelStepOutput::ToolCalls {
+                        calls: vec![call],
+                        tokens: 1,
+                        cost_usd_micros: None,
+                    }),
+                    Ok(ModelStepOutput::Terminal {
+                        text: answer.to_owned(),
+                        tokens: 1,
+                        cost_usd_micros: None,
+                    }),
+                ]),
+                ..Default::default()
+            }
+        }
+
         /// Refuse the first packet as too large, answer the recovery's
         /// compaction request with `summary`, then answer the retried step.
         fn overflow_then_summary_then_answer(summary: &str, answer: &str) -> Self {
@@ -15948,6 +16095,9 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         /// one — so a scripted turn's background jobs behave the way a real
         /// session's do, including outliving the turn that started them.
         jobs: crate::exec_tools::JobRegistry,
+        /// What the session's threads share — notices, MCP connections —
+        /// as `run_started_session` owns one for the whole session.
+        shared: SessionShared,
         session_id: protocol::SessionId,
         actor: ActorRef,
         root: PathBuf,
@@ -15986,6 +16136,7 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             Self {
                 client,
                 jobs: crate::exec_tools::JobRegistry::default(),
+                shared: SessionShared::default(),
                 session_id,
                 actor,
                 root: env.project.clone(),
@@ -16063,7 +16214,7 @@ cancelled and not turned into a turn interrupt:\n{painted}"
                 backing,
                 budget,
                 self.jobs.clone(),
-                SessionNotices::default(),
+                self.shared.clone(),
             );
             join.join()
                 .expect("the turn thread must not panic (catching_panics wraps its body)");
@@ -16860,7 +17011,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             renderer: &mut renderer,
             autonomous: None,
             compaction: None,
-            notices: SessionNotices::default(),
+            shared: SessionShared::default(),
             #[cfg(test)]
             scripted_backings: None,
         };
@@ -17189,7 +17340,7 @@ pre-approve it with `rapid permissions allow <tool>`";
                 renderer: &mut renderer,
                 autonomous: None,
                 compaction: None,
-                notices: SessionNotices::default(),
+                shared: SessionShared::default(),
                 #[cfg(test)]
                 scripted_backings: None,
             };
@@ -17220,7 +17371,7 @@ pre-approve it with `rapid permissions allow <tool>`";
                 renderer: &mut renderer,
                 autonomous: None,
                 compaction: None,
-                notices: SessionNotices::default(),
+                shared: SessionShared::default(),
                 #[cfg(test)]
                 scripted_backings: None,
             };

@@ -1250,6 +1250,18 @@ impl WorkspaceTools {
     /// environment, and handshake a real turn performs.
     pub fn register_mcp_servers(&mut self, servers: &[McpServerConfig]) {
         for server in servers {
+            // Registered already — by an earlier turn of a session sharing
+            // its registry (see `share_mcp`) — is registered: never a
+            // second child for the same name.
+            let already = self
+                .mcp
+                .lock()
+                .expect("mcp")
+                .iter()
+                .any(|connection| connection.server == server.name);
+            if already {
+                continue;
+            }
             match connect_mcp_server(server) {
                 Ok(connected) => {
                     // Take ownership first: until the child is inside an
@@ -1492,6 +1504,14 @@ impl WorkspaceTools {
     /// [`JobRegistry::share_table`].
     pub(crate) fn share_job_table(&mut self, session: &JobRegistry) {
         self.jobs.share_table(session);
+    }
+
+    /// Use the session's MCP connections instead of this turn's own — see
+    /// [`McpRegistry`]. Called before `register_mcp_servers`, which then
+    /// connects only the servers the session does not have yet.
+    pub(crate) fn share_mcp(&mut self, session: &McpRegistry) {
+        self.mcp = Arc::clone(&session.connections);
+        self.mcp_surface = Arc::clone(&session.surface);
     }
 
     /// Report this surface's workspace writes to `changes`. See
@@ -4879,6 +4899,30 @@ pub struct McpServerConfig {
 
 /// A live stdio MCP connection: the supervised child, its JSON-RPC session,
 /// and the tools it advertised at registration.
+/// A session's MCP connections, shared into every turn's tools the way
+/// `JobRegistry` shares the session's job table: a server is spawned and
+/// handshaken once per session, not once per turn, so its state (an open
+/// browser, a database handle) survives from one turn to the next and a
+/// turn does not start with the cost of bringing every server up. The
+/// children are reaped when the last handle drops — the session's end.
+#[derive(Clone, Default)]
+pub struct McpRegistry {
+    connections: Arc<Mutex<Vec<McpConnection>>>,
+    surface: Arc<Mutex<Vec<(String, String, mcp::transport::McpToolDescriptor)>>>,
+}
+
+impl McpRegistry {
+    /// Names of the servers registered so far, online or not.
+    pub fn servers(&self) -> Vec<String> {
+        self.connections
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|connection| connection.server.clone())
+            .collect()
+    }
+}
+
 struct McpConnection {
     server: String,
     online: bool,
@@ -5446,6 +5490,14 @@ impl ExecTools {
     pub(crate) fn share_job_table(&mut self, session: &JobRegistry) {
         if let Self::Workspace(tools) = self {
             tools.share_job_table(session);
+        }
+    }
+
+    /// Use the session's MCP connections (no-op on the no-op surface). See
+    /// [`McpRegistry`].
+    pub(crate) fn share_mcp(&mut self, session: &McpRegistry) {
+        if let Self::Workspace(tools) = self {
+            tools.share_mcp(session);
         }
     }
 
