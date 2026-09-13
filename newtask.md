@@ -8017,6 +8017,115 @@ show this bug on macOS** — BSD `kill` is correct — so the cycle here is CI o
 this commit died in the hooks timeout test; the run after must complete `plugin-host`,
 `process-supervisor` and `sandbox`.
 
+**The transcript after `/rewind` (and `/fork`, and `/resume` onto a fork) shows the past,
+2026-09-13 (`127218d`).** A fork's ledger starts at `session.forked`, so the display came up
+empty — a session with no past rather than one rewound to a point in it — while the model, since
+`94d0f59`, remembered the turns up to the rewind point. The reducer's kernel path cannot fold a
+parent's events (their seqs and session id are the parent's), so the parent's *projection* is
+carried across: `inherited_transcript` reads the session's first event, and for a `session.forked`
+folds the parent's events through `source_seq` with the same reducer the live session uses
+(recursing for the parent's own inheritance, eight deep like the model's history read), and
+`LocalUiEvent::InheritTranscript` puts those entries before the session's own, bounded like every
+transcript write. One call in `switch_to_session` covers `/fork`, `/rewind` and `/resume`; the
+startup `rapid resume` path makes the same call before its replay. Test drives `/rewind <seq>`,
+`/resume` back and forth, and `/fork` again through `dispatch_slash`, asserting the turn before the
+rewind point is shown, nothing after it, and the command's confirmation follows the inherited past;
+revert cycle 158. The remaining-list entry is closed.
+
+**`/compact`, a real summarizer, and an overflow recovery that shrinks the packet, 2026-09-13
+(`b0700b9`).** Item 13 in the remaining list, built as designed there with one departure
+recorded below. **What was found, precisely, before touching it**: `/compact` said "not wired
+yet"; `LiveRecoveryController::recover_from_overflow` compacted through `compact_with_policy`
+whose first step classifies the packet's *estimated* size against a soft threshold — and the
+compiler had just admitted that packet under budget, so the estimate was `Under`, the summarizer
+was never consulted, and the rebuilt packet was byte-identical to the one the provider refused.
+Retried to the policy bound, then "context recovery retries exhausted". The `[phases] compact`
+config override is parsed and validated (`resolve_purpose_model`) and has no caller. **What
+shipped.** One summarizer, `host::summarize_conversation`: a single model call whose request is
+compiled through the same compiler as a turn's packet (instructions as a system block, the
+earlier summary if any, the turns as the model sees them on a turn; the memory partition given the
+whole leftover; oldest turns left out first when it does not fit), reply trimmed and capped at
+`MAX_COMPACTION_SUMMARY` on a character boundary, tool calls or an empty reply a typed
+`NoSummary`. Two callers. (1) **`/compact`** — `SessionLoop::compact_session`: reads the history
+through `conversation_history`, runs the summarizer on its own thread behind the same supervised
+step layer a turn uses (`run_live_compaction`: transient retries, one token tally), accrues the
+call's tokens to the active goal without counting a turn (`accrue_model_usage`), and appends
+**`context.compacted {summary, through_seq, turns, tokens, cost_usd_micros}`** — a new
+`EventKind`, registered in `event.rs`, the SDK wire schema (regenerated, 105 kinds) and the reducer.
+Not a turn: no `turn.started`, no lease, nothing in the user column. The model slot is held
+(`model_busy`: a turn or a compaction, never both), Ctrl-C cancels it through its own token (the
+kernel interrupt cannot reach a non-turn), and `/fork`, `/rewind`, `/resume` refuse while it runs.
+The reducer shows the summary as its own transcript entry (`TranscriptEntry::Compacted`) —
+model output that is not a reply, so neither `Assistant` nor `CommandOutput`. (2) **The overflow
+recovery** now folds: with turns in the packet, they and the carried summary become one
+model-written summary (the model's failure keeps the carried summary and drops the turns —
+less history beats a failed turn, the trade the memory partition already makes; a cancelled call
+ends the turn as cancelled); with none, the retrieved context goes; with only a summary left, it
+goes; with nothing optional, `NotRecoverable` outright. Every rebuild is checked against the
+*actual* rebuilt packet — strictly fewer included tokens than the one refused, or
+`NotRecoverable` — which is the departure from the design: `compact_with_policy`'s threshold
+classification is the wrong gate for a provider-proved overflow (the estimate is what was wrong),
+and its `StillOverHard` estimate (`mandatory + summary/4`) is weaker than measuring the packet
+that will actually be sent, so the controller no longer calls it; `compact_packet`/`PacketSummarizer`
+stay as the crate's seam with no production caller, as before `P5-024`. The backing is shared
+between the driver and the controller (`Rc<RefCell<B>>`, never contended — the executor runs one
+or the other) so the recovery writes its summary with the turn's own model, and the summarizer's
+tokens land in the same `SupervisedModel` tally as every other step (`cli_host_entry_reaches_
+recovery_capable_executor` pins `tokens == 2`). **Reading side**: `conversation_history` returns
+`ConversationHistory {summary, turns}`; a `context.compacted` folds every turn from a parent
+session and every turn of its own session recorded through `through_seq` — a turn another
+process landed after that seq is still carried as a turn, which is the one way one can land
+between the summary and its record — and a child forked after a compaction reads it from the
+parent. `PreservedLiveContext::with_compaction_summary` puts the summary in the packet ahead of
+the turns (score 1 in the memory partition, kept in preference to any one turn) with a
+`system/post-compaction` block carrying `POST_COMPACTION_SYSTEM_PROMPT` — the section
+`PromptContext::post_compaction` rendered for nobody until now. `rapid exec --continue` reads the
+same history, so a headless continuation after a TUI `/compact` carries the summary. **Tests**
+through the real boundaries: `slash_compact_folds_the_earlier_turns_into_a_summary_the_next_turn_
+carries` (two turns, `/compact` through `dispatch_slash`, the summarizer's request inspected, the
+ledger re-read, the third turn's packet carries the summary and no turns, the fourth carries the
+summary then one turn); nothing-to-compact; a failing model reported with nothing recorded and
+the slot freed; Ctrl-C cancelling a running one; the fold rule against the real ledger through a
+fork; the reducer entry (secret-classified summary never shown); host: the request shape, the
+suffix rule under a small window, the byte cap, the supervised tally, and the recovery folding,
+refusing, keeping the carried summary on failure, cancelling, and dropping the summary on the
+second overflow. **Not done, recorded honestly**: `[phases] compact` still routes nothing —
+honoring it means running the managed-policy gate over the phase model too, since
+`select_from_process_env_gated` gates only the active model; the compaction runs on the
+conversation model. Headless has no `/compact`; a `rapid compact` subcommand would be the
+`run_compaction` entry behind an argv, not new machinery. The display transcript is not cleared
+by a compaction (the ledger is the record; the model's memory is what changed, and the entry says
+so). **Self-review of `b0700b9` (fixed in `07d8285`), three real findings and several
+smaller ones, all taken.** (M2) The recovery's summary lived only in the turn's own packet, so
+the *next* turn re-read the same turns, overflowed the same way and paid for the same recovery,
+every turn, silently — now `ExecOutcome.recovered` carries the summary the model wrote (only
+while the retried packet actually carried it) and the turn records it as `context.compacted
+{source: "overflow-recovery"}` covering the history it was given; revert cycle 156. (ML1) A
+compaction older than the reader's 8192-event window was lost — the summary being the whole
+memory of everything before it — so the projection now remembers the latest compaction's seq
+(`SessionSnapshot::last_compaction`, in-process only: the wire snapshot schema is unchanged and
+a decoded snapshot reads `None`) and the reader reads that one event ahead of the window; cycle
+157. (M1) `/compact` read the history, then the tip, so a turn another process landed between
+the two was folded but never summarised — the history now names the tip it was read through
+(`ConversationHistory::through_seq`) and that is what the record covers. (ML2) A model-written
+summary that left the packet no smaller failed the turn while a model *failure* dropped the turns
+gracefully — the harsher outcome for the better behaviour; the recovery now tries the candidates
+in order (the written summary, the one already carried, none) and takes the first that shrinks
+the packet, `NotRecoverable` only when none does, computed on a clone and committed only then
+(L7). (ML3) The compaction request itself can be refused by the provider — it is re-sent without
+the oldest half of its turns, three times at most. (L1) More than ~250 turns hit the compiler's
+block capacity; the newest `MAX_COMPACTION_TURNS` (192) are folded. (L2) A window too small for
+even the newest turn re-summarised the earlier summary under a count of zero, and the record
+then covered turns that never fit — refused as a compile error now. (L4) An oversized summary in
+a `context.compacted` folded the turns and was then rejected by the packet — bounded at the
+fold. (L5, L6) The history read moved onto the compaction thread, and a compaction still running
+at quit is cancelled through its token. (M3) The first fold drops the retrieved context with the
+turns — deliberate, the docs now say so, and a test covers turns + retrieved together. The token
+test now uses an empty reply (billed, retried) so the supervised tally and the step's own figure
+differ. One review claim was not taken: that plain text typed during a compaction should be
+answered rather than dropped — it is dropped exactly as during a turn, and changing one without
+the other would be the inconsistency.
+
 **`rapid exec --resume <session>` / `--continue`, 2026-09-13 (`3982049`).** Headless conversations
 across runs: the turn is submitted as the next turn of the recorded session (at its tip, as an
 interactive turn on a resumed session is), and the model carries the earlier runs' prompts and
@@ -8223,10 +8332,23 @@ conversation-history and `exec --continue` work. From here a red Format, Lint, o
 Test step is the next task before anything else, and the platform matrix is the cross-platform
 gate.
 
-**2026-09-13** (`94d0f59`..`ff4f9c0`): a turn carries the session's earlier turns to the model,
-following forks; `rapid exec --resume`/`--continue`. Next in order: compaction (item 13, with the
-design and the overflow-recovery finding recorded there), then the transcript display after
-`/rewind`, then `/agents cancel`.
+**2026-09-13** (`94d0f59`..`127218d`): a turn carries the session's earlier turns to the model,
+following forks; `rapid exec --resume`/`--continue`; `/compact` and a real overflow recovery
+(`b0700b9`, reviewed and hardened in `07d8285`); the transcript after `/rewind`/`/fork`/`/resume`
+onto a fork (`127218d`). **Next, found while closing those: the interactive turn is second-class.**
+`run_interactive_turn_inner`'s own doc comment says it — no hooks, no MCP servers, no proactive
+retrieval, no reminders, no fallback chain, no managed-policy ceilings, no subagent runner (so
+`task_spawn` fails in the TUI) — all of which `exec_turn` sets up from the same settings files.
+The same project configuration works headless and silently does nothing in the TUI. The fix is
+an extraction: `exec_turn`'s trusted-tools setup (`set_trace_calls`, managed ceilings and
+`policy_version`, `load_project_integrations` → allowlist/hooks/shadow/MCP with the rejection
+warnings, the credential canary, `LiveSubagentRunner`) and its context setup (reminders,
+retrieval) into functions both paths call, and `resolve_model_plan`/`build_backing_model` in
+place of the TUI's single-model `resolve_interactive_backing`. Session-start/end hooks are
+per-run in headless; in the TUI they belong at session start and exit, a separate step. After
+that: `/agents cancel` (item 5, a feature), `[phases] compact` routing (needs the managed gate over
+the phase model), `pre_compact`/`post_compact` hooks (the registry has the events; nothing fires
+them).
 
 **`92240bf` (rewind fix) had a clean single workspace run — exit 0, 80 of 80 — on 2026-09-12, which
 also covers `eababe4` below, resolving the partial-evidence note that follows.**
@@ -8370,7 +8492,10 @@ actually failed them.
     entry above): it was `BrokenPipe` on the stdin hand-off, exactly the suspected cause.
 12. ~~**`rapid exec --resume <session>` / `--continue`**~~ — **done 2026-09-13** (`3982049`, entry
     above).
-13. **Compaction — and the in-turn overflow recovery is a no-op today.** Read while scoping this:
+13. ~~**Compaction — and the in-turn overflow recovery is a no-op today.**~~ — **done 2026-09-13**
+    (`b0700b9`, `07d8285`, entries above): `/compact`, one summarizer, the recovery folds and
+    shrinks or refuses, the summary is recorded and carried across turns, runs and forks. The
+    original scoping follows. Read while scoping this:
     `LiveRecoveryController::recover_from_overflow` calls `compact_with_policy(packet, policy,
     None, ..)` — no summarizer — and the deterministic "summary" `compact_packet` produces without
     one is a stats line (`included=N dropped=M tokens=…`), content-free. The rebuilt packet is the
