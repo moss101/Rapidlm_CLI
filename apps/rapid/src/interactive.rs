@@ -1714,14 +1714,6 @@ fn unsupported_command_text(action: &KernelAction) -> String {
         | KernelAction::SleepAgent { .. } => {
             "no running-agent registry exists yet to pause, resume, or sleep a specific agent"
         }
-        // Reached only for the id-carrying form: the sole `KernelApi::
-        // Interrupt` implementation is a session-wide interrupt that takes
-        // no id, so honouring one of these would mean killing the current
-        // turn and calling it a cancellation of the thing named.
-        KernelAction::CancelAgent { .. } | KernelAction::TerminateAgent { .. } => {
-            "no running-agent registry exists yet to cancel or terminate an agent; press \
-Ctrl-C to interrupt the turn that is running"
-        }
         KernelAction::ShowGoalBudget { .. } => {
             "goal budget has no display or mutation backend yet, in the TUI or the headless CLI"
         }
@@ -4725,6 +4717,12 @@ type SessionNotices = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 struct SessionShared {
     notices: SessionNotices,
     mcp: crate::exec_tools::McpRegistry,
+    /// The session's running subagents — what `/agents cancel` acts on.
+    agents: crate::exec_tools::SubagentRegistry,
+    /// Test-only seam: a subagent runner for scripted turns, which have no
+    /// configured model to build the real one from.
+    #[cfg(test)]
+    scripted_subagents: Option<std::sync::Arc<dyn crate::exec_tools::SubagentRunner>>,
 }
 
 /// Leave `line` for the loop to show. Bounded: a turn that has a lot to
@@ -5800,6 +5798,26 @@ denied\n",
         self.drain()
     }
 
+    /// `/agents cancel [id]` and `/agents terminate [id]`: stop one running
+    /// subagent, or every running one. A subagent runs inside its parent
+    /// turn's `task_spawn` call, so stopping it ends that call with a
+    /// cancelled report and the parent turn goes on — the turn itself is
+    /// Ctrl-C's to stop. Terminate is cancel: an in-process child has no
+    /// harsher stop than its token.
+    fn cancel_agent(&mut self, id: Option<protocol::AgentId>) -> Result<(), InteractiveError> {
+        let text = match id {
+            Some(id) if self.shared.agents.cancel(id) => format!("cancelled agent {id}"),
+            Some(id) => format!("no running agent {id}"),
+            None => match self.shared.agents.cancel_all() {
+                0 => "no running agents to cancel".to_owned(),
+                1 => "cancelled 1 running agent".to_owned(),
+                n => format!("cancelled {n} running agents"),
+            },
+        };
+        self.append_command_output(text);
+        self.drain()
+    }
+
     fn cancel_job(&mut self, id: Option<protocol::JobId>) -> Result<(), InteractiveError> {
         let text = match (id, self.jobs.cancel(id)) {
             (Some(id), None) => format!("no job {id} in this session"),
@@ -5832,6 +5850,9 @@ denied\n",
             KernelAction::ResumeGoal => self.goal_lifecycle_command(GoalLifecycleKind::Resume)?,
             KernelAction::CancelGoal => self.goal_lifecycle_command(GoalLifecycleKind::Cancel)?,
             KernelAction::CancelJob { id } => self.cancel_job(id)?,
+            KernelAction::CancelAgent { id } | KernelAction::TerminateAgent { id } => {
+                self.cancel_agent(id)?;
+            }
             KernelAction::ResumeSession { session } => self.resume_session(session)?,
             KernelAction::CompactSession => self.compact_session()?,
             KernelAction::RunGoal => self.start_autonomous_goal()?,
@@ -5852,18 +5873,12 @@ denied\n",
                 KernelApi::Interrupt => {
                     // `CancelJob`/`CancelAgent`/`TerminateAgent` all map to
                     // `KernelApi::Interrupt`, whose only implementation is a
-                    // *session-wide* interrupt that takes no id. Naming one
-                    // therefore killed the current turn instead of the thing
-                    // named — worse than a no-op, because it did something
-                    // destructive and different from what the command says.
-                    // The bare form is refused too: there is no per-job or
-                    // per-agent backend either way, and silently turning
-                    // `/jobs cancel` into "kill the turn" under a command
-                    // summarised "inspect or cancel supervised jobs" is the
-                    // same untruth without the id.
-                    // The gate above already refused every cancellation
-                    // that names a job or agent, so anything reaching here
-                    // is a genuine session-wide interrupt.
+                    // *session-wide* interrupt that takes no id — naming one
+                    // used to kill the current turn instead of the thing
+                    // named. Each of those has its own arm above now (the
+                    // session's job table, its subagent registry), so
+                    // anything reaching here is a genuine session-wide
+                    // interrupt.
                     self.interrupt()?;
                 }
                 KernelApi::SubmitTurn => {
@@ -6646,6 +6661,71 @@ struct LedgerJobEvents {
     actor: ActorRef,
 }
 
+/// A `task_spawn` child's lifecycle as `agent.*` ledger events — what the
+/// `/agents` panel and the kernel's own `active_agents` project. One
+/// `agent.spawned` and exactly one terminal event per child, in that
+/// order: the projection refuses a terminal event for an agent it does
+/// not have, and a session that replays into a refused event is unreadable.
+struct LedgerAgentEvents {
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: ActorRef,
+}
+
+impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
+    fn spawned(&self, agent: protocol::AgentId, agent_type: &str, task: &str) {
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::AgentSpawned,
+            serde_json::json!({
+                "agent_id": agent.to_string(),
+                "role": agent_type,
+                "state": "running",
+                "current_operation": task,
+            }),
+        );
+    }
+
+    fn finished(
+        &self,
+        agent: protocol::AgentId,
+        end: crate::exec_tools::SubagentEnd,
+        detail: Option<&str>,
+    ) {
+        use crate::exec_tools::SubagentEnd;
+        use event_ledger::event::EventKind;
+        let (kind, payload) = match end {
+            SubagentEnd::Succeeded => (
+                EventKind::AgentResult,
+                serde_json::json!({"agent_id": agent.to_string(), "state": "succeeded"}),
+            ),
+            // `agent.state_changed` with a terminal state is how the
+            // projection records a failure (there is no `agent.failed`).
+            SubagentEnd::Failed => (
+                EventKind::AgentStateChanged,
+                serde_json::json!({
+                    "agent_id": agent.to_string(),
+                    "state": "failed",
+                    "blocker": detail.unwrap_or("failed"),
+                }),
+            ),
+            SubagentEnd::Cancelled => (
+                EventKind::AgentCancelled,
+                serde_json::json!({"agent_id": agent.to_string(), "state": "cancelled"}),
+            ),
+        };
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            kind,
+            payload,
+        );
+    }
+}
+
 impl crate::exec_tools::JobEvents for LedgerJobEvents {
     fn started(&self, job: protocol::JobId, handle: &str, command: &str) {
         let _ = self.client.append_turn_progress(
@@ -7121,8 +7201,11 @@ fn run_interactive_turn_inner(
     };
     let policy_version = apply_managed_ceilings(&mut tools);
     // The session's MCP connections, before the integrations connect any:
-    // a server the session already has is reused, not spawned again.
+    // a server the session already has is reused, not spawned again — and
+    // its subagent registry, so `/agents cancel` reaches a child this turn
+    // starts.
     tools.share_mcp(&shared.mcp);
+    tools.share_subagents(&shared.agents);
     // Session-start/end hooks are per run; the interactive session fires
     // its own at start and exit, not per turn.
     if trusted {
@@ -7519,6 +7602,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         };
     let _policy_version = apply_managed_ceilings(&mut tools);
     tools.share_mcp(&shared.mcp);
+    tools.share_subagents(&shared.agents);
     if trusted {
         let _ = configure_trusted_integrations(&mut tools, root, &mut warn);
     }
@@ -7552,6 +7636,9 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     );
     // Same session-scoped job table the production path uses.
     tools.share_job_table(jobs);
+    if let Some(runner) = &shared.scripted_subagents {
+        tools.set_subagent_runner(std::sync::Arc::clone(runner));
+    }
     execute_interactive_turn(
         client,
         session_id,
@@ -7672,6 +7759,11 @@ fn attach_ledger_sinks(
         actor: actor.clone(),
     }));
     tools.set_workspace_changes(std::sync::Arc::new(LedgerWorkspaceChanges {
+        client: client.clone(),
+        session_id,
+        actor: actor.clone(),
+    }));
+    tools.set_agent_events(std::sync::Arc::new(LedgerAgentEvents {
         client: client.clone(),
         session_id,
         actor: actor.clone(),
@@ -12572,6 +12664,152 @@ question the panel answers"
         assert_eq!(post["summary_bytes"], "the two turns".len());
     }
 
+    /// A subagent runner that runs until its token is cancelled, then
+    /// reports a cancelled run — the shape of a child that would otherwise
+    /// take a while.
+    struct RunsUntilCancelled {
+        started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::exec_tools::SubagentRunner for RunsUntilCancelled {
+        fn run(
+            &self,
+            _prompt: &str,
+            _agent_type: &str,
+            _write_scope: Option<&str>,
+            cancel: &agent_runtime::CancellationToken,
+        ) -> Result<crate::exec_tools::SubagentReport, String> {
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            for _ in 0..2_000 {
+                if cancel.is_cancelled() {
+                    return Ok(crate::exec_tools::SubagentReport {
+                        summary: "stopped before finishing".to_owned(),
+                        status: "cancelled".to_owned(),
+                        tool_calls: 0,
+                        tokens: 0,
+                        cost_usd_micros: None,
+                        stop_reason: Some("cancelled".to_owned()),
+                        claims: Vec::new(),
+                        blockers: Vec::new(),
+                        open_questions: Vec::new(),
+                        patch_summary: None,
+                        artifacts: Vec::new(),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err("the child was never cancelled".to_owned())
+        }
+    }
+
+    #[test]
+    fn slash_agents_cancel_stops_a_running_subagent_that_the_panel_shows() {
+        // `/agents cancel` was refused — no running-agent registry — and
+        // `/agents` showed nothing for the one kind of agent the binary
+        // runs, because a `task_spawn` child left no `agent.*` event. Now
+        // the child is recorded, the panel shows it running, and the loop
+        // stops it by id while its parent turn goes on.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![ScriptedModel::call_then_answer(
+                crate::exec_tools::TASK_SPAWN_TOOL,
+                serde_json::json!({"prompt": "survey the tests", "type": "explore"}),
+                "the child reported",
+            )],
+        );
+        loop_state.shared.scripted_subagents = Some(std::sync::Arc::new(RunsUntilCancelled {
+            started: started.clone(),
+        }));
+        loop_state.submit_turn("delegate").expect("submit");
+
+        // The child is running and the panel knows: one agent, Running,
+        // with its role and task.
+        let mut running_id = None;
+        for _ in 0..600 {
+            loop_state.drain().expect("drain");
+            if let Some(agent) = loop_state
+                .ui
+                .agents()
+                .values()
+                .find(|agent| agent.state() == tui::state::AgentLifecycle::Running)
+            {
+                running_id = Some(agent.id());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let running_id = running_id.unwrap_or_else(|| {
+            panic!(
+                "the child should show as running: {:?} / error {:?} / transcript {:?}",
+                loop_state.ui.agents(),
+                loop_state.ui.protocol_error(),
+                loop_state.ui.transcript()
+            )
+        });
+        assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+        let row = &loop_state.ui.agents()[&running_id];
+        assert_eq!(row.role(), Some("explore"));
+        assert_eq!(row.current_operation(), Some("survey the tests"));
+        assert_eq!(loop_state.shared.agents.running(), vec![running_id]);
+
+        // Cancel it by id — the child ends, the parent turn goes on.
+        loop_state
+            .dispatch_slash(&format!("/agents cancel {running_id}"))
+            .expect("cancel");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|t| *t == format!("cancelled agent {running_id}")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+        for _ in 0..600 {
+            loop_state.drain().expect("drain");
+            if !loop_state.model_busy() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        settle_last_turn(&mut loop_state);
+        assert_eq!(
+            loop_state.ui.agents()[&running_id].state(),
+            tui::state::AgentLifecycle::Cancelled,
+            "{:?}",
+            loop_state.ui.agents()
+        );
+        assert!(loop_state.shared.agents.running().is_empty());
+        assert!(
+            loop_state.ui.transcript().iter().any(|entry| matches!(
+                entry,
+                TranscriptEntry::Assistant { text } if text == "the child reported"
+            )),
+            "the parent turn finished on its own: {:?}",
+            loop_state.ui.transcript()
+        );
+        // Cancelling again names nothing.
+        loop_state
+            .dispatch_slash(&format!("/agents cancel {running_id}"))
+            .expect("cancel again");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|t| *t == format!("no running agent {running_id}")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+        loop_state.dispatch_slash("/agents cancel").expect("bare");
+        assert!(
+            command_outputs(loop_state.ui).contains(&"no running agents to cancel"),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn an_interactive_sessions_mcp_servers_are_started_once_and_serve_every_turn() {
@@ -15351,11 +15589,12 @@ cancelled and not turned into a turn interrupt:\n{painted}"
     }
 
     #[test]
-    fn a_bare_jobs_cancel_is_refused_too_and_interrupts_nothing() {
-        // The first pass refused only the id-carrying form, leaving
-        // `/jobs cancel` routed to a session-wide interrupt under a command
-        // summarised "inspect or cancel supervised jobs" — the same untruth
-        // without the id, and `/help` reported `/jobs` as fully working.
+    fn a_bare_cancel_names_its_own_target_and_interrupts_nothing() {
+        // `/jobs cancel` and `/agents cancel` once routed to a session-wide
+        // interrupt under commands summarised as job and agent control —
+        // the wrong thing, done silently. Each now answers from its own
+        // table: with nothing running, it says so, and the turn is never
+        // interrupted.
         let _lock = lock_terminal();
         let env = TempEnv::create();
         let report = run_interactive(env.options_capturing_render(vec![
@@ -15372,7 +15611,9 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         let painted = report
             .rendered_output
             .expect("capture_render was requested");
-        assert!(painted.contains("not available"), "{painted}");
+        assert!(painted.contains("no running jobs to cancel"), "{painted}");
+        assert!(painted.contains("no running agents to cancel"), "{painted}");
+        assert!(!painted.contains("not available"), "{painted}");
     }
 
     #[test]
@@ -15834,7 +16075,6 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         }
 
         /// Call `tool` with `arguments` (a JSON object), then answer.
-        #[cfg_attr(not(unix), allow(dead_code))]
         fn call_then_answer(tool: &str, arguments: serde_json::Value, answer: &str) -> Self {
             let call = ProposedToolCall::new(
                 "c1",

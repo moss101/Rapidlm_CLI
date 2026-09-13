@@ -307,6 +307,134 @@ pub(crate) trait WorkspaceChanges: Send + Sync {
     fn wrote(&self, path: &str, before: Option<u64>, after: u64, hunks: Option<&str>);
 }
 
+/// How a `task_spawn` child ended, as reported to [`AgentEvents`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubagentEnd {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+/// Where a turn reports the subagents it runs. The `/agents` panel projects
+/// `agent.*` ledger events; nothing emitted any for `task_spawn` children,
+/// so the panel was empty for the one kind of agent the binary actually
+/// runs. An observer on `task_spawn`, not a second way of running one.
+pub(crate) trait AgentEvents: Send + Sync {
+    /// A child is about to run: its id, the requested agent type, and its
+    /// task (bounded by the caller).
+    fn spawned(&self, agent: protocol::AgentId, agent_type: &str, task: &str);
+    /// The child has ended; `detail` is the failure text for a failure.
+    fn finished(&self, agent: protocol::AgentId, end: SubagentEnd, detail: Option<&str>);
+}
+
+/// Longest task text an `agent.spawned` event carries.
+pub const MAX_AGENT_TASK_BYTES: usize = 512;
+
+/// The session's running subagents and the token that stops each one —
+/// what `/agents cancel <id>` acts on. Shared into every turn's tools the
+/// way the job table is, so a child started by one turn is addressable by
+/// its id from the loop while it runs.
+#[derive(Clone, Default)]
+pub struct SubagentRegistry {
+    running: Arc<Mutex<Vec<(protocol::AgentId, CancellationToken)>>>,
+}
+
+impl SubagentRegistry {
+    fn register(&self, agent: protocol::AgentId, cancel: CancellationToken) {
+        self.running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((agent, cancel));
+    }
+
+    fn unregister(&self, agent: protocol::AgentId) {
+        self.running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(id, _)| *id != agent);
+    }
+
+    /// Ids of the children running now, oldest first.
+    pub fn running(&self) -> Vec<protocol::AgentId> {
+        self.running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Cancel one running child: `true` if it was running. A child that
+    /// already ended is not an error, just `false`.
+    pub fn cancel(&self, agent: protocol::AgentId) -> bool {
+        let running = self.running.lock().unwrap_or_else(|p| p.into_inner());
+        match running.iter().find(|(id, _)| *id == agent) {
+            Some((_, cancel)) => {
+                cancel.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Cancel every running child; returns how many there were.
+    pub fn cancel_all(&self) -> usize {
+        let running = self.running.lock().unwrap_or_else(|p| p.into_inner());
+        for (_, cancel) in running.iter() {
+            cancel.cancel();
+        }
+        running.len()
+    }
+}
+
+/// Propagates the parent turn's cancellation to a child's own token — the
+/// tokens have no parent/child link, so a poller carries it — for as long
+/// as the child runs. Stopped explicitly when the child returns; `Drop` is
+/// the fallback for the path that does not get there.
+struct ParentCancelBridge {
+    stop: Arc<AtomicBool>,
+    watchdog: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ParentCancelBridge {
+    const POLL: Duration = Duration::from_millis(50);
+
+    fn start(parent: &CancellationToken, child: CancellationToken) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let parent = parent.clone();
+        let stop_flag = Arc::clone(&stop);
+        let watchdog = std::thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                if parent.is_cancelled() {
+                    child.cancel();
+                    return;
+                }
+                std::thread::sleep(Self::POLL);
+            }
+        });
+        Self {
+            stop,
+            watchdog: Some(watchdog),
+        }
+    }
+
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(watchdog) = self.watchdog.take() {
+            let _ = watchdog.join();
+        }
+    }
+}
+
+impl Drop for ParentCancelBridge {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(watchdog) = self.watchdog.take() {
+            let _ = watchdog.join();
+        }
+    }
+}
+
 /// Registry of background commands started by `shell.exec` with
 /// `background: true`.
 ///
@@ -1118,6 +1246,11 @@ pub struct WorkspaceTools {
     /// default; headless `exec` turns it on so runs are diagnosable.
     trace_calls: bool,
     subagents: Option<Arc<dyn SubagentRunner>>,
+    /// See [`SubagentRegistry`]: the session's, once shared; this turn's
+    /// own otherwise.
+    subagent_registry: SubagentRegistry,
+    /// See [`AgentEvents`]. `None` outside a kernel session.
+    agent_events: Option<Arc<dyn AgentEvents>>,
     /// See [`WorkspaceChanges`]. `None` outside a kernel session.
     changes: Option<Arc<dyn WorkspaceChanges>>,
     fetch_allowlist: Vec<String>,
@@ -1200,6 +1333,8 @@ impl WorkspaceTools {
             read_only: false,
             trace_calls: false,
             subagents: None,
+            subagent_registry: SubagentRegistry::default(),
+            agent_events: None,
             changes: None,
             fetch_allowlist: Vec::new(),
             hooks: crate::hooks::HooksConfig::default(),
@@ -1534,6 +1669,17 @@ impl WorkspaceTools {
     /// telling a half-truth about what is running.
     pub(crate) fn job_events(&self) -> Option<Arc<dyn JobEvents>> {
         self.jobs.events.clone()
+    }
+
+    /// Report this surface's subagents to `events`. See [`AgentEvents`].
+    pub(crate) fn set_agent_events(&mut self, events: Arc<dyn AgentEvents>) {
+        self.agent_events = Some(events);
+    }
+
+    /// Run this turn's subagents in the session's registry, so the loop can
+    /// cancel one by id while it runs. See [`SubagentRegistry`].
+    pub(crate) fn share_subagents(&mut self, session: &SubagentRegistry) {
+        self.subagent_registry = session.clone();
     }
 
     /// parent's. See `JobRegistry::share_job_budget`.
@@ -3257,12 +3403,38 @@ read with job_output, in this turn or a later one — the job is stopped when th
                 crate::hooks::HOOK_TIMEOUT,
             );
         }
+        // The child's own token: the parent's cancellation reaches it
+        // through the bridge below, and `/agents cancel <id>` reaches it
+        // through the registry — either stops this one child.
+        let agent_id = protocol::AgentId::new();
+        let child_cancel = CancellationToken::new();
+        self.subagent_registry
+            .register(agent_id, child_cancel.clone());
+        let bridge = ParentCancelBridge::start(cancel, child_cancel.clone());
+        if let Some(events) = &self.agent_events {
+            events.spawned(
+                agent_id,
+                &args.agent_type,
+                &bounded_text(args.prompt.as_bytes(), MAX_AGENT_TASK_BYTES),
+            );
+        }
         let outcome = runner.run(
             &args.prompt,
             &args.agent_type,
             args.write_scope.as_deref(),
-            cancel,
+            &child_cancel,
         );
+        bridge.stop();
+        self.subagent_registry.unregister(agent_id);
+        if let Some(events) = &self.agent_events {
+            let (end, detail) = match &outcome {
+                Ok(report) if report.status == "cancelled" => (SubagentEnd::Cancelled, None),
+                Ok(report) if report.status == "succeeded" => (SubagentEnd::Succeeded, None),
+                Ok(report) => (SubagentEnd::Failed, Some(report.status.as_str())),
+                Err(reason) => (SubagentEnd::Failed, Some(reason.as_str())),
+            };
+            events.finished(agent_id, end, detail);
+        }
         if !self.hooks.subagent_stop.is_empty() {
             let (status, ok) = match &outcome {
                 Ok(report) => (report.status.clone(), true),
@@ -5482,6 +5654,22 @@ impl ExecTools {
     pub(crate) fn set_job_events(&mut self, events: Arc<dyn JobEvents>) {
         if let Self::Workspace(tools) = self {
             tools.set_job_events(events);
+        }
+    }
+
+    /// Report subagents to `events` (no-op on the no-op surface). See
+    /// [`AgentEvents`].
+    pub(crate) fn set_agent_events(&mut self, events: Arc<dyn AgentEvents>) {
+        if let Self::Workspace(tools) = self {
+            tools.set_agent_events(events);
+        }
+    }
+
+    /// Run subagents in the session's registry (no-op on the no-op
+    /// surface). See [`SubagentRegistry`].
+    pub(crate) fn share_subagents(&mut self, session: &SubagentRegistry) {
+        if let Self::Workspace(tools) = self {
+            tools.share_subagents(session);
         }
     }
 
@@ -11385,12 +11573,17 @@ mod tests {
     }
 
     #[test]
-    fn task_spawn_forwards_the_callers_real_cancellation_token_to_the_runner() {
-        use std::sync::Mutex as StdMutex;
-        struct CapturingRunner {
-            captured: StdMutex<Option<CancellationToken>>,
+    fn task_spawn_stops_a_running_child_when_the_caller_is_cancelled() {
+        // The child runs on its own token (so `/agents cancel <id>` can
+        // stop just it), and the caller's cancellation — Ctrl-C,
+        // `--max-wall-time` — must still reach it while it runs: an
+        // implementation that handed the child a fresh, disconnected token
+        // would leave an in-flight subagent running after its parent was
+        // cancelled.
+        struct RunsUntilCancelled {
+            started: Arc<AtomicBool>,
         }
-        impl crate::exec_tools::SubagentRunner for CapturingRunner {
+        impl crate::exec_tools::SubagentRunner for RunsUntilCancelled {
             fn run(
                 &self,
                 _prompt: &str,
@@ -11398,51 +11591,60 @@ mod tests {
                 _write_scope: Option<&str>,
                 cancel: &CancellationToken,
             ) -> Result<SubagentReport, String> {
-                *self.captured.lock().expect("lock") = Some(cancel.clone());
-                Ok(SubagentReport {
-                    summary: "done".to_owned(),
-                    status: "succeeded".to_owned(),
-                    tool_calls: 0,
-                    tokens: 1,
-                    cost_usd_micros: None,
-                    stop_reason: None,
-                    claims: Vec::new(),
-                    blockers: Vec::new(),
-                    open_questions: Vec::new(),
-                    patch_summary: None,
-                    artifacts: Vec::new(),
-                })
+                self.started.store(true, Ordering::SeqCst);
+                for _ in 0..2_000 {
+                    if cancel.is_cancelled() {
+                        return Ok(SubagentReport {
+                            summary: "stopped".to_owned(),
+                            status: "cancelled".to_owned(),
+                            tool_calls: 0,
+                            tokens: 0,
+                            cost_usd_micros: None,
+                            stop_reason: Some("cancelled".to_owned()),
+                            claims: Vec::new(),
+                            blockers: Vec::new(),
+                            open_questions: Vec::new(),
+                            patch_summary: None,
+                            artifacts: Vec::new(),
+                        });
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err("never cancelled".to_owned())
             }
         }
 
         let root = TempRoot::new("spawn-cancel");
         let mut tools = permissive_workspace(&root.0);
-        let runner = Arc::new(CapturingRunner {
-            captured: StdMutex::new(None),
-        });
-        tools.subagents = Some(Arc::clone(&runner) as Arc<dyn SubagentRunner>);
+        let started = Arc::new(AtomicBool::new(false));
+        tools.subagents = Some(Arc::new(RunsUntilCancelled {
+            started: Arc::clone(&started),
+        }));
         let cancel = CancellationToken::new();
         let call = make_call("c1", TASK_SPAWN_TOOL, r#"{"prompt":"x","type":"explore"}"#);
         let validated = tools.validate(&call, &cancel).expect("v");
-        tools.execute(&validated, &cancel).expect("e");
-
-        let captured = runner
-            .captured
-            .lock()
-            .expect("lock")
-            .clone()
-            .expect("the runner must receive a cancellation token");
-        assert!(!captured.is_cancelled(), "sanity: not cancelled yet");
-        // Cancel the caller's own token *after* the call returns, then check
-        // whether the runner's captured token reflects it: a shared
-        // Arc<AtomicBool> under Clone means this only passes if the runner
-        // was actually handed the caller's real token, not a fresh,
-        // disconnected one it can never observe.
-        cancel.cancel();
-        assert!(
-            captured.is_cancelled(),
-            "the token the runner received must be the caller's real token, not a fresh disconnected one"
-        );
+        // Cancel the caller once the child is running.
+        let canceller = {
+            let cancel = cancel.clone();
+            let started = Arc::clone(&started);
+            std::thread::spawn(move || {
+                for _ in 0..2_000 {
+                    if started.load(Ordering::SeqCst) {
+                        cancel.cancel();
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        let result = tools.execute(&validated, &cancel).expect("e");
+        canceller.join().expect("canceller");
+        match result {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("status=cancelled"), "{summary}");
+            }
+            other => panic!("expected the cancelled report, got {other:?}"),
+        }
     }
 
     #[test]
