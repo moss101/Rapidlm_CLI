@@ -682,8 +682,19 @@ fn modal_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
     for modal in state.modal_stack() {
         match modal {
             crate::state::Modal::Approval { id } => {
-                lines.push(format!("approval required: {id}"));
-                lines.push("resolve from the CLI/host approval surface".to_owned());
+                // Show the action, not just the id: the projection carries
+                // the requesting surface's own summary and tool, bounded by
+                // the same display rules as every other rendered field.
+                let approval = state.approvals().get(id);
+                if let Some(tool) = approval.and_then(|approval| approval.tool()) {
+                    lines.push(format!("approval required: {tool}"));
+                } else {
+                    lines.push(format!("approval required: {id}"));
+                }
+                if let Some(summary) = approval.and_then(|approval| approval.summary()) {
+                    lines.push(summary.to_owned());
+                }
+                lines.push("resolve with /approvals approve|deny <n>".to_owned());
             }
             crate::state::Modal::ProtocolError => {
                 lines.push("protocol error".to_owned());
@@ -1629,16 +1640,32 @@ pre-approve it with `rapid permissions allow <tool>`";
                 serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
             )),
         );
+        // The durable request opens the modal (with the action summary the
+        // requesting surface recorded); the in-flight tool event adds the
+        // transcript glyph. Both are emitted in production, in this order.
         state = reduce(
             state,
             &UiEvent::Kernel(event(
                 2,
+                EventKind::ApprovalRequested,
+                serde_json::json!({
+                    "id": "019c0000-0000-7000-8000-00000000001a",
+                    "call_id": "call-1",
+                    "tool": "shell_exec",
+                    "summary": "run: cargo test",
+                }),
+            )),
+        );
+        state = reduce(
+            state,
+            &UiEvent::Kernel(event(
+                3,
                 EventKind::ToolApprovalRequired,
                 serde_json::json!({
                     "turn_id": "019c0000-0000-7000-8000-000000000012",
                     "call_id": "call-1",
                     "tool": "shell_exec",
-                    "approval_id": "019c0000-0000-7000-8000-00000000001a",
+                    "id": "019c0000-0000-7000-8000-00000000001a",
                 }),
             )),
         );
@@ -1655,6 +1682,75 @@ pre-approve it with `rapid permissions allow <tool>`";
             size,
             true,
             &cancel(),
+        );
+        // The modal leads with the action (the tool the pending call names)
+        // now that the projection carries it — what the user needs to decide
+        // — and falls back to the id when the event named no tool.
+        assert!(
+            screen.snapshot().contains("approval required: shell_exec"),
+            "{}",
+            screen.snapshot()
+        );
+    }
+
+    #[test]
+    fn modal_without_a_named_tool_falls_back_to_the_approval_id() {
+        use event_ledger::event::{ActorKind, ActorRef, EventEnvelope, EventKind, RecordedAt};
+        use protocol::{EventId, RedactionClass, SessionId, TraceId};
+
+        let session: SessionId = "019c0000-0000-7000-8000-000000000010"
+            .parse()
+            .expect("session");
+        let actor = ActorRef::new(ActorKind::System, "019c0000-0000-7000-8000-000000000016")
+            .expect("actor");
+        let event = |seq: u64, kind: EventKind, payload: serde_json::Value| {
+            UiEvent::Kernel(EventEnvelope::new(
+                format!("019c0000-0000-7000-8000-{seq:012x}")
+                    .parse::<EventId>()
+                    .expect("event id"),
+                session,
+                seq,
+                "2026-08-14T15:20:04.123Z"
+                    .parse::<RecordedAt>()
+                    .expect("recorded_at"),
+                actor.clone(),
+                TraceId::new(),
+                kind,
+                RedactionClass::Project,
+                payload,
+            ))
+        };
+
+        let mut state = reduce(
+            AppState::new(),
+            &event(
+                1,
+                EventKind::SessionCreated,
+                serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
+            ),
+        );
+        let state = reduce(
+            state,
+            &event(
+                2,
+                EventKind::ApprovalRequested,
+                serde_json::json!({ "approval_id": "019c0000-0000-7000-8000-00000000001a" }),
+            ),
+        );
+        let cancel = cancel();
+        let size = Rect::new(0, 0, 80, 24);
+        let viewport = TranscriptViewport::from_rect(
+            compute_screen_layout(&state, size, 1, true).transcript(),
+        );
+        let screen = paint_screen(
+            &state,
+            &Transcript::new(),
+            &viewport,
+            &[],
+            &StatusChrome::default(),
+            size,
+            true,
+            &cancel,
         );
         assert!(
             screen

@@ -171,6 +171,8 @@ define_event_kinds! {
     TurnInterrupted = "turn.interrupted" => Turn,
     TurnCompleted = "turn.completed" => Turn,
     TurnFailed = "turn.failed" => Turn,
+    MessageQueued = "message.queued" => Turn,
+    MessageState = "message.state" => Turn,
     ModelRequested = "model.requested" => Model,
     ModelStreamDelta = "model.stream_delta" => Model,
     ModelCompleted = "model.completed" => Model,

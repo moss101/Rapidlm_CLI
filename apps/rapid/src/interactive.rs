@@ -4588,6 +4588,7 @@ fn run_started_session(
         autonomous: None,
         compaction: None,
         shared: SessionShared::default(),
+        message_queue: Vec::new(),
         #[cfg(test)]
         scripted_backings: None,
     }
@@ -4624,6 +4625,14 @@ fn run_started_session(
         }),
         (Err(err), _) | (Ok(_), Err(err)) => Err(err),
     }
+}
+
+/// One message accepted while the session's model slot was busy. `id` links
+/// the in-memory entry to its durable `message.queued`/`message.state` events.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QueuedMessage {
+    id: String,
+    text: String,
 }
 
 struct SessionLoop<'a> {
@@ -4672,6 +4681,11 @@ struct SessionLoop<'a> {
     /// notices they leave for the user (drained into the transcript on every
     /// tick) and the session's MCP connections. See [`SessionShared`].
     shared: SessionShared,
+    /// Messages submitted while a turn was running, waiting to run after it.
+    /// Never silently dropped: each one is journaled (`message.queued`) the
+    /// moment it is accepted, so the queue survives a restart; `/queue` lists,
+    /// cancels, edits and runs them. See [`SessionLoop::queue_message`].
+    message_queue: Vec<QueuedMessage>,
     /// Test-only seam: when set, `submit_turn` runs the next queued scripted
     /// backing instead of resolving a real model from process env/config —
     /// the same idea as `run_interactive_turn_with_backing`'s existing
@@ -4793,6 +4807,8 @@ impl SessionLoop<'_> {
         // the first tick. This is the restart-recovery half of the durable
         // approval flow; `/approvals` resolves them.
         self.surface_pending_approvals();
+        // The same for messages accepted while a turn was running.
+        self.restore_queued_messages();
         let result = self.run_until_quit(inputs);
         // A compaction still out when the session ends is not a turn, so
         // the exit path's kernel interrupt cannot reach it; its own token
@@ -4814,6 +4830,7 @@ impl SessionLoop<'_> {
                 .map_err(|_| InteractiveError::Cancelled)?;
             self.drain()?;
             self.step_autonomous_goal()?;
+            self.dequeue_if_ready()?;
             match next_input(inputs, self.cancel)? {
                 None => continue,
                 Some(InteractiveInput::Eof) => return Ok(InteractiveOutcome::Quit),
@@ -4931,7 +4948,221 @@ impl SessionLoop<'_> {
     /// session (see `command_error_text`'s own doc comment for why this
     /// matters: it once did, silently, for every `CommandError` other than
     /// `Empty`).
+    /// Accept a message while the session's model slot is busy. The queue is
+    /// durable from the moment of acceptance: `message.queued` lands in the
+    /// ledger before this returns, so a crash never loses an accepted
+    /// message.
+    fn queue_message(&mut self, text: &str) -> Result<(), InteractiveError> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = format!(
+            "q{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let bounded = kernel::bounded_turn_text(text);
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::MessageQueued,
+            serde_json::json!({ "id": id, "text": bounded }),
+        );
+        self.message_queue.push(QueuedMessage {
+            id: id.clone(),
+            text: bounded.clone(),
+        });
+        self.append_command_output(format!(
+            "queued as {id} (position {} of {}): {}\n\
+It will run after the current turn; /queue cancels or edits it, /queue run {} starts it now.",
+            self.message_queue.len(),
+            self.message_queue.len(),
+            first_line(&bounded),
+            id,
+        ));
+        Ok(())
+    }
+
+    /// Run the next queued message when the session's model slot is free and
+    /// nothing is waiting on a human decision — a queued follow-up must not
+    /// silently take the slot an approval question is holding open.
+    fn dequeue_if_ready(&mut self) -> Result<(), InteractiveError> {
+        if self.model_busy() || self.message_queue.is_empty() {
+            return Ok(());
+        }
+        if !crate::approvals::pending_approvals(self.client, self.session_id).is_empty() {
+            return Ok(());
+        }
+        let next = self.message_queue.remove(0);
+        self.mark_message(&next.id, "submitted");
+        self.submit_turn(&next.text)
+    }
+
+    /// Record a queue-state transition (`submitted`/`cancelled`) durably.
+    fn mark_message(&self, id: &str, state: &str) {
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::MessageState,
+            serde_json::json!({ "id": id, "state": state }),
+        );
+    }
+
+    /// Rebuild the queue from the ledger — the restart half of durability:
+    /// every `message.queued` whose latest `message.state` still says
+    /// `queued` is offered again, unchanged.
+    fn restore_queued_messages(&mut self) {
+        let mut latest: Vec<(String, String, String)> = Vec::new(); // (id, text, state)
+        for seq in 1..=self.session_tip().unwrap_or(0) {
+            let Ok(event) = self.client.read_event(self.session_id, seq) else {
+                continue;
+            };
+            match event.kind() {
+                event_ledger::event::EventKind::MessageQueued => {
+                    let payload = event.payload();
+                    if let (Some(id), Some(text)) = (
+                        payload.get("id").and_then(serde_json::Value::as_str),
+                        payload.get("text").and_then(serde_json::Value::as_str),
+                    ) {
+                        latest.retain(|entry| entry.0 != id);
+                        latest.push((id.to_owned(), text.to_owned(), "queued".to_owned()));
+                    }
+                }
+                event_ledger::event::EventKind::MessageState => {
+                    let payload = event.payload();
+                    if let (Some(id), Some(state)) = (
+                        payload.get("id").and_then(serde_json::Value::as_str),
+                        payload.get("state").and_then(serde_json::Value::as_str),
+                    ) {
+                        if let Some(entry) = latest.iter_mut().find(|entry| entry.0 == id) {
+                            entry.2 = state.to_owned();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (id, text, state) in latest {
+            if state == "queued" {
+                self.message_queue.push(QueuedMessage {
+                    id: id.clone(),
+                    text: text.clone(),
+                });
+                self.append_command_output(format!(
+                    "restored queued message {id} from a previous run: {}\n\
+It will run after the current turn; /queue cancels or edits it.",
+                    first_line(&text),
+                ));
+            }
+        }
+    }
+
+    /// `/queue`: the human side of the durable message queue — list, cancel,
+    /// edit, or run a queued message now.
+    fn run_queue_command(&mut self, rest: &str) -> Result<(), InteractiveError> {
+        let args = rest.trim();
+        if args.is_empty() || args == "list" {
+            if self.message_queue.is_empty() {
+                self.append_command_output(
+                    "no queued messages; messages sent while a turn runs are queued here"
+                        .to_owned(),
+                );
+            } else {
+                let mut lines = vec![format!("{} queued message(s):", self.message_queue.len())];
+                for (index, message) in self.message_queue.iter().enumerate() {
+                    lines.push(format!(
+                        "{}. [{}] {}",
+                        index + 1,
+                        message.id,
+                        first_line(&message.text)
+                    ));
+                }
+                lines.push(
+                    "/queue cancel <id|n> | /queue edit <id|n> <text> | /queue run <id|n>"
+                        .to_owned(),
+                );
+                self.append_command_output(lines.join("\n"));
+            }
+            return Ok(());
+        }
+        let mut parts = args.splitn(3, ' ');
+        let action = parts.next().unwrap_or_default();
+        let selector = parts.next().unwrap_or_default();
+        let index = if let Some(position) = self
+            .message_queue
+            .iter()
+            .position(|message| message.id == selector)
+        {
+            Some(position)
+        } else {
+            match selector.parse::<usize>() {
+                Ok(n) if (1..=self.message_queue.len()).contains(&n) => Some(n - 1),
+                _ => None,
+            }
+        };
+        let Some(index) = index else {
+            self.append_command_error(format!(
+                "/queue: nothing queued matches '{selector}' (run /queue to list)"
+            ));
+            return Ok(());
+        };
+        match action {
+            "cancel" => {
+                let message = self.message_queue.remove(index);
+                self.mark_message(&message.id, "cancelled");
+                self.append_command_output(format!("cancelled queued message {}", message.id));
+                Ok(())
+            }
+            "edit" => {
+                let new_text = parts.next().unwrap_or_default().trim().to_owned();
+                if new_text.is_empty() {
+                    self.append_command_error(
+                        "/queue: edit needs text: /queue edit <id|n> <text>".to_owned(),
+                    );
+                    return Ok(());
+                }
+                let message = &mut self.message_queue[index];
+                message.text = kernel::bounded_turn_text(&new_text);
+                let id = message.id.clone();
+                let text = message.text.clone();
+                // Re-record durably: the newest `message.queued` for an id is
+                // the one a restart replays.
+                let _ = self.client.append_turn_progress(
+                    self.session_id,
+                    self.actor,
+                    TraceId::new(),
+                    event_ledger::event::EventKind::MessageQueued,
+                    serde_json::json!({ "id": id, "text": text }),
+                );
+                self.append_command_output(format!("edited queued message {id}"));
+                Ok(())
+            }
+            "run" => {
+                if self.model_busy() {
+                    self.append_command_error(
+                        "/queue: a turn or compaction is running; it will run after".to_owned(),
+                    );
+                    return Ok(());
+                }
+                let message = self.message_queue.remove(index);
+                self.mark_message(&message.id, "submitted");
+                self.submit_turn(&message.text)
+            }
+            other => {
+                self.append_command_error(format!(
+                    "/queue: unknown action '{other}' (list | cancel <id|n> | edit <id|n> <text> | run <id|n>)"
+                ));
+                Ok(())
+            }
+        }
+    }
+
     fn dispatch_slash(&mut self, command: &str) -> Result<LoopControl, InteractiveError> {
+        // `/queue` is handled locally: it drives the durable message queue,
+        // session state plus this client's own appends.
+        if let Some(rest) = command.strip_prefix("/queue") {
+            self.run_queue_command(rest)?;
+            return Ok(LoopControl::Continue);
+        }
         // `/approvals` is handled locally: it drives the pending-approval
         // flow (list / approve / remember / deny / answer), which is session
         // state plus the kernel's approval APIs, not a TUI panel route.
@@ -5291,7 +5522,7 @@ denied\n",
                 let mut line = format!(
                     "{}. [{}] {} — {}",
                     index + 1,
-                    short_token(&payload.token),
+                    short_token(&payload.id),
                     payload.tool,
                     payload.summary
                 );
@@ -5323,7 +5554,7 @@ denied\n",
         let selector = parts.next().unwrap_or_default();
         let index = if let Some(position) = pending
             .iter()
-            .position(|item| item.payload().token == selector)
+            .position(|item| item.payload().id == selector)
         {
             Some(position)
         } else {
@@ -5339,7 +5570,7 @@ denied\n",
         };
         let index = index.expect("selector match guarantees a valid index");
         let item = &pending[index];
-        let token = item.payload().token.clone();
+        let token = item.payload().id.clone();
         let call_id = item.payload().call_id.clone();
         let is_question = item.payload().tool == "ask_user";
         let extra = parts.next().unwrap_or_default().to_owned();
@@ -5513,7 +5744,7 @@ denied\n",
             lines.push(format!(
                 "{}. [{}] {} — {}",
                 index + 1,
-                short_token(&payload.token),
+                short_token(&payload.id),
                 payload.tool,
                 payload.summary
             ));
@@ -6278,12 +6509,13 @@ the full history, where `/diff` lists every file it wrote\n"
         }
         // A turn already running on its own thread (see below) holds the
         // kernel's own exclusive lease; reaching `SubmitTurn` again here
-        // would only bounce off `SessionConflict`. Silently ignoring a
-        // submission while one is in flight (rather than queuing it) is the
-        // deliberately simple choice for a first working version of real
-        // turn execution.
+        // would only bounce off `SessionConflict`. The message is never
+        // silently dropped: it is queued — durably — and runs after the
+        // in-flight turn settles (`/queue` lists, cancels, edits, or runs
+        // it early).
         if self.model_busy() {
-            return Ok(());
+            self.queue_message(text)?;
+            return self.drain();
         }
         // The kernel's own tip, not the projection's seq. The projection
         // lags the ledger by the live-tail poll interval (see
@@ -6751,6 +6983,7 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
         // Set by the one arm that carries one; folded into the payload below
         // rather than widening the tuple every other arm would have to pad.
         let mut denial_reason: Option<String> = None;
+        let mut approval_token: Option<String> = None;
         let (kind, turn_id, call_id, tool, request_id, step, tokens) = match event {
             TurnEvent::Started { .. }
             | TurnEvent::Completed { .. }
@@ -6870,15 +7103,27 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
                 turn_id,
                 call_id,
                 tool,
-            } => (
-                EventKind::ToolApprovalRequired,
-                turn_id,
-                Some(call_id),
-                Some(tool),
-                None,
-                None,
-                None,
-            ),
+            } => {
+                // The durable pending approval for this call was recorded by
+                // the approval sink moments ago, inside the tool call itself;
+                // carrying its wait token as `id` lets the TUI's approval
+                // projection (and modal) key on the real request instead of
+                // failing closed on an anonymous event.
+                approval_token = crate::approvals::pending_token_for_call(
+                    self.client,
+                    self.session_id,
+                    &call_id,
+                );
+                (
+                    EventKind::ToolApprovalRequired,
+                    turn_id,
+                    Some(call_id),
+                    Some(tool),
+                    None,
+                    None,
+                    None,
+                )
+            }
             TurnEvent::ToolContextRequired {
                 turn_id,
                 call_id,
@@ -6903,6 +7148,9 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
             // Read back by `tui::state`'s fold through the same bounded,
             // redaction-aware accessor as `tool`.
             "detail": denial_reason,
+            // The durable pending approval's wait token, when this event
+            // closes one — the approval projection's key.
+            "id": approval_token,
         });
         self.client
             .append_turn_progress(self.session_id, self.actor, TraceId::new(), kind, payload)
@@ -7940,6 +8188,22 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
         record_turn_context(client, session_id, actor, outcome, history_through);
     }
     kernel_turn_outcome(&run_result)
+}
+
+/// The first line of a (possibly multi-line) queued message, bounded —
+/// what `/queue` and the acceptance notice show.
+fn first_line(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default();
+    let mut end = 80.min(line.len());
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = &line[..end];
+    if end < line.len() {
+        format!("{cut}…")
+    } else {
+        cut.to_owned()
+    }
 }
 
 /// Display short form of a wait token: stable, enough to disambiguate a
@@ -11617,6 +11881,7 @@ alignment below it: {line:?}",
             autonomous: None,
             compaction: None,
             shared: session.shared.clone(),
+            message_queue: Vec::new(),
             scripted_backings: Some(backings),
         }
     }
@@ -17980,13 +18245,15 @@ pre-approve it with `rapid permissions allow <tool>`";
     }
 
     #[test]
-    fn second_submission_while_a_turn_is_in_flight_is_silently_dropped_not_duplicated() {
+    fn second_submission_while_a_turn_is_in_flight_is_queued_durably_not_dropped() {
         // Targets `SessionLoop::submit_turn`'s own `turn_in_flight` guard
         // directly: a submission that arrives while one is already running
         // must never reach `kernel::SubmitTurn` a second time (which would
         // either hit `SessionConflict` or, worse, actually start a second
-        // concurrent turn) — see the guard's own comment for why dropping
-        // it is the deliberate choice, not queuing it.
+        // concurrent turn) — and it must never be silently dropped either:
+        // it is queued, and the queue is durable from the moment of
+        // acceptance (`message.queued` in the ledger), so even a crash
+        // before the turn settles cannot lose an accepted message.
         let env = TempEnv::create();
         let session = ScriptedSession::create(&env);
         let cancel = CancellationToken::new();
@@ -18024,19 +18291,46 @@ pre-approve it with `rapid permissions allow <tool>`";
             autonomous: None,
             compaction: None,
             shared: SessionShared::default(),
+            message_queue: Vec::new(),
             #[cfg(test)]
             scripted_backings: None,
         };
         loop_state
             .submit_turn("a message arriving while another turn is in flight")
-            .expect("submit_turn itself must not error even when dropped");
+            .expect("submit_turn queues it, never errors");
 
+        // No second turn reached the kernel: exactly one event may have
+        // landed — the `message.queued` record itself — and no `turn.started`.
         let after_seq = block_on(session.client.get_session(session.session_id), &cancel)
             .expect("session")
             .seq();
+        assert!(
+            after_seq <= before_seq + 1,
+            "queueing the message appends at most its own record: {before_seq} -> {after_seq}"
+        );
+        // But the message is queued in memory and durably in the ledger.
+        assert_eq!(loop_state.message_queue.len(), 1);
+        let queued = &loop_state.message_queue[0];
         assert_eq!(
-            before_seq, after_seq,
-            "a submission while turn_in_flight is set must never reach kernel::SubmitTurn"
+            queued.text,
+            "a message arriving while another turn is in flight"
+        );
+        let mut saw_queued_event = false;
+        for seq in 1..=after_seq {
+            let Ok(event) = session.client.read_event(session.session_id, seq) else {
+                continue;
+            };
+            if event.kind() == event_ledger::event::EventKind::MessageQueued {
+                saw_queued_event = true;
+                assert_eq!(
+                    event.payload().get("text").and_then(|v| v.as_str()),
+                    Some("a message arriving while another turn is in flight")
+                );
+            }
+        }
+        assert!(
+            saw_queued_event,
+            "the queue must be durable from acceptance"
         );
         close_stream(&mut stream);
     }
@@ -18355,6 +18649,7 @@ pre-approve it with `rapid permissions allow <tool>`";
                 shared: SessionShared::default(),
                 #[cfg(test)]
                 scripted_backings: None,
+                message_queue: Vec::new(),
             };
             loop_state
                 .handle_input(InteractiveInput::PageUp)
@@ -18386,6 +18681,7 @@ pre-approve it with `rapid permissions allow <tool>`";
                 shared: SessionShared::default(),
                 #[cfg(test)]
                 scripted_backings: None,
+                message_queue: Vec::new(),
             };
             for _ in 0..10 {
                 loop_state

@@ -307,7 +307,7 @@ fn ask_with_a_sink_suspends_records_and_resumes_the_exact_call() {
     let reopened = InProcessKernelClient::open(ledger_path(&project.root)).expect("reopens");
     let pendings = call(reopened.pending_approvals(session)).expect("pendings");
     assert_eq!(pendings.len(), 1);
-    let token = pendings[0].payload().token.clone();
+    let token = pendings[0].payload().id.clone();
 
     // Approve once — durable resolution, and a duplicate fails closed.
     call(

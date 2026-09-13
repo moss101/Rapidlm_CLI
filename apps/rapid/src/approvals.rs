@@ -257,7 +257,9 @@ pub fn new_wait_token() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("approval-{nanos:x}-{count:x}")
+    // Hex and hyphens only: the TUI's approval projection keys on this id
+    // and its parser admits exactly that alphabet.
+    format!("{nanos:x}-{count:x}")
 }
 
 /// Extract `(summary, scope, diff)` for a pending call from its tool name and
@@ -470,6 +472,9 @@ pub fn record_suspension(
     let detail = serde_json::to_string(suspended)
         .map_err(|err| format!("suspension could not be encoded: {err}"))?;
     let payload = serde_json::json!({
+        // `id` is what the TUI's approval projection keys on; `token` names
+        // the same wait token for the resume path.
+        "id": token,
         "call_id": call_id,
         "tool": tool,
         "request_id": null,
@@ -514,7 +519,7 @@ pub fn pending_token_for_call(
     pending_approvals(client, session_id)
         .into_iter()
         .find(|pending| pending.payload().call_id == call_id)
-        .map(|pending| pending.payload().token.clone())
+        .map(|pending| pending.payload().id.clone())
 }
 
 /// Every unresolved `approval.requested` for a session, oldest first.
@@ -535,6 +540,6 @@ pub fn requested_payload(
 ) -> Option<ApprovalRequestedPayload> {
     pending_approvals(client, session_id)
         .into_iter()
-        .find(|pending| pending.payload().token == token)
+        .find(|pending| pending.payload().id == token)
         .map(|pending| pending.payload().clone())
 }

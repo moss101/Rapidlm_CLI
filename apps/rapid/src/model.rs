@@ -311,9 +311,14 @@ impl LiveModelCall for ConfiguredModel<'_> {
         }
         let request = build_request(self, blocks, input)?;
         let request_bytes = request_text_bytes(&request);
-        // The agent token is checked on entry and exit; the blocking HTTP
-        // call itself is bounded by the transport timeout.
+        // The router's token is a different type than the turn's, and the
+        // blocking HTTP call runs on this thread — so a watcher bridges
+        // them: the moment the turn is cancelled (Ctrl-C, wall clock,
+        // session interrupt), the in-flight provider request is aborted at
+        // the transport's next read check instead of running to its own
+        // timeout. The same pattern `web_fetch::fetch_page` uses.
         let router_cancel = llm_router::provider::CancellationToken::new();
+        let _bridge = ProviderCancelWatch::start(cancel.clone(), router_cancel.clone());
         let stream = match &self.backend {
             Backend::OpenAi(adapter) => adapter.invoke_sync(request, &router_cancel),
             Backend::Anthropic(adapter) => adapter.invoke_sync(request, &router_cancel),
@@ -323,6 +328,44 @@ impl LiveModelCall for ConfiguredModel<'_> {
             return Err(ModelStepError::Cancelled);
         }
         fold_stream(&stream, request_bytes)
+    }
+}
+
+/// Bridges the turn's cancellation into a provider request: a watcher thread
+/// cancels the router token the moment the turn token fires. Detached — it
+/// exits within one poll interval of the step returning, and touching
+/// nothing after that but the token it owns.
+struct ProviderCancelWatch {
+    turn_cancel: CancellationToken,
+    router_cancel: llm_router::provider::CancellationToken,
+}
+
+impl ProviderCancelWatch {
+    fn start(
+        turn_cancel: CancellationToken,
+        router_cancel: llm_router::provider::CancellationToken,
+    ) -> Self {
+        Self {
+            turn_cancel,
+            router_cancel,
+        }
+    }
+}
+
+impl Drop for ProviderCancelWatch {
+    fn drop(&mut self) {
+        // Already done? Either way this is correct: the step has returned,
+        // so cancelling the router token only retires it early; the watcher
+        // sees the cancelled state and exits without leaking.
+        self.router_cancel.cancel();
+        let turn_cancel = self.turn_cancel.clone();
+        let router_cancel = self.router_cancel.clone();
+        std::thread::spawn(move || {
+            while !turn_cancel.is_cancelled() && !router_cancel.is_cancelled() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            router_cancel.cancel();
+        });
     }
 }
 

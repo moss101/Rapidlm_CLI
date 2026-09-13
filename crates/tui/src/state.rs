@@ -537,6 +537,11 @@ pub struct ApprovalProjection {
     id: ApprovalKey,
     state: ApprovalLifecycle,
     decision: Option<ApprovalDecisionView>,
+    /// What the pending call would do — the requesting surface's own bounded
+    /// summary — so the modal can show the action, not just an id.
+    summary: Option<String>,
+    /// The tool the pending call names, when the event carried one.
+    tool: Option<String>,
 }
 
 /// Approval lifecycle copied from approval event kinds.
@@ -757,12 +762,23 @@ fn apply_kernel(
             upsert_job(&mut state, event, JobLifecycle::OrphanReconciled)?;
         }
         EventKind::ApprovalRequested => {
-            let id = upsert_approval(&mut state, event, ApprovalLifecycle::Requested)?;
-            push_approval_modal(&mut state, id)?;
+            if let Some(id) = upsert_approval(&mut state, event, ApprovalLifecycle::Requested)? {
+                // A model *question* (ask_user) has its own glyph and the
+                // answer flows through the same resolution path; a modal
+                // would cover the question it is asking. Only tool
+                // approvals take the modal.
+                let is_question = state
+                    .approvals()
+                    .get(&id)
+                    .and_then(|approval| approval.tool())
+                    .is_some_and(|tool| tool == "ask_user");
+                if !is_question {
+                    push_approval_modal(&mut state, id)?;
+                }
+            }
         }
         EventKind::ToolApprovalRequired => {
-            let id = upsert_approval(&mut state, event, ApprovalLifecycle::Requested)?;
-            push_approval_modal(&mut state, id)?;
+            upsert_approval(&mut state, event, ApprovalLifecycle::Requested)?;
             if let Some(tool) = optional_display(event, event.payload(), "tool")? {
                 push_transcript(
                     &mut state,
@@ -775,12 +791,14 @@ fn apply_kernel(
             }
         }
         EventKind::ApprovalResolved => {
-            let id = upsert_approval(&mut state, event, ApprovalLifecycle::Resolved)?;
-            pop_approval_modal(&mut state, &id);
+            if let Some(id) = upsert_approval(&mut state, event, ApprovalLifecycle::Resolved)? {
+                pop_approval_modal(&mut state, &id);
+            }
         }
         EventKind::ApprovalExpired => {
-            let id = upsert_approval(&mut state, event, ApprovalLifecycle::Expired)?;
-            pop_approval_modal(&mut state, &id);
+            if let Some(id) = upsert_approval(&mut state, event, ApprovalLifecycle::Expired)? {
+                pop_approval_modal(&mut state, &id);
+            }
         }
         EventKind::ControlTransferredToHuman => {
             state.control_holder = ControlHolder::Human;
@@ -1244,8 +1262,12 @@ fn upsert_approval(
     state: &mut AppState,
     event: &ErasedEventEnvelope,
     lifecycle: ApprovalLifecycle,
-) -> Result<ApprovalKey, UiStateError> {
+) -> Result<Option<ApprovalKey>, UiStateError> {
     let payload = event.payload();
+    // Missing id stays a typed fold error: an approval event that cannot name
+    // what it approves is malformed, and the fail-closed contract (freeze the
+    // session with a protocol error, block actions) is the documented
+    // behavior. Producers attach the durable request's wait token as `id`.
     let id = parse_approval_key(payload)?;
     if !state.approvals.contains_key(&id) {
         insert_approval(
@@ -1254,6 +1276,8 @@ fn upsert_approval(
                 id: id.clone(),
                 state: lifecycle,
                 decision: None,
+                summary: None,
+                tool: None,
             },
         )?;
     }
@@ -1270,7 +1294,13 @@ fn upsert_approval(
                 .ok_or(UiStateError::InvalidField { field: "decision" })?,
         );
     }
-    Ok(id)
+    if let Some(summary) = optional_display(event, payload, "summary")? {
+        approval.summary = Some(summary);
+    }
+    if let Some(tool) = optional_display(event, payload, "tool")? {
+        approval.tool = Some(tool);
+    }
+    Ok(Some(id))
 }
 
 fn insert_agent(state: &mut AppState, agent: AgentProjection) -> Result<(), UiStateError> {
@@ -1885,6 +1915,14 @@ impl ApprovalProjection {
 
     pub fn decision(&self) -> Option<ApprovalDecisionView> {
         self.decision
+    }
+
+    pub fn summary(&self) -> Option<&str> {
+        self.summary.as_deref()
+    }
+
+    pub fn tool(&self) -> Option<&str> {
+        self.tool.as_deref()
     }
 }
 

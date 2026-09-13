@@ -45,7 +45,7 @@ pub use client::{
     EventStreamError, FinishTurn, InProcessKernelClient, Interrupt, InterruptReason, KernelClient,
     MAX_APPROVAL_DIFF_BYTES, MAX_APPROVAL_SUMMARY_BYTES, PendingApproval, RecordApproval,
     ResolveApproval, RewindResult, RewindSession, SubmitTurn, SubscribeEvents, TurnHandle,
-    TurnOutcome,
+    TurnOutcome, bounded_turn_text,
 };
 pub use config::loader::{
     CancellationToken, ConfigLoadError, ConfigLoadResult, ConfigOrigin, ConfigOverride,

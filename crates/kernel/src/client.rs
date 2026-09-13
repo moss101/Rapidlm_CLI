@@ -113,7 +113,7 @@ const MAX_TERMINAL_APPEND_ATTEMPTS: u32 = 20;
 
 /// Truncate `text` to `MAX_TURN_TEXT_BYTES`, backing off to the nearest
 /// UTF-8 char boundary so a multibyte character is never split.
-fn bounded_turn_text(text: &str) -> String {
+pub fn bounded_turn_text(text: &str) -> String {
     if text.len() <= MAX_TURN_TEXT_BYTES {
         return text.to_owned();
     }
@@ -656,9 +656,11 @@ impl RecordApproval {
 /// Wire payload of `approval.requested`. `Serialize` for the append,
 /// `Deserialize` for the pending-approval reader and a restarted process
 /// reconstructing what it must still ask a human about.
+/// `id` is the wait token; the TUI's approval projection keys off an
+/// `id`/`approval_id` payload field, so the token travels under that name.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalRequestedPayload {
-    pub token: String,
+    pub id: String,
     pub call_id: String,
     pub tool: String,
     pub summary: String,
@@ -676,10 +678,15 @@ pub struct ApprovalRequestedPayload {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalResolvedPayload {
     pub decision: ApprovalDecision,
+    /// The wait token this resolves, also carried as `id` — the field the
+    /// TUI's approval projection keys on, so a resolution closes the modal
+    /// the request opened.
     #[serde(default)]
     pub wait_token: String,
     #[serde(default)]
     pub remember: bool,
+    #[serde(default)]
+    pub id: String,
 }
 
 /// One unresolved `approval.requested`, read back from the ledger.
@@ -699,7 +706,7 @@ impl PendingApproval {
     }
 
     pub fn token(&self) -> &str {
-        &self.payload.token
+        &self.payload.id
     }
 }
 
@@ -1168,6 +1175,7 @@ impl InProcessKernelClient {
                     decision: req.decision,
                     wait_token: req.wait_token.clone(),
                     remember: req.remember,
+                    id: req.wait_token.clone(),
                 },
                 &options,
                 &ledger_live(),
@@ -1218,7 +1226,7 @@ impl InProcessKernelClient {
             expected_seq: Some(req.expected_seq),
         };
         let payload = ApprovalRequestedPayload {
-            token: req.token.clone(),
+            id: req.token.clone(),
             call_id: req.call_id.clone(),
             tool: req.tool.clone(),
             summary: req.summary.clone(),
@@ -1280,6 +1288,18 @@ impl InProcessKernelClient {
         Ok(detail)
     }
 
+    /// One committed event by sequence. The queue-restore and suspension
+    /// readers replay sessions event-by-event; this is their read path.
+    pub fn read_event(
+        &self,
+        session_id: SessionId,
+        seq: u64,
+    ) -> Result<ErasedEventEnvelope, ApiError> {
+        self.ledger
+            .get(session_id, seq, &ledger_live())
+            .map_err(|err| ledger_api(err, TraceId::new()))
+    }
+
     /// Every `approval.requested` still awaiting resolution, in ledger order.
     /// Resolution is paired by wait token, so an approval resolved under a
     /// different token leaves its request listed — the same rule the wait
@@ -1304,12 +1324,13 @@ impl InProcessKernelClient {
                     serde_json::from_value::<ApprovalRequestedPayload>(event.payload().clone())
                 {
                     pending.push(PendingApproval { seq, payload });
+                    let _ = &pending;
                 }
             } else if event.kind() == EventKind::ApprovalResolved {
                 if let Ok(resolved) =
                     serde_json::from_value::<ApprovalResolvedPayload>(event.payload().clone())
                 {
-                    pending.retain(|request| request.payload.token != resolved.wait_token);
+                    pending.retain(|request| request.payload.id != resolved.wait_token);
                 }
             }
         }
