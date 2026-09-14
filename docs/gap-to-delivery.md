@@ -274,10 +274,14 @@ recovery/workflow tasks.
 - `[x]` **Release notes + RC draft** — `docs/RELEASE-NOTES-0.1.0-rc1.md`:
   highlights, honest limitations (streaming, credentials, signing), platform
   table, upgrade path. Publication stays the final approval step.
-- `[x]` **Per-platform clean-environment smoke** — the release matrix now runs
-  `scripts/release-smoke.sh` against each built artifact under a pristine HOME
-  on macOS and Linux runners before packaging (Windows keeps its existing smoke
-  steps while the smoke script's Unix-first sandbox assumptions are sorted).
+- `[x]` **Per-platform clean-environment smoke — EXECUTED on CI** — the release
+  matrix runs `scripts/release-smoke.sh` against each built artifact under a
+  pristine HOME. Run 34888814182 (workflow_dispatch on main, 2026-09-14):
+  all three legs green — macOS arm64 and Linux x86_64 each printed
+  `release smoke: OK` from a pristine HOME; Windows compiles the workspace
+  (Unix-socket daemon gated behind cfg(unix) with a typed runtime refusal)
+  and passes its binary smoke. Publishing remains tag-gated: a `v*` tag is
+  the explicit, approval-gated publication act.
 - `[~]` Authenticity: ssh-keygen ed25519 signing/verification
   (`scripts/release-sign.sh`, live-tested sign → verify → tamper-refused)
   covers the manifest (digests + SBOM + provenance) without external
