@@ -27,6 +27,7 @@
 //! exists — a wrong token is rejected before any RPC is served.
 
 use std::io::Write as _;
+#[cfg(unix)]
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -84,19 +85,45 @@ tool call. Approve trust with `rapid trust grant`."
     if let Some(parent) = ledger_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket).map_err(|err| {
+    // The daemon's wire transport is a Unix domain socket. On platforms
+    // without one this is a typed runtime refusal, not a build failure —
+    // the SDK path remains Unix-first by documented platform statement.
+    #[cfg(not(unix))]
+    {
+        let _ = &socket;
+        eprintln!(
+            "rapid daemon: Unix domain sockets are not available on this platform; \
+the SDK daemon path is Unix-first (see the platform notes in docs/getting-started.md)"
+        );
+        return Err(crate::p9_commands::P9CommandError::Agent(
+            "daemon requires a Unix socket; unsupported on this platform".to_owned(),
+        ));
+    }
+    #[cfg(unix)]
+    serve_unix(&socket, &ledger_path, &root, trusted)
+}
+
+/// The Unix-socket serving loop: bind, tighten permissions, accept SDK
+/// clients until the listener breaks. Only compiled on Unix.
+#[cfg(unix)]
+fn serve_unix(
+    socket: &std::path::Path,
+    ledger_path: &std::path::Path,
+    root: &std::path::Path,
+    trusted: bool,
+) -> Result<i32, crate::p9_commands::P9CommandError> {
+    let _ = std::fs::remove_file(socket);
+    let listener = UnixListener::bind(socket).map_err(|err| {
         crate::p9_commands::P9CommandError::Agent(format!("bind {socket:?}: {err}"))
     })?;
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600));
     }
     println!("rapid daemon listening on {}", socket.display());
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
-    let client = InProcessKernelClient::open(&ledger_path)
+    let client = InProcessKernelClient::open(ledger_path)
         .map_err(|err| crate::p9_commands::P9CommandError::Agent(err.to_string()))?;
     let actor = event_ledger::event::ActorRef::new(
         event_ledger::event::ActorKind::Agent,
@@ -112,7 +139,7 @@ tool call. Approve trust with `rapid trust grant`."
         let serve = Connection {
             client: client.clone(),
             actor: actor.clone(),
-            root: root.clone(),
+            root: root.to_path_buf(),
             trusted,
             daemon_token: daemon_token.clone(),
         };
@@ -120,7 +147,7 @@ tool call. Approve trust with `rapid trust grant`."
             let _ = serve.serve(stream);
         });
     }
-    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_file(socket);
     Ok(0)
 }
 
@@ -131,6 +158,7 @@ fn user_home() -> PathBuf {
 }
 
 /// One connected SDK client.
+#[cfg(unix)]
 struct Connection {
     client: InProcessKernelClient,
     actor: event_ledger::event::ActorRef,
@@ -139,6 +167,7 @@ struct Connection {
     daemon_token: Option<String>,
 }
 
+#[cfg(unix)]
 impl Connection {
     fn serve(&self, stream: std::os::unix::net::UnixStream) -> Result<(), String> {
         let _ = stream.set_nonblocking(false);
@@ -460,11 +489,13 @@ impl Connection {
     }
 }
 
+#[cfg(unix)]
 enum StreamCommand {
     Stop,
 }
 
 /// One newline-terminated JSON frame, written atomically per frame.
+#[cfg(unix)]
 fn write_frame(
     writer: &Mutex<std::os::unix::net::UnixStream>,
     frame: &serde_json::Value,
