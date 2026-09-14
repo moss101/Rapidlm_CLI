@@ -46,8 +46,8 @@ use crate::goal_host::{
 };
 use crate::headless::jsonl::JsonlExitCode;
 use crate::host::{
-    ExecOutcome, FallbackChainModel, PreservedLiveContext, RouterDecisionReason, StepDiag,
-    UnconfiguredModel, run_live_exec,
+    ExecOutcome, FallbackChainModel, LiveModelCall as _, PreservedLiveContext,
+    RouterDecisionReason, StepDiag, UnconfiguredModel, run_live_exec,
 };
 use crate::model::{ConfiguredModel, SelectedModel};
 use crate::user_config::ModelSelection;
@@ -4081,7 +4081,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         .map(|_| auth::InMemoryCredentialStore::new())
         .collect();
     let diag = parsed.verbose.then(|| StepDiag::stderr(&base_url));
-    let (backing, router_decisions) = match build_backing_model(
+    let (mut backing, router_decisions) = match build_backing_model(
         &models,
         &credential_stores,
         unconfigured,
@@ -4095,6 +4095,19 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             return Ok(JsonlExitCode::Usage.as_i32());
         }
     };
+    // Progressive output (delivery goal §2): provider text deltas print to
+    // stdout as they arrive; when any streamed, the final full answer is
+    // not re-printed (only a closing newline). JSONL mode keeps stdout
+    // reserved for records — its deltas ride `assistant.delta` records.
+    let deltas_streamed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if parsed.json_schema.is_none() && !parsed.jsonl {
+        let flag = std::sync::Arc::clone(&deltas_streamed);
+        backing.set_delta_sink(Some(std::sync::Arc::new(move |delta: &str| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            print!("{delta}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        })));
+    }
 
     // Prompt/context stack: project instructions (AGENTS.md convention +
     // compat paths) and the conditional-section system prompt (environment,
@@ -4506,7 +4519,13 @@ run without --continue to start one"
         )
         .map(|record| io.records().write(&record));
     } else if let Some(text) = &text {
-        println!("{text}");
+        // When the provider streamed text deltas live, stdout already holds
+        // the answer; only close the line.
+        if deltas_streamed.load(std::sync::atomic::Ordering::SeqCst) {
+            println!();
+        } else {
+            println!("{text}");
+        }
     }
     // Where the record went, on stderr so stdout stays the answer. A run that
     // was recorded names the session — the id is otherwise only discoverable
@@ -4924,6 +4943,11 @@ struct SessionShared {
     /// every later turn's model resolution; wins over `[models].default`
     /// and `RAPIDLM_MODEL`, sits under a managed lock. `None` = default.
     model_override: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Coalesced assistant text not yet flushed as a `model.stream_delta`
+    /// ledger event (progressive streaming, §2). The delta sink appends;
+    /// the flush after each turn (and the 120-char threshold inside the
+    /// sink) emits.
+    stream_buffer: std::sync::Arc<std::sync::Mutex<String>>,
     /// Test-only seam: a subagent runner for scripted turns, which have no
     /// configured model to build the real one from.
     #[cfg(test)]
@@ -8218,11 +8242,40 @@ fn run_interactive_turn_inner(
         Ok(model) => model,
         Err(reason) => return kernel::TurnOutcome::Failed { reason },
     };
-    let backing = match session_model.backing(None, &mut warn) {
+    let mut backing = match session_model.backing(None, &mut warn) {
         Ok(backing) => backing,
         Err(reason) => return kernel::TurnOutcome::Failed { reason },
     };
     let (context_limit, output_reserve) = context_budget_for(&backing);
+
+    // Live text deltas: each provider text delta lands as a
+    // `model.stream_delta` ledger event, so the session's subscribers (the
+    // TUI's own 50 ms drain, JSONL, the SDK) see the answer as it arrives.
+    // Coalesced at ~120 chars so a fast stream does not produce one event
+    // per token.
+    {
+        let delta_client = client.clone();
+        let delta_actor = actor.clone();
+        let buffer = std::sync::Arc::clone(&shared.stream_buffer);
+        backing.set_delta_sink(Some(std::sync::Arc::new(move |delta: &str| {
+            let pending = {
+                let mut buf = buffer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                buf.push_str(delta);
+                (buf.len() >= 120).then(|| std::mem::take(&mut *buf))
+            };
+            if let Some(text) = pending {
+                let _ = delta_client.append_turn_progress(
+                    session_id,
+                    &delta_actor,
+                    TraceId::new(),
+                    event_ledger::event::EventKind::ModelStreamDelta,
+                    serde_json::json!({ "delta": text }),
+                );
+            }
+        })));
+    }
 
     // The session's earlier turns, so "now fix the tests" on turn two means
     // what it says: without this every turn ran on its prompt alone, and
@@ -8269,7 +8322,7 @@ fn run_interactive_turn_inner(
         ),
     ));
 
-    execute_interactive_turn(
+    let outcome = execute_interactive_turn(
         client,
         session_id,
         actor,
@@ -8280,7 +8333,27 @@ fn run_interactive_turn_inner(
         backing,
         cancel,
         history_through,
-    )
+    );
+    // Flush coalesced stream text still buffered when the turn ended, so
+    // subscribers always get the full answer even if it was shorter than
+    // the coalescing threshold.
+    {
+        let mut buf = shared
+            .stream_buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !buf.is_empty() {
+            let text = std::mem::take(&mut *buf);
+            let _ = client.append_turn_progress(
+                session_id,
+                actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::ModelStreamDelta,
+                serde_json::json!({ "delta": text }),
+            );
+        }
+    }
+    outcome
 }
 
 /// Execute an already-submitted ACP turn on its own thread: the same
