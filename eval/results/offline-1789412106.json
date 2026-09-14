@@ -1,0 +1,299 @@
+{
+  "failed": 0,
+  "kind": "mechanical validation (scripted gold trajectories; says nothing about model quality)",
+  "mode": "offline",
+  "passed": 40,
+  "per_agent_usage": {
+    "runner": {
+      "tokens_per_verified_success": {
+        "over_passed_tasks": 40,
+        "tokens": 20,
+        "usage_reported_for": 40
+      }
+    }
+  },
+  "results": [
+    {
+      "category": "bugfix",
+      "id": "bugfix-001",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 153
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-002",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 144
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-003",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 154
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-004",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 151
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-005",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 151
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-006",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 151
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-007",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 154
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-008",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 154
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-009",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 152
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-010",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 153
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-011",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 152
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-012",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 152
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-013",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 152
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-014",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 151
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-015",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 150
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-016",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 151
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-017",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 150
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-018",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 151
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-027",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 153
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-028",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 152
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-029",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 143
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-030",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 153
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-031",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 156
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-032",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 154
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-033",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 152
+    },
+    {
+      "category": "tests",
+      "id": "tests-019",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 145
+    },
+    {
+      "category": "tests",
+      "id": "tests-020",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 150
+    },
+    {
+      "category": "tests",
+      "id": "tests-021",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 155
+    },
+    {
+      "category": "tests",
+      "id": "tests-022",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 155
+    },
+    {
+      "category": "tests",
+      "id": "tests-023",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 152
+    },
+    {
+      "category": "tests",
+      "id": "tests-024",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 154
+    },
+    {
+      "category": "tests",
+      "id": "tests-025",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 154
+    },
+    {
+      "category": "tests",
+      "id": "tests-026",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 148
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-034",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 155
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-035",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 159
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-036",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 161
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-037",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 154
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-038",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 159
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-039",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 152
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-040",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 163
+    }
+  ],
+  "skipped": 0,
+  "tasks": 40
+}

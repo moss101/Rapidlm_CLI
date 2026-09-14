@@ -1,0 +1,330 @@
+{
+  "failed": 40,
+  "kind": "mechanical validation (scripted gold trajectories; says nothing about model quality)",
+  "mode": "offline",
+  "passed": 0,
+  "results": [
+    {
+      "category": "bugfix",
+      "id": "bugfix-001",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 67
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-002",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 67
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-003",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 66
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-004",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 74
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-005",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 74
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-006",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 75
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-007",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 67
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-008",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 75
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-009",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 75
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-010",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 69
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-011",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 76
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-012",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 83
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-013",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 69
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-014",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 66
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-015",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 74
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-016",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 73
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-017",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 68
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-018",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 74
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-027",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 75
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-028",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 72
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-029",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 71
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-030",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 67
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-031",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 66
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-032",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 73
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-033",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 74
+    },
+    {
+      "category": "tests",
+      "id": "tests-019",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 72
+    },
+    {
+      "category": "tests",
+      "id": "tests-020",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 72
+    },
+    {
+      "category": "tests",
+      "id": "tests-021",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 74
+    },
+    {
+      "category": "tests",
+      "id": "tests-022",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 78
+    },
+    {
+      "category": "tests",
+      "id": "tests-023",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 74
+    },
+    {
+      "category": "tests",
+      "id": "tests-024",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 67
+    },
+    {
+      "category": "tests",
+      "id": "tests-025",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 65
+    },
+    {
+      "category": "tests",
+      "id": "tests-026",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 69
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-034",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 74
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-035",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 75
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-036",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 67
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-037",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 74
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-038",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 77
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-039",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 77
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-040",
+      "outcome": "failed",
+      "reason": "the project is not trusted; offline evaluation refuses to run with no tools",
+      "tokens": 20,
+      "wall_ms": 77
+    }
+  ],
+  "skipped": 0,
+  "tasks": 40
+}
