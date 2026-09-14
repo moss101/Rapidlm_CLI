@@ -572,6 +572,13 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         handler: SubcommandHandler::Native(exec_subcommand),
     },
     Subcommand {
+        name: "acp",
+        operands: "",
+        summary: "serve RapidLM as an ACP agent over stdio",
+        own_help: true,
+        handler: SubcommandHandler::P9(crate::acp_serve::run_acp),
+    },
+    Subcommand {
         name: "run",
         operands: "<playbook.json> | --resume <run-id> | --status <run-id> | --resolve <run-id> approve|deny|answer <text> | --retry <run-id> <step>",
         summary: "execute (and resume) a playbook workflow",
@@ -8099,6 +8106,112 @@ fn run_interactive_turn_inner(
         cancel,
         history_through,
     )
+}
+
+/// Execute an already-submitted ACP turn on its own thread: the same
+/// assembly the TUI's `spawn_interactive_turn` uses (hooks, MCP, retrieval,
+/// approval sink, ledger sinks), minus the session loop's UI plumbing — the
+/// serve loop watches the ledger for progress and the terminal event.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_acp_turn(
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    turn_id: protocol::TurnId,
+    actor: ActorRef,
+    root: PathBuf,
+    trusted: bool,
+    text: String,
+    kernel_cancel: kernel::CancelToken,
+) {
+    std::thread::spawn(move || {
+        let outcome = catching_panics(std::panic::AssertUnwindSafe(|| {
+            run_interactive_turn(
+                &client,
+                session_id,
+                &actor,
+                &root,
+                trusted,
+                &text,
+                &kernel_cancel,
+                &crate::exec_tools::JobRegistry::default(),
+                &SessionShared::default(),
+            )
+        }));
+        let _ = client.finish_turn(kernel::FinishTurn::new(
+            session_id,
+            turn_id,
+            actor,
+            TraceId::new(),
+            outcome,
+        ));
+    });
+}
+
+/// The serve-side half of the durable approval flow (shared with the TUI's
+/// `/approvals`): record the decision durably, then submit and spawn the
+/// continuation turn that replays the suspension. Used by `rapid acp` so an
+/// editor's permission decision resumes the exact turn.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn acp_resolve_and_continue(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    token: &str,
+    call_id: &str,
+    approve: bool,
+) -> Result<(), String> {
+    use kernel::KernelClient as _;
+    let tip = block_on_session_tip(client, session_id)?;
+    let decision = if approve {
+        kernel::ApprovalDecision::Approved
+    } else {
+        kernel::ApprovalDecision::Denied
+    };
+    crate::approvals::client_approve(
+        client,
+        kernel::ResolveApproval::new(session_id, tip, decision, actor.clone(), TraceId::new())
+            .with_wait_token(token),
+    )?;
+    let suspended = crate::approvals::recorded_suspension(client, session_id, token)
+        .ok_or_else(|| "the paused turn's resumable state could not be loaded".to_owned())?;
+    let decision = if approve {
+        ContinuationDecision::Execute
+    } else {
+        ContinuationDecision::Deny
+    };
+    let expected_seq = block_on_session_tip(client, session_id)?;
+    let handle = crate::approvals::client_submit_turn(
+        client,
+        kernel::SubmitTurn::new(session_id, expected_seq, actor.clone(), TraceId::new(), ""),
+    )?;
+    if let Some(turn_cancel) = client.turn_cancel_token(session_id) {
+        spawn_continuation_turn(
+            client.clone(),
+            session_id,
+            handle.turn_id(),
+            actor.clone(),
+            root.to_path_buf(),
+            trusted,
+            turn_cancel,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            crate::exec_tools::JobRegistry::default(),
+            SessionShared::default(),
+            token.to_owned(),
+            call_id.to_owned(),
+            decision,
+        );
+    }
+    Ok(())
+}
+
+fn block_on_session_tip(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+) -> Result<u64, String> {
+    use kernel::KernelClient as _;
+    crate::approvals::client_call(client.get_session(session_id)).map(|snapshot| snapshot.seq())
 }
 
 /// The resolution a pending approval's continuation carries: the human

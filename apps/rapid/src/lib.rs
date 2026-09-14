@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod acp_serve;
 pub mod agent_views;
 pub mod approvals;
 pub mod command_help;

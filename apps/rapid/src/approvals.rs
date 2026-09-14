@@ -440,7 +440,7 @@ impl ApprovalSink for LedgerApprovalSink {
 /// appends/reads — always immediately ready on a single poll, exactly the
 /// assumption `interactive.rs`'s own `block_on` documents; `Pending` is
 /// treated as an error so a surprise never silently stalls a tool batch.
-fn client_call<T, E>(future: impl Future<Output = Result<T, E>>) -> Result<T, String>
+pub fn client_call<T, E>(future: impl Future<Output = Result<T, E>>) -> Result<T, String>
 where
     E: std::fmt::Display,
 {
@@ -520,6 +520,22 @@ pub fn pending_token_for_call(
         .into_iter()
         .find(|pending| pending.payload().call_id == call_id)
         .map(|pending| pending.payload().id.clone())
+}
+
+/// Poll one kernel approval resolution to completion (see `client_call`).
+pub fn client_approve(
+    client: &InProcessKernelClient,
+    request: kernel::ResolveApproval,
+) -> Result<(), String> {
+    client_call(client.approve(request))
+}
+
+/// Poll one turn submission to completion (see `client_call`).
+pub fn client_submit_turn(
+    client: &InProcessKernelClient,
+    request: kernel::SubmitTurn,
+) -> Result<kernel::TurnHandle, String> {
+    client_call(client.submit_turn(request))
 }
 
 /// Every unresolved `approval.requested` for a session, oldest first.
