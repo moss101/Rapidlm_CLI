@@ -84,17 +84,35 @@ Legend: `[x]` closed with evidence · `[~]` partial (named limitation) · `[ ]` 
   with a ceiling rather than supervising across pause/resume; run-level progress in
   the TUI (runs are currently CLI-first). Open, scoped.
 
-## 3. Parallel execution (goal §4) — OPEN
+## 3. Parallel execution (goal §4) — CLOSED this cycle
 
-- `[ ]` Write-capable subagents still run in the parent tree with per-path write
-  locks; the workspace crate's GitWorktreeStore/ViewRegistry/MergePreview/transaction
-  machinery (conflict detection, verification hooks, rollback) is built and tested
-  in `crates/workspace` but not wired into `task_spawn` or the `/agents` panel's
-  parsed-but-unsupported `apply/pause/resume` intents. Concurrency (≤32/turn, depth
-  1, narrowed lattice) and attribution (`PatchSummary`, workspace-changes events)
-  exist. The design is ready (isolate child → attributable view → `/agents
-  integrate` via `commit_transaction` with re-run checks → `abandon` via the store's
-  non-destructive cleanup) but is not implemented.
+- `[x]` **Worktree isolation** — every write-capable `task_spawn` child runs in its
+  own git worktree view (`apps/rapid/src/agent_views.rs` over `crates/workspace`'s
+  GitWorktreeStore/ViewRegistry: `refs/rapidlm/views/{id}`, detached checkout at the
+  parent HEAD, write-owner attribution). The child's tools and context are rooted at
+  the worktree; the parent's tree, branch, and dirty uncommitted files are untouched
+  and never see the child's writes until integration. A view that cannot be created
+  (non-git project, limit) refuses the delegation fail-closed — per-file write locks
+  remain as scheduling inside a child, not as a substitute for isolation. The view id
+  reaches the `/agents` panel (`agent.state_changed` with `workspace_view_id`) and
+  the child's report carries its diff-stat.
+  Evidence: 6 lifecycle tests on real repositories (`agent_views::tests`): clean
+  integrate, check-command re-run (pass and fail), conflict refusal without touching
+  the parent, nothing-to-apply release, fail-closed outside git, user's dirty work
+  surviving integration.
+- `[x]` **Reviewable integration** — interactive sessions hold a successful child's
+  changes in its worktree for review (`/diff --agent`, `/agents show`), then
+  `/agents integrate <id> [check-command...]` applies the patch with a
+  conflict-decided-first three-way-safe apply (file-level overlap against the base
+  is decided before anything is written; a conflict leaves the parent byte-identical
+  and the worktree kept), optionally re-runs a check command in the parent and
+  reports its output, and releases the view. Headless runs auto-integrate (no
+  reviewer exists) and report conflicts honestly instead of force-applying.
+  `/agents abandon <id>` removes the worktree via the store's never-force-delete
+  removal — the parent was never touched, so there is nothing to undo.
+- `[~]` Line-level three-way merges within one conflicted file are deliberately
+  refused (file-granularity conflicts); a human merges those by hand from the kept
+  worktree. Subagent depth stays capped at 1 and concurrency at 32/turn.
 
 ## 4. Integrations (goal §5) — OPEN (machinery exists, entry points do not)
 

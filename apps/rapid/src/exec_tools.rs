@@ -326,6 +326,13 @@ pub(crate) trait AgentEvents: Send + Sync {
     /// refused by the session projection on every replay, so the caller
     /// must not send one.
     fn spawned(&self, agent: protocol::AgentId, agent_type: &str, task: &str) -> bool;
+    /// An isolated worktree view was created for this write-capable child:
+    /// its id travels to the `/agents` panel's `workspace_view_id` column.
+    /// `false` is a dropped record, not a failure of the isolation.
+    fn isolated_view(&self, agent: protocol::AgentId, view_id: &str) -> bool {
+        let _ = (agent, view_id);
+        false
+    }
     /// The child has ended; `detail` is the failure text for a failure.
     fn finished(&self, agent: protocol::AgentId, end: SubagentEnd, detail: Option<&str>);
 }
@@ -1208,6 +1215,7 @@ pub trait SubagentRunner: Send + Sync {
     /// subagent.
     fn run(
         &self,
+        agent: protocol::AgentId,
         prompt: &str,
         agent_type: &str,
         write_scope: Option<&str>,
@@ -1312,6 +1320,14 @@ pub struct WorkspaceTools {
     subagent_registry: SubagentRegistry,
     /// See [`AgentEvents`]. `None` outside a kernel session.
     agent_events: Option<Arc<dyn AgentEvents>>,
+    /// The session's worktree-isolation manager (`agent_views.rs`): a
+    /// write-capable `task_spawn` child gets its own git worktree view and
+    /// runs rooted there. `None` refuses write delegation fail-closed.
+    agent_views: Option<Arc<crate::agent_views::AgentViewManager>>,
+    /// Whether a successful isolated child's patch applies to the parent
+    /// automatically (headless: no reviewer) or is held for deliberate
+    /// `/agents integrate` (interactive).
+    subagent_auto_integrate: bool,
     /// See [`WorkspaceChanges`]. `None` outside a kernel session.
     changes: Option<Arc<dyn WorkspaceChanges>>,
     fetch_allowlist: Vec<String>,
@@ -1401,6 +1417,8 @@ impl WorkspaceTools {
             subagents: None,
             subagent_registry: SubagentRegistry::default(),
             agent_events: None,
+            agent_views: None,
+            subagent_auto_integrate: false,
             changes: None,
             fetch_allowlist: Vec::new(),
             hooks: crate::hooks::HooksConfig::default(),
@@ -1772,6 +1790,31 @@ impl WorkspaceTools {
     /// Report this surface's subagents to `events`. See [`AgentEvents`].
     pub(crate) fn set_agent_events(&mut self, events: Arc<dyn AgentEvents>) {
         self.agent_events = Some(events);
+    }
+
+    /// Attach the worktree-isolation manager a spawned write-capable child
+    /// runs under. See [`crate::agent_views::AgentViewManager`].
+    pub fn set_agent_views(&mut self, views: Arc<crate::agent_views::AgentViewManager>) {
+        self.agent_views = Some(views);
+    }
+
+    pub(crate) fn agent_views_handle(&self) -> Option<Arc<crate::agent_views::AgentViewManager>> {
+        self.agent_views.clone()
+    }
+
+    /// Set whether a successful isolated child's patch applies to the
+    /// parent automatically (headless exec: no reviewer is present) or is
+    /// held in the worktree for deliberate integration (the TUI).
+    pub fn set_subagent_auto_integrate(&mut self, auto: bool) {
+        self.subagent_auto_integrate = auto;
+    }
+
+    pub(crate) fn subagent_auto_integrate(&self) -> bool {
+        self.subagent_auto_integrate
+    }
+
+    pub(crate) fn agent_events_handle(&self) -> Option<Arc<dyn AgentEvents>> {
+        self.agent_events.clone()
     }
 
     /// Run this turn's subagents in the session's registry, so the loop can
@@ -3582,6 +3625,7 @@ read with job_output, in this turn or a later one — the job is stopped when th
         );
         let bridge = ParentCancelBridge::start(cancel, child_cancel.clone());
         let outcome = runner.run(
+            agent_id,
             &args.prompt,
             &args.agent_type,
             args.write_scope.as_deref(),
@@ -5826,6 +5870,42 @@ impl ExecTools {
         }
     }
 
+    /// Attach the worktree-isolation manager (no-op on the no-op surface).
+    pub fn set_agent_views(&mut self, views: Arc<crate::agent_views::AgentViewManager>) {
+        if let Self::Workspace(tools) = self {
+            tools.set_agent_views(views);
+        }
+    }
+
+    pub(crate) fn agent_views_handle(&self) -> Option<Arc<crate::agent_views::AgentViewManager>> {
+        match self {
+            Self::Workspace(tools) => tools.agent_views_handle(),
+            Self::Noop(_) => None,
+        }
+    }
+
+    pub(crate) fn agent_events_handle(&self) -> Option<Arc<dyn AgentEvents>> {
+        match self {
+            Self::Workspace(tools) => tools.agent_events_handle(),
+            Self::Noop(_) => None,
+        }
+    }
+
+    pub(crate) fn subagent_auto_integrate(&self) -> bool {
+        match self {
+            Self::Workspace(tools) => tools.subagent_auto_integrate(),
+            Self::Noop(_) => false,
+        }
+    }
+
+    /// Set headless auto-integration for isolated children (no-op on the
+    /// no-op surface).
+    pub fn set_subagent_auto_integrate_mode(&mut self, auto: bool) {
+        if let Self::Workspace(tools) = self {
+            tools.set_subagent_auto_integrate(auto);
+        }
+    }
+
     /// Attach the durable approval sink (no-op on the no-op surface — an
     /// untrusted project refuses every call long before any approval).
     pub fn set_approval_source(&mut self, sink: Arc<dyn crate::approvals::ApprovalSink>) {
@@ -6829,6 +6909,7 @@ mod tests {
         impl crate::exec_tools::SubagentRunner for FakeRunner {
             fn run(
                 &self,
+                _agent: protocol::AgentId,
                 _prompt: &str,
                 _agent_type: &str,
                 _write_scope: Option<&str>,
@@ -11488,6 +11569,7 @@ mod tests {
         impl crate::exec_tools::SubagentRunner for FakeRunner {
             fn run(
                 &self,
+                _agent: protocol::AgentId,
                 prompt: &str,
                 agent_type: &str,
                 _write_scope: Option<&str>,
@@ -11641,6 +11723,7 @@ mod tests {
         impl crate::exec_tools::SubagentRunner for ScopeCapturingRunner {
             fn run(
                 &self,
+                _agent: protocol::AgentId,
                 _prompt: &str,
                 _agent_type: &str,
                 write_scope: Option<&str>,
@@ -11713,6 +11796,7 @@ mod tests {
         impl crate::exec_tools::SubagentRunner for CountingRunner {
             fn run(
                 &self,
+                _agent: protocol::AgentId,
                 _prompt: &str,
                 _agent_type: &str,
                 _write_scope: Option<&str>,
@@ -11785,6 +11869,7 @@ mod tests {
         impl crate::exec_tools::SubagentRunner for RunsUntilCancelled {
             fn run(
                 &self,
+                _agent: protocol::AgentId,
                 _prompt: &str,
                 _agent_type: &str,
                 _write_scope: Option<&str>,
@@ -11876,6 +11961,7 @@ mod tests {
         impl crate::exec_tools::SubagentRunner for ErrsWhenCancelled {
             fn run(
                 &self,
+                _agent: protocol::AgentId,
                 _prompt: &str,
                 _agent_type: &str,
                 _write_scope: Option<&str>,
@@ -11979,6 +12065,7 @@ mod tests {
         impl crate::exec_tools::SubagentRunner for Panics {
             fn run(
                 &self,
+                _agent: protocol::AgentId,
                 _prompt: &str,
                 _agent_type: &str,
                 _write_scope: Option<&str>,
@@ -12023,6 +12110,7 @@ mod tests {
         impl crate::exec_tools::SubagentRunner for Succeeds {
             fn run(
                 &self,
+                _agent: protocol::AgentId,
                 _prompt: &str,
                 _agent_type: &str,
                 _write_scope: Option<&str>,
@@ -12136,6 +12224,7 @@ mod tests {
         impl crate::exec_tools::SubagentRunner for CostRunner {
             fn run(
                 &self,
+                _agent: protocol::AgentId,
                 _prompt: &str,
                 _agent_type: &str,
                 _write_scope: Option<&str>,
@@ -12199,6 +12288,7 @@ mod tests {
         impl crate::exec_tools::SubagentRunner for RichRunner {
             fn run(
                 &self,
+                _agent: protocol::AgentId,
                 _prompt: &str,
                 _agent_type: &str,
                 _write_scope: Option<&str>,

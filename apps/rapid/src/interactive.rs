@@ -2621,6 +2621,13 @@ fn configure_trusted_model_tools(
         let job_budget = tools
             .job_budget_handle()
             .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        // Isolation: the session's manager when one is attached (the TUI —
+        // `/agents integrate|abandon` resolves the same instance), else a
+        // fresh one for this run (headless: a successful child's patch then
+        // applies automatically, since no reviewer exists).
+        let agent_views = tools
+            .agent_views_handle()
+            .unwrap_or_else(|| std::sync::Arc::new(crate::agent_views::AgentViewManager::new()));
         tools.set_subagent_runner(std::sync::Arc::new(LiveSubagentRunner {
             active: active.clone(),
             root: root.to_path_buf(),
@@ -2635,6 +2642,9 @@ fn configure_trusted_model_tools(
             trace_calls,
             turn_ceilings,
             redaction: tools.redaction_handle(),
+            agent_views: Some(agent_views),
+            agent_events: tools.agent_events_handle(),
+            auto_integrate: tools.subagent_auto_integrate(),
         }));
     }
 }
@@ -2811,11 +2821,24 @@ struct LiveSubagentRunner {
     /// the parent's instead of leaking them unscrubbed by default. See
     /// `ExecTools::share_redaction`'s own doc comment.
     redaction: Option<security::RedactionSnapshot>,
+    /// The session's worktree-isolation manager (`agent_views.rs`). A
+    /// write-capable child gets its own git worktree view and runs with its
+    /// tools rooted there; `None` refuses write delegation fail-closed.
+    agent_views: Option<std::sync::Arc<crate::agent_views::AgentViewManager>>,
+    /// The agent-events sink, so the runner can record the isolated view it
+    /// created for a child (the `/agents` panel's view column) and the
+    /// integration outcome after the child ends.
+    agent_events: Option<std::sync::Arc<dyn crate::exec_tools::AgentEvents>>,
+    /// Whether a successful child's patch is applied to the parent
+    /// automatically (headless: there is no reviewer) or held in the
+    /// worktree for deliberate `/agents integrate` (interactive).
+    auto_integrate: bool,
 }
 
 impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
     fn run(
         &self,
+        agent: protocol::AgentId,
         prompt: &str,
         agent_type: &str,
         write_scope: Option<&str>,
@@ -2825,6 +2848,36 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         let store = auth::InMemoryCredentialStore::new();
         let model = crate::model::ConfiguredModel::build(&self.active, &store)
             .map_err(|err| err.to_string())?;
+        // Workspace isolation (delivery goal §4): a write-capable child runs
+        // in its own git worktree view, never in the parent's tree. A view
+        // that cannot be created refuses the delegation fail-closed —
+        // per-file write locks are scheduling, not isolation.
+        let write_capable = agent_type != "explore" && agent_type != "plan";
+        let mut held_view: Option<crate::agent_views::ChildView> = None;
+        let child_root: PathBuf = if write_capable {
+            let Some(views) = self.agent_views.as_ref() else {
+                return Err(
+                    "write-capable delegation requires an isolated worktree view and no isolation manager is configured on this surface; delegate read-only work (explore/plan) or fix the surface's configuration"
+                        .to_owned(),
+                );
+            };
+            match views.create_for(&self.root, agent) {
+                Ok(view) => {
+                    if let Some(events) = self.agent_events.as_ref() {
+                        events.isolated_view(agent, &view.view_id.to_string());
+                    }
+                    held_view = Some(view.clone());
+                    view.worktree.clone()
+                }
+                Err(reason) => {
+                    return Err(format!(
+                        "write-capable delegation requires an isolated worktree view, which could not be created: {reason}; delegate read-only work (explore/plan), narrow the task, or fix the reason"
+                    ));
+                }
+            }
+        } else {
+            self.root.clone()
+        };
         // A write-capable child never inherits a blanket `BypassPermissions`
         // ceiling: it was the model's own choice to delegate, not the
         // human's direct action, so it must not silently wield authority the
@@ -2835,10 +2888,13 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         if let Some(scope) = write_scope {
             child_permissions = child_permissions.with_write_scope(scope);
         }
-        let mut tools = if agent_type == "explore" || agent_type == "plan" {
+        // The isolated child's tools are rooted at its worktree: every write
+        // lands in the view, and the child's context (AGENTS.md, retrieval)
+        // is built from the same base content the worktree checked out.
+        let mut tools = if !write_capable {
             ExecTools::read_only_with_permissions(&self.root, child_permissions)
         } else {
-            ExecTools::workspace_with_permissions(&self.root, child_permissions)
+            ExecTools::workspace_with_permissions(&child_root, child_permissions)
         }
         .map_err(|err| err.to_string())?;
         // Bounded recursive delegation (Modbit AGT-010): a subagent must
@@ -2896,8 +2952,8 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // context budget already disagrees with.
         let caps = model.capabilities();
         let preserved = build_live_context(
-            Some(&self.root),
-            Some(&self.root),
+            Some(&child_root),
+            Some(&child_root),
             prompt.to_owned(),
             true,
             caps.context_limit(),
@@ -2941,6 +2997,15 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             return Ok(subagent_context_required_report(&outcome, question));
         }
         if !is_effective_success(&outcome) {
+            // A failed child's worktree is discarded: the parent never saw
+            // any of its writes, and "abandon without damaging the parent"
+            // is exactly the cleanup the store's non-destructive removal
+            // gives. A report names the discard so nothing is silent.
+            if held_view.is_some()
+                && let Some(views) = self.agent_views.as_ref()
+            {
+                let _ = views.cleanup(&self.root, agent);
+            }
             return Err(format!(
                 "subagent turn {}",
                 outcome.result.status().as_str()
@@ -2952,6 +3017,50 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
                 " (the turn performed {} tool call(s) before the final response came back empty; verify workspace state)",
                 outcome.tool_calls
             ));
+        }
+        // Isolation epilogue: an isolated child's changes live in its
+        // worktree, so the report says where they are and what happens
+        // next — applied automatically (headless), held for review
+        // (interactive), or discarded when the child failed.
+        let mut diff_note = String::new();
+        if let Some(views) = self.agent_views.as_ref() {
+            if let Some(view) = &held_view {
+                diff_note = views.diff_stat(agent).unwrap_or_default();
+            }
+            let held = held_view.is_some();
+            if held && self.auto_integrate {
+                match views.integrate(&self.root, agent, None) {
+                    Ok((outcome, _)) if outcome.applied() => {
+                        summary.push_str(
+                            " Changes were applied to the parent workspace (three-way merge).",
+                        );
+                    }
+                    Ok((crate::agent_views::IntegrationOutcome::Conflict { files }, _)) => {
+                        summary.push_str(&format!(
+                            " CONFLICT: the parent workspace changed the same file(s) ({}); \
+the child's changes are held in its isolated worktree at {} and were NOT applied.",
+                            files.join(", "),
+                            held_view
+                                .as_ref()
+                                .map(|view| view.worktree.display().to_string())
+                                .unwrap_or_default(),
+                        ));
+                    }
+                    Ok(_) => {
+                        summary.push_str(" The child changed no files.");
+                    }
+                    Err(reason) => {
+                        summary.push_str(&format!(
+                            " The child's changes are held in its isolated worktree ({reason})."
+                        ));
+                    }
+                }
+            } else if held {
+                summary.push_str(
+                    " Changes are held in the child's isolated worktree for review: \
+/agents integrate <id> [check-command] applies them, /agents abandon <id> discards them.",
+                );
+            }
         }
         let claims = outcome
             .result
@@ -2972,14 +3081,24 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             .map(|blocker| format!("[{}] {}", blocker.kind().as_str(), blocker.summary()))
             .collect();
         let open_questions = outcome.result.open_questions().to_vec();
-        let patch_summary = outcome.result.patch_summary().map(|patch| {
-            format!(
-                "{} file(s) changed, +{} -{}",
-                patch.files_changed(),
-                patch.additions(),
-                patch.deletions()
-            )
-        });
+        let patch_summary = outcome
+            .result
+            .patch_summary()
+            .map(|patch| {
+                format!(
+                    "{} file(s) changed, +{} -{}",
+                    patch.files_changed(),
+                    patch.additions(),
+                    patch.deletions()
+                )
+            })
+            .or_else(|| {
+                if diff_note.is_empty() {
+                    None
+                } else {
+                    Some(diff_note.trim().to_owned())
+                }
+            });
         let artifacts = outcome
             .result
             .artifacts()
@@ -3788,6 +3907,10 @@ pub(crate) fn exec_turn(
         }
         _ => ExecTools::noop(),
     };
+    // Headless has no reviewer: a successful isolated child's patch applies
+    // to the parent automatically (conflicts hold in the worktree and are
+    // reported, never force-applied). See `agent_views.rs`.
+    tools.set_subagent_auto_integrate_mode(true);
     tools.set_trace_calls(true);
     // Managed-policy disk/network ceilings (Modbit `CAP-001`/`WRK-017`):
     // narrow-only, so a missing or default policy is simply a no-op here.
@@ -4740,6 +4863,11 @@ struct SessionShared {
     mcp: crate::exec_tools::McpRegistry,
     /// The session's running subagents — what `/agents cancel` acts on.
     agents: crate::exec_tools::SubagentRegistry,
+    /// Worktree isolation for write-capable subagents
+    /// (`agent_views.rs`): the same instance the turn threads create
+    /// views under and `/agents integrate|abandon` resolves, so a child's
+    /// held changes are reviewable no matter which thread spawned it.
+    agent_views: std::sync::Arc<crate::agent_views::AgentViewManager>,
     /// Test-only seam: a subagent runner for scripted turns, which have no
     /// configured model to build the real one from.
     #[cfg(test)]
@@ -5063,6 +5191,126 @@ It will run after the current turn; /queue cancels or edits it.",
         }
     }
 
+    /// `/agents integrate <id> [check-command...]` and
+    /// `/agents abandon <id>`: the human side of worktree isolation.
+    /// Integration applies the child's held patch with a three-way merge (a
+    /// dry run decides first: a conflict leaves the parent untouched and the
+    /// worktree in place), optionally re-runs a check command in the parent,
+    /// and releases the view. Abandon removes the view without applying
+    /// anything — the parent was never touched, so there is nothing to undo.
+    fn run_agent_view_command(&mut self, verb: &str, rest: &str) -> Result<(), InteractiveError> {
+        let args = rest.trim();
+        // Resolve against the agents that actually hold isolated views:
+        // full id or a unique prefix/suffix (the same short-id rule the
+        // panels display by).
+        let selector = args.split_whitespace().next().unwrap_or("");
+        let held = self.shared.agent_views.held_agents();
+        let matches: Vec<protocol::AgentId> = held
+            .iter()
+            .filter(|id| id.to_string().contains(selector))
+            .cloned()
+            .collect();
+        let agent = match matches.len() {
+            1 => matches[0],
+            0 => {
+                self.append_command_error(format!(
+                    "/agents {verb}: no isolated view matches '{selector}' \
+(/agents show lists ids; only write-capable children hold views)"
+                ));
+                return Ok(());
+            }
+            _ => {
+                self.append_command_error(format!(
+                    "/agents {verb}: '{selector}' matches {} agents; be more specific",
+                    matches.len()
+                ));
+                return Ok(());
+            }
+        };
+        let check_command = args
+            .split_once(' ')
+            .map(|(_, command)| command.trim().to_owned())
+            .filter(|command| !command.is_empty());
+        let views = std::sync::Arc::clone(&self.shared.agent_views);
+        let root = self.root.to_path_buf();
+        let result = match verb {
+            "integrate" => {
+                let outcome = views.integrate(&root, agent, check_command.as_deref());
+                match outcome {
+                    Ok((
+                        crate::agent_views::IntegrationOutcome::IntegratedVerified {
+                            files,
+                            check_output,
+                        },
+                        _,
+                    )) => {
+                        self.append_command_output(format!(
+                            "integrated agent {agent}: {} file(s) applied; check passed:\n{}",
+                            files.len(),
+                            check_output
+                        ));
+                        Ok(())
+                    }
+                    Ok((
+                        crate::agent_views::IntegrationOutcome::CheckFailed {
+                            files,
+                            check_output,
+                        },
+                        _,
+                    )) => {
+                        self.append_command_output(format!(
+                            "integrated agent {agent}: {} file(s) applied, but the check FAILED:\n{}\n\nThe files are applied; fix forward or revert by hand.",
+                            files.len(),
+                            check_output
+                        ));
+                        Ok(())
+                    }
+                    Ok((crate::agent_views::IntegrationOutcome::Integrated { files }, _)) => {
+                        self.append_command_output(format!(
+                            "integrated agent {agent}: {} file(s) applied to the parent workspace.\n\
+No check command was given; re-run affected checks with \
+/agents diff-verify or by hand.",
+                            files.len()
+                        ));
+                        Ok(())
+                    }
+                    Ok((crate::agent_views::IntegrationOutcome::Conflict { files }, _)) => {
+                        self.append_command_error(format!(
+                            "agent {agent}: CONFLICT — the parent workspace changed the same \
+file(s) since the child's base: {}. Nothing was applied and the worktree is \
+kept at {}; resolve by hand (e.g. git -C <worktree> diff) then integrate again, \
+or /agents abandon {agent}.",
+                            files.join(", "),
+                            views
+                                .get(agent)
+                                .map(|v| v.worktree.display().to_string())
+                                .unwrap_or_default(),
+                        ));
+                        Ok(())
+                    }
+                    Ok((crate::agent_views::IntegrationOutcome::NothingToApply, _)) => {
+                        self.append_command_output(format!(
+                            "agent {agent} changed no files; view released"
+                        ));
+                        Ok(())
+                    }
+                    Err(reason) => Err(reason),
+                }
+            }
+            "abandon" => views.abandon(&root, agent).map(|_| {
+                self.append_command_output(format!(
+                    "abandoned agent {agent}: its isolated worktree was removed; the parent \
+workspace was never touched by it"
+                ))
+            }),
+            _ => Err(format!("unknown verb {verb}")),
+        };
+        if let Err(reason) = result {
+            self.append_command_error(format!("/agents {verb}: {reason}"));
+        }
+        Ok(())
+    }
+
     /// `/queue`: the human side of the durable message queue — list, cancel,
     /// edit, or run a queued message now.
     fn run_queue_command(&mut self, rest: &str) -> Result<(), InteractiveError> {
@@ -5169,6 +5417,16 @@ It will run after the current turn; /queue cancels or edits it.",
         if let Some(rest) = command.strip_prefix("/queue") {
             self.run_queue_command(rest)?;
             return Ok(LoopControl::Continue);
+        }
+        // `/agents integrate|abandon` resolve an isolated child's held
+        // changes — session-side actions on the view manager, not a panel
+        // route. (The tui parser still owns the rest of `/agents`.)
+        for verb in ["integrate", "abandon"] {
+            let prefix = format!("/agents {verb}");
+            if let Some(rest) = command.strip_prefix(&prefix) {
+                self.run_agent_view_command(verb, rest.trim())?;
+                return Ok(LoopControl::Continue);
+            }
         }
         // `/approvals` is handled locally: it drives the pending-approval
         // flow (list / approve / remember / deny / answer), which is session
@@ -7219,6 +7477,26 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
             .is_ok()
     }
 
+    fn isolated_view(&self, agent: protocol::AgentId, view_id: &str) -> bool {
+        // `agent.state_changed` carrying `workspace_view_id` is exactly what
+        // the `/agents` panel's view column reads (the projection accepts it
+        // on spawned/started/state_changed alike).
+        self.client
+            .append_turn_progress(
+                self.session_id,
+                &self.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::AgentStateChanged,
+                serde_json::json!({
+                    "agent_id": agent.to_string(),
+                    "state": "running",
+                    "current_operation": "working in an isolated worktree view",
+                    "workspace_view_id": view_id,
+                }),
+            )
+            .is_ok()
+    }
+
     fn finished(
         &self,
         agent: protocol::AgentId,
@@ -7737,6 +8015,12 @@ fn run_interactive_turn_inner(
     // starts.
     tools.share_mcp(&shared.mcp);
     tools.share_subagents(&shared.agents);
+    // Worktree isolation is a session concern: `/agents integrate|abandon`
+    // must resolve the same views the turn threads create.
+    tools.set_agent_views(std::sync::Arc::clone(&shared.agent_views));
+    // A session with a reviewer holds a successful child's changes in its
+    // worktree until `/agents integrate` (headless exec sets auto instead).
+    tools.set_subagent_auto_integrate_mode(false);
     // Session-start/end hooks are per run; the interactive session fires
     // its own at start and exit, not per turn.
     if trusted {
@@ -8007,6 +8291,12 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
     let _policy_version = apply_managed_ceilings(&mut tools);
     tools.share_mcp(&shared.mcp);
     tools.share_subagents(&shared.agents);
+    // Worktree isolation is a session concern: `/agents integrate|abandon`
+    // must resolve the same views the turn threads create.
+    tools.set_agent_views(std::sync::Arc::clone(&shared.agent_views));
+    // A session with a reviewer holds a successful child's changes in its
+    // worktree until `/agents integrate` (headless exec sets auto instead).
+    tools.set_subagent_auto_integrate_mode(false);
     if trusted {
         let _ = configure_trusted_integrations(&mut tools, root, &mut warn);
     }
@@ -8576,6 +8866,12 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     let _policy_version = apply_managed_ceilings(&mut tools);
     tools.share_mcp(&shared.mcp);
     tools.share_subagents(&shared.agents);
+    // Worktree isolation is a session concern: `/agents integrate|abandon`
+    // must resolve the same views the turn threads create.
+    tools.set_agent_views(std::sync::Arc::clone(&shared.agent_views));
+    // A session with a reviewer holds a successful child's changes in its
+    // worktree until `/agents integrate` (headless exec sets auto instead).
+    tools.set_subagent_auto_integrate_mode(false);
     if trusted {
         let _ = configure_trusted_integrations(&mut tools, root, &mut warn);
     }
@@ -13801,6 +14097,7 @@ question the panel answers"
     impl crate::exec_tools::SubagentRunner for RunsUntilCancelled {
         fn run(
             &self,
+            _agent: protocol::AgentId,
             _prompt: &str,
             _agent_type: &str,
             _write_scope: Option<&str>,
