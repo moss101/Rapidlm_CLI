@@ -584,6 +584,13 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         handler: SubcommandHandler::Native(exec_subcommand),
     },
     Subcommand {
+        name: "update",
+        operands: "[--url <manifest-url>] [--force] [--check]",
+        summary: "self-update with verification and rollback",
+        own_help: true,
+        handler: SubcommandHandler::P9(crate::update_serve::run_update),
+    },
+    Subcommand {
         name: "eval",
         operands: "--offline | --live",
         summary: "reproducible coding benchmark",
@@ -13276,7 +13283,9 @@ alignment below it: {line:?}",
         let _lock = lock_terminal();
         for command in [
             "/sandbox doctor",
-            "/model list",
+            // `/model list` left this list too: it now renders the real
+            // configured-model report (`model_select_switches_lists_and_
+            // clears_through_the_session` covers it).
             "/plugins list",
             "/policy explain",
             "/knowledge list",
