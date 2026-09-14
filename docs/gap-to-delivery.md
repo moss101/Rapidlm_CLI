@@ -143,12 +143,26 @@ Legend: `[x]` closed with evidence · `[~]` partial (named limitation) · `[ ]` 
 - `[~]` **Model setup**: capabilities still hard-coded (vision/caching/reasoning);
   `/model list|select` parsed but unrouted; `rapid doctor` is strong.
 
-## 5. Execution protection (goal §6) — OPEN
+## 5. Execution protection (goal §6) — reporting + fail-closed CLOSED this cycle
 
-- `[ ]` Seatbelt (macOS) enforces for real (tests genuinely deny network);
-  host-restricted enforces resources only and its fs/network non-enforcement is not
-  surfaced in tool output; no required-protection fail-closed knob; `rapid sandbox`
-  does not exist; doctor reports tiers truthfully but only as a warning.
+- `[x]` **Truthful level reporting** — `shell_exec {"sandbox": true}` names the
+  tier in its model-visible output: `[sandbox: seatbelt — filesystem writes and
+  network are confined]` on macOS with sandbox-exec; `[sandbox: host-restricted —
+  resource limits only; filesystem and network are NOT confined]` elsewhere.
+  `rapid doctor` probes the same backends and reports available tiers; the two
+  surfaces now agree.
+- `[x]` **Fail-closed required protection** — `RAPIDLM_SANDBOX_REQUIRED=1`
+  (an ExecTools field resolved at open) refuses sandboxed execution on tiers that
+  cannot confine, with the reason and remedy in the failure detail. Evidence:
+  `sandbox_truth_tests::required_confinement_fails_closed_where_only_resource_
+  limits_exist` (early-returns where Seatbelt exists, runs where it matters);
+  Seatbelt's own suite genuinely denies network and confines writes
+  (`crates/sandbox` seatbelt tests).
+- `[x]` **Accurate platform notes** — getting-started documents both tiers and
+  the Windows posture (job control, hooks Unix-first; PTY and sandbox tiers need
+  Unix tools).
+- `[ ]` `rapid sandbox` as a standalone doctor-style command — doctor covers the
+  same checks today; the dedicated command is polish, not a truthfulness gap.
 
 ## 6. Benchmark (goal §7) — OPEN
 
