@@ -283,8 +283,6 @@ impl fmt::Display for UserConfigError {
     }
 }
 
-
-
 fn join_ids(ids: &[String]) -> String {
     if ids.is_empty() {
         "(none)".to_owned()
@@ -906,8 +904,7 @@ pub fn select_active_model_with_override(
         .map(|key| format!("unknown config key '{key}'"))
         .collect::<Vec<_>>();
     let policy = crate::managed_config::load_policy(env)?;
-    let gated =
-        crate::managed_config::resolve_gated(&effective_env, &config, policy.as_ref())?;
+    let gated = crate::managed_config::resolve_gated(&effective_env, &config, policy.as_ref())?;
     for report in &gated.reports {
         warnings.push(format!("managed gate: {report}"));
     }

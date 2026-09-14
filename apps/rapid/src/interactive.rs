@@ -3368,10 +3368,7 @@ pub(crate) fn resolve_model_plan_with_override(
     let mut primary_config: Option<crate::user_config::ActiveModel> = None;
     let mut compact: Option<crate::user_config::ActiveModel> = None;
     let mut unconfigured = false;
-    match crate::user_config::select_active_model_with_override(
-        process_env,
-        model_override,
-    ) {
+    match crate::user_config::select_active_model_with_override(process_env, model_override) {
         Ok(ModelSelection::Configured { active, warnings }) => {
             for warning in warnings {
                 warn(&format!("warning: {warning}"));
@@ -5299,8 +5296,10 @@ It will run after the current turn; /queue cancels or edits it.",
                 "/model select <id> switches for the rest of the session; /model clear returns to the default"
                     .to_owned(),
             );
-            self.append_command_output(lines.join("
-"));
+            self.append_command_output(lines.join(
+                "
+",
+            ));
             return Ok(());
         }
         let mut parts = args.splitn(2, ' ');
@@ -5313,10 +5312,7 @@ It will run after the current turn; /queue cancels or edits it.",
                     );
                     return Ok(());
                 };
-                match crate::user_config::select_active_model_with_override(
-                    &model_env,
-                    Some(id),
-                ) {
+                match crate::user_config::select_active_model_with_override(&model_env, Some(id)) {
                     Ok(crate::user_config::ModelSelection::Configured { active, .. }) => {
                         *self
                             .shared
@@ -17528,13 +17524,17 @@ api_key = "k"
             message_queue: Vec::new(),
             scripted_backings: None,
         };
-        loop_state.dispatch_slash("/model select second").expect("select");
+        loop_state
+            .dispatch_slash("/model select second")
+            .expect("select");
         assert_eq!(
             loop_state.shared.model_override.lock().unwrap().as_deref(),
             Some("second"),
             "the override is recorded for later turns"
         );
-        loop_state.dispatch_slash("/model select nope").expect("unknown id handled");
+        loop_state
+            .dispatch_slash("/model select nope")
+            .expect("unknown id handled");
         assert_eq!(
             loop_state.shared.model_override.lock().unwrap().as_deref(),
             Some("second"),

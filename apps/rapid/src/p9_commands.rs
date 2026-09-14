@@ -3286,9 +3286,9 @@ pub fn run_release_manifest(args: &[String]) -> Result<i32, P9CommandError> {
     // workspace crate and third-party dependency with its locked version
     // (read from Cargo.lock, so it describes the artifact that was actually
     // built), and the provenance block names the source commit and builder.
-    let sbom = sbom_from_lock("Cargo.lock").unwrap_or_else(|| {
-        serde_json::json!({ "error": "Cargo.lock not readable from this directory" })
-    });
+    let sbom = sbom_from_lock("Cargo.lock").unwrap_or_else(
+        || serde_json::json!({ "error": "Cargo.lock not readable from this directory" }),
+    );
     let provenance = serde_json::json!({
         "commit": std::env::var("RAPIDLM_BUILD_COMMIT").unwrap_or_else(|_| "unrecorded".to_owned()),
         "builder": {
@@ -3344,7 +3344,12 @@ fn sbom_from_lock(lock_path: &str) -> Option<serde_json::Value> {
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("[[package]]") {
-            flush(&mut name, &mut version, &mut is_workspace_member, &mut components);
+            flush(
+                &mut name,
+                &mut version,
+                &mut is_workspace_member,
+                &mut components,
+            );
             in_package = true;
             continue;
         }
@@ -3360,7 +3365,12 @@ fn sbom_from_lock(lock_path: &str) -> Option<serde_json::Value> {
             is_workspace_member = !trimmed.contains("registry");
         }
     }
-    flush(&mut name, &mut version, &mut is_workspace_member, &mut components);
+    flush(
+        &mut name,
+        &mut version,
+        &mut is_workspace_member,
+        &mut components,
+    );
     Some(serde_json::json!({
         "bomFormat": "CycloneDX",
         "specVersion": "1.4",

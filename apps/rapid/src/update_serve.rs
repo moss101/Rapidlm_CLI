@@ -50,13 +50,13 @@ atomically swapped; any failure leaves the running binary untouched.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpdateManifest {
     pub version: String,
-    pub sha256:  String,
-    pub url:     String,
+    pub sha256: String,
+    pub url: String,
 }
 
 pub fn parse_manifest(json: &str) -> Result<UpdateManifest, String> {
-    let value: serde_json::Value = serde_json::from_str(json)
-        .map_err(|err| format!("manifest is not JSON: {err}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|err| format!("manifest is not JSON: {err}"))?;
     let field = |name: &str| -> Result<String, String> {
         value
             .get(name)
@@ -113,9 +113,7 @@ pub fn fetch(url: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     if let Some(mut stdout) = child.stdout.take() {
         let mut capped = vec![0u8; max_bytes + 1];
-        let read = stdout
-            .read(&mut capped)
-            .map_err(|err| err.to_string())?;
+        let read = stdout.read(&mut capped).map_err(|err| err.to_string())?;
         body = capped[..read.min(max_bytes)].to_vec();
     }
     let status = child.wait().map_err(|err| err.to_string())?;
@@ -186,8 +184,7 @@ pub fn apply_update(
     }
     // Then the artifact must run and claim the manifest's version.
     let staged = bin.with_extension("update-new");
-    std::fs::write(&staged, artifact_bytes)
-        .map_err(|err| format!("staging write: {err}"))?;
+    std::fs::write(&staged, artifact_bytes).map_err(|err| format!("staging write: {err}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -199,16 +196,14 @@ pub fn apply_update(
         let _ = std::fs::remove_file(&staged);
         return Err(format!(
             "staged artifact reports {:?}, manifest claims {:?} — old binary untouched",
-            staged_version,
-            manifest.version
+            staged_version, manifest.version
         ));
     }
     // Atomic swap with rollback: old aside, new in, smoke-run; on failure
     // the old binary returns.
     let backup = bin.with_extension("update-old");
     let _ = std::fs::remove_file(&backup);
-    std::fs::rename(bin, &backup)
-        .map_err(|err| format!("backup rename: {err}"))?;
+    std::fs::rename(bin, &backup).map_err(|err| format!("backup rename: {err}"))?;
     if let Err(err) = std::fs::rename(&staged, bin) {
         let _ = std::fs::rename(&backup, bin);
         return Err(format!("install rename: {err} (old binary restored)"));
@@ -257,19 +252,17 @@ pub fn run_update(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandE
         }
     }
     let Some(url) = url else {
-        eprintln!(
-            "rapid update: no release URL configured; set RAPIDLM_UPDATE_URL or pass --url"
-        );
+        eprintln!("rapid update: no release URL configured; set RAPIDLM_UPDATE_URL or pass --url");
         return Err(crate::p9_commands::P9CommandError::Usage);
     };
     let bin = std::env::current_exe()
         .map_err(|err| crate::p9_commands::P9CommandError::Agent(err.to_string()))?;
-    let manifest_bytes = fetch(&url, 64 * 1024)
-        .map_err(|err| crate::p9_commands::P9CommandError::Agent(err))?;
+    let manifest_bytes =
+        fetch(&url, 64 * 1024).map_err(|err| crate::p9_commands::P9CommandError::Agent(err))?;
     let manifest_text = String::from_utf8(manifest_bytes)
         .map_err(|err| crate::p9_commands::P9CommandError::Agent(err.to_string()))?;
-    let manifest = parse_manifest(&manifest_text)
-        .map_err(crate::p9_commands::P9CommandError::Agent)?;
+    let manifest =
+        parse_manifest(&manifest_text).map_err(crate::p9_commands::P9CommandError::Agent)?;
     let current = running_version(&bin).map_err(crate::p9_commands::P9CommandError::Agent)?;
     if check_only {
         println!(
@@ -386,8 +379,7 @@ mod tests {
             sha256: "0".repeat(64),
             url: "https://releases.example/rapid".to_owned(),
         };
-        let error = apply_update(&bin_copy, &manifest, b"new bytes", true)
-            .expect_err("refused");
+        let error = apply_update(&bin_copy, &manifest, b"new bytes", true).expect_err("refused");
         assert!(error.contains("checksum mismatch"), "{error}");
         assert!(error.contains("untouched"), "{error}");
         assert_eq!(std::fs::read(&bin_copy).unwrap(), b"old");
@@ -439,9 +431,8 @@ mod tests {
         .expect("parses");
         assert_eq!(good.version, "0.2.0");
         assert!(parse_manifest(r#"{"version":"0.2.0"}"#).is_err());
-        assert!(parse_manifest(
-            r#"{"version":"0.2.0","sha256":"short","url":"https://x"}"#
-        )
-        .is_err());
+        assert!(
+            parse_manifest(r#"{"version":"0.2.0","sha256":"short","url":"https://x"}"#).is_err()
+        );
     }
 }
