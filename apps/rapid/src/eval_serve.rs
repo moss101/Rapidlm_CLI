@@ -649,8 +649,19 @@ fn run_live_agent(
         let read = stdout.read(&mut capped).unwrap_or(0);
         text.push_str(&String::from_utf8_lossy(&capped[..read]));
     }
+    if let Some(mut stderr) = child.stderr.take() {
+        let mut capped = vec![0u8; 8 * 1024];
+        let read = stderr.read(&mut capped).unwrap_or(0);
+        let err_text = String::from_utf8_lossy(&capped[..read]);
+        if !err_text.trim().is_empty() {
+            text.push_str("\n[stderr] ");
+            text.push_str(err_text.trim());
+        }
+    }
     if !status.success() {
-        return Err(format!("{name} exited non-zero: {}", text.chars().take(200).collect::<String>()));
+        let mut snippet: String = text.chars().take(300).collect();
+        snippet = snippet.replace('\n', " ");
+        return Err(format!("{name} exited non-zero: {snippet}"));
     }
     if !run_verify(scratch, &task.verify, 120).unwrap_or(false) {
         return Err("verification command failed after the live run".to_owned());

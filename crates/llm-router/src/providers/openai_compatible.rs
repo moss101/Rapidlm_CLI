@@ -700,6 +700,19 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
     }
 }
 
+#[test]
+fn sse_text_delta_parser_emits_deltas_across_chunk_boundaries() {
+    let mut parser = SseTextDeltaParser::new();
+    let mut deltas: Vec<String> = Vec::new();
+    let part1 = "data: {\"choices\":[{\"delta\":{\"content\":\"He\"}}]}\n\ndata: {\"cho";
+    let part2 = "ices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\ndata: [DONE]\n\n";
+    let first = parser.feed(part1, &mut |t| deltas.push(t.to_owned()));
+    assert_eq!(first, 1, "first feed emits the complete block delta");
+    let second = parser.feed(part2, &mut |t| deltas.push(t.to_owned()));
+    assert_eq!(second, 1, "reassembled block delta emitted");
+    assert_eq!(deltas, vec!["He".to_owned(), "llo".to_owned()]);
+}
+
 impl<T: HttpTransport + ?Sized> HttpTransport for Box<T> {
     fn execute(
         &self,
@@ -770,8 +783,6 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
             events,
             cancel,
         )
-
-
     }
     /// [`Self::invoke_sync`] with live text delivery: text deltas are
     /// forwarded to `on_text` as they arrive from the wire (via
@@ -825,7 +836,6 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
             events,
             cancel,
         )
-
     }
 }
 
@@ -1704,6 +1714,8 @@ impl SseTextDeltaParser {
     /// is forwarded to `on_text`. Returns the number of deltas emitted.
     pub fn feed(&mut self, chunk: &str, on_text: &mut dyn FnMut(&str)) -> usize {
         self.buffer.push_str(chunk);
+        eprintln!("[dbg-feed] chunk={chunk:?}");
+        eprintln!("[dbg-feed] buffer={:?}", self.buffer);
         let mut emitted = 0usize;
         loop {
             let Some(end) = self.buffer.find("\n\n") else {
@@ -1728,13 +1740,14 @@ impl SseTextDeltaParser {
             let Ok(value) = serde_json::from_str::<Value>(&data) else {
                 continue;
             };
-            if let Some(text) = value
+            let text = value
                 .get("choices")
                 .and_then(Value::as_array)
                 .and_then(|choices| choices.first())
                 .and_then(|choice| choice.get("delta"))
-                .and_then(Value::as_str)
-            {
+                .and_then(|delta| delta.get("content"))
+                .and_then(Value::as_str);
+            if let Some(text) = text {
                 on_text(text);
                 emitted += 1;
             }
