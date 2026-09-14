@@ -1,0 +1,595 @@
+//! `rapid daemon` — bind the kernel's session/turn services on a Unix socket
+//! for the TypeScript SDK (`sdk/typescript`).
+//!
+//! The kernel's own `IpcServer` speaks underscore method names with an
+//! `auth.challenge` handshake; the SDK speaks dotted names with a `hello` /
+//! `hello_ok` handshake (`rapidlm.sdk.rpc` v1). This module is the bridge:
+//! one long-lived process bound to a workspace, serving the SDK's exact wire
+//! contract over a newline-delimited JSON Unix socket:
+//!
+//! - `sessions.create/get/fork/rewind` → the kernel client's session ops,
+//!   returning the same wire shapes the SDK's generated decoders accept
+//!   (unknown fields are rejected there, so the shapes here are exact);
+//! - `turns.submit` → kernel submit **plus execution** with the production
+//!   assembly (hooks, MCP, retrieval, durable approval sink, worktree-
+//!   isolated subagents) — the SDK sees progress by subscribing to events;
+//! - `turns.interrupt` → the kernel's live-turn cancel;
+//! - `approvals.resolve` → the durable approval machinery: the wait row is
+//!   marked terminal and the paused turn resumes as a continuation (the
+//!   SDK names a turn-scoped `expected_seq`; the daemon resolves the
+//!   session's oldest pending wait, which is that turn's);
+//! - `events.subscribe` → `{kind:"event"}` frames streamed from the session
+//!   cursor, ended by `stream_end` on cancel or terminal.
+//!
+//! Boundaries: the socket lives in the project's `.rapidlm/` directory with
+//! owner-only permissions; a `hello` carrying an auth handle is verified
+//! against the local daemon token (`~/.rapidlm/daemon.token`) when one
+//! exists — a wrong token is rejected before any RPC is served.
+
+use std::io::Write as _;
+use std::os::unix::net::UnixListener;
+use std::path::PathBuf;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
+
+use acp::stdio::{FrameReader, MAX_FRAME_BYTES};
+use kernel::InProcessKernelClient;
+use protocol::{ProjectId, SessionId};
+use std::sync::mpsc::Receiver;
+
+use crate::interactive::{acp_resolve_and_continue, spawn_acp_turn};
+
+pub const DAEMON_USAGE: &str = "\
+usage: rapid daemon [--socket <path>]
+
+Bind the kernel's session/turn services on a Unix socket for the TypeScript
+SDK. The socket defaults to <project>/.rapidlm/daemon.sock and is created
+owner-only; the path is printed on startup. One daemon serves one workspace.
+
+Exit codes: 0 clean shutdown · 2 usage · 1 bind/serve failure.
+";
+
+/// `rapid daemon`.
+pub fn run_daemon(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandError> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{DAEMON_USAGE}");
+        return Ok(0);
+    }
+    let socket = match args.iter().position(|arg| arg == "--socket") {
+        Some(position) => args
+            .get(position + 1)
+            .map(PathBuf::from)
+            .ok_or(crate::p9_commands::P9CommandError::Usage)?,
+        None => crate::interactive::project_ledger_path(
+            &std::env::current_dir()
+                .unwrap_or_default()
+                .join(crate::interactive::PROJECT_MARKER),
+        )
+        .parent()
+        .map(|dir| dir.join("daemon.sock"))
+        .unwrap_or_else(|| PathBuf::from("daemon.sock")),
+    };
+    let Some((root, trusted)) = crate::interactive::workflow_workspace_root() else {
+        eprintln!("rapid daemon: no project workspace resolved");
+        return Err(crate::p9_commands::P9CommandError::Usage);
+    };
+    if !trusted {
+        eprintln!(
+            "warning: the project is not trusted; sessions served here will refuse every \
+tool call. Approve trust with `rapid trust grant`."
+        );
+    }
+    let ledger_path =
+        crate::interactive::project_ledger_path(&root.join(crate::interactive::PROJECT_MARKER));
+    if let Some(parent) = ledger_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::remove_file(&socket);
+    let listener = UnixListener::bind(&socket).map_err(|err| {
+        crate::p9_commands::P9CommandError::Agent(format!("bind {socket:?}: {err}"))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600));
+    }
+    println!("rapid daemon listening on {}", socket.display());
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    let client = InProcessKernelClient::open(&ledger_path)
+        .map_err(|err| crate::p9_commands::P9CommandError::Agent(err.to_string()))?;
+    let actor = event_ledger::event::ActorRef::new(
+        event_ledger::event::ActorKind::Agent,
+        &protocol::EventId::new().to_string(),
+    )
+    .map_err(|err| crate::p9_commands::P9CommandError::Agent(err.to_string()))?;
+    let daemon_token = std::fs::read_to_string(user_home().join("daemon.token"))
+        .map(|token| token.trim().to_owned())
+        .ok();
+
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { break };
+        let serve = Connection {
+            client: client.clone(),
+            actor: actor.clone(),
+            root: root.clone(),
+            trusted,
+            daemon_token: daemon_token.clone(),
+        };
+        std::thread::spawn(move || {
+            let _ = serve.serve(stream);
+        });
+    }
+    let _ = std::fs::remove_file(&socket);
+    Ok(0)
+}
+
+fn user_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// One connected SDK client.
+struct Connection {
+    client: InProcessKernelClient,
+    actor: event_ledger::event::ActorRef,
+    root: PathBuf,
+    trusted: bool,
+    daemon_token: Option<String>,
+}
+
+impl Connection {
+    fn serve(&self, stream: std::os::unix::net::UnixStream) -> Result<(), String> {
+        let _ = stream.set_nonblocking(false);
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(3600)))
+            .ok();
+        let raw_writer = stream
+            .try_clone()
+            .map_err(|err| format!("socket clone: {err}"))?;
+        let writer = Mutex::new(raw_writer);
+        let mut reader =
+            FrameReader::new(stream, MAX_FRAME_BYTES).map_err(|err| err.to_string())?;
+        let cancel = acp::stdio::CancellationToken::new();
+        // Newline-delimited JSON out: one `write_all` per frame so a frame
+        // is never interleaved mid-line by another writer (see `write_frame`).
+
+        // Handshake: exactly one hello, then RPCs.
+        let hello = read_request(&mut reader, &cancel)?;
+        let Some(reply_id) = self.verify_hello(&hello) else {
+            write_frame(
+                &writer,
+                &error_frame(&hello_frame_id(&hello), "unauthorized", "bad daemon token"),
+            )?;
+            return Err("unauthorized hello".to_owned());
+        };
+        write_frame(&writer, &hello_ok(reply_id))?;
+
+        // One event stream at a time; its cancel path is the `cancel` frame.
+        let stream_control: Arc<Mutex<Option<Sender<StreamCommand>>>> = Arc::new(Mutex::new(None));
+        loop {
+            let frame = read_request(&mut reader, &cancel)?;
+            let (kind, id, method, params) = match parse_request(&frame) {
+                Some(parsed) => parsed,
+                None => {
+                    if frame.get("kind").and_then(serde_json::Value::as_str) == Some("cancel") {
+                        let target = frame.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                        if let Some(control) = stream_control
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .as_ref()
+                        {
+                            let _ = control.send(StreamCommand::Stop);
+                        }
+                        let _ = target;
+                        continue;
+                    }
+                    write_frame(
+                        &writer,
+                        &error_frame(&frame["id"], "invalid_request", "expected an RPC request"),
+                    )?;
+                    continue;
+                }
+            };
+            if method == "events.subscribe" {
+                let (tx, rx) = std::sync::mpsc::channel::<StreamCommand>();
+                *stream_control
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+                write_frame(&writer, &response_ok(&id, serde_json::json!({})))?;
+                self.stream_events(&writer, &id, &params, rx)?;
+                continue;
+            }
+            let outcome = self.rpc(&method, &params);
+            let frame = match outcome {
+                Ok(result) => response_ok(&id, result),
+                Err(error) => error_frame(&id, "rpc_failed", &error),
+            };
+            write_frame(&writer, &frame)?;
+        }
+    }
+
+    fn verify_hello(&self, hello: &serde_json::Value) -> Option<serde_json::Value> {
+        if hello.get("schema").and_then(serde_json::Value::as_str) != Some("rapidlm.sdk.rpc") {
+            return None;
+        }
+        if hello
+            .get("schema_version")
+            .and_then(serde_json::Value::as_i64)
+            != Some(1)
+        {
+            return None;
+        }
+        if hello.get("kind").and_then(serde_json::Value::as_str) != Some("hello") {
+            return None;
+        }
+        if let Some(expected) = &self.daemon_token {
+            let presented = hello
+                .get("auth")
+                .and_then(|auth| auth.get("handle"))
+                .and_then(serde_json::Value::as_str);
+            if presented != Some(expected.as_str()) {
+                return None;
+            }
+        }
+        hello.get("id").cloned()
+    }
+
+    fn rpc(&self, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+        use kernel::KernelClient as _;
+        match method {
+            "sessions.create" => {
+                let snapshot = crate::approvals::client_call(self.client.create_session(
+                    kernel::CreateSession::new(
+                        ProjectId::new(),
+                        self.actor.clone(),
+                        trace_id_of(params),
+                    ),
+                ))
+                .map_err(|err| err.to_string())?;
+                snapshot_json(&snapshot)
+            }
+            "sessions.get" => {
+                let session = session_of(params)?;
+                let snapshot = crate::approvals::client_call(self.client.get_session(session))
+                    .map_err(|err| err.to_string())?;
+                snapshot_json(&snapshot)
+            }
+            "sessions.fork" => {
+                let source = uuid_field(params, "source")?;
+                let at_seq = u64_field(params, "at_seq")?;
+                let snapshot = crate::approvals::client_call(self.client.fork_session(
+                    kernel::ForkSession::new(
+                        source,
+                        at_seq,
+                        self.actor.clone(),
+                        trace_id_of(params),
+                    ),
+                ))
+                .map_err(|err| err.to_string())?;
+                snapshot_json(&snapshot)
+            }
+            "sessions.rewind" => {
+                let session = session_of(params)?;
+                let to_seq = u64_field(params, "to_seq")?;
+                let rewound = crate::approvals::client_call(
+                    self.client
+                        .rewind(kernel::RewindSession::new(session, to_seq)),
+                )
+                .map_err(|err| err.to_string())?;
+                snapshot_json(&rewound.snapshot())
+            }
+            "turns.submit" => {
+                let session = session_of(params)?;
+                let expected_seq = u64_field(params, "expected_seq")?;
+                let text = params
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let handle = crate::approvals::client_call(self.client.submit_turn(
+                    kernel::SubmitTurn::new(
+                        session,
+                        expected_seq,
+                        self.actor.clone(),
+                        trace_id_of(params),
+                        text.clone(),
+                    ),
+                ))
+                .map_err(|err| err.to_string())?;
+                // Execute the turn with the production assembly; progress
+                // streams to any events.subscribe consumer.
+                let kernel_cancel = self.client.turn_cancel_token(session).unwrap_or_else(|| {
+                    kernel::CancellationTree::root(kernel::CancelOwner::Session(session))
+                        .expect("session cancel root")
+                });
+                spawn_acp_turn(
+                    self.client.clone(),
+                    session,
+                    handle.turn_id(),
+                    self.actor.clone(),
+                    self.root.clone(),
+                    self.trusted,
+                    text,
+                    kernel_cancel,
+                );
+                turn_handle_json(&handle)
+            }
+            "turns.interrupt" => {
+                let session = session_of(params)?;
+                crate::approvals::client_call(self.client.interrupt(kernel::Interrupt::new(
+                    session,
+                    kernel::InterruptReason::ClientRequested,
+                    self.actor.clone(),
+                    trace_id_of(params),
+                )))
+                .map_err(|err| err.to_string())?;
+                Ok(serde_json::json!({}))
+            }
+            "approvals.resolve" => {
+                let session = session_of(params)?;
+                let expected_seq = u64_field(params, "expected_seq")?;
+                let decision = match params.get("decision").and_then(serde_json::Value::as_str) {
+                    Some("approved") => kernel::ApprovalDecision::Approved,
+                    Some("denied") => kernel::ApprovalDecision::Denied,
+                    other => return Err(format!("unknown decision {other:?}")),
+                };
+                // The SDK names the turn, not the wait; resolve the session's
+                // oldest pending wait — single-turn-per-session makes that
+                // the one being answered — and resume it as a continuation.
+                let pendings =
+                    crate::approvals::client_call(self.client.pending_approvals(session))
+                        .map_err(|err| err.to_string())?;
+                let oldest = pendings.first().map(|pending| pending.payload().id.clone());
+                let call_id = pendings
+                    .first()
+                    .map(|pending| pending.payload().call_id.clone());
+                crate::approvals::client_call(self.client.approve(kernel::ResolveApproval::new(
+                    session,
+                    expected_seq,
+                    decision,
+                    self.actor.clone(),
+                    trace_id_of(params),
+                )))
+                .map_err(|err| err.to_string())?;
+                if let (Some(token), Some(call_id)) = (oldest, call_id) {
+                    let _ = acp_resolve_and_continue(
+                        &self.client,
+                        session,
+                        &self.actor,
+                        &self.root,
+                        self.trusted,
+                        &token,
+                        &call_id,
+                        decision == kernel::ApprovalDecision::Approved,
+                    );
+                }
+                Ok(serde_json::json!({}))
+            }
+            other => Err(format!("unknown method {other:?}")),
+        }
+    }
+
+    fn stream_events(
+        &self,
+        writer: &Mutex<std::os::unix::net::UnixStream>,
+        id: &serde_json::Value,
+        params: &serde_json::Value,
+        control: Receiver<StreamCommand>,
+    ) -> Result<(), String> {
+        use kernel::KernelClient as _;
+        let session = session_of(params)?;
+        let from_seq = u64_field(params, "from_seq").unwrap_or(0);
+        let Ok(subscribed) = crate::approvals::client_call(
+            self.client
+                .subscribe(kernel::SubscribeEvents::new(session, from_seq)),
+        ) else {
+            return Err("subscribe went async under the daemon".to_owned());
+        };
+        let mut stream = subscribed;
+        loop {
+            // Stop on an explicit cancel frame without blocking the reader.
+            if let Ok(StreamCommand::Stop) = control.try_recv() {
+                stream.close();
+                break;
+            }
+            match stream.try_recv() {
+                Ok(Some(event)) => {
+                    let event_value =
+                        serde_json::to_value(&event).map_err(|err| err.to_string())?;
+                    let frame = serde_json::json!({
+                        "schema": "rapidlm.sdk.rpc",
+                        "schema_version": 1,
+                        "kind": "event",
+                        "id": id,
+                        "cursor": event.seq(),
+                        "event": event_value,
+                    });
+                    write_frame(writer, &frame)?;
+                    // A terminal turn event ends the stream: the SDK's run()
+                    // generator is done, and the connection thread must get
+                    // back to reading requests or everything after the first
+                    // subscribe starves.
+                    if matches!(
+                        event.kind(),
+                        event_ledger::event::EventKind::TurnCompleted
+                            | event_ledger::event::EventKind::TurnFailed
+                            | event_ledger::event::EventKind::TurnInterrupted
+                    ) {
+                        let frame = serde_json::json!({
+                            "schema": "rapidlm.sdk.rpc",
+                            "schema_version": 1,
+                            "kind": "stream_end",
+                            "id": id,
+                            "cursor": event.seq(),
+                            "reason": "complete",
+                        });
+                        write_frame(writer, &frame)?;
+                        return Ok(());
+                    }
+                }
+                Ok(None) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(err) => {
+                    let cursor = stream.cursor();
+                    let frame = serde_json::json!({
+                        "schema": "rapidlm.sdk.rpc",
+                        "schema_version": 1,
+                        "kind": "stream_end",
+                        "id": id,
+                        "cursor": cursor,
+                        "reason": "disconnected",
+                    });
+                    write_frame(writer, &frame)?;
+                    return Ok(());
+                }
+            }
+        }
+        let cursor = stream.cursor();
+        let frame = serde_json::json!({
+            "schema": "rapidlm.sdk.rpc",
+            "schema_version": 1,
+            "kind": "stream_end",
+            "id": id,
+            "cursor": cursor,
+            "reason": "cancelled",
+        });
+        write_frame(writer, &frame)
+    }
+}
+
+enum StreamCommand {
+    Stop,
+}
+
+/// One newline-terminated JSON frame, written atomically per frame.
+fn write_frame(
+    writer: &Mutex<std::os::unix::net::UnixStream>,
+    frame: &serde_json::Value,
+) -> Result<(), String> {
+    let mut line = serde_json::to_string(frame).map_err(|err| err.to_string())?;
+    line.push('\n');
+    let mut stream = writer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|err| err.to_string())
+}
+
+fn read_request(
+    reader: &mut FrameReader<impl std::io::Read>,
+    cancel: &acp::stdio::CancellationToken,
+) -> Result<serde_json::Value, String> {
+    let frame = reader.read_frame(cancel).map_err(|err| err.to_string())?;
+    let Some(frame) = frame else {
+        return Err("disconnected".to_owned());
+    };
+    serde_json::from_slice(&frame).map_err(|err| err.to_string())
+}
+
+fn parse_request(
+    frame: &serde_json::Value,
+) -> Option<(String, serde_json::Value, String, serde_json::Value)> {
+    let kind = frame.get("kind").and_then(serde_json::Value::as_str)?;
+    if kind != "request" {
+        return None;
+    }
+    if frame.get("schema").and_then(serde_json::Value::as_str) != Some("rapidlm.sdk.rpc") {
+        return None;
+    }
+    Some((
+        "request".to_owned(),
+        frame.get("id")?.clone(),
+        frame.get("method")?.as_str()?.to_owned(),
+        frame
+            .get("params")
+            .cloned()
+            .unwrap_or(serde_json::json!({})),
+    ))
+}
+
+fn hello_ok(id: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "rapidlm.sdk.rpc",
+        "schema_version": 1,
+        "kind": "hello_ok",
+        "id": id,
+        "wire_schema": "rapidlm.sdk.wire",
+        "wire_schema_version": 1,
+        "wire_schema_sha256": "53423d0293e15ca708cc2450e393a9d82bdd742e23ec50d8a508bffdd031823b",
+    })
+}
+
+fn response_ok(id: &serde_json::Value, result: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "rapidlm.sdk.rpc",
+        "schema_version": 1,
+        "kind": "response",
+        "id": id,
+        "result": result,
+    })
+}
+
+fn error_frame(id: &serde_json::Value, code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "rapidlm.sdk.rpc",
+        "schema_version": 1,
+        "kind": "response",
+        "id": id,
+        "error": { "code": code, "message": message },
+    })
+}
+
+fn hello_frame_id(hello: &serde_json::Value) -> serde_json::Value {
+    hello.get("id").cloned().unwrap_or(serde_json::Value::Null)
+}
+
+fn session_of(params: &serde_json::Value) -> Result<SessionId, String> {
+    let raw = params
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing session_id")?;
+    raw.parse::<SessionId>()
+        .map_err(|_| format!("session_id {raw:?} is not a session id"))
+}
+
+fn uuid_field(params: &serde_json::Value, field: &str) -> Result<SessionId, String> {
+    let raw = params
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("missing {field}"))?;
+    raw.parse::<SessionId>()
+        .map_err(|_| format!("{field} {raw:?} is not an id"))
+}
+
+fn u64_field(params: &serde_json::Value, field: &str) -> Result<u64, String> {
+    params
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("missing or invalid {field}"))
+}
+
+fn trace_id_of(params: &serde_json::Value) -> protocol::TraceId {
+    params
+        .get("trace_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or_else(protocol::TraceId::new)
+}
+
+/// The exact wire shape `decodeSession` accepts (unknown fields are
+/// rejected by the SDK, so this stays minimal and precise).
+fn snapshot_json(snapshot: &kernel::SessionSnapshot) -> Result<serde_json::Value, String> {
+    serde_json::to_value(snapshot).map_err(|err| err.to_string())
+}
+
+fn turn_handle_json(handle: &kernel::TurnHandle) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "session_id": handle.session_id().to_string(),
+        "turn_id": handle.turn_id().to_string(),
+        "seq": handle.seq(),
+    }))
+}

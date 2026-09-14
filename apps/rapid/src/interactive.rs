@@ -572,6 +572,13 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         handler: SubcommandHandler::Native(exec_subcommand),
     },
     Subcommand {
+        name: "daemon",
+        operands: "[--socket <path>]",
+        summary: "serve the TypeScript SDK on a Unix socket",
+        own_help: true,
+        handler: SubcommandHandler::P9(crate::daemon_serve::run_daemon),
+    },
+    Subcommand {
         name: "acp",
         operands: "",
         summary: "serve RapidLM as an ACP agent over stdio",

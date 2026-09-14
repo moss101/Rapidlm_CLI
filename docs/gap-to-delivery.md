@@ -114,15 +114,30 @@ Legend: `[x]` closed with evidence · `[~]` partial (named limitation) · `[ ]` 
   refused (file-granularity conflicts); a human merges those by hand from the kept
   worktree. Subagent depth stays capped at 1 and concurrency at 32/turn.
 
-## 4. Integrations (goal §5) — OPEN (machinery exists, entry points do not)
+## 4. Integrations (goal §5) — ACP + daemon CLOSED this cycle; MCP HTTP + model catalog open
 
-- `[ ]` **ACP**: agent-side v1+v2 adapters complete in `crates/acp`; no `rapid acp`
-  serve loop. The approval round-trip it needs now exists (§2).
-- `[ ]` **Daemon/SDK**: `IpcServer` complete (challenge auth, subscribe,
-  submit_turn with prompt, approve, fork, rewind) and unbound; SDK speaks dotted
-  method names + hello handshake vs the kernel's underscore names + auth.challenge —
-  a translation layer is needed. `approvals.resolve` on the SDK side now has a real
-  producer behind it.
+- `[x]` **ACP entry point** — `rapid acp` (`apps/rapid/src/acp_serve.rs`) binds the
+  complete v1/v2 adapters to a real workspace over stdio: initialize/new/load answer
+  through the kernel client; a prompt submits and EXECUTES the turn with the
+  production assembly (hooks, MCP, retrieval, durable approval sink, worktree-
+  isolated subagents) on its own thread while the loop streams mapped kernel events
+  as `session/update` notifications and ends the prompt with the mapped stop
+  reason. A pending approval surfaces as a real `session/request_permission`; the
+  editor's decision resolves through the durable approval machinery and resumes the
+  exact turn. Live evidence: real stdio session — initialize → session/new (ledger
+  session) → session/load → session/prompt (turn executed; an unconfigured model
+  maps honestly to a refusal stop) → cancel → clean exit 0.
+- `[x]` **Daemon/SDK** — `rapid daemon` (`apps/rapid/src/daemon_serve.rs`) binds a
+  workspace on an owner-only Unix socket and speaks the TypeScript SDK's exact wire
+  contract (`rapidlm.sdk.rpc` v1: hello/hello_ok, dotted methods, event streams
+  with cursor + stream_end): sessions create/get/fork/rewind; turns.submit submits
+  AND executes; turns.interrupt; approvals.resolve through the durable machinery
+  (pending wait resolved, turn resumed as a continuation); events.subscribe streams
+  ledger envelopes and ends at terminal turn events (a starvation bug found and
+  fixed by the live exercise). Live evidence with the REAL SDK
+  (`examples/daemon/sdk-e2e.mjs`, node against the built package): connect →
+  sessions.create → turns.submit streaming 5 events → sessions.fork → resume
+  replay from cursor 0 → clean exit.
 - `[~]` **MCP**: stdio wired (env/bounds/offline diagnostics/reconnect); `crates/mcp`
   has StreamableHttpTransport — unwired; no url/headers config; no OAuth.
 - `[~]` **Model setup**: capabilities still hard-coded (vision/caching/reasoning);
