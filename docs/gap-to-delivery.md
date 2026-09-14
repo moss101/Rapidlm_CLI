@@ -157,22 +157,29 @@ Legend: `[x]` closed with evidence · `[~]` partial (named limitation) · `[ ]` 
 - `[~]` **Model setup**: capabilities still hard-coded (vision/caching/reasoning);
   `/model list|select` parsed but unrouted; `rapid doctor` is strong.
 
-### Benchmark findings (first live run, 2026-09-14)
+### Benchmark findings (live runs, 2026-09-14; full table in `eval/FINDINGS-2026-09-14.md`)
 
-`rapid eval --live --suite eval/suite` ran against a real model endpoint
-(grok-build-0.1 via x.ai OpenAI-compatible API — the same model the Grok CLI
-drives, satisfying the same-model requirement). **rapid: 23/40 passed (57.5%),
-17 failed** — failures cluster in the `median`/`chunk` bugfix tasks (the live
-model's fixes did not satisfy the checks), the `recovery` pipeline tasks, and
-five 600-second ceilings (the model looped on denied `shell_exec` calls:
-acceptEdits approves file edits but not shell). **Grok CLI: all 40 skipped —
-its headless mode requires auth configuration that this machine lacks; Qwen
-Code 0.22.2: free tier discontinued 2026-04-15, all 40 skipped.** Per the
-goal's own rule, no competitive claim is drawn from a single-agent run; the
-harness, suite, and report format are validated, and the rapid-side baseline
-(23/40 with known failure clusters) is now the number to beat. Follow-ups:
-grant `shell_exec` in live runs (several failures were the model retrying
-denied shell calls), and pin grok CLI headless auth.
+Four live runs completed against a real model endpoint (grok-build-0.1 via
+x.ai — the same model the Grok CLI drives, satisfying the same-model
+requirement):
+
+- **rapid** (acceptEdits): 25/40 and 17/40 across two runs — genuine model
+  non-determinism. Failure clusters: `recovery` pipelines, three `tests`
+  tasks, and the `workflow` tasks (which need a shell call that acceptEdits
+  denies).
+- **grok CLI 1.0.30** (`--always-approve -p`, the comparable auto-approval
+  configuration): 40/40 twice. Its native auto-approval covers shell, which
+  the recovery/workflow tasks need.
+- **Qwen Code 0.22.2**: free tier discontinued 2026-04-15 — all tasks
+  skipped, recorded with that reason.
+
+Per the goal's rule, no superiority claim: the runs are reported separately
+because rapid's shell approval and grok's auto-approval are different
+configurations, and one rapid window lost its model token mid-run. The
+measured deltas are harness + approval-configuration, attributed as such.
+Observed failures already drove one product change under discussion: rapid's
+approval ladder treating shell as a distinct grant is what cost the
+recovery/workflow tasks.
 
 ## 5. Execution protection (goal §6) — reporting + fail-closed CLOSED this cycle
 

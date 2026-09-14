@@ -465,18 +465,24 @@ fn run_live_agent_with(
 /// binary is present AND a recipe is recorded here — an unpinned binary is
 /// skipped rather than compared, and the recorded version is embedded in
 /// the report so runs are reproducible.
-fn agent_recipes() -> Vec<(String, String, Vec<String>)> {
-    // (name, argv-prefix). The prompt is appended as the final argument.
+fn agent_recipes() -> Vec<(String, String, String, Vec<String>)> {
+    // (name, pinned version, version probe flag, argv prefix). The prompt is
+    // appended as the final argument.
     vec![
         (
             "rapid".to_owned(),
+            env!("CARGO_PKG_VERSION").to_owned(),
             String::new(),
             vec!["exec".to_owned()],
         ),
         (
             "grok".to_owned(),
             "1.0.30".to_owned(),
-            vec!["-p".to_owned()],
+            "--version".to_owned(),
+            // `--always-approve` is grok's auto-approval mode — the
+            // comparable setting to rapid's acceptEdits (file/shell tools
+            // auto-approved; the task's verify command is still the judge).
+            vec!["--always-approve".to_owned(), "-p".to_owned()],
         ),
     ]
 }
@@ -496,20 +502,30 @@ pub fn run_live(
         self_exe.to_path_buf(),
         vec!["exec".to_owned()],
     )];
-    for (name, prefix, version_probe) in agent_recipes() {
+    for (name, pinned_version, version_flag, prefix) in agent_recipes() {
         if name == "rapid" {
             continue;
         }
-        if probe_binary(&name) {
-            let mut argv = prefix
-                .split_whitespace()
-                .map(str::to_owned)
-                .collect::<Vec<_>>();
-            argv.extend(version_probe.clone());
-            agents.push((name.clone(), PathBuf::from(&name), argv));
-        } else {
+        if !probe_binary(&name) {
             eprintln!("eval: competitor {name} not found on PATH; recorded as skipped");
+            continue;
         }
+        // Pin check: the installed version must match the pinned one.
+        let observed = Command::new(&name)
+            .arg(&version_flag)
+            .output()
+            .ok()
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default();
+        if !observed.contains(&pinned_version) {
+            eprintln!(
+                "eval: competitor {name} version mismatch (pinned {pinned_version}, found {:?}); \
+recorded as skipped rather than compared unpinned",
+                observed.trim()
+            );
+            continue;
+        }
+        agents.push((name.clone(), PathBuf::from(&name), prefix));
     }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
