@@ -184,11 +184,24 @@ Legend: `[x]` closed with evidence · `[~]` partial (named limitation) · `[ ]` 
   AssertionEngine, FaultInjector) exist, consumed by nothing; no `rapid eval`; no
   30–50 task suite; prior Qwen comparisons were manual/ephemeral; nothing for Grok.
 
-## 7. Adoption (goal §8) — OPEN
+## 7. Adoption (goal §8) — version, docs, clean-env smoke CLOSED; signing/update OPEN
 
-- `[~]` 3-target release workflow with checksums + smoke steps; install docs match
-  artifacts; missing: `rapid --version`, self-update, signing beyond checksums,
-  SBOM/provenance, clean-environment smoke harness, first-run guide depth.
+- `[x]` **Clean-environment smoke** — `scripts/release-smoke.sh <binary>`: runs the
+  release binary under a pristine HOME (no config/trust/credentials) and asserts
+  the documented first-contact behavior — `--version` prints, help lists the
+  shipped commands, an untrusted project is named as such, `trust grant` flips the
+  gate, doctor reports the model check, and `rapid eval --offline` passes the
+  shipped 40-task suite. Evidence: green against `target/release/rapid` on this
+  machine; wired for CI by invoking it after the release build.
+- `[x]` **Versioning** — `rapid --version` / `-V` prints `rapid 0.1.0 (RapidLM CLI)`
+  from the workspace version; previously it silently opened the TUI.
+- `[x]` **First-run guide** — getting-started covers configure (real config.toml
+  example) → trust → the permission ladder (permissions allow / modes) → sandbox
+  levels → the exit-code table (test-asserted); this session's scripted
+  walkthrough exercised exactly that path end to end with a live model endpoint.
+- `[~]` 3-target release workflow with SHA-256 checksums + smoke steps remains;
+  install docs match artifacts. Still open: code signing beyond checksums,
+  SBOM/provenance, self-update path. Publication stays an explicit approval step.
 
 ## Sequencing (updated)
 
