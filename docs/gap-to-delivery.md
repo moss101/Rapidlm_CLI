@@ -182,7 +182,7 @@ Legend: `[x]` closed with evidence · `[~]` partial (named limitation) · `[ ]` 
 2. ~~Queued messages / provider-cancel / clarification~~ → done.
 3. ~~Workflow executor + examples + completion semantics~~ → done.
 4. §4 subagent isolation (workspace crate wiring) — next.
-5. §5 ACP + daemon/SDK bridge + MCP HTTP (ride the approval machinery).
+5. ~~§5 ACP + daemon/SDK bridge + MCP HTTP~~ → all three entry points closed.
 6. §6 sandbox truthfulness.
 7. §7 benchmark harness offline + suite.
 8. §8 release hardening + RC prep.
