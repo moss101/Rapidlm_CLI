@@ -77,6 +77,18 @@ jobs:
           test "$rc" -eq 0 -o "$rc" -eq 1
           "$BIN" sessions list >/dev/null
 
+      # Clean-environment smoke: a pristine HOME (no config/trust/credentials)
+      # exercising --version, help, untrusted-project reporting, the trust
+      # gate, doctor, and the shipped offline eval suite. This is the
+      # per-platform clean-environment validation the release checklist
+      # requires; scripts/release-smoke.sh asserts each step and fails the
+      # job on any deviation.
+      - name: clean-environment smoke
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          REPO_ROOT="$(pwd)" sh scripts/release-smoke.sh target/release/rapid${{ matrix.ext }}
+
       - name: package
         run: |
           set -euo pipefail
