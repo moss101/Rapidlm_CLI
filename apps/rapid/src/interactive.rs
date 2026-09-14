@@ -13955,6 +13955,9 @@ that is no longer there"
         use crate::user_config::{ConfigProvider, ModelEntry, ModelsSection, UserConfig};
 
         let entry = |model: &str, window: Option<u32>| ModelEntry {
+            vision: None,
+            caching: None,
+            reasoning: None,
             provider: ConfigProvider::Anthropic,
             model: model.to_owned(),
             base_url: "https://example.invalid/v1".to_owned(),

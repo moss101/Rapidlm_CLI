@@ -163,12 +163,20 @@ impl<'store> ConfiguredModel<'store> {
             .context_window
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
         let max_output = active.entry.max_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+        // Per-model capability overrides (§5): a model entry may turn on
+        // vision / prompt caching / reasoning when its provider genuinely
+        // supports them. Absent keys keep the historical conservative
+        // defaults (off) — capabilities are never guessed upward.
         let capabilities = ProviderCapabilities::new(
             true,
             true,
-            false,
-            false,
-            ReasoningSupport::None,
+            active.entry.vision.unwrap_or(false),
+            active.entry.caching.unwrap_or(false),
+            if active.entry.reasoning.unwrap_or(false) {
+                ReasoningSupport::Exposed
+            } else {
+                ReasoningSupport::None
+            },
             true,
             context_limit,
             max_output,
@@ -847,6 +855,9 @@ mod tests {
 
     fn entry(model: &str, base_url: &str) -> ModelEntry {
         ModelEntry {
+            vision: None,
+            caching: None,
+            reasoning: None,
             provider: ConfigProvider::OpenAiCompatible,
             model: model.to_owned(),
             base_url: base_url.to_owned(),

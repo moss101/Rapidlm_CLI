@@ -123,6 +123,13 @@ pub struct ModelEntry {
     pub context_window: Option<u32>,
     /// Reasoning-effort request override; `None` means the provider default.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Per-model capability overrides (delivery goal §5): a model whose
+    /// provider genuinely supports vision/prompt-caching/reasoning can turn
+    /// them on instead of inheriting the historical conservative defaults.
+    /// Absent = the documented default (off) — never guessed.
+    pub vision: Option<bool>,
+    pub caching: Option<bool>,
+    pub reasoning: Option<bool>,
 }
 
 /// The configured model the exec path should drive.
@@ -462,6 +469,9 @@ fn parse_model_entry(
         "max_tokens",
         "context_window",
         "reasoning_effort",
+        "vision",
+        "caching",
+        "reasoning",
     ];
     for key in table.keys() {
         if !known.contains(&key.as_str()) {
@@ -536,6 +546,9 @@ fn parse_model_entry(
         None => None,
         Some(value) => Some(positive_u32(value, &format!("{prefix}.context_window"))?),
     };
+    let vision = parse_bool_field(table, &prefix, "vision")?;
+    let caching = parse_bool_field(table, &prefix, "caching")?;
+    let reasoning = parse_bool_field(table, &prefix, "reasoning")?;
     let reasoning_effort = match table.get("reasoning_effort") {
         None => None,
         Some(value) => {
@@ -561,7 +574,29 @@ fn parse_model_entry(
         max_tokens,
         context_window,
         reasoning_effort,
+        vision,
+        caching,
+        reasoning,
     })
+}
+
+/// Read one optional boolean `[model.<id>]` field. Unknown keys are already
+/// rejected upstream; a wrong-typed value is a config error, never silence.
+fn parse_bool_field(
+    table: &toml::Table,
+    prefix: &str,
+    key: &str,
+) -> Result<Option<bool>, UserConfigError> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| UserConfigError::InvalidValue {
+                key: format!("{prefix}.{key}"),
+                reason: "expected true or false".to_owned(),
+            }),
+    }
 }
 
 fn validate_env_name(raw: &str, key: &str) -> Result<String, UserConfigError> {
@@ -1420,5 +1455,63 @@ env_key = 42
         let rendered = format!("{err}");
         assert!(!rendered.contains("super-secret-value"));
         assert!(rendered.contains("model.a.env_key"));
+    }
+}
+
+#[cfg(test)]
+mod capability_override_tests {
+    use super::*;
+
+    fn entry_from(toml_text: &str) -> ModelEntry {
+        let table: toml::Table = toml::from_str(toml_text)
+            .map_err(|err| UserConfigError::InvalidValue {
+                key: "toml".to_owned(),
+                reason: err.to_string(),
+            })
+            .unwrap();
+        parse_model_entry("m", &table, &mut Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn vision_caching_reasoning_overrides_parse_and_default_off() {
+        let enabled = entry_from(
+            r#"
+            provider = "openai-compatible"
+            model = "test-model"
+            base_url = "http://127.0.0.1:9/v1"
+            api_key = "k"
+            vision = true
+            caching = true
+            reasoning = true
+            "#,
+        );
+        assert_eq!(enabled.vision, Some(true));
+        assert_eq!(enabled.caching, Some(true));
+        assert_eq!(enabled.reasoning, Some(true));
+
+        let plain = entry_from(
+            r#"
+            provider = "openai-compatible"
+            model = "test-model"
+            base_url = "http://127.0.0.1:9/v1"
+            api_key = "k"
+            "#,
+        );
+        assert_eq!(plain.vision, None);
+        assert_eq!(plain.caching, None);
+        assert_eq!(plain.reasoning, None);
+
+        // Wrong-typed value is a config error, never silence.
+        let broken: toml::Table = toml::from_str(
+            r#"
+            provider = "openai-compatible"
+            model = "test-model"
+            base_url = "http://127.0.0.1:9/v1"
+            api_key = "k"
+            vision = "yes"
+            "#,
+        )
+        .unwrap();
+        assert!(parse_model_entry("m", &broken, &mut Vec::new()).is_err());
     }
 }
