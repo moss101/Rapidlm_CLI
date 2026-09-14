@@ -329,6 +329,7 @@ fn render_subcommand_line(entry: &Subcommand) -> String {
 pub const EXEC_USAGE: &str = "\
 usage: rapid exec <prompt> [--resume <session-id> | --continue] [--verbose]
                   [--max-wall-time <seconds>] [--json-schema <path>] [--jsonl]
+                  [--usage-file <path>]
 
 Run one headless agent turn with the configured model. The final response is
 printed to stdout; diagnostics go to stderr; a non-zero exit code reports a
@@ -356,6 +357,10 @@ Options:
                           (schema + assistant.message + session.finished)
                           instead of plain text. Covers only the turn
                           outcome itself, not a pre-flight setup failure.
+  --usage-file <path>     Write this turn's measured consumption to <path> as
+                          JSON: tokens, cost_usd_micros (null when the
+                          provider reports none), tool_calls, status.
+                          Machine-readable; stdout/stderr are unchanged.
   -h, --help              Print this help
 
 Environment:
@@ -1945,6 +1950,14 @@ struct ExecArgs {
     /// separate, unbuilt `rapid run <goal/playbook>` durable-graph command
     /// the contract's own doc comment was originally scoped to.
     jsonl: bool,
+    /// `--usage-file <path>`: write the turn's measured consumption as a
+    /// small JSON object (`{"tokens", "cost_usd_micros", "tool_calls",
+    /// "status"}`) at the path when the turn ends. `cost_usd_micros` is
+    /// `null` when the provider reported no cost — unknown, never free.
+    /// Opt-in so plain `exec` stdout/stderr stay unchanged; the eval
+    /// harness (and any CI wrapper) reads the file instead of parsing
+    /// human output.
+    usage_file: Option<PathBuf>,
     /// Run as the next turn of a recorded session rather than a new one.
     resume: ExecResume,
 }
@@ -1965,12 +1978,16 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
     let mut max_wall_time = None;
     let mut json_schema = None;
     let mut jsonl = false;
+    let mut usage_file = None;
     let mut resume = ExecResume::Fresh;
     let mut words: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--verbose" {
             verbose = true;
+        } else if args[i] == "--usage-file" {
+            i += 1;
+            usage_file = Some(PathBuf::from(args.get(i)?));
         } else if args[i] == "--resume" {
             i += 1;
             let id = args.get(i)?.parse::<protocol::SessionId>().ok()?;
@@ -2007,6 +2024,7 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
         max_wall_time,
         json_schema,
         jsonl,
+        usage_file,
         resume,
     })
 }
@@ -4108,6 +4126,12 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             let _ = std::io::Write::flush(&mut std::io::stdout());
         })));
     }
+    // Machine-readable usage split (input / cached-input / output), summed
+    // per provider-reported step. Read after the turn for `--usage-file`;
+    // never affects the turn itself.
+    let usage_totals: crate::model::UsageTotalsHandle =
+        std::sync::Arc::new(std::sync::Mutex::new(crate::model::UsageTotals::default()));
+    backing.set_usage_totals(Some(std::sync::Arc::clone(&usage_totals)));
 
     // Prompt/context stack: project instructions (AGENTS.md convention +
     // compat paths) and the conditional-section system prompt (environment,
@@ -4355,6 +4379,39 @@ run without --continue to start one"
             outcome.cost_usd_micros.unwrap_or(0),
             active_ms,
         );
+    }
+    // `--usage-file`: measured consumption for machine readers (the eval
+    // harness, CI wrappers). Best-effort: a write failure warns on stderr
+    // and leaves the file absent, never fails the turn itself — the turn's
+    // outcome is already decided at this point.
+    if let (Ok(outcome), Some(usage_path)) = (&run_result, parsed.usage_file.as_deref()) {
+        let totals = usage_totals.lock().ok();
+        let (input_tokens, cached_tokens, output_tokens) = totals
+            .map(|totals| {
+                (
+                    (totals.input_tokens > 0 || totals.output_tokens > 0)
+                        .then_some(totals.input_tokens),
+                    totals.cached_tokens,
+                    (totals.input_tokens > 0 || totals.output_tokens > 0)
+                        .then_some(totals.output_tokens),
+                )
+            })
+            .unwrap_or((None, None, None));
+        let usage = serde_json::json!({
+            "tokens": outcome.tokens,
+            "cost_usd_micros": outcome.cost_usd_micros,
+            "input_tokens": input_tokens,
+            "cached_tokens": cached_tokens,
+            "output_tokens": output_tokens,
+            "tool_calls": outcome.tool_calls,
+            "status": outcome.result.status().as_str(),
+        });
+        if let Err(err) = std::fs::write(usage_path, format!("{usage}\n")) {
+            eprintln!(
+                "--usage-file: could not write {}: {err}",
+                usage_path.display()
+            );
+        }
     }
     // `--jsonl`: everything above stays exactly as for plain-text exec; only
     // the outcome below is reported differently. `rapid_schema` is written
@@ -11069,6 +11126,31 @@ base_url = "http://127.0.0.1:11434/v1"
             parse_exec_args(&unbounded).expect("parses").max_wall_time,
             None
         );
+    }
+
+    #[test]
+    fn usage_file_flag_carries_the_path_and_stays_absent_without_it() {
+        let with: Vec<String> = [
+            "prompt",
+            "--usage-file",
+            "/tmp/rapid-usage/eval-task.json",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let parsed = parse_exec_args(&with).expect("parses");
+        assert_eq!(
+            parsed.usage_file,
+            Some(PathBuf::from("/tmp/rapid-usage/eval-task.json"))
+        );
+        let without: Vec<String> = vec!["just".to_owned(), "a".to_owned(), "prompt".to_owned()];
+        assert_eq!(parse_exec_args(&without).expect("parses").usage_file, None);
+        // A missing value is a usage error, not a silent default.
+        let missing: Vec<String> = ["prompt", "--usage-file"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert!(parse_exec_args(&missing).is_none());
     }
 
     #[test]

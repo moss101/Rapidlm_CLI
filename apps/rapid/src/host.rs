@@ -469,6 +469,15 @@ pub trait LiveModelCall {
     fn set_delta_sink(&mut self, sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>) {
         let _ = sink;
     }
+
+    /// Attach a shared accumulator for provider-reported token splits
+    /// (input / cached-input / output) across this binding's steps. Default:
+    /// no-op — scripted and unconfigured backings report no usage detail.
+    /// Never affects turn behavior; machine readers (the eval harness, CI
+    /// wrappers) use it for cost estimation at published rates.
+    fn set_usage_totals(&mut self, totals: Option<crate::model::UsageTotalsHandle>) {
+        let _ = totals;
+    }
 }
 
 /// A [`ModelDriver`] bound to the host-owned live context. Reads the (possibly

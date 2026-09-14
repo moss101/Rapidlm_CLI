@@ -133,7 +133,35 @@ pub struct ConfiguredModel<'store> {
     /// deltas stream to it while the response arrives. `None` keeps the
     /// non-streaming path.
     delta_sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    /// Cumulative provider-reported token split (input / cached-input /
+    /// output), shared with the caller that owns this binding. Opt-in via
+    /// [`Self::set_usage_totals`]; machine readers (the eval harness, CI
+    /// wrappers) use it for cost estimation at published rates. Never
+    /// affects turn behavior.
+    usage_totals: Option<UsageTotalsHandle>,
 }
+
+/// Provider-reported per-step token split, summed into a shared
+/// [`UsageTotals`] when one is attached.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UsageDetail {
+    pub input_tokens: u64,
+    /// The cached subset of `input_tokens`, when the provider itemizes it
+    /// (x.ai bills cached input at a lower rate; cost estimation needs the
+    /// split). `None` when not itemized.
+    pub cached_tokens: Option<u64>,
+    pub output_tokens: u64,
+}
+
+/// Shared accumulator for [`UsageDetail`]s across one model binding's steps.
+#[derive(Clone, Debug, Default)]
+pub struct UsageTotals {
+    pub input_tokens: u64,
+    pub cached_tokens: Option<u64>,
+    pub output_tokens: u64,
+}
+
+pub type UsageTotalsHandle = std::sync::Arc<std::sync::Mutex<UsageTotals>>;
 
 impl<'store> ConfiguredModel<'store> {
     /// Construct the adapter for `active`, seeding `store` with the resolved
@@ -251,6 +279,7 @@ impl<'store> ConfiguredModel<'store> {
         Ok(Self {
             backend,
             delta_sink: None,
+            usage_totals: None,
             provider,
             model,
             max_output_tokens: active.entry.max_tokens,
@@ -272,6 +301,14 @@ impl<'store> ConfiguredModel<'store> {
         sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
     ) {
         self.delta_sink = sink;
+    }
+
+    /// Attach the shared usage-totals accumulator. Idempotent; later calls
+    /// replace. Only provider-REPORTED splits are added — the byte-derived
+    /// fallback estimate deliberately never touches it (a fabricated split
+    /// would launder a guess into what looks like a measurement).
+    pub fn set_usage_totals(&mut self, totals: Option<UsageTotalsHandle>) {
+        self.usage_totals = totals;
     }
 
     pub fn capabilities(&self) -> &ProviderCapabilities {
@@ -355,7 +392,22 @@ impl LiveModelCall for ConfiguredModel<'_> {
         if cancel.is_cancelled() {
             return Err(ModelStepError::Cancelled);
         }
-        fold_stream(&stream, request_bytes)
+        let (output, usage_detail) = fold_stream(&stream, request_bytes)?;
+        if let (Some(totals), Some(detail)) = (&self.usage_totals, usage_detail) {
+            if let Ok(mut totals) = totals.lock() {
+                totals.input_tokens = totals.input_tokens.saturating_add(detail.input_tokens);
+                totals.output_tokens = totals.output_tokens.saturating_add(detail.output_tokens);
+                // Cached sum stays Some only while every reported step
+                // itemizes its cache hit count; a step that omits it makes
+                // the running sum partially unknown, i.e. `None`.
+                totals.cached_tokens = match (totals.cached_tokens, detail.cached_tokens) {
+                    (None, next) => next,
+                    (Some(sum), Some(next)) => Some(sum.saturating_add(next)),
+                    (Some(_), None) | (None, Some(_)) => None,
+                };
+            }
+        }
+        Ok(output)
     }
 }
 
@@ -439,6 +491,13 @@ impl LiveModelCall for SelectedModel<'_> {
     fn set_delta_sink(&mut self, sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>) {
         match self {
             Self::Configured(model) => model.set_delta_sink(sink),
+            _ => {}
+        }
+    }
+
+    fn set_usage_totals(&mut self, totals: Option<UsageTotalsHandle>) {
+        match self {
+            Self::Configured(model) => model.set_usage_totals(totals),
             _ => {}
         }
     }
@@ -744,11 +803,14 @@ fn map_provider_error(err: ProviderError) -> ModelStepError {
 
 /// Fold the collected provider stream into one step output. Text deltas form
 /// the terminal text; tool-call deltas form proposed calls (the tool driver
-/// decides validity downstream).
+/// decides validity downstream). Also returns the provider-reported token
+/// split when the provider reported one — `None` covers both "no usage
+/// event" and "reported nothing usable"; the byte-derived estimate fallback
+/// never masquerades as a measurement.
 fn fold_stream(
     stream: &ModelStream,
     request_bytes: usize,
-) -> Result<ModelStepOutput, ModelStepError> {
+) -> Result<(ModelStepOutput, Option<UsageDetail>), ModelStepError> {
     let mut text = String::new();
     // (call_id, tool name, accumulated arguments), in the order the
     // provider actually proposed them. Order matters downstream:
@@ -814,7 +876,18 @@ fn fold_stream(
     // (not available at this call site) would be fabricating a number, not
     // estimating one. `None` means "unknown," never "free" or "zero" — see
     // `ModelStepOutput`'s own doc comment.
-    let cost_usd_micros = usage.and_then(usage_cost_micros);
+    let cost_usd_micros = usage.and_then(|u| usage_cost_micros(u));
+    // The provider-reported split, when it actually reported one (never the
+    // estimate fallback above): machine readers price the turn from this.
+    let usage_detail = usage.and_then(|u| {
+        let input = u.input_tokens().unwrap_or(0);
+        let output = u.output_tokens().unwrap_or(0);
+        (input > 0 || output > 0).then(|| UsageDetail {
+            input_tokens: input,
+            cached_tokens: u.cached_input_tokens(),
+            output_tokens: output,
+        })
+    });
     // A provider stream that emits two `ToolCallStart` events sharing one
     // `call_id` would otherwise have every `ToolCallArgumentsDelta` for
     // both calls merged into whichever entry `tools.iter_mut().find(...)`
@@ -831,11 +904,14 @@ fn fold_stream(
         return Err(ModelStepError::Failed);
     }
     if tools.is_empty() {
-        return Ok(ModelStepOutput::Terminal {
-            text,
-            tokens,
-            cost_usd_micros,
-        });
+        return Ok((
+            ModelStepOutput::Terminal {
+                text,
+                tokens,
+                cost_usd_micros,
+            },
+            usage_detail,
+        ));
     }
     let calls = tools
         .into_iter()
@@ -843,11 +919,14 @@ fn fold_stream(
             ProposedToolCall::new(call_id, tool, arguments).map_err(|_| ModelStepError::Failed)
         })
         .collect::<Result<Vec<_>, ModelStepError>>()?;
-    Ok(ModelStepOutput::ToolCalls {
-        calls,
-        tokens,
-        cost_usd_micros,
-    })
+    Ok((
+        ModelStepOutput::ToolCalls {
+            calls,
+            tokens,
+            cost_usd_micros,
+        },
+        usage_detail,
+    ))
 }
 
 /// Real provider-reported cost only — see `fold_stream`'s cost_usd_micros
@@ -1078,7 +1157,7 @@ mod tests {
                 usage,
             },
         ]);
-        match fold_stream(&reported_stream, 0).expect("fold") {
+        match fold_stream(&reported_stream, 0).expect("fold").0 {
             ModelStepOutput::Terminal {
                 cost_usd_micros, ..
             } => {
@@ -1095,7 +1174,7 @@ mod tests {
             finish: FinishReason::Stop,
             usage: unknown_usage,
         }]);
-        match fold_stream(&unreported_stream, 0).expect("fold") {
+        match fold_stream(&unreported_stream, 0).expect("fold").0 {
             ModelStepOutput::Terminal {
                 cost_usd_micros, ..
             } => {
@@ -1129,7 +1208,7 @@ mod tests {
                 usage,
             },
         ]);
-        let output = fold_stream(&stream, 0).expect("fold");
+        let (output, detail) = fold_stream(&stream, 0).expect("fold");
         match output {
             ModelStepOutput::Terminal { text, tokens, .. } => {
                 assert_eq!(text, "hello");
@@ -1137,6 +1216,16 @@ mod tests {
             }
             other => panic!("expected terminal, got {other:?}"),
         }
+        // The provider-reported split rides along for machine readers; the
+        // estimate fallback (next test) must never produce one.
+        assert_eq!(
+            detail,
+            Some(UsageDetail {
+                input_tokens: 11,
+                cached_tokens: None,
+                output_tokens: 7,
+            })
+        );
     }
 
     #[test]
@@ -1151,7 +1240,8 @@ mod tests {
         let stream = stream(vec![ModelStreamEvent::TextDelta {
             text: "a reasonably long response body here".to_owned(),
         }]);
-        let output = fold_stream(&stream, 400).expect("fold");
+        let (output, detail) = fold_stream(&stream, 400).expect("fold");
+        assert_eq!(detail, None, "estimate fallback must not pose as a reported split");
         match output {
             ModelStepOutput::Terminal { text, tokens, .. } => {
                 assert_eq!(text, "a reasonably long response body here");
@@ -1183,7 +1273,7 @@ mod tests {
                 usage,
             },
         ]);
-        let output = fold_stream(&stream, 0).expect("fold");
+        let (output, detail) = fold_stream(&stream, 0).expect("fold");
         match output {
             ModelStepOutput::ToolCalls { calls, tokens, .. } => {
                 assert_eq!(calls.len(), 1);
@@ -1277,7 +1367,7 @@ mod tests {
                 usage,
             },
         ]);
-        let output = fold_stream(&stream, 0).expect("fold");
+        let (output, detail) = fold_stream(&stream, 0).expect("fold");
         match output {
             ModelStepOutput::ToolCalls { calls, .. } => {
                 assert_eq!(calls.len(), 2);

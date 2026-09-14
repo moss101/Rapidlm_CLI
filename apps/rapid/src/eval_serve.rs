@@ -257,7 +257,10 @@ impl agent_runtime::ModelDriver for GoldPatchModel {
 }
 
 /// One task's outcome. `skipped` runs are recorded with the reason — a
-/// report that hides its skips is a lie.
+/// report that hides its skips is a lie. Usage fields are `None` when the
+/// agent cannot report them (or the task never ran); `cost_usd_micros` is
+/// `None` when the provider reports no cost for this credential, which is
+/// "unknown", never "free".
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct TaskResult {
     pub id: String,
@@ -268,6 +271,25 @@ pub struct TaskResult {
     pub wall_ms: u128,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd_micros: Option<u64>,
+    /// Cost ESTIMATED from the measured token split at the provider's
+    /// published rates — recorded beside, never merged with, the measured
+    /// `cost_usd_micros`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_estimate_usd_micros: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_turns: Option<u64>,
+    /// Which live agent produced this record (`rapid`, `grok`, …). `None`
+    /// in offline mode, where the runner is this binary's gold trajectory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 /// Run the suite offline: gold trajectory through the real turn loop, graded
@@ -303,6 +325,13 @@ pub fn run_offline(tasks: &[BenchTask], scratch_root: &Path, trusted: bool) -> V
             reason: result.err(),
             wall_ms: started.elapsed().as_millis(),
             tokens: Some(u64::from(task.gold.len() as u32 + 1) * 10),
+            cost_usd_micros: None,
+            cost_estimate_usd_micros: None,
+            input_tokens: None,
+            cached_tokens: None,
+            output_tokens: None,
+            num_turns: None,
+            agent: None,
         });
     }
     results
@@ -482,7 +511,15 @@ fn agent_recipes() -> Vec<(String, String, String, Vec<String>)> {
             // `--always-approve` is grok's auto-approval mode — the
             // comparable setting to rapid's acceptEdits (file/shell tools
             // auto-approved; the task's verify command is still the judge).
-            vec!["--always-approve".to_owned(), "-p".to_owned()],
+            // `--output-format json` returns the final answer plus the
+            // provider-reported token/cost usage as one JSON object —
+            // the harness's per-task usage source.
+            vec![
+                "--always-approve".to_owned(),
+                "--output-format".to_owned(),
+                "json".to_owned(),
+                "-p".to_owned(),
+            ],
         ),
     ]
 }
@@ -496,6 +533,7 @@ pub fn run_live(
     scratch_root: &Path,
     self_exe: &Path,
     trusted: bool,
+    grant_shell: bool,
 ) -> Vec<(String, Vec<TaskResult>)> {
     let mut agents: Vec<(String, PathBuf, Vec<String>)> = vec![(
         "rapid".to_owned(),
@@ -531,6 +569,10 @@ recorded as skipped rather than compared unpinned",
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    // Usage files live OUTSIDE the per-task scratch (which is removed after
+    // each task) so a failed task's spend is still recorded.
+    let usage_dir = scratch_root.join("usage");
+    let _ = std::fs::create_dir_all(&usage_dir);
     let mut per_agent = Vec::new();
     for (name, bin, args) in &agents {
         // Pre-flight: a probe task. If the model call itself fails (no
@@ -538,8 +580,9 @@ recorded as skipped rather than compared unpinned",
         // agent is recorded as SKIPPED with that reason — failures of the
         // environment are not failures of the tasks.
         let probe = scratch_root.join(format!("preflight-{name}-{stamp:x}"));
-        let model_ready = match run_live_agent(bin, args, &tasks[0], &probe, name) {
-            Err(reason)
+        let model_ready = match run_live_agent(bin, args, &tasks[0], &probe, name, grant_shell, None)
+        {
+            (Err(reason), _)
                 if reason.contains("model")
                     || reason.contains("provider")
                     || reason.contains("non-zero") =>
@@ -564,6 +607,13 @@ recorded as skipped rather than compared unpinned",
                         reason: Some(format!("model not usable: {reason}")),
                         wall_ms: 0,
                         tokens: None,
+                        cost_usd_micros: None,
+                        cost_estimate_usd_micros: None,
+                        input_tokens: None,
+                        cached_tokens: None,
+                        output_tokens: None,
+                        num_turns: None,
+                        agent: Some(name.clone()),
                     })
                     .collect(),
             ));
@@ -573,7 +623,13 @@ recorded as skipped rather than compared unpinned",
         for task in tasks {
             let started = std::time::Instant::now();
             let scratch = scratch_root.join(format!("{name}-{}-{stamp:x}", task.id));
-            let result = run_live_agent(bin, args, task, &scratch, name);
+            let usage_path = usage_dir.join(format!("{name}-{}-{stamp:x}.json", task.id));
+            let usage_file = if name == "rapid" {
+                Some(usage_path.as_path())
+            } else {
+                None
+            };
+            let (result, usage) = run_live_agent(bin, args, task, &scratch, name, grant_shell, usage_file);
             let _ = std::fs::remove_dir_all(&scratch);
             results.push(TaskResult {
                 id: task.id.clone(),
@@ -588,33 +644,147 @@ recorded as skipped rather than compared unpinned",
                         }
                     }
                 },
-                reason: result.err(),
-                wall_ms: started.elapsed().as_millis(),
-                tokens: None,
-            });
+            reason: result.err(),
+            wall_ms: started.elapsed().as_millis(),
+            tokens: usage.tokens,
+            cost_usd_micros: usage.cost_usd_micros,
+            cost_estimate_usd_micros: estimate_cost_micros(&usage),
+            input_tokens: usage.input_tokens,
+            cached_tokens: usage.cached_tokens,
+            output_tokens: usage.output_tokens,
+            num_turns: usage.num_turns,
+            agent: Some(name.clone()),
+        });
         }
         per_agent.push((name.clone(), results));
     }
     per_agent
 }
 
+/// Consumption an agent reported for one task. Every field is optional:
+/// agents differ in what they can report, and "unknown" must stay
+/// distinguishable from "zero" in the report.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LiveUsage {
+    pub tokens: Option<u64>,
+    pub cost_usd_micros: Option<u64>,
+    pub num_turns: Option<u64>,
+    pub input_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+/// x.ai's published grok-4.6 API rates in USD per million tokens (input,
+/// cached input, output) — [x.ai/api](https://x.ai/api),
+/// [docs.x.ai/developers/pricing](https://docs.x.ai/developers/pricing).
+/// Used ONLY for the clearly-labeled rapid cost estimate: the OpenAI-
+/// compatible endpoint reports no cost field, so pricing rapid's measured
+/// split at the provider's public catalog is an estimate, never a
+/// measurement.
+const RAPID_ESTIMATE_USD_PER_M: (f64, f64, f64) = (2.0, 0.5, 6.0);
+
+/// Price a measured token split at the published rates. `None` when the
+/// split itself was not reported. When the provider did not itemize the
+/// cached subset, all input is priced at the uncached rate (a stated
+/// upper bound, never silently optimistic).
+fn estimate_cost_micros(usage: &LiveUsage) -> Option<u64> {
+    let (input, output) = match (usage.input_tokens, usage.output_tokens) {
+        (Some(input), Some(output)) => (input, output),
+        _ => return None,
+    };
+    let (input_rate, cached_rate, output_rate) = RAPID_ESTIMATE_USD_PER_M;
+    let cached = usage.cached_tokens.unwrap_or(0);
+    let uncached = input.saturating_sub(cached);
+    let micros = uncached as f64 * input_rate
+        + cached as f64 * cached_rate
+        + output as f64 * output_rate;
+    Some(micros as u64)
+}
+
+/// Parse rapid's `exec --usage-file` output.
+fn parse_rapid_usage_file(text: &str) -> Option<LiveUsage> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    Some(LiveUsage {
+        tokens: value.get("tokens").and_then(|v| v.as_u64()),
+        cost_usd_micros: value.get("cost_usd_micros").and_then(|v| v.as_u64()),
+        num_turns: None,
+        input_tokens: value.get("input_tokens").and_then(|v| v.as_u64()),
+        cached_tokens: value.get("cached_tokens").and_then(|v| v.as_u64()),
+        output_tokens: value.get("output_tokens").and_then(|v| v.as_u64()),
+    })
+}
+
+/// Parse grok CLI `--output-format json` stdout. `total_cost_usd_ticks` is
+/// the provider-reported cost in 1e-10 USD units (its integer form);
+/// micros are ticks / 10_000, truncated.
+fn parse_grok_usage(stdout: &str) -> Option<LiveUsage> {
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+    if value.get("type").and_then(|v| v.as_str()) == Some("error") {
+        return None;
+    }
+    let usage = value.get("usage")?;
+    Some(LiveUsage {
+        tokens: usage.get("total_tokens").and_then(|v| v.as_u64()),
+        cost_usd_micros: value
+            .get("total_cost_usd_ticks")
+            .and_then(|v| v.as_u64())
+            .map(|ticks| ticks / 10_000),
+        num_turns: value.get("num_turns").and_then(|v| v.as_u64()),
+        input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()),
+        cached_tokens: usage
+            .get("cache_read_input_tokens")
+            .and_then(|v| v.as_u64()),
+        output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()),
+    })
+}
+
+/// Read up to `cap` bytes from a stream (looping — one `read` may return
+/// less than the buffer even with more pending).
+fn read_capped(stream: &mut impl std::io::Read, cap: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut buf = Vec::with_capacity(cap.min(64 * 1024));
+    let mut chunk = [0u8; 16 * 1024];
+    while buf.len() < cap {
+        let room = (cap - buf.len()).min(chunk.len());
+        let read = stream.read(&mut chunk[..room])?;
+        if read == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..read]);
+    }
+    Ok(buf)
+}
+
 /// Drive one live agent on one task: materialize the identical repo, run
 /// the agent's argv with the prompt appended, then judge with the task's
-/// verification command (with the anti-vacuity check first).
+/// verification command (with the anti-vacuity check first). Returns the
+/// usage the agent reported, when it can.
+#[allow(clippy::too_many_arguments)]
 fn run_live_agent(
     bin: &Path,
     args: &[String],
     task: &BenchTask,
     scratch: &Path,
     name: &str,
-) -> Result<(), String> {
-    materialize(scratch, task)?;
+    grant_shell: bool,
+    usage_file: Option<&Path>,
+) -> (Result<(), String>, LiveUsage) {
+    if let Err(reason) = materialize(scratch, task) {
+        return (Err(reason), LiveUsage::default());
+    }
     if task.verify_fails_before && run_verify(scratch, &task.verify, 60).unwrap_or(true) {
-        return Err("vacuous task (verify passes before any change)".to_owned());
+        return (
+            Err("vacuous task (verify passes before any change)".to_owned()),
+            LiveUsage::default(),
+        );
     }
     use std::io::Read as _;
     use std::process::{Command, Stdio};
     let mut argv = args.to_vec();
+    if let Some(path) = usage_file {
+        argv.push("--usage-file".to_owned());
+        argv.push(path.display().to_string());
+    }
     argv.push(task.prompt.clone());
     let mut command = Command::new(bin);
     command
@@ -629,41 +799,81 @@ fn run_live_agent(
         // rapid exec in acceptEdits mode — file edits auto-approved, deny
         // rules and managed ceilings still enforced. This mirrors what a
         // real operator does interactively; it grants nothing to the model
-        // that the operator did not.
-        let trust = Command::new(bin)
+        // that the operator did not. With `grant_shell` (the equal-surface
+        // configuration) the operator also pre-approves shell_exec per
+        // scratch repo, matching the competitor's auto-approved shell.
+        let trust = match Command::new(bin)
             .arg("trust")
             .arg("grant")
             .current_dir(scratch)
             .status()
-            .map_err(|err| err.to_string())?;
+        {
+            Ok(status) => status,
+            Err(err) => return (Err(err.to_string()), LiveUsage::default()),
+        };
         if !trust.success() {
-            return Err("trust grant failed in scratch repo".to_owned());
+            return (
+                Err("trust grant failed in scratch repo".to_owned()),
+                LiveUsage::default(),
+            );
+        }
+        if grant_shell {
+            let shell = match Command::new(bin)
+                .args(["permissions", "allow", "shell_exec"])
+                .current_dir(scratch)
+                .status()
+            {
+                Ok(status) => status,
+                Err(err) => return (Err(err.to_string()), LiveUsage::default()),
+            };
+            if !shell.success() {
+                return (
+                    Err("shell_exec pre-approval failed in scratch repo".to_owned()),
+                    LiveUsage::default(),
+                );
+            }
         }
         command.env("RAPIDLM_PERMISSION_MODE", "acceptEdits");
     }
-    let mut child = command
-        .spawn()
-        .map_err(|err| format!("{name} could not start: {err}"))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            return (
+                Err(format!("{name} could not start: {err}")),
+                LiveUsage::default(),
+            )
+        }
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(LIVE_TASK_TIMEOUT_SECS);
     let status = loop {
-        match child.try_wait().map_err(|err| err.to_string())? {
-            Some(status) => break status,
-            None => {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
                 if std::time::Instant::now() > deadline {
                     let _ = child.kill();
-                    return Err(format!(
-                        "{name} exceeded the {LIVE_TASK_TIMEOUT_SECS}s ceiling"
-                    ));
+                    return (
+                        Err(format!(
+                            "{name} exceeded the {LIVE_TASK_TIMEOUT_SECS}s ceiling"
+                        )),
+                        LiveUsage::default(),
+                    );
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
+            Err(err) => {
+                return (
+                    Err(err.to_string()),
+                    LiveUsage::default(),
+                );
+            }
         }
     };
+    // The 512 KiB stdout cap exists for the grok JSON contract: its whole
+    // final answer comes back as one JSON object (text + thought + usage).
     let mut text = String::new();
     if let Some(mut stdout) = child.stdout.take() {
-        let mut capped = vec![0u8; 8 * 1024];
-        let read = stdout.read(&mut capped).unwrap_or(0);
-        text.push_str(&String::from_utf8_lossy(&capped[..read]));
+        let capped = read_capped(&mut stdout, 512 * 1024).unwrap_or_default();
+        text.push_str(&String::from_utf8_lossy(&capped));
     }
     if let Some(mut stderr) = child.stderr.take() {
         let mut capped = vec![0u8; 8 * 1024];
@@ -677,12 +887,33 @@ fn run_live_agent(
     if !status.success() {
         let mut snippet: String = text.chars().take(300).collect();
         snippet = snippet.replace('\n', " ");
-        return Err(format!("{name} exited non-zero: {snippet}"));
+        let usage = collect_usage(name, usage_file, &text);
+        return (Err(format!("{name} exited non-zero: {snippet}")), usage);
     }
+    let usage = collect_usage(name, usage_file, &text);
     if !run_verify(scratch, &task.verify, 120).unwrap_or(false) {
-        return Err("verification command failed after the live run".to_owned());
+        return (
+            Err("verification command failed after the live run".to_owned()),
+            usage,
+        );
     }
-    Ok(())
+    (Ok(()), usage)
+}
+
+/// Usage harvest after a live run: grok reports in its stdout JSON, rapid
+/// in the `--usage-file` the harness passed. Missing on either side stays
+/// `None` — unknown, never zero.
+fn collect_usage(name: &str, usage_file: Option<&Path>, stdout: &str) -> LiveUsage {
+    if name == "grok" {
+        parse_grok_usage(stdout).unwrap_or_default()
+    } else if let Some(path) = usage_file {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|body| parse_rapid_usage_file(&body))
+            .unwrap_or_default()
+    } else {
+        LiveUsage::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -695,7 +926,96 @@ pub fn summarize(mode: &str, results: &[TaskResult]) -> (serde_json::Value, Stri
     let passed = results.iter().filter(|r| r.outcome == "passed").count();
     let failed = results.iter().filter(|r| r.outcome == "failed").count();
     let skipped = results.iter().filter(|r| r.outcome == "skipped").count();
-    let report = serde_json::json!({
+    // Tokens and cost per VERIFIED success (goal §7), PER AGENT: totals over
+    // that agent's passed tasks, divided by the pass count. Cost divides
+    // only tasks whose cost the provider actually reported — the divisor is
+    // the number of those tasks, reported beside the rate so partial
+    // coverage cannot masquerade as a full comparison. Cross-agent totals
+    // are never summed: different agents' spend is not one budget.
+    let mut agent_names: Vec<String> = Vec::new();
+    for result in results {
+        let name = result.agent.clone().unwrap_or_else(|| "runner".to_owned());
+        if !agent_names.contains(&name) {
+            agent_names.push(name);
+        }
+    }
+    let mut agent_metrics = serde_json::Map::new();
+    let mut metric_lines: Vec<String> = Vec::new();
+    for agent in &agent_names {
+        let passed_tasks: Vec<&TaskResult> = results
+            .iter()
+            .filter(|r| r.outcome == "passed")
+            .filter(|r| r.agent.as_deref().unwrap_or("runner") == agent)
+            .collect();
+        if passed_tasks.is_empty() {
+            continue;
+        }
+        let tokens_reported = passed_tasks.iter().filter(|r| r.tokens.is_some()).count();
+        let tokens_total: u64 = passed_tasks.iter().filter_map(|r| r.tokens).sum();
+        let cost_reported = passed_tasks
+            .iter()
+            .filter(|r| r.cost_usd_micros.is_some())
+            .count();
+        let cost_total: u64 = passed_tasks.iter().filter_map(|r| r.cost_usd_micros).sum();
+        let est_reported = passed_tasks
+            .iter()
+            .filter(|r| r.cost_estimate_usd_micros.is_some())
+            .count();
+        let est_total: u64 = passed_tasks
+            .iter()
+            .filter_map(|r| r.cost_estimate_usd_micros)
+            .sum();
+        let mut entry = serde_json::Map::new();
+        if tokens_reported > 0 {
+            let per_success = tokens_total / passed_tasks.len() as u64;
+            entry.insert(
+                "tokens_per_verified_success".to_owned(),
+                serde_json::json!({
+                    "tokens": per_success,
+                    "over_passed_tasks": passed_tasks.len(),
+                    "usage_reported_for": tokens_reported,
+                }),
+            );
+            metric_lines.push(format!(
+                "  {agent} tokens/verified-success: {per_success} (usage reported for \
+                 {tokens_reported}/{} passed)",
+                passed_tasks.len()
+            ));
+        }
+        if cost_reported > 0 {
+            let per_success = cost_total / cost_reported as u64;
+            entry.insert(
+                "cost_per_verified_success".to_owned(),
+                serde_json::json!({
+                    "usd_micros": per_success,
+                    "over_tasks_with_reported_cost": cost_reported,
+                }),
+            );
+            metric_lines.push(format!(
+                "  {agent} cost/verified-success: ${:.4} (cost reported for {cost_reported} passed)",
+                per_success as f64 / 1_000_000.0
+            ));
+        }
+        if est_reported > 0 {
+            let per_success = est_total / est_reported as u64;
+            entry.insert(
+                "cost_estimate_per_verified_success".to_owned(),
+                serde_json::json!({
+                    "usd_micros": per_success,
+                    "over_tasks_with_reported_split": est_reported,
+                    "basis": "measured token split priced at the provider's published rates — an estimate, not a measurement",
+                }),
+            );
+            metric_lines.push(format!(
+                "  {agent} cost-estimate/verified-success: ${:.4} (published-rate estimate over {est_reported} passed)",
+                per_success as f64 / 1_000_000.0
+            ));
+        }
+        if !entry.is_empty() {
+            agent_metrics.insert(agent.clone(), serde_json::Value::Object(entry));
+        }
+    }
+    let mut report = serde_json::json!({
         "mode": mode,
         "kind": if mode == "offline" { "mechanical validation (scripted gold trajectories; says nothing about model quality)" } else { "live model quality (agents given prompts only; the verification command is the judge)" },
         "tasks": results.len(),
@@ -704,17 +1024,26 @@ pub fn summarize(mode: &str, results: &[TaskResult]) -> (serde_json::Value, Stri
         "skipped": skipped,
         "results": results,
     });
+    if !agent_metrics.is_empty() {
+        report["per_agent_usage"] = serde_json::Value::Object(agent_metrics);
+    }
     let mut lines = vec![format!(
         "{mode}: {}/{} passed, {failed} failed, {skipped} skipped",
         passed,
         results.len()
     )];
+    lines.extend(metric_lines);
     for result in results {
         if result.outcome != "passed" {
             lines.push(format!(
-                "  {} [{}] {}: {}",
+                "  {} [{}]{} {}: {}",
                 result.id,
                 result.category,
+                result
+                    .agent
+                    .as_ref()
+                    .map(|agent| format!(" ({agent})"))
+                    .unwrap_or_default(),
                 result.outcome,
                 result.reason.as_deref().unwrap_or("")
             ));
@@ -732,7 +1061,7 @@ pub fn results_dir(root: &Path) -> PathBuf {
 // CLI
 // ---------------------------------------------------------------------------
 
-pub const EVAL_USAGE: &str = "usage: rapid eval --offline [--suite <dir>] [--scratch <dir>] | rapid eval --live [--suite <dir>]
+pub const EVAL_USAGE: &str = "usage: rapid eval --offline [--suite <dir>] [--scratch <dir>] | rapid eval --live [--grant-shell] [--suite <dir>]
 
 Run the reproducible coding benchmark.
 
@@ -744,6 +1073,10 @@ Run the reproducible coding benchmark.
               with the same prompts and the same verification commands.
               Agents without a pinned, present binary are recorded as skipped;
               no comparison is claimed without actual runs on both sides.
+  --grant-shell  (live, rapid arm only) pre-approve shell_exec per scratch
+              repo — the equal-tool-surface configuration, matching a
+              competitor that auto-approves shell. Without it rapid runs
+              acceptEdits (shell denied) and the report says so.
 
 Results are written to eval/results/<mode>-<stamp>.json; exit 0 iff every
 non-skipped task passed.
@@ -791,8 +1124,9 @@ pub fn run_eval(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandErr
     let results = if offline {
         run_offline(&tasks, &scratch, trusted)
     } else {
+        let grant_shell = args.iter().any(|arg| arg == "--grant-shell");
         let self_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rapid"));
-        run_live(&tasks, &scratch, &self_exe, trusted)
+        run_live(&tasks, &scratch, &self_exe, trusted, grant_shell)
             .into_iter()
             .flat_map(|(_agent, results)| results)
             .collect::<Vec<_>>()
@@ -810,4 +1144,119 @@ pub fn run_eval(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandErr
     }
     let any_failed = results.iter().any(|result| result.outcome == "failed");
     Ok(if any_failed { 1 } else { 0 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(id: &str, agent: Option<&str>, outcome: &str, tokens: Option<u64>, cost: Option<u64>) -> TaskResult {
+        TaskResult {
+            id: id.to_owned(),
+            category: "bugfix".to_owned(),
+            outcome: outcome.to_owned(),
+            reason: None,
+            wall_ms: 1,
+            tokens,
+            cost_usd_micros: cost,
+            cost_estimate_usd_micros: None,
+            input_tokens: None,
+            cached_tokens: None,
+            output_tokens: None,
+            num_turns: None,
+            agent: agent.map(|a| a.to_owned()),
+        }
+    }
+
+    #[test]
+    fn grok_usage_json_yields_tokens_cost_and_turns() {
+        // Verbatim shape from a live grok CLI `--output-format json` run.
+        let stdout = r#"{
+  "text": "OK",
+  "stopReason": "end_turn",
+  "sessionId": "01a0a130",
+  "usage": {"input_tokens": 5961, "cache_read_input_tokens": 10496, "output_tokens": 34, "reasoning_tokens": 29, "total_tokens": 16491},
+  "num_turns": 1,
+  "total_cost_usd": 0.00590716,
+  "total_cost_usd_ticks": 59071600
+}"#;
+        let usage = parse_grok_usage(stdout).expect("parses");
+        assert_eq!(usage.tokens, Some(16491));
+        assert_eq!(usage.num_turns, Some(1));
+        // ticks / 10_000, truncated: 59071600 / 10_000 = 5907 micros.
+        assert_eq!(usage.cost_usd_micros, Some(5907));
+    }
+
+    #[test]
+    fn grok_error_object_reports_no_usage() {
+        let stdout = r#"{"type":"error","message":"Couldn't set model: unknown model id"}"#;
+        assert_eq!(parse_grok_usage(stdout), None);
+    }
+
+    #[test]
+    fn rapid_usage_file_parses_and_null_cost_stays_unknown() {
+        let usage = parse_rapid_usage_file(
+            r#"{"tokens":4321,"cost_usd_micros":null,"input_tokens":4000,"cached_tokens":3200,"output_tokens":321,"tool_calls":6,"status":"Completed"}"#,
+        )
+        .expect("parses");
+        assert_eq!(usage.tokens, Some(4321));
+        assert_eq!(usage.cost_usd_micros, None, "null is unknown, never free");
+        assert_eq!(usage.input_tokens, Some(4000));
+        assert_eq!(usage.cached_tokens, Some(3200));
+        assert_eq!(usage.output_tokens, Some(321));
+        assert_eq!(parse_rapid_usage_file("not json"), None);
+        // Published-rate estimate: (4000-3200)×$2/M + 3200×$0.5/M + 321×$6/M
+        // = 800×2 + 3200×0.5 + 321×6 micros = 1600 + 1600 + 1926 = 5126.
+        assert_eq!(estimate_cost_micros(&usage), Some(5126));
+        // No split reported: no estimate rather than a fabricated one.
+        let bare = parse_rapid_usage_file(r#"{"tokens":99,"cost_usd_micros":null}"#).expect("parses");
+        assert_eq!(estimate_cost_micros(&bare), None);
+    }
+
+    #[test]
+    fn summarize_reports_usage_per_agent_and_never_across_agents() {
+        let results = vec![
+            task("a-1", Some("rapid"), "passed", Some(1000), None),
+            task("a-2", Some("rapid"), "passed", Some(3000), None),
+            task("a-3", Some("rapid"), "failed", Some(999_999), None),
+            task("g-1", Some("grok"), "passed", Some(500), Some(1000)),
+            task("g-2", Some("grok"), "passed", Some(1500), Some(3000)),
+            task("g-3", Some("grok"), "failed", Some(777), Some(999)),
+        ];
+        let (report, lines) = summarize("live", &results);
+        let per_agent = report["per_agent_usage"].as_object().expect("per-agent block");
+        // rapid: usage only, (1000+3000)/2 = 2000 tokens per success; no
+        // cost entry (provider reported none) and the failed task's spend
+        // never leaks into the rate.
+        let rapid = &per_agent["rapid"];
+        assert_eq!(
+            rapid["tokens_per_verified_success"]["tokens"].as_u64(),
+            Some(2000)
+        );
+        assert!(rapid.get("cost_per_verified_success").is_none());
+        // grok: (500+1500)/2 = 1000 tokens; (1000+3000)/2 = 2000 micros.
+        let grok = &per_agent["grok"];
+        assert_eq!(grok["tokens_per_verified_success"]["tokens"].as_u64(), Some(1000));
+        assert_eq!(
+            grok["cost_per_verified_success"]["usd_micros"].as_u64(),
+            Some(2000)
+        );
+        assert_eq!(
+            grok["cost_per_verified_success"]["over_tasks_with_reported_cost"].as_u64(),
+            Some(2)
+        );
+        // The human summary names each metric line with its agent.
+        assert!(lines.contains("rapid tokens/verified-success: 2000"));
+        assert!(lines.contains("grok cost/verified-success: $0.0020"));
+        // Failure lines carry the agent so the report is attributable.
+        assert!(lines.contains("a-3 [bugfix] (rapid) failed"));
+    }
+
+    #[test]
+    fn summarize_without_usage_reports_no_metrics() {
+        let results = vec![task("x-1", None, "passed", None, None)];
+        let (report, lines) = summarize("offline", &results);
+        assert!(report.get("per_agent_usage").is_none());
+        assert_eq!(lines.lines().count(), 1, "only the headline, no metric lines");
+    }
 }
