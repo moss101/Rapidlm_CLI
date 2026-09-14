@@ -1,0 +1,506 @@
+{
+  "failed": 15,
+  "kind": "live model quality (agents given prompts only; the verification command is the judge)",
+  "mode": "live",
+  "passed": 64,
+  "results": [
+    {
+      "category": "bugfix",
+      "id": "bugfix-001",
+      "outcome": "passed",
+      "wall_ms": 116816
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-002",
+      "outcome": "passed",
+      "wall_ms": 49920
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-003",
+      "outcome": "failed",
+      "reason": "rapid exited non-zero:  [stderr] context retrieval: 2 block(s) proactively retrieved tool repo_glob: ok (stats.py test_stats.py) tool workspace_read: ok (from stats import mean assert mean([1, 2, 3]) == 2 print('OK') ) tool workspace_read: ok (def mean(xs):     return sum(xs) / (len(xs) + 1) ) tool shell_exec: denied (she",
+      "wall_ms": 362089
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-004",
+      "outcome": "passed",
+      "wall_ms": 38910
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-005",
+      "outcome": "passed",
+      "wall_ms": 36684
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-006",
+      "outcome": "passed",
+      "wall_ms": 26895
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-007",
+      "outcome": "passed",
+      "wall_ms": 166863
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-008",
+      "outcome": "passed",
+      "wall_ms": 28547
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-009",
+      "outcome": "passed",
+      "wall_ms": 30743
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-010",
+      "outcome": "passed",
+      "wall_ms": 114750
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-011",
+      "outcome": "failed",
+      "reason": "rapid exited non-zero:  [stderr] context retrieval: 3 block(s) proactively retrieved tool repo_glob: ok (client.py config.py test_config.py worker.py) tool workspace_read: ok (import config  def value():     return config.TIMEOUT ) tool workspace_read: ok (from client import value from worker import current assert value()",
+      "wall_ms": 182590
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-012",
+      "outcome": "passed",
+      "wall_ms": 33681
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-013",
+      "outcome": "passed",
+      "wall_ms": 41927
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-014",
+      "outcome": "passed",
+      "wall_ms": 43714
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-015",
+      "outcome": "passed",
+      "wall_ms": 29691
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-016",
+      "outcome": "passed",
+      "wall_ms": 28949
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-017",
+      "outcome": "failed",
+      "reason": "rapid exited non-zero:  [stderr] context retrieval: 3 block(s) proactively retrieved tool repo_glob: ok (client.py config.py test_config.py worker.py) tool workspace_read: ok (import config  def value():     return config.SCHEME ) tool workspace_read: ok (import config  def current():     return config.SCHEME ) tool works",
+      "wall_ms": 153815
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-018",
+      "outcome": "failed",
+      "reason": "rapid exited non-zero:  [stderr] context retrieval: 3 block(s) proactively retrieved tool repo_glob: ok (client.py config.py test_config.py worker.py) tool repo_read: ok (VERSION = 1 [end of file: lines 1-1 of 1]) tool repo_read: ok (import config  def value():     return config.VERSION [end of file: lines 1-4 of 4]) tool",
+      "wall_ms": 147430
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-027",
+      "outcome": "failed",
+      "reason": "rapid exited non-zero:  [stderr] context retrieval: 3 block(s) proactively retrieved tool shell_exec: denied (shell_exec denied: requires approval, which no surface in this build can prompt for yet; pre-approve it with `rapid permissions allow <tool>`, or a `permissions.allow` entry in .rapidlm/settings.json, or set RAPID",
+      "wall_ms": 206124
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-028",
+      "outcome": "failed",
+      "reason": "rapid exited non-zero:  [stderr] context retrieval: 3 block(s) proactively retrieved tool shell_exec: denied (shell_exec denied: requires approval, which no surface in this build can prompt for yet; pre-approve it with `rapid permissions allow <tool>`, or a `permissions.allow` entry in .rapidlm/settings.json, or set RAPID",
+      "wall_ms": 256671
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-029",
+      "outcome": "passed",
+      "wall_ms": 97502
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-030",
+      "outcome": "passed",
+      "wall_ms": 178423
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-031",
+      "outcome": "failed",
+      "reason": "rapid exited non-zero:  [stderr] context retrieval: 3 block(s) proactively retrieved tool shell_exec: denied (shell_exec denied: requires approval, which no surface in this build can prompt for yet; pre-approve it with `rapid permissions allow <tool>`, or a `permissions.allow` entry in .rapidlm/settings.json, or set RAPID",
+      "wall_ms": 239198
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-032",
+      "outcome": "failed",
+      "reason": "rapid exited non-zero:  [stderr] context retrieval: 3 block(s) proactively retrieved tool shell_exec: denied (shell_exec denied: requires approval, which no surface in this build can prompt for yet; pre-approve it with `rapid permissions allow <tool>`, or a `permissions.allow` entry in .rapidlm/settings.json, or set RAPID",
+      "wall_ms": 229485
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-033",
+      "outcome": "passed",
+      "wall_ms": 112165
+    },
+    {
+      "category": "tests",
+      "id": "tests-019",
+      "outcome": "passed",
+      "wall_ms": 203672
+    },
+    {
+      "category": "tests",
+      "id": "tests-020",
+      "outcome": "failed",
+      "reason": "rapid exited non-zero:  [stderr] context retrieval: 2 block(s) proactively retrieved tool repo_glob: ok (numutil.py) tool repo_search: ok (numutil.py:5: def sign(x):) tool repo_read: ok (def clamp(x, lo, hi):     return max(lo, min(hi, x))   def sign(x):     return (x > 0) - (x < 0)  [end of file: lines 1-7 of 7]) tool re",
+      "wall_ms": 215511
+    },
+    {
+      "category": "tests",
+      "id": "tests-021",
+      "outcome": "failed",
+      "reason": "rapid exited non-zero:  [stderr] context retrieval: 4 block(s) proactively retrieved tool repo_glob: ok (strutil.py) tool repo_glob: ok (strutil.py) tool workspace_read: ok (def split_words(s):     return s.split()   def join_words(ws):     return ' '.join(ws)  ) tool repo_search: ok (no matches for \"strutil\" (hits beyond",
+      "wall_ms": 220591
+    },
+    {
+      "category": "tests",
+      "id": "tests-022",
+      "outcome": "failed",
+      "reason": "rapid exited non-zero:  [stderr] context retrieval: 2 block(s) proactively retrieved tool repo_glob: ok (logutil.py) tool repo_search: ok (logutil.py:5: def enabled(n):) tool repo_search: ok (logutil.py:1: def level_name(n):) tool repo_read: ok (def level_name(n):     return {10: 'DEBUG', 20: 'INFO'}.get(n, 'OTHER')   def",
+      "wall_ms": 216378
+    },
+    {
+      "category": "tests",
+      "id": "tests-023",
+      "outcome": "passed",
+      "wall_ms": 120854
+    },
+    {
+      "category": "tests",
+      "id": "tests-024",
+      "outcome": "passed",
+      "wall_ms": 119721
+    },
+    {
+      "category": "tests",
+      "id": "tests-025",
+      "outcome": "passed",
+      "wall_ms": 99442
+    },
+    {
+      "category": "tests",
+      "id": "tests-026",
+      "outcome": "passed",
+      "wall_ms": 114779
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-034",
+      "outcome": "failed",
+      "reason": "rapid exited non-zero:  [stderr] context retrieval: 1 block(s) proactively retrieved tool shell_exec: denied (shell_exec denied: requires approval, which no surface in this build can prompt for yet; pre-approve it with `rapid permissions allow <tool>`, or a `permissions.allow` entry in .rapidlm/settings.json, or set RAPID",
+      "wall_ms": 292692
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-035",
+      "outcome": "failed",
+      "reason": "rapid exited non-zero:  [stderr] context retrieval: 1 block(s) proactively retrieved tool repo_glob: ok (playbook.json) tool repo_glob: ok (playbook.json) tool workspace_read: ok ({   \"name\": \"broken-1\",   \"steps\": [     {       \"key\": \"a\",       \"kind\": \"task\",       \"label\": \"a\",       \"depends_on\": [         \"b\"       ",
+      "wall_ms": 286524
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-036",
+      "outcome": "failed",
+      "reason": "rapid exited non-zero:  [stderr] context retrieval: 1 block(s) proactively retrieved tool repo_read: ok ({   \"name\": \"broken-2\",   \"steps\": [     {       \"key\": \"a\",       \"kind\": \"task\",       \"label\": \"a\",       \"depends_on\": [         \"b\"       ]     },     {       \"key\": \"b\",       \"kind\": \"task\",       \"label\": \"b\", ",
+      "wall_ms": 218498
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-037",
+      "outcome": "passed",
+      "wall_ms": 95396
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-038",
+      "outcome": "skipped",
+      "reason": "rapid exited non-zero:  [stderr] context retrieval: 1 block(s) proactively retrieved tool repo_glob: ok (playbook.json) tool repo_search: ok (no matches for \"playbook.json\" (hits beyond offset skipped: 0)) tool workspace_read: ok ({   \"name\": \"broken-4\",   \"steps\": [     {       \"key\": \"a\",       \"kind\": \"task\",       \"la",
+      "wall_ms": 235064
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-039",
+      "outcome": "failed",
+      "reason": "rapid exited non-zero:  [stderr] context retrieval: 1 block(s) proactively retrieved tool shell_exec: denied (shell_exec denied: requires approval, which no surface in this build can prompt for yet; pre-approve it with `rapid permissions allow <tool>`, or a `permissions.allow` entry in .rapidlm/settings.json, or set RAPID",
+      "wall_ms": 180081
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-040",
+      "outcome": "passed",
+      "wall_ms": 127037
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-001",
+      "outcome": "passed",
+      "wall_ms": 37866
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-002",
+      "outcome": "passed",
+      "wall_ms": 16609
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-003",
+      "outcome": "passed",
+      "wall_ms": 66611
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-004",
+      "outcome": "passed",
+      "wall_ms": 15391
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-005",
+      "outcome": "passed",
+      "wall_ms": 14555
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-006",
+      "outcome": "passed",
+      "wall_ms": 18278
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-007",
+      "outcome": "passed",
+      "wall_ms": 27220
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-008",
+      "outcome": "passed",
+      "wall_ms": 29378
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-009",
+      "outcome": "passed",
+      "wall_ms": 134176
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-010",
+      "outcome": "passed",
+      "wall_ms": 33090
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-011",
+      "outcome": "passed",
+      "wall_ms": 13708
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-012",
+      "outcome": "passed",
+      "wall_ms": 19093
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-013",
+      "outcome": "passed",
+      "wall_ms": 19324
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-014",
+      "outcome": "passed",
+      "wall_ms": 19944
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-015",
+      "outcome": "passed",
+      "wall_ms": 16445
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-016",
+      "outcome": "passed",
+      "wall_ms": 17489
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-017",
+      "outcome": "passed",
+      "wall_ms": 15789
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-018",
+      "outcome": "passed",
+      "wall_ms": 14378
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-027",
+      "outcome": "passed",
+      "wall_ms": 20139
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-028",
+      "outcome": "passed",
+      "wall_ms": 40700
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-029",
+      "outcome": "passed",
+      "wall_ms": 24230
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-030",
+      "outcome": "passed",
+      "wall_ms": 22376
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-031",
+      "outcome": "passed",
+      "wall_ms": 19285
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-032",
+      "outcome": "passed",
+      "wall_ms": 15778
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-033",
+      "outcome": "passed",
+      "wall_ms": 18232
+    },
+    {
+      "category": "tests",
+      "id": "tests-019",
+      "outcome": "passed",
+      "wall_ms": 88897
+    },
+    {
+      "category": "tests",
+      "id": "tests-020",
+      "outcome": "passed",
+      "wall_ms": 46670
+    },
+    {
+      "category": "tests",
+      "id": "tests-021",
+      "outcome": "passed",
+      "wall_ms": 27360
+    },
+    {
+      "category": "tests",
+      "id": "tests-022",
+      "outcome": "passed",
+      "wall_ms": 23189
+    },
+    {
+      "category": "tests",
+      "id": "tests-023",
+      "outcome": "passed",
+      "wall_ms": 26124
+    },
+    {
+      "category": "tests",
+      "id": "tests-024",
+      "outcome": "passed",
+      "wall_ms": 50988
+    },
+    {
+      "category": "tests",
+      "id": "tests-025",
+      "outcome": "passed",
+      "wall_ms": 52292
+    },
+    {
+      "category": "tests",
+      "id": "tests-026",
+      "outcome": "passed",
+      "wall_ms": 82111
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-034",
+      "outcome": "passed",
+      "wall_ms": 116936
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-035",
+      "outcome": "passed",
+      "wall_ms": 55378
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-036",
+      "outcome": "passed",
+      "wall_ms": 103959
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-037",
+      "outcome": "passed",
+      "wall_ms": 48305
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-038",
+      "outcome": "passed",
+      "wall_ms": 130826
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-039",
+      "outcome": "passed",
+      "wall_ms": 61774
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-040",
+      "outcome": "passed",
+      "wall_ms": 78664
+    }
+  ],
+  "skipped": 1,
+  "tasks": 80
+}

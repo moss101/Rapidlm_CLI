@@ -172,17 +172,18 @@ Six live runs completed against a real model endpoint (grok-build-0.1 via
 x.ai — the same model the Grok CLI drives, satisfying the same-model
 requirement):
 
-- **rapid** (acceptEdits): 25/40 and 17/40 across credential-clean runs —
-  genuine model non-determinism. Failure clusters: `recovery` pipelines,
-  three `tests` tasks, and the `workflow` tasks (which need a shell call
-  that acceptEdits denies). Two further windows were invalidated by the
-  grok CLI's rotating OIDC token expiring mid-run (all-skip and
-  partial-auth-failure runs, recorded honestly).
+- **rapid** (acceptEdits): 24/40 and 25/40 across credential-clean runs —
+  genuine model non-determinism. Failure clusters: `recovery` pipelines and
+  `workflow` tasks (9 of 16 non-passes in the definitive run were `shell_exec`
+  denials under acceptEdits), three `tests` tasks, three `multifile` tasks.
+  Two further windows were invalidated by the grok CLI's rotating OIDC token
+  expiring mid-run (all-skip and partial-auth-failure runs, recorded honestly).
 - **grok CLI 1.0.30** (`--always-approve -p`, the comparable auto-approval
-  configuration): 40/40, twice. Its native auto-approval covers shell, which
-  the recovery/workflow tasks need. One earlier run failed 0/40 to a harness
-  argv bug (prompt consumed by a flag value) — retained as a harness finding,
-  fixed.
+  configuration): 40/40, three times — including the definitive same-window
+  run (combined 64/80, `eval/results/live-1789401760.json`). Its native
+  auto-approval covers shell, which the recovery/workflow tasks need. One
+  earlier run failed 0/40 to a harness argv bug (prompt consumed by a flag
+  value) — retained as a harness finding, fixed.
 - **Qwen Code 0.22.2**: free tier discontinued 2026-04-15 — all tasks
   skipped, recorded with that reason.
 - **Fresh-user walkthrough** (pristine HOME): doctor 9 checks → trust grant →
