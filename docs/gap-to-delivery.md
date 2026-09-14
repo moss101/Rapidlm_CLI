@@ -199,9 +199,26 @@ Legend: `[x]` closed with evidence · `[~]` partial (named limitation) · `[ ]` 
   example) → trust → the permission ladder (permissions allow / modes) → sandbox
   levels → the exit-code table (test-asserted); this session's scripted
   walkthrough exercised exactly that path end to end with a live model endpoint.
+- `[x]` **Self-update with failure recovery** — `rapid update` (registered
+  subcommand, `apps/rapid/src/update_serve.rs`): fetches a release manifest
+  (`{version, sha256, url}`; https-only fetch), refuses downgrades unless
+  `--force`, verifies the artifact checksum BEFORE touching anything, smoke-runs
+  the staged binary (`--version` must report the manifest version), swaps
+  atomically, and rolls the old binary back if the smoke run fails. Five
+  lifecycle tests on executable fixtures: clean swap, checksum refusal,
+  wrong-version staged artifact rollback, downgrade refusal, bounded manifest
+  parsing. Signed manifests are surfaced for user verification (signing keys
+  are operator credentials this binary does not hold).
+- `[x]` **SBOM + provenance** — `rapid release-manifest <version> <artifacts…>`
+  now embeds a CycloneDX SBOM read from Cargo.lock (248 components for this
+  workspace, live-checked) and a provenance block (commit via
+  `RAPIDLM_BUILD_COMMIT`, builder, timestamp).
+- `[x]` **Release notes + RC draft** — `docs/RELEASE-NOTES-0.1.0-rc1.md`:
+  highlights, honest limitations (streaming, credentials, signing), platform
+  table, upgrade path. Publication stays the final approval step.
 - `[~]` 3-target release workflow with SHA-256 checksums + smoke steps remains;
-  install docs match artifacts. Still open: code signing beyond checksums,
-  SBOM/provenance, self-update path. Publication stays an explicit approval step.
+  install docs match artifacts. Code signing beyond checksums requires signing
+  infrastructure (approval-gated credentials).
 
 ## Sequencing (updated)
 
