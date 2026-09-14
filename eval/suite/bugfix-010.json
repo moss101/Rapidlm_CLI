@@ -1,0 +1,14 @@
+{
+  "id": "bugfix-010",
+  "category": "bugfix",
+  "prompt": "test_strs.py currently fails. Read strs.py, find and fix the bug (known symptom: title_case(\"hello world\") returns \"Hello world\" lowercased after the first letter... it must not lowercase the rest), and make test_strs.py pass. Do not change the test.",
+  "setup": {
+    "strs.py": "def title_case(s):\n    return s.capitalize().lower()\n",
+    "test_strs.py": "from strs import title_case\nassert title_case(\"hello world\") == \"Hello world\"\nprint('OK')\n"
+  },
+  "gold": {
+    "strs.py": "def title_case(s):\n    return s.capitalize()\n"
+  },
+  "verify": "python3 -B test_strs.py",
+  "verify_fails_before": true
+}

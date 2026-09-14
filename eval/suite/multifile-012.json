@@ -1,0 +1,16 @@
+{
+  "id": "multifile-012",
+  "category": "multifile",
+  "prompt": "The requirement changed: config.RETRIES must be 3 (it is 1). Update config.py, keep client.py and worker.py working, and make the check pass: python3 -B -c 'import config, sys; sys.exit(0 if config.RETRIES == 3 else 1)' && python3 -B test_config.py",
+  "setup": {
+    "config.py": "RETRIES = 1\n",
+    "client.py": "import config\n\ndef value():\n    return config.RETRIES\n",
+    "worker.py": "import config\n\ndef current():\n    return config.RETRIES\n",
+    "test_config.py": "from client import value\nfrom worker import current\nassert value() == current(), 'modules disagree'\nprint('OK')\n"
+  },
+  "gold": {
+    "config.py": "RETRIES = 3\n"
+  },
+  "verify": "python3 -B -c 'import config, sys; sys.exit(0 if config.RETRIES == 3 else 1)' && python3 -B test_config.py",
+  "verify_fails_before": true
+}

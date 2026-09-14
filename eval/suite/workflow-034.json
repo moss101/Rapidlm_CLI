@@ -1,0 +1,13 @@
+{
+  "id": "workflow-034",
+  "category": "workflow",
+  "prompt": "playbook.json fails to compile because its dependencies form a cycle. Replace it with a valid two-step playbook: a `task` step named build, and a `verification` step named check that depends on build and runs `true`. Verify with: {RAPID} playbook-compile playbook.json",
+  "setup": {
+    "playbook.json": "{\n  \"name\": \"broken-0\",\n  \"steps\": [\n    {\n      \"key\": \"a\",\n      \"kind\": \"task\",\n      \"label\": \"a\",\n      \"depends_on\": [\n        \"b\"\n      ]\n    },\n    {\n      \"key\": \"b\",\n      \"kind\": \"task\",\n      \"label\": \"b\",\n      \"depends_on\": [\n        \"a\"\n      ]\n    }\n  ]\n}"
+  },
+  "gold": {
+    "playbook.json": "{\n  \"name\": \"fixed-0\",\n  \"steps\": [\n    {\n      \"key\": \"build\",\n      \"kind\": \"task\",\n      \"label\": \"build the artifact\"\n    },\n    {\n      \"key\": \"check\",\n      \"kind\": \"verification\",\n      \"label\": \"check the artifact\",\n      \"depends_on\": [\n        \"build\"\n      ],\n      \"command\": \"true\"\n    }\n  ]\n}"
+  },
+  "verify": "{RAPID} playbook-compile playbook.json > /dev/null",
+  "verify_fails_before": true
+}

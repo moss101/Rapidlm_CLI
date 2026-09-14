@@ -63,6 +63,9 @@ fn node_kind_from_str(raw: &str) -> Option<NodeKind> {
         "approval" => Some(NodeKind::Approval),
         "artifact" => Some(NodeKind::Artifact),
         "claim" => Some(NodeKind::Claim),
+        "verification" => Some(NodeKind::Verification),
+        "join" => Some(NodeKind::Join),
+        "human_control" => Some(NodeKind::HumanControl),
         _ => None,
     }
 }

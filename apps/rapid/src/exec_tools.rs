@@ -13649,7 +13649,9 @@ mod sandbox_truth_tests {
         )
         .unwrap();
         let validated = tools.validate(&call, &CancellationToken::new()).unwrap();
-        let outcome = tools.execute(&validated, &CancellationToken::new()).unwrap();
+        let outcome = tools
+            .execute(&validated, &CancellationToken::new())
+            .unwrap();
         let detail = match &outcome {
             ToolStepResult::Failed { detail, .. } => detail.clone().unwrap_or_default(),
             other => panic!("expected a fail-closed refusal, got {other:?}"),

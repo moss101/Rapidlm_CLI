@@ -1,0 +1,14 @@
+{
+  "id": "bugfix-005",
+  "category": "bugfix",
+  "prompt": "test_calc.py currently fails. Read calc.py, find and fix the bug (known symptom: mul(4, 2) returns 6; it must return 8), and make test_calc.py pass. Do not change the test.",
+  "setup": {
+    "calc.py": "def mul(a, b):\n    return a + b\n",
+    "test_calc.py": "from calc import mul\nassert mul(4, 2) == 8\nprint('OK')\n"
+  },
+  "gold": {
+    "calc.py": "def mul(a, b):\n    return a * b\n"
+  },
+  "verify": "python3 -B test_calc.py",
+  "verify_fails_before": true
+}

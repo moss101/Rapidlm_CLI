@@ -1,0 +1,13 @@
+{
+  "id": "tests-025",
+  "category": "tests",
+  "prompt": "dictutil.py has no tests. Write test_dictutil.py that imports every public function (merge, invert) and asserts their documented behavior, then make it pass.",
+  "setup": {
+    "dictutil.py": "def merge(a, b):\n    return {**a, **b}\n\n\ndef invert(d):\n    return {v: k for k, v in d.items()}\n\n"
+  },
+  "gold": {
+    "test_dictutil.py": "from dictutil import merge, invert\nassert merge({\"a\": 1}, {\"b\": 2}) == {\"a\": 1, \"b\": 2}\nassert invert({\"a\": 1}) == {1: \"a\"}\nprint('OK')\n"
+  },
+  "verify": "python3 -B test_dictutil.py",
+  "verify_fails_before": true
+}

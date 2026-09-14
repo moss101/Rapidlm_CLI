@@ -1,0 +1,15 @@
+{
+  "id": "recovery-027",
+  "category": "recovery",
+  "prompt": "sh run.sh fails partway through the pipeline. Diagnose the failure, repair it, and make sh run.sh print PIPELINE-OK.",
+  "setup": {
+    "pipeline.py": "raw = open('input.txt').read()\nPROCESSED = raw.strip().upper()\nopen('out/result.txt', 'w').write(PROCESSED)\n",
+    "input.txt": "hello pipeline\n",
+    "run.sh": "python3 -B pipeline.py && test -s out/result.txt && echo PIPELINE-OK\n"
+  },
+  "gold": {
+    "pipeline.py": "import os\nraw = open('input.txt').read()\nPROCESSED = raw.strip().upper()\nos.makedirs('out', exist_ok=True)\nopen('out/result.txt', 'w').write(PROCESSED)\n"
+  },
+  "verify": "sh run.sh | grep PIPELINE-OK",
+  "verify_fails_before": true
+}

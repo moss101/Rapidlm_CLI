@@ -1,0 +1,14 @@
+{
+  "id": "bugfix-003",
+  "category": "bugfix",
+  "prompt": "test_stats.py currently fails. Read stats.py, find and fix the bug (known symptom: mean([1, 2, 3]) returns 2.0... wrong: it must return 2), and make test_stats.py pass. Do not change the test.",
+  "setup": {
+    "stats.py": "def mean(xs):\n    return sum(xs) / (len(xs) + 1)\n",
+    "test_stats.py": "from stats import mean\nassert mean([1, 2, 3]) == 2\nprint('OK')\n"
+  },
+  "gold": {
+    "stats.py": "def mean(xs):\n    return sum(xs) / len(xs)\n"
+  },
+  "verify": "python3 -B test_stats.py",
+  "verify_fails_before": true
+}

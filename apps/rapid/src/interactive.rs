@@ -227,7 +227,10 @@ enum LoopControl {
 /// Classify argv after the program name. Flags do not select a subcommand.
 pub fn classify_launch<S: AsRef<str>>(args: &[S]) -> LaunchMode {
     // `--version`/`-V` anywhere prints the version; it takes no subcommand.
-    if args.iter().any(|arg| matches!(arg.as_ref(), "--version" | "-V")) {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_ref(), "--version" | "-V"))
+    {
         return LaunchMode::Version;
     }
     // `--help` before any subcommand word prints the top-level usage; after
@@ -406,10 +409,7 @@ pub fn run() -> Result<i32, InteractiveError> {
             Ok(0)
         }
         LaunchMode::Version => {
-            println!(
-                "rapid {} (RapidLM CLI)",
-                env!("CARGO_PKG_VERSION")
-            );
+            println!("rapid {} (RapidLM CLI)", env!("CARGO_PKG_VERSION"));
             Ok(0)
         }
         LaunchMode::Interactive => {
@@ -582,6 +582,13 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         summary: "one-shot/headless agent turn",
         own_help: true,
         handler: SubcommandHandler::Native(exec_subcommand),
+    },
+    Subcommand {
+        name: "eval",
+        operands: "--offline | --live",
+        summary: "reproducible coding benchmark",
+        own_help: true,
+        handler: SubcommandHandler::P9(crate::eval_serve::run_eval),
     },
     Subcommand {
         name: "daemon",

@@ -1,0 +1,13 @@
+{
+  "id": "tests-021",
+  "category": "tests",
+  "prompt": "strutil.py has no tests. Write test_strutil.py that imports every public function (split_words, join_words) and asserts their documented behavior, then make it pass.",
+  "setup": {
+    "strutil.py": "def split_words(s):\n    return s.split()\n\n\ndef join_words(ws):\n    return ' '.join(ws)\n\n"
+  },
+  "gold": {
+    "test_strutil.py": "from strutil import split_words, join_words\nassert split_words(\"a b\") == [\"a\", \"b\"]\nassert join_words([\"a\", \"b\"]) == \"a b\"\nprint('OK')\n"
+  },
+  "verify": "python3 -B test_strutil.py",
+  "verify_fails_before": true
+}

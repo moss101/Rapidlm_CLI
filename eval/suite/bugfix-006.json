@@ -1,0 +1,14 @@
+{
+  "id": "bugfix-006",
+  "category": "bugfix",
+  "prompt": "test_strs.py currently fails. Read strs.py, find and fix the bug (known symptom: repeat(\"ab\", 2) returns \"ab-ab\"; it must return \"abab\"), and make test_strs.py pass. Do not change the test.",
+  "setup": {
+    "strs.py": "def repeat(s, n):\n    return \"-\".join([s] * n)\n",
+    "test_strs.py": "from strs import repeat\nassert repeat(\"ab\", 2) == \"abab\"\nprint('OK')\n"
+  },
+  "gold": {
+    "strs.py": "def repeat(s, n):\n    return s * n\n"
+  },
+  "verify": "python3 -B test_strs.py",
+  "verify_fails_before": true
+}

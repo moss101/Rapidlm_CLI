@@ -1,0 +1,14 @@
+{
+  "id": "bugfix-004",
+  "category": "bugfix",
+  "prompt": "test_lists.py currently fails. Read lists.py, find and fix the bug (known symptom: drop_last([1, 2, 3]) drops the FIRST item; it must drop the last), and make test_lists.py pass. Do not change the test.",
+  "setup": {
+    "lists.py": "def drop_last(xs):\n    return xs[1:]\n",
+    "test_lists.py": "from lists import drop_last\nassert drop_last([1, 2, 3]) == [1, 2]\nprint('OK')\n"
+  },
+  "gold": {
+    "lists.py": "def drop_last(xs):\n    return xs[:-1]\n"
+  },
+  "verify": "python3 -B test_lists.py",
+  "verify_fails_before": true
+}

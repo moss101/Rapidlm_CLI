@@ -10,6 +10,7 @@ pub mod computer_runtime;
 pub mod context_retrieval;
 pub mod daemon_serve;
 pub mod doctor;
+pub mod eval_serve;
 pub mod exec_diag;
 pub mod exec_tools;
 pub mod external_agents;

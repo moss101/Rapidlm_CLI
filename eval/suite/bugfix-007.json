@@ -1,0 +1,14 @@
+{
+  "id": "bugfix-007",
+  "category": "bugfix",
+  "prompt": "test_stats.py currently fails. Read stats.py, find and fix the bug (known symptom: median(xs) returns the first element; it must return the statistical median), and make test_stats.py pass. Do not change the test.",
+  "setup": {
+    "stats.py": "def median(xs):\n    return xs[0]\n",
+    "test_stats.py": "from stats import median\nassert median([3, 1, 2]) == 2\nprint('OK')\n"
+  },
+  "gold": {
+    "stats.py": "def median(xs):\n    ys = sorted(xs)\n    n = len(ys)\n    mid = n // 2\n    if n % 2:\n        return ys[mid]\n    return (ys[mid - 1] + ys[mid]) / 2\n"
+  },
+  "verify": "python3 -B test_stats.py",
+  "verify_fails_before": true
+}
