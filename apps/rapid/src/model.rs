@@ -129,6 +129,10 @@ pub struct ConfiguredModel<'store> {
     model: ModelId,
     max_output_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
+    /// Live text-delta sink (delivery goal §2): when set, provider text
+    /// deltas stream to it while the response arrives. `None` keeps the
+    /// non-streaming path.
+    delta_sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 impl<'store> ConfiguredModel<'store> {
@@ -246,6 +250,7 @@ impl<'store> ConfiguredModel<'store> {
 
         Ok(Self {
             backend,
+            delta_sink: None,
             provider,
             model,
             max_output_tokens: active.entry.max_tokens,
@@ -261,6 +266,14 @@ impl<'store> ConfiguredModel<'store> {
     /// authoritative source for deriving this turn's context budget — never
     /// re-derive it from `active.entry` a second time at a different call
     /// site, which could silently drift from what the real request sends.
+    /// Attach the live text-delta sink. Idempotent; later calls replace.
+    pub fn set_delta_sink(
+        &mut self,
+        sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    ) {
+        self.delta_sink = sink;
+    }
+
     pub fn capabilities(&self) -> &ProviderCapabilities {
         match &self.backend {
             Backend::OpenAi(adapter) => adapter.config().capabilities(),
@@ -327,9 +340,16 @@ impl LiveModelCall for ConfiguredModel<'_> {
         // timeout. The same pattern `web_fetch::fetch_page` uses.
         let router_cancel = llm_router::provider::CancellationToken::new();
         let _bridge = ProviderCancelWatch::start(cancel.clone(), router_cancel.clone());
-        let stream = match &self.backend {
-            Backend::OpenAi(adapter) => adapter.invoke_sync(request, &router_cancel),
-            Backend::Anthropic(adapter) => adapter.invoke_sync(request, &router_cancel),
+        let stream = match (&self.backend, &self.delta_sink) {
+            (Backend::OpenAi(adapter), Some(sink)) => adapter
+                .invoke_sync_streaming(request, &router_cancel, &mut |delta| sink(delta)),
+            (Backend::OpenAi(adapter), None) => adapter.invoke_sync(request, &router_cancel),
+            (Backend::Anthropic(adapter), sink) => {
+                // Anthropic streaming requires its own SSE shape; the plain
+                // path is used and deltas are not surfaced live (documented).
+                let _ = sink;
+                adapter.invoke_sync(request, &router_cancel)
+            }
         };
         let stream = stream.map_err(map_provider_error)?;
         if cancel.is_cancelled() {
@@ -413,6 +433,13 @@ impl LiveModelCall for SelectedModel<'_> {
             Self::Configured(model) => model.step(blocks, input, cancel),
             Self::Unconfigured(fallback) => fallback.step(blocks, input, cancel),
             Self::FallbackChain(chain) => chain.step(blocks, input, cancel),
+        }
+    }
+
+    fn set_delta_sink(&mut self, sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>) {
+        match self {
+            Self::Configured(model) => model.set_delta_sink(sink),
+            _ => {}
         }
     }
 }

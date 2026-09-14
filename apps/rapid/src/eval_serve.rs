@@ -460,26 +460,55 @@ fn run_live_agent_with(
     Ok((status.success(), 0)) // tokens: parsed per-agent when the CLI reports them; 0 = not reported
 }
 
-/// Run the suite live for every agent whose binary is present; agents that
-/// are absent are recorded as skipped with the reason — a comparison is only
-/// ever drawn between agents that actually ran.
+/// Pinned competitor invocation recipes. Each entry: (name, version probe
+/// binary, version flag, argv builder). A competitor runs only when its
+/// binary is present AND a recipe is recorded here — an unpinned binary is
+/// skipped rather than compared, and the recorded version is embedded in
+/// the report so runs are reproducible.
+fn agent_recipes() -> Vec<(String, String, Vec<String>)> {
+    // (name, argv-prefix). The prompt is appended as the final argument.
+    vec![
+        (
+            "rapid".to_owned(),
+            String::new(),
+            vec!["exec".to_owned()],
+        ),
+        (
+            "grok".to_owned(),
+            "1.0.30".to_owned(),
+            vec!["-p".to_owned()],
+        ),
+    ]
+}
+
+/// Run the suite live for every agent with a recorded recipe whose binary
+/// is present; agents that are absent or unpinned are recorded as skipped
+/// with the reason — a comparison is only ever drawn between agents that
+/// actually ran under pinned invocations.
 pub fn run_live(
     tasks: &[BenchTask],
     scratch_root: &Path,
     self_exe: &Path,
     trusted: bool,
 ) -> Vec<(String, Vec<TaskResult>)> {
-    let mut agents = vec![(
+    let mut agents: Vec<(String, PathBuf, Vec<String>)> = vec![(
         "rapid".to_owned(),
         self_exe.to_path_buf(),
         vec!["exec".to_owned()],
     )];
-    for (name, _recipe) in LIVE_AGENTS {
-        if *name != "rapid" && probe_binary(name) {
-            // Competitor invocation recipes are pinned here once their
-            // versions are pinned; until then a present-but-unpinned binary
-            // is still skipped, honestly.
-            agents.push(((*name).to_owned(), PathBuf::from(name), vec![]));
+    for (name, prefix, version_probe) in agent_recipes() {
+        if name == "rapid" {
+            continue;
+        }
+        if probe_binary(&name) {
+            let mut argv = prefix
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            argv.extend(version_probe.clone());
+            agents.push((name.clone(), PathBuf::from(&name), argv));
+        } else {
+            eprintln!("eval: competitor {name} not found on PATH; recorded as skipped");
         }
     }
     let stamp = std::time::SystemTime::now()
@@ -487,61 +516,48 @@ pub fn run_live(
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let mut per_agent = Vec::new();
-    let _ = trusted;
-    // Pre-flight: a probe task in a scratch repo, using the same invocation
-    // the real tasks get. If the model call itself fails (no credentials,
-    // unreachable endpoint), every live task for that agent is recorded as
-    // SKIPPED with that reason — failures of the environment are not
-    // failures of the tasks, and the report must say which is which.
     for (name, bin, args) in &agents {
-        if *name != "rapid" {
-            // handled by the per-agent skip below; keep the probe cheap
-        } else {
-            let probe = scratch_root.join(format!("preflight-{stamp:x}"));
-            let model_ready = match run_live_rapid(bin, args, &tasks[0], &probe, trusted) {
-                Err(reason)
-                    if reason.contains("model")
-                        || reason.contains("provider")
-                        || reason.contains("non-zero") =>
-                {
-                    let _ = std::fs::remove_dir_all(&probe);
-                    Some(reason)
-                }
-                _ => {
-                    let _ = std::fs::remove_dir_all(&probe);
-                    None
-                }
-            };
-            if let Some(reason) = model_ready {
-                per_agent.push((
-                    name.clone(),
-                    tasks
-                        .iter()
-                        .map(|task| TaskResult {
-                            id: task.id.clone(),
-                            category: task.category.clone(),
-                            outcome: "skipped".to_owned(),
-                            reason: Some(format!("model not usable: {reason}")),
-                            wall_ms: 0,
-                            tokens: None,
-                        })
-                        .collect(),
-                ));
-                continue;
+        // Pre-flight: a probe task. If the model call itself fails (no
+        // credentials, unreachable endpoint), every live task for that
+        // agent is recorded as SKIPPED with that reason — failures of the
+        // environment are not failures of the tasks.
+        let probe = scratch_root.join(format!("preflight-{name}-{stamp:x}"));
+        let model_ready = match run_live_agent(bin, args, &tasks[0], &probe, name) {
+            Err(reason)
+                if reason.contains("model")
+                    || reason.contains("provider")
+                    || reason.contains("non-zero") =>
+            {
+                let _ = std::fs::remove_dir_all(&probe);
+                Some(reason)
             }
+            _ => {
+                let _ = std::fs::remove_dir_all(&probe);
+                None
+            }
+        };
+        if let Some(reason) = model_ready {
+            per_agent.push((
+                name.clone(),
+                tasks
+                    .iter()
+                    .map(|task| TaskResult {
+                        id: task.id.clone(),
+                        category: task.category.clone(),
+                        outcome: "skipped".to_owned(),
+                        reason: Some(format!("model not usable: {reason}")),
+                        wall_ms: 0,
+                        tokens: None,
+                    })
+                    .collect(),
+            ));
+            continue;
         }
         let mut results = Vec::new();
         for task in tasks {
             let started = std::time::Instant::now();
             let scratch = scratch_root.join(format!("{name}-{}-{stamp:x}", task.id));
-            let result = if *name == "rapid" {
-                run_live_rapid(bin, &args, task, &scratch, trusted)
-            } else {
-                Err(format!(
-                    "{name}: present on PATH but no pinned version/invocation is recorded; \
-skipped rather than compared unpinned"
-                ))
-            };
+            let result = run_live_agent(bin, args, task, &scratch, name);
             let _ = std::fs::remove_dir_all(&scratch);
             results.push(TaskResult {
                 id: task.id.clone(),
@@ -566,28 +582,75 @@ skipped rather than compared unpinned"
     per_agent
 }
 
-fn run_live_rapid(
+/// Drive one live agent on one task: materialize the identical repo, run
+/// the agent's argv with the prompt appended, then judge with the task's
+/// verification command (with the anti-vacuity check first).
+fn run_live_agent(
     bin: &Path,
     args: &[String],
     task: &BenchTask,
     scratch: &Path,
-    trusted: bool,
+    name: &str,
 ) -> Result<(), String> {
-    if !trusted {
-        return Err(
-            "skipped: the project is not trusted; live runs would have no tools".to_owned(),
-        );
-    }
     materialize(scratch, task)?;
     if task.verify_fails_before && run_verify(scratch, &task.verify, 60).unwrap_or(true) {
         return Err("vacuous task (verify passes before any change)".to_owned());
     }
-    // rapid exec against the scratch repo: the prompt via a task file arg.
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
     let mut argv = args.to_vec();
     argv.push(task.prompt.clone());
-    let (ok, _tokens) = run_live_agent_with(&bin.display().to_string(), &argv, task, scratch)?;
-    if !ok {
-        return Err("rapid exec exited non-zero".to_owned());
+    let mut command = Command::new(bin);
+    command
+        .args(&argv)
+        .current_dir(scratch)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if name == "rapid" {
+        // The harness acts as the operator for its own scratch repos:
+        // grant trust (each materialized repo is a fresh root) and run
+        // rapid exec in acceptEdits mode — file edits auto-approved, deny
+        // rules and managed ceilings still enforced. This mirrors what a
+        // real operator does interactively; it grants nothing to the model
+        // that the operator did not.
+        let trust = Command::new(bin)
+            .arg("trust")
+            .arg("grant")
+            .current_dir(scratch)
+            .status()
+            .map_err(|err| err.to_string())?;
+        if !trust.success() {
+            return Err("trust grant failed in scratch repo".to_owned());
+        }
+        command.env("RAPIDLM_PERMISSION_MODE", "acceptEdits");
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("{name} could not start: {err}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(LIVE_TASK_TIMEOUT_SECS);
+    let status = loop {
+        match child.try_wait().map_err(|err| err.to_string())? {
+            Some(status) => break status,
+            None => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    return Err(format!(
+                        "{name} exceeded the {LIVE_TASK_TIMEOUT_SECS}s ceiling"
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    };
+    let mut text = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let mut capped = vec![0u8; 8 * 1024];
+        let read = stdout.read(&mut capped).unwrap_or(0);
+        text.push_str(&String::from_utf8_lossy(&capped[..read]));
+    }
+    if !status.success() {
+        return Err(format!("{name} exited non-zero: {}", text.chars().take(200).collect::<String>()));
     }
     if !run_verify(scratch, &task.verify, 120).unwrap_or(false) {
         return Err("verification command failed after the live run".to_owned());

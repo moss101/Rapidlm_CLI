@@ -98,6 +98,21 @@ pub trait HttpTransport: Send + Sync {
         request: &ProviderHttpRequest<'_>,
         cancel: &CancellationToken,
     ) -> Result<ProviderHttpResponse, ProviderError>;
+
+    /// Streaming variant: like [`Self::execute`], but newly-arrived body
+    /// text is also forwarded to `on_body` as it arrives (SSE fragments
+    /// included). The returned response is still the complete, canonical
+    /// one. The default delegates to [`Self::execute`] -- no streaming --
+    /// so transports that cannot incrementally read keep working.
+    fn execute_streaming(
+        &self,
+        request: &ProviderHttpRequest<'_>,
+        cancel: &CancellationToken,
+        on_body: &mut dyn FnMut(&str),
+    ) -> Result<ProviderHttpResponse, ProviderError> {
+        let _ = on_body;
+        self.execute(request, cancel)
+    }
 }
 
 /// Materializes `Authorization` at the wire only. Must not log the bytes.
@@ -542,6 +557,147 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
 
         read_http_response(&mut stream, self.max_response_bytes, cancel, deadline)
     }
+
+    fn execute_streaming(
+        &self,
+        request: &ProviderHttpRequest<'_>,
+        cancel: &CancellationToken,
+        on_body: &mut dyn FnMut(&str),
+    ) -> Result<ProviderHttpResponse, ProviderError> {
+        cancel.check()?;
+        if request
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        {
+            return Err(ProviderError::InvalidRequest);
+        }
+
+        let parsed = parse_http_url(request.url)?;
+        if host_is_blocked(&parsed.host) {
+            return Err(ProviderError::InvalidRequest);
+        }
+
+        let addrs = (parsed.host.as_str(), parsed.port)
+            .to_socket_addrs()
+            .map_err(|_| ProviderError::Connection)?;
+        let mut selected = None;
+        for addr in addrs {
+            cancel.check()?;
+            if ip_is_blocked(addr.ip()) {
+                return Err(ProviderError::InvalidRequest);
+            }
+            if selected.is_none() {
+                selected = Some(addr);
+            }
+        }
+        let addr = selected.ok_or(ProviderError::Connection)?;
+
+        let token = self.auth.bearer_token(request.credential, cancel)?;
+        if token
+            .bytes()
+            .any(|b| b < 0x20 || b == 0x7f || b == b'\n' || b == b'\r')
+        {
+            return Err(ProviderError::InvalidRequest);
+        }
+
+        cancel.check()?;
+        let tcp = TcpStream::connect_timeout(&addr, self.timeout)
+            .map_err(|_| ProviderError::Connection)?;
+        tcp.set_read_timeout(Some(slice_timeout(self.timeout)))
+            .map_err(|_| ProviderError::Connection)?;
+        tcp.set_write_timeout(Some(slice_timeout(self.timeout)))
+            .map_err(|_| ProviderError::Connection)?;
+        tcp.set_nodelay(true)
+            .map_err(|_| ProviderError::Connection)?;
+
+        let mut stream = match parsed.scheme {
+            UrlScheme::Http => MaybeTlsStream::Plain(tcp),
+            UrlScheme::Https => {
+                let server_name = ServerName::try_from(parsed.host.to_string())
+                    .map_err(|_| ProviderError::InvalidRequest)?;
+                let connection = ClientConnection::new(Arc::clone(&TLS_CLIENT_CONFIG), server_name)
+                    .map_err(|_| ProviderError::Connection)?;
+                MaybeTlsStream::Tls(Box::new(StreamOwned::new(connection, tcp)))
+            }
+        };
+
+        let deadline = Instant::now() + self.timeout;
+        write_http_request(
+            &mut stream,
+            &parsed,
+            request.headers,
+            request.body,
+            &token,
+            cancel,
+            deadline,
+        )?;
+        drop(token);
+
+        // Headers, then incremental body: every newly-read batch feeds
+        // `on_body` while the complete raw response is returned for the
+        // canonical parse.
+        let raw = read_until_limit_opts(
+            &mut stream,
+            self.max_response_bytes + 16 * 1024,
+            cancel,
+            deadline,
+            false,
+        )?;
+        let split = find_header_body_split(&raw).ok_or(ProviderError::Permanent)?;
+        let mut body = raw[split + 4..].to_vec();
+        if !body.is_empty()
+            && let Ok(text) = std::str::from_utf8(&body)
+        {
+            on_body(text);
+        }
+        let header_text =
+            std::str::from_utf8(&raw[..split]).map_err(|_| ProviderError::Permanent)?;
+        let mut content_length: Option<usize> = None;
+        for line in header_text.split("\r\n").skip(1) {
+            if let Some((name, value)) = line.split_once(':')
+                && name.trim().eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.trim().parse::<usize>().ok();
+            }
+        }
+        let mut fed = body.len();
+        loop {
+            if body.len() >= self.max_response_bytes {
+                return Err(ProviderError::BoundExceeded);
+            }
+            let mut buf = [0u8; 2048];
+            let want = (self.max_response_bytes - body.len()).min(buf.len());
+            let n = read_some(&mut stream, &mut buf[..want], cancel, deadline)?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&buf[..n]);
+            if body.len() > fed
+                && let Ok(text) = std::str::from_utf8(&body[fed..])
+            {
+                on_body(text);
+            }
+            fed = body.len();
+            if let Some(length) = content_length
+                && body.len() >= length
+            {
+                body.truncate(length);
+                break;
+            }
+        }
+        ProviderHttpResponse::new(
+            parse_status_line(
+                std::str::from_utf8(&raw[..split])
+                    .map_err(|_| ProviderError::Permanent)?
+                    .split("\r\n")
+                    .next()
+                    .ok_or(ProviderError::Permanent)?,
+            )?,
+            Vec::new(),
+            body,
+        )
+    }
 }
 
 impl<T: HttpTransport + ?Sized> HttpTransport for Box<T> {
@@ -614,6 +770,62 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
             events,
             cancel,
         )
+
+
+    }
+    /// [`Self::invoke_sync`] with live text delivery: text deltas are
+    /// forwarded to `on_text` as they arrive from the wire (via
+    /// [`HttpTransport::execute_streaming`]) while the full response is
+    /// still parsed canonically at the end. Transports whose
+    /// `execute_streaming` is the default delegate read everything first --
+    /// the result is identical, only not incremental.
+    pub fn invoke_sync_streaming(
+        &self,
+        req: CanonicalModelRequest,
+        cancel: &CancellationToken,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<ModelStream, ProviderError> {
+        cancel.check()?;
+        validate_request(&req, &self.config)?;
+        let resolver = CredentialResolver::new(self.store);
+        let credential = resolver.resolve(
+            self.config.profile.provider(),
+            self.config.profile(),
+            cancel,
+        )?;
+        let body = encode_provider_payload(&req, self.config.endpoint.style, cancel)?;
+        let encoded = serde_json::to_vec(&body).map_err(|_| ProviderError::InvalidRequest)?;
+        if encoded.len() > MAX_HTTP_REQUEST_BYTES {
+            return Err(ProviderError::BoundExceeded);
+        }
+        let url = self.config.endpoint.request_url();
+        let request_id = req.request_id().as_str().to_owned();
+        let mut parser = SseTextDeltaParser::new();
+        let response = self.transport.execute_streaming(
+            &ProviderHttpRequest {
+                url: &url,
+                headers: &[
+                    ("content-type".to_owned(), "application/json".to_owned()),
+                    ("accept".to_owned(), "text/event-stream".to_owned()),
+                    ("x-rapidlm-request-id".to_owned(), request_id),
+                ],
+                body: &encoded,
+                credential: &credential,
+            },
+            cancel,
+            &mut |chunk| {
+                parser.feed(chunk, on_text);
+            },
+        )?;
+        classify_http_error(&response)?;
+        let events = parse_provider_stream(self.config.endpoint.style, &response.body, cancel)?;
+        ModelStream::from_events(
+            req.request_id().clone(),
+            req.model().clone(),
+            events,
+            cancel,
+        )
+
     }
 }
 
@@ -1465,6 +1677,127 @@ fn bounded_chunks(text: &str) -> Result<Vec<String>, ProviderError> {
         rest = &rest[end..];
     }
     Ok(chunks)
+}
+
+/// Incremental SSE parser for streaming bodies: `feed` consumes newly
+/// arrived text, emits text deltas for every complete `data:` block, and
+/// keeps the trailing partial block buffered. `[DONE]` and non-JSON blocks
+/// are skipped; tool-call deltas remain with the full-body canonical parse.
+pub struct SseTextDeltaParser {
+    buffer: String,
+}
+
+impl Default for SseTextDeltaParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SseTextDeltaParser {
+    pub fn new() -> Self {
+        Self {
+            buffer: String::new(),
+        }
+    }
+
+    /// Feed newly arrived text; every complete block's text delta (if any)
+    /// is forwarded to `on_text`. Returns the number of deltas emitted.
+    pub fn feed(&mut self, chunk: &str, on_text: &mut dyn FnMut(&str)) -> usize {
+        self.buffer.push_str(chunk);
+        let mut emitted = 0usize;
+        loop {
+            let Some(end) = self.buffer.find("\n\n") else {
+                break;
+            };
+            let block = self.buffer[..end].to_string();
+            self.buffer.drain(..end + 2);
+            let mut data = String::new();
+            for line in block.lines() {
+                let line = line.trim_end_matches('\r');
+                if let Some(payload) = line.strip_prefix("data:") {
+                    let payload = payload.strip_prefix(' ').unwrap_or(payload);
+                    if !data.is_empty() {
+                        data.push('\n');
+                    }
+                    data.push_str(payload);
+                }
+            }
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            if let Some(text) = value
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("delta"))
+                .and_then(Value::as_str)
+            {
+                on_text(text);
+                emitted += 1;
+            }
+        }
+        emitted
+    }
+}
+
+/// Streaming body reader: mirrors `read_http_response_impl`'s header
+/// handling, then forwards every newly-read body byte batch (UTF-8-safe
+/// per batch) while returning the complete raw response for the canonical
+/// parse. Chunked framing is decoded at completion by the caller's normal
+/// path; identity/EOF-framed SSE streams genuinely stream.
+fn read_streaming_body<S: Read + Write>(
+    stream: &mut S,
+    max_body: usize,
+    cancel: &CancellationToken,
+    deadline: Instant,
+    on_chunk: &mut dyn FnMut(&str),
+) -> Result<Vec<u8>, ProviderError> {
+    let raw = read_until_limit_opts(stream, max_body + 16 * 1024, cancel, deadline, false)?;
+    let split = find_header_body_split(&raw).ok_or(ProviderError::Permanent)?;
+    let mut body = raw[split + 4..].to_vec();
+    if !body.is_empty()
+        && let Ok(text) = std::str::from_utf8(&body)
+    {
+        on_chunk(text);
+    }
+    let header_text = std::str::from_utf8(&raw[..split]).map_err(|_| ProviderError::Permanent)?;
+    let mut content_length: Option<usize> = None;
+    for line in header_text.split("\r\n").skip(1) {
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse::<usize>().ok();
+        }
+    }
+    let mut fed = body.len();
+    loop {
+        if body.len() >= max_body {
+            return Err(ProviderError::BoundExceeded);
+        }
+        let mut buf = [0u8; 2048];
+        let want = (max_body - body.len()).min(buf.len());
+        let n = read_some(stream, &mut buf[..want], cancel, deadline)?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&buf[..n]);
+        if body.len() > fed
+            && let Ok(text) = std::str::from_utf8(&body[fed..])
+        {
+            on_chunk(text);
+        }
+        fed = body.len();
+        if let Some(length) = content_length
+            && body.len() >= length
+        {
+            body.truncate(length);
+            break;
+        }
+    }
+    Ok(raw)
 }
 
 fn sse_data_blocks(body: &str) -> Vec<String> {

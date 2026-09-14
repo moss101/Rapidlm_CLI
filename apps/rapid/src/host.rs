@@ -461,6 +461,14 @@ pub trait LiveModelCall {
         input: &ModelStepInput<'_>,
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError>;
+
+    /// Attach a live text-delta sink: every provider text delta forwards to
+    /// it while the response arrives (delivery goal §2 progressive
+    /// streaming). Default: no-op for models/drivers that do not support
+    /// live deltas (scripted, unconfigured).
+    fn set_delta_sink(&mut self, sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>) {
+        let _ = sink;
+    }
 }
 
 /// A [`ModelDriver`] bound to the host-owned live context. Reads the (possibly
