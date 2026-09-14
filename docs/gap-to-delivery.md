@@ -210,6 +210,14 @@ Legend: `[x]` closed with evidence · `[~]` partial (named limitation) · `[ ]` 
 3. ~~Workflow executor + examples + completion semantics~~ → done.
 4. §4 subagent isolation (workspace crate wiring) — next.
 5. ~~§5 ACP + daemon/SDK bridge + MCP HTTP~~ → all three entry points closed.
+   Also closed since this document's first commit: §7 (rapid eval + 40-task suite
+   + offline validation + live-mode honesty), §6 (truthful levels + fail-closed),
+   per-model capability overrides, and the fresh-user walkthrough (live: configure
+   → doctor → trust → exec change → scoped approvals → rerun → tests pass → diff
+   → --continue). Validation at this commit: rapid lib 775 + approvals_flow 6 +
+   6 agent_views + eval module 6, all green; crates kernel/agent-runtime/
+   event-ledger/scheduler/tui/workspace 1093 green; mcp 86 green; release smoke
+   green against target/release/rapid.
 6. §6 sandbox truthfulness.
 7. §7 benchmark harness offline + suite.
 8. §8 release hardening + RC prep.
