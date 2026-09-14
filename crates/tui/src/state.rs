@@ -2552,6 +2552,55 @@ mod tests {
     }
 
     #[test]
+    fn model_stream_delta_events_replay_without_blocking_or_errors() {
+        // The delta sink emits `model.stream_delta` progress events during
+        // live turns (progressive streaming, delivery goal §2). A replay of
+        // a session containing them must succeed and leave the transcript
+        // unchanged -- deltas are transient render input, not transcript
+        // entries (the completed turn's text lands via turn.completed).
+        let events = vec![
+            created(),
+            UiEvent::Kernel(envelope(
+                2,
+                EventKind::TurnStarted,
+                UPDATED_AT,
+                serde_json::json!({"turn_id": "019c0000-0000-7000-8000-000000000012", "text": "prompt"}),
+            )),
+            UiEvent::Kernel(envelope(
+                3,
+                EventKind::ModelStreamDelta,
+                UPDATED_AT,
+                serde_json::json!({ "delta": "Hel" }),
+            )),
+            UiEvent::Kernel(envelope(
+                4,
+                EventKind::ModelStreamDelta,
+                UPDATED_AT,
+                serde_json::json!({ "delta": "lo" }),
+            )),
+            UiEvent::Kernel(envelope(
+                5,
+                EventKind::TurnCompleted,
+                UPDATED_AT,
+                serde_json::json!({"turn_id": "019c0000-0000-7000-8000-000000000012", "text": "Hello"}),
+            )),
+        ];
+        let state = replay(&events, &CancellationToken::new()).expect("replay succeeds");
+        assert!(
+            !state.actions_blocked(),
+            "delta events must not block the session"
+        );
+        // The completed turn's text is the transcript entry; deltas left none.
+        assert!(
+            state
+                .transcript
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::Assistant { text } if text == "Hello")),
+            "the final answer lands once"
+        );
+    }
+
+    #[test]
     fn missing_stable_id_is_typed_and_blocks_actions() {
         let events = vec![
             created(),
