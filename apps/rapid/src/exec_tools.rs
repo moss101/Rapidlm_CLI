@@ -1328,6 +1328,10 @@ pub struct WorkspaceTools {
     /// automatically (headless: no reviewer) or is held for deliberate
     /// `/agents integrate` (interactive).
     subagent_auto_integrate: bool,
+    /// When set (`RAPIDLM_SANDBOX_REQUIRED=1` at open, or the test setter),
+    /// a sandbox request on a tier that cannot confine filesystem/network
+    /// fails closed instead of degrading — execution protection goal §6.
+    sandbox_confinement_required: bool,
     /// See [`WorkspaceChanges`]. `None` outside a kernel session.
     changes: Option<Arc<dyn WorkspaceChanges>>,
     fetch_allowlist: Vec<String>,
@@ -1419,6 +1423,9 @@ impl WorkspaceTools {
             agent_events: None,
             agent_views: None,
             subagent_auto_integrate: false,
+            sandbox_confinement_required: std::env::var("RAPIDLM_SANDBOX_REQUIRED")
+                .map(|value| value == "1")
+                .unwrap_or(false),
             changes: None,
             fetch_allowlist: Vec::new(),
             hooks: crate::hooks::HooksConfig::default(),
@@ -1811,6 +1818,17 @@ impl WorkspaceTools {
 
     pub(crate) fn subagent_auto_integrate(&self) -> bool {
         self.subagent_auto_integrate
+    }
+
+    /// Test/CLI knob for the fail-closed sandbox contract: refuse
+    /// `sandbox: true` on tiers that cannot confine.
+    #[cfg(test)]
+    fn set_sandbox_confinement_required(&mut self, required: bool) {
+        self.sandbox_confinement_required = required;
+    }
+
+    pub(crate) fn sandbox_confinement_required(&self) -> bool {
+        self.sandbox_confinement_required
     }
 
     pub(crate) fn agent_events_handle(&self) -> Option<Arc<dyn AgentEvents>> {
@@ -2845,6 +2863,9 @@ impl WorkspaceTools {
             // it. Runs as an async background job (`start_sandboxed`),
             // unlike `run_sandboxed` below which is synchronous.
             if find_sandbox_exec().is_some() {
+                // Seatbelt is the one tier that genuinely confines both the
+                // filesystem and the network — say so, by name, so "sandboxed"
+                // never quietly means something weaker.
                 let job_id = self.jobs.start_sandboxed(
                     self.root(),
                     &args.argv,
@@ -2852,7 +2873,8 @@ impl WorkspaceTools {
                     MAX_JOB_OUTPUT_BYTES as u64,
                 )?;
                 let mut summary = format!(
-                    "started sandboxed job {job_id}: {} (timeout {}s); poll with job_status \
+                    "started sandboxed job {job_id}: {} (timeout {}s) [sandbox: seatbelt — \
+filesystem writes and network are confined]; poll with job_status \
 in this turn or a later one — the job is stopped when the session ends",
                     args.argv.join(" "),
                     args.timeout.as_secs()
@@ -2870,7 +2892,22 @@ in this turn or a later one — the job is stopped when the session ends",
             // crate's host-restricted backend — real process-group isolation
             // plus CPU/memory/pid limits, synchronous (unlike the job above;
             // see sandbox_exec's doc comment). A genuine capability where
-            // this previously just failed outright.
+            // this previously just failed outright. The protection level is
+            // named truthfully: resource limits only — filesystem and network
+            // are NOT confined on this tier. When confinement was required
+            // (`RAPIDLM_SANDBOX_REQUIRED=1`), refusing beats degrading.
+            if self.sandbox_confinement_required {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(
+                        "sandboxed exec refused: this platform can only provide the \
+host-restricted tier (resource limits; no filesystem or network confinement) \
+but confinement was required (RAPIDLM_SANDBOX_REQUIRED=1). Install a \
+confining backend or unset the requirement.",
+                    )),
+                });
+            }
             return match crate::sandbox_exec::run_sandboxed(
                 self.root(),
                 &args.argv,
@@ -2887,7 +2924,10 @@ in this turn or a later one — the job is stopped when the session ends",
                         outcome.oom,
                         outcome.policy_violation,
                     );
-                    let mut summary = format!("sandboxed {status}\n{output}");
+                    let mut summary = format!(
+                        "sandboxed {status}\n[sandbox: host-restricted — resource limits only; \
+filesystem and network are NOT confined]\n{output}"
+                    );
                     if let Some(note) = scan_command_advisory(self.root(), &args.argv) {
                         summary.push('\n');
                         summary.push_str(&note);
@@ -13572,5 +13612,50 @@ for line in sys.stdin:
             ToolKind::Write,
             "unknown tools stay write-class"
         );
+    }
+}
+
+#[cfg(test)]
+mod sandbox_truth_tests {
+    use super::*;
+
+    /// The truthful-level contract: on a platform without a confining
+    /// backend, `sandbox: true` + a required-confinement environment fails
+    /// closed with the refusal reason — never a silently weaker run.
+    #[test]
+    fn required_confinement_fails_closed_where_only_resource_limits_exist() {
+        if find_sandbox_exec().is_some() {
+            // This platform HAS the confining tier; the fail-closed branch is
+            // unreachable here and the seatbelt tests cover it.
+            return;
+        }
+        // SAFETY-of-test: env mutation in a single-threaded test.
+        let dir = std::env::temp_dir().join(format!(
+            "sandbox-truth-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tools = ExecTools::workspace(&dir).expect("tools");
+        if let ExecTools::Workspace(inner) = &mut tools {
+            inner.set_sandbox_confinement_required(true);
+        }
+        let call = ProposedToolCall::new(
+            "s1",
+            "shell_exec",
+            r#"{"argv":["echo","hi"],"sandbox":true}"#,
+        )
+        .unwrap();
+        let validated = tools.validate(&call, &CancellationToken::new()).unwrap();
+        let outcome = tools.execute(&validated, &CancellationToken::new()).unwrap();
+        let detail = match &outcome {
+            ToolStepResult::Failed { detail, .. } => detail.clone().unwrap_or_default(),
+            other => panic!("expected a fail-closed refusal, got {other:?}"),
+        };
+        assert!(detail.contains("host-restricted"), "{detail}");
+        assert!(detail.contains("RAPIDLM_SANDBOX_REQUIRED"), "{detail}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

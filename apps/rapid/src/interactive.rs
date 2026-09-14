@@ -84,6 +84,7 @@ pub enum LaunchMode {
     Interactive,
     Subcommand,
     Help,
+    Version,
 }
 
 /// How the interactive session ended after terminal restore + kernel quiesce.
@@ -225,6 +226,10 @@ enum LoopControl {
 
 /// Classify argv after the program name. Flags do not select a subcommand.
 pub fn classify_launch<S: AsRef<str>>(args: &[S]) -> LaunchMode {
+    // `--version`/`-V` anywhere prints the version; it takes no subcommand.
+    if args.iter().any(|arg| matches!(arg.as_ref(), "--version" | "-V")) {
+        return LaunchMode::Version;
+    }
     // `--help` before any subcommand word prints the top-level usage; after
     // one it belongs to that subcommand (`rapid exec --help` → exec usage).
     for arg in args {
@@ -398,6 +403,13 @@ pub fn run() -> Result<i32, InteractiveError> {
     match classify_launch(&args) {
         LaunchMode::Help => {
             print!("{}", *CLI_USAGE);
+            Ok(0)
+        }
+        LaunchMode::Version => {
+            println!(
+                "rapid {} (RapidLM CLI)",
+                env!("CARGO_PKG_VERSION")
+            );
             Ok(0)
         }
         LaunchMode::Interactive => {

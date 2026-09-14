@@ -124,6 +124,25 @@ nor a failure to retry — re-run with the missing input.
 | `10` | a workflow run paused for a human decision; resume with --resume |
 | `130` | interrupted (Ctrl-C or an external cancel) |
 
+## Sandbox levels, truthfully
+
+`shell_exec` with `"sandbox": true` reports the protection you actually got,
+by name:
+
+- **macOS with `sandbox-exec`**: the Seatbelt tier — filesystem writes and
+  network are genuinely confined (`[sandbox: seatbelt — filesystem writes and
+  network are confined]`).
+- **Everywhere else** (Linux, Windows, macOS without `sandbox-exec`): the
+  host-restricted tier — real process-group isolation plus CPU/memory/pid
+  limits, but filesystem and network are **not** confined
+  (`[sandbox: host-restricted — resource limits only; filesystem and network
+  are NOT confined]`).
+
+Set `RAPIDLM_SANDBOX_REQUIRED=1` to fail those calls closed instead of
+degrading: on a platform that cannot confine, the call is refused with the
+reason rather than running unprotected. `rapid doctor` probes the same
+backends and reports which tiers are available on this machine.
+
 ## Where to next
 
 - [`docs/reference/cli-command-reference.md`](reference/cli-command-reference.md) —
