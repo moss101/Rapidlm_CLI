@@ -3,7 +3,7 @@
 This is the target public command grammar; Phase 0 reconciles it with current source before breaking/renaming existing commands.
 
 > **What the binary actually dispatches today** (everything else in the table below is
-> roadmap, not shipped behavior): `exec`, `run`, `acp`, `daemon`, `eval`, `trust`, `goal`, `mcp`, `doctor`, `plugins`,
+> roadmap, not shipped behavior): `exec`, `run`, `acp`, `daemon`, `eval`, `update`, `trust`, `goal`, `mcp`, `doctor`, `plugins`,
 > `agents`, `cron`, `scan`, `findings`, `sessions`, `inspect-export`, `insights`, `permissions`,
 > `resume`,
 > `playbook-compile`, `agent-cli`, `mcp-tools`, `tools`, `release-manifest`,

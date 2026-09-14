@@ -3343,13 +3343,28 @@ pub(crate) fn resolve_model_plan(
     reminder_floor: agent_runtime::reminders::ReminderFloor,
     warn: &mut dyn FnMut(&str),
 ) -> Result<ModelPlan, ModelPlanError> {
+    resolve_model_plan_with_override(process_env, reminder_floor, warn, None)
+}
+
+/// [`resolve_model_plan`] with a session's mid-selection override: the
+/// `/model select <id>` choice, which wins over `[models].default` and
+/// `RAPIDLM_MODEL` (but sits under a managed lock, like the env var).
+pub(crate) fn resolve_model_plan_with_override(
+    process_env: &[(String, String)],
+    reminder_floor: agent_runtime::reminders::ReminderFloor,
+    warn: &mut dyn FnMut(&str),
+    model_override: Option<&str>,
+) -> Result<ModelPlan, ModelPlanError> {
     // `models`: [primary, ...fallback alternates] — resolved as plain data
     // (no borrows yet) so the credential-store count is known upfront.
     let mut models: Vec<crate::user_config::ActiveModel> = Vec::new();
     let mut primary_config: Option<crate::user_config::ActiveModel> = None;
     let mut compact: Option<crate::user_config::ActiveModel> = None;
     let mut unconfigured = false;
-    match crate::user_config::select_active_model_gated(process_env) {
+    match crate::user_config::select_active_model_with_override(
+        process_env,
+        model_override,
+    ) {
         Ok(ModelSelection::Configured { active, warnings }) => {
             for warning in warnings {
                 warn(&format!("warning: {warning}"));
@@ -4901,6 +4916,10 @@ struct SessionShared {
     /// views under and `/agents integrate|abandon` resolves, so a child's
     /// held changes are reviewable no matter which thread spawned it.
     agent_views: std::sync::Arc<crate::agent_views::AgentViewManager>,
+    /// The mid-session model override (`/model select <id>`): consulted by
+    /// every later turn's model resolution; wins over `[models].default`
+    /// and `RAPIDLM_MODEL`, sits under a managed lock. `None` = default.
+    model_override: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Test-only seam: a subagent runner for scripted turns, which have no
     /// configured model to build the real one from.
     #[cfg(test)]
@@ -5224,6 +5243,117 @@ It will run after the current turn; /queue cancels or edits it.",
         }
     }
 
+    /// `/model list|select|clear`: the mid-session model switching path.
+    /// The override is session state consulted by every later turn's model
+    /// resolution; it wins over `[models].default` and `RAPIDLM_MODEL` but
+    /// sits under a managed lock. An unknown id fails with the defined list
+    /// so the composer can show the choices.
+    fn run_model_command(&mut self, rest: &str) -> Result<(), InteractiveError> {
+        let args = rest.trim();
+        // Config resolution for this command uses the session's own home —
+        // the same catalog every turn reads — with RAPIDLM_CONFIG (if the
+        // process set one) still winning, exactly like turn-side resolution.
+        let mut model_env: Vec<(String, String)> =
+            vec![("HOME".to_owned(), self.user_home.display().to_string())];
+        for (key, value) in std::env::vars() {
+            if key == "RAPIDLM_CONFIG" {
+                model_env.push((key, value));
+            }
+        }
+        if args.is_empty() || args == "list" {
+            let models = crate::user_config::list_configured_models(&model_env);
+            let override_active = self
+                .shared
+                .model_override
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if models.is_empty() {
+                self.append_command_output(
+                    "no models configured; add a [model.<id>] table to config.toml".to_owned(),
+                );
+                return Ok(());
+            }
+            let mut lines = vec![format!("{} configured model(s):", models.len())];
+            for id in &models {
+                let marker = if override_active.as_deref() == Some(id.as_str()) {
+                    " [session override]"
+                } else {
+                    ""
+                };
+                lines.push(format!("  {id}{marker}"));
+            }
+            if let Some(active) = &override_active {
+                lines.push(format!("session override: {active}"));
+            } else {
+                lines.push("using the configured default".to_owned());
+            }
+            lines.push(
+                "/model select <id> switches for the rest of the session; /model clear returns to the default"
+                    .to_owned(),
+            );
+            self.append_command_output(lines.join("
+"));
+            return Ok(());
+        }
+        let mut parts = args.splitn(2, ' ');
+        let action = parts.next().unwrap_or_default();
+        match action {
+            "select" => {
+                let Some(id) = parts.next().map(str::trim).filter(|id| !id.is_empty()) else {
+                    self.append_command_error(
+                        "/model select needs a model id (run /model to list)".to_owned(),
+                    );
+                    return Ok(());
+                };
+                match crate::user_config::select_active_model_with_override(
+                    &model_env,
+                    Some(id),
+                ) {
+                    Ok(crate::user_config::ModelSelection::Configured { active, .. }) => {
+                        *self
+                            .shared
+                            .model_override
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(id.to_owned());
+                        self.append_command_output(format!(
+                            "model switched to {id} ({}): the NEXT turn runs on it; the current turn is unaffected",
+                            active.entry.model
+                        ));
+                    }
+                    Ok(crate::user_config::ModelSelection::Unconfigured { searched }) => {
+                        self.append_command_error(format!(
+                            "no model configuration found (looked in: {})",
+                            searched.join(", ")
+                        ));
+                    }
+                    Err(err) => {
+                        self.append_command_error(format!("/model select: {err}"));
+                    }
+                }
+                Ok(())
+            }
+            "clear" => {
+                *self
+                    .shared
+                    .model_override
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                self.append_command_output(
+                    "model override cleared; later turns use the configured default".to_owned(),
+                );
+                Ok(())
+            }
+            other => {
+                self.append_command_error(format!(
+                    "/model: unknown action '{other}' (list | select <id> | clear)"
+                ));
+                Ok(())
+            }
+        }
+    }
+
     /// `/agents integrate <id> [check-command...]` and
     /// `/agents abandon <id>`: the human side of worktree isolation.
     /// Integration applies the child's held patch with a three-way merge (a
@@ -5449,6 +5579,11 @@ workspace was never touched by it"
         // session state plus this client's own appends.
         if let Some(rest) = command.strip_prefix("/queue") {
             self.run_queue_command(rest)?;
+            return Ok(LoopControl::Continue);
+        }
+        // `/model list|select|clear` drives the session's model override.
+        if let Some(rest) = command.strip_prefix("/model") {
+            self.run_model_command(rest)?;
             return Ok(LoopControl::Continue);
         }
         // `/agents integrate|abandon` resolve an isolated child's held
@@ -8064,8 +8199,19 @@ fn run_interactive_turn_inner(
     // The model, resolved the way a headless run resolves it — env
     // overrides, user config, the `[models] fallback` chain, the managed
     // policy — and *before* context construction, so the context budget is
-    // derived from the model that will actually run this turn.
-    let session_model = match SessionModel::resolve(reminder_floor, policy_version, &mut warn) {
+    // derived from the model that will actually run this turn. The
+    // session's mid-selection override (`/model select`) rides on top.
+    let model_override = shared
+        .model_override
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let session_model = match SessionModel::resolve_with_override(
+        reminder_floor,
+        policy_version,
+        &mut warn,
+        model_override,
+    ) {
         Ok(model) => model,
         Err(reason) => return kernel::TurnOutcome::Failed { reason },
     };
@@ -8702,9 +8848,26 @@ impl SessionModel {
         policy_version: Option<String>,
         warn: &mut dyn FnMut(&str),
     ) -> Result<Self, String> {
+        Self::resolve_with_override(reminder_floor, policy_version, warn, None)
+    }
+
+    /// [`Self::resolve`] with a session model override (mid-session
+    /// `/model select <id>`): the override replaces `[models].default` and
+    /// beats `RAPIDLM_MODEL`, sitting under a managed lock like the env var.
+    fn resolve_with_override(
+        reminder_floor: agent_runtime::reminders::ReminderFloor,
+        policy_version: Option<String>,
+        warn: &mut dyn FnMut(&str),
+        model_override: Option<String>,
+    ) -> Result<Self, String> {
         let process_env: Vec<(String, String)> = std::env::vars().collect();
-        let plan = resolve_model_plan(&process_env, reminder_floor, warn)
-            .map_err(|err| err.to_string())?;
+        let plan = resolve_model_plan_with_override(
+            &process_env,
+            reminder_floor,
+            warn,
+            model_override.as_deref(),
+        )
+        .map_err(|err| err.to_string())?;
         let stores = plan
             .models
             .iter()
@@ -17292,6 +17455,86 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
         let canonical = fs::canonicalize(&env.project).expect("canonicalize");
         assert!(persisted_grants_for(&canonical, &env.user_home).is_empty());
+    }
+
+    #[test]
+    #[test]
+    fn model_select_switches_lists_and_clears_through_the_session() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let config_dir = env.user_home.join(".rapidlm");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        fs::write(
+            config_dir.join("config.toml"),
+            r#"
+[models]
+default = "fixture"
+
+[model.fixture]
+provider = "openai-compatible"
+model = "fixture-model"
+base_url = "http://127.0.0.1:9/v1"
+api_key = "k"
+
+[model.second]
+provider = "openai-compatible"
+model = "second-model"
+base_url = "http://127.0.0.1:9/v1"
+api_key = "k"
+"#,
+        )
+        .expect("config");
+        let cancel = CancellationToken::new();
+        let session = ScriptedSession::create(&env);
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, 0)),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = AppState::new();
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let mut loop_state = SessionLoop {
+            client: &session.client,
+            stream: &mut stream,
+            ui: &mut ui,
+            session_id: session.session_id,
+            actor: &session.actor,
+            cancel: &cancel,
+            interrupt_count: &mut interrupt_count,
+            saw_ctrl_c: &mut saw_ctrl_c,
+            root: &session.root,
+            user_home: &session.user_home,
+            trusted: true,
+            turn_in_flight,
+            jobs: crate::exec_tools::JobRegistry::default(),
+            renderer: &mut renderer,
+            autonomous: None,
+            compaction: None,
+            shared: session.shared.clone(),
+            message_queue: Vec::new(),
+            scripted_backings: None,
+        };
+        loop_state.dispatch_slash("/model select second").expect("select");
+        assert_eq!(
+            loop_state.shared.model_override.lock().unwrap().as_deref(),
+            Some("second"),
+            "the override is recorded for later turns"
+        );
+        loop_state.dispatch_slash("/model select nope").expect("unknown id handled");
+        assert_eq!(
+            loop_state.shared.model_override.lock().unwrap().as_deref(),
+            Some("second"),
+            "an unknown id leaves the previous selection standing"
+        );
+        loop_state.dispatch_slash("/model").expect("list renders");
+        loop_state.dispatch_slash("/model clear").expect("clear");
+        assert!(loop_state.shared.model_override.lock().unwrap().is_none());
+        close_stream(&mut stream);
     }
 
     #[test]

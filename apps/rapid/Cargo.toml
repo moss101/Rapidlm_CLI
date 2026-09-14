@@ -65,6 +65,7 @@ kernel = { path = "../../crates/kernel" }
 # workspace: GitWorktreeStore isolation backend, used for shadow-verified
 # writes (materialize a candidate edit, run diagnostics, only then commit).
 workspace = { path = "../../crates/workspace" }
+sha2 = "0.10"
 # tui: terminal lifecycle, reducer, and slash-command dispatch. Domain state
 # stays in the kernel; this crate only projects and forwards commands.
 tui = { path = "../../crates/tui" }

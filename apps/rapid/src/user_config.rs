@@ -219,6 +219,25 @@ pub enum UserConfigError {
     },
 }
 
+impl std::error::Error for UserConfigError {}
+
+impl UserConfig {
+    /// Every defined `[model.<id>]` id, sorted (what `/model select` offers).
+    pub fn model_ids(&self) -> Vec<String> {
+        self.models.entries.keys().cloned().collect()
+    }
+}
+
+/// The defined model ids for a process environment (what `/model list`
+/// shows). Empty when no config resolves — a diagnostic, not an error.
+pub fn list_configured_models(env: &[(String, String)]) -> Vec<String> {
+    let source = resolve_config_source(env);
+    let Some(config) = load_config(&source).ok().flatten() else {
+        return Vec::new();
+    };
+    config.model_ids()
+}
+
 impl fmt::Display for UserConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -264,7 +283,7 @@ impl fmt::Display for UserConfigError {
     }
 }
 
-impl std::error::Error for UserConfigError {}
+
 
 fn join_ids(ids: &[String]) -> String {
     if ids.is_empty() {
@@ -841,22 +860,54 @@ pub fn select_from_process_env() -> Result<ModelSelection, UserConfigError> {
 pub fn select_active_model_gated(
     env: &[(String, String)],
 ) -> Result<ModelSelection, crate::managed_config::GatedConfigError> {
+    select_active_model_with_override(env, None)
+}
+
+/// [`Self::select_active_model_gated`] with an explicit model-id override —
+/// the mid-session `/model select <id>` path. The override has the same
+/// precedence as `RAPIDLM_MODEL` (above `[models].default`) and must name a
+/// defined model; an unknown id fails with the defined list so the
+/// composer can show the choices.
+pub fn select_active_model_with_override(
+    env: &[(String, String)],
+    override_id: Option<&str>,
+) -> Result<ModelSelection, crate::managed_config::GatedConfigError> {
     let source = resolve_config_source(env);
     let searched = match &source {
         ConfigSource::ExplicitPath(path) | ConfigSource::HomeFallback(path) => {
             vec![path.display().to_string()]
         }
     };
-    let Some(config) = load_config(&source)? else {
+    let Some(mut config) = load_config(&source)? else {
         return Ok(ModelSelection::Unconfigured { searched });
     };
+    // The session override has RAPIDLM_MODEL's precedence (above
+    // `[models].default`) but sits under a managed lock, exactly like the
+    // env var does. Implemented by making it the env-less default: filter
+    // RAPIDLM_MODEL out of the env the resolver sees and set the cloned
+    // config's default, so `[phases]` routes and warnings stay consistent.
+    let mut effective_env: Vec<(String, String)> = env.to_vec();
+    if let Some(id) = override_id {
+        if !config.model_ids().contains(&id.to_owned()) {
+            return Err(crate::managed_config::GatedConfigError::Config(
+                UserConfigError::UnknownDefaultModel {
+                    id: id.to_owned(),
+                    available: config.model_ids(),
+                },
+            )
+            .into());
+        }
+        effective_env.retain(|(key, _)| key != DEFAULT_MODEL_ENV);
+        config.models.default = Some(id.to_owned());
+    }
     let mut warnings = config
         .unknown_keys
         .iter()
         .map(|key| format!("unknown config key '{key}'"))
         .collect::<Vec<_>>();
     let policy = crate::managed_config::load_policy(env)?;
-    let gated = crate::managed_config::resolve_gated(env, &config, policy.as_ref())?;
+    let gated =
+        crate::managed_config::resolve_gated(&effective_env, &config, policy.as_ref())?;
     for report in &gated.reports {
         warnings.push(format!("managed gate: {report}"));
     }

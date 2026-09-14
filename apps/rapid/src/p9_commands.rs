@@ -3282,11 +3282,31 @@ pub fn run_release_manifest(args: &[String]) -> Result<i32, P9CommandError> {
         let digest = protocol::ArtifactId::from_bytes(&bytes).to_string();
         entries.push((path.clone(), digest));
     }
+    // SBOM + provenance ride alongside the manifest: the SBOM lists every
+    // workspace crate and third-party dependency with its locked version
+    // (read from Cargo.lock, so it describes the artifact that was actually
+    // built), and the provenance block names the source commit and builder.
+    let sbom = sbom_from_lock("Cargo.lock").unwrap_or_else(|| {
+        serde_json::json!({ "error": "Cargo.lock not readable from this directory" })
+    });
+    let provenance = serde_json::json!({
+        "commit": std::env::var("RAPIDLM_BUILD_COMMIT").unwrap_or_else(|_| "unrecorded".to_owned()),
+        "builder": {
+            "tool": "rapid release-manifest",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    });
     let payload = serde_json::json!({
         "schema": "rapidlm.release_manifest",
         "schema_version": 1,
         "version": version,
         "artifacts": entries.iter().map(|(p, d)| serde_json::json!({"path": p, "digest": d})).collect::<Vec<_>>(),
+        "sbom": sbom,
+        "provenance": provenance,
         "rollback": { "previous_manifest_required": true, "strategy": "reinstall_previous" },
     });
     println!(
@@ -3294,6 +3314,58 @@ pub fn run_release_manifest(args: &[String]) -> Result<i32, P9CommandError> {
         serde_json::to_string_pretty(&payload).map_err(P9CommandError::Json)?
     );
     Ok(0)
+}
+
+/// Minimal CycloneDX-shaped SBOM from Cargo.lock: every locked crate with
+/// its exact version, and the workspace's own components marked as the
+/// application. Integrity hashes of upstream crates belong to the registry;
+/// the lock here is the record of what was actually built.
+fn sbom_from_lock(lock_path: &str) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(lock_path).ok()?;
+    let mut components: Vec<serde_json::Value> = Vec::new();
+    let mut in_package = false;
+    let mut name: Option<String> = None;
+    let mut version: Option<String> = None;
+    let mut is_workspace_member = false;
+    let mut flush = |name: &mut Option<String>,
+                     version: &mut Option<String>,
+                     member: &mut bool,
+                     components: &mut Vec<serde_json::Value>| {
+        if let (Some(n), Some(v)) = (name.take(), version.take()) {
+            components.push(serde_json::json!({
+                "type": "library",
+                "name": n,
+                "version": v,
+                "scope": if *member { "excluded" } else { "required" },
+            }));
+            *member = false;
+        }
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("[[package]]") {
+            flush(&mut name, &mut version, &mut is_workspace_member, &mut components);
+            in_package = true;
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("name = ") {
+            name = Some(rest.trim_matches('"').to_owned());
+        } else if let Some(rest) = trimmed.strip_prefix("version = ") {
+            version = Some(rest.trim_matches('"').to_owned());
+        } else if trimmed.starts_with("source = ") {
+            // A workspace member has no registry source.
+            is_workspace_member = !trimmed.contains("registry");
+        }
+    }
+    flush(&mut name, &mut version, &mut is_workspace_member, &mut components);
+    Some(serde_json::json!({
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.4",
+        "components": components,
+    }))
 }
 
 #[cfg(test)]
