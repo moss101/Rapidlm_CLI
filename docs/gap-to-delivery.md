@@ -138,8 +138,22 @@ Legend: `[x]` closed with evidence · `[~]` partial (named limitation) · `[ ]` 
   (`examples/daemon/sdk-e2e.mjs`, node against the built package): connect →
   sessions.create → turns.submit streaming 5 events → sessions.fork → resume
   replay from cursor 0 → clean exit.
-- `[~]` **MCP**: stdio wired (env/bounds/offline diagnostics/reconnect); `crates/mcp`
-  has StreamableHttpTransport — unwired; no url/headers config; no OAuth.
+- `[x]` **MCP**: stdio wired (env/bounds/offline diagnostics/reconnect) AND
+  Streamable HTTP wired end to end: `crates/mcp` exposes the exchange seam
+  (`exchange_skipping_notifications` at the transport level — the streamable
+  transport answers each POST within its own response; the old send/recv framing
+  could never serve HTTP) and `HttpRequest` read accessors;
+  `apps/rapid/src/mcp_http.rs` implements `StreamableHttpIo` over llm-router's
+  new `Http1Transport::post_raw` (real HTTP/1.1 + rustls, SSRF guards, bounded
+  responses, broker→router cancel bridge); `mcp_config.rs` accepts
+  `{"type":"http","url":…,"headers":{…}}` (bounded caps; unknown remote kinds
+  still named by kind); `connect_mcp_http` authorizes egress to exactly the
+  configured origin with real system DNS for redirect revalidation.
+  Evidence: `rapid mcp probe` against a live fixture HTTP server
+  (`examples/mcp-http/fixture-server.py`) reports
+  `ok=fixture-http tools=1 mcp__fixture-http__ping`; stdio untouched;
+  mcp crate tests green (80+6). Bearer-token auth via configured headers
+  works; full OAuth discovery remains future work.
 - `[~]` **Model setup**: capabilities still hard-coded (vision/caching/reasoning);
   `/model list|select` parsed but unrouted; `rapid doctor` is strong.
 
