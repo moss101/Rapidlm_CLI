@@ -59,6 +59,12 @@ pub const MAX_SERVER_NAME_BYTES: usize = 32;
 /// keep a hostile or corrupt settings file from producing an unbounded argv,
 /// not to constrain real configurations.
 pub const MAX_COMMAND_BYTES: usize = 4096;
+/// URL/header bounds for streamable-HTTP entries (mirrors the stdio bounds'
+/// spirit: bounded config can never balloon a request).
+pub const MAX_URL_BYTES: usize = 2048;
+pub const MAX_HTTP_HEADERS: usize = 16;
+pub const MAX_HTTP_HEADER_KEY_BYTES: usize = 128;
+pub const MAX_HTTP_HEADER_VALUE_BYTES: usize = 4096;
 pub const MAX_ARGS: usize = 64;
 pub const MAX_ARG_BYTES: usize = 4096;
 pub const MAX_ENV_VARS: usize = 32;
@@ -129,6 +135,19 @@ pub enum McpConfigIssue {
     /// No `command` key. This is also what a remote (`type`/`url`) entry looks
     /// like, which is why `remote` is reported separately below.
     MissingCommand,
+    MissingUrl,
+    UrlTooLong {
+        bytes: usize,
+    },
+    TooManyHttpHeaders {
+        count: usize,
+    },
+    HttpHeaderNotAString {
+        key: String,
+    },
+    HttpHeaderTooLong {
+        key: String,
+    },
     /// A `type`/`url` entry: a transport this build does not speak. Reported
     /// as its own issue rather than as "no command", which would be true but
     /// useless.
@@ -201,6 +220,19 @@ impl std::fmt::Display for McpConfigIssue {
 `mcp__<server>__<tool>`; every tool on this server would be unroutable",
             ),
             Self::MissingCommand => f.write_str("entry has no `command`"),
+            Self::MissingUrl => f.write_str("an http entry needs a `url`"),
+            Self::UrlTooLong { bytes } => f.write_str(&format!(
+                "`url` is {bytes} bytes, over the {MAX_URL_BYTES}-byte limit"
+            )),
+            Self::TooManyHttpHeaders { count } => {
+                f.write_str(&format!("`headers` has {count} entries, over the limit"))
+            }
+            Self::HttpHeaderNotAString { key } => {
+                f.write_str(&format!("header `{key}` is not a string"))
+            }
+            Self::HttpHeaderTooLong { key } => {
+                f.write_str(&format!("header `{key}` exceeds its byte bound"))
+            }
             Self::RemoteTransport { kind } => write!(
                 f,
                 "remote MCP transport {kind:?} is not supported; this build speaks stdio only, \
@@ -468,17 +500,52 @@ pub fn parse_entry(
     let Some(spec) = spec.as_object() else {
         return Err(McpConfigIssue::EntryNotAnObject);
     };
-    let command = match spec.get("command").and_then(serde_json::Value::as_str) {
-        Some(command) => command,
-        None => {
-            // A remote entry is the common shape of "no command"; naming the
-            // real reason is the difference between a user fixing a typo and
-            // a user discovering this build is stdio-only.
-            let kind = spec
-                .get("type")
+    // Streamable-HTTP remote entry (`{"type": "http", "url": …, "headers":
+    // {…}}`): a transport this build now speaks. The URL host is the
+    // egress-allowlist key; headers are the auth/tenancy boundary and are
+    // attached verbatim at the io layer — never logged, never inherited.
+    let mut http_endpoint: Option<crate::exec_tools::McpHttpEndpoint> = None;
+    let http_kind = spec
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let command: String = match spec.get("command").and_then(serde_json::Value::as_str) {
+        Some(command) => command.to_owned(),
+        None if http_kind.as_deref() == Some("http") => {
+            let url = spec
+                .get("url")
                 .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| spec.get("url").map(|_| "url".to_owned()));
+                .ok_or(McpConfigIssue::MissingUrl)?;
+            if url.is_empty() || url.len() > MAX_URL_BYTES {
+                return Err(McpConfigIssue::UrlTooLong { bytes: url.len() });
+            }
+            let mut headers = Vec::new();
+            if let Some(map) = spec.get("headers").and_then(serde_json::Value::as_object) {
+                if map.len() > MAX_HTTP_HEADERS {
+                    return Err(McpConfigIssue::TooManyHttpHeaders { count: map.len() });
+                }
+                for (key, value) in map {
+                    let Some(value) = value.as_str() else {
+                        return Err(McpConfigIssue::HttpHeaderNotAString { key: label(key) });
+                    };
+                    if key.len() > MAX_HTTP_HEADER_KEY_BYTES
+                        || value.len() > MAX_HTTP_HEADER_VALUE_BYTES
+                    {
+                        return Err(McpConfigIssue::HttpHeaderTooLong { key: label(key) });
+                    }
+                    headers.push((key.clone(), value.to_owned()));
+                }
+            }
+            http_endpoint = Some(crate::exec_tools::McpHttpEndpoint {
+                url: url.to_owned(),
+                headers,
+            });
+            url.to_owned()
+        }
+        None => {
+            // A remote entry with an unknown type is still "this shape is
+            // not stdio"; name the real kind.
+            let kind = http_kind.or_else(|| spec.get("url").map(|_| "url".to_owned()));
             return Err(match kind {
                 Some(kind) if kind != "stdio" => {
                     McpConfigIssue::RemoteTransport { kind: label(&kind) }
@@ -550,9 +617,10 @@ pub fn parse_entry(
     };
     Ok(McpServerConfig {
         name: name.to_owned(),
-        command: command.to_owned(),
+        command,
         args,
         env,
+        http: http_endpoint,
     })
 }
 
@@ -696,16 +764,23 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_entry_names_the_real_reason_not_just_a_missing_command() {
-        // Reporting "entry has no `command`" for `{"type": "http", …}` is
-        // true and useless: the user did not forget a key, this build does
-        // not speak that transport.
+    fn http_entries_parse_and_unknown_remote_kinds_still_name_the_kind() {
+        // The build now SPEAKS streamable HTTP: a `{type:"http", url:…}`
+        // entry parses into the http endpoint (url + headers), and the
+        // command field carries the url for display surfaces.
+        let http = parse_one(
+            r#"{"type": "http", "url": "https://example.com/mcp", "headers": {"Authorization": "Bearer tok"}}"#,
+        )
+        .expect("http parses");
+        assert_eq!(http.command, "https://example.com/mcp");
+        let endpoint = http.http.expect("http endpoint present");
+        assert_eq!(endpoint.url, "https://example.com/mcp");
         assert_eq!(
-            parse_one(r#"{"type": "http", "url": "https://example.com/mcp"}"#),
-            Err(McpConfigIssue::RemoteTransport {
-                kind: "http".to_owned()
-            })
+            endpoint.headers,
+            vec![("Authorization".to_owned(), "Bearer tok".to_owned())]
         );
+        // A `url` WITHOUT the http type is still an unknown remote shape —
+        // named by kind, not as a missing command.
         assert_eq!(
             parse_one(r#"{"url": "https://example.com/mcp"}"#),
             Err(McpConfigIssue::RemoteTransport {

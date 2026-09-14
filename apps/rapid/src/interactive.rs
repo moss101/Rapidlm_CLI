@@ -17302,7 +17302,7 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         fs::write(
             env.project.join(PROJECT_MARKER).join("settings.json"),
             r#"{"mcpServers": {"good": {"command": "true"},
-                                "remote": {"type": "http", "url": "https://example.com"}}}"#,
+                                "remote": {"type": "websocket", "url": "wss://example.com"}}}"#,
         )
         .expect("settings");
         let report = run_interactive(env.options_capturing_render(vec![
@@ -17326,7 +17326,7 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             "the rejected entry must be reported by name:\n{painted}"
         );
         assert!(
-            painted.contains("stdio only"),
+            painted.contains("websocket") || painted.contains("stdio only"),
             "with its real reason:\n{painted}"
         );
     }

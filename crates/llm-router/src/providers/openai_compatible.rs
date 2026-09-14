@@ -347,6 +347,100 @@ impl WireAuthorization for StaticWireAuth {
     }
 }
 
+impl Http1Transport<StaticWireAuth> {
+    /// One raw POST for out-of-router consumers (the MCP streamable-HTTP io
+    /// adapter): fixed bearer token, real HTTP/1.1 + rustls TLS, SSRF
+    /// guards, bounded response. A general-purpose raw client this is not —
+    /// GET/streaming live in their own transports — but it is the honest,
+    /// already-audited path for an authorized single exchange.
+    pub fn post_raw(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        token: &str,
+        cancel: &CancellationToken,
+    ) -> Result<RawHttpResponse, ProviderError> {
+        cancel.check()?;
+        if body.len() > MAX_HTTP_REQUEST_BYTES {
+            return Err(ProviderError::BoundExceeded);
+        }
+        if headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        {
+            return Err(ProviderError::InvalidRequest);
+        }
+        let parsed = parse_http_url(url)?;
+        if host_is_blocked(&parsed.host) {
+            return Err(ProviderError::InvalidRequest);
+        }
+        let addrs = (parsed.host.as_str(), parsed.port)
+            .to_socket_addrs()
+            .map_err(|_| ProviderError::Connection)?;
+        let mut selected = None;
+        for addr in addrs {
+            cancel.check()?;
+            if ip_is_blocked(addr.ip()) {
+                return Err(ProviderError::InvalidRequest);
+            }
+            if selected.is_none() {
+                selected = Some(addr);
+            }
+        }
+        let addr = selected.ok_or(ProviderError::Connection)?;
+        if token
+            .bytes()
+            .any(|b| b < 0x20 || b == 0x7f || b == b'\n' || b == b'\r')
+        {
+            return Err(ProviderError::InvalidRequest);
+        }
+        cancel.check()?;
+        let tcp = TcpStream::connect_timeout(&addr, self.timeout)
+            .map_err(|_| ProviderError::Connection)?;
+        tcp.set_read_timeout(Some(slice_timeout(self.timeout)))
+            .map_err(|_| ProviderError::Connection)?;
+        tcp.set_write_timeout(Some(slice_timeout(self.timeout)))
+            .map_err(|_| ProviderError::Connection)?;
+        tcp.set_nodelay(true)
+            .map_err(|_| ProviderError::Connection)?;
+        let mut stream = match parsed.scheme {
+            UrlScheme::Http => MaybeTlsStream::Plain(tcp),
+            UrlScheme::Https => {
+                let server_name = ServerName::try_from(parsed.host.to_string())
+                    .map_err(|_| ProviderError::InvalidRequest)?;
+                let connection = ClientConnection::new(Arc::clone(&TLS_CLIENT_CONFIG), server_name)
+                    .map_err(|_| ProviderError::Connection)?;
+                MaybeTlsStream::Tls(Box::new(StreamOwned::new(connection, tcp)))
+            }
+        };
+        let deadline = Instant::now() + self.timeout;
+        write_http_request(&mut stream, &parsed, headers, body, token, cancel, deadline)?;
+        let response = read_http_response(&mut stream, self.max_response_bytes, cancel, deadline)?;
+        Ok(RawHttpResponse {
+            status: response.status,
+            headers: response.headers,
+            body: response.body,
+        })
+    }
+}
+
+/// Raw single-exchange response for [`Http1Transport::post_raw`].
+pub struct RawHttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl RawHttpResponse {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
 impl<A: WireAuthorization> Http1Transport<A> {
     pub fn new(auth: A) -> Self {
         Self {

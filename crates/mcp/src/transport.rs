@@ -153,6 +153,26 @@ pub struct HttpRequest<'a> {
     body: &'a [u8],
 }
 
+impl HttpRequest<'_> {
+    /// Read-only seams for out-of-crate [`StreamableHttpIo`] implementations:
+    /// the fields are intentionally not constructible outside the crate (an
+    /// exchange can only run with an authorized request the transport built),
+    /// but a production io adapter needs the request's pieces to make the
+    /// real HTTP call. `body` and `session_id` already had public readers.
+    pub fn url(&self) -> String {
+        if self.path.starts_with('/') {
+            origin_url_for(self.target) + self.path
+        } else {
+            origin_url_for(self.target) + "/" + self.path
+        }
+    }
+}
+
+/// Public helper: canonical origin -> `scheme://host:port`.
+pub fn origin_url_for(target: &CanonicalNetworkTarget) -> String {
+    origin_url(target)
+}
+
 /// Inbound streamable-HTTP exchange. `Location` is untrusted.
 pub struct HttpResponse {
     status: u16,
@@ -188,6 +208,25 @@ pub trait McpTransport {
     }
 
     fn close(&mut self, cancel: &CancellationToken) -> Result<(), TransportError>;
+
+    /// One id-matched request/response. The default is newline framing:
+    /// send, then receive until the id-matched reply arrives. A transport
+    /// whose request and response share one exchange (streamable HTTP's
+    /// single POST) overrides this.
+    fn exchange_skipping_notifications(
+        &mut self,
+        request: &[u8],
+        expected_id: u64,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<u8>, TransportError> {
+        self.send_frame(request, cancel)?;
+        loop {
+            let frame = self.recv_frame(cancel)?;
+            if has_response_id(&frame, expected_id) {
+                return Ok(frame);
+            }
+        }
+    }
 }
 
 /// Performs one authorized streamable-HTTP POST. Callers must pass a consumed
@@ -792,6 +831,21 @@ impl<I: StreamableHttpIo, Rsv: NetworkResolver> McpTransport for StreamableHttpT
         TransportKind::StreamableHttp
     }
 
+    /// Streamable HTTP answers every POST within its own response: the
+    /// id-matched reply IS the body (a notification POST's body is empty).
+    fn exchange_skipping_notifications(
+        &mut self,
+        request: &[u8],
+        expected_id: u64,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<u8>, TransportError> {
+        let body = self.post(request, cancel)?;
+        if body.is_empty() || !has_response_id(&body, expected_id) {
+            return Err(TransportError::InvalidFrame);
+        }
+        Ok(body)
+    }
+
     fn send_frame(
         &mut self,
         bytes: &[u8],
@@ -960,8 +1014,10 @@ impl<T: McpTransport> McpSession<T> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let request = encode_tools_list(id)?;
-        // Skip server->client notification frames (no id) before the reply.
-        let response = self.exchange_skipping_notifications(&request, id, cancel)?;
+        // Skip server->client notification frames (no id) before the reply;
+        // the transport itself decides what "exchange" means (newline
+        // framing for stdio, one authorized POST for streamable HTTP).
+        let response = self.transport.exchange_skipping_notifications(&request, id, cancel)?;
         parse_tools_list_result(&response, id)
     }
 
@@ -980,7 +1036,7 @@ impl<T: McpTransport> McpSession<T> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let request = encode_tools_call(id, name, arguments)?;
-        let response = self.exchange_skipping_notifications(&request, id, cancel)?;
+        let response = self.transport.exchange_skipping_notifications(&request, id, cancel)?;
         parse_tools_call_result(&response, id)
     }
 

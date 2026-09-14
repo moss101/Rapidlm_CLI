@@ -961,7 +961,7 @@ mod tests {
             ".rapidlm/settings.json",
             r#"{"mcpServers": {
                  "ok": {"command": "true"},
-                 "remote": {"type": "http", "url": "https://example.com"},
+                 "remote": {"type": "sse", "url": "https://example.com"},
                  "bad__name": {"command": "true"}
                }}"#,
         );

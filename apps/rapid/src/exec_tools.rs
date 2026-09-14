@@ -1518,7 +1518,7 @@ impl WorkspaceTools {
                             online: true,
                             offline_reason: None,
                             session: Some(Mutex::new(session)),
-                            child: Some(child),
+                            child,
                         });
                     let mut surface = self.mcp_surface.lock().unwrap_or_else(|p| p.into_inner());
                     for tool in &tools {
@@ -5331,6 +5331,17 @@ pub struct McpServerConfig {
     /// a server needing an API key in its environment — most real ones —
     /// could not be configured at all.
     pub env: Vec<(String, String)>,
+    /// Streamable-HTTP remote server (delivery goal §5): when `Some`, the
+    /// entry connects over HTTP to `url` instead of spawning `command`.
+    /// `headers` are attached verbatim as the auth/tenancy boundary.
+    pub http: Option<McpHttpEndpoint>,
+}
+
+/// A remote MCP endpoint: the URL plus configured headers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpHttpEndpoint {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
 }
 
 /// A session's MCP connections, shared into every turn's tools the way
@@ -5355,7 +5366,7 @@ struct McpConnection {
     /// verbatim by `execute_mcp_tool` so a model calling the offline marker
     /// tool learns the actual cause instead of a fixed string.
     offline_reason: Option<String>,
-    session: Option<Mutex<mcp_session_box::SessionBox>>,
+    session: Option<Mutex<mcp_session_box::AnySession>>,
     child: Option<std::process::Child>,
 }
 
@@ -5365,8 +5376,8 @@ pub(crate) struct ConnectedMcpServer {
     pub(crate) tools: Vec<mcp::transport::McpToolDescriptor>,
     /// `Option` only so [`Self::into_connection`] can hand ownership to a
     /// caller that takes over teardown; both are always `Some` on the way
-    /// out of [`connect_mcp_server`].
-    session: Option<mcp_session_box::SessionBox>,
+    /// out of [`connect_mcp_server`]. An HTTP connect leaves `child` `None`.
+    session: Option<mcp_session_box::AnySession>,
     child: Option<std::process::Child>,
 }
 
@@ -5428,6 +5439,13 @@ const MCP_INHERITED_ENV: [&str; 4] = ["PATH", "HOME", "LANG", "TMPDIR"];
 pub(crate) fn connect_mcp_server(
     server: &McpServerConfig,
 ) -> Result<ConnectedMcpServer, McpConnectError> {
+    // Streamable-HTTP remote: connect through the production io adapter
+    // (`crate::mcp_http::RapidHttpIo` — llm-router's real HTTP/TLS client,
+    // cancel-bridged), authorize egress to the configured origin only, and
+    // handshake over the streamable transport. No child process exists.
+    if let Some(http) = &server.http {
+        return connect_mcp_http(server, http);
+    }
     use mcp::transport::{
         ClientCapabilities, ImplementationInfo, IoBounds, McpSession, StdioTransport,
     };
@@ -5475,8 +5493,102 @@ pub(crate) fn connect_mcp_server(
     };
     Ok(ConnectedMcpServer {
         tools,
-        session: Some(session),
+        session: Some(mcp_session_box::AnySession::Stdio(session)),
         child: Some(child),
+    })
+}
+
+/// Connect to a streamable-HTTP MCP server: real DNS resolution feeds the
+/// capability-broker's egress authorization (the configured origin is the
+/// allowlist entry), the request/response path is
+/// `crate::mcp_http::RapidHttpIo`, and the same JSON-RPC handshake the
+/// stdio path runs happens over the streamable transport.
+fn connect_mcp_http(
+    server: &McpServerConfig,
+    http: &McpHttpEndpoint,
+) -> Result<ConnectedMcpServer, McpConnectError> {
+    use mcp::transport::{
+        ClientCapabilities, ImplementationInfo, IoBounds, McpSession, StreamableHttpTransport,
+    };
+    // Minimal URL split (scheme://host[:port]/path): the egress layer
+    // re-validates everything from the canonical form anyway.
+    let (scheme_str, rest) = http
+        .url
+        .split_once("://")
+        .ok_or_else(|| McpConnectError::Handshake("url has no scheme".to_owned()))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (
+            host.to_owned(),
+            port.parse::<u16>()
+                .map_err(|_| McpConnectError::Handshake("bad port".to_owned()))?,
+        ),
+        None => (
+            authority.to_owned(),
+            if scheme_str == "https" { 443 } else { 80 },
+        ),
+    };
+    if host.is_empty() {
+        return Err(McpConnectError::Handshake("url has no host".to_owned()));
+    }
+    // Egress authorization: exactly this origin is allowed. The policy is
+    // built from the CONFIGURED url — not from whatever a redirect names
+    // (the transport re-authorizes redirects itself and refuses hops that
+    // leave the scope).
+    let rules = vec![
+        security::EgressRule::host(&host)
+            .map_err(|err| McpConnectError::Handshake(format!("bad host {host:?}: {err}")))?,
+    ];
+    let proxy = security::EgressProxy::new(
+        security::EgressPolicy::allowlist(rules)
+            .map_err(|err| McpConnectError::Handshake(format!("egress policy: {err}")))?,
+        security::NetworkClient::Tool,
+    );
+    let bounds = IoBounds::new(64 * 1024, Duration::from_secs(30)).expect("standard io bounds");
+    let scheme = if scheme_str == "https" {
+        capability_broker::NetworkScheme::Https
+    } else {
+        capability_broker::NetworkScheme::Http
+    };
+    let resource = capability_broker::ResourceDescriptor::Network(
+        capability_broker::NetworkScope::new(scheme, &host, port)
+            .map_err(|err| McpConnectError::Handshake(format!("scope: {err}")))?,
+    );
+    let io = crate::mcp_http::RapidHttpIo {
+        headers: http.headers.clone(),
+        bearer: None,
+    };
+    let request = mcp::transport::HttpConnectRequest::new(
+        http.url.clone(),
+        capability_broker::Capability::NetConnect,
+        resource,
+        None,
+        bounds,
+    );
+    let transport = StreamableHttpTransport::connect(
+        io,
+        mcp_session_box::HttpSystemResolver { port },
+        proxy,
+        request,
+        &capability_broker::CancellationToken::new(),
+    )
+    .map_err(|err| McpConnectError::Handshake(err.to_string()))?;
+    let mut session = McpSession::new(
+        transport,
+        ImplementationInfo::rapidlm(),
+        ClientCapabilities::new(true),
+    );
+    let cancel = capability_broker::CancellationToken::new();
+    session
+        .initialize(&cancel)
+        .map_err(|err| McpConnectError::Handshake(err.to_string()))?;
+    let tools = session
+        .tools_list(&capability_broker::CancellationToken::new())
+        .map_err(|err| McpConnectError::ToolsList(err.to_string()))?;
+    Ok(ConnectedMcpServer {
+        tools,
+        session: Some(mcp_session_box::AnySession::Http(session)),
+        child: None,
     })
 }
 
@@ -5485,9 +5597,11 @@ impl ConnectedMcpServer {
     /// — `ExecTools::register_mcp_servers`, which keeps them for the whole
     /// turn behind [`McpConnection`]'s own `Drop`. This type's `Drop` then
     /// has nothing left to reap.
-    pub(crate) fn into_connection(mut self) -> (mcp_session_box::SessionBox, std::process::Child) {
+    pub(crate) fn into_connection(
+        mut self,
+    ) -> (mcp_session_box::AnySession, Option<std::process::Child>) {
         let session = self.session.take().expect("session taken once");
-        let child = self.child.take().expect("child taken once");
+        let child = self.child.take();
         (session, child)
     }
 
@@ -5508,6 +5622,14 @@ impl Drop for McpConnection {
             let _ = child.kill();
             let _ = child.wait();
         }
+        // An HTTP session has no child to reap, but its transport owns a
+        // connection the protocol closes with a `close` notification — send
+        // it best-effort so the server does not keep session state forever.
+        if let Some(session) = self.session.as_mut() {
+            if let Ok(session) = session.get_mut() {
+                session.close(&capability_broker::CancellationToken::new());
+            }
+        }
     }
 }
 
@@ -5516,6 +5638,80 @@ pub(crate) mod mcp_session_box {
     use std::process::{ChildStdin, ChildStdout};
 
     pub type SessionBox = McpSession<StdioTransport<ChildStdout, ChildStdin>>;
+
+    /// The streamable-HTTP session: no child pipes; the transport is the
+    /// HTTP exchange loop (`crate::mcp_http::RapidHttpIo`).
+    pub type HttpSession = McpSession<
+        mcp::transport::StreamableHttpTransport<crate::mcp_http::RapidHttpIo, HttpSystemResolver>,
+    >;
+
+    /// The DNS resolver the HTTP transport re-authorizes redirects against:
+    /// real system resolution, so redirect egress checks judge the true
+    /// next origin.
+    pub struct HttpSystemResolver {
+        pub port: u16,
+    }
+
+    impl capability_broker::NetworkResolver for HttpSystemResolver {
+        fn resolve(
+            &self,
+            host: &capability_broker::Hostname,
+        ) -> Result<Vec<std::net::IpAddr>, capability_broker::NetworkNormalizeError> {
+            use std::net::ToSocketAddrs;
+            let candidates = (host.as_str(), self.port)
+                .to_socket_addrs()
+                .map_err(|_| capability_broker::NetworkNormalizeError::EmptyUrl)?
+                .map(|addr| addr.ip())
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                return Err(capability_broker::NetworkNormalizeError::EmptyUrl);
+            }
+            Ok(candidates)
+        }
+    }
+
+    /// Either kind of live MCP session behind one type, so `McpConnection`
+    /// and the tool-call path do not need to be generic.
+    pub enum AnySession {
+        Stdio(SessionBox),
+        Http(HttpSession),
+    }
+
+    impl AnySession {
+        pub fn tools_list(
+            &mut self,
+            cancel: &capability_broker::CancellationToken,
+        ) -> Result<Vec<mcp::transport::McpToolDescriptor>, mcp::transport::TransportError>
+        {
+            match self {
+                Self::Stdio(session) => session.tools_list(cancel),
+                Self::Http(session) => session.tools_list(cancel),
+            }
+        }
+
+        pub fn tools_call(
+            &mut self,
+            tool: &str,
+            arguments: &serde_json::Value,
+            cancel: &capability_broker::CancellationToken,
+        ) -> Result<mcp::transport::McpToolCallOutput, mcp::transport::TransportError> {
+            match self {
+                Self::Stdio(session) => session.tools_call(tool, arguments, cancel),
+                Self::Http(session) => session.tools_call(tool, arguments, cancel),
+            }
+        }
+
+        pub fn close(&mut self, cancel: &capability_broker::CancellationToken) {
+            match self {
+                Self::Stdio(session) => {
+                    let _ = session.close(cancel);
+                }
+                Self::Http(session) => {
+                    let _ = session.close(cancel);
+                }
+            }
+        }
+    }
 }
 
 /// Bounded char-safe string cut.
@@ -12617,6 +12813,7 @@ for line in sys.stdin:
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
             env: Vec::new(),
+            http: None,
         }];
 
         // Registration: surface gains mcp__demo__echo.
@@ -12639,6 +12836,7 @@ for line in sys.stdin:
             command: "/nonexistent/mcp-binary".to_owned(),
             args: vec![],
             env: Vec::new(),
+            http: None,
         }];
         tools.register_mcp_servers(&dead);
         let surface: Vec<String> = tools
@@ -12731,6 +12929,7 @@ for line in sys.stdin:
             command: "rapidlm-definitely-not-a-program".to_owned(),
             args: Vec::new(),
             env: Vec::new(),
+            http: None,
         }];
         let mut first = permissive_workspace(&root.0);
         first.share_mcp(&registry);
@@ -12744,6 +12943,7 @@ for line in sys.stdin:
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
             env: Vec::new(),
+            http: None,
         }];
         let mut second = permissive_workspace(&root.0);
         second.share_mcp(&registry);
@@ -12807,6 +13007,7 @@ for line in sys.stdin:
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
             env: vec![("MCP_TEST_TOKEN".to_owned(), "delivered".to_owned())],
+            http: None,
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -12838,6 +13039,7 @@ for line in sys.stdin:
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
             env: Vec::new(),
+            http: None,
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -12915,6 +13117,7 @@ for line in sys.stdin:
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
             env: Vec::new(),
+            http: None,
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -12982,6 +13185,7 @@ for line in sys.stdin:
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
             env: Vec::new(),
+            http: None,
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -13068,6 +13272,7 @@ time.sleep(30)
                 pid_path.display().to_string(),
             ],
             env: Vec::new(),
+            http: None,
         }];
 
         let mut tools = permissive_workspace(&root.0);
@@ -13156,6 +13361,7 @@ time.sleep(30)
                 pid_path.display().to_string(),
             ],
             env: Vec::new(),
+            http: None,
         };
 
         fn alive(pid: i32) -> bool {
@@ -13238,6 +13444,7 @@ for line in sys.stdin:
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
             env: Vec::new(),
+            http: None,
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
