@@ -631,13 +631,20 @@ recorded as skipped rather than compared unpinned",
             };
             let (result, usage) = run_live_agent(bin, args, task, &scratch, name, grant_shell, usage_file);
             let _ = std::fs::remove_dir_all(&scratch);
+            // Only the harness's OWN skip reasons count as skipped — the
+            // preflight gate and the anti-vacuity check. Task stderr that
+            // happens to contain the word ("hits beyond offset skipped: 0")
+            // must never downgrade a real failure.
+            let harness_skip = |reason: &str| {
+                reason.starts_with("model not usable") || reason.starts_with("vacuous task")
+            };
             results.push(TaskResult {
                 id: task.id.clone(),
                 category: task.category.clone(),
                 outcome: match &result {
                     Ok(()) => "passed".to_owned(),
                     Err(reason) => {
-                        if reason.contains("skipped") {
+                        if harness_skip(reason) {
                             "skipped".to_owned()
                         } else {
                             "failed".to_owned()
@@ -1258,5 +1265,21 @@ mod tests {
         let (report, lines) = summarize("offline", &results);
         assert!(report.get("per_agent_usage").is_none());
         assert_eq!(lines.lines().count(), 1, "only the headline, no metric lines");
+    }
+
+    #[test]
+    fn task_stderr_mentioning_skip_never_downgrades_a_failure() {
+        // Found in the live equal-surface window: a task's stderr contained
+        // "hits beyond offset skipped: 0" and the substring heuristic
+        // recorded a real non-zero exit as `skipped`. Only harness-produced
+        // reasons classify as skips now.
+        let harness_skip = |reason: &str| {
+            reason.starts_with("model not usable") || reason.starts_with("vacuous task")
+        };
+        assert!(harness_skip("model not usable: no credentials"));
+        assert!(harness_skip("vacuous task (verify passes before any change)"));
+        assert!(!harness_skip(
+            "rapid exited non-zero: [stderr] hits beyond offset skipped: 0"
+        ));
     }
 }
