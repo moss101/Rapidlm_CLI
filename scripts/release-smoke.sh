@@ -5,6 +5,9 @@
 set -eu
 BIN="${1:-target/release/rapid}"
 BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
+# Resolve the checkout root before any cd: later steps chdir into scratch
+# projects, which breaks relative $0 resolution.
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 HOME="$WORK/home"
@@ -37,7 +40,6 @@ echo "$OUT" | grep -q "not trusted" || fail "untrusted project must be named"
 # 6. eval offline passes against the shipped suite (mechanical validation)
 mkdir -p smoke-repo && cd smoke-repo && git init -q .
 "$BIN" trust grant > /dev/null
-REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)}"
 if [ ! -d "$REPO_ROOT/eval/suite" ]; then
   fail "eval/suite not found; run the smoke from a checkout or set REPO_ROOT"
 fi
