@@ -240,9 +240,15 @@ recovery/workflow tasks.
 - `[x]` **Release notes + RC draft** — `docs/RELEASE-NOTES-0.1.0-rc1.md`:
   highlights, honest limitations (streaming, credentials, signing), platform
   table, upgrade path. Publication stays the final approval step.
-- `[~]` 3-target release workflow with SHA-256 checksums + smoke steps remains;
-  install docs match artifacts. Code signing beyond checksums requires signing
-  infrastructure (approval-gated credentials).
+- `[x]` **Per-platform clean-environment smoke** — the release matrix now runs
+  `scripts/release-smoke.sh` against each built artifact under a pristine HOME
+  on macOS and Linux runners before packaging (Windows keeps its existing smoke
+  steps while the smoke script's Unix-first sandbox assumptions are sorted).
+- `[~]` Authenticity: ssh-keygen ed25519 signing/verification
+  (`scripts/release-sign.sh`, live-tested sign → verify → tamper-refused)
+  covers the manifest (digests + SBOM + provenance) without external
+  infrastructure; a CI signing key is an operator secret to add at publication.
+  Self-update with rollback is shipped (`rapid update`, 5 lifecycle tests).
 
 ## Sequencing (updated)
 
