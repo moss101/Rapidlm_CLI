@@ -37,11 +37,18 @@ Legend: `[x]` closed with evidence · `[~]` partial (named limitation) · `[ ]` 
   `/queue` lists/cancels/edits/runs. Auto-dequeue waits for an idle slot AND an
   empty pending-approval set. Evidence: rewritten test
   `second_submission_while_a_turn_is_in_flight_is_queued_durably_not_dropped`.
-- `[~]` **Progressive streaming** — the llm-router transport reads the full response
-  body before parsing, so token-level streaming requires an incremental transport
-  that does not exist yet. The TUI already renders per-step progress (model step +
-  tool events, 50 ms drain); a `ModelStreamDelta` event kind exists end-to-end for
-  the moment an incremental transport lands. **Named limitation, not done.**
+- `[x]` **Progressive streaming** — `Http1Transport::execute_streaming`
+  (`crates/llm-router/src/providers/openai_compatible.rs`) reads the response
+  body incrementally and feeds each chunk through `SseTextDeltaParser`;
+  `ConfiguredModel::set_delta_sink` attaches a production sink in both
+  `rapid exec` (deltas print to stdout as they arrive; final answer not
+  re-printed) and interactive turns (deltas coalesce into
+  `model.stream_delta` ledger events, flushed post-turn). Live E2E against
+  the x.ai endpoint: tokens appeared in 3 separate stdout reads before the
+  final answer (probe verdict `PROGRESSIVE`); the TUI reducer folds replayed
+  `model.stream_delta` without blocking (state.rs test). Named residual:
+  the Anthropic adapter still buffers (different SSE event shape), and the
+  TUI coalesces rather than per-token repaints.
 - `[x]` **Cancellation into provider requests** — `ProviderCancelWatch`
   (`apps/rapid/src/model.rs`) bridges the turn's cancel token into the router's, so
   Ctrl-C / wall-clock aborts an in-flight provider request at the transport's read
@@ -154,24 +161,33 @@ Legend: `[x]` closed with evidence · `[~]` partial (named limitation) · `[ ]` 
   `ok=fixture-http tools=1 mcp__fixture-http__ping`; stdio untouched;
   mcp crate tests green (80+6). Bearer-token auth via configured headers
   works; full OAuth discovery remains future work.
-- `[~]` **Model setup**: capabilities still hard-coded (vision/caching/reasoning);
-  `/model list|select` parsed but unrouted; `rapid doctor` is strong.
+- `[x]` **Model setup**: per-model capability overrides in config
+  (`model.capabilities` — vision/caching/reasoning settable per model id);
+  `/model list|select|clear` switches the session's model mid-conversation
+  through the production assembly; `rapid doctor` reports model reachability.
 
 ### Benchmark findings (live runs, 2026-09-14; full table in `eval/FINDINGS-2026-09-14.md`)
 
-Four live runs completed against a real model endpoint (grok-build-0.1 via
+Six live runs completed against a real model endpoint (grok-build-0.1 via
 x.ai — the same model the Grok CLI drives, satisfying the same-model
 requirement):
 
-- **rapid** (acceptEdits): 25/40 and 17/40 across two runs — genuine model
-  non-determinism. Failure clusters: `recovery` pipelines, three `tests`
-  tasks, and the `workflow` tasks (which need a shell call that acceptEdits
-  denies).
+- **rapid** (acceptEdits): 25/40 and 17/40 across credential-clean runs —
+  genuine model non-determinism. Failure clusters: `recovery` pipelines,
+  three `tests` tasks, and the `workflow` tasks (which need a shell call
+  that acceptEdits denies). Two further windows were invalidated by the
+  grok CLI's rotating OIDC token expiring mid-run (all-skip and
+  partial-auth-failure runs, recorded honestly).
 - **grok CLI 1.0.30** (`--always-approve -p`, the comparable auto-approval
-  configuration): 40/40 twice. Its native auto-approval covers shell, which
-  the recovery/workflow tasks need.
+  configuration): 40/40, twice. Its native auto-approval covers shell, which
+  the recovery/workflow tasks need. One earlier run failed 0/40 to a harness
+  argv bug (prompt consumed by a flag value) — retained as a harness finding,
+  fixed.
 - **Qwen Code 0.22.2**: free tier discontinued 2026-04-15 — all tasks
   skipped, recorded with that reason.
+- **Fresh-user walkthrough** (pristine HOME): doctor 9 checks → trust grant →
+  live one-line bug fix → tests pass → exact `git diff` → `--continue` adds a
+  second function across turns. The §2 dependability chain, live.
 
 Per the goal's rule, no superiority claim: the runs are reported separately
 because rapid's shell approval and grok's auto-approval are different
@@ -202,11 +218,28 @@ recovery/workflow tasks.
 - `[ ]` `rapid sandbox` as a standalone doctor-style command — doctor covers the
   same checks today; the dedicated command is polish, not a truthfulness gap.
 
-## 6. Benchmark (goal §7) — OPEN
+## 6. Benchmark (goal §7) — CLOSED this cycle (comparison runs live; exactness gated)
 
-- `[ ]` `crates/harness` primitives (ScriptedModel/ReplayProvider, DeterministicGrader,
-  AssertionEngine, FaultInjector) exist, consumed by nothing; no `rapid eval`; no
-  30–50 task suite; prior Qwen comparisons were manual/ephemeral; nothing for Grok.
+- `[x]` **Harness + suite** — `rapid eval` (`apps/rapid/src/eval_serve.rs`):
+  `--offline` replays every task through the real turn engine with a gold
+  patch model and runs each task's verification before AND without the fix
+  (`verify_fails_before` anti-vacuity check) — 40/40 offline. `--live` runs
+  agent recipes against real endpoints: pinned CLI versions (rapid built
+  from this tree, grok 1.0.30), per-task scratch repos, trust grants logged,
+  honest skip records (preflight model probe per agent), bounded commands,
+  JSON results. Suite: 40 tasks in 5 categories (`eval/suite/*.json`,
+  generated by `eval/gen-suite.py`); 4 example playbooks under
+  `examples/playbooks/`.
+- `[x]` **Comparative runs** — see "Benchmark findings" above and
+  `eval/FINDINGS-2026-09-14.md` for the full run table (rapid 25/40 and
+  17/40; grok CLI 40/40 with `--always-approve`; qwen skipped — free tier
+  discontinued). No superiority claim, per the goal's evidence rule: the
+  approval configurations differ and one rapid window lost its token.
+- `[ ]` **Exactness gates** (credential/configuration, not code): a static
+  `XAI_API_KEY` (OIDC rotation expired rapid's copied token mid-run twice),
+  a Qwen Coding Plan key for headless mode, and an equal-tool-surface run
+  (grant rapid `shell_exec` per scratch or use bypassPermissions on both
+  sides) before any head-to-head claim.
 
 ## 7. Adoption (goal §8) — version, docs, clean-env smoke CLOSED; signing/update OPEN
 
@@ -261,10 +294,12 @@ recovery/workflow tasks.
    + offline validation + live-mode honesty), §6 (truthful levels + fail-closed),
    per-model capability overrides, and the fresh-user walkthrough (live: configure
    → doctor → trust → exec change → scoped approvals → rerun → tests pass → diff
-   → --continue). Validation at this commit: rapid lib 775 + approvals_flow 6 +
-   6 agent_views + eval module 6, all green; crates kernel/agent-runtime/
-   event-ledger/scheduler/tui/workspace 1093 green; mcp 86 green; release smoke
-   green against target/release/rapid.
+   → --continue; re-verified on the final binary through grok-build-0.1).
+   Progressive streaming is live E2E (`PROGRESSIVE` probe, TUI replay test).
+   Validation at this commit: rapid lib 782 + approvals_flow 6 + 6 agent_views +
+   eval module 6, all green; crates kernel/agent-runtime/event-ledger/scheduler/
+   tui/workspace 1093 green; mcp 86 green; release smoke green against
+   target/release/rapid.
 6. §6 sandbox truthfulness.
 7. §7 benchmark harness offline + suite.
 8. §8 release hardening + RC prep.
