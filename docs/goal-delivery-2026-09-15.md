@@ -143,6 +143,15 @@ Legend: **verified** = implemented + regression-tested through production entry 
 - **Not measured:** same-model (grok-4.6 vs rapid-on-grok-4.6) comparison —
   no x.ai credential available in this window; this is the exact blocked
   criterion. No parity percentage is claimed from a one-sided run.
+- **Fresh re-run on the hardened judge (§5 follow-up, same day):**
+  `eval/results/live-1789500016.json` — grok (grok-4.6) **12/12 passed**
+  against the NEW deploy-pipeline judge (artifact validation + mutation
+  checks; 181,991 measured tokens, coverage 12/12). rapid arm again typed
+  as infrastructure skips: the configured model is rejected by its
+  provider (`model_failed`), unchanged from the delivery window — the
+  same-model comparison remains blocked on that credential, and the gate
+  again correctly failed the incomplete comparison. kimi not installed;
+  qwen not authenticated — typed skips.
 
 ## 4. Remaining limitations
 
