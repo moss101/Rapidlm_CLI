@@ -75,6 +75,10 @@ pub const JOB_OUTPUT_TOOL: &str = "job_output";
 pub const PLAN_PATH: &str = ".rapidlm/plan.md";
 /// Maximum live background jobs per run.
 pub const MAX_BACKGROUND_JOBS: usize = 16;
+/// Maximum detached (`task_spawn` with `background: true`) subagents running
+/// at once, session-wide. A detached child outlives its parent turn, so the
+/// bound lives on the session-shared [`SubagentRegistry`], not on a turn.
+pub const MAX_DETACHED_SUBAGENTS: usize = 4;
 /// Poll interval for background job supervision.
 pub const JOB_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How long a finished job's supervisor waits for its output readers to
@@ -246,6 +250,7 @@ enum JobState {
     Running,
     Completed(i32),
     Failed(String),
+    Cancelled,
 }
 
 impl JobState {
@@ -254,6 +259,7 @@ impl JobState {
             Self::Running => "running".to_owned(),
             Self::Completed(code) => format!("completed exit {code}"),
             Self::Failed(reason) => format!("failed: {reason}"),
+            Self::Cancelled => "cancelled".to_owned(),
         }
     }
 }
@@ -405,6 +411,9 @@ pub const MAX_AGENT_TASK_BYTES: usize = 512;
 #[derive(Clone, Default)]
 pub struct SubagentRegistry {
     running: Arc<Mutex<Vec<(protocol::AgentId, CancellationToken)>>>,
+    /// Detached (`background: true`) children running right now,
+    /// session-shared so the concurrency bound counts across turns.
+    detached_running: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SubagentRegistry {
@@ -452,6 +461,31 @@ impl SubagentRegistry {
             cancel.cancel();
         }
         running.len()
+    }
+
+    /// Count of detached (`background: true`) children running now.
+    pub fn running_detached(&self) -> usize {
+        self.detached_running
+            .load(std::sync::atomic::Ordering::SeqCst) as usize
+    }
+
+    /// Try to claim one of the session's detached-concurrency slots.
+    fn claim_detached(&self) -> bool {
+        let current = self
+            .detached_running
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |count| (count < MAX_DETACHED_SUBAGENTS as u64).then_some(count + 1),
+            )
+            .is_ok();
+        current
+    }
+
+    /// Release a claimed detached-concurrency slot.
+    fn release_detached(&self) {
+        self.detached_running
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -585,6 +619,38 @@ impl JobRegistry {
     /// Only *running* jobs count: cancelling an already-finished one is a
     /// no-op, and saying "cancelled 1" for a job that completed ten minutes
     /// ago would be a lie the user acts on.
+    /// Register a detached subagent as a session job: same table, same
+    /// `job-N` handles, same budget as background shells, but no child
+    /// process — a [`SubagentRunner`] thread drives the state instead.
+    /// Returns the model-facing handle and the shared cells the thread
+    /// writes its report and terminal state into.
+    fn register_detached(&self, label: &str) -> Result<(String, JobShared), ToolStepError> {
+        if self.started_this_turn.fetch_add(1, Ordering::SeqCst) >= MAX_BACKGROUND_JOBS as u64 {
+            return Err(ToolStepError::Failed);
+        }
+        let id = format!("job-{}", self.table.seq.fetch_add(1, Ordering::SeqCst) + 1);
+        let ledger_id = protocol::JobId::new();
+        if let Some(events) = self.events.as_ref() {
+            events.started(ledger_id, &id, label);
+        }
+        let shared = JobShared {
+            ledger_id,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            output: Arc::new(Mutex::new(Vec::new())),
+            overflow: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(Mutex::new(JobState::Running)),
+            child: Arc::new(Mutex::new(None)),
+            reported: Arc::new(AtomicBool::new(false)),
+            sandbox_cancel: None,
+        };
+        self.table
+            .jobs
+            .lock()
+            .map_err(|_| ToolStepError::Failed)?
+            .insert(id.clone(), shared.clone());
+        Ok((id, shared))
+    }
+
     pub(crate) fn cancel(&self, id: Option<protocol::JobId>) -> Option<usize> {
         let jobs = self.table.jobs.lock().ok()?;
         let mut stopped = 0usize;
@@ -3625,7 +3691,7 @@ read with job_output, in this turn or a later one — the job is stopped when th
         cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_task_args(call.arguments())?;
-        let Some(runner) = self.subagents.as_ref() else {
+        let Some(runner) = self.subagents.clone() else {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
@@ -3641,6 +3707,9 @@ read with job_output, in this turn or a later one — the job is stopped when th
                     self.max_subagent_spawns
                 ))),
             });
+        }
+        if args.background {
+            return self.execute_task_spawn_detached(call, runner, args);
         }
         if !self.hooks.subagent_start.is_empty() {
             let _ = crate::hooks::run_notify_hooks(
@@ -3711,36 +3780,9 @@ read with job_output, in this turn or a later one — the job is stopped when th
                 crate::hooks::HOOK_TIMEOUT,
             );
         }
-        match outcome {
-            Ok(report) => {
-                let body = bounded_text(report.summary.as_bytes(), MAX_SUBAGENT_REPORT_BYTES);
-                let mut header = format!(
-                    "subagent ({}) report [status={} tool_calls={} tokens={}",
-                    args.agent_type, report.status, report.tool_calls, report.tokens
-                );
-                if let Some(cost_usd_micros) = report.cost_usd_micros {
-                    header.push_str(&format!(" cost_usd_micros={cost_usd_micros}"));
-                }
-                if let Some(reason) = &report.stop_reason {
-                    header.push_str(&format!(" stop_reason={reason}"));
-                }
-                header.push(']');
-                let mut summary = format!("{header}:\n{body}");
-                if let Some(patch_summary) = &report.patch_summary {
-                    summary.push_str(&format!("\npatch: {patch_summary}"));
-                }
-                for claim in &report.claims {
-                    summary.push_str(&format!("\nclaim: {claim}"));
-                }
-                for blocker in &report.blockers {
-                    summary.push_str(&format!("\nblocker: {blocker}"));
-                }
-                for question in &report.open_questions {
-                    summary.push_str(&format!("\nopen question: {question}"));
-                }
-                for artifact in &report.artifacts {
-                    summary.push_str(&format!("\nartifact: {artifact}"));
-                }
+        match &outcome {
+            Ok(_) => {
+                let summary = render_subagent_report(&args.agent_type, &outcome);
                 Ok(ToolStepResult::Succeeded {
                     call_id: call.call_id().to_owned(),
                     summary,
@@ -3755,6 +3797,156 @@ read with job_output, in this turn or a later one — the job is stopped when th
                 ))),
             }),
         }
+    }
+
+    /// Detached `task_spawn`: claim a session concurrency slot, register a
+    /// job, and run the SAME [`SubagentRunner`] (so worktree isolation,
+    /// narrowed permissions, hooks, and budgets are inherited unchanged) on
+    /// a thread that outlives the turn. The parent's tool call returns
+    /// immediately; the report lands in the job spool for
+    /// `job_status`/`job_output` and the completion notification.
+    ///
+    /// Cancellation: `/agents cancel <agent-id>` (the registry token) or
+    /// `/jobs cancel` (the job's cancelled flag, forwarded by a watchdog).
+    /// The parent turn's own cancellation deliberately does NOT propagate —
+    /// surviving the turn is the point of detachment, the same lifetime
+    /// contract background shells have.
+    ///
+    /// Continuation semantics: a detached child runs to completion or
+    /// cancellation and cannot be resumed mid-run. Its writes (if
+    /// write-capable) stay in the retained worktree until
+    /// `/agents integrate|abandon`; re-invoking `task_spawn` starts a fresh
+    /// child — state lives in the worktree, not the process.
+    fn execute_task_spawn_detached(
+        &self,
+        call: &ValidatedToolCall,
+        runner: Arc<dyn SubagentRunner>,
+        args: TaskSpawnArgs,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        let registry = self.subagent_registry.clone();
+        if !registry.claim_detached() {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "detached subagent concurrency limit reached ({MAX_DETACHED_SUBAGENTS} \
+                     already running session-wide); wait for one to finish or cancel one \
+                     with /agents cancel"
+                ))),
+            });
+        }
+        let (job_id, shared) = match self
+            .jobs
+            .register_detached(&format!("detached subagent ({})", args.agent_type))
+        {
+            Ok(handle) => handle,
+            Err(_) => {
+                registry.release_detached();
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(
+                        "background job budget exhausted; cannot start a detached subagent \
+                         this turn",
+                    )),
+                });
+            }
+        };
+        let agent_id = protocol::AgentId::new();
+        let child_cancel = CancellationToken::new();
+        let prompt = args.prompt.clone();
+        let agent_type = args.agent_type.clone();
+        let write_scope = args.write_scope.clone();
+        let events = self.agent_events.clone();
+        let watchdog_flag = shared.cancelled.clone();
+        let watchdog_token = child_cancel.clone();
+        std::thread::spawn(move || {
+            // Forward `/jobs cancel` (the job's cancelled flag) to the
+            // child's token, whose observation point is inside the runner.
+            let watchdog = std::thread::spawn(move || {
+                while !watchdog_token.is_cancelled() {
+                    if watchdog_flag.load(Ordering::SeqCst) {
+                        watchdog_token.cancel();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            });
+            let lifecycle = ChildLifecycle::begin(
+                &registry,
+                events.as_ref(),
+                agent_id,
+                child_cancel.clone(),
+                &agent_type,
+                &bounded_text(prompt.as_bytes(), MAX_AGENT_TASK_BYTES),
+            );
+            // A panicking runner must not leak the concurrency slot or
+            // strand the job as Running forever.
+            let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runner.run(
+                    agent_id,
+                    &prompt,
+                    &agent_type,
+                    write_scope.as_deref(),
+                    &child_cancel,
+                )
+            })) {
+                Err(_) => Err("detached subagent runner panicked".to_owned()),
+                Ok(other) => other,
+            };
+            // A child stopped by its token ended cancelled whatever the
+            // runner made of it — same normalization as the inline path.
+            let outcome = match outcome {
+                Err(reason) if child_cancel.is_cancelled() => Ok(SubagentReport {
+                    summary: reason,
+                    status: "cancelled".to_owned(),
+                    tool_calls: 0,
+                    tokens: 0,
+                    cost_usd_micros: None,
+                    stop_reason: Some("cancelled".to_owned()),
+                    claims: Vec::new(),
+                    blockers: Vec::new(),
+                    open_questions: Vec::new(),
+                    patch_summary: None,
+                    artifacts: Vec::new(),
+                }),
+                other => other,
+            };
+            let (end, detail) = match &outcome {
+                Ok(report) if report.status == "cancelled" => (SubagentEnd::Cancelled, None),
+                Ok(report) if report.status == "succeeded" => (SubagentEnd::Succeeded, None),
+                Ok(report) => (SubagentEnd::Failed, Some(report.status.as_str())),
+                Err(reason) => (SubagentEnd::Failed, Some(reason.as_str())),
+            };
+            lifecycle.end(end, detail);
+            registry.release_detached();
+            // Spool the report BEFORE marking the job terminal, so a
+            // completion notification never shows an empty output page.
+            if let Ok(mut buffer) = shared.output.lock() {
+                let rendered = render_subagent_report(&agent_type, &outcome);
+                buffer.extend_from_slice(rendered.as_bytes());
+            }
+            if let Ok(mut state) = shared.state.lock() {
+                *state = match &outcome {
+                    Ok(report) if report.status == "succeeded" => JobState::Completed(0),
+                    Ok(report) if report.status == "cancelled" => JobState::Cancelled,
+                    Ok(report) => JobState::Failed(format!("status {}", report.status)),
+                    Err(reason) => JobState::Failed(reason.clone()),
+                };
+            }
+            let _ = watchdog.join();
+        });
+        Ok(ToolStepResult::Succeeded {
+            call_id: call.call_id().to_owned(),
+            summary: format!(
+                "detached subagent started: agent={agent_id} job={job_id} type={}. The parent \
+                 turn continues now; read the report with job_status(job_id=\"{job_id}\") / \
+                 job_output; cancel with /agents cancel {agent_id} (or /jobs cancel). Its \
+                 writes stay in a retained worktree until /agents integrate or /agents \
+                 abandon; re-invoking task_spawn starts a fresh child.",
+                args.agent_type
+            ),
+        })
     }
 
     /// Group key for write-class calls: same key ⇒ serialized in proposal
@@ -4056,6 +4248,46 @@ fn checked_relative(relative: &str) -> Result<&Path, ToolStepError> {
 
 /// Largest valid UTF-8 prefix within `cap` bytes, with an explicit
 /// truncation marker when content was cut.
+/// Render one subagent outcome as the model-facing summary — shared by the
+/// inline `task_spawn` path (returns it as the tool result) and the detached
+/// path (spools it into the job's output buffer).
+fn render_subagent_report(agent_type: &str, outcome: &Result<SubagentReport, String>) -> String {
+    match outcome {
+        Ok(report) => {
+            let body = bounded_text(report.summary.as_bytes(), MAX_SUBAGENT_REPORT_BYTES);
+            let mut header = format!(
+                "subagent ({}) report [status={} tool_calls={} tokens={}",
+                agent_type, report.status, report.tool_calls, report.tokens
+            );
+            if let Some(cost_usd_micros) = report.cost_usd_micros {
+                header.push_str(&format!(" cost_usd_micros={cost_usd_micros}"));
+            }
+            if let Some(reason) = &report.stop_reason {
+                header.push_str(&format!(" stop_reason={reason}"));
+            }
+            header.push(']');
+            let mut summary = format!("{header}:\n{body}");
+            if let Some(patch_summary) = &report.patch_summary {
+                summary.push_str(&format!("\npatch: {patch_summary}"));
+            }
+            for claim in &report.claims {
+                summary.push_str(&format!("\nclaim: {claim}"));
+            }
+            for blocker in &report.blockers {
+                summary.push_str(&format!("\nblocker: {blocker}"));
+            }
+            for question in &report.open_questions {
+                summary.push_str(&format!("\nopen question: {question}"));
+            }
+            for artifact in &report.artifacts {
+                summary.push_str(&format!("\nartifact: {artifact}"));
+            }
+            summary
+        }
+        Err(reason) => format!("subagent ({agent_type}) failed: {reason}"),
+    }
+}
+
 fn bounded_text(bytes: &[u8], cap: usize) -> String {
     let mut end = bytes.len().min(cap);
     while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
@@ -4235,6 +4467,12 @@ struct TaskSpawnArgs {
     /// outside (Modbit `CAP-008`: a narrow write scope). `None`: unscoped,
     /// today's existing behavior.
     write_scope: Option<String>,
+    /// Detached mode: the parent's tool call returns immediately with a job
+    /// handle; the child keeps running in the session (bounded by
+    /// [`MAX_DETACHED_SUBAGENTS`]) and its report is retrievable through
+    /// `job_status`/`job_output`. Default `false` (the original blocking
+    /// behavior).
+    background: bool,
 }
 
 struct EmptyArgs;
@@ -5813,7 +6051,7 @@ fn parse_web_fetch_args(raw: &str) -> Result<(String, usize), ToolStepError> {
 /// subagent arguments. Types adopt the reference-CLI standard:
 /// general-purpose | explore | plan.
 fn parse_task_args(raw: &str) -> Result<TaskSpawnArgs, ToolStepError> {
-    const ALLOWED: &[&str] = &["prompt", "type", "description", "write_scope"];
+    const ALLOWED: &[&str] = &["prompt", "type", "description", "write_scope", "background"];
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
     let object = value.as_object().ok_or(ToolStepError::Invalid)?;
     if !object.keys().all(|key| ALLOWED.contains(&key.as_str())) || !object.contains_key("prompt") {
@@ -5844,10 +6082,16 @@ fn parse_task_args(raw: &str) -> Result<TaskSpawnArgs, ToolStepError> {
         }
         None => None,
     };
+    let background = match object.get("background") {
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(_) => return Err(ToolStepError::Invalid),
+        None => false,
+    };
     Ok(TaskSpawnArgs {
         prompt: prompt.to_owned(),
         agent_type,
         write_scope,
+        background,
     })
 }
 
@@ -6804,7 +7048,15 @@ impl WorkspaceTools {
             ),
             ToolSurface::new(
                 TASK_SPAWN_TOOL,
-                "Spawn a subagent (depth 1: it cannot spawn further agents) for a focused                  task and return its final report. Types: general-purpose (full tools),                  explore (read-only), plan (read-only). Optionally confine its writes to                  one workspace-relative path with write_scope. Arguments JSON:                  {\"prompt\":\"<task>\",\"type\":\"explore\",\"write_scope\":\"src/feature\"}.",
+                "Spawn a subagent (depth 1: it cannot spawn further agents) for a focused \
+                 task. Types: general-purpose (full tools), explore (read-only), plan \
+                 (read-only). Optionally confine its writes to one workspace-relative path \
+                 with write_scope. With background:true the call returns immediately with a \
+                 job handle; the child keeps running (bounded session-wide) and its report \
+                 is readable via job_status/job_output, cancellable via /agents cancel. \
+                 Arguments JSON: \
+                 {\"prompt\":\"<task>\",\"type\":\"explore\",\"write_scope\":\"src/feature\",\
+                 \"background\":false}.",
                 arguments_schema(
                     "Spawn a subagent for a focused task",
                     serde_json::json!({
@@ -6815,7 +7067,10 @@ impl WorkspaceTools {
                         "description": {"type": "string", "description": "short label"},
                         "write_scope": {"type": "string",
                                         "description": "workspace-relative path the subagent may write \
-                                         inside, never outside (e.g. \"src/feature\")"}
+                                         inside, never outside (e.g. \"src/feature\")"},
+                        "background": {"type": "boolean",
+                                       "description": "detached: return immediately with a job \
+                                        handle; retrieve the report with job_output"}
                     }),
                     &["prompt"],
                 ),
@@ -7210,6 +7465,220 @@ mod tests {
             2,
             "the runner never even ran past the cap"
         );
+    }
+
+    use std::sync::Mutex as StdMutex;
+
+    /// A scripted runner for detached tests: optionally slow, optionally
+    /// cancel-aware, records invocations.
+    struct DetachedFakeRunner {
+        delay: Duration,
+        calls: Arc<StdMutex<Vec<()>>>,
+    }
+    impl crate::exec_tools::SubagentRunner for DetachedFakeRunner {
+        fn run(
+            &self,
+            _agent: protocol::AgentId,
+            prompt: &str,
+            _agent_type: &str,
+            _write_scope: Option<&str>,
+            cancel: &CancellationToken,
+        ) -> Result<SubagentReport, String> {
+            self.calls.lock().expect("lock").push(());
+            let deadline = std::time::Instant::now() + self.delay;
+            while std::time::Instant::now() < deadline {
+                if cancel.is_cancelled() {
+                    return Ok(SubagentReport {
+                        summary: "stopped early".to_owned(),
+                        status: "cancelled".to_owned(),
+                        tool_calls: 0,
+                        tokens: 0,
+                        cost_usd_micros: None,
+                        stop_reason: Some("cancelled".to_owned()),
+                        claims: Vec::new(),
+                        blockers: Vec::new(),
+                        open_questions: Vec::new(),
+                        patch_summary: None,
+                        artifacts: Vec::new(),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = prompt;
+            Ok(SubagentReport {
+                summary: "detached-done".to_owned(),
+                status: "succeeded".to_owned(),
+                tool_calls: 3,
+                tokens: 42,
+                cost_usd_micros: None,
+                stop_reason: None,
+                claims: Vec::new(),
+                blockers: Vec::new(),
+                open_questions: Vec::new(),
+                patch_summary: None,
+                artifacts: Vec::new(),
+            })
+        }
+    }
+
+    fn spawn_detached(tools: &mut WorkspaceTools, cancel: &CancellationToken, id: &str) -> String {
+        let call = make_call(
+            id,
+            TASK_SPAWN_TOOL,
+            r#"{"prompt":"probe the thing","type":"explore","background":true}"#,
+        );
+        let validated = tools.validate(&call, cancel).expect("v");
+        match tools.execute(&validated, cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => summary,
+            other => panic!("detached spawn should return immediately, got {other:?}"),
+        }
+    }
+
+    fn job_id_from(summary: &str) -> String {
+        summary
+            .split("job=")
+            .nth(1)
+            .and_then(|rest| rest.split([' ', '.']).next())
+            .expect("job handle in summary")
+            .to_owned()
+    }
+
+    fn job_status_text(
+        tools: &mut WorkspaceTools,
+        cancel: &CancellationToken,
+        job: &str,
+    ) -> String {
+        let call = make_call("js", JOB_STATUS_TOOL, &format!(r#"{{"job_id":"{job}"}}"#));
+        let validated = tools.validate(&call, cancel).expect("v");
+        match tools.execute(&validated, cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => summary,
+            other => panic!("job_status should succeed, got {other:?}"),
+        }
+    }
+
+    fn job_output_text(
+        tools: &mut WorkspaceTools,
+        cancel: &CancellationToken,
+        job: &str,
+    ) -> String {
+        let call = make_call("jo", JOB_OUTPUT_TOOL, &format!(r#"{{"job_id":"{job}"}}"#));
+        let validated = tools.validate(&call, cancel).expect("v");
+        match tools.execute(&validated, cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => summary,
+            other => panic!("job_output should succeed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detached_spawn_returns_immediately_and_the_report_lands_in_the_job() {
+        let root = TempRoot::new("detached-spawn-report");
+        let mut tools = permissive_workspace(&root.0);
+        tools.subagents = Some(Arc::new(DetachedFakeRunner {
+            delay: Duration::from_millis(150),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        }) as Arc<dyn SubagentRunner>);
+        let cancel = CancellationToken::new();
+        let started = std::time::Instant::now();
+        let summary = spawn_detached(&mut tools, &cancel, "c-detach");
+        // The tool call returns BEFORE the runner finishes.
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "detached spawn must not block on the child"
+        );
+        assert!(summary.contains("detached subagent started"));
+        let job = job_id_from(&summary);
+        // Poll to terminal state through the model-facing tool.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            let text = job_status_text(&mut tools, &cancel, &job);
+            if !text.contains("running") || std::time::Instant::now() > deadline {
+                break text;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert!(status.contains("completed"), "terminal status: {status}");
+        let output = job_output_text(&mut tools, &cancel, &job);
+        assert!(
+            output.contains("detached-done"),
+            "report in spool: {output}"
+        );
+        assert!(output.contains("status=succeeded"));
+        assert_eq!(
+            tools.subagent_registry.running_detached(),
+            0,
+            "the concurrency slot is released"
+        );
+    }
+
+    #[test]
+    fn detached_spawn_is_cancellable_through_the_registry_and_the_job_flag() {
+        let root = TempRoot::new("detached-spawn-cancel");
+        let mut tools = permissive_workspace(&root.0);
+        tools.subagents = Some(Arc::new(DetachedFakeRunner {
+            delay: Duration::from_secs(5),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        }) as Arc<dyn SubagentRunner>);
+        let cancel = CancellationToken::new();
+        let summary = spawn_detached(&mut tools, &cancel, "c-cancel");
+        let job = job_id_from(&summary);
+        assert_eq!(tools.subagent_registry.running_detached(), 1);
+        // Cancel through the registry (what `/agents cancel` drives).
+        let agent = tools.subagent_registry.running()[0];
+        assert!(tools.subagent_registry.cancel(agent));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            let text = job_status_text(&mut tools, &cancel, &job);
+            if !text.contains("running") || std::time::Instant::now() > deadline {
+                break text;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert!(status.contains("cancelled"), "terminal status: {status}");
+        let output = job_output_text(&mut tools, &cancel, &job);
+        assert!(output.contains("status=cancelled"), "report: {output}");
+        assert_eq!(tools.subagent_registry.running_detached(), 0);
+    }
+
+    #[test]
+    fn detached_spawn_enforces_the_session_concurrency_bound() {
+        let root = TempRoot::new("detached-spawn-bound");
+        let mut tools = permissive_workspace(&root.0);
+        tools.subagents = Some(Arc::new(DetachedFakeRunner {
+            delay: Duration::from_secs(5),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        }) as Arc<dyn SubagentRunner>);
+        let cancel = CancellationToken::new();
+        for i in 0..MAX_DETACHED_SUBAGENTS {
+            let summary = spawn_detached(&mut tools, &cancel, &format!("c{i}"));
+            assert!(summary.contains("detached subagent started"));
+        }
+        let call = make_call(
+            "c-over",
+            TASK_SPAWN_TOOL,
+            r#"{"prompt":"x","type":"explore","background":true}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("v");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
+                assert!(handled);
+                assert!(
+                    detail.unwrap().contains("concurrency limit reached"),
+                    "bound must refuse with a handled error"
+                );
+            }
+            other => panic!("expected the detached bound to refuse, got {other:?}"),
+        }
+        // Cleanup: stop every blocking child so the test binary exits.
+        tools.subagent_registry.cancel_all();
+        for _ in 0..50 {
+            if tools.subagent_registry.running_detached() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(tools.subagent_registry.running_detached(), 0);
     }
 
     #[test]

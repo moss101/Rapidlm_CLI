@@ -2251,15 +2251,22 @@ pub(crate) fn persisted_grants_for(
 fn exec_permission_lattice(
     canonical_root: Option<&Path>,
     forced_mode: Option<crate::permissions::PermissionMode>,
+    session_override: Option<crate::permissions::PermissionMode>,
 ) -> Result<crate::permissions::PermissionLattice, String> {
     use crate::permissions::{PermissionLattice, PermissionMode, ProjectSettings, parse_settings};
-    let mut mode: Option<PermissionMode> = match exec_permission_mode() {
-        Ok(mode) => Some(mode),
-        Err(msg) => {
-            eprintln!("warning: {msg}, falling back to default mode resolution");
-            None
-        }
-    };
+    // A session-level mode override (ACP `session/set_mode`) is an explicit
+    // operator decision for this session: it ranks ahead of env and
+    // project settings, and the managed-policy ceiling below still narrows
+    // whatever mode resolves — switching modes can never widen past the
+    // ceiling.
+    let mut mode: Option<PermissionMode> =
+        session_override.or_else(|| match exec_permission_mode() {
+            Ok(mode) => Some(mode),
+            Err(msg) => {
+                eprintln!("warning: {msg}, falling back to default mode resolution");
+                None
+            }
+        });
     let mut loaded_settings: Vec<ProjectSettings> = Vec::new();
     for file_name in PROJECT_SETTINGS_FILES {
         let Ok(text) = fs::read_to_string(file_name) else {
@@ -3963,6 +3970,7 @@ pub(crate) fn exec_turn(
     let permission_lattice = match exec_permission_lattice(
         workspace.as_ref().map(|(root, _)| root.as_path()),
         forced_mode,
+        None,
     ) {
         Ok(lattice) => lattice,
         Err(reason) => {
@@ -4820,7 +4828,7 @@ fn run_started_session(
     // govern tool calls rather than a second guess at it. A resolution
     // failure leaves the dash: the bar never asserts a posture it could not
     // confirm.
-    if let Ok(lattice) = exec_permission_lattice(Some(&resolved.root), None) {
+    if let Ok(lattice) = exec_permission_lattice(Some(&resolved.root), None, None) {
         renderer.chrome = session_status_chrome(lattice.mode());
     }
     let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -5000,6 +5008,13 @@ struct SessionShared {
     /// every later turn's model resolution; wins over `[models].default`
     /// and `RAPIDLM_MODEL`, sits under a managed lock. `None` = default.
     model_override: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// The session's permission-mode override (ACP `session/set_mode`):
+    /// consulted by every later turn's lattice resolution ahead of
+    /// env/settings, still narrowed by the managed-policy ceiling. Shared
+    /// with the ACP serve so a switch outlives the turn that asked.
+    /// `None` = resolve as usual.
+    permission_mode_override:
+        std::sync::Arc<std::sync::Mutex<Option<crate::permissions::PermissionMode>>>,
     /// Coalesced assistant text not yet flushed as a `model.stream_delta`
     /// ledger event (progressive streaming, §2). The delta sink appends;
     /// the flush after each turn (and the 120-char threshold inside the
@@ -8202,15 +8217,17 @@ fn build_interactive_turn_tools(
     root: &Path,
     trusted: bool,
     forced_mode: Option<crate::permissions::PermissionMode>,
+    session_override: Option<crate::permissions::PermissionMode>,
 ) -> Result<(ExecTools, crate::permissions::PermissionLattice), kernel::TurnOutcome> {
-    let permission_lattice = match exec_permission_lattice(Some(root), forced_mode) {
-        Ok(lattice) => lattice,
-        Err(err) => {
-            return Err(kernel::TurnOutcome::Failed {
-                reason: format!("permission configuration error: {err}"),
-            });
-        }
-    };
+    let permission_lattice =
+        match exec_permission_lattice(Some(root), forced_mode, session_override) {
+            Ok(lattice) => lattice,
+            Err(err) => {
+                return Err(kernel::TurnOutcome::Failed {
+                    reason: format!("permission configuration error: {err}"),
+                });
+            }
+        };
     let tools = if trusted {
         ExecTools::workspace_with_permissions(root, permission_lattice.clone())
             .unwrap_or_else(|_| ExecTools::noop())
@@ -8256,10 +8273,17 @@ fn run_interactive_turn_inner(
     shared: &SessionShared,
 ) -> kernel::TurnOutcome {
     let mut warn = |line: &str| notify(&shared.notices, line);
-    let (mut tools, permission_lattice) = match build_interactive_turn_tools(root, trusted, None) {
-        Ok(built) => built,
-        Err(outcome) => return outcome,
-    };
+    let session_mode_override = shared
+        .permission_mode_override
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .copied();
+    let (mut tools, permission_lattice) =
+        match build_interactive_turn_tools(root, trusted, None, session_mode_override) {
+            Ok(built) => built,
+            Err(outcome) => return outcome,
+        };
     let policy_version = apply_managed_ceilings(&mut tools);
     // The session's MCP connections, before the integrations connect any:
     // a server the session already has is reused, not spawned again — and
@@ -8427,8 +8451,15 @@ pub(crate) fn spawn_acp_turn(
     trusted: bool,
     text: String,
     kernel_cancel: kernel::CancelToken,
+    mode_override: std::sync::Arc<std::sync::Mutex<Option<crate::permissions::PermissionMode>>>,
 ) {
     std::thread::spawn(move || {
+        // A fresh SessionShared per turn (ACP prompts have no conversation
+        // state here) except the mode override, which is the serve's own
+        // shared cell: a `session/set_mode` switch must reach every later
+        // turn of the session.
+        let mut shared = SessionShared::default();
+        shared.permission_mode_override = mode_override;
         let outcome = catching_panics(std::panic::AssertUnwindSafe(|| {
             run_interactive_turn(
                 &client,
@@ -8439,7 +8470,7 @@ pub(crate) fn spawn_acp_turn(
                 &text,
                 &kernel_cancel,
                 &crate::exec_tools::JobRegistry::default(),
-                &SessionShared::default(),
+                &shared,
             )
         }));
         let _ = client.finish_turn(kernel::FinishTurn::new(
@@ -8702,10 +8733,17 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
         };
     };
     let mut warn = |line: &str| notify(&shared.notices, line);
-    let (mut tools, permission_lattice) = match build_interactive_turn_tools(root, trusted, None) {
-        Ok(built) => built,
-        Err(outcome) => return outcome,
-    };
+    let session_mode_override = shared
+        .permission_mode_override
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .copied();
+    let (mut tools, permission_lattice) =
+        match build_interactive_turn_tools(root, trusted, None, session_mode_override) {
+            Ok(built) => built,
+            Err(outcome) => return outcome,
+        };
     let _policy_version = apply_managed_ceilings(&mut tools);
     tools.share_mcp(&shared.mcp);
     tools.share_subagents(&shared.agents);
@@ -9294,7 +9332,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     let (context_limit, output_reserve) = budget;
     let mut warn = |line: &str| notify(&shared.notices, line);
     let (mut tools, permission_lattice) =
-        match build_interactive_turn_tools(root, trusted, forced_mode) {
+        match build_interactive_turn_tools(root, trusted, forced_mode, None) {
             Ok(built) => built,
             Err(outcome) => return outcome,
         };
@@ -9643,8 +9681,9 @@ pub(crate) fn run_workflow_agent_step(
     task: &str,
 ) -> Result<String, String> {
     let mut warn: &mut dyn FnMut(&str) = &mut |_| {};
-    let (mut tools, permission_lattice) = build_interactive_turn_tools(root, trusted, None)
-        .map_err(|outcome| "workflow step could not build its tools".to_owned())?;
+    let (mut tools, permission_lattice) =
+        build_interactive_turn_tools(root, trusted, None, None)
+            .map_err(|outcome| "workflow step could not build its tools".to_owned())?;
     let _policy_version = apply_managed_ceilings(&mut tools);
     tools.share_mcp(&Default::default());
     let (_reminder_floor, reminder_block) = interactive_reminders(root, &mut warn);
@@ -11157,16 +11196,52 @@ base_url = "http://127.0.0.1:11434/v1"
         // by requesting two different modes and confirming both distinctly
         // come back out, rather than both collapsing to one ambient default
         // (which would mean `forced_mode` was silently ignored).
-        let plan = exec_permission_lattice(None, Some(crate::permissions::PermissionMode::Plan))
-            .expect("lattice");
-        assert_eq!(plan.mode(), crate::permissions::PermissionMode::Plan);
-        let accept_edits =
-            exec_permission_lattice(None, Some(crate::permissions::PermissionMode::AcceptEdits))
+        let plan =
+            exec_permission_lattice(None, Some(crate::permissions::PermissionMode::Plan), None)
                 .expect("lattice");
+        assert_eq!(plan.mode(), crate::permissions::PermissionMode::Plan);
+        let accept_edits = exec_permission_lattice(
+            None,
+            Some(crate::permissions::PermissionMode::AcceptEdits),
+            None,
+        )
+        .expect("lattice");
         assert_eq!(
             accept_edits.mode(),
             crate::permissions::PermissionMode::AcceptEdits
         );
+    }
+
+    #[test]
+    fn session_mode_override_wins_over_env_and_settings_but_not_forced() {
+        // ACP `session/set_mode` is an explicit operator decision for the
+        // session: it beats whatever the ambient environment/project
+        // settings would resolve. Two distinct requested modes come back
+        // distinctly, proving the override actually reaches the lattice.
+        let plan =
+            exec_permission_lattice(None, None, Some(crate::permissions::PermissionMode::Plan))
+                .expect("lattice");
+        assert_eq!(plan.mode(), crate::permissions::PermissionMode::Plan);
+        let bypass = exec_permission_lattice(
+            None,
+            None,
+            Some(crate::permissions::PermissionMode::BypassPermissions),
+        )
+        .expect("lattice");
+        assert_eq!(
+            bypass.mode(),
+            crate::permissions::PermissionMode::BypassPermissions
+        );
+        // A caller-forced mode (a hard ceiling like cron propose-only)
+        // still wins when both exist: the forced path is a caller
+        // constraint, not a user preference.
+        let forced = exec_permission_lattice(
+            None,
+            Some(crate::permissions::PermissionMode::Plan),
+            Some(crate::permissions::PermissionMode::BypassPermissions),
+        )
+        .expect("lattice");
+        assert_eq!(forced.mode(), crate::permissions::PermissionMode::Plan);
     }
 
     #[test]
@@ -11233,7 +11308,7 @@ base_url = "http://127.0.0.1:11434/v1"
 
         // Exactly what the interactive turn builds, with production's own
         // `forced_mode: None`.
-        let lattice = exec_permission_lattice(Some(&root), None).expect("lattice");
+        let lattice = exec_permission_lattice(Some(&root), None, None).expect("lattice");
         // A developer machine with RAPIDLM_PERMISSION_MODE exported would
         // otherwise make this assert something else entirely.
         assert_eq!(

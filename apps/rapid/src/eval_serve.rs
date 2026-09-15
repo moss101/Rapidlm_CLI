@@ -1992,6 +1992,9 @@ Modes:
               reason. Every requested arm appears in the report.
   --trials <n>  (live) run every task n times and report per-task variation;
               one run is never presented as definitive.
+  --arms <names>  (live) comma-separated arm subset to run (e.g. --arms
+              rapid,grok). The full arm plan stays in provenance; the gate
+              judges only what ran.
   --grant-shell  (live, rapid arm only) pre-approve shell_exec per scratch
               repo — the equal-tool-surface configuration, matching a
               competitor that auto-approves shell. Without it rapid runs
@@ -2053,7 +2056,29 @@ pub fn run_eval(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandErr
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|trials| *trials >= 1)
         .unwrap_or(1);
-    let arms = plan_arms(&std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rapid")));
+    let all_arms = plan_arms(&std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rapid")));
+    // `--arms rapid,grok` restricts the RUN to the named arms. The full
+    // plan stays in provenance (so the record shows what else was
+    // requested of the environment); the gate only judges what ran.
+    let requested_arms: Option<Vec<String>> = args
+        .iter()
+        .position(|arg| arg == "--arms")
+        .and_then(|position| args.get(position + 1))
+        .map(|value| {
+            value
+                .split(',')
+                .map(|name| name.trim().to_owned())
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .filter(|names: &Vec<String>| !names.is_empty());
+    let arms: Vec<ArmPlan> = match &requested_arms {
+        Some(names) => all_arms
+            .into_iter()
+            .filter(|arm| names.contains(&arm.name))
+            .collect(),
+        None => all_arms,
+    };
     let provenance = build_provenance(mode, &suite, &tasks, &arms, grant_shell);
     let results = if offline {
         run_offline(&tasks, &scratch, trusted)

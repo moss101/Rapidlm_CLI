@@ -142,6 +142,7 @@ fn serve_unix(
             root: root.to_path_buf(),
             trusted,
             daemon_token: daemon_token.clone(),
+            mode_override: Default::default(),
         };
         std::thread::spawn(move || {
             let _ = serve.serve(stream);
@@ -165,6 +166,11 @@ struct Connection {
     root: PathBuf,
     trusted: bool,
     daemon_token: Option<String>,
+    /// The connection's permission-mode override cell: every spawned turn
+    /// reads it. Unset by default (mode resolves from env/settings); the
+    /// cell exists so a mode switch surface shares one authoritative cell
+    /// per connection.
+    mode_override: std::sync::Arc<std::sync::Mutex<Option<crate::permissions::PermissionMode>>>,
 }
 
 #[cfg(unix)]
@@ -342,6 +348,7 @@ impl Connection {
                     self.trusted,
                     text,
                     kernel_cancel,
+                    self.mode_override.clone(),
                 );
                 turn_handle_json(&handle)
             }

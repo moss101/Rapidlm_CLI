@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use event_ledger::event::{ActorRef, ErasedEventEnvelope, EventKind};
 use kernel::{
@@ -42,6 +43,26 @@ pub const METHOD_SESSION_CANCEL: &str = "session/cancel";
 pub const METHOD_SESSION_UPDATE: &str = "session/update";
 /// JSON-RPC request: mapped approval (agent → client).
 pub const METHOD_SESSION_REQUEST_PERMISSION: &str = "session/request_permission";
+/// JSON-RPC request: switch the session's mode for subsequent prompts.
+/// Only served when a [`SessionModeControl`] is installed; otherwise the
+/// method stays `METHOD_NOT_FOUND` — a capability is advertised only when
+/// it is real.
+pub const METHOD_SESSION_SET_MODE: &str = "session/set_mode";
+
+/// What the composition root implements when the agent genuinely supports
+/// switching modes between prompts. Advertised through `session/new` /
+/// `session/load` (`modes` + `currentMode`) and acted on by
+/// `session/set_mode`. The switch takes effect on the NEXT prompt: ACP
+/// prompts on one session are sequential, so there is no mid-turn mode.
+pub trait SessionModeControl: Send + Sync {
+    /// Advertised modes as `(id, display name)`, in display order.
+    fn modes(&self) -> Vec<(String, String)>;
+    /// Id of the mode the next prompt will run under.
+    fn current_mode(&self) -> String;
+    /// Switch modes for subsequent prompts. `Err(reason)` when the id is
+    /// unknown or the switch is refused.
+    fn set_mode(&self, id: &str) -> Result<(), String>;
+}
 
 /// Maximum UTF-8 bytes accepted in `cwd`.
 pub const MAX_CWD_BYTES: usize = 4096;
@@ -88,6 +109,10 @@ pub struct V1Adapter<C> {
     cancel: CancellationToken,
     initialized: bool,
     cursors: HashMap<SessionId, u64>,
+    /// Mode control installed by the composition root. `None` (default):
+    /// `session/set_mode` stays METHOD_NOT_FOUND and no mode fields are
+    /// advertised.
+    session_modes: Option<Arc<dyn SessionModeControl>>,
 }
 
 /// Typed ACP v1 adapter failure. Display never echoes prompt, cwd, or payload.
@@ -364,6 +389,15 @@ struct SessionIdParams {
     session_id: String,
 }
 
+/// `session/set_mode` parameters: the session to switch and the target
+/// mode id (one of the advertised ids).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetModeParams {
+    session_id: String,
+    mode: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PromptParams {
@@ -402,7 +436,37 @@ impl<C: KernelClient> V1Adapter<C> {
             cancel,
             initialized: false,
             cursors: HashMap::new(),
+            session_modes: None,
         }
+    }
+
+    /// Install mode control: `session/set_mode` becomes available and
+    /// `session/new`/`session/load` advertise the modes. Install ONLY a
+    /// control backed by real runtime behavior — advertisement is a
+    /// contract, not a wish.
+    pub fn with_session_modes(mut self, modes: Arc<dyn SessionModeControl>) -> Self {
+        self.session_modes = Some(modes);
+        self
+    }
+
+    /// The installed mode control, when any.
+    pub fn session_modes(&self) -> Option<&Arc<dyn SessionModeControl>> {
+        self.session_modes.as_ref()
+    }
+
+    /// The `modes` + `currentMode` advertisement block, present only when
+    /// mode control is installed.
+    fn mode_advertisement(&self) -> Option<Value> {
+        let modes = self.session_modes.as_ref()?;
+        let advertised: Vec<Value> = modes
+            .modes()
+            .into_iter()
+            .map(|(id, name)| serde_json::json!({"id": id, "name": name}))
+            .collect();
+        Some(serde_json::json!({
+            "modes": advertised,
+            "currentMode": modes.current_mode(),
+        }))
     }
 
     pub fn client(&self) -> &C {
@@ -665,20 +729,58 @@ impl<C: KernelClient> V1Adapter<C> {
             }
             METHOD_SESSION_NEW => {
                 let result = self.session_new(params).await?;
-                Ok(Dispatch::Value(serde_json::json!({
+                let mut reply = serde_json::json!({
                     "sessionId": result.session_id,
-                })))
+                });
+                if let Some(advertised) = self.mode_advertisement() {
+                    reply["modes"] = advertised["modes"].clone();
+                    reply["currentMode"] = advertised["currentMode"].clone();
+                }
+                Ok(Dispatch::Value(reply))
             }
             METHOD_SESSION_LOAD => {
                 let _ = self.session_load(params).await?;
-                Ok(Dispatch::Value(Value::Object(Map::new())))
+                let mut reply = Value::Object(Map::new());
+                if let Some(advertised) = self.mode_advertisement() {
+                    reply["modes"] = advertised["modes"].clone();
+                    reply["currentMode"] = advertised["currentMode"].clone();
+                }
+                Ok(Dispatch::Value(reply))
             }
             METHOD_SESSION_PROMPT => {
                 let (turn, events) = self.session_prompt(params).await?;
                 Ok(Dispatch::Prompt { turn, events })
             }
+            METHOD_SESSION_SET_MODE => {
+                let result = self.session_set_mode(params).await?;
+                Ok(Dispatch::Value(result))
+            }
             _ => Err(V1Error::MethodNotFound),
         }
+    }
+
+    /// `session/set_mode`: switch the session's mode for subsequent
+    /// prompts. Requires installed mode control; unknown ids are typed
+    /// parameter errors that leave the current mode untouched.
+    async fn session_set_mode(&mut self, params: Value) -> Result<Value, V1Error> {
+        self.require_ready()?;
+        let Some(modes) = self.session_modes.as_ref() else {
+            return Err(V1Error::MethodNotFound);
+        };
+        let parsed: SetModeParams = parse_params(params)?;
+        let session_id = parse_session_id(&parsed.session_id)?;
+        // The session must exist and be open; the mode itself is
+        // composition-root state, so a switch on a closed session is a
+        // protocol error, not a silent no-op.
+        let snapshot = self.load_kernel_session(session_id).await?;
+        if snapshot.status() == SessionStatus::Closed {
+            return Err(V1Error::SessionClosed);
+        }
+        modes
+            .set_mode(&parsed.mode)
+            .map_err(|_| V1Error::InvalidParams)?;
+        let advertisement = self.mode_advertisement().ok_or(V1Error::MethodNotFound)?;
+        Ok(advertisement)
     }
 
     async fn session_cancel_params(&mut self, params: Option<&Value>) -> Result<(), V1Error> {
@@ -1519,6 +1621,146 @@ mod tests {
             other => panic!("expected method-not-found, got {other:?}"),
         }
         block_on(tmp.client.get_session(created.session_id())).expect("still valid");
+    }
+
+    /// A scripted mode control: three known modes; unknown ids refused.
+    struct ScriptedModes {
+        current: std::sync::Mutex<String>,
+    }
+    impl SessionModeControl for ScriptedModes {
+        fn modes(&self) -> Vec<(String, String)> {
+            vec![
+                ("default".to_owned(), "Default".to_owned()),
+                ("acceptEdits".to_owned(), "Accept edits".to_owned()),
+                ("plan".to_owned(), "Plan".to_owned()),
+            ]
+        }
+        fn current_mode(&self) -> String {
+            self.current
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        }
+        fn set_mode(&self, id: &str) -> Result<(), String> {
+            let mut current = self.current.lock().unwrap_or_else(|p| p.into_inner());
+            if self.modes().iter().any(|(known, _)| known == id) {
+                *current = id.to_owned();
+                Ok(())
+            } else {
+                Err(format!("unknown mode {id}"))
+            }
+        }
+    }
+
+    fn adapter_with_modes(client: InProcessKernelClient) -> V1Adapter<InProcessKernelClient> {
+        adapter(client).with_session_modes(Arc::new(ScriptedModes {
+            current: std::sync::Mutex::new("default".to_owned()),
+        }))
+    }
+
+    #[test]
+    fn modes_are_advertised_and_set_mode_switches_for_subsequent_prompts() {
+        let tmp = TempClient::create();
+        let mut acp = {
+            let mut acp = adapter_with_modes(tmp.client.clone());
+            block_on(acp.initialize(serde_json::json!({"protocolVersion": 1})))
+                .expect("initialize");
+            acp
+        };
+        // session/new advertises exactly the modes the control names, with
+        // the current mode id.
+        let reply = block_on(acp.handle(&JsonRpcMessage::Request {
+            id: JsonRpcId::Number(2),
+            method: METHOD_SESSION_NEW.into(),
+            params: Some(serde_json::json!({
+                "cwd": "/tmp/project",
+                "mcpServers": []
+            })),
+        }))
+        .expect("handle");
+        let session_id = match &reply {
+            HandleResult::Reply(JsonRpcMessage::Result { result, .. }) => {
+                assert_eq!(result["modes"].as_array().expect("modes").len(), 3);
+                assert_eq!(result["modes"][0]["id"], "default");
+                assert_eq!(result["modes"][1]["name"], "Accept edits");
+                assert_eq!(result["currentMode"], "default");
+                result["sessionId"].as_str().expect("session id").to_owned()
+            }
+            other => panic!("expected session/new result, got {other:?}"),
+        };
+        // A known id switches; the reply carries the refreshed advertisement.
+        let reply = block_on(acp.handle(&JsonRpcMessage::Request {
+            id: JsonRpcId::Number(3),
+            method: METHOD_SESSION_SET_MODE.into(),
+            params: Some(serde_json::json!({
+                "sessionId": session_id,
+                "mode": "acceptEdits"
+            })),
+        }))
+        .expect("handle");
+        match &reply {
+            HandleResult::Reply(JsonRpcMessage::Result { result, .. }) => {
+                assert_eq!(result["currentMode"], "acceptEdits");
+            }
+            other => panic!("expected set_mode result, got {other:?}"),
+        }
+        let control = acp.session_modes().expect("control installed").clone();
+        assert_eq!(
+            control.current_mode(),
+            "acceptEdits",
+            "state actually switched"
+        );
+        // An unknown id is a typed parameter error and changes nothing.
+        let reply = block_on(acp.handle(&JsonRpcMessage::Request {
+            id: JsonRpcId::Number(4),
+            method: METHOD_SESSION_SET_MODE.into(),
+            params: Some(serde_json::json!({
+                "sessionId": session_id,
+                "mode": "no-such-mode"
+            })),
+        }))
+        .expect("handle");
+        match reply {
+            HandleResult::Reply(JsonRpcMessage::Error { error, .. }) => {
+                assert_eq!(error.code(), INVALID_PARAMS);
+            }
+            other => panic!("expected invalid-params, got {other:?}"),
+        }
+        assert_eq!(
+            control.current_mode(),
+            "acceptEdits",
+            "failed switch is a no-op"
+        );
+        block_on(
+            tmp.client
+                .get_session(parse_session_id(&session_id).expect("id")),
+        )
+        .expect("session still valid");
+    }
+
+    #[test]
+    fn session_new_omits_mode_fields_without_mode_control() {
+        let tmp = TempClient::create();
+        let mut acp = block_on(ready_adapter(tmp.client.clone()));
+        let reply = block_on(acp.handle(&JsonRpcMessage::Request {
+            id: JsonRpcId::Number(5),
+            method: METHOD_SESSION_NEW.into(),
+            params: Some(serde_json::json!({
+                "cwd": "/tmp/project",
+                "mcpServers": []
+            })),
+        }))
+        .expect("handle");
+        match &reply {
+            HandleResult::Reply(JsonRpcMessage::Result { result, .. }) => {
+                assert!(
+                    result.get("modes").is_none(),
+                    "no control, no advertisement"
+                );
+                assert!(result.get("currentMode").is_none());
+            }
+            other => panic!("expected session/new result, got {other:?}"),
+        }
     }
 
     #[test]

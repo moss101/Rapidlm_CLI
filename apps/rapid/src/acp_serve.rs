@@ -48,6 +48,49 @@ gates every tool call, and a pending approval surfaces to the editor as a
 Exit codes: 0 clean disconnect · 2 usage · 1 protocol failure.
 ";
 
+/// The ACP serve's mode control: the six permission modes the runtime
+/// genuinely implements, backed by the shared override cell every turn's
+/// lattice resolution reads. This is what makes the `session/set_mode`
+/// advertisement truthful — the switch changes real permission behavior on
+/// the next prompt, ahead of env/settings, still narrowed by the
+/// managed-policy ceiling.
+#[derive(Clone)]
+struct RapidSessionModes {
+    override_cell: Arc<Mutex<Option<crate::permissions::PermissionMode>>>,
+}
+
+impl acp::v1::SessionModeControl for RapidSessionModes {
+    fn modes(&self) -> Vec<(String, String)> {
+        [
+            ("default", "Default"),
+            ("plan", "Plan"),
+            ("acceptEdits", "Accept edits"),
+            ("auto", "Auto"),
+            ("dontAsk", "Don't ask"),
+            ("bypassPermissions", "Bypass permissions"),
+        ]
+        .into_iter()
+        .map(|(id, name)| (id.to_owned(), name.to_owned()))
+        .collect()
+    }
+
+    fn current_mode(&self) -> String {
+        self.override_cell
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|mode| crate::permissions::MODE_NAMES[*mode as usize].to_owned())
+            .unwrap_or_else(|| "default".to_owned())
+    }
+
+    fn set_mode(&self, id: &str) -> Result<(), String> {
+        let mode = crate::permissions::PermissionMode::parse(id)
+            .ok_or_else(|| format!("unknown mode {id}"))?;
+        *self.override_cell.lock().unwrap_or_else(|p| p.into_inner()) = Some(mode);
+        Ok(())
+    }
+}
+
 /// `rapid acp`: bind the ACP adapters to this workspace over stdio.
 pub fn run_acp(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandError> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -81,12 +124,17 @@ Approve trust with `rapid trust grant`."
     .map_err(|err| crate::p9_commands::P9CommandError::Agent(err.to_string()))?;
 
     let serve_cancel = acp::stdio::CancellationToken::new();
+    let mode_override: Arc<Mutex<Option<crate::permissions::PermissionMode>>> =
+        Arc::new(Mutex::new(None));
     let adapter = V1Adapter::new(
         client.clone(),
         ProjectId::new(),
         actor.clone(),
         serve_cancel.clone(),
-    );
+    )
+    .with_session_modes(Arc::new(RapidSessionModes {
+        override_cell: mode_override.clone(),
+    }));
     let serve = Serve {
         client,
         adapter: std::cell::RefCell::new(adapter),
@@ -94,6 +142,7 @@ Approve trust with `rapid trust grant`."
         root,
         trusted,
         pending: Arc::new(Mutex::new(None)),
+        mode_override,
     };
     match serve.run(std::io::stdin(), std::io::stdout(), serve_cancel) {
         Ok(()) => Ok(0),
@@ -116,6 +165,10 @@ struct Serve {
     /// Where the live prompt thread waits for the editor's permission
     /// decision. `Some` only while a prompt is in flight.
     pending: Arc<Mutex<Option<PendingPermit>>>,
+    /// The session's permission-mode cell: written by
+    /// `session/set_mode` (through [`RapidSessionModes`]) and read by
+    /// every spawned turn's lattice resolution.
+    mode_override: Arc<Mutex<Option<crate::permissions::PermissionMode>>>,
 }
 
 impl Serve {
@@ -252,6 +305,7 @@ impl Serve {
                     self.trusted,
                     text,
                     kernel_cancel,
+                    self.mode_override.clone(),
                 );
                 let (decision_tx, decision_rx) = std::sync::mpsc::channel::<serde_json::Value>();
                 *self

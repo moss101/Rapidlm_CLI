@@ -17,9 +17,11 @@ use crate::stdio::{
     CancellationToken, INTERNAL_ERROR, INVALID_PARAMS, JsonRpcErrorObject, JsonRpcId,
     JsonRpcMessage, METHOD_NOT_FOUND,
 };
+use std::sync::Arc;
+
 use crate::v1::{
     HandleResult, InitializeResult, MAX_IMPLEMENTATION_NAME_BYTES,
-    MAX_IMPLEMENTATION_VERSION_BYTES, METHOD_INITIALIZE, V1Adapter, V1Error,
+    MAX_IMPLEMENTATION_VERSION_BYTES, METHOD_INITIALIZE, SessionModeControl, V1Adapter, V1Error,
 };
 
 /// Highest ACP major version this adapter will speak.
@@ -206,6 +208,14 @@ impl<C: KernelClient> V2Adapter<C> {
             cancel,
             negotiated: None,
         }
+    }
+
+    /// Install mode control on the inner v1 adapter: `session/set_mode`
+    /// becomes available through v2 as well, and the mode advertisement
+    /// rides the v1 `session/new`/`session/load` payloads v2 delegates to.
+    pub fn with_session_modes(mut self, modes: Arc<dyn SessionModeControl>) -> Self {
+        self.inner = self.inner.with_session_modes(modes);
+        self
     }
 
     pub fn inner(&self) -> &V1Adapter<C> {
