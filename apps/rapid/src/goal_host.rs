@@ -158,10 +158,11 @@ impl Error for GoalPersistError {}
 /// both files as a single atomic domain operation (`create`/`replace`/
 /// `pause`/`resume`/`cancel`/`complete` only ever touch the machine/
 /// snapshot half; `claim`/`evidence record` only ever touch evidence), and
-/// evidence records are immutable and append-only in every reachable
-/// production path (`invalidate_subject`, the one record-mutating method
-/// on `EvidenceStore`, has zero callers outside its own crate) — so a
-/// evidence-gated decision (`Complete`'s own gate) reading a
+/// per-record content is immutable in every reachable production path: the
+/// one record-mutating effect is freshness invalidation (`GoalHost::
+/// stale_all_fresh_evidence`, driven by the workspace-write hook), which
+/// can only *remove* satisfaction — so a evidence-gated decision
+/// (`Complete`'s own gate) reading a
 /// moment-stale evidence view can only under-count real evidence and
 /// refuse conservatively, never over-count and allow completion on
 /// insufficient evidence. That asymmetry is what makes two independent
@@ -318,6 +319,15 @@ impl GoalHost {
         spec: agent_runtime::EvidenceSpec,
     ) -> Result<&EvidenceRecord, EvidenceError> {
         self.evidence.record(spec)
+    }
+
+    /// Mark every fresh evidence record stale — the workspace-mutation
+    /// hook's effect (see `interactive.rs`'s `evidence_invalidator_for`).
+    /// Deliberately conservative: a recorded check speaks about the whole
+    /// tree, so any tree change stales it; under-counting only makes the
+    /// completion gate refuse until the check re-runs.
+    pub fn stale_all_fresh_evidence(&mut self) -> usize {
+        self.evidence.invalidate_all_fresh()
     }
 
     /// Apply a lifecycle command. Subagent actors are rejected; only a human /

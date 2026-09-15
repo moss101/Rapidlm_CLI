@@ -775,6 +775,26 @@ impl EvidenceStore {
         n
     }
 
+    /// Mark EVERY fresh record stale. The workspace-mutation semantics: a
+    /// recorded verification (a test run, a build, a scan) speaks about the
+    /// tree as a whole, so a change to any file can invalidate any recorded
+    /// check — there is no principled per-record relevance test a caller
+    /// could apply instead. Deliberately conservative: the completion gate
+    /// under-counts (refuses until the check re-runs), never counts proof
+    /// that predates the code it claims to verify. See
+    /// [`invalidate_subject`](Self::invalidate_subject) for the targeted
+    /// form.
+    pub fn invalidate_all_fresh(&mut self) -> usize {
+        let mut n = 0;
+        for record in &mut self.records {
+            if record.freshness.is_fresh() {
+                record.freshness = EvidenceFreshness::Stale;
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Insert an already-decoded record (bounds-checked). Persistence hosts
     /// restore a validated doc with this; decoding already ran the full spec
     /// validation, so no second pass is performed here.
@@ -847,6 +867,12 @@ impl EvidenceService {
 
     pub fn invalidate_subject(&mut self, subject_ref: &str) -> usize {
         self.store.invalidate_subject(subject_ref)
+    }
+
+    /// Mark every fresh record stale — the workspace-mutation semantics;
+    /// see [`EvidenceStore::invalidate_all_fresh`].
+    pub fn invalidate_all_fresh(&mut self) -> usize {
+        self.store.invalidate_all_fresh()
     }
 
     /// Restore an already-decoded record (bounds-checked). See
@@ -1881,6 +1907,29 @@ mod tests {
             verdicts.verdicts()[0].reason(),
             Some(CriterionUnsatisfied::Stale)
         );
+    }
+
+    #[test]
+    fn invalidate_all_fresh_stales_everything_and_stays_conservative() {
+        // The workspace-mutation semantics: any tree change stales every
+        // fresh record (a check speaks about the whole tree). A record
+        // already stale stays stale, and a staled store fails completion
+        // until the check re-runs.
+        let goal = goal_with_test_requirement();
+        let mut service = EvidenceService::new();
+        service.record(passing_test()).expect("record");
+        assert!(service.validate_goal(&goal).allowed());
+        // One fresh record; staling once reports it and flips it.
+        assert_eq!(service.invalidate_all_fresh(), 1);
+        // Now stale: a second pass finds nothing fresh to stale — and the
+        // count cannot resurrect a record by double-counting.
+        assert_eq!(service.invalidate_all_fresh(), 0);
+        assert!(!service.validate_goal(&goal).allowed());
+        assert_eq!(
+            service.validate_goal(&goal).verdicts()[0].reason(),
+            Some(CriterionUnsatisfied::Stale)
+        );
+        assert!(!service.can_complete(&goal).allowed());
     }
 
     #[test]
