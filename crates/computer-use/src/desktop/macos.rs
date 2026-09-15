@@ -619,9 +619,10 @@ return out"#;
                     Some(node) => focus_element_statement(&self.current_locator(node)?),
                     None => String::new(),
                 };
-                Ok(tell_events(
-                    &format!("{focus}\n\t{stroke}").trim_end().to_owned(),
-                ))
+                let mut body = format!("{focus}\n\t{stroke}");
+                let trimmed = body.trim_end().len();
+                body.truncate(trimmed);
+                Ok(tell_events(&body))
             }
             DesktopAction::Chord { keys } => {
                 // System Events has no simultaneous-chord primitive for
@@ -980,7 +981,7 @@ fn run_osascript(
     // would deadlock once a snapshot fills the 64KiB pipe buffer.
     let stdout_task = join_drain(stdout_pipe, 1024 * 1024);
     let stderr_task = join_drain(stderr_pipe, 4096);
-    let outcome = loop {
+    loop {
         if cancel.is_cancelled() {
             let _ = child.kill();
             let _ = child.wait();
@@ -1005,8 +1006,7 @@ fn run_osascript(
             }
             Err(_) => break Err(DesktopError::Backend),
         }
-    };
-    outcome
+    }
 }
 
 /// Map `osascript`'s failure output onto the typed error: an element that
