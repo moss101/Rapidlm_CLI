@@ -1952,6 +1952,7 @@ pub fn eval_exit_code(results: &[TaskResult]) -> i32 {
 /// reproduced later: repository state, runner + grading versions, suite
 /// digest, model identity, permissions, budgets, environment, and the exact
 /// arm plan with observed binary versions.
+#[allow(clippy::too_many_arguments)]
 pub fn build_provenance(
     mode: &str,
     suite_dir: &Path,
