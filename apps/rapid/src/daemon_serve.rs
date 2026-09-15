@@ -33,7 +33,8 @@
 use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
-#[cfg(unix)]
+// PathBuf is NOT unix-only: `run_daemon` parses `--socket` on every
+// platform before the cfg(unix) refusal.
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::mpsc::{Receiver, Sender};
