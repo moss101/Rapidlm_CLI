@@ -26,21 +26,28 @@
 //! against the local daemon token (`~/.rapidlm/daemon.token`) when one
 //! exists — a wrong token is rejected before any RPC is served.
 
-// Unix-only serving writes frames + flushes; on Windows the daemon path is
-// a typed refusal, so the trait import would be dead there.
+// Everything below the usage text serves the Unix socket; on Windows the
+// daemon path is a typed refusal, so the whole import block is unix-only
+// or it is dead there (the failure ci.yml caught twice).
 #[cfg(unix)]
 use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
+#[cfg(unix)]
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
+#[cfg(unix)]
+use std::sync::mpsc::{Receiver, Sender};
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
 
+#[cfg(unix)]
 use acp::stdio::{FrameReader, MAX_FRAME_BYTES};
+#[cfg(unix)]
 use kernel::InProcessKernelClient;
+#[cfg(unix)]
 use protocol::{ProjectId, SessionId};
-use std::sync::mpsc::Receiver;
 
+#[cfg(unix)]
 use crate::interactive::{acp_resolve_and_continue, spawn_acp_turn};
 
 pub const DAEMON_USAGE: &str = "\
