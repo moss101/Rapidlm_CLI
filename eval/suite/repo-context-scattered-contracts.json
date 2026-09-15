@@ -1,0 +1,41 @@
+{
+  "id": "repo-context-scattered-contracts",
+  "category": "context",
+  "prompt": "The orderdesk service defines its pricing behavior in CONTRACT comments scattered across the service_*.py modules (two of the files are just notes, not contracts). Implement policy.py so it exports exactly these functions with the contracted behavior: shipping_cost, tax, discount_code, total, can_express, free_shipping, split_billing, currency. Read every service_*.py first: the contracts are authoritative, including rounding, flooring, and argument order. Do not modify the service_*.py files.",
+  "setup": {
+    "service_shipping.py": "Service helper. The binding behavior lives in the CONTRACT comment.\n\n# CONTRACT(policy.shipping_cost): shipping_cost(weight_kg) returns\n# 5 + 2 * weight_kg, capped at 25 (oversized items ship at the flat max).\n\ndef _placeholder():\n    return None\n",
+    "service_tax.py": "Service helper. The binding behavior lives in the CONTRACT comment.\n\n# CONTRACT(policy.tax): tax(amount, region) multiplies amount by the\n# regional rate: EU 0.20, US 0.07, everywhere else 0.15.\n\ndef _placeholder():\n    return None\n",
+    "service_promos.py": "Service helper. The binding behavior lives in the CONTRACT comment.\n\n# CONTRACT(policy.discount_code): discount_code(code) returns the promo\n# fraction: WELCOME10 -> 0.10, VIP20 -> 0.20, unknown -> 0.0.\n\ndef _placeholder():\n    return None\n",
+    "service_totals.py": "Service helper. The binding behavior lives in the CONTRACT comment.\n\n# CONTRACT(policy.total): total(subtotal, weight_kg, region, code) computes\n# subtotal minus the code's discount fraction, applies the regional tax RATE\n# to the discounted amount, adds shipping_cost(weight_kg), and rounds the\n# result to 2 decimal places.\n\ndef _placeholder():\n    return None\n",
+    "service_express.py": "Service helper. The binding behavior lives in the CONTRACT comment.\n\n# CONTRACT(policy.can_express): can_express(region, weight_kg) is True only\n# when weight_kg is at most 20 AND region is not \"AU\".\n\ndef _placeholder():\n    return None\n",
+    "service_free_shipping.py": "Service helper. The binding behavior lives in the CONTRACT comment.\n\n# CONTRACT(policy.free_shipping): free_shipping(total, region) is True only\n# for US orders whose total is at least 50.\n\ndef _placeholder():\n    return None\n",
+    "service_billing_split.py": "Service helper. The binding behavior lives in the CONTRACT comment.\n\n# CONTRACT(policy.split_billing): split_billing(total, people) returns the\n# tuple (even_share, last_share): everyone but the last pays\n# round(total / people, 2); the last pays round(total - even_share * (people - 1), 2).\n\ndef _placeholder():\n    return None\n",
+    "service_currency.py": "Service helper. The binding behavior lives in the CONTRACT comment.\n\n# CONTRACT(policy.currency): currency(amount) formats as \"<amount> USD\"\n# with exactly two decimals.\n\ndef _placeholder():\n    return None\n",
+    "service_audit.py": "# Audit notes, not contracts.\n# 2026-08: totals module refactored twice; watch rounding.\n# 2026-09: express eligibility tightened for AU.\n",
+    "service_notes.py": "# Random ops notes.\n# The staging pool is capped at 4 workers.\n# Never edit generated clients by hand.\n",
+    "README.md": "# orderdesk\n\nPricing and shipping policy is defined by CONTRACT comments scattered through\nthe service_* modules. policy.py is the single place those behaviors are\nimplemented for callers.\n"
+  },
+  "gold": {
+    "policy.py": "def shipping_cost(weight_kg):\n    return min(25, 5 + 2 * weight_kg)\n\ndef tax(amount, region):\n    return amount * {\"EU\": 0.20, \"US\": 0.07}.get(region, 0.15)\n\ndef discount_code(code):\n    return {\"WELCOME10\": 0.10, \"VIP20\": 0.20}.get(code, 0.0)\n\ndef total(subtotal, weight_kg, region, code):\n    discounted = subtotal * (1 - discount_code(code))\n    return round(discounted * (1 + tax(1, region)) + shipping_cost(weight_kg), 2)\n\ndef can_express(region, weight_kg):\n    return weight_kg <= 20 and region != \"AU\"\n\ndef free_shipping(total_amount, region):\n    return region == \"US\" and total_amount >= 50\n\ndef split_billing(total_amount, people):\n    share = round(total_amount / people, 2)\n    last = round(total_amount - share * (people - 1), 2)\n    return share, last\n\ndef currency(amount):\n    return \"%.2f USD\" % amount\n"
+  },
+  "verify": "python3 -B -c 'import policy; assert policy.shipping_cost(0) == 5 and policy.shipping_cost(3) == 11 and policy.shipping_cost(50) == 25, \"cap must apply\"; assert abs(policy.tax(100, \"EU\") - 20.0) < 1e-9 and abs(policy.tax(100, \"US\") - 7.0) < 1e-9 and abs(policy.tax(100, \"JP\") - 15.0) < 1e-9; assert policy.discount_code(\"WELCOME10\") == 0.10 and policy.discount_code(\"VIP20\") == 0.20 and policy.discount_code(\"nope\") == 0.0; assert policy.total(100, 0, \"US\", \"WELCOME10\") == round(100 * 0.90 * 1.07 + 5, 2); assert policy.can_express(\"US\", 20) is True and policy.can_express(\"US\", 21) is False and policy.can_express(\"AU\", 5) is False; assert policy.free_shipping(50, \"US\") is True and policy.free_shipping(49.99, \"US\") is False and policy.free_shipping(99, \"EU\") is False; share, last = policy.split_billing(100, 3); assert share == 33.33 and last == 33.34; assert policy.currency(7) == \"7.00 USD\"'",
+  "verify_fails_before": true,
+  "protected": [
+    "service_shipping.py",
+    "service_tax.py",
+    "service_promos.py",
+    "service_totals.py",
+    "service_express.py",
+    "service_free_shipping.py",
+    "service_billing_split.py",
+    "service_currency.py",
+    "service_audit.py",
+    "service_notes.py"
+  ],
+  "mutants": [
+    {
+      "file": "policy.py",
+      "contents": "def shipping_cost(weight_kg):\n    return 5 + 2 * weight_kg\n\ndef tax(amount, region):\n    return amount * {\"EU\": 0.20, \"US\": 0.07}.get(region, 0.15)\n\ndef discount_code(code):\n    return {\"WELCOME10\": 0.10, \"VIP20\": 0.20}.get(code, 0.0)\n\ndef total(subtotal, weight_kg, region, code):\n    discounted = subtotal * (1 - discount_code(code))\n    return round(discounted * (1 + tax(1, region)) + shipping_cost(weight_kg), 2)\n\ndef can_express(region, weight_kg):\n    return weight_kg <= 20 and region != \"AU\"\n\ndef free_shipping(total_amount, region):\n    return region == \"US\" and total_amount >= 50\n\ndef split_billing(total_amount, people):\n    share = round(total_amount / people, 2)\n    last = round(total_amount - share * (people - 1), 2)\n    return share, last\n\ndef currency(amount):\n    return \"%.2f USD\" % amount\n"
+    }
+  ]
+}

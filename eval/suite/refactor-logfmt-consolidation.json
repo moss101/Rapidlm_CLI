@@ -1,0 +1,28 @@
+{
+  "id": "refactor-logfmt-consolidation",
+  "category": "refactor",
+  "prompt": "web_logger.py, job_logger.py, and cli_logger.py each format log lines differently (one drops the level, one drops the timestamp), so no two logs parse the same. The authoritative behavior is test_contract.py. Create logfmt.py with the single authoritative definition and change every listed module to import the name from it (keep re-exporting the same name so existing imports keep working). Every module must behave identically and all contract assertions must pass. Do not modify test_contract.py, and no listed module may keep its own def.",
+  "setup": {
+    "web_logger.py": "LEVEL_TAGS = {\"INFO\": \"INFO\", \"WARN\": \"WARN\", \"ERROR\": \"ERROR\"}\n\n\ndef format_line(level, message, stamp):\n    return stamp + \" [\" + LEVEL_TAGS.get(level, level) + \"] \" + message\n",
+    "job_logger.py": "def format_line(level, message, stamp):\n    return stamp + \" \" + message\n",
+    "cli_logger.py": "def format_line(level, message, stamp):\n    return \"[\" + level + \"] \" + message\n",
+    "test_contract.py": "from web_logger import format_line as f1\nfrom job_logger import format_line as f2\nfrom cli_logger import format_line as f3\nimport logfmt\nfor f in (f1, f2, f3, logfmt.format_line):\n    assert f(\"INFO\", \"hello\", \"2026-01-01T00:00:00\") == \"2026-01-01T00:00:00 [INFO] hello\"\n    assert f(\"ERROR\", \"boom\", \"2026-01-01T00:00:01\") == \"2026-01-01T00:00:01 [ERROR] boom\"\nprint(\"CONTRACT-OK\")\n"
+  },
+  "gold": {
+    "logfmt.py": "def format_line(level, message, stamp):\n    \"\"\"Canonical line: <ISO stamp> [<LEVEL>] <message>.\"\"\"\n    return stamp + \" [\" + level + \"] \" + message\n",
+    "web_logger.py": "from logfmt import format_line\n",
+    "job_logger.py": "from logfmt import format_line\n",
+    "cli_logger.py": "from logfmt import format_line\n"
+  },
+  "verify": "python3 -B test_contract.py && ! grep -q \"def format_line\" web_logger.py job_logger.py cli_logger.py",
+  "verify_fails_before": true,
+  "protected": [
+    "test_contract.py"
+  ],
+  "mutants": [
+    {
+      "file": "logfmt.py",
+      "contents": "def format_line(level, message, stamp):\n    \"\"\"Canonical line: <ISO stamp> [<LEVEL>] <message>.\"\"\"\n    return stamp + \" \" + message\n"
+    }
+  ]
+}

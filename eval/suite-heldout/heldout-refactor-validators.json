@@ -1,0 +1,28 @@
+{
+  "id": "heldout-refactor-validators",
+  "category": "refactor",
+  "prompt": "email_field.py, url_field.py, and phone_field.py each define a one-argument validate(value) for one field kind. Consolidate: create validators.py with validate(kind, value) handling email/url/phone exactly as test_contract.py requires (unknown kinds raise ValueError), and change the three field modules to re-export validate from validators (plain re-export: after the change each module must contain no `def validate` of its own). Do not modify test_contract.py.",
+  "setup": {
+    "email_field.py": "def validate(value):\n    return \"@\" in value and \".\" in value.split(\"@\")[-1]\n",
+    "url_field.py": "def validate(value):\n    return value.startswith(\"https://\")\n",
+    "phone_field.py": "def validate(value):\n    return value.replace(\"-\", \"\").isdigit() and len(value.replace(\"-\", \"\")) == 10\n",
+    "test_contract.py": "from email_field import validate as v1\nfrom url_field import validate as v2\nfrom phone_field import validate as v3\nimport validators\nassert v1(\"email\", \"a@b.com\") is True and v1(\"email\", \"nope\") is False\nassert v2(\"url\", \"https://x.dev\") is True and v2(\"url\", \"http://x.dev\") is False\nassert v3(\"phone\", \"555-123-4567\") is True and v3(\"phone\", \"55512\") is False\nassert validators.validate(\"email\", \"a@b.com\") is True\nassert validators.validate(\"phone\", \"5551234567\") is True\nassert validators.validate(\"url\", \"https://y.io\") is True\nprint(\"CONTRACT-OK\")\n"
+  },
+  "gold": {
+    "validators.py": "def validate(kind, value):\n    if kind == \"email\":\n        return \"@\" in value and \".\" in value.split(\"@\")[-1]\n    if kind == \"url\":\n        return value.startswith(\"https://\")\n    if kind == \"phone\":\n        return value.replace(\"-\", \"\").isdigit() and len(value.replace(\"-\", \"\")) == 10\n    raise ValueError(kind)\n",
+    "email_field.py": "from validators import validate\n",
+    "url_field.py": "from validators import validate\n",
+    "phone_field.py": "from validators import validate\n"
+  },
+  "verify": "python3 -B test_contract.py && ! grep -q \"def validate\" email_field.py url_field.py phone_field.py",
+  "verify_fails_before": true,
+  "protected": [
+    "test_contract.py"
+  ],
+  "mutants": [
+    {
+      "file": "validators.py",
+      "contents": "def validate(kind, value):\n    if kind == \"email\":\n        return \"@\" in value and \".\" in value.split(\"@\")[-1]\n    if kind == \"url\":\n        return value.startswith(\"http\")\n    if kind == \"phone\":\n        return value.replace(\"-\", \"\").isdigit() and len(value.replace(\"-\", \"\")) == 10\n    raise ValueError(kind)\n"
+    }
+  ]
+}

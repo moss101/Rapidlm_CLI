@@ -1,0 +1,28 @@
+{
+  "id": "refactor-backoff-consolidation",
+  "category": "refactor",
+  "prompt": "api_client.py, mail_client.py, and report_client.py each define their own backoff() and the copies disagree (squared, exponential, and linear). The authoritative behavior is test_contract.py. Create retry_policy.py with the single authoritative definition and change every listed module to import the name from it (keep re-exporting the same name so existing imports keep working). Every module must behave identically and all contract assertions must pass. Do not modify test_contract.py, and no listed module may keep its own def.",
+  "setup": {
+    "api_client.py": "RETRY_CEILING = 5\n\n\ndef backoff(attempt):\n    \"\"\"Seconds to wait before retry number `attempt`.\"\"\"\n    return attempt ** 2\n",
+    "mail_client.py": "RETRY_CEILING = 5\n\n\ndef backoff(attempt):\n    \"\"\"Seconds to wait before retry number `attempt`.\"\"\"\n    return 2 ** attempt\n",
+    "report_client.py": "RETRY_CEILING = 5\n\n\ndef backoff(attempt):\n    \"\"\"Seconds to wait before retry number `attempt`.\"\"\"\n    return 3 * attempt\n",
+    "test_contract.py": "from api_client import backoff as b1\nfrom mail_client import backoff as b2\nfrom report_client import backoff as b3\nimport retry_policy\nfor b in (b1, b2, b3, retry_policy.backoff):\n    assert [b(a) for a in range(6)] == [1, 2, 4, 8, 16, 32]\n    assert b(-1) == 0, \"negative attempts wait zero\"\nprint(\"CONTRACT-OK\")\n"
+  },
+  "gold": {
+    "retry_policy.py": "def backoff(attempt):\n    \"\"\"Seconds to wait before retry number `attempt`.\"\"\"\n    if attempt < 0:\n        return 0\n    return 2 ** attempt\n",
+    "api_client.py": "from retry_policy import backoff\n",
+    "mail_client.py": "from retry_policy import backoff\n",
+    "report_client.py": "from retry_policy import backoff\n"
+  },
+  "verify": "python3 -B test_contract.py && ! grep -q \"def backoff\" api_client.py mail_client.py report_client.py",
+  "verify_fails_before": true,
+  "protected": [
+    "test_contract.py"
+  ],
+  "mutants": [
+    {
+      "file": "retry_policy.py",
+      "contents": "def backoff(attempt):\n    \"\"\"Seconds to wait before retry number `attempt`.\"\"\"\n    if attempt < 0:\n        return 0\n    return 2 ** (attempt - 1)\n"
+    }
+  ]
+}

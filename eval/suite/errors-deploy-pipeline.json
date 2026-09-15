@@ -1,0 +1,25 @@
+{
+  "id": "errors-deploy-pipeline",
+  "category": "errors",
+  "prompt": "Running `sh deploy.sh` fails partway. Diagnose and fix the repo so the full pipeline runs and prints DEPLOY-OK. Every step's failure is a real bug in the repo (some hints are in README.md). Run deploy.sh as you work. Do not modify deploy.sh or .env.",
+  "setup": {
+    "deploy.sh": "set -e\npython3 tools/migrate.py\npython3 tools/seed.py\npython3 tools/report.py\necho DEPLOY-OK\n",
+    ".env": "SEED_TOKEN=abc123\n",
+    "README.md": "# deploy-bundle\n\n`sh deploy.sh` runs migrate, seed, and report, then prints DEPLOY-OK.\nSecrets live in .env (KEY=VALUE lines); tools may read .env when the\nvariable is not exported.\n",
+    "tools/migrate.py": "import json\n\ndef run():\n    with open(\"migrations/applied.json\", \"w\") as f:\n        json.dump([\"0001-init\"], f)\n\nif __name__ == \"__main__\":\n    run()\n    print(\"migrate: ok\")\n",
+    "tools/seed.py": "import json\nimport os\n\ndef run():\n    token = os.environ[\"SEED_TOKEN\"]\n    with open(\"seed/manifest.json\", \"w\") as f:\n        json.dump({\"token\": token}, f)\n\nif __name__ == \"__main__\":\n    run()\n    print(\"seed: ok\")\n",
+    "tools/report.py": "def run():\n    with open(\"Data/summary.csv\") as f:\n        rows = f.read().count(\"\\n\")\n    print(\"report: %d rows\" % rows)\n\nif __name__ == \"__main__\":\n    run()\n",
+    "data/summary.csv": "id,name\n1,a\n2,b\n"
+  },
+  "gold": {
+    "tools/migrate.py": "import json\nimport os\n\ndef run():\n    os.makedirs(\"migrations\", exist_ok=True)\n    with open(\"migrations/applied.json\", \"w\") as f:\n        json.dump([\"0001-init\"], f)\n\nif __name__ == \"__main__\":\n    run()\n    print(\"migrate: ok\")\n",
+    "tools/seed.py": "import json\nimport os\n\ndef _token():\n    token = os.environ.get(\"SEED_TOKEN\")\n    if token:\n        return token\n    with open(\".env\") as f:\n        for line in f:\n            if line.startswith(\"SEED_TOKEN=\"):\n                return line.strip().split(\"=\", 1)[1]\n    raise SystemExit(\"no SEED_TOKEN\")\n\ndef run():\n    os.makedirs(\"seed\", exist_ok=True)\n    with open(\"seed/manifest.json\", \"w\") as f:\n        json.dump({\"token\": _token()}, f)\n\nif __name__ == \"__main__\":\n    run()\n    print(\"seed: ok\")\n",
+    "tools/report.py": "def run():\n    with open(\"data/summary.csv\") as f:\n        rows = f.read().count(\"\\n\")\n    print(\"report: %d rows\" % rows)\n\nif __name__ == \"__main__\":\n    run()\n"
+  },
+  "verify": "sh deploy.sh | grep DEPLOY-OK",
+  "verify_fails_before": true,
+  "protected": [
+    "deploy.sh",
+    ".env"
+  ]
+}

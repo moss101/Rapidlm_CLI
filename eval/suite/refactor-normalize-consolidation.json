@@ -1,0 +1,28 @@
+{
+  "id": "refactor-normalize-consolidation",
+  "category": "refactor",
+  "prompt": "ini_parser.py, env_parser.py, and cli_flags.py each normalize settings keys their own way, so the same key resolves differently per source. The authoritative behavior is test_contract.py. Create normalize.py with the single authoritative definition and change every listed module to import the name from it (keep re-exporting the same name so existing imports keep working). Every module must behave identically and all contract assertions must pass. Do not modify test_contract.py, and no listed module may keep its own def.",
+  "setup": {
+    "ini_parser.py": "def normalize_key(raw):\n    return raw.strip()\n",
+    "env_parser.py": "def normalize_key(raw):\n    return raw.strip().lower().replace(\"-\", \"_\")\n",
+    "cli_flags.py": "def normalize_key(raw):\n    return raw.strip().lower()\n",
+    "test_contract.py": "from ini_parser import normalize_key as n1\nfrom env_parser import normalize_key as n2\nfrom cli_flags import normalize_key as n3\nimport normalize\nfor n in (n1, n2, n3, normalize.normalize_key):\n    assert n(\"  Max-Connections \") == \"max_connections\"\n    assert n(\"TIMEOUT\") == \"timeout\"\nprint(\"CONTRACT-OK\")\n"
+  },
+  "gold": {
+    "normalize.py": "def normalize_key(raw):\n    \"\"\"Normalize one settings key: trimmed, lowercase, dashes to underscores.\"\"\"\n    return raw.strip().lower().replace(\"-\", \"_\")\n",
+    "ini_parser.py": "from normalize import normalize_key\n",
+    "env_parser.py": "from normalize import normalize_key\n",
+    "cli_flags.py": "from normalize import normalize_key\n"
+  },
+  "verify": "python3 -B test_contract.py && ! grep -q \"def normalize_key\" ini_parser.py env_parser.py cli_flags.py",
+  "verify_fails_before": true,
+  "protected": [
+    "test_contract.py"
+  ],
+  "mutants": [
+    {
+      "file": "normalize.py",
+      "contents": "def normalize_key(raw):\n    \"\"\"Normalize one settings key: trimmed, lowercase, dashes to underscores.\"\"\"\n    return raw.strip().lower()\n"
+    }
+  ]
+}

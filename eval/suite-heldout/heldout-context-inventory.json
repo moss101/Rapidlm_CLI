@@ -1,0 +1,33 @@
+{
+  "id": "heldout-context-inventory",
+  "category": "context",
+  "prompt": "The warehouse service defines inventory behavior in CONTRACT comments across the inv_*.py modules. Implement inventory.py so it exports exactly: available, reserve, release, receive, value, low_stock \u2014 each with the contracted behavior. State is module-level (start empty). The contracts are authoritative, including the ValueError and flooring rules. Do not modify the inv_*.py files.",
+  "setup": {
+    "inv_stock.py": "Inventory helper. The binding behavior lives in the CONTRACT comment.\n\n# CONTRACT(inventory.available): available(sku) returns stocked minus reserved, floored at 0.\n",
+    "inv_reserve.py": "Inventory helper. The binding behavior lives in the CONTRACT comment.\n\n# CONTRACT(inventory.reserve): reserve(sku, n) raises ValueError when n exceeds available; otherwise adds to reserved and returns the new available.\n",
+    "inv_release.py": "Inventory helper. The binding behavior lives in the CONTRACT comment.\n\n# CONTRACT(inventory.release): release(sku, n) subtracts n from reserved, floored at 0, and returns the new available.\n",
+    "inv_receive.py": "Inventory helper. The binding behavior lives in the CONTRACT comment.\n\n# CONTRACT(inventory.receive): receive(sku, n) adds n to stocked and returns the new stocked.\n",
+    "inv_value.py": "Inventory helper. The binding behavior lives in the CONTRACT comment.\n\n# CONTRACT(inventory.value): value(catalog) sums stocked * price for every sku in the catalog dict {sku: price}; skus never received contribute 0.\n",
+    "inv_lowstock.py": "Inventory helper. The binding behavior lives in the CONTRACT comment.\n\n# CONTRACT(inventory.low_stock): low_stock(threshold) lists skus whose available is at or below threshold, sorted alphabetically.\n",
+    "README.md": "# warehouse\n\nInventory behavior is defined by CONTRACT comments across the inv_*.py modules.\ninventory.py implements them for callers.\n"
+  },
+  "gold": {
+    "inventory.py": "_stocked = {}\n_reserved = {}\n\ndef available(sku):\n    return max(0, _stocked.get(sku, 0) - _reserved.get(sku, 0))\n\ndef reserve(sku, n):\n    if n > available(sku):\n        raise ValueError(\"insufficient stock\")\n    _reserved[sku] = _reserved.get(sku, 0) + n\n    return available(sku)\n\ndef release(sku, n):\n    _reserved[sku] = max(0, _reserved.get(sku, 0) - n)\n    return available(sku)\n\ndef receive(sku, n):\n    _stocked[sku] = _stocked.get(sku, 0) + n\n    return _stocked[sku]\n\ndef value(catalog):\n    return sum(_stocked.get(sku, 0) * price for sku, price in catalog.items())\n\ndef low_stock(threshold):\n    skus = set(_stocked) | set(_reserved)\n    return sorted(sku for sku in skus if available(sku) <= threshold)\n"
+  },
+  "verify": "python3 -B -c 'import inventory\nassert inventory.receive(\"widget\", 10) == 10\nassert inventory.receive(\"gadget\", 3) == 3\nassert inventory.available(\"widget\") == 10\nassert inventory.reserve(\"widget\", 4) == 6\nassert inventory.available(\"widget\") == 6\ntry:\n    inventory.reserve(\"gadget\", 4)\n    raise SystemExit(\"over-reserve must raise ValueError\")\nexcept ValueError:\n    pass\nassert inventory.release(\"widget\", 10) == 10, \"release floors reserved at zero\"\nassert inventory.low_stock(3) == [\"gadget\"]\nassert inventory.value({\"widget\": 2, \"ghost\": 5}) == 20'",
+  "verify_fails_before": true,
+  "protected": [
+    "inv_stock.py",
+    "inv_reserve.py",
+    "inv_release.py",
+    "inv_receive.py",
+    "inv_value.py",
+    "inv_lowstock.py"
+  ],
+  "mutants": [
+    {
+      "file": "inventory.py",
+      "contents": "_stocked = {}\n_reserved = {}\n\ndef available(sku):\n    return max(0, _stocked.get(sku, 0) - _reserved.get(sku, 0))\n\ndef reserve(sku, n):\n    if n < 0:\n        raise ValueError(\"insufficient stock\")\n    _reserved[sku] = _reserved.get(sku, 0) + n\n    return available(sku)\n\ndef release(sku, n):\n    _reserved[sku] = max(0, _reserved.get(sku, 0) - n)\n    return available(sku)\n\ndef receive(sku, n):\n    _stocked[sku] = _stocked.get(sku, 0) + n\n    return _stocked[sku]\n\ndef value(catalog):\n    return sum(_stocked.get(sku, 0) * price for sku, price in catalog.items())\n\ndef low_stock(threshold):\n    skus = set(_stocked) | set(_reserved)\n    return sorted(sku for sku in skus if available(sku) <= threshold)\n"
+    }
+  ]
+}

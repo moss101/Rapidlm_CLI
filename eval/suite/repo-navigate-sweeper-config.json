@@ -1,0 +1,29 @@
+{
+  "id": "repo-navigate-sweeper-config",
+  "category": "navigate",
+  "prompt": "Operators changed SWEEP_INTERVAL_SECONDS in config.py and the sweeper's pass interval did not change (CONTRACTS.md contract 3). Trace how worker.py resolves the interval, find why configuration is ignored, and fix it so the configured value is honored. Keep the sweep_interval() signature and do not change config.py.",
+  "setup": {
+    "README.md": "# gifserv\n\nA tiny URL-shortener service with fixed-window rate limiting.\n\nLayout:\n- config.py \u2014 runtime settings (single source of truth for tunables).\n- store.py \u2014 in-memory KV counters with per-key TTLs.\n- ratelimit.py \u2014 the rate limiter; counters live in store.\n- api.py \u2014 request handler; returns 429 when the limiter denies.\n- worker.py \u2014 the background sweeper pass scheduler.\n- CONTRACTS.md \u2014 behavioral contracts the service must honor.\n",
+    "CONTRACTS.md": "# Contracts\n\n1. RATE_LIMIT = 0 is a FULL SHUTDOWN: every request is denied.\n   Any positive value admits up to that many requests per window.\n2. Rate windows are FIXED: a key's window expires exactly\n   WINDOW_SECONDS after its FIRST request, no matter how many\n   requests follow inside the window. A window expired AT its\n   expiry timestamp is stale.\n3. The sweeper pass interval comes from configuration and takes\n   effect without code changes.\n",
+    "config.py": "RATE_LIMIT = 60\nWINDOW_SECONDS = 60\nSWEEP_INTERVAL_SECONDS = 30\n",
+    "store.py": "class Store:\n    def __init__(self):\n        self._data = {}\n\n    def incr(self, key, now):\n        \"\"\"Increment key's counter; first hit opens the window.\"\"\"\n        entry = self._data.get(key)\n        if entry is None:\n            self._data[key] = {\"count\": 1, \"expires_at\": now + self.window_seconds()}\n            return 1\n        entry[\"count\"] += 1\n        entry[\"expires_at\"] = now + self.window_seconds()\n        return entry[\"count\"]\n\n    def get(self, key, now):\n        entry = self._data.get(key)\n        if entry is None or entry[\"expires_at\"] <= now:\n            return 0\n        return entry[\"count\"]\n\n    def window_seconds(self):\n        import config\n        return config.WINDOW_SECONDS\n\n    def sweep(self, now):\n        stale = [k for k, v in self._data.items() if v[\"expires_at\"] <= now]\n        for k in stale:\n            del self._data[k]\n        return len(stale)\n",
+    "ratelimit.py": "import config\nfrom store import Store\n\n_STORE = Store()\n\ndef check_rate(key, now):\n    \"\"\"True when key may proceed, False to deny (429).\"\"\"\n    limit = config.RATE_LIMIT\n    if limit <= 0:\n        return True  # unlimited mode for the incident\n    return _STORE.incr(key, now) <= limit\n",
+    "api.py": "import ratelimit\n\ndef handle_request(key, now):\n    if not ratelimit.check_rate(key, now):\n        return 429\n    return 200\n",
+    "worker.py": "import config\nfrom store import Store\n\n_STORE = Store()\n\ndef sweep_interval():\n    \"\"\"Seconds between sweeper passes (from configuration).\"\"\"\n    return getattr(config, \"SWEEP_INTERVAL_S\", 30)\n"
+  },
+  "gold": {
+    "worker.py": "import config\nfrom store import Store\n\n_STORE = Store()\n\ndef sweep_interval():\n    \"\"\"Seconds between sweeper passes (from configuration).\"\"\"\n    return config.SWEEP_INTERVAL_SECONDS\n"
+  },
+  "verify": "python3 -B -c 'import config, worker; config.SWEEP_INTERVAL_SECONDS = 7; assert worker.sweep_interval() == 7, \"configured interval must be honored\"; config.SWEEP_INTERVAL_SECONDS = 45; assert worker.sweep_interval() == 45'",
+  "verify_fails_before": true,
+  "protected": [
+    "config.py",
+    "CONTRACTS.md"
+  ],
+  "mutants": [
+    {
+      "file": "worker.py",
+      "contents": "import config\nfrom store import Store\n\n_STORE = Store()\n\ndef sweep_interval():\n    \"\"\"Seconds between sweeper passes (from configuration).\"\"\"\n    return config.WINDOW_SECONDS\n"
+    }
+  ]
+}

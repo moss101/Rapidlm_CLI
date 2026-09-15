@@ -1,0 +1,26 @@
+{
+  "id": "errors-interrupted-refactor",
+  "category": "errors",
+  "prompt": "A refactor was interrupted midway: report.py was being migrated onto utils.py's formatter (fmt_value), but the migration is incomplete and the module does not even import cleanly. Finish the migration: report.py must use utils.fmt_value for every value (no local formatting helpers left), build_report must produce `name: <formatted>` lines, and the contract test must pass. Do not modify utils.py or test_contract.py.",
+  "setup": {
+    "utils.py": "def fmt_value(v):\n    \"\"\"Format one report value: thousands separators, 2 decimals for floats.\"\"\"\n    if isinstance(v, float):\n        return \"{:,.2f}\".format(v)\n    return \"{:,}\".format(v)\n",
+    "report.py": "from utils import fmt\n\ndef _fmt(v):\n    return str(v)\n\ndef build_report(rows):\n    lines = []\n    for name, value in rows:\n        lines.append(name + \": \" + _fmt(value))\n    return \"\\n\".join(lines)\n",
+    "test_contract.py": "from report import build_report\nr = build_report([(\"visits\", 12345), (\"revenue\", 1234.5), (\"units\", 42)])\nassert r == \"visits: 12,345\\nrevenue: 1,234.50\\nunits: 42\", repr(r)\nprint(\"CONTRACT-OK\")\n",
+    "MIGRATION-NOTES.md": "# Interrupted migration\n\nGoal: report.py uses utils.fmt_value for all values; the local _fmt helper\ngoes away. The import at the top of report.py was left pointing at the old\nname `fmt` \u2014 utils.py never exported that.\n"
+  },
+  "gold": {
+    "report.py": "from utils import fmt_value\n\ndef build_report(rows):\n    lines = []\n    for name, value in rows:\n        lines.append(name + \": \" + fmt_value(value))\n    return \"\\n\".join(lines)\n"
+  },
+  "verify": "python3 -B test_contract.py",
+  "verify_fails_before": true,
+  "protected": [
+    "utils.py",
+    "test_contract.py"
+  ],
+  "mutants": [
+    {
+      "file": "utils.py",
+      "contents": "def fmt_value(v):\n    \"\"\"Format one report value: thousands separators, 2 decimals for floats.\"\"\"\n    if isinstance(v, float):\n        return \"{}\".format(round(v, 2))\n    return \"{:,}\".format(v)\n"
+    }
+  ]
+}

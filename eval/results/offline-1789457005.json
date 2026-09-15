@@ -1,0 +1,429 @@
+{
+  "failed": 0,
+  "grading_version": "2",
+  "kind": "mechanical validation (scripted gold trajectories; says nothing about model quality)",
+  "mode": "offline",
+  "passed": 40,
+  "per_agent_outcomes": {
+    "runner": {
+      "failed": 0,
+      "passed": 40,
+      "skipped": 0,
+      "total": 40
+    }
+  },
+  "per_agent_usage": {
+    "runner": {
+      "attempts": 40,
+      "tokens_per_verified_success": {
+        "attempts_measured": 40,
+        "attempts_missing_usage": 0,
+        "complete_coverage": true,
+        "lower_bound": false,
+        "successful_attempts_measured": 40,
+        "successful_attempts_only_average": 20,
+        "tokens_all_measured_attempts_per_success": 20
+      },
+      "verified_successes": 40
+    }
+  },
+  "provenance": {
+    "arms": [
+      {
+        "name": "rapid",
+        "observed_version": "0.1.0",
+        "pinned_version": "0.1.0",
+        "runnable": true,
+        "skip_reason": null
+      },
+      {
+        "name": "grok",
+        "observed_version": "grok 1.0.30 (04b7ffed98c6) [stable]",
+        "pinned_version": "1.0.30",
+        "runnable": true,
+        "skip_reason": null
+      },
+      {
+        "name": "kimi",
+        "observed_version": null,
+        "pinned_version": "0.43.0",
+        "runnable": false,
+        "skip_reason": "infrastructure: competitor kimi not found on PATH"
+      },
+      {
+        "name": "qwen",
+        "observed_version": "0.22.2",
+        "pinned_version": "0.22.2",
+        "runnable": true,
+        "skip_reason": null
+      }
+    ],
+    "budgets": {
+      "live_task_timeout_secs": 600,
+      "max_file_bytes": 16384,
+      "max_tasks": 64,
+      "probe_timeout_secs": 120
+    },
+    "environment": {
+      "arch": "aarch64",
+      "family": "unix",
+      "os": "macos"
+    },
+    "grading": {
+      "mutation_timeout_secs": 120,
+      "vacuity_timeout_secs": 60,
+      "verify_timeout_secs": 120,
+      "version": "2"
+    },
+    "mode": "offline",
+    "model": {
+      "rapid_active_model": "deepseek-v4-flash-vision-exp",
+      "rapid_model_env_override": null
+    },
+    "permissions": {
+      "grant_shell": false,
+      "rapid_permission_mode": "acceptEdits",
+      "trust_granted_per_scratch": true
+    },
+    "repository": {
+      "commit": "b6d1c02f9161c954f49b0f210059b6423406cc7f",
+      "dirty": true
+    },
+    "runner": {
+      "name": "rapid",
+      "version": "0.1.0"
+    },
+    "suite": {
+      "dir": "eval/suite-smoke",
+      "hash_sha256": "9f488aed9882006c245fb1442f30e41c12178ea31cbced248ca5a522bd3622a0",
+      "task_ids": [
+        "bugfix-001",
+        "bugfix-002",
+        "bugfix-003",
+        "bugfix-004",
+        "bugfix-005",
+        "bugfix-006",
+        "bugfix-007",
+        "bugfix-008",
+        "bugfix-009",
+        "bugfix-010",
+        "multifile-011",
+        "multifile-012",
+        "multifile-013",
+        "multifile-014",
+        "multifile-015",
+        "multifile-016",
+        "multifile-017",
+        "multifile-018",
+        "recovery-027",
+        "recovery-028",
+        "recovery-029",
+        "recovery-030",
+        "recovery-031",
+        "recovery-032",
+        "recovery-033",
+        "tests-019",
+        "tests-020",
+        "tests-021",
+        "tests-022",
+        "tests-023",
+        "tests-024",
+        "tests-025",
+        "tests-026",
+        "workflow-034",
+        "workflow-035",
+        "workflow-036",
+        "workflow-037",
+        "workflow-038",
+        "workflow-039",
+        "workflow-040"
+      ],
+      "tasks": 40
+    },
+    "timestamp_unix_secs": 1789457005
+  },
+  "results": [
+    {
+      "category": "bugfix",
+      "id": "bugfix-001",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 151
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-002",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 147
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-003",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 156
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-004",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 165
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-005",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 151
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-006",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 150
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-007",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 149
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-008",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 149
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-009",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 150
+    },
+    {
+      "category": "bugfix",
+      "id": "bugfix-010",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 150
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-011",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 149
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-012",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 153
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-013",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 154
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-014",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 143
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-015",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 147
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-016",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 155
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-017",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 152
+    },
+    {
+      "category": "multifile",
+      "id": "multifile-018",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 152
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-027",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 154
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-028",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 153
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-029",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 161
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-030",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 152
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-031",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 145
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-032",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 158
+    },
+    {
+      "category": "recovery",
+      "id": "recovery-033",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 174
+    },
+    {
+      "category": "tests",
+      "id": "tests-019",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 272
+    },
+    {
+      "category": "tests",
+      "id": "tests-020",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 281
+    },
+    {
+      "category": "tests",
+      "id": "tests-021",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 271
+    },
+    {
+      "category": "tests",
+      "id": "tests-022",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 279
+    },
+    {
+      "category": "tests",
+      "id": "tests-023",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 264
+    },
+    {
+      "category": "tests",
+      "id": "tests-024",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 274
+    },
+    {
+      "category": "tests",
+      "id": "tests-025",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 270
+    },
+    {
+      "category": "tests",
+      "id": "tests-026",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 271
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-034",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 171
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-035",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 149
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-036",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 137
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-037",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 140
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-038",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 151
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-039",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 149
+    },
+    {
+      "category": "workflow",
+      "id": "workflow-040",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 148
+    }
+  ],
+  "skipped": 0,
+  "tasks": 40
+}

@@ -1,0 +1,27 @@
+{
+  "id": "integration-two-feature-merge",
+  "category": "integration",
+  "prompt": "Two feature branches each extended models.py, and now they must land together. feature-auth/user.py adds the email field and validate_email; feature-billing/user.py adds the plan field, PLAN_PRICES, and plan_price(user, months=1). Integrate BOTH features into the single top-level models.py so test_contract.py passes: User takes (name, email, plan); validate_email and plan_price keep their behavior and names. Do not modify feature-auth/, feature-billing/, or test_contract.py.",
+  "setup": {
+    "models.py": "class User:\n    def __init__(self, name):\n        self.name = name\n",
+    "feature-auth/user.py": "class User:\n    def __init__(self, name, email):\n        self.name = name\n        self.email = email\n\ndef validate_email(user):\n    return \"@\" in user.email and user.email.index(\"@\") > 0\n",
+    "feature-billing/user.py": "class User:\n    def __init__(self, name, plan):\n        self.name = name\n        self.plan = plan\n\nPLAN_PRICES = {\"free\": 0, \"pro\": 20, \"team\": 50}\n\ndef plan_price(user, months=1):\n    return PLAN_PRICES.get(user.plan, 0) * months\n",
+    "test_contract.py": "from models import User, validate_email, plan_price\nu = User(\"amy\", \"amy@example.com\", \"pro\")\nassert u.name == \"amy\" and u.email == \"amy@example.com\" and u.plan == \"pro\"\nassert validate_email(u) is True\nassert plan_price(u) == 20 and plan_price(u, 3) == 60\nassert plan_price(User(\"bob\", \"b@x.com\", \"free\")) == 0\nprint(\"CONTRACT-OK\")\n"
+  },
+  "gold": {
+    "models.py": "class User:\n    def __init__(self, name, email, plan):\n        self.name = name\n        self.email = email\n        self.plan = plan\n\nPLAN_PRICES = {\"free\": 0, \"pro\": 20, \"team\": 50}\n\ndef validate_email(user):\n    return \"@\" in user.email and user.email.index(\"@\") > 0\n\ndef plan_price(user, months=1):\n    return PLAN_PRICES.get(user.plan, 0) * months\n"
+  },
+  "verify": "python3 -B test_contract.py",
+  "verify_fails_before": true,
+  "protected": [
+    "feature-auth/user.py",
+    "feature-billing/user.py",
+    "test_contract.py"
+  ],
+  "mutants": [
+    {
+      "file": "models.py",
+      "contents": "class User:\n    def __init__(self, name, email, plan):\n        self.name = name\n        self.email = email\n        self.plan = plan\n\nPLAN_PRICES = {\"free\": 0, \"pro\": 20, \"team\": 50}\n\ndef validate_email(user):\n    return \"@\" in user.email and user.email.index(\"@\") > 0\n\ndef plan_price(user, months=1):\n    return PLAN_PRICES.get(user.plan, 0)\n"
+    }
+  ]
+}

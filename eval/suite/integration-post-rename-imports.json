@@ -1,0 +1,21 @@
+{
+  "id": "integration-post-rename-imports",
+  "category": "integration",
+  "prompt": "The strings_util module was renamed to textkit.py last week, but two new contributions (importer.py, exporter.py) were written against the old name, so the package is broken. Fix all imports so test_contract.py passes. The old strings_util.py is gone and must stay gone; textkit.py is authoritative and must not change. Do not modify test_contract.py.",
+  "setup": {
+    "textkit.py": "def slugify(text):\n    return \"-\".join(text.lower().split())\n\ndef truncate(text, n):\n    return text if len(text) <= n else text[: n - 3] + \"...\"\n",
+    "importer.py": "from strings_util import slugify\n\ndef topic_key(title):\n    return slugify(title)[:40]\n",
+    "exporter.py": "from strings_util import truncate\n\ndef heading(title):\n    return truncate(title, 24)\n",
+    "test_contract.py": "from importer import topic_key\nfrom exporter import heading\nfrom textkit import slugify, truncate\nassert topic_key(\"Hello Wide World\") == \"hello-wide-world\"\nh = heading(\"x\" * 100)\nassert h.endswith(\"...\") and len(h) == 24, repr(h)\nassert slugify(\"A  B\") == \"a-b\" and truncate(\"abc\", 5) == \"abc\"\nprint(\"CONTRACT-OK\")\n"
+  },
+  "gold": {
+    "importer.py": "from textkit import slugify\n\ndef topic_key(title):\n    return slugify(title)[:40]\n",
+    "exporter.py": "from textkit import truncate\n\ndef heading(title):\n    return truncate(title, 24)\n"
+  },
+  "verify": "python3 -B test_contract.py && ! test -e strings_util.py",
+  "verify_fails_before": true,
+  "protected": [
+    "textkit.py",
+    "test_contract.py"
+  ]
+}

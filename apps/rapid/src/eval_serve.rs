@@ -720,16 +720,12 @@ pub fn grade_submission(scratch: &Path, task: &BenchTask) -> Result<(), GradeFai
         return Err(GradeFailure::Verification { output: run.output });
     }
     // 3. Mutation checks: every deliberately broken implementation must be
-    //    REJECTED by the submission. The original state is restored after
-    //    each attempt, win or lose.
+    //    REJECTED by the submission. The file's pre-mutation contents are
+    //    snapshotted and restored after each attempt (or the file deleted,
+    //    when the submission created it), win or lose.
     for (file, contents) in &task.mutants {
-        let original = task.setup.iter().find(|(name, _)| name == file);
-        if original.is_none() {
-            return Err(GradeFailure::Infrastructure {
-                detail: format!("mutant target {file} is not in setup"),
-            });
-        }
         let mutant_path = scratch.join(file);
+        let before = std::fs::read(&mutant_path).ok();
         if let Some(parent) = mutant_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -739,10 +735,14 @@ pub fn grade_submission(scratch: &Path, task: &BenchTask) -> Result<(), GradeFai
             });
         }
         let run = run_verify(scratch, &task.verify, 120);
-        restore(
-            scratch,
-            original.map(|(name, contents)| (name.as_str(), contents.as_str())),
-        );
+        match before {
+            Some(previous) => {
+                let _ = std::fs::write(&mutant_path, previous);
+            }
+            None => {
+                let _ = std::fs::remove_file(&mutant_path);
+            }
+        }
         if run.error.is_some() || run.timed_out {
             return Err(GradeFailure::MutationError {
                 file: file.clone(),
@@ -756,15 +756,6 @@ pub fn grade_submission(scratch: &Path, task: &BenchTask) -> Result<(), GradeFai
         }
     }
     Ok(())
-}
-
-fn restore(scratch: &Path, original: Option<(&str, &str)>) {
-    match original {
-        Some((name, contents)) => {
-            let _ = std::fs::write(scratch.join(name), contents);
-        }
-        None => {}
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -863,6 +854,10 @@ pub struct TaskResult {
     /// in offline mode, where the runner is this binary's gold trajectory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Zero-based trial index in repeated-trial runs; `None` when the run
+    /// was single-trial (or offline).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trial: Option<u64>,
 }
 
 /// Run the suite offline: gold trajectory through the real turn loop, graded
@@ -905,6 +900,7 @@ pub fn run_offline(tasks: &[BenchTask], scratch_root: &Path, trusted: bool) -> V
             output_tokens: None,
             num_turns: None,
             agent: None,
+            trial: None,
         });
     }
     results
@@ -1412,15 +1408,20 @@ fn prepare_rapid_scratch(bin: &Path, scratch: &Path, grant_shell: bool) -> Resul
     Ok(())
 }
 
-/// Run the suite live for every planned arm. Arms that cannot run are
-/// recorded as all-skipped with their typed infrastructure reason — every
-/// requested arm appears in the report, always.
+/// Run the suite live for every planned arm, `trials` times per task.
+/// Arms that cannot run are recorded as all-skipped with their typed
+/// infrastructure reason — every requested arm appears in the report,
+/// always. With `trials > 1` each attempt is recorded with its trial index
+/// and `summarize` reports per-task variation; one run is never presented
+/// as definitive.
 pub fn run_live(
     tasks: &[BenchTask],
     scratch_root: &Path,
     arms: &[ArmPlan],
     grant_shell: bool,
+    trials: u32,
 ) -> Vec<(String, Vec<TaskResult>)> {
+    let trials = trials.max(1);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -1447,46 +1448,53 @@ pub fn run_live(
             continue;
         }
         let mut results = Vec::new();
-        for task in tasks {
-            let started = std::time::Instant::now();
-            let scratch = scratch_root.join(format!("{}-{}-{stamp:x}", plan.name, task.id));
-            let usage_path = usage_dir.join(format!("{}-{}-{stamp:x}.json", plan.name, task.id));
-            let usage_file = if plan.name == "rapid" {
-                Some(usage_path.as_path())
-            } else {
-                None
-            };
-            let (result, usage) = run_live_agent(plan, task, &scratch, grant_shell, usage_file);
-            let _ = std::fs::remove_dir_all(&scratch);
-            let (outcome, reason, failure_kind) = match &result {
-                Ok(()) => ("passed".to_owned(), None, None),
-                Err(failure) => (
-                    if failure.is_harness_skip() {
-                        "skipped"
-                    } else {
-                        "failed"
-                    }
-                    .to_owned(),
-                    Some(failure.reason()),
-                    Some(failure.kind().to_owned()),
-                ),
-            };
-            results.push(TaskResult {
-                id: task.id.clone(),
-                category: task.category.clone(),
-                outcome,
-                reason,
-                failure_kind,
-                wall_ms: started.elapsed().as_millis(),
-                tokens: usage.tokens,
-                cost_usd_micros: usage.cost_usd_micros,
-                cost_estimate_usd_micros: estimate_cost_micros(&usage),
-                input_tokens: usage.input_tokens,
-                cached_tokens: usage.cached_tokens,
-                output_tokens: usage.output_tokens,
-                num_turns: usage.num_turns,
-                agent: Some(plan.name.clone()),
-            });
+        for trial in 0..trials {
+            for task in tasks {
+                let started = std::time::Instant::now();
+                let scratch =
+                    scratch_root.join(format!("{}-{}-{}-{stamp:x}", plan.name, trial, task.id));
+                let usage_path = usage_dir.join(format!(
+                    "{}-{}-{}-{stamp:x}.json",
+                    plan.name, trial, task.id
+                ));
+                let usage_file = if plan.name == "rapid" {
+                    Some(usage_path.as_path())
+                } else {
+                    None
+                };
+                let (result, usage) = run_live_agent(plan, task, &scratch, grant_shell, usage_file);
+                let _ = std::fs::remove_dir_all(&scratch);
+                let (outcome, reason, failure_kind) = match &result {
+                    Ok(()) => ("passed".to_owned(), None, None),
+                    Err(failure) => (
+                        if failure.is_harness_skip() {
+                            "skipped"
+                        } else {
+                            "failed"
+                        }
+                        .to_owned(),
+                        Some(failure.reason()),
+                        Some(failure.kind().to_owned()),
+                    ),
+                };
+                results.push(TaskResult {
+                    id: task.id.clone(),
+                    category: task.category.clone(),
+                    outcome,
+                    reason,
+                    failure_kind,
+                    trial: (trials > 1).then_some(u64::from(trial)),
+                    wall_ms: started.elapsed().as_millis(),
+                    tokens: usage.tokens,
+                    cost_usd_micros: usage.cost_usd_micros,
+                    cost_estimate_usd_micros: estimate_cost_micros(&usage),
+                    input_tokens: usage.input_tokens,
+                    cached_tokens: usage.cached_tokens,
+                    output_tokens: usage.output_tokens,
+                    num_turns: usage.num_turns,
+                    agent: Some(plan.name.clone()),
+                });
+            }
         }
         per_agent.push((plan.name.clone(), results));
     }
@@ -1511,6 +1519,7 @@ fn skip_all(tasks: &[BenchTask], agent: &str, reason: &str) -> Vec<TaskResult> {
             output_tokens: None,
             num_turns: None,
             agent: Some(agent.to_owned()),
+            trial: None,
         })
         .collect()
 }
@@ -1738,6 +1747,62 @@ pub fn summarize(mode: &str, results: &[TaskResult]) -> (serde_json::Value, Stri
         );
         agent_metrics.insert(agent.clone(), metrics);
     }
+    // Repeated-trial variation: with trials > 1, report per-task pass
+    // counts so one run is never presented as definitive. A task that
+    // passed SOME trials but not all is flaky; a task that never passed is
+    // listed too.
+    let mut variation: Option<serde_json::Value> = None;
+    let max_trial = results.iter().filter_map(|r| r.trial).max();
+    if let Some(max_trial) = max_trial {
+        let trials = max_trial + 1;
+        if trials > 1 {
+            let mut variation_by_agent = serde_json::Map::new();
+            for agent in &agent_names {
+                let attempts: Vec<&TaskResult> = results
+                    .iter()
+                    .filter(|r| r.agent.as_deref().unwrap_or("runner") == agent)
+                    .filter(|r| r.outcome != "skipped")
+                    .collect();
+                let mut ids: Vec<&str> = attempts.iter().map(|r| r.id.as_str()).collect();
+                ids.sort_unstable();
+                ids.dedup();
+                let mut per_task = serde_json::Map::new();
+                let mut flaky = Vec::new();
+                let mut never = Vec::new();
+                for id in ids {
+                    let task_results: Vec<&TaskResult> =
+                        attempts.iter().filter(|r| r.id == id).copied().collect();
+                    let passes = task_results
+                        .iter()
+                        .filter(|r| r.outcome == "passed")
+                        .count();
+                    per_task.insert(id.to_owned(), serde_json::json!(passes));
+                    if passes == 0 {
+                        never.push(id.to_owned());
+                    } else if passes < task_results.len() {
+                        flaky.push(id.to_owned());
+                    }
+                }
+                variation_by_agent.insert(
+                    agent.clone(),
+                    serde_json::json!({
+                        "trials": trials,
+                        "per_task_passes": per_task,
+                        "flaky_tasks": flaky,
+                        "never_passed": never,
+                    }),
+                );
+                if !flaky.is_empty() {
+                    metric_lines.push(format!(
+                        "  {agent} VARIATION across {trials} trials: flaky tasks (passed some \
+                         trials, not all): {}",
+                        flaky.join(", ")
+                    ));
+                }
+            }
+            variation = Some(serde_json::Value::Object(variation_by_agent));
+        }
+    }
     let mut report = serde_json::json!({
         "mode": mode,
         "kind": if mode == "offline" { "mechanical validation (scripted gold trajectories; says nothing about model quality)" } else { "live model quality (agents given prompts only; the verification command is the judge)" },
@@ -1753,6 +1818,9 @@ pub fn summarize(mode: &str, results: &[TaskResult]) -> (serde_json::Value, Stri
     }
     if !outcome_metrics.is_empty() {
         report["per_agent_outcomes"] = serde_json::Value::Object(outcome_metrics);
+    }
+    if let Some(variation) = variation {
+        report["variation"] = variation;
     }
     let mut lines = vec![format!(
         "{mode}: {}/{} passed, {failed} failed, {skipped} skipped",
@@ -1901,10 +1969,18 @@ pub fn build_provenance(
 // CLI
 // ---------------------------------------------------------------------------
 
-pub const EVAL_USAGE: &str = "usage: rapid eval --offline [--suite <dir>] [--scratch <dir>] | rapid eval --live [--grant-shell] [--suite <dir>]
+pub const EVAL_USAGE: &str = "usage: rapid eval --offline [--suite <dir>] [--scratch <dir>] | rapid eval --live [--grant-shell] [--trials <n>] [--suite <dir>] [--scratch <dir>]
 
 Run the reproducible coding benchmark.
 
+Suites:
+  eval/suite           representative model-quality tasks (navigate, refactor,
+                       context, errors, integration) — the default
+  eval/suite-smoke     40 mechanical smoke cases (harness validation; NOT a
+                       model-quality evaluation)
+  eval/suite-heldout   held-out variants, never used for tuning
+
+Modes:
   --offline   mechanical validation: each task's gold patch replays through
               the real turn executor (tools, permission lattice, ledger) and
               the task's verification command is the only judge. Deterministic;
@@ -1914,14 +1990,16 @@ Run the reproducible coding benchmark.
               probe runs first; arms that cannot run (binary missing, version
               mismatch, probe failure) are recorded as skipped with a typed
               reason. Every requested arm appears in the report.
+  --trials <n>  (live) run every task n times and report per-task variation;
+              one run is never presented as definitive.
   --grant-shell  (live, rapid arm only) pre-approve shell_exec per scratch
               repo — the equal-tool-surface configuration, matching a
               competitor that auto-approves shell. Without it rapid runs
               acceptEdits (shell denied) and the report says so.
 
 Grading (version 2) runs outside the agent-editable workspace: protected-file
-integrity, the verification command, and mutation checks (a test-authoring
-submission must detect deliberately broken implementations).
+integrity, the verification command, and mutation checks (a submission must
+detect deliberately broken implementations).
 
 Results are written to eval/results/<mode>-<stamp>.json with full provenance
 (repository commit, suite hash, model, permissions, budgets, arm versions).
@@ -1968,12 +2046,19 @@ pub fn run_eval(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandErr
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let grant_shell = args.iter().any(|arg| arg == "--grant-shell");
+    let trials = args
+        .iter()
+        .position(|arg| arg == "--trials")
+        .and_then(|position| args.get(position + 1))
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|trials| *trials >= 1)
+        .unwrap_or(1);
     let arms = plan_arms(&std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rapid")));
     let provenance = build_provenance(mode, &suite, &tasks, &arms, grant_shell);
     let results = if offline {
         run_offline(&tasks, &scratch, trusted)
     } else {
-        run_live(&tasks, &scratch, &arms, grant_shell)
+        run_live(&tasks, &scratch, &arms, grant_shell, trials)
             .into_iter()
             .flat_map(|(_agent, results)| results)
             .collect::<Vec<_>>()
@@ -2010,6 +2095,7 @@ mod tests {
             outcome: outcome.to_owned(),
             reason: None,
             failure_kind: None,
+            trial: None,
             wall_ms: 1,
             tokens,
             cost_usd_micros: cost,
@@ -2168,6 +2254,44 @@ mod tests {
         let outcomes = &report["per_agent_outcomes"];
         assert_eq!(outcomes["kimi"]["skipped"].as_u64(), Some(1));
         assert_eq!(outcomes["kimi"]["total"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn repeated_trials_report_variation_and_flag_flaky_tasks() {
+        let mut attempt = |trial: u64, passed: bool| {
+            let mut t = task(
+                "a-1",
+                Some("rapid"),
+                if passed { "passed" } else { "failed" },
+                Some(500),
+                None,
+            );
+            t.trial = Some(trial);
+            t
+        };
+        let results = vec![
+            attempt(0, true),
+            attempt(1, false),
+            attempt(2, true),
+            {
+                let mut t = task("a-2", Some("rapid"), "failed", Some(400), None);
+                t.trial = Some(0);
+                t
+            },
+            {
+                let mut t = task("a-2", Some("rapid"), "failed", Some(400), None);
+                t.trial = Some(1);
+                t
+            },
+        ];
+        let (report, lines) = summarize("live", &results);
+        let variation = &report["variation"]["rapid"];
+        assert_eq!(variation["trials"].as_u64(), Some(3));
+        assert_eq!(variation["per_task_passes"]["a-1"].as_u64(), Some(2));
+        assert_eq!(variation["per_task_passes"]["a-2"].as_u64(), Some(0));
+        assert_eq!(variation["flaky_tasks"][0].as_str(), Some("a-1"));
+        assert_eq!(variation["never_passed"][0].as_str(), Some("a-2"));
+        assert!(lines.contains("VARIATION") && lines.contains("a-1"));
     }
 
     // -- gate ---------------------------------------------------------------

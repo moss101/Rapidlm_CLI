@@ -1,0 +1,32 @@
+{
+  "id": "refactor-discount-consolidation",
+  "category": "refactor",
+  "prompt": "economy.py, premium.py, and legacy_cli.py each define their own discount() and the copies have drifted apart (one lost a tier, none handles empty carts). The authoritative behavior is test_contract.py. Create pricing.py with the single authoritative definition and change every listed module to import the name from it (keep re-exporting the same name so existing imports keep working). Every module must behave identically and all contract assertions must pass. Do not modify test_contract.py, and no listed module may keep its own def.",
+  "setup": {
+    "economy.py": "def discount(customer_type, subtotal):\n    return 0.05 if customer_type == \"member\" else 0.0\n",
+    "premium.py": "def discount(customer_type, subtotal):\n    if customer_type == \"member\":\n        return 0.05\n    if customer_type == \"vip\":\n        return 0.15\n    return 0.0\n",
+    "legacy_cli.py": "def discount(customer_type, subtotal):\n    return 0.05 if customer_type == \"member\" else 0.0\n",
+    "test_contract.py": "from economy import discount as d1\nfrom premium import discount as d2\nfrom legacy_cli import discount as d3\nimport pricing\nfor d in (d1, d2, d3, pricing.discount):\n    assert d(\"member\", 100) == 0.05\n    assert d(\"vip\", 100) == 0.15\n    assert d(\"guest\", 100) == 0.0\n    assert d(\"member\", 0) == 0.0, \"empty carts get no discount\"\nprint(\"CONTRACT-OK\")\n"
+  },
+  "gold": {
+    "pricing.py": "def discount(customer_type, subtotal):\n    if subtotal <= 0:\n        return 0.0\n    if customer_type == \"member\":\n        return 0.05\n    if customer_type == \"vip\":\n        return 0.15\n    return 0.0\n",
+    "economy.py": "from pricing import discount\n",
+    "premium.py": "from pricing import discount\n",
+    "legacy_cli.py": "from pricing import discount\n"
+  },
+  "verify": "python3 -B test_contract.py && ! grep -q \"def discount\" economy.py premium.py legacy_cli.py",
+  "verify_fails_before": true,
+  "protected": [
+    "test_contract.py"
+  ],
+  "mutants": [
+    {
+      "file": "pricing.py",
+      "contents": "def discount(customer_type, subtotal):\n    if subtotal <= 0:\n        return 0.0\n    if customer_type == \"member\":\n        return 0.05\n    if customer_type == \"vip\":\n        return 0.10\n    return 0.0\n"
+    },
+    {
+      "file": "pricing.py",
+      "contents": "def discount(customer_type, subtotal):\n    if customer_type == \"member\":\n        return 0.05\n    if customer_type == \"vip\":\n        return 0.15\n    return 0.0\n"
+    }
+  ]
+}

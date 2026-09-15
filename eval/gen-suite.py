@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Generate the 40-task benchmark suite into eval/suite/.
+"""Generate the 40-task SMOKE suite into eval/suite-smoke/.
+
+SMOKE: mechanical, deliberately simple cases that validate the harness end
+to end (seed -> prompt -> gold -> judge). They are NOT a model-quality
+evaluation and are labelled smoke everywhere they are reported. The
+representative model-quality suite lives in eval/suite/ (see
+gen-repo-suite.py); held-out tasks live in eval/suite-heldout/.
 
 Each task seeds a scratch repo (setup files), states a plain-language task,
 carries a gold patch, and names a verification command (exit 0 = correct).
@@ -23,7 +29,7 @@ run re-proves end to end through the real grading pipeline.
 """
 import json, os
 
-SUITE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "suite")
+SUITE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "suite-smoke")
 
 def write_task(task_id, category, prompt, setup, gold, verify, fails_before=True, protected=None, mutants=None):
     spec = {

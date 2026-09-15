@@ -1,0 +1,21 @@
+{
+  "id": "heldout-integration-pipeline-merge",
+  "category": "integration",
+  "prompt": "Two branches extended pipeline_config.py: the cache branch (cache-branch/version.py) adds CACHE_DIR and cache_dir(); the lint branch (lint-branch/version.py) adds the lint stage to STAGES. Merge BOTH into the top-level pipeline_config.py so test_contract.py passes: STAGES starts with lint, cache_dir() returns \".cache\", and pipeline() still returns a fresh copy. Do not modify the branch directories or the test.",
+  "setup": {
+    "pipeline_config.py": "STAGES = [\"build\", \"test\"]\ndef pipeline():\n    return list(STAGES)\n",
+    "cache-branch/version.py": "STAGES = [\"build\", \"test\"]\nCACHE_DIR = \".cache\"\ndef pipeline():\n    return list(STAGES)\ndef cache_dir():\n    return CACHE_DIR\n",
+    "lint-branch/version.py": "STAGES = [\"lint\", \"build\", \"test\"]\ndef pipeline():\n    return list(STAGES)\n",
+    "test_contract.py": "import pipeline_config\nfrom pipeline_config import pipeline, cache_dir\nassert pipeline() == [\"lint\", \"build\", \"test\"]\nassert cache_dir() == \".cache\"\nassert pipeline() is not pipeline_config.STAGES, \"callers get a copy\"\nprint(\"CONTRACT-OK\")\n"
+  },
+  "gold": {
+    "pipeline_config.py": "STAGES = [\"lint\", \"build\", \"test\"]\nCACHE_DIR = \".cache\"\ndef pipeline():\n    return list(STAGES)\ndef cache_dir():\n    return CACHE_DIR\n"
+  },
+  "verify": "python3 -B test_contract.py",
+  "verify_fails_before": true,
+  "protected": [
+    "cache-branch/version.py",
+    "lint-branch/version.py",
+    "test_contract.py"
+  ]
+}
