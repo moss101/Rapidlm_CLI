@@ -379,12 +379,12 @@ impl LiveModelCall for ConfiguredModel<'_> {
                 adapter.invoke_sync_streaming(request, &router_cancel, &mut |delta| sink(delta))
             }
             (Backend::OpenAi(adapter), None) => adapter.invoke_sync(request, &router_cancel),
-            (Backend::Anthropic(adapter), sink) => {
-                // Anthropic streaming requires its own SSE shape; the plain
-                // path is used and deltas are not surfaced live (documented).
-                let _ = sink;
-                adapter.invoke_sync(request, &router_cancel)
+            (Backend::Anthropic(adapter), Some(sink)) => {
+                // Progressive delivery: content_block_delta text surfaces
+                // live; the whole body is still canonically parsed.
+                adapter.invoke_sync_streaming(request, &router_cancel, &mut |delta| sink(delta))
             }
+            (Backend::Anthropic(adapter), None) => adapter.invoke_sync(request, &router_cancel),
         };
         let stream = stream.map_err(map_provider_error)?;
         if cancel.is_cancelled() {

@@ -174,6 +174,63 @@ impl<'store, T: HttpTransport> AnthropicAdapter<'store, T> {
             cancel,
         )
     }
+
+    /// Progressive delivery: the transport's streaming path feeds chunks to
+    /// an SSE delta parser as they arrive (`content_block_delta` text
+    /// forwarded to `on_text`), then the WHOLE body is canonically parsed
+    /// exactly as the buffered path — the wire contract is unchanged, only
+    /// when the text becomes visible differs.
+    pub fn invoke_sync_streaming(
+        &self,
+        req: CanonicalModelRequest,
+        cancel: &CancellationToken,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<ModelStream, ProviderError> {
+        cancel.check()?;
+        validate_request(&req, &self.config)?;
+        let resolver = CredentialResolver::new(self.store);
+        let credential = resolver.resolve(
+            self.config.profile.provider(),
+            self.config.profile(),
+            cancel,
+        )?;
+        let max_tokens = req
+            .max_output_tokens()
+            .unwrap_or_else(|| self.config.capabilities.max_output());
+        let body = encode_anthropic_payload(&req, max_tokens, cancel)?;
+        let encoded = serde_json::to_vec(&body).map_err(|_| ProviderError::InvalidRequest)?;
+        if encoded.len() > MAX_HTTP_REQUEST_BYTES {
+            return Err(ProviderError::BoundExceeded);
+        }
+        let url = self.config.endpoint.request_url();
+        let request_id = req.request_id().as_str().to_owned();
+        let mut parser = AnthropicSseTextDeltaParser::new();
+        let headers = [
+            ("content-type".to_owned(), "application/json".to_owned()),
+            ("accept".to_owned(), "text/event-stream".to_owned()),
+            (
+                "anthropic-version".to_owned(),
+                ANTHROPIC_API_VERSION.to_owned(),
+            ),
+            ("x-rapidlm-request-id".to_owned(), request_id),
+        ];
+        cancel.check()?;
+        let outbound = ProviderHttpRequest::new(&url, &headers, &encoded, &credential);
+        let response =
+            self.transport
+                .execute_streaming(&outbound, cancel, &mut |chunk: &str| {
+                    parser.feed(chunk, on_text);
+                })?;
+        drop(credential);
+        classify_http_error(&response)?;
+        let events = parse_anthropic_stream(response.body(), cancel)?;
+        ModelStream::from_events(
+            req.request_id().clone(),
+            req.model().clone(),
+            events,
+            cancel,
+        )
+    }
 }
 
 impl<T: HttpTransport> ProviderAdapter for AnthropicAdapter<'_, T> {
@@ -526,6 +583,72 @@ fn parse_retry_after_ms(raw: &str) -> Option<u64> {
     }
     let seconds: u64 = raw.parse().ok()?;
     seconds.checked_mul(1000)
+}
+
+/// Incremental SSE parser for Anthropic Messages streams: forwards
+/// `content_block_delta` text deltas to `on_text` as their frames complete,
+/// retaining only the incomplete frame across chunks. Framing matches the
+/// OpenAI-compatible parser (blank-line-separated `data:` lines); the delta
+/// JSON shape is Anthropic's.
+#[derive(Default)]
+pub struct AnthropicSseTextDeltaParser {
+    buffer: String,
+}
+
+impl AnthropicSseTextDeltaParser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed newly arrived text; every complete frame's text delta (if any)
+    /// is forwarded to `on_text`. Returns the number of deltas emitted.
+    pub fn feed(&mut self, chunk: &str, on_text: &mut dyn FnMut(&str)) -> usize {
+        self.buffer.push_str(chunk);
+        let mut emitted = 0usize;
+        loop {
+            let Some(end) = self.buffer.find("\n\n") else {
+                break;
+            };
+            let block = self.buffer[..end].to_string();
+            self.buffer.drain(..end + 2);
+            let mut data = String::new();
+            for line in block.lines() {
+                let line = line.trim_end_matches('\r');
+                if let Some(payload) = line.strip_prefix("data:") {
+                    let payload = payload.strip_prefix(' ').unwrap_or(payload);
+                    if !data.is_empty() {
+                        data.push('\n');
+                    }
+                    data.push_str(payload);
+                }
+            }
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            let is_text_delta = value.get("type").and_then(Value::as_str)
+                == Some("content_block_delta")
+                && value
+                    .get("delta")
+                    .and_then(|delta| delta.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("text_delta");
+            if !is_text_delta {
+                continue;
+            }
+            if let Some(text) = value
+                .get("delta")
+                .and_then(|delta| delta.get("text"))
+                .and_then(Value::as_str)
+            {
+                on_text(text);
+                emitted += 1;
+            }
+        }
+        emitted
+    }
 }
 
 fn parse_anthropic_stream(
@@ -1276,6 +1399,98 @@ mod tests {
          event: message_stop\n\
          data: {\"type\":\"message_stop\"}\n\n"
             .to_owned()
+    }
+
+    /// Transport whose streaming path delivers the body in fixed-size
+    /// slices BEFORE returning the canonical response — mid-frame splits
+    /// included, which is the case the default (delegate) transport can
+    /// never exercise.
+    struct SlicedStreamingTransport {
+        inner: ScriptedTransport,
+        slice: usize,
+    }
+    impl HttpTransport for SlicedStreamingTransport {
+        fn execute(
+            &self,
+            request: &ProviderHttpRequest<'_>,
+            cancel: &CancellationToken,
+        ) -> Result<ProviderHttpResponse, ProviderError> {
+            self.inner.execute(request, cancel)
+        }
+        fn execute_streaming(
+            &self,
+            request: &ProviderHttpRequest<'_>,
+            cancel: &CancellationToken,
+            on_body: &mut dyn FnMut(&str),
+        ) -> Result<ProviderHttpResponse, ProviderError> {
+            let response = self.inner.execute(request, cancel)?;
+            let body = String::from_utf8_lossy(response.body()).into_owned();
+            for chunk in body.as_bytes().chunks(self.slice) {
+                on_body(&String::from_utf8_lossy(chunk));
+            }
+            Ok(response)
+        }
+    }
+
+    #[test]
+    fn streaming_forwards_text_deltas_progressively_and_canonical_parse_holds() {
+        let body = sse_text();
+        let transport = SlicedStreamingTransport {
+            inner: ScriptedTransport::new(200, body.into_bytes()),
+            slice: 41, // deliberately mid-frame
+        };
+        let store = store_with_canary();
+        let adapter = AnthropicAdapter::new(
+            config("http://127.0.0.1:9/v1", caps(true, false)),
+            transport,
+            &store,
+        );
+        let req = request(false, false);
+        let deltas = std::sync::Arc::<std::sync::Mutex<Vec<String>>>::default();
+        let sink = deltas.clone();
+        let stream = adapter
+            .invoke_sync_streaming(req, &live(), &mut |text| {
+                sink.lock().expect("lock").push(text.to_owned())
+            })
+            .expect("streaming invoke");
+        // Deltas surfaced live, in order, exactly as the frames carried.
+        assert_eq!(deltas.lock().expect("lock").as_slice(), ["Hello", " world"]);
+        // The canonical events are the buffered path's: full text + Completed.
+        let mut text = String::new();
+        let mut completed = false;
+        for event in stream.events() {
+            if let ModelStreamEvent::TextDelta { text: chunk } = event {
+                text.push_str(chunk);
+            }
+            if matches!(event, ModelStreamEvent::Completed { .. }) {
+                completed = true;
+            }
+        }
+        assert_eq!(text, "Hello world");
+        assert!(completed, "canonical Completed event present");
+    }
+
+    #[test]
+    fn delta_parser_ignores_non_text_frames_and_survives_split_frames() {
+        let mut parser = AnthropicSseTextDeltaParser::new();
+        let mut seen = Vec::new();
+        // Split the frame boundary inside the JSON payload.
+        let first = "event: content_block_delta\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text";
+        let second = "_delta\",\"text\":\"hi\"}}\n\n";
+        parser.feed(first, &mut |text| seen.push(text.to_owned()));
+        assert!(seen.is_empty(), "incomplete frame emits nothing");
+        parser.feed(second, &mut |text| seen.push(text.to_owned()));
+        assert_eq!(seen, ["hi"]);
+        // Non-text shapes emit nothing.
+        let before = seen.len();
+        parser.feed(
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+            &mut |text| seen.push(text.to_owned()),
+        );
+        parser.feed("data: {\"type\":\"ping\"}\n\n", &mut |text| {
+            seen.push(text.to_owned())
+        });
+        assert_eq!(seen.len(), before);
     }
 
     fn block_on<F: Future>(fut: F) -> F::Output {

@@ -78,7 +78,21 @@ pub(crate) fn kernel_action_is_supported(action: &KernelAction) -> bool {
         // own token, and the loop cancels it by id — see
         // `SessionLoop::cancel_agent`. Terminate is cancel.
         | KernelAction::CancelAgent { .. }
-        | KernelAction::TerminateAgent { .. } => true,
+        | KernelAction::TerminateAgent { .. }
+        // Mid-session model switching: `SessionLoop::select_model` writes
+        // the session's model override; the next turn resolves through it.
+        | KernelAction::SelectModel { .. }
+        // Plugin trust management: ledger-backed register (always
+        // untrusted), revoke (narrowing), and a permissions report.
+        // Elevation stays with the explicit reviewed argv command.
+        | KernelAction::InstallPlugin { .. }
+        | KernelAction::RemovePlugin { .. }
+        | KernelAction::SetPluginPermissions { .. }
+        // Computer-use entry points: observe/test run the production
+        // desktop stack (typed fail-closed where the OS adapter cannot
+        // confirm trust); `ComputerRecord` stays unwired.
+        | KernelAction::ComputerObserve
+        | KernelAction::ComputerTest => true,
         other => matches!(
             other.kernel_api(),
             KernelApi::Interrupt

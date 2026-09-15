@@ -1782,9 +1782,6 @@ fn unsupported_command_text(action: &KernelAction) -> String {
         KernelAction::ValidatePlaybook { .. } => {
             "playbook validation has no name-addressable store to resolve against yet"
         }
-        KernelAction::SelectModel { .. } => {
-            "mid-session model switching is not wired yet; set RAPIDLM_MODEL or edit config.toml"
-        }
         KernelAction::AddMcp { .. } => {
             "adding a server needs a program and its arguments, which `/mcp add` has no \
 grammar for: run `rapid mcp add <name> --command <program>` (see `rapid mcp --help`)"
@@ -1806,11 +1803,6 @@ grammar for: run `rapid mcp add <name> --command <program>` (see `rapid mcp --he
             "no remote MCP transport is wired in this build — only stdio `command` servers \
 are supported, and they have no auth step"
         }
-        KernelAction::InstallPlugin { .. }
-        | KernelAction::RemovePlugin { .. }
-        | KernelAction::SetPluginPermissions { .. } => {
-            "plugin install/trust management is not wired into the interactive session yet"
-        }
         KernelAction::ApplyChangeSet { .. } | KernelAction::Rollback { .. } => {
             "no change-set apply/rollback backend exists yet"
         }
@@ -1819,10 +1811,8 @@ are supported, and they have no auth step"
         | KernelAction::ControlReturn => {
             "execution handoff/takeover is not wired into the interactive session yet"
         }
-        KernelAction::ComputerObserve
-        | KernelAction::ComputerRecord
-        | KernelAction::ComputerTest => {
-            "computer-use actions are not wired into the interactive session yet"
+        KernelAction::ComputerRecord => {
+            "session recording has no backend on this build: the observation ledger is in-memory and no capture sink is wired"
         }
         _ => "not available yet",
     };
@@ -5343,6 +5333,40 @@ It will run after the current turn; /queue cancels or edits it.",
         }
     }
 
+    /// The mid-session model switching backend, shared by `/model select`
+    /// and `KernelAction::SelectModel`: validate the id against the session's
+    /// own config catalog, then record the override for every later turn.
+    /// The NEXT turn runs on it; the current turn is unaffected.
+    fn select_model(
+        &mut self,
+        model_env: &[(String, String)],
+        id: &str,
+    ) -> Result<(), InteractiveError> {
+        match crate::user_config::select_active_model_with_override(model_env, Some(id)) {
+            Ok(crate::user_config::ModelSelection::Configured { active, .. }) => {
+                *self
+                    .shared
+                    .model_override
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id.to_owned());
+                self.append_command_output(format!(
+                    "model switched to {id} ({}): the NEXT turn runs on it; the current turn is unaffected",
+                    active.entry.model
+                ));
+            }
+            Ok(crate::user_config::ModelSelection::Unconfigured { searched }) => {
+                self.append_command_error(format!(
+                    "no model configuration found (looked in: {})",
+                    searched.join(", ")
+                ));
+            }
+            Err(err) => {
+                self.append_command_error(format!("/model select: {err}"));
+            }
+        }
+        Ok(())
+    }
+
     /// `/model list|select|clear`: the mid-session model switching path.
     /// The override is session state consulted by every later turn's model
     /// resolution; it wins over `[models].default` and `RAPIDLM_MODEL` but
@@ -5408,29 +5432,7 @@ It will run after the current turn; /queue cancels or edits it.",
                     );
                     return Ok(());
                 };
-                match crate::user_config::select_active_model_with_override(&model_env, Some(id)) {
-                    Ok(crate::user_config::ModelSelection::Configured { active, .. }) => {
-                        *self
-                            .shared
-                            .model_override
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(id.to_owned());
-                        self.append_command_output(format!(
-                            "model switched to {id} ({}): the NEXT turn runs on it; the current turn is unaffected",
-                            active.entry.model
-                        ));
-                    }
-                    Ok(crate::user_config::ModelSelection::Unconfigured { searched }) => {
-                        self.append_command_error(format!(
-                            "no model configuration found (looked in: {})",
-                            searched.join(", ")
-                        ));
-                    }
-                    Err(err) => {
-                        self.append_command_error(format!("/model select: {err}"));
-                    }
-                }
+                self.select_model(&model_env, id)?;
                 Ok(())
             }
             "clear" => {
@@ -6864,6 +6866,126 @@ denied\n",
         self.drain()
     }
 
+    /// `/computer observe`: the observation half of the computer-use
+    /// workflow through the production stack — `ComputerUseRuntime`
+    /// policies over `DesktopActor` over the platform AX host. Where the
+    /// OS adapter reports trust (it cannot on this build: the host fails
+    /// closed rather than linking ApplicationServices), the same path
+    /// returns the fenced observation; here it surfaces the typed
+    /// PermissionMissing with the operator's next step.
+    fn computer_observe(&mut self) -> Result<(), InteractiveError> {
+        let runtime = crate::computer_runtime::ComputerUseRuntime::new(self.session_id);
+        let cancel = capability_broker::CancellationToken::new();
+        let backend = computer_use::desktop::macos::MacosDesktopBackend::new(
+            computer_use::desktop::macos::LiveMacosAxHost,
+        );
+        let actor = computer_use::desktop::backend::DesktopActor::new(backend);
+        let session = computer_use::desktop::backend::DesktopSessionId::new();
+        let health = actor.health(&cancel);
+        let lines = match health {
+            Ok(health) if health.is_available() => {
+                let request = computer_use::desktop::backend::DesktopObserveRequest::new()
+                    .with_cancel(cancel.clone());
+                match actor.observe(session, request) {
+                    Ok(observation) => {
+                        let text = format!(
+                            "computer-use observation ({} windows)",
+                            observation.windows().len(),
+                        );
+                        let fenced = runtime
+                            .fence_observation_text(
+                                computer_use::browser::fence::SurfaceSource::DesktopAx,
+                                None,
+                                computer_use::browser::observe::ObservationId::new(),
+                                0,
+                                text,
+                            )
+                            .expect("fence");
+                        vec![format!(
+                            "{} [fenced: {}]",
+                            fenced.text(),
+                            fenced.observation_id(),
+                        )]
+                    }
+                    Err(err) => vec![format!("computer-use observation failed: {err}")],
+                }
+            }
+            Ok(health) => {
+                let reason = health
+                    .reason()
+                    .map(|reason| format!("{reason:?}"))
+                    .unwrap_or_else(|| "unknown".to_owned());
+                vec![
+                    "computer-use observation is blocked (typed infrastructure failure): the OS adapter does not report Accessibility trust."
+                        .to_owned(),
+                    format!("health reason: {reason}"),
+                    "This build never prompts for TCC and never links the Accessibility framework, so it cannot confirm trust; grant Accessibility (and Screen Recording for screenshots) to the host terminal in System Settings, then retry."
+                        .to_owned(),
+                ]
+            }
+            Err(err) => vec![format!("computer-use health probe failed: {err}")],
+        };
+        for line in lines {
+            self.append_command_output(line);
+        }
+        self.drain()
+    }
+
+    /// `/computer test`: the production computer-use policy self-check —
+    /// the JS gate's classification boundaries and the batch/settle policy,
+    /// plus the platform health probe. Every verdict comes from executing
+    /// the real runtime, not canned text.
+    fn computer_selftest(&mut self) -> Result<(), InteractiveError> {
+        let runtime = crate::computer_runtime::ComputerUseRuntime::new(self.session_id);
+        let mut lines = Vec::new();
+        let read_only = runtime.js_gate_check("document.queryselector('#status')", false, false);
+        let denied = runtime.js_gate_check("el.innerhtml = '<b>x</b>'", false, false);
+        let leased = runtime.js_gate_check("el.innerhtml = '<b>x</b>'", true, true);
+        let verdict = |outcome: &Result<
+            crate::computer_runtime::JsClassification,
+            crate::computer_runtime::JsGateError,
+        >| match outcome {
+            Ok(classification) => format!("{classification:?}"),
+            Err(err) => format!("denied ({err})"),
+        };
+        lines.push(format!(
+            "js gate: query (no leases) -> {}; mutation (no leases) -> {}; mutation (leases) -> {}",
+            verdict(&read_only),
+            verdict(&denied),
+            verdict(&leased),
+        ));
+        assert!(
+            !read_only
+                .expect("read-only queries run without leases")
+                .requires_control()
+        );
+        assert!(denied.is_err(), "unleased mutation must be denied");
+        assert!(
+            leased
+                .expect("leased mutation classifies")
+                .requires_control()
+        );
+        let cancel = capability_broker::CancellationToken::new();
+        let backend = computer_use::desktop::macos::MacosDesktopBackend::new(
+            computer_use::desktop::macos::LiveMacosAxHost,
+        );
+        let actor = computer_use::desktop::backend::DesktopActor::new(backend);
+        match actor.health(&cancel) {
+            Ok(health) if health.is_available() => {
+                lines.push("desktop health: available".to_owned());
+            }
+            Ok(health) => lines.push(format!(
+                "desktop health: unavailable ({:?}) — expected on this build",
+                health.reason()
+            )),
+            Err(err) => lines.push(format!("desktop health probe failed: {err}")),
+        }
+        for line in lines {
+            self.append_command_output(line);
+        }
+        self.drain()
+    }
+
     fn apply_kernel_action(&mut self, action: KernelAction) -> Result<(), InteractiveError> {
         self.cancel
             .check()
@@ -6887,6 +7009,66 @@ denied\n",
                 self.cancel_agent(id)?;
             }
             KernelAction::ResumeSession { session } => self.resume_session(session)?,
+            // Computer-use entry points: the PRODUCTION stack
+            // (ComputerUseRuntime policies over DesktopActor over the
+            // platform's AX host). On this build the live host never links
+            // the OS Accessibility framework (the crate is
+            // `forbid(unsafe_code)`), so the probe fails CLOSED with the
+            // typed reason instead of pretending.
+            KernelAction::ComputerObserve => self.computer_observe()?,
+            KernelAction::ComputerTest => self.computer_selftest()?,
+            // Mid-session model switching: the same backend `/model select`
+            // drives. The override is session state; the NEXT turn runs on
+            // the selected model, the current turn is unaffected.
+            // Plugin trust management: install/remove/report through the
+            // same ledger-backed trust store as `rapid plugins`. Register
+            // ALWAYS stores untrusted (executables disabled) — elevation
+            // stays with the explicit reviewed argv command, so the
+            // approval-classified escalation never happens from a two-word
+            // slash command.
+            KernelAction::InstallPlugin { spec } => {
+                let text = match crate::p9_commands::plugin_install_from_manifest(&spec) {
+                    Ok(text) => {
+                        self.append_command_output(text);
+                        return self.drain();
+                    }
+                    Err(text) => text,
+                };
+                self.append_command_error(text);
+                return self.drain();
+            }
+            KernelAction::RemovePlugin { name } => {
+                let text = match crate::p9_commands::plugin_revoke_by_name(&name) {
+                    Ok(text) => {
+                        self.append_command_output(text);
+                        return self.drain();
+                    }
+                    Err(text) => text,
+                };
+                self.append_command_error(text);
+                return self.drain();
+            }
+            KernelAction::SetPluginPermissions { name } => {
+                let text = match crate::p9_commands::plugin_permissions_report(&name) {
+                    Ok(text) => {
+                        self.append_command_output(text);
+                        return self.drain();
+                    }
+                    Err(text) => text,
+                };
+                self.append_command_error(text);
+                return self.drain();
+            }
+            KernelAction::SelectModel { name } => {
+                let mut model_env: Vec<(String, String)> =
+                    vec![("HOME".to_owned(), self.user_home.display().to_string())];
+                for (key, value) in std::env::vars() {
+                    if key == "RAPIDLM_CONFIG" {
+                        model_env.push((key, value));
+                    }
+                }
+                self.select_model(&model_env, &name)?;
+            }
             KernelAction::CompactSession => self.compact_session()?,
             KernelAction::RunGoal => self.start_autonomous_goal()?,
             KernelAction::StopGoal => {
@@ -17770,6 +17952,155 @@ api_key = "k"
         loop_state.dispatch_slash("/model clear").expect("clear");
         assert!(loop_state.shared.model_override.lock().unwrap().is_none());
         close_stream(&mut stream);
+    }
+
+    #[test]
+    fn kernel_action_select_model_switches_the_session_override() {
+        // The kernel-action route (what the TUI sends for `/model select`)
+        // must drive the SAME backend as the slash command: one override
+        // cell, next turn runs on it, unknown ids leave it standing.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let config_dir = env.user_home.join(".rapidlm");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        fs::write(
+            config_dir.join("config.toml"),
+            r#"
+[models]
+default = "fixture"
+
+[model.fixture]
+provider = "openai-compatible"
+model = "fixture-model"
+base_url = "http://127.0.0.1:9/v1"
+api_key = "k"
+
+[model.second]
+provider = "openai-compatible"
+model = "second-model"
+base_url = "http://127.0.0.1:9/v1"
+api_key = "k"
+"#,
+        )
+        .expect("config");
+        let cancel = CancellationToken::new();
+        let session = ScriptedSession::create(&env);
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, 0)),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = AppState::new();
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let mut loop_state = SessionLoop {
+            client: &session.client,
+            stream: &mut stream,
+            ui: &mut ui,
+            session_id: session.session_id,
+            actor: &session.actor,
+            cancel: &cancel,
+            saw_ctrl_c: &mut saw_ctrl_c,
+            interrupt_count: &mut interrupt_count,
+            root: &session.root,
+            user_home: &session.user_home,
+            trusted: true,
+            turn_in_flight,
+            jobs: crate::exec_tools::JobRegistry::default(),
+            renderer: &mut renderer,
+            autonomous: None,
+            compaction: None,
+            shared: session.shared.clone(),
+            message_queue: Vec::new(),
+            scripted_backings: None,
+        };
+        loop_state
+            .apply_kernel_action(KernelAction::SelectModel {
+                name: "second".to_owned(),
+            })
+            .expect("select via kernel action");
+        assert_eq!(
+            loop_state.shared.model_override.lock().unwrap().as_deref(),
+            Some("second"),
+            "the kernel action writes the same override cell"
+        );
+        loop_state
+            .apply_kernel_action(KernelAction::SelectModel {
+                name: "no-such-model".to_owned(),
+            })
+            .expect("unknown id handled");
+        assert_eq!(
+            loop_state.shared.model_override.lock().unwrap().as_deref(),
+            Some("second"),
+            "an unknown id leaves the previous selection standing"
+        );
+        close_stream(&mut stream);
+    }
+
+    #[test]
+    #[test]
+    fn computer_observe_reports_the_typed_platform_gate_not_a_stub() {
+        // `/computer observe` runs the production desktop stack. On this
+        // build the live AX host fails closed by design (it never links
+        // ApplicationServices), so the command must surface the TYPED gate
+        // and the operator's next step — not a generic "not available".
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        fs::create_dir_all(env.project.join(PROJECT_MARKER)).expect("marker");
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/computer observe".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
+        assert!(
+            painted.contains("computer-use observation is blocked"),
+            "typed gate message expected:\n{painted}"
+        );
+        assert!(
+            painted.contains("health reason:"),
+            "the typed health reason must be named:\n{painted}"
+        );
+        assert!(
+            !painted.contains("not available"),
+            "the action is wired now; the old unsupported text must be gone:\n{painted}"
+        );
+    }
+
+    #[test]
+    fn computer_selftest_executes_the_production_policies() {
+        // `/computer test` exercises the real runtime pieces: the JS gate
+        // classifies (read-only vs mutation) and the desktop health probe
+        // answers. The output is evidence of execution, not canned text.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        fs::create_dir_all(env.project.join(PROJECT_MARKER)).expect("marker");
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/computer test".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
+        assert!(painted.contains("js gate:"), "{painted}");
+        assert!(painted.contains("ReadOnlyQuery"), "{painted}");
+        assert!(painted.contains("DomMutation"), "{painted}");
+        assert!(
+            painted.contains("denied"),
+            "the unleased mutation must show its denial:\n{painted}"
+        );
+        assert!(
+            painted.contains("desktop health:"),
+            "the live probe must have run:\n{painted}"
+        );
     }
 
     #[test]

@@ -1714,8 +1714,6 @@ impl SseTextDeltaParser {
     /// is forwarded to `on_text`. Returns the number of deltas emitted.
     pub fn feed(&mut self, chunk: &str, on_text: &mut dyn FnMut(&str)) -> usize {
         self.buffer.push_str(chunk);
-        eprintln!("[dbg-feed] chunk={chunk:?}");
-        eprintln!("[dbg-feed] buffer={:?}", self.buffer);
         let mut emitted = 0usize;
         loop {
             let Some(end) = self.buffer.find("\n\n") else {

@@ -2366,6 +2366,120 @@ const HOOK_EVENT_MAX_BYTES: usize = 8 * 1024;
 const MAX_CLI_RESOURCE_BYTES: usize = 4096;
 
 /// Default trust catalog location, matching the install layout root.
+/// Interactive-session plugin installation (`/plugin install <manifest>`):
+/// the SAME policy boundary as `rapid plugins register` — a
+/// privilege-checked manifest parse and a ledger-backed registration that
+/// ALWAYS stores the plugin untrusted (executables disabled). Trust
+/// elevation stays with the explicit `rapid plugins approve` review.
+pub(crate) fn plugin_install_from_manifest(path: &str) -> Result<String, String> {
+    plugin_install_into(&default_trust_catalog(), path)
+}
+
+pub(crate) fn plugin_install_into(catalog: &Path, path: &str) -> Result<String, String> {
+    let cancel = capability_broker::CancellationToken::new();
+    let bytes =
+        read_bounded_file(path, plugin_host::MAX_MANIFEST_BYTES).map_err(|err| err.to_string())?;
+    let manifest = plugin_host::parse_manifest(&bytes, &cancel)
+        .map_err(|err| format!("manifest rejected: {err}"))?;
+    let identity = plugin_host::ExtensionIdentity::from_binding(&manifest.trust_binding());
+    let source = plugin_host::InstallSource::new(
+        plugin_host::InstallSourceKind::User,
+        "interactive-install",
+    )
+    .map_err(|err| err.to_string())?;
+    let observation = plugin_host::ExtensionObservation::new(
+        identity,
+        source,
+        plugin_host::TrustScope::User,
+        review_timestamp(None).map_err(|err| err.to_string())?,
+    );
+    let store = plugin_host::ExtensionTrustStore::open(catalog);
+    let record = store
+        .register(&observation, &cancel)
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "registered plugin {} ({} by {}) as {}: capabilities are NOT enabled. Review it, then          grant capabilities with `rapid plugins approve {} --capability <cap> --resource <res>`          — trust elevation is always an explicit, reviewed step.",
+        record.identity().plugin().as_str(),
+        record.identity().version(),
+        manifest.publisher().as_str(),
+        record.status().as_str(),
+        record.identity().plugin().as_str(),
+    ))
+}
+
+/// Interactive-session plugin removal (`/plugin remove <id>`): revoke in
+/// the same ledger — a narrowing, fail-closed write.
+pub(crate) fn plugin_revoke_by_name(name: &str) -> Result<String, String> {
+    plugin_revoke_in(&default_trust_catalog(), name)
+}
+
+pub(crate) fn plugin_revoke_in(catalog: &Path, name: &str) -> Result<String, String> {
+    let cancel = capability_broker::CancellationToken::new();
+    let store = plugin_host::ExtensionTrustStore::open(catalog);
+    let identity = stored_identity(&store, name, &cancel)
+        .map_err(|_| format!("plugin {name} is not in the trust catalog"))?;
+    let updated = store
+        .revoke(
+            &identity,
+            review_timestamp(None).map_err(|e| e.to_string())?,
+            &cancel,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "revoked plugin {} (status {}): every granted capability is now disabled",
+        updated.identity().plugin().as_str(),
+        updated.status().as_str(),
+    ))
+}
+
+/// Interactive-session trust view (`/plugin permissions <id>`): the
+/// plugin's recorded policy and grants, plus the exact argv that changes
+/// them — granting needs a capability AND a resource, which no two-word
+/// slash grammar can carry, so elevation stays on the explicit command.
+pub(crate) fn plugin_permissions_report(name: &str) -> Result<String, String> {
+    plugin_permissions_report_in(&default_trust_catalog(), name)
+}
+
+pub(crate) fn plugin_permissions_report_in(catalog: &Path, name: &str) -> Result<String, String> {
+    let cancel = capability_broker::CancellationToken::new();
+    let store = plugin_host::ExtensionTrustStore::open(catalog);
+    let views = store.list(&cancel).map_err(|e| e.to_string())?;
+    let view = views
+        .iter()
+        .find(|view| view.plugin().as_str() == name)
+        .ok_or_else(|| format!("plugin {name} is not in the trust catalog (run /plugin list)"))?;
+    let mut lines = vec![format!(
+        "plugin {} v{} publisher={} status={} policy={} executable_enabled={}",
+        view.plugin().as_str(),
+        view.version(),
+        view.publisher().as_str(),
+        view.status().as_str(),
+        view.policy().as_str(),
+        view.executable_enabled(),
+    )];
+    let granted = view.granted_capabilities();
+    if granted.is_empty() {
+        lines.push("granted capabilities: (none)".to_owned());
+    } else {
+        lines.push(format!("granted capabilities: {}", granted.len()));
+        for grant in granted {
+            lines.push(format!(
+                "  capability={} resource_kind={}",
+                grant.capability().as_str(),
+                grant.resource().family().as_str(),
+            ));
+        }
+    }
+    lines.push(
+        "grant: rapid plugins approve <id> --capability <cap> --resource <res> |          revoke all: rapid plugins reject <id>"
+            .to_owned(),
+    );
+    Ok(lines.join(
+        "
+",
+    ))
+}
+
 fn default_trust_catalog() -> PathBuf {
     crate::interactive::project_path(PathBuf::from("plugins").join(plugin_host::TRUST_CATALOG_FILE))
 }
@@ -3524,6 +3638,87 @@ mod release_tests {
         drop(std::fs::remove_file(&manifest_path));
         drop(std::fs::remove_dir(&dir));
         assert!(code.is_err(), "ambient capability must fail validation");
+    }
+
+    static PLUGIN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn benign_manifest() -> String {
+        // Minimal manifest with no requested capabilities: parseable and
+        // privilege-clean, exactly what an interactive install accepts.
+        r#"{"schema":"rapidlm.plugin_manifest","schema_version":1,"id":"acme.fmt","version":"1.2.3","publisher":"acme","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","entrypoint":"plugin.wasm","wit_version":"1.0.0","compatibility":{"min":"1.0.0","max":"2.0.0"},"requested_caps":[]}"#.to_owned()
+    }
+
+    #[test]
+    fn interactive_plugin_flow_registers_untrusted_then_revokes() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-plugin-flow-{}-{}",
+            std::process::id(),
+            PLUGIN_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let catalog = dir.join("catalog.json");
+        let manifest = dir.join("fmt.json");
+        std::fs::write(&manifest, benign_manifest()).unwrap();
+
+        // Install: registered, UNTRUSTED, executables disabled — a slash
+        // command can add a plugin but never elevate it.
+        let installed = plugin_install_into(&catalog, manifest.to_str().unwrap()).expect("install");
+        assert!(installed.contains("acme.fmt"), "{installed}");
+        assert!(
+            installed.contains("capabilities are NOT enabled"),
+            "the output must name the fail-closed status: {installed}"
+        );
+        // The record on disk really is untrusted.
+        let cancel = capability_broker::CancellationToken::new();
+        let store = plugin_host::ExtensionTrustStore::open(&catalog);
+        let views = store.list(&cancel).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].status().as_str(), "untrusted");
+        assert!(!views[0].executable_enabled());
+
+        // Permissions report: the truth about the record, with the argv
+        // that would change it.
+        let report = plugin_permissions_report_in(&catalog, "acme.fmt").expect("report");
+        assert!(report.contains("status=untrusted"), "{report}");
+        assert!(report.contains("(none)"), "{report}");
+        assert!(report.contains("rapid plugins approve"), "{report}");
+
+        // Revoke: a narrowing write through the same ledger. It strips
+        // executables and re-stamps the review; it can NEVER escalate —
+        // an untrusted record stays untrusted.
+        plugin_revoke_in(&catalog, "acme.fmt").expect("revoke");
+        let views = store.list(&cancel).unwrap();
+        assert_eq!(views[0].status().as_str(), "untrusted");
+        assert!(!views[0].executable_enabled());
+
+        // An unknown plugin errors instead of inventing state.
+        assert!(plugin_revoke_in(&catalog, "ghost").is_err());
+        assert!(plugin_permissions_report_in(&catalog, "ghost").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interactive_plugin_install_rejects_a_privileged_manifest() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-plugin-priv-{}-{}",
+            std::process::id(),
+            PLUGIN_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let catalog = dir.join("catalog.json");
+        let manifest = dir.join("ambient.json");
+        // Host-root filesystem reads are ambient and fail closed at parse —
+        // the interactive path inherits the exact CLI policy boundary.
+        std::fs::write(
+            &manifest,
+            r#"{"schema":"rapidlm.plugin_manifest","schema_version":1,"id":"acme.ambient","version":"1.0.0","publisher":"acme","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","entrypoint":"plugin.wasm","wit_version":"1.0.0","compatibility":{"min":"1.0.0","max":"2.0.0"},"requested_caps":[{"capability":{"schema":"rapidlm.capability","schema_version":1,"family":"fs","action":"read"},"resource":{"schema":"rapidlm.resource_descriptor","schema_version":1,"kind":"filesystem","root":"host","glob":"/etc/**"}}]}"#,
+        )
+        .unwrap();
+        assert!(plugin_install_into(&catalog, manifest.to_str().unwrap()).is_err());
+        // Nothing leaked into the catalog.
+        assert!(!catalog.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
