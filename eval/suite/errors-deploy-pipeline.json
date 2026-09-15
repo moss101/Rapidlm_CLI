@@ -16,10 +16,28 @@
     "tools/seed.py": "import json\nimport os\n\ndef _token():\n    token = os.environ.get(\"SEED_TOKEN\")\n    if token:\n        return token\n    with open(\".env\") as f:\n        for line in f:\n            if line.startswith(\"SEED_TOKEN=\"):\n                return line.strip().split(\"=\", 1)[1]\n    raise SystemExit(\"no SEED_TOKEN\")\n\ndef run():\n    os.makedirs(\"seed\", exist_ok=True)\n    with open(\"seed/manifest.json\", \"w\") as f:\n        json.dump({\"token\": _token()}, f)\n\nif __name__ == \"__main__\":\n    run()\n    print(\"seed: ok\")\n",
     "tools/report.py": "def run():\n    with open(\"data/summary.csv\") as f:\n        rows = f.read().count(\"\\n\")\n    print(\"report: %d rows\" % rows)\n\nif __name__ == \"__main__\":\n    run()\n"
   },
-  "verify": "sh deploy.sh | grep DEPLOY-OK",
+  "verify": "rm -rf migrations seed\nout=$(sh deploy.sh 2>&1) || { printf '%s\\n' \"$out\" >&2; exit 1; }\nprintf '%s\\n' \"$out\" | grep -q DEPLOY-OK || { printf '%s\\n' \"$out\" >&2; exit 1; }\ngrep -q 0001-init migrations/applied.json || exit 1\ngrep -q abc123 seed/manifest.json || exit 1\n",
   "verify_fails_before": true,
   "protected": [
     "deploy.sh",
     ".env"
+  ],
+  "mutants": [
+    {
+      "file": "tools/migrate.py",
+      "contents": "raise SystemExit(\"migrate broken\")\n"
+    },
+    {
+      "file": "tools/migrate.py",
+      "contents": "print(\"migrate: ok\")\n"
+    },
+    {
+      "file": "tools/seed.py",
+      "contents": "raise SystemExit(\"seed broken\")\n"
+    },
+    {
+      "file": "tools/report.py",
+      "contents": "raise SystemExit(\"report broken\")\n"
+    }
   ]
 }

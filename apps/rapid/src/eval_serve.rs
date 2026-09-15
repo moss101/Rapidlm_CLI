@@ -854,6 +854,11 @@ pub struct TaskResult {
     /// in offline mode, where the runner is this binary's gold trajectory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// The model identity the agent's own output reported, when it does —
+    /// the resolved competitor model, captured per run instead of assumed
+    /// from the CLI version. `None` when the agent reports no model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Zero-based trial index in repeated-trial runs; `None` when the run
     /// was single-trial (or offline).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -900,6 +905,7 @@ pub fn run_offline(tasks: &[BenchTask], scratch_root: &Path, trusted: bool) -> V
             output_tokens: None,
             num_turns: None,
             agent: None,
+            model: None,
             trial: None,
         });
     }
@@ -1242,27 +1248,55 @@ pub struct LiveUsage {
     pub input_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// The model identity the agent's own output reported, when it reports
+    /// one — the resolved competitor model, recorded per run rather than
+    /// assumed from the CLI's version string.
+    pub model: Option<String>,
 }
 
-/// x.ai's published grok-4.6 API rates in USD per million tokens (input,
-/// cached input, output) — [x.ai/api](https://x.ai/api),
+/// Published-rate catalog for the ESTIMATED cost field: `(model, (input,
+/// cached-input, output) USD per million tokens, basis)`. An entry applies
+/// ONLY when the resolved model identity matches exactly — pricing model A
+/// at model B's rates is worse than reporting the estimate unavailable, so
+/// no match means no estimate. Rates: [x.ai/api](https://x.ai/api),
 /// [docs.x.ai/developers/pricing](https://docs.x.ai/developers/pricing).
-/// Used ONLY for the clearly-labeled rapid cost estimate: the OpenAI-
-/// compatible endpoint reports no cost field, so pricing rapid's measured
-/// split at the provider's public catalog is an estimate, never a
-/// measurement.
-const RAPID_ESTIMATE_USD_PER_M: (f64, f64, f64) = (2.0, 0.5, 6.0);
+const RATE_CATALOG: &[(&str, (f64, f64, f64), &str)] = &[(
+    "grok-4.6",
+    (2.0, 0.5, 6.0),
+    "x.ai published API rates for grok-4.6 (retrieved 2026-09)",
+)];
 
-/// Price a measured token split at the published rates. `None` when the
-/// split itself was not reported. When the provider did not itemize the
-/// cached subset, all input is priced at the uncached rate (a stated
-/// upper bound, never silently optimistic).
-fn estimate_cost_micros(usage: &LiveUsage) -> Option<u64> {
+/// Resolve the estimate basis for THIS environment: the catalog entry whose
+/// model matches the rapid model resolution (env override, then user
+/// config) — the same resolution provenance records. `None` when the
+/// active model is unconfigured, unresolvable, or not in the catalog.
+fn rapid_estimate_basis() -> Option<((f64, f64, f64), &'static str)> {
+    let model = match crate::user_config::select_from_process_env() {
+        Ok(crate::user_config::ModelSelection::Configured { active, .. }) => active.entry.model,
+        _ => return None,
+    };
+    RATE_CATALOG
+        .iter()
+        .find(|(catalog_model, _, _)| model.contains(catalog_model))
+        .map(|(_, rates, basis)| (*rates, *basis))
+}
+
+/// Price a measured token split at the resolved basis. `None` when the
+/// split itself was not reported, or when no catalog entry matches the
+/// active model (the estimate is then UNAVAILABLE, never approximated).
+/// When the provider did not itemize the cached subset, all input is
+/// priced at the uncached rate (a stated upper bound, never silently
+/// optimistic).
+fn estimate_cost_micros(
+    usage: &LiveUsage,
+    basis: Option<((f64, f64, f64), &'static str)>,
+) -> Option<u64> {
+    let (rates, _) = basis?;
     let (input, output) = match (usage.input_tokens, usage.output_tokens) {
         (Some(input), Some(output)) => (input, output),
         _ => return None,
     };
-    let (input_rate, cached_rate, output_rate) = RAPID_ESTIMATE_USD_PER_M;
+    let (input_rate, cached_rate, output_rate) = rates;
     let cached = usage.cached_tokens.unwrap_or(0);
     let uncached = input.saturating_sub(cached);
     let micros =
@@ -1280,6 +1314,10 @@ fn parse_rapid_usage_file(text: &str) -> Option<LiveUsage> {
         input_tokens: value.get("input_tokens").and_then(|v| v.as_u64()),
         cached_tokens: value.get("cached_tokens").and_then(|v| v.as_u64()),
         output_tokens: value.get("output_tokens").and_then(|v| v.as_u64()),
+        model: value
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
     })
 }
 
@@ -1304,6 +1342,10 @@ fn parse_grok_usage(stdout: &str) -> Option<LiveUsage> {
             .get("cache_read_input_tokens")
             .and_then(|v| v.as_u64()),
         output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()),
+        model: value
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
     })
 }
 
@@ -1421,6 +1463,25 @@ pub fn run_live(
     grant_shell: bool,
     trials: u32,
 ) -> Vec<(String, Vec<TaskResult>)> {
+    run_live_with_estimate(
+        tasks,
+        scratch_root,
+        arms,
+        grant_shell,
+        trials,
+        rapid_estimate_basis(),
+    )
+}
+
+/// `run_live` with the estimate basis explicit — the tests' seam.
+fn run_live_with_estimate(
+    tasks: &[BenchTask],
+    scratch_root: &Path,
+    arms: &[ArmPlan],
+    grant_shell: bool,
+    trials: u32,
+    estimate: Option<((f64, f64, f64), &'static str)>,
+) -> Vec<(String, Vec<TaskResult>)> {
     let trials = trials.max(1);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1487,12 +1548,13 @@ pub fn run_live(
                     wall_ms: started.elapsed().as_millis(),
                     tokens: usage.tokens,
                     cost_usd_micros: usage.cost_usd_micros,
-                    cost_estimate_usd_micros: estimate_cost_micros(&usage),
+                    cost_estimate_usd_micros: estimate_cost_micros(&usage, estimate),
                     input_tokens: usage.input_tokens,
                     cached_tokens: usage.cached_tokens,
                     output_tokens: usage.output_tokens,
                     num_turns: usage.num_turns,
                     agent: Some(plan.name.clone()),
+                    model: usage.model,
                 });
             }
         }
@@ -1519,6 +1581,7 @@ fn skip_all(tasks: &[BenchTask], agent: &str, reason: &str) -> Vec<TaskResult> {
             output_tokens: None,
             num_turns: None,
             agent: Some(agent.to_owned()),
+            model: None,
             trial: None,
         })
         .collect()
@@ -1538,8 +1601,22 @@ fn run_live_agent(
     if let Err(detail) = materialize(scratch, task) {
         return (Err(RunFailure::Materialize(detail)), LiveUsage::default());
     }
-    if prechange_check(scratch, task).is_err() {
-        return (Err(RunFailure::Vacuous), LiveUsage::default());
+    if let Err(failure) = prechange_check(scratch, task) {
+        // The pre-change gate distinguishes a vacuous task (verify passes
+        // with no change — proves nothing, a harness skip) from a broken
+        // verification environment (interpreter missing, command not
+        // executable, ceiling too low — typed infrastructure, never an
+        // agent failure). Both are skips, but with different kinds.
+        return (
+            Err(match failure {
+                GradeFailure::Vacuous => RunFailure::Vacuous,
+                GradeFailure::Infrastructure { detail } => {
+                    RunFailure::PreVerifyError(format!("pre-change check: {detail}"))
+                }
+                other => RunFailure::PreVerifyError(other.reason()),
+            }),
+            LiveUsage::default(),
+        );
     }
     let mut argv = plan.args.clone();
     if let Some(path) = usage_file {
@@ -1881,6 +1958,9 @@ pub fn build_provenance(
     tasks: &[BenchTask],
     arms: &[ArmPlan],
     grant_shell: bool,
+    trials: u32,
+    requested_arms: Option<&[String]>,
+    estimate_basis: Option<&'static str>,
 ) -> serde_json::Value {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1946,6 +2026,26 @@ pub fn build_provenance(
             "probe_timeout_secs": PROBE_TIMEOUT_SECS,
             "max_tasks": MAX_TASKS,
             "max_file_bytes": MAX_FILE_BYTES,
+            "trials": trials,
+        },
+        "cost_estimate": {
+            "basis": estimate_basis,
+            "applies_only_when_model_matches": true,
+        },
+        "invocation": {
+            "requested_arms": requested_arms,
+            "argv_by_arm": arms
+                .iter()
+                .map(|arm| {
+                    serde_json::json!({
+                        "name": arm.name,
+                        "bin": arm.bin.display().to_string(),
+                        // The prompt is appended after these args; the
+                        // usage-file flag is appended for the rapid arm.
+                        "args": arm.args,
+                    })
+                })
+                .collect::<Vec<_>>(),
         },
         "environment": {
             "os": std::env::consts::OS,
@@ -2073,13 +2173,43 @@ pub fn run_eval(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandErr
         })
         .filter(|names: &Vec<String>| !names.is_empty());
     let arms: Vec<ArmPlan> = match &requested_arms {
-        Some(names) => all_arms
-            .into_iter()
-            .filter(|arm| names.contains(&arm.name))
-            .collect(),
+        Some(names) => {
+            // A typo beside a valid name used to shrink the run silently:
+            // the gate then judged a subset while looking like it judged
+            // the request. Unknown names fail the invocation instead.
+            let unknown: Vec<&str> = names
+                .iter()
+                .filter(|name| !all_arms.iter().any(|arm| &arm.name == *name))
+                .map(String::as_str)
+                .collect();
+            if !unknown.is_empty() {
+                let known = all_arms
+                    .iter()
+                    .map(|arm| arm.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(crate::p9_commands::P9CommandError::Agent(format!(
+                    "unknown arm(s): {} — known arms: {known}",
+                    unknown.join(", ")
+                )));
+            }
+            all_arms
+                .into_iter()
+                .filter(|arm| names.contains(&arm.name))
+                .collect()
+        }
         None => all_arms,
     };
-    let provenance = build_provenance(mode, &suite, &tasks, &arms, grant_shell);
+    let provenance = build_provenance(
+        mode,
+        &suite,
+        &tasks,
+        &arms,
+        grant_shell,
+        trials,
+        requested_arms.as_deref(),
+        rapid_estimate_basis().map(|(_, basis)| basis),
+    );
     let results = if offline {
         run_offline(&tasks, &scratch, trusted)
     } else {
@@ -2130,6 +2260,7 @@ mod tests {
             output_tokens: None,
             num_turns: None,
             agent: agent.map(|a| a.to_owned()),
+            model: None,
         }
     }
 
@@ -2172,11 +2303,21 @@ mod tests {
         assert_eq!(parse_rapid_usage_file("not json"), None);
         // Published-rate estimate: (4000-3200)×$2/M + 3200×$0.5/M + 321×$6/M
         // = 800×2 + 3200×0.5 + 321×6 micros = 1600 + 1600 + 1926 = 5126.
-        assert_eq!(estimate_cost_micros(&usage), Some(5126));
+        let basis = ((2.0, 0.5, 6.0), "test basis");
+        assert_eq!(estimate_cost_micros(&usage, Some(basis)), Some(5126));
         // No split reported: no estimate rather than a fabricated one.
         let bare =
             parse_rapid_usage_file(r#"{"tokens":99,"cost_usd_micros":null}"#).expect("parses");
-        assert_eq!(estimate_cost_micros(&bare), None);
+        assert_eq!(estimate_cost_micros(&bare, Some(basis)), None);
+        // No matching rate basis: the estimate is UNAVAILABLE even with a
+        // full split — never priced at another model's rates.
+        assert_eq!(estimate_cost_micros(&usage, None), None);
+        // A model field in the agent's own output is captured.
+        let modeled = parse_rapid_usage_file(
+            r#"{"tokens":10,"model":"grok-4.6","input_tokens":8,"output_tokens":2}"#,
+        )
+        .expect("parses");
+        assert_eq!(modeled.model.as_deref(), Some("grok-4.6"));
     }
 
     // -- accounting ---------------------------------------------------------
@@ -2690,6 +2831,133 @@ print("{unique}-child-after")"#
             Err(GradeFailure::Integrity {
                 path: "run.sh".to_owned()
             }),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Mirrors `eval/suite/errors-deploy-pipeline.json`: a protected
+    /// pipeline script whose judge must honor the pipeline's OWN exit
+    /// status (never a downstream grep's) and independently validate the
+    /// artifacts the pipeline is supposed to produce.
+    fn deploy_pipeline_like_task() -> BenchTask {
+        BenchTask {
+            id: "errors-deploy-pipeline".to_owned(),
+            category: "errors".to_owned(),
+            prompt: "fix the deploy pipeline".to_owned(),
+            setup: vec![
+                (
+                    "deploy.sh".to_owned(),
+                    "set -e\npython3 tools/migrate.py\npython3 tools/seed.py\npython3 tools/report.py\necho DEPLOY-OK\n".to_owned(),
+                ),
+                (".env".to_owned(), "SEED_TOKEN=abc123\n".to_owned()),
+                (
+                    "tools/migrate.py".to_owned(),
+                    "import json\n\ndef run():\n    with open(\"migrations/applied.json\", \"w\") as f:\n        json.dump([\"0001-init\"], f)\n\nif __name__ == \"__main__\":\n    run()\n    print(\"migrate: ok\")\n".to_owned(),
+                ),
+                (
+                    "tools/seed.py".to_owned(),
+                    "import json\nimport os\n\ndef run():\n    token = os.environ[\"SEED_TOKEN\"]\n    with open(\"seed/manifest.json\", \"w\") as f:\n        json.dump({\"token\": token}, f)\n\nif __name__ == \"__main__\":\n    run()\n    print(\"seed: ok\")\n".to_owned(),
+                ),
+                (
+                    "tools/report.py".to_owned(),
+                    "def run():\n    with open(\"Data/summary.csv\") as f:\n        rows = f.read().count(\"\\n\")\n    print(\"report: %d rows\" % rows)\n\nif __name__ == \"__main__\":\n    run()\n".to_owned(),
+                ),
+                ("data/summary.csv".to_owned(), "id,name\n1,a\n2,b\n".to_owned()),
+            ],
+            gold: vec![
+                (
+                    "tools/migrate.py".to_owned(),
+                    "import json\nimport os\n\ndef run():\n    os.makedirs(\"migrations\", exist_ok=True)\n    with open(\"migrations/applied.json\", \"w\") as f:\n        json.dump([\"0001-init\"], f)\n\nif __name__ == \"__main__\":\n    run()\n    print(\"migrate: ok\")\n".to_owned(),
+                ),
+                (
+                    "tools/seed.py".to_owned(),
+                    "import json\nimport os\n\ndef _token():\n    token = os.environ.get(\"SEED_TOKEN\")\n    if token:\n        return token\n    with open(\".env\") as f:\n        for line in f:\n            if line.startswith(\"SEED_TOKEN=\"):\n                return line.strip().split(\"=\", 1)[1]\n    raise SystemExit(\"no SEED_TOKEN\")\n\ndef run():\n    os.makedirs(\"seed\", exist_ok=True)\n    with open(\"seed/manifest.json\", \"w\") as f:\n        json.dump({\"token\": _token()}, f)\n\nif __name__ == \"__main__\":\n    run()\n    print(\"seed: ok\")\n".to_owned(),
+                ),
+                (
+                    "tools/report.py".to_owned(),
+                    "def run():\n    with open(\"data/summary.csv\") as f:\n        rows = f.read().count(\"\\n\")\n    print(\"report: %d rows\" % rows)\n\nif __name__ == \"__main__\":\n    run()\n".to_owned(),
+                ),
+            ],
+            // rm -rf first: the judge validates THIS run's artifacts, never
+            // outputs left behind by an earlier verification pass.
+            verify: "rm -rf migrations seed\nout=$(sh deploy.sh 2>&1) || { printf '%s\\n' \"$out\" >&2; exit 1; }\nprintf '%s\\n' \"$out\" | grep -q DEPLOY-OK || { printf '%s\\n' \"$out\" >&2; exit 1; }\ngrep -q 0001-init migrations/applied.json || exit 1\ngrep -q abc123 seed/manifest.json || exit 1\n".to_owned(),
+            verify_fails_before: true,
+            protected: vec!["deploy.sh".to_owned(), ".env".to_owned()],
+            mutants: vec![
+                (
+                    "tools/migrate.py".to_owned(),
+                    "raise SystemExit(\"migrate broken\")\n".to_owned(),
+                ),
+                (
+                    "tools/migrate.py".to_owned(),
+                    "print(\"migrate: ok\")\n".to_owned(),
+                ),
+                (
+                    "tools/seed.py".to_owned(),
+                    "raise SystemExit(\"seed broken\")\n".to_owned(),
+                ),
+                (
+                    "tools/report.py".to_owned(),
+                    "raise SystemExit(\"report broken\")\n".to_owned(),
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn deploy_pipeline_gold_submission_passes_all_mutants_rejected() {
+        let task = deploy_pipeline_like_task();
+        let dir = scratch_for(&task, "deploy-gold");
+        assert_eq!(prechange_check(&dir, &task), Ok(()));
+        for (path, contents) in &task.gold {
+            write_scratch(&dir, path, contents);
+        }
+        // Runs every mutant internally: a broken or hard-coded tool must
+        // fail the judge or the grade is MutationSurvived.
+        assert_eq!(grade_submission(&dir, &task), Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deploy_pipeline_print_then_exit_one_is_rejected() {
+        // The demonstrated grading defect: migrate prints DEPLOY-OK and
+        // exits 1. The old judge `sh deploy.sh | grep DEPLOY-OK` reported
+        // grep's status and accepted this. The pipeline's own failure must
+        // now fail the verification command.
+        let task = deploy_pipeline_like_task();
+        let dir = scratch_for(&task, "deploy-cheat-exit1");
+        write_scratch(
+            &dir,
+            "tools/migrate.py",
+            "print(\"DEPLOY-OK\")\nraise SystemExit(1)\n",
+        );
+        let verdict = grade_submission(&dir, &task);
+        assert!(
+            matches!(verdict, Err(GradeFailure::Verification { .. })),
+            "the broken pipeline must be rejected, got {verdict:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deploy_pipeline_exit_zero_without_artifacts_is_rejected() {
+        // A subtler cheat: every step exits 0 and DEPLOY-OK prints, but
+        // migrate never writes its artifact. Exit status alone cannot catch
+        // this — the judge validates the artifacts independently.
+        let task = deploy_pipeline_like_task();
+        let dir = scratch_for(&task, "deploy-cheat-noart");
+        for (path, contents) in &task.gold {
+            write_scratch(&dir, path, contents);
+        }
+        write_scratch(
+            &dir,
+            "tools/migrate.py",
+            "print(\"DEPLOY-OK\")\nprint(\"migrate: ok\")\n",
+        );
+        let verdict = grade_submission(&dir, &task);
+        assert!(
+            matches!(verdict, Err(GradeFailure::Verification { .. })),
+            "a deployment without its artifacts must be rejected, got {verdict:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
