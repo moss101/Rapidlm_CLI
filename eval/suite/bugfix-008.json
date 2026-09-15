@@ -10,5 +10,8 @@
     "lists.py": "def chunk(xs, n):\n    return [xs[i:i+n] for i in range(0, len(xs), n)]\n"
   },
   "verify": "python3 -B test_lists.py",
-  "verify_fails_before": true
+  "verify_fails_before": true,
+  "protected": [
+    "test_lists.py"
+  ]
 }

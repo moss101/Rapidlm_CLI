@@ -1262,6 +1262,7 @@ dependencies = [
  "mcp",
  "mobile-sim",
  "plugin-host",
+ "process-signal",
  "process-supervisor",
  "protocol",
  "regex",

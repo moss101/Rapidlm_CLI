@@ -71,7 +71,18 @@ impl MetricCollector {
         }
     }
 
-    pub fn collect(self, records: &[LedgerRecord], tokens_used: u64) -> Metric {
+    /// Collect one metric for a run. `verdicts` are the authoritative
+    /// assertion results: `VerifiedSuccessPerToken` derives verified success
+    /// from them — a turn merely completing (`turn.completed`) or a goal
+    /// event alone is NOT proof the work was correct, so record kinds are
+    /// never consulted for success. With no verdicts there is no verified
+    /// success.
+    pub fn collect(
+        self,
+        records: &[LedgerRecord],
+        verdicts: &[(Assertion, Verdict)],
+        tokens_used: u64,
+    ) -> Metric {
         match self {
             Self::EventCount => Metric {
                 name: self.name(),
@@ -92,10 +103,7 @@ impl MetricCollector {
                 }
             }
             Self::VerifiedSuccessPerToken => {
-                let completed = records
-                    .iter()
-                    .any(|r| r.kind == "goal.completed" || r.kind == "turn.completed");
-                let success = u32::from(completed) as f64;
+                let success = f64::from(DeterministicGrader::grade(verdicts).passed);
                 Metric {
                     name: self.name(),
                     value: if tokens_used == 0 {
@@ -192,12 +200,49 @@ mod tests {
             LedgerRecord::new("approval.resolved", json!({})),
             LedgerRecord::new("turn.completed", json!({})),
         ];
-        let vspt = MetricCollector::VerifiedSuccessPerToken.collect(&records, 100);
+        let passing = vec![
+            (
+                Assertion {
+                    family: AssertionFamily::Graph,
+                    contains: None,
+                    min_count: 1,
+                },
+                Verdict::Passed,
+            ),
+            (
+                Assertion {
+                    family: AssertionFamily::Process,
+                    contains: None,
+                    min_count: 1,
+                },
+                Verdict::Passed,
+            ),
+        ];
+        let vspt = MetricCollector::VerifiedSuccessPerToken.collect(&records, &passing, 100);
         assert_eq!(vspt.name, "verified_success_per_token");
         assert!((vspt.value - 0.01).abs() < 1e-9);
-        let rate = MetricCollector::ApprovalRate.collect(&records, 0);
+        // A completed turn WITHOUT passing assertions is not a verified
+        // success — ordinary terminal output must not earn the metric.
+        let vspt_unverified = MetricCollector::VerifiedSuccessPerToken.collect(&records, &[], 100);
+        assert_eq!(vspt_unverified.value, 0.0);
+        let failing = vec![(
+            Assertion {
+                family: AssertionFamily::Graph,
+                contains: None,
+                min_count: 1,
+            },
+            Verdict::Failed { observed: 0 },
+        )];
+        let vspt_failed = MetricCollector::VerifiedSuccessPerToken.collect(&records, &failing, 100);
+        assert_eq!(vspt_failed.value, 0.0);
+        let rate = MetricCollector::ApprovalRate.collect(&records, &passing, 0);
         assert!((rate.value - (1.0 / 3.0)).abs() < 1e-9);
-        assert_eq!(MetricCollector::EventCount.collect(&records, 0).value, 3.0);
+        assert_eq!(
+            MetricCollector::EventCount
+                .collect(&records, &passing, 0)
+                .value,
+            3.0
+        );
     }
 
     #[test]

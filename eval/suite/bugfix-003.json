@@ -10,5 +10,8 @@
     "stats.py": "def mean(xs):\n    return sum(xs) / len(xs)\n"
   },
   "verify": "python3 -B test_stats.py",
-  "verify_fails_before": true
+  "verify_fails_before": true,
+  "protected": [
+    "test_stats.py"
+  ]
 }

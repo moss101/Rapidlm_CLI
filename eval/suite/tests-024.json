@@ -1,7 +1,7 @@
 {
   "id": "tests-024",
   "category": "tests",
-  "prompt": "listutil.py has no tests. Write test_listutil.py that imports every public function (dedupe, flatten) and asserts their documented behavior, then make it pass.",
+  "prompt": "listutil.py has no tests. Write test_listutil.py that imports every public function (dedupe, flatten) and asserts their documented behavior, then make it pass. Do not modify listutil.py.",
   "setup": {
     "listutil.py": "def dedupe(xs):\n    return list(dict.fromkeys(xs))\n\n\ndef flatten(xss):\n    return [x for xs in xss for x in xs]\n\n"
   },
@@ -9,5 +9,18 @@
     "test_listutil.py": "from listutil import dedupe, flatten\nassert dedupe([1, 1, 2]) == [1, 2]\nassert flatten([[1], [2, 3]]) == [1, 2, 3]\nprint('OK')\n"
   },
   "verify": "python3 -B test_listutil.py",
-  "verify_fails_before": true
+  "verify_fails_before": true,
+  "protected": [
+    "listutil.py"
+  ],
+  "mutants": [
+    {
+      "file": "listutil.py",
+      "contents": "def dedupe(xs):\n    return xs\n\n\ndef flatten(xss):\n    return [x for xs in xss for x in xs]\n\n"
+    },
+    {
+      "file": "listutil.py",
+      "contents": "def dedupe(xs):\n    return list(dict.fromkeys(xs))\n\n\ndef flatten(xss):\n    return xss\n\n"
+    }
+  ]
 }

@@ -296,10 +296,7 @@ impl<'store> ConfiguredModel<'store> {
     /// re-derive it from `active.entry` a second time at a different call
     /// site, which could silently drift from what the real request sends.
     /// Attach the live text-delta sink. Idempotent; later calls replace.
-    pub fn set_delta_sink(
-        &mut self,
-        sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
-    ) {
+    pub fn set_delta_sink(&mut self, sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>) {
         self.delta_sink = sink;
     }
 
@@ -378,8 +375,9 @@ impl LiveModelCall for ConfiguredModel<'_> {
         let router_cancel = llm_router::provider::CancellationToken::new();
         let _bridge = ProviderCancelWatch::start(cancel.clone(), router_cancel.clone());
         let stream = match (&self.backend, &self.delta_sink) {
-            (Backend::OpenAi(adapter), Some(sink)) => adapter
-                .invoke_sync_streaming(request, &router_cancel, &mut |delta| sink(delta)),
+            (Backend::OpenAi(adapter), Some(sink)) => {
+                adapter.invoke_sync_streaming(request, &router_cancel, &mut |delta| sink(delta))
+            }
             (Backend::OpenAi(adapter), None) => adapter.invoke_sync(request, &router_cancel),
             (Backend::Anthropic(adapter), sink) => {
                 // Anthropic streaming requires its own SSE shape; the plain
@@ -1241,7 +1239,10 @@ mod tests {
             text: "a reasonably long response body here".to_owned(),
         }]);
         let (output, detail) = fold_stream(&stream, 400).expect("fold");
-        assert_eq!(detail, None, "estimate fallback must not pose as a reported split");
+        assert_eq!(
+            detail, None,
+            "estimate fallback must not pose as a reported split"
+        );
         match output {
             ModelStepOutput::Terminal { text, tokens, .. } => {
                 assert_eq!(text, "a reasonably long response body here");

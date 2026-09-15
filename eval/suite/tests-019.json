@@ -1,7 +1,7 @@
 {
   "id": "tests-019",
   "category": "tests",
-  "prompt": "pathutil.py has no tests. Write test_pathutil.py that imports every public function (basename, ext) and asserts their documented behavior, then make it pass.",
+  "prompt": "pathutil.py has no tests. Write test_pathutil.py that imports every public function (basename, ext) and asserts their documented behavior, then make it pass. Do not modify pathutil.py.",
   "setup": {
     "pathutil.py": "def basename(p):\n    return p.rsplit(\"/\", 1)[-1]\n\n\ndef ext(p):\n    return p.rsplit('.', 1)[-1] if '.' in p else ''\n\n"
   },
@@ -9,5 +9,18 @@
     "test_pathutil.py": "from pathutil import basename, ext\nassert basename(\"/x/y.py\") == \"y.py\"\nassert ext(\"y.py\") == \"py\"\nprint('OK')\n"
   },
   "verify": "python3 -B test_pathutil.py",
-  "verify_fails_before": true
+  "verify_fails_before": true,
+  "protected": [
+    "pathutil.py"
+  ],
+  "mutants": [
+    {
+      "file": "pathutil.py",
+      "contents": "def basename(p):\n    return p\n\n\ndef ext(p):\n    return p.rsplit('.', 1)[-1] if '.' in p else ''\n\n"
+    },
+    {
+      "file": "pathutil.py",
+      "contents": "def basename(p):\n    return p.rsplit(\"/\", 1)[-1]\n\n\ndef ext(p):\n    return p\n\n"
+    }
+  ]
 }

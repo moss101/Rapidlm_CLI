@@ -1,7 +1,7 @@
 {
   "id": "multifile-013",
   "category": "multifile",
-  "prompt": "The requirement changed: config.BATCH_SIZE must be 25 (it is 10). Update config.py, keep client.py and worker.py working, and make the check pass: python3 -B -c 'import config, sys; sys.exit(0 if config.BATCH_SIZE == 25 else 1)' && python3 -B test_config.py",
+  "prompt": "The requirement changed: config.BATCH_SIZE must be 25 (it is 10). Update config.py, keep client.py and worker.py working, and make the check pass: python3 -B -c 'import config, sys; sys.exit(0 if config.BATCH_SIZE == 25 else 1)' && python3 -B test_config.py. Do not modify test_config.py.",
   "setup": {
     "config.py": "BATCH_SIZE = 10\n",
     "client.py": "import config\n\ndef value():\n    return config.BATCH_SIZE\n",
@@ -12,5 +12,8 @@
     "config.py": "BATCH_SIZE = 25\n"
   },
   "verify": "python3 -B -c 'import config, sys; sys.exit(0 if config.BATCH_SIZE == 25 else 1)' && python3 -B test_config.py",
-  "verify_fails_before": true
+  "verify_fails_before": true,
+  "protected": [
+    "test_config.py"
+  ]
 }

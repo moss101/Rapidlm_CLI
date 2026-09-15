@@ -15,21 +15,44 @@
 //!   report.
 //! - **live** (model quality): drives real agent CLIs (`rapid exec`, plus
 //!   pinned competitor binaries when present) against identical scratch
-//!   repositories with the same verification commands. Agents that are not
-//!   installed, or runs that exceed the wall-clock ceiling, are recorded as
-//!   skipped/failed with the reason — never silently dropped, and no
-//!   comparison is claimed without actual runs on both sides.
+//!   repositories with the same verification commands. Every requested arm
+//!   appears in the report; arms that cannot run (binary missing, version
+//!   mismatch, health-probe failure) are recorded as skipped with a TYPED
+//!   infrastructure reason — never inferred from error text, never silently
+//!   dropped, and no comparison is claimed without actual runs on both
+//!   sides.
 //!
-//! Output: a JSON results file (`eval/results/<stamp>-<mode>.json`) and a
-//! summary line per task; exit 0 iff every non-skipped task passed.
+//! Grading (version [`GRADER_VERSION`]) runs entirely outside the agent-
+//! editable scratch: integrity check over protected files, the verification
+//! command, then mutation checks proving the submission detects defects.
+//! The command text, protected list, and mutation matrix all live in the
+//! task JSON under `eval/suite/`, which agents never see.
+//!
+//! Output: a JSON results file (`eval/results/<mode>-<stamp>.json`) with a
+//! full provenance block; exit 0 iff every task of every requested arm
+//! passed. Skips are gate failures: an empty, all-skipped, or incomplete
+//! comparison never exits 0.
 
 use agent_runtime::run_turn;
 use protocol::{AgentId, SessionId};
+use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
+use std::time::Duration;
+
+/// Grading semantics version. Bump whenever the grading pipeline changes in
+/// a way that affects which submissions pass, so retained results stay
+/// interpretable alongside the code that produced them.
+pub const GRADER_VERSION: &str = "2";
 
 /// Wall-clock ceiling per live task (offline tasks finish in milliseconds).
 const LIVE_TASK_TIMEOUT_SECS: u64 = 600;
+
+/// Ceiling for the dedicated health probe (a trivial "answer READY" turn),
+/// which replaces the old practice of preflighting with the first real task.
+const PROBE_TIMEOUT_SECS: u64 = 120;
 
 /// Where the suite ships.
 pub const SUITE_DIR: &str = "eval/suite";
@@ -38,9 +61,10 @@ pub const SUITE_DIR: &str = "eval/suite";
 // Task schema
 // ---------------------------------------------------------------------------
 
-/// One benchmark task. `deny_unknown_fields` semantics via manual parse: a
-/// task file the runner does not fully understand must fail the load, not
-/// silently skip fields.
+/// One benchmark task. Parsed manually so a task file containing fields the
+/// runner does not understand is at least fully explicit about what it uses;
+/// unknown extra fields are ignored rather than fatal, because the suite may
+/// carry metadata for other tooling.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BenchTask {
     /// Stable id, e.g. `bugfix-001`.
@@ -56,11 +80,23 @@ pub struct BenchTask {
     /// model writes. Live agents are given only the prompt.
     pub gold: Vec<(String, String)>,
     /// The external judge: a shell command run in the scratch repo root;
-    /// exit 0 = the task is done correctly.
+    /// exit 0 = the task is done correctly. The command text lives HERE,
+    /// outside the agent-editable workspace — agents cannot weaken it.
     pub verify: String,
-    /// A second command that must FAIL on the unmodified repo (the task is
-    /// not vacuous) — the anti-vacuity check every offline run performs.
+    /// A second command behavior that must FAIL on the unmodified repo (the
+    /// task is not vacuous) — the anti-vacuity check every run performs.
     pub verify_fails_before: bool,
+    /// Paths that must remain byte-identical to their setup contents after
+    /// the run. This is how the grader detects prohibited modifications:
+    /// test files, judge scripts, and harness files the agent was told not
+    /// to touch. Deleting a protected path is also a violation.
+    pub protected: Vec<String>,
+    /// Mutation matrix for test-authoring tasks: each entry `(path,
+    /// contents)` is a deliberately broken implementation the grader swaps
+    /// in alone; the submission's verification command MUST FAIL against
+    /// every mutant. An empty test file, zero discovered tests, weakened
+    /// assertions, or hard-coded outputs survive a mutant and are rejected.
+    pub mutants: Vec<(String, String)>,
 }
 
 const MAX_TASKS: usize = 64;
@@ -69,14 +105,7 @@ const MAX_FILE_BYTES: usize = 16 * 1024;
 /// Load every task file in a directory, sorted by name.
 pub fn load_suite(dir: &Path) -> Result<Vec<BenchTask>, String> {
     let mut tasks = Vec::new();
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|err| format!("{}: {err}", dir.display()))?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-        .collect();
-    entries.sort();
-    for path in entries {
+    for path in sorted_task_files(dir)? {
         let bytes = std::fs::read(&path).map_err(|err| err.to_string())?;
         let value: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|err| format!("{}: {err}", path.display()))?;
@@ -104,12 +133,56 @@ pub fn load_suite(dir: &Path) -> Result<Vec<BenchTask>, String> {
             .get("verify_fails_before")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
+        let protected = value
+            .get("protected")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        item.as_str()
+                            .ok_or_else(|| format!("{}: non-string protected path", path.display()))
+                            .map(str::to_owned)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let mutants = value
+            .get("mutants")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        let file = item
+                            .get("file")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| format!("{}: mutant missing file", path.display()))?;
+                        let contents = item
+                            .get("contents")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| {
+                                format!("{}: mutant missing contents", path.display())
+                            })?;
+                        if contents.len() > MAX_FILE_BYTES {
+                            return Err(format!(
+                                "{}: mutant exceeds the byte bound",
+                                path.display()
+                            ));
+                        }
+                        Ok((file.to_owned(), contents.to_owned()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
         let files = |key: &str| -> Result<Vec<(String, String)>, String> {
             let mut out = Vec::new();
             for (path, contents) in value
                 .get(key)
                 .and_then(serde_json::Value::as_object)
-                .ok_or_else(|| format!("{}: missing {key} object", path_name(dir)))?
+                .ok_or_else(|| format!("{}: missing {key} object", dir.display()))?
             {
                 let contents = contents
                     .as_str()
@@ -134,6 +207,8 @@ pub fn load_suite(dir: &Path) -> Result<Vec<BenchTask>, String> {
             gold,
             verify,
             verify_fails_before,
+            protected,
+            mutants,
         });
     }
     if tasks.is_empty() {
@@ -142,8 +217,34 @@ pub fn load_suite(dir: &Path) -> Result<Vec<BenchTask>, String> {
     Ok(tasks)
 }
 
-fn path_name(dir: &Path) -> String {
-    dir.display().to_string()
+fn sorted_task_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|err| format!("{}: {err}", dir.display()))?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    entries.sort();
+    Ok(entries)
+}
+
+/// Stable digest over the suite: SHA-256 of every task file's name + bytes
+/// in sorted order. Recorded in provenance so a retained result names the
+/// exact suite that produced it.
+pub fn suite_digest(dir: &Path) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    for path in sorted_task_files(dir)? {
+        let bytes = std::fs::read(&path).map_err(|err| err.to_string())?;
+        hasher.update(
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?")
+                .as_bytes(),
+        );
+        hasher.update([0x00]);
+        hasher.update(&bytes);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 // ---------------------------------------------------------------------------
@@ -171,32 +272,498 @@ pub fn materialize(root: &Path, task: &BenchTask) -> Result<(), String> {
     Ok(())
 }
 
-fn run_verify(dir: &Path, command: &str, timeout_secs: u64) -> Result<bool, String> {
-    use std::io::Read as _;
-    // `{RAPID}` in a task's verify command names this binary — so a judge
-    // can invoke real rapid subcommands without depending on PATH.
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rapid"));
-    let substituted = command.replace("{RAPID}", &format!("'{}'", exe.display()));
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(&substituted)
-        .current_dir(dir)
+// ---------------------------------------------------------------------------
+// Supervised subprocess execution
+// ---------------------------------------------------------------------------
+
+/// Retain at most this many bytes per stream from live agents (the grok JSON
+/// contract is one final JSON object; the tail is what matters) while still
+/// draining every byte a verbose child produces.
+const LIVE_OUTPUT_RETAIN_BYTES: usize = 512 * 1024;
+
+/// Retain at most this many bytes per stream from verification commands —
+/// enough for any test-runner failure dump, never a pipe-filling hazard.
+const VERIFY_OUTPUT_RETAIN_BYTES: usize = 64 * 1024;
+
+/// Last-resort grace for drain threads after process exit. A child that
+/// exited but left a pipe held by a surviving descendant cannot EOF its
+/// side; the group kill on timeout prevents that on Unix, and this grace
+/// bounds it everywhere else.
+const DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+/// Bounded tail buffer: keeps the LAST `cap` bytes and counts everything
+/// dropped in front. Retained diagnostics stay bounded no matter how
+/// verbose the child, and excess bytes are still consumed (drained) so the
+/// child never blocks on a full pipe.
+struct BoundedTail {
+    buf: VecDeque<u8>,
+    cap: usize,
+    dropped: u64,
+    total: u64,
+}
+
+impl BoundedTail {
+    fn new(cap: usize) -> Self {
+        Self {
+            buf: VecDeque::with_capacity(cap.min(64 * 1024)),
+            cap,
+            dropped: 0,
+            total: 0,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        self.total = self.total.saturating_add(chunk.len() as u64);
+        self.buf.extend(chunk.iter().copied());
+        let excess = self.buf.len().saturating_sub(self.cap);
+        if excess > 0 {
+            self.dropped += excess as u64;
+            self.buf.drain(..excess);
+        }
+    }
+
+    fn text(&self) -> String {
+        let mut bytes = Vec::with_capacity(self.buf.len());
+        bytes.extend(self.buf.iter().copied());
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+/// Outcome of one supervised child process.
+#[derive(Clone, Debug)]
+pub struct SupervisedOutput {
+    /// `None` only when the child could not be waited on at all (already
+    /// reaped by the platform after a group kill).
+    pub success: bool,
+    pub timed_out: bool,
+    /// The child's exit code, when the platform reported one. `None` when
+    /// killed by a signal (including the group kill on timeout).
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_dropped: u64,
+    pub stderr_dropped: u64,
+    pub stdout_total: u64,
+    pub stderr_total: u64,
+}
+
+/// Process-group discipline comes from `process-signal` — the same
+/// proven primitives the supervisor, sandbox backends, and plugin-host use
+/// (`isolate_process_group` = pgid == pid; `terminate_process_group` =
+/// TERM, grace, unconditional group KILL, leader reaped before it
+/// returns). The evaluation runner does not hand-roll its own setsid/kill.
+fn supervise_spawn(command: &mut Command) -> Result<std::process::Child, std::io::Error> {
+    process_signal::isolate_process_group(command);
+    command.spawn()
+}
+
+fn kill_process_tree(child: &mut std::process::Child) {
+    process_signal::terminate_process_group(
+        child,
+        process_signal::DEFAULT_TERM_GRACE,
+        process_signal::DEFAULT_KILL_WAIT,
+    );
+}
+
+/// Run one child to completion under supervision:
+///
+/// - stdout and stderr are drained CONCURRENTLY for the whole lifetime, so
+///   a verbose child can never fill a pipe and block (the manufactured-
+///   timeout defect); retained output is bounded, excess bytes are counted
+///   and discarded.
+/// - on timeout the entire process GROUP is killed and the immediate child
+///   is reaped; no descendants survive.
+/// - stdin, when given, is written from a separate thread and closed.
+fn run_supervised(
+    command: &mut Command,
+    stdin_bytes: Option<&[u8]>,
+    timeout: Duration,
+    retain_bytes: usize,
+) -> Result<SupervisedOutput, std::io::Error> {
+    process_signal::isolate_process_group(command);
+    command
+        .stdin(if stdin_bytes.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|err| err.to_string())?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        .stderr(std::process::Stdio::piped());
+    let mut child = supervise_spawn(command)?;
+    if let Some(bytes) = stdin_bytes {
+        // A child that never reads stdin could fill the pipe and block the
+        // write; the thread keeps the main flow free either way, and the
+        // write fails once the child (or its group) is killed.
+        let bytes = bytes.to_vec();
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            let _ = stdin.write_all(&bytes);
+            // Dropping closes the pipe.
+        });
+    }
+    let (stdout_tx, stdout_rx) = mpsc::channel::<BoundedTail>();
+    let (stderr_tx, stderr_rx) = mpsc::channel::<BoundedTail>();
+    if let Some(stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            drain_to_tail(stdout, retain_bytes, &stdout_tx);
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            drain_to_tail(stderr, retain_bytes, &stderr_tx);
+        });
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    let mut timed_out = false;
+    let mut status: Option<std::process::ExitStatus> = None;
     loop {
-        match child.try_wait().map_err(|err| err.to_string())? {
-            Some(status) => return Ok(status.success()),
-            None => {
+        match child.try_wait() {
+            Ok(Some(exit)) => {
+                status = Some(exit);
+                break;
+            }
+            Ok(None) => {
                 if std::time::Instant::now() > deadline {
-                    let _ = child.kill();
-                    return Err(format!("verify exceeded its {timeout_secs}s ceiling"));
+                    timed_out = true;
+                    // TERM the group, grace, KILL the group, reap the
+                    // leader — no descendants survive this call.
+                    kill_process_tree(&mut child);
+                    break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    let mut stdout_tail = latest_tail(&stdout_rx);
+    let mut stderr_tail = latest_tail(&stderr_rx);
+    // Bounded wait for the remaining drains (pipes close when the killed
+    // group's descriptors are released; the grace bounds pathological cases).
+    let drain_deadline = std::time::Instant::now() + DRAIN_GRACE;
+    while (stdout_tail.is_none() || stderr_tail.is_none())
+        && std::time::Instant::now() < drain_deadline
+    {
+        if stdout_tail.is_none() {
+            match stdout_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(tail) => stdout_tail = Some(tail),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    stdout_tail = Some(BoundedTail::new(retain_bytes));
+                }
             }
         }
+        if stderr_tail.is_none() {
+            match stderr_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(tail) => stderr_tail = Some(tail),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    stderr_tail = Some(BoundedTail::new(retain_bytes));
+                }
+            }
+        }
+    }
+    let empty = BoundedTail::new(retain_bytes);
+    let stdout_tail = stdout_tail.unwrap_or_else(|| empty);
+    let empty = BoundedTail::new(retain_bytes);
+    let stderr_tail = stderr_tail.unwrap_or_else(|| empty);
+    Ok(SupervisedOutput {
+        success: !timed_out && status.is_some_and(|status| status.success()),
+        timed_out,
+        exit_code: status.and_then(|status| status.code()),
+        stdout: stdout_tail.text(),
+        stderr: stderr_tail.text(),
+        stdout_dropped: stdout_tail.dropped,
+        stderr_dropped: stderr_tail.dropped,
+        stdout_total: stdout_tail.total,
+        stderr_total: stderr_tail.total,
+    })
+}
+
+fn drain_to_tail(
+    mut stream: impl std::io::Read + Send + 'static,
+    retain_bytes: usize,
+    tx: &mpsc::Sender<BoundedTail>,
+) {
+    let mut tail = BoundedTail::new(retain_bytes);
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => tail.push(&chunk[..n]),
+            Err(_) => break,
+        }
+    }
+    let _ = tx.send(tail);
+}
+
+/// Non-blocking sweep of a tail channel: returns the latest tail received so
+/// far, if any.
+fn latest_tail(rx: &mpsc::Receiver<BoundedTail>) -> Option<BoundedTail> {
+    let mut latest = None;
+    while let Ok(tail) = rx.try_recv() {
+        latest = Some(tail);
+    }
+    latest
+}
+
+// ---------------------------------------------------------------------------
+// Grading pipeline (grader version 2)
+// ---------------------------------------------------------------------------
+
+/// Why a submission failed grading. Infrastructure and vacuity are HARNESS
+/// outcomes (skips) — they say nothing about the submission; everything
+/// else is a rejection of the submission itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GradeFailure {
+    /// The verification command passes on the UNMODIFIED repo: the task
+    /// proves nothing, so no agent can be graded on it.
+    Vacuous,
+    /// The verification infrastructure itself could not run (interpreter
+    /// missing, command not executable). A broken environment is not a
+    /// failing submission — recorded as a skip, never as an agent failure.
+    Infrastructure { detail: String },
+    /// A protected file (test, judge script, harness file) was modified or
+    /// deleted relative to its setup contents.
+    Integrity { path: String },
+    /// The verification command failed on the submission.
+    Verification { output: String },
+    /// A deliberately broken implementation passed the submission's tests:
+    /// the tests do not detect the defect (empty tests, weakened
+    /// assertions, hard-coded outputs all land here).
+    MutationSurvived { file: String },
+    /// The mutation run itself could not execute (environment broke while
+    /// mutating) — distinct from a survived mutation.
+    MutationError { file: String, detail: String },
+}
+
+impl GradeFailure {
+    /// Machine-readable kind for the results JSON.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Vacuous => "vacuous",
+            Self::Infrastructure { .. } => "infrastructure",
+            Self::Integrity { .. } => "integrity_violation",
+            Self::Verification { .. } => "verification_failed",
+            Self::MutationSurvived { .. } => "mutation_survived",
+            Self::MutationError { .. } => "mutation_error",
+        }
+    }
+
+    /// Harness-level skips: not verdicts about the submission.
+    pub fn is_harness_skip(&self) -> bool {
+        matches!(self, Self::Vacuous | Self::Infrastructure { .. })
+    }
+
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Vacuous => "vacuous task (verify passes before any change)".to_owned(),
+            Self::Infrastructure { detail } => format!("infrastructure: {detail}"),
+            Self::Integrity { path } => {
+                format!("protected file was modified or deleted: {path}")
+            }
+            Self::Verification { output } => {
+                format!(
+                    "verification command failed after the run: {}",
+                    clip(output, 400)
+                )
+            }
+            Self::MutationSurvived { file } => format!(
+                "mutation survived: tests still pass with a deliberately broken {file} — \
+                 the submission does not detect the defect"
+            ),
+            Self::MutationError { file, detail } => {
+                format!("mutation run for {file} could not execute: {detail}")
+            }
+        }
+    }
+}
+
+fn clip(text: &str, max_chars: usize) -> String {
+    let flattened = text.replace('\n', " ");
+    flattened.chars().take(max_chars).collect()
+}
+
+/// One verification-command execution with bounded output capture.
+pub struct VerifyRun {
+    pub passed: bool,
+    pub timed_out: bool,
+    pub error: Option<String>,
+    /// The shell's exit code, when it exited. Codes 126/127 are sh's
+    /// reserved "could not execute / not found" — a broken environment,
+    /// never a verdict on the submission.
+    pub exit_code: Option<i32>,
+    pub output: String,
+}
+
+/// True when a verify outcome means the command itself could not run:
+/// spawn/IO failure, sh's 126 (not executable) or 127 (not found). These
+/// are infrastructure — distinguished from a genuine failing test.
+fn verify_unrunnable(run: &VerifyRun) -> bool {
+    run.error.is_some() || matches!(run.exit_code, Some(126 | 127))
+}
+
+fn verify_unrunnable_detail(run: &VerifyRun) -> String {
+    if let Some(detail) = &run.error {
+        format!("verification could not run: {detail}")
+    } else {
+        format!(
+            "verification command not found or not executable (exit {})",
+            run.exit_code.unwrap_or_default()
+        )
+    }
+}
+
+/// Run a task's verification command in `dir`. `{RAPID}` names this binary,
+/// so a judge can invoke real rapid subcommands without depending on PATH.
+/// Output is drained concurrently and retained up to
+/// [`VERIFY_OUTPUT_RETAIN_BYTES`] per stream.
+pub fn run_verify(dir: &Path, command: &str, timeout_secs: u64) -> VerifyRun {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rapid"));
+    let substituted = command.replace("{RAPID}", &format!("'{}'", exe.display()));
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(&substituted).current_dir(dir);
+    let outcome = run_supervised(
+        &mut command,
+        None,
+        Duration::from_secs(timeout_secs),
+        VERIFY_OUTPUT_RETAIN_BYTES,
+    );
+    match outcome {
+        Err(err) => VerifyRun {
+            passed: false,
+            timed_out: false,
+            error: Some(err.to_string()),
+            exit_code: None,
+            output: String::new(),
+        },
+        Ok(out) => {
+            let mut output = out.stdout.trim().to_owned();
+            if !out.stderr.trim().is_empty() {
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push_str("[stderr] ");
+                output.push_str(out.stderr.trim());
+            }
+            VerifyRun {
+                passed: out.success,
+                timed_out: out.timed_out,
+                error: None,
+                exit_code: out.exit_code,
+                output,
+            }
+        }
+    }
+}
+
+/// The anti-vacuity gate, run BEFORE the agent works: the verification
+/// command must FAIL on the unmodified repo, or the task proves nothing. A
+/// command that cannot EXECUTE at all is a broken environment, not a vacuous
+/// task — the two are distinguished here.
+pub fn prechange_check(scratch: &Path, task: &BenchTask) -> Result<(), GradeFailure> {
+    if !task.verify_fails_before {
+        return Ok(());
+    }
+    let run = run_verify(scratch, &task.verify, 60);
+    if verify_unrunnable(&run) {
+        return Err(GradeFailure::Infrastructure {
+            detail: format!("pre-change check: {}", verify_unrunnable_detail(&run)),
+        });
+    }
+    if run.timed_out {
+        return Err(GradeFailure::Infrastructure {
+            detail: "pre-change check exceeded its ceiling".to_owned(),
+        });
+    }
+    if run.passed {
+        return Err(GradeFailure::Vacuous);
+    }
+    Ok(())
+}
+
+/// Post-run grading: integrity, verification, mutations. Every check
+/// executes OUTSIDE the agent's influence — the task data (protected list,
+/// command text, mutants) lives in `eval/suite/`, and this function runs in
+/// the harness process, not in the scratch the agent edited.
+pub fn grade_submission(scratch: &Path, task: &BenchTask) -> Result<(), GradeFailure> {
+    // 1. Protected-file integrity: test files, judge scripts, and harness
+    //    files must be byte-identical to what setup wrote. Deletion counts.
+    for path in &task.protected {
+        let Some((_, expected)) = task.setup.iter().find(|(name, _)| name == path) else {
+            return Err(GradeFailure::Infrastructure {
+                detail: format!("protected path {path} is not in setup"),
+            });
+        };
+        match std::fs::read(scratch.join(path)) {
+            Ok(actual) if actual.as_slice() == expected.as_bytes() => {}
+            Ok(_) => return Err(GradeFailure::Integrity { path: path.clone() }),
+            Err(_) => return Err(GradeFailure::Integrity { path: path.clone() }),
+        }
+    }
+    // 2. Verification: the submission must satisfy the judge.
+    let run = run_verify(scratch, &task.verify, 120);
+    if verify_unrunnable(&run) {
+        return Err(GradeFailure::Infrastructure {
+            detail: verify_unrunnable_detail(&run),
+        });
+    }
+    if run.timed_out {
+        return Err(GradeFailure::Verification {
+            output: format!(
+                "verification exceeded its 120s ceiling; output: {}",
+                run.output
+            ),
+        });
+    }
+    if !run.passed {
+        return Err(GradeFailure::Verification { output: run.output });
+    }
+    // 3. Mutation checks: every deliberately broken implementation must be
+    //    REJECTED by the submission. The original state is restored after
+    //    each attempt, win or lose.
+    for (file, contents) in &task.mutants {
+        let original = task.setup.iter().find(|(name, _)| name == file);
+        if original.is_none() {
+            return Err(GradeFailure::Infrastructure {
+                detail: format!("mutant target {file} is not in setup"),
+            });
+        }
+        let mutant_path = scratch.join(file);
+        if let Some(parent) = mutant_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(err) = std::fs::write(&mutant_path, contents) {
+            return Err(GradeFailure::Infrastructure {
+                detail: format!("could not apply mutant {file}: {err}"),
+            });
+        }
+        let run = run_verify(scratch, &task.verify, 120);
+        restore(
+            scratch,
+            original.map(|(name, contents)| (name.as_str(), contents.as_str())),
+        );
+        if run.error.is_some() || run.timed_out {
+            return Err(GradeFailure::MutationError {
+                file: file.clone(),
+                detail: run
+                    .error
+                    .unwrap_or_else(|| "verification timed out".to_owned()),
+            });
+        }
+        if run.passed {
+            return Err(GradeFailure::MutationSurvived { file: file.clone() });
+        }
+    }
+    Ok(())
+}
+
+fn restore(scratch: &Path, original: Option<(&str, &str)>) {
+    match original {
+        Some((name, contents)) => {
+            let _ = std::fs::write(scratch.join(name), contents);
+        }
+        None => {}
     }
 }
 
@@ -208,7 +775,7 @@ fn run_verify(dir: &Path, command: &str, timeout_secs: u64) -> Result<bool, Stri
 /// A model driver that performs the task's gold patch: one `workspace_write`
 /// call per gold file, then a terminal answer. This exercises the real tool
 /// dispatcher, permission lattice, and ledger — nothing about the outcome is
-/// asserted without the verification command running.
+/// asserted without the grading pipeline running.
 struct GoldPatchModel {
     calls: Vec<agent_runtime::ProposedToolCall>,
     step: usize,
@@ -268,6 +835,12 @@ pub struct TaskResult {
     pub outcome: String, // passed | failed | skipped
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Typed failure class (`vacuous`, `infrastructure`, `timeout`,
+    /// `agent_non_zero`, `integrity_violation`, `verification_failed`,
+    /// `mutation_survived`, `mutation_error`). Classification comes from
+    /// the typed outcome, never from substring matching on error text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<String>,
     pub wall_ms: u128,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<u64>,
@@ -293,7 +866,8 @@ pub struct TaskResult {
 }
 
 /// Run the suite offline: gold trajectory through the real turn loop, graded
-/// only by the task's verification command (plus the anti-vacuity check).
+/// only by the grading pipeline (anti-vacuity, integrity, verification,
+/// mutations).
 pub fn run_offline(tasks: &[BenchTask], scratch_root: &Path, trusted: bool) -> Vec<TaskResult> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -317,12 +891,11 @@ pub fn run_offline(tasks: &[BenchTask], scratch_root: &Path, trusted: bool) -> V
             category: task.category.clone(),
             outcome: match &result {
                 Ok(()) => "passed".to_owned(),
-                Err(reason) => {
-                    let _ = reason;
-                    "failed".to_owned()
-                }
+                Err(failure) if failure.is_harness_skip() => "skipped".to_owned(),
+                Err(_) => "failed".to_owned(),
             },
-            reason: result.err(),
+            reason: result.as_ref().err().map(|failure| failure.reason()),
+            failure_kind: result.err().map(|failure| failure.kind().to_owned()),
             wall_ms: started.elapsed().as_millis(),
             tokens: Some(u64::from(task.gold.len() as u32 + 1) * 10),
             cost_usd_micros: None,
@@ -337,42 +910,42 @@ pub fn run_offline(tasks: &[BenchTask], scratch_root: &Path, trusted: bool) -> V
     results
 }
 
-fn run_offline_task(task: &BenchTask, scratch: &Path, trusted: bool) -> Result<(), String> {
-    materialize(scratch, task)?;
-    // Anti-vacuity: the verification command must FAIL on the unmodified
-    // repo, or the task proves nothing.
-    if task.verify_fails_before && run_verify(scratch, &task.verify, 60).unwrap_or(true) {
-        return Err(
-            "verification command passes on the UNMODIFIED repo; the task is vacuous".to_owned(),
-        );
-    }
+fn run_offline_task(task: &BenchTask, scratch: &Path, trusted: bool) -> Result<(), GradeFailure> {
+    materialize(scratch, task).map_err(|detail| GradeFailure::Infrastructure { detail })?;
+    // Anti-vacuity before the gold trajectory runs.
+    prechange_check(scratch, task)?;
     // The gold trajectory through the REAL turn loop: tools, lattice, ledger.
     if !trusted {
-        return Err(
-            "the project is not trusted; offline evaluation refuses to run with no tools"
+        return Err(GradeFailure::Infrastructure {
+            detail: "the project is not trusted; offline evaluation refuses to run with no tools"
                 .to_owned(),
-        );
+        });
     }
     // The gold trajectory is scripted, not a model's proposal: the calls are
     // known-good by construction, so the lattice runs in bypass mode (the
     // same seam the interactive test harness uses) and the permission gate
-    // is not what is under test here — the verification command is.
+    // is not what is under test here — the grading pipeline is.
     let mut tools = crate::exec_tools::ExecTools::workspace_with_permissions(
         scratch,
         crate::permissions::PermissionLattice::new(
             crate::permissions::PermissionMode::BypassPermissions,
         ),
     )
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| GradeFailure::Infrastructure {
+        detail: err.to_string(),
+    })?;
     tools.set_approval_source(std::sync::Arc::new(
         crate::approvals::LedgerApprovalSink::new(
-            offline_ledger_client(scratch)?,
+            offline_ledger_client(scratch)
+                .map_err(|detail| GradeFailure::Infrastructure { detail })?,
             SessionId::new(),
             event_ledger::event::ActorRef::new(
                 event_ledger::event::ActorKind::Agent,
                 &protocol::EventId::new().to_string(),
             )
-            .map_err(|err| err.to_string())?,
+            .map_err(|err| GradeFailure::Infrastructure {
+                detail: err.to_string(),
+            })?,
             scratch.to_path_buf(),
         ),
     ));
@@ -384,7 +957,9 @@ fn run_offline_task(task: &BenchTask, scratch: &Path, trusted: bool) -> Result<(
     )
     .permissions_profile("work")
     .build()
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| GradeFailure::Infrastructure {
+        detail: err.to_string(),
+    })?;
     let request = agent_runtime::AgentExecutionRequest::new(spec, SessionId::new());
     let mut model = GoldPatchModel::for_task(task);
     let mut events = Vec::new();
@@ -400,21 +975,22 @@ fn run_offline_task(task: &BenchTask, scratch: &Path, trusted: bool) -> Result<(
         ),
         &agent_runtime::CancellationToken::new(),
     )
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| GradeFailure::Infrastructure {
+        detail: err.to_string(),
+    })?;
     if outcome.status() != agent_runtime::TurnStatus::Completed {
-        return Err(format!(
-            "the gold trajectory turn did not complete: {}",
-            outcome
-                .reason()
-                .map(|reason| reason.as_str())
-                .unwrap_or("unknown")
-        ));
+        return Err(GradeFailure::Infrastructure {
+            detail: format!(
+                "the gold trajectory turn did not complete: {}",
+                outcome
+                    .reason()
+                    .map(|reason| reason.as_str())
+                    .unwrap_or("unknown")
+            ),
+        });
     }
-    // The external judge: verification exit 0 in the patched repo.
-    if !run_verify(scratch, &task.verify, 120).unwrap_or(false) {
-        return Err("verification command failed after the gold patch".to_owned());
-    }
-    Ok(())
+    let _ = request;
+    grade_submission(scratch, task)
 }
 
 fn offline_ledger_client(scratch: &Path) -> Result<kernel::InProcessKernelClient, String> {
@@ -426,16 +1002,124 @@ fn offline_ledger_client(scratch: &Path) -> Result<kernel::InProcessKernelClient
 }
 
 // ---------------------------------------------------------------------------
-// Live mode: real agent CLIs, identical repos, same judge.
+// Live mode: real agent CLIs, identical repos, same grading pipeline.
 // ---------------------------------------------------------------------------
 
-/// The live agents. `rapid` is ourselves; competitors run when their pinned
-/// CLI is on PATH. Each entry names the binary to probe and the argv shape.
-pub const LIVE_AGENTS: &[(&str, &str)] = &[
-    ("rapid", "rapid exec <prompt>"),
-    ("qwen", "qwen -p <prompt> (pinned version required)"),
-    ("grok", "grok <prompt> (pinned version required)"),
+/// Typed infrastructure failure for a live arm. Classification is structural
+/// (a probe result, a missing binary, a version probe) — never inferred from
+/// error text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InfraError {
+    BinaryMissing {
+        agent: String,
+    },
+    VersionMismatch {
+        agent: String,
+        pinned: String,
+        found: String,
+    },
+    ProbeFailed {
+        agent: String,
+        detail: String,
+    },
+    ProbeTimeout {
+        agent: String,
+    },
+    Prep {
+        agent: String,
+        detail: String,
+    },
+}
+
+impl InfraError {
+    pub fn reason(&self) -> String {
+        match self {
+            Self::BinaryMissing { agent } => {
+                format!("infrastructure: competitor {agent} not found on PATH")
+            }
+            Self::VersionMismatch {
+                agent,
+                pinned,
+                found,
+            } => format!(
+                "infrastructure: competitor {agent} version mismatch (pinned {pinned}, found \
+                 {found}); skipped rather than compared unpinned"
+            ),
+            Self::ProbeFailed { agent, detail } => {
+                format!(
+                    "infrastructure: {agent} health probe failed: {}",
+                    clip(detail, 300)
+                )
+            }
+            Self::ProbeTimeout { agent } => {
+                format!(
+                    "infrastructure: {agent} health probe exceeded its {PROBE_TIMEOUT_SECS}s ceiling"
+                )
+            }
+            Self::Prep { agent, detail } => {
+                format!("infrastructure: {agent} scratch preparation failed: {detail}")
+            }
+        }
+    }
+}
+
+/// One pinned competitor recipe. A competitor runs only when its binary is
+/// present AND reports the pinned version — an unpinned binary is skipped
+/// rather than compared, and the observed version is embedded in provenance.
+/// Pins recorded 2026-09-15 from the vendors' published releases and the
+/// locally installed versions: grok CLI 1.0.30 (x.ai), kimi-code v0.43.0
+/// (MoonshotAI, 2026-09-14; not installed locally), @qwen-code/qwen-code
+/// 0.22.2 (the installed version; npm latest at pin time was 0.23.3).
+/// Approval flags follow each vendor's documented non-interactive mode and
+/// are re-validated by the health probe before any task runs.
+pub struct AgentRecipe {
+    pub name: &'static str,
+    pub pinned_version: &'static str,
+    pub version_flag: &'static str,
+    pub prefix: &'static [&'static str],
+}
+
+pub const RECIPES: &[AgentRecipe] = &[
+    AgentRecipe {
+        name: "grok",
+        pinned_version: "1.0.30",
+        version_flag: "--version",
+        // `--always-approve` is grok's auto-approval mode — the comparable
+        // setting to rapid's acceptEdits — and `--output-format json`
+        // returns the final answer plus provider-reported token/cost usage
+        // as one JSON object: the harness's per-task usage source.
+        prefix: &["--always-approve", "--output-format", "json", "-p"],
+    },
+    AgentRecipe {
+        name: "kimi",
+        // kimi-code documents a positional prompt for one-shot runs; the
+        // probe below fails fast (typed) if the invocation is wrong.
+        pinned_version: "0.43.0",
+        version_flag: "--version",
+        prefix: &[],
+    },
+    AgentRecipe {
+        name: "qwen",
+        // Qwen Code headless: `-p` print mode; auto-approval via the forked
+        // gemini-cli `--yolo` switch. An unrecognized flag exits non-zero
+        // immediately, which the probe records as a typed skip — it can
+        // never silently hang the suite.
+        pinned_version: "0.22.2",
+        version_flag: "--version",
+        prefix: &["--yolo", "-p"],
+    },
 ];
+
+/// One requested arm and whether it can run at all.
+#[derive(Clone, Debug)]
+pub struct ArmPlan {
+    pub name: String,
+    pub bin: PathBuf,
+    pub args: Vec<String>,
+    pub pinned_version: String,
+    pub observed_version: Option<String>,
+    pub state: Result<(), InfraError>,
+}
 
 fn probe_binary(name: &str) -> bool {
     Command::new("sh")
@@ -446,226 +1130,109 @@ fn probe_binary(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// The real live runner: `bin` is the resolved agent binary (ours is the
-/// current executable); the prompt is piped on stdin so agents with
-/// different CLI grammars get identical instructions.
-fn run_live_agent_with(
-    bin: &str,
-    args: &[String],
-    task: &BenchTask,
-    scratch: &Path,
-) -> Result<(bool, u64), String> {
-    use std::io::Write as _;
-    use std::process::Stdio;
-    let started = std::time::Instant::now();
-    let mut child = Command::new(bin)
-        .args(args)
-        .current_dir(scratch)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("{bin} could not start: {err}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(task.prompt.as_bytes());
-    }
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(LIVE_TASK_TIMEOUT_SECS);
-    let status = loop {
-        match child.try_wait().map_err(|err| err.to_string())? {
-            Some(status) => break status,
-            None => {
-                if std::time::Instant::now() > deadline {
-                    let _ = child.kill();
-                    return Err(format!(
-                        "{bin} exceeded the {LIVE_TASK_TIMEOUT_SECS}s ceiling"
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-        }
-    };
-    let _ = started;
-    Ok((status.success(), 0)) // tokens: parsed per-agent when the CLI reports them; 0 = not reported
-}
-
-/// Pinned competitor invocation recipes. Each entry: (name, version probe
-/// binary, version flag, argv builder). A competitor runs only when its
-/// binary is present AND a recipe is recorded here — an unpinned binary is
-/// skipped rather than compared, and the recorded version is embedded in
-/// the report so runs are reproducible.
-fn agent_recipes() -> Vec<(String, String, String, Vec<String>)> {
-    // (name, pinned version, version probe flag, argv prefix). The prompt is
-    // appended as the final argument.
-    vec![
-        (
-            "rapid".to_owned(),
-            env!("CARGO_PKG_VERSION").to_owned(),
-            String::new(),
-            vec!["exec".to_owned()],
-        ),
-        (
-            "grok".to_owned(),
-            "1.0.30".to_owned(),
-            "--version".to_owned(),
-            // `--always-approve` is grok's auto-approval mode — the
-            // comparable setting to rapid's acceptEdits (file/shell tools
-            // auto-approved; the task's verify command is still the judge).
-            // `--output-format json` returns the final answer plus the
-            // provider-reported token/cost usage as one JSON object —
-            // the harness's per-task usage source.
-            vec![
-                "--always-approve".to_owned(),
-                "--output-format".to_owned(),
-                "json".to_owned(),
-                "-p".to_owned(),
-            ],
-        ),
-    ]
-}
-
-/// Run the suite live for every agent with a recorded recipe whose binary
-/// is present; agents that are absent or unpinned are recorded as skipped
-/// with the reason — a comparison is only ever drawn between agents that
-/// actually ran under pinned invocations.
-pub fn run_live(
-    tasks: &[BenchTask],
-    scratch_root: &Path,
-    self_exe: &Path,
-    trusted: bool,
-    grant_shell: bool,
-) -> Vec<(String, Vec<TaskResult>)> {
-    let mut agents: Vec<(String, PathBuf, Vec<String>)> = vec![(
-        "rapid".to_owned(),
-        self_exe.to_path_buf(),
-        vec!["exec".to_owned()],
-    )];
-    for (name, pinned_version, version_flag, prefix) in agent_recipes() {
-        if name == "rapid" {
+/// Resolve every requested arm (ourselves + every pinned recipe) BEFORE any
+/// task runs. Absent or version-mismatched competitors stay in the plan as
+/// `Unavailable` so the report can include every requested arm — skipped,
+/// with the typed reason, never omitted.
+pub fn plan_arms(self_exe: &Path) -> Vec<ArmPlan> {
+    let mut plans = vec![ArmPlan {
+        name: "rapid".to_owned(),
+        bin: self_exe.to_path_buf(),
+        args: vec!["exec".to_owned()],
+        pinned_version: env!("CARGO_PKG_VERSION").to_owned(),
+        observed_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+        state: Ok(()),
+    }];
+    for recipe in RECIPES {
+        if !probe_binary(recipe.name) {
+            plans.push(ArmPlan {
+                name: recipe.name.to_owned(),
+                bin: PathBuf::from(recipe.name),
+                args: recipe.prefix.iter().map(|arg| arg.to_string()).collect(),
+                pinned_version: recipe.pinned_version.to_owned(),
+                observed_version: None,
+                state: Err(InfraError::BinaryMissing {
+                    agent: recipe.name.to_owned(),
+                }),
+            });
             continue;
         }
-        if !probe_binary(&name) {
-            eprintln!("eval: competitor {name} not found on PATH; recorded as skipped");
-            continue;
-        }
-        // Pin check: the installed version must match the pinned one.
-        let observed = Command::new(&name)
-            .arg(&version_flag)
+        let observed = Command::new(recipe.name)
+            .arg(recipe.version_flag)
             .output()
             .ok()
             .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
             .unwrap_or_default();
-        if !observed.contains(&pinned_version) {
-            eprintln!(
-                "eval: competitor {name} version mismatch (pinned {pinned_version}, found {:?}); \
-recorded as skipped rather than compared unpinned",
-                observed.trim()
-            );
+        if !observed.contains(recipe.pinned_version) {
+            plans.push(ArmPlan {
+                name: recipe.name.to_owned(),
+                bin: PathBuf::from(recipe.name),
+                args: recipe.prefix.iter().map(|arg| arg.to_string()).collect(),
+                pinned_version: recipe.pinned_version.to_owned(),
+                observed_version: Some(observed.trim().to_owned()),
+                state: Err(InfraError::VersionMismatch {
+                    agent: recipe.name.to_owned(),
+                    pinned: recipe.pinned_version.to_owned(),
+                    found: observed.trim().to_owned(),
+                }),
+            });
             continue;
         }
-        agents.push((name.clone(), PathBuf::from(&name), prefix));
-    }
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    // Usage files live OUTSIDE the per-task scratch (which is removed after
-    // each task) so a failed task's spend is still recorded.
-    let usage_dir = scratch_root.join("usage");
-    let _ = std::fs::create_dir_all(&usage_dir);
-    let mut per_agent = Vec::new();
-    for (name, bin, args) in &agents {
-        // Pre-flight: a probe task. If the model call itself fails (no
-        // credentials, unreachable endpoint), every live task for that
-        // agent is recorded as SKIPPED with that reason — failures of the
-        // environment are not failures of the tasks.
-        let probe = scratch_root.join(format!("preflight-{name}-{stamp:x}"));
-        let model_ready = match run_live_agent(bin, args, &tasks[0], &probe, name, grant_shell, None)
-        {
-            (Err(reason), _)
-                if reason.contains("model")
-                    || reason.contains("provider")
-                    || reason.contains("non-zero") =>
-            {
-                let _ = std::fs::remove_dir_all(&probe);
-                Some(reason)
-            }
-            _ => {
-                let _ = std::fs::remove_dir_all(&probe);
-                None
-            }
-        };
-        if let Some(reason) = model_ready {
-            per_agent.push((
-                name.clone(),
-                tasks
-                    .iter()
-                    .map(|task| TaskResult {
-                        id: task.id.clone(),
-                        category: task.category.clone(),
-                        outcome: "skipped".to_owned(),
-                        reason: Some(format!("model not usable: {reason}")),
-                        wall_ms: 0,
-                        tokens: None,
-                        cost_usd_micros: None,
-                        cost_estimate_usd_micros: None,
-                        input_tokens: None,
-                        cached_tokens: None,
-                        output_tokens: None,
-                        num_turns: None,
-                        agent: Some(name.clone()),
-                    })
-                    .collect(),
-            ));
-            continue;
-        }
-        let mut results = Vec::new();
-        for task in tasks {
-            let started = std::time::Instant::now();
-            let scratch = scratch_root.join(format!("{name}-{}-{stamp:x}", task.id));
-            let usage_path = usage_dir.join(format!("{name}-{}-{stamp:x}.json", task.id));
-            let usage_file = if name == "rapid" {
-                Some(usage_path.as_path())
-            } else {
-                None
-            };
-            let (result, usage) = run_live_agent(bin, args, task, &scratch, name, grant_shell, usage_file);
-            let _ = std::fs::remove_dir_all(&scratch);
-            // Only the harness's OWN skip reasons count as skipped — the
-            // preflight gate and the anti-vacuity check. Task stderr that
-            // happens to contain the word ("hits beyond offset skipped: 0")
-            // must never downgrade a real failure.
-            let harness_skip = |reason: &str| {
-                reason.starts_with("model not usable") || reason.starts_with("vacuous task")
-            };
-            results.push(TaskResult {
-                id: task.id.clone(),
-                category: task.category.clone(),
-                outcome: match &result {
-                    Ok(()) => "passed".to_owned(),
-                    Err(reason) => {
-                        if harness_skip(reason) {
-                            "skipped".to_owned()
-                        } else {
-                            "failed".to_owned()
-                        }
-                    }
-                },
-            reason: result.err(),
-            wall_ms: started.elapsed().as_millis(),
-            tokens: usage.tokens,
-            cost_usd_micros: usage.cost_usd_micros,
-            cost_estimate_usd_micros: estimate_cost_micros(&usage),
-            input_tokens: usage.input_tokens,
-            cached_tokens: usage.cached_tokens,
-            output_tokens: usage.output_tokens,
-            num_turns: usage.num_turns,
-            agent: Some(name.clone()),
+        plans.push(ArmPlan {
+            name: recipe.name.to_owned(),
+            bin: PathBuf::from(recipe.name),
+            args: recipe.prefix.iter().map(|arg| arg.to_string()).collect(),
+            pinned_version: recipe.pinned_version.to_owned(),
+            observed_version: Some(observed.trim().to_owned()),
+            state: Ok(()),
         });
-        }
-        per_agent.push((name.clone(), results));
     }
-    per_agent
+    plans
+}
+
+/// Why one live task run failed. Only harness-level outcomes are skips;
+/// timeouts and agent non-zero exits are FAILURES — a model that hangs or
+/// crashes on a task has failed that task.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunFailure {
+    Materialize(String),
+    Spawn(String),
+    Vacuous,
+    PreVerifyError(String),
+    AgentNonZero { snippet: String },
+    Timeout,
+    Grading(GradeFailure),
+}
+
+impl RunFailure {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Materialize(_) | Self::Spawn(_) | Self::PreVerifyError(_) => "infrastructure",
+            Self::Vacuous => "vacuous",
+            Self::AgentNonZero { .. } => "agent_non_zero",
+            Self::Timeout => "timeout",
+            Self::Grading(failure) => failure.kind(),
+        }
+    }
+
+    pub fn is_harness_skip(&self) -> bool {
+        matches!(
+            self,
+            Self::Vacuous | Self::Materialize(_) | Self::Spawn(_) | Self::PreVerifyError(_)
+        )
+    }
+
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Materialize(detail) | Self::Spawn(detail) | Self::PreVerifyError(detail) => {
+                format!("infrastructure: {detail}")
+            }
+            Self::Vacuous => GradeFailure::Vacuous.reason(),
+            Self::AgentNonZero { snippet } => format!("exited non-zero: {}", clip(snippet, 300)),
+            Self::Timeout => format!("exceeded the {LIVE_TASK_TIMEOUT_SECS}s ceiling"),
+            Self::Grading(failure) => failure.reason(),
+        }
+    }
 }
 
 /// Consumption an agent reported for one task. Every field is optional:
@@ -702,9 +1269,8 @@ fn estimate_cost_micros(usage: &LiveUsage) -> Option<u64> {
     let (input_rate, cached_rate, output_rate) = RAPID_ESTIMATE_USD_PER_M;
     let cached = usage.cached_tokens.unwrap_or(0);
     let uncached = input.saturating_sub(cached);
-    let micros = uncached as f64 * input_rate
-        + cached as f64 * cached_rate
-        + output as f64 * output_rate;
+    let micros =
+        uncached as f64 * input_rate + cached as f64 * cached_rate + output as f64 * output_rate;
     Some(micros as u64)
 }
 
@@ -745,171 +1311,11 @@ fn parse_grok_usage(stdout: &str) -> Option<LiveUsage> {
     })
 }
 
-/// Read up to `cap` bytes from a stream (looping — one `read` may return
-/// less than the buffer even with more pending).
-fn read_capped(stream: &mut impl std::io::Read, cap: usize) -> std::io::Result<Vec<u8>> {
-    use std::io::Read as _;
-    let mut buf = Vec::with_capacity(cap.min(64 * 1024));
-    let mut chunk = [0u8; 16 * 1024];
-    while buf.len() < cap {
-        let room = (cap - buf.len()).min(chunk.len());
-        let read = stream.read(&mut chunk[..room])?;
-        if read == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..read]);
-    }
-    Ok(buf)
-}
-
-/// Drive one live agent on one task: materialize the identical repo, run
-/// the agent's argv with the prompt appended, then judge with the task's
-/// verification command (with the anti-vacuity check first). Returns the
-/// usage the agent reported, when it can.
-#[allow(clippy::too_many_arguments)]
-fn run_live_agent(
-    bin: &Path,
-    args: &[String],
-    task: &BenchTask,
-    scratch: &Path,
-    name: &str,
-    grant_shell: bool,
-    usage_file: Option<&Path>,
-) -> (Result<(), String>, LiveUsage) {
-    if let Err(reason) = materialize(scratch, task) {
-        return (Err(reason), LiveUsage::default());
-    }
-    if task.verify_fails_before && run_verify(scratch, &task.verify, 60).unwrap_or(true) {
-        return (
-            Err("vacuous task (verify passes before any change)".to_owned()),
-            LiveUsage::default(),
-        );
-    }
-    use std::io::Read as _;
-    use std::process::{Command, Stdio};
-    let mut argv = args.to_vec();
-    if let Some(path) = usage_file {
-        argv.push("--usage-file".to_owned());
-        argv.push(path.display().to_string());
-    }
-    argv.push(task.prompt.clone());
-    let mut command = Command::new(bin);
-    command
-        .args(&argv)
-        .current_dir(scratch)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if name == "rapid" {
-        // The harness acts as the operator for its own scratch repos:
-        // grant trust (each materialized repo is a fresh root) and run
-        // rapid exec in acceptEdits mode — file edits auto-approved, deny
-        // rules and managed ceilings still enforced. This mirrors what a
-        // real operator does interactively; it grants nothing to the model
-        // that the operator did not. With `grant_shell` (the equal-surface
-        // configuration) the operator also pre-approves shell_exec per
-        // scratch repo, matching the competitor's auto-approved shell.
-        let trust = match Command::new(bin)
-            .arg("trust")
-            .arg("grant")
-            .current_dir(scratch)
-            .status()
-        {
-            Ok(status) => status,
-            Err(err) => return (Err(err.to_string()), LiveUsage::default()),
-        };
-        if !trust.success() {
-            return (
-                Err("trust grant failed in scratch repo".to_owned()),
-                LiveUsage::default(),
-            );
-        }
-        if grant_shell {
-            let shell = match Command::new(bin)
-                .args(["permissions", "allow", "shell_exec"])
-                .current_dir(scratch)
-                .status()
-            {
-                Ok(status) => status,
-                Err(err) => return (Err(err.to_string()), LiveUsage::default()),
-            };
-            if !shell.success() {
-                return (
-                    Err("shell_exec pre-approval failed in scratch repo".to_owned()),
-                    LiveUsage::default(),
-                );
-            }
-        }
-        command.env("RAPIDLM_PERMISSION_MODE", "acceptEdits");
-    }
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            return (
-                Err(format!("{name} could not start: {err}")),
-                LiveUsage::default(),
-            )
-        }
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(LIVE_TASK_TIMEOUT_SECS);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if std::time::Instant::now() > deadline {
-                    let _ = child.kill();
-                    return (
-                        Err(format!(
-                            "{name} exceeded the {LIVE_TASK_TIMEOUT_SECS}s ceiling"
-                        )),
-                        LiveUsage::default(),
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-            Err(err) => {
-                return (
-                    Err(err.to_string()),
-                    LiveUsage::default(),
-                );
-            }
-        }
-    };
-    // The 512 KiB stdout cap exists for the grok JSON contract: its whole
-    // final answer comes back as one JSON object (text + thought + usage).
-    let mut text = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        let capped = read_capped(&mut stdout, 512 * 1024).unwrap_or_default();
-        text.push_str(&String::from_utf8_lossy(&capped));
-    }
-    if let Some(mut stderr) = child.stderr.take() {
-        let mut capped = vec![0u8; 8 * 1024];
-        let read = stderr.read(&mut capped).unwrap_or(0);
-        let err_text = String::from_utf8_lossy(&capped[..read]);
-        if !err_text.trim().is_empty() {
-            text.push_str("\n[stderr] ");
-            text.push_str(err_text.trim());
-        }
-    }
-    if !status.success() {
-        let mut snippet: String = text.chars().take(300).collect();
-        snippet = snippet.replace('\n', " ");
-        let usage = collect_usage(name, usage_file, &text);
-        return (Err(format!("{name} exited non-zero: {snippet}")), usage);
-    }
-    let usage = collect_usage(name, usage_file, &text);
-    if !run_verify(scratch, &task.verify, 120).unwrap_or(false) {
-        return (
-            Err("verification command failed after the live run".to_owned()),
-            usage,
-        );
-    }
-    (Ok(()), usage)
-}
-
 /// Usage harvest after a live run: grok reports in its stdout JSON, rapid
-/// in the `--usage-file` the harness passed. Missing on either side stays
-/// `None` — unknown, never zero.
+/// in the `--usage-file` the harness passed. Called on EVERY exit path —
+/// including timeouts — so partial usage is preserved when the agent
+/// reported it before dying. Missing on either side stays `None` —
+/// unknown, never zero.
 fn collect_usage(name: &str, usage_file: Option<&Path>, stdout: &str) -> LiveUsage {
     if name == "grok" {
         parse_grok_usage(stdout).unwrap_or_default()
@@ -923,9 +1329,351 @@ fn collect_usage(name: &str, usage_file: Option<&Path>, stdout: &str) -> LiveUsa
     }
 }
 
+/// The dedicated health probe: a trivial no-tools turn that proves the
+/// model call works before any real task is attempted. Replaces the old
+/// preflight that ran the first real task and classified failures by
+/// substring — a real task failure could there masquerade as
+/// "model not usable" and skip the whole arm.
+const PROBE_PROMPT: &str = "Health probe: reply with exactly READY and finish. Do not use any tools and do not modify any files.";
+
+/// Probe one READY arm: prepare a scratch (trust + permissions for our own
+/// binary), run the trivial prompt under supervision, and classify the
+/// outcome structurally (spawn error / timeout / non-zero exit).
+fn probe_agent_health(plan: &ArmPlan, scratch_root: &Path, stamp: u128) -> Result<(), InfraError> {
+    let dir = scratch_root.join(format!("health-{}-{stamp:x}", plan.name));
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        return Err(InfraError::Prep {
+            agent: plan.name.clone(),
+            detail: err.to_string(),
+        });
+    }
+    let outcome = (|| {
+        if plan.name == "rapid" {
+            prepare_rapid_scratch(&plan.bin, &dir, false).map_err(|detail| InfraError::Prep {
+                agent: plan.name.clone(),
+                detail,
+            })?;
+        }
+        let mut command = Command::new(&plan.bin);
+        command.args(&plan.args).arg(PROBE_PROMPT).current_dir(&dir);
+        run_supervised(
+            &mut command,
+            None,
+            Duration::from_secs(PROBE_TIMEOUT_SECS),
+            LIVE_OUTPUT_RETAIN_BYTES,
+        )
+        .map_err(|err| InfraError::ProbeFailed {
+            agent: plan.name.clone(),
+            detail: err.to_string(),
+        })
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    match outcome {
+        Ok(out) if out.timed_out => Err(InfraError::ProbeTimeout {
+            agent: plan.name.clone(),
+        }),
+        Ok(out) if !out.success => Err(InfraError::ProbeFailed {
+            agent: plan.name.clone(),
+            detail: clip(&out.stderr, 300),
+        }),
+        Ok(_) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// The harness acts as the operator for its own scratch repos: grant trust
+/// (each materialized repo is a fresh root) and run rapid exec in
+/// acceptEdits mode — file edits auto-approved, deny rules and managed
+/// ceilings still enforced. This mirrors what a real operator does
+/// interactively; it grants nothing to the model that the operator did not.
+/// With `grant_shell` (the equal-surface configuration) the operator also
+/// pre-approves shell_exec per scratch repo, matching a competitor's
+/// auto-approved shell.
+fn prepare_rapid_scratch(bin: &Path, scratch: &Path, grant_shell: bool) -> Result<(), String> {
+    let trust = Command::new(bin)
+        .arg("trust")
+        .arg("grant")
+        .current_dir(scratch)
+        .status()
+        .map_err(|err| err.to_string())?;
+    if !trust.success() {
+        return Err("trust grant failed in scratch repo".to_owned());
+    }
+    if grant_shell {
+        let shell = Command::new(bin)
+            .args(["permissions", "allow", "shell_exec"])
+            .current_dir(scratch)
+            .status()
+            .map_err(|err| err.to_string())?;
+        if !shell.success() {
+            return Err("shell_exec pre-approval failed in scratch repo".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Run the suite live for every planned arm. Arms that cannot run are
+/// recorded as all-skipped with their typed infrastructure reason — every
+/// requested arm appears in the report, always.
+pub fn run_live(
+    tasks: &[BenchTask],
+    scratch_root: &Path,
+    arms: &[ArmPlan],
+    grant_shell: bool,
+) -> Vec<(String, Vec<TaskResult>)> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // Usage files live OUTSIDE the per-task scratch (which is removed after
+    // each task) so a failed task's spend is still recorded.
+    let usage_dir = scratch_root.join("usage");
+    let _ = std::fs::create_dir_all(&usage_dir);
+    let mut per_agent = Vec::new();
+    for plan in arms {
+        if let Err(infra) = &plan.state {
+            per_agent.push((
+                plan.name.clone(),
+                skip_all(tasks, &plan.name, &infra.reason()),
+            ));
+            continue;
+        }
+        // Health probe BEFORE any real task: a typed infrastructure gate.
+        if let Err(infra) = probe_agent_health(plan, scratch_root, stamp) {
+            per_agent.push((
+                plan.name.clone(),
+                skip_all(tasks, &plan.name, &infra.reason()),
+            ));
+            continue;
+        }
+        let mut results = Vec::new();
+        for task in tasks {
+            let started = std::time::Instant::now();
+            let scratch = scratch_root.join(format!("{}-{}-{stamp:x}", plan.name, task.id));
+            let usage_path = usage_dir.join(format!("{}-{}-{stamp:x}.json", plan.name, task.id));
+            let usage_file = if plan.name == "rapid" {
+                Some(usage_path.as_path())
+            } else {
+                None
+            };
+            let (result, usage) = run_live_agent(plan, task, &scratch, grant_shell, usage_file);
+            let _ = std::fs::remove_dir_all(&scratch);
+            let (outcome, reason, failure_kind) = match &result {
+                Ok(()) => ("passed".to_owned(), None, None),
+                Err(failure) => (
+                    if failure.is_harness_skip() {
+                        "skipped"
+                    } else {
+                        "failed"
+                    }
+                    .to_owned(),
+                    Some(failure.reason()),
+                    Some(failure.kind().to_owned()),
+                ),
+            };
+            results.push(TaskResult {
+                id: task.id.clone(),
+                category: task.category.clone(),
+                outcome,
+                reason,
+                failure_kind,
+                wall_ms: started.elapsed().as_millis(),
+                tokens: usage.tokens,
+                cost_usd_micros: usage.cost_usd_micros,
+                cost_estimate_usd_micros: estimate_cost_micros(&usage),
+                input_tokens: usage.input_tokens,
+                cached_tokens: usage.cached_tokens,
+                output_tokens: usage.output_tokens,
+                num_turns: usage.num_turns,
+                agent: Some(plan.name.clone()),
+            });
+        }
+        per_agent.push((plan.name.clone(), results));
+    }
+    per_agent
+}
+
+fn skip_all(tasks: &[BenchTask], agent: &str, reason: &str) -> Vec<TaskResult> {
+    tasks
+        .iter()
+        .map(|task| TaskResult {
+            id: task.id.clone(),
+            category: task.category.clone(),
+            outcome: "skipped".to_owned(),
+            reason: Some(reason.to_owned()),
+            failure_kind: Some("infrastructure".to_owned()),
+            wall_ms: 0,
+            tokens: None,
+            cost_usd_micros: None,
+            cost_estimate_usd_micros: None,
+            input_tokens: None,
+            cached_tokens: None,
+            output_tokens: None,
+            num_turns: None,
+            agent: Some(agent.to_owned()),
+        })
+        .collect()
+}
+
+/// Drive one live agent on one task: materialize the identical repo,
+/// anti-vacuity check, run the agent's argv with the prompt appended under
+/// supervision (concurrent drain, group kill on timeout, partial usage
+/// preserved), then grade the submission with the full pipeline.
+fn run_live_agent(
+    plan: &ArmPlan,
+    task: &BenchTask,
+    scratch: &Path,
+    grant_shell: bool,
+    usage_file: Option<&Path>,
+) -> (Result<(), RunFailure>, LiveUsage) {
+    if let Err(detail) = materialize(scratch, task) {
+        return (Err(RunFailure::Materialize(detail)), LiveUsage::default());
+    }
+    if prechange_check(scratch, task).is_err() {
+        return (Err(RunFailure::Vacuous), LiveUsage::default());
+    }
+    let mut argv = plan.args.clone();
+    if let Some(path) = usage_file {
+        argv.push("--usage-file".to_owned());
+        argv.push(path.display().to_string());
+    }
+    argv.push(task.prompt.clone());
+    let mut command = Command::new(&plan.bin);
+    command.args(&argv).current_dir(scratch);
+    if plan.name == "rapid" {
+        if let Err(detail) = prepare_rapid_scratch(&plan.bin, scratch, grant_shell) {
+            return (Err(RunFailure::Spawn(detail)), LiveUsage::default());
+        }
+        command.env("RAPIDLM_PERMISSION_MODE", "acceptEdits");
+    }
+    let outcome = match run_supervised(
+        &mut command,
+        None,
+        Duration::from_secs(LIVE_TASK_TIMEOUT_SECS),
+        LIVE_OUTPUT_RETAIN_BYTES,
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            return (
+                Err(RunFailure::Spawn(format!(
+                    "{} could not start: {err}",
+                    plan.name
+                ))),
+                LiveUsage::default(),
+            );
+        }
+    };
+    let mut text = outcome.stdout.clone();
+    if !outcome.stderr.trim().is_empty() {
+        text.push_str("\n[stderr] ");
+        text.push_str(outcome.stderr.trim());
+    }
+    // Usage is collected on EVERY path — including timeouts and non-zero
+    // exits — so partial measurements survive failed attempts.
+    let usage = collect_usage(&plan.name, usage_file, &text);
+    if outcome.timed_out {
+        return (Err(RunFailure::Timeout), usage);
+    }
+    if !outcome.success {
+        return (Err(RunFailure::AgentNonZero { snippet: text }), usage);
+    }
+    if let Err(failure) = grade_submission(scratch, task) {
+        return (Err(RunFailure::Grading(failure)), usage);
+    }
+    (Ok(()), usage)
+}
+
 // ---------------------------------------------------------------------------
-// Reporting
+// Accounting
 // ---------------------------------------------------------------------------
+
+/// Per-agent efficiency accounting. The headline rate is TOTAL measured
+/// usage across ALL attempts (passed AND failed) divided by verified
+/// successes — spend includes failed work. Successful-attempt averages are
+/// reported separately. Missing usage is unknown, never zero: coverage and
+/// the lower-bound flag are always exposed, and a rate is only published
+/// when at least one attempt was measured. Verified successes come from the
+/// grading pipeline (`outcome == "passed"`), never from a turn merely
+/// completing.
+fn agent_usage_metrics(results: &[TaskResult], agent: &str) -> serde_json::Value {
+    let attempts: Vec<&TaskResult> = results
+        .iter()
+        .filter(|r| r.agent.as_deref().unwrap_or("runner") == agent)
+        .collect();
+    let successes = attempts.iter().filter(|r| r.outcome == "passed").count();
+    let successful: Vec<&&TaskResult> = attempts.iter().filter(|r| r.outcome == "passed").collect();
+    let mut entry = serde_json::Map::new();
+    entry.insert("attempts".to_owned(), serde_json::json!(attempts.len()));
+    entry.insert(
+        "verified_successes".to_owned(),
+        serde_json::json!(successes),
+    );
+    if successes == 0 {
+        entry.insert(
+            "note".to_owned(),
+            serde_json::json!(
+                "no verified successes; per-success rates are undefined and intentionally absent"
+            ),
+        );
+    }
+    // Tokens: all measured attempts over verified successes.
+    let measured: Vec<u64> = attempts.iter().filter_map(|r| r.tokens).collect();
+    let missing = attempts.len() - measured.len();
+    if !measured.is_empty() && successes > 0 {
+        let total: u64 = measured.iter().sum();
+        let successful_measured: Vec<u64> = successful.iter().filter_map(|r| r.tokens).collect();
+        let mut block = serde_json::json!({
+            "tokens_all_measured_attempts_per_success": total / successes as u64,
+            "attempts_measured": measured.len(),
+            "attempts_missing_usage": missing,
+            "complete_coverage": missing == 0,
+            // With missing measurements the published rate can only grow,
+            // so it is a LOWER bound on true spend per success.
+            "lower_bound": missing > 0,
+        });
+        if !successful_measured.is_empty() {
+            block["successful_attempts_only_average"] = serde_json::json!(
+                successful_measured.iter().sum::<u64>() / successful_measured.len() as u64
+            );
+            block["successful_attempts_measured"] = serde_json::json!(successful_measured.len());
+        }
+        entry.insert("tokens_per_verified_success".to_owned(), block);
+    }
+    // Measured cost: same semantics, kept strictly separate from the
+    // published-rate estimate below.
+    let cost_measured: Vec<u64> = attempts.iter().filter_map(|r| r.cost_usd_micros).collect();
+    if !cost_measured.is_empty() && successes > 0 {
+        entry.insert(
+            "cost_per_verified_success".to_owned(),
+            serde_json::json!({
+                "usd_micros_all_measured_attempts_per_success":
+                    cost_measured.iter().sum::<u64>() / successes as u64,
+                "attempts_measured": cost_measured.len(),
+                "attempts_missing_usage": attempts.len() - cost_measured.len(),
+                "lower_bound": cost_measured.len() < attempts.len(),
+            }),
+        );
+    }
+    // Estimated cost: measured token split priced at published rates — an
+    // estimate, never merged with measured charges.
+    let est_measured: Vec<u64> = attempts
+        .iter()
+        .filter_map(|r| r.cost_estimate_usd_micros)
+        .collect();
+    if !est_measured.is_empty() && successes > 0 {
+        entry.insert(
+            "cost_estimate_per_verified_success".to_owned(),
+            serde_json::json!({
+                "usd_micros_all_measured_attempts_per_success":
+                    est_measured.iter().sum::<u64>() / successes as u64,
+                "attempts_measured": est_measured.len(),
+                "basis": "measured token split priced at the provider's published rates — an estimate, not a measurement",
+                "lower_bound": est_measured.len() < attempts.len(),
+            }),
+        );
+    }
+    serde_json::Value::Object(entry)
+}
 
 /// Summary counts + the JSON report body. Mechanical and live reports are
 /// written to separate files and never summed together.
@@ -933,12 +1681,6 @@ pub fn summarize(mode: &str, results: &[TaskResult]) -> (serde_json::Value, Stri
     let passed = results.iter().filter(|r| r.outcome == "passed").count();
     let failed = results.iter().filter(|r| r.outcome == "failed").count();
     let skipped = results.iter().filter(|r| r.outcome == "skipped").count();
-    // Tokens and cost per VERIFIED success (goal §7), PER AGENT: totals over
-    // that agent's passed tasks, divided by the pass count. Cost divides
-    // only tasks whose cost the provider actually reported — the divisor is
-    // the number of those tasks, reported beside the rate so partial
-    // coverage cannot masquerade as a full comparison. Cross-agent totals
-    // are never summed: different agents' spend is not one budget.
     let mut agent_names: Vec<String> = Vec::new();
     for result in results {
         let name = result.agent.clone().unwrap_or_else(|| "runner".to_owned());
@@ -947,84 +1689,59 @@ pub fn summarize(mode: &str, results: &[TaskResult]) -> (serde_json::Value, Stri
         }
     }
     let mut agent_metrics = serde_json::Map::new();
+    let mut outcome_metrics = serde_json::Map::new();
     let mut metric_lines: Vec<String> = Vec::new();
     for agent in &agent_names {
-        let passed_tasks: Vec<&TaskResult> = results
-            .iter()
-            .filter(|r| r.outcome == "passed")
-            .filter(|r| r.agent.as_deref().unwrap_or("runner") == agent)
-            .collect();
-        if passed_tasks.is_empty() {
-            continue;
-        }
-        let tokens_reported = passed_tasks.iter().filter(|r| r.tokens.is_some()).count();
-        let tokens_total: u64 = passed_tasks.iter().filter_map(|r| r.tokens).sum();
-        let cost_reported = passed_tasks
-            .iter()
-            .filter(|r| r.cost_usd_micros.is_some())
-            .count();
-        let cost_total: u64 = passed_tasks.iter().filter_map(|r| r.cost_usd_micros).sum();
-        let est_reported = passed_tasks
-            .iter()
-            .filter(|r| r.cost_estimate_usd_micros.is_some())
-            .count();
-        let est_total: u64 = passed_tasks
-            .iter()
-            .filter_map(|r| r.cost_estimate_usd_micros)
-            .sum();
-        let mut entry = serde_json::Map::new();
-        if tokens_reported > 0 {
-            let per_success = tokens_total / passed_tasks.len() as u64;
-            entry.insert(
-                "tokens_per_verified_success".to_owned(),
-                serde_json::json!({
-                    "tokens": per_success,
-                    "over_passed_tasks": passed_tasks.len(),
-                    "usage_reported_for": tokens_reported,
-                }),
-            );
+        let metrics = agent_usage_metrics(results, agent);
+        if let Some(tokens) = metrics.get("tokens_per_verified_success") {
             metric_lines.push(format!(
-                "  {agent} tokens/verified-success: {per_success} (usage reported for \
-                 {tokens_reported}/{} passed)",
-                passed_tasks.len()
+                "  {agent} tokens/verified-success: {} (all measured attempts / {} successes; \
+                 coverage {}/{}, lower_bound={})",
+                tokens["tokens_all_measured_attempts_per_success"]
+                    .as_u64()
+                    .unwrap_or(0),
+                metrics["verified_successes"].as_u64().unwrap_or(0),
+                tokens["attempts_measured"].as_u64().unwrap_or(0),
+                metrics["attempts"].as_u64().unwrap_or(0),
+                tokens["lower_bound"].as_bool().unwrap_or(false),
             ));
         }
-        if cost_reported > 0 {
-            let per_success = cost_total / cost_reported as u64;
-            entry.insert(
-                "cost_per_verified_success".to_owned(),
-                serde_json::json!({
-                    "usd_micros": per_success,
-                    "over_tasks_with_reported_cost": cost_reported,
-                }),
-            );
+        if let Some(cost) = metrics.get("cost_per_verified_success") {
             metric_lines.push(format!(
-                "  {agent} cost/verified-success: ${:.4} (cost reported for {cost_reported} passed)",
-                per_success as f64 / 1_000_000.0
+                "  {agent} cost/verified-success: ${:.4} (measured, all attempts / successes)",
+                cost["usd_micros_all_measured_attempts_per_success"]
+                    .as_u64()
+                    .unwrap_or(0) as f64
+                    / 1_000_000.0
             ));
         }
-        if est_reported > 0 {
-            let per_success = est_total / est_reported as u64;
-            entry.insert(
-                "cost_estimate_per_verified_success".to_owned(),
-                serde_json::json!({
-                    "usd_micros": per_success,
-                    "over_tasks_with_reported_split": est_reported,
-                    "basis": "measured token split priced at the provider's published rates — an estimate, not a measurement",
-                }),
-            );
+        if let Some(est) = metrics.get("cost_estimate_per_verified_success") {
             metric_lines.push(format!(
-                "  {agent} cost-estimate/verified-success: ${:.4} (published-rate estimate over {est_reported} passed)",
-                per_success as f64 / 1_000_000.0
+                "  {agent} cost-estimate/verified-success: ${:.4} (published-rate estimate)",
+                est["usd_micros_all_measured_attempts_per_success"]
+                    .as_u64()
+                    .unwrap_or(0) as f64
+                    / 1_000_000.0
             ));
         }
-        if !entry.is_empty() {
-            agent_metrics.insert(agent.clone(), serde_json::Value::Object(entry));
-        }
+        let outcomes = results
+            .iter()
+            .filter(|r| r.agent.as_deref().unwrap_or("runner") == agent);
+        outcome_metrics.insert(
+            agent.clone(),
+            serde_json::json!({
+                "total": outcomes.clone().count(),
+                "passed": outcomes.clone().filter(|r| r.outcome == "passed").count(),
+                "failed": outcomes.clone().filter(|r| r.outcome == "failed").count(),
+                "skipped": outcomes.filter(|r| r.outcome == "skipped").count(),
+            }),
+        );
+        agent_metrics.insert(agent.clone(), metrics);
     }
     let mut report = serde_json::json!({
         "mode": mode,
         "kind": if mode == "offline" { "mechanical validation (scripted gold trajectories; says nothing about model quality)" } else { "live model quality (agents given prompts only; the verification command is the judge)" },
+        "grading_version": GRADER_VERSION,
         "tasks": results.len(),
         "passed": passed,
         "failed": failed,
@@ -1033,6 +1750,9 @@ pub fn summarize(mode: &str, results: &[TaskResult]) -> (serde_json::Value, Stri
     });
     if !agent_metrics.is_empty() {
         report["per_agent_usage"] = serde_json::Value::Object(agent_metrics);
+    }
+    if !outcome_metrics.is_empty() {
+        report["per_agent_outcomes"] = serde_json::Value::Object(outcome_metrics);
     }
     let mut lines = vec![format!(
         "{mode}: {}/{} passed, {failed} failed, {skipped} skipped",
@@ -1064,6 +1784,119 @@ pub fn results_dir(root: &Path) -> PathBuf {
     root.join("eval").join("results")
 }
 
+/// The gate: exit 0 only when every task of every requested arm passed.
+/// Empty result sets, any failure, and any skip (missing competitor, failed
+/// health probe, vacuous task) all fail the gate — an incomplete comparison
+/// can never pass.
+pub fn eval_exit_code(results: &[TaskResult]) -> i32 {
+    if results.is_empty() {
+        return 1;
+    }
+    if results.iter().any(|result| result.outcome != "passed") {
+        1
+    } else {
+        0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Provenance
+// ---------------------------------------------------------------------------
+
+/// Everything a retained result needs in order to be interpreted and
+/// reproduced later: repository state, runner + grading versions, suite
+/// digest, model identity, permissions, budgets, environment, and the exact
+/// arm plan with observed binary versions.
+pub fn build_provenance(
+    mode: &str,
+    suite_dir: &Path,
+    tasks: &[BenchTask],
+    arms: &[ArmPlan],
+    grant_shell: bool,
+) -> serde_json::Value {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let commit = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .map(|out| out.status.success() && !out.stdout.is_empty());
+    let suite_hash = suite_digest(suite_dir).unwrap_or_else(|_| "unknown".to_owned());
+    let model = match crate::user_config::select_from_process_env() {
+        Ok(crate::user_config::ModelSelection::Configured { active, .. }) => {
+            serde_json::json!(active.entry.model)
+        }
+        Ok(crate::user_config::ModelSelection::Unconfigured { .. }) => {
+            serde_json::json!("unconfigured")
+        }
+        Err(err) => serde_json::json!(format!("unresolvable: {err}")),
+    };
+    let model_env = std::env::var("RAPIDLM_MODEL").ok();
+    serde_json::json!({
+        "timestamp_unix_secs": timestamp,
+        "mode": mode,
+        "repository": {
+            "commit": commit,
+            "dirty": dirty,
+        },
+        "runner": {
+            "name": "rapid",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "grading": {
+            "version": GRADER_VERSION,
+            "vacuity_timeout_secs": 60,
+            "verify_timeout_secs": 120,
+            "mutation_timeout_secs": 120,
+        },
+        "suite": {
+            "dir": suite_dir.display().to_string(),
+            "tasks": tasks.len(),
+            "hash_sha256": suite_hash,
+            "task_ids": tasks.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+        },
+        "model": {
+            "rapid_active_model": model,
+            "rapid_model_env_override": model_env,
+        },
+        "permissions": {
+            "rapid_permission_mode": "acceptEdits",
+            "grant_shell": grant_shell,
+            "trust_granted_per_scratch": true,
+        },
+        "budgets": {
+            "live_task_timeout_secs": LIVE_TASK_TIMEOUT_SECS,
+            "probe_timeout_secs": PROBE_TIMEOUT_SECS,
+            "max_tasks": MAX_TASKS,
+            "max_file_bytes": MAX_FILE_BYTES,
+        },
+        "environment": {
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "family": std::env::consts::FAMILY,
+        },
+        "arms": arms
+            .iter()
+            .map(|arm| serde_json::json!({
+                "name": arm.name,
+                "pinned_version": arm.pinned_version,
+                "observed_version": arm.observed_version,
+                "runnable": arm.state.is_ok(),
+                "skip_reason": arm.state.as_ref().err().map(|err| err.reason()),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -1077,16 +1910,23 @@ Run the reproducible coding benchmark.
               the task's verification command is the only judge. Deterministic;
               says nothing about model quality.
   --live      model quality: real agent CLIs run on identical scratch repos
-              with the same prompts and the same verification commands.
-              Agents without a pinned, present binary are recorded as skipped;
-              no comparison is claimed without actual runs on both sides.
+              with the same prompts and the same grading pipeline. A health
+              probe runs first; arms that cannot run (binary missing, version
+              mismatch, probe failure) are recorded as skipped with a typed
+              reason. Every requested arm appears in the report.
   --grant-shell  (live, rapid arm only) pre-approve shell_exec per scratch
               repo — the equal-tool-surface configuration, matching a
               competitor that auto-approves shell. Without it rapid runs
               acceptEdits (shell denied) and the report says so.
 
-Results are written to eval/results/<mode>-<stamp>.json; exit 0 iff every
-non-skipped task passed.
+Grading (version 2) runs outside the agent-editable workspace: protected-file
+integrity, the verification command, and mutation checks (a test-authoring
+submission must detect deliberately broken implementations).
+
+Results are written to eval/results/<mode>-<stamp>.json with full provenance
+(repository commit, suite hash, model, permissions, budgets, arm versions).
+Exit code: 0 only if EVERY task of EVERY requested arm passed. Skips fail
+the gate — an empty, all-skipped, or incomplete comparison never passes.
 ";
 
 /// `rapid eval`.
@@ -1117,28 +1957,29 @@ pub fn run_eval(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandErr
     let tasks = load_suite(&suite).map_err(|err| {
         crate::p9_commands::P9CommandError::Agent(format!("suite load failed: {err}"))
     })?;
-    let Some((root, trusted)) = crate::interactive::workflow_workspace_root() else {
+    let Some((_root, trusted)) = crate::interactive::workflow_workspace_root() else {
         eprintln!("rapid eval: no project workspace resolved");
         return Err(crate::p9_commands::P9CommandError::Usage);
     };
-    let _ = &root;
 
     let mode = if offline { "offline" } else { "live" };
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let grant_shell = args.iter().any(|arg| arg == "--grant-shell");
+    let arms = plan_arms(&std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rapid")));
+    let provenance = build_provenance(mode, &suite, &tasks, &arms, grant_shell);
     let results = if offline {
         run_offline(&tasks, &scratch, trusted)
     } else {
-        let grant_shell = args.iter().any(|arg| arg == "--grant-shell");
-        let self_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rapid"));
-        run_live(&tasks, &scratch, &self_exe, trusted, grant_shell)
+        run_live(&tasks, &scratch, &arms, grant_shell)
             .into_iter()
             .flat_map(|(_agent, results)| results)
             .collect::<Vec<_>>()
     };
-    let (report, summary) = summarize(mode, &results);
+    let (mut report, summary) = summarize(mode, &results);
+    report["provenance"] = provenance;
     let results_dir = results_dir(&std::env::current_dir().unwrap_or_default());
     let _ = std::fs::create_dir_all(&results_dir);
     let results_path = results_dir.join(format!("{mode}-{stamp}.json"));
@@ -1149,20 +1990,26 @@ pub fn run_eval(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandErr
     if written {
         println!("results: {}", results_path.display());
     }
-    let any_failed = results.iter().any(|result| result.outcome == "failed");
-    Ok(if any_failed { 1 } else { 0 })
+    Ok(eval_exit_code(&results))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn task(id: &str, agent: Option<&str>, outcome: &str, tokens: Option<u64>, cost: Option<u64>) -> TaskResult {
+    fn task(
+        id: &str,
+        agent: Option<&str>,
+        outcome: &str,
+        tokens: Option<u64>,
+        cost: Option<u64>,
+    ) -> TaskResult {
         TaskResult {
             id: id.to_owned(),
             category: "bugfix".to_owned(),
             outcome: outcome.to_owned(),
             reason: None,
+            failure_kind: None,
             wall_ms: 1,
             tokens,
             cost_usd_micros: cost,
@@ -1216,70 +2063,582 @@ mod tests {
         // = 800×2 + 3200×0.5 + 321×6 micros = 1600 + 1600 + 1926 = 5126.
         assert_eq!(estimate_cost_micros(&usage), Some(5126));
         // No split reported: no estimate rather than a fabricated one.
-        let bare = parse_rapid_usage_file(r#"{"tokens":99,"cost_usd_micros":null}"#).expect("parses");
+        let bare =
+            parse_rapid_usage_file(r#"{"tokens":99,"cost_usd_micros":null}"#).expect("parses");
         assert_eq!(estimate_cost_micros(&bare), None);
     }
 
+    // -- accounting ---------------------------------------------------------
+
     #[test]
-    fn summarize_reports_usage_per_agent_and_never_across_agents() {
+    fn accounting_counts_failed_attempts_in_the_spend_denominator_is_successes() {
+        // rapid: 2 passed (1000 + 3000 tokens), 1 failed (999_999), 1
+        // timeout with NO usage. Total measured = 1_003_999 over 2
+        // successes; successful-only average = 2000. Missing usage = 1,
+        // lower_bound = true.
         let results = vec![
             task("a-1", Some("rapid"), "passed", Some(1000), None),
             task("a-2", Some("rapid"), "passed", Some(3000), None),
             task("a-3", Some("rapid"), "failed", Some(999_999), None),
-            task("g-1", Some("grok"), "passed", Some(500), Some(1000)),
-            task("g-2", Some("grok"), "passed", Some(1500), Some(3000)),
-            task("g-3", Some("grok"), "failed", Some(777), Some(999)),
         ];
+        let mut timed_out = task("a-4", Some("rapid"), "failed", None, None);
+        timed_out.failure_kind = Some("timeout".to_owned());
+        let results = [results, vec![timed_out]].concat();
         let (report, lines) = summarize("live", &results);
-        let per_agent = report["per_agent_usage"].as_object().expect("per-agent block");
-        // rapid: usage only, (1000+3000)/2 = 2000 tokens per success; no
-        // cost entry (provider reported none) and the failed task's spend
-        // never leaks into the rate.
-        let rapid = &per_agent["rapid"];
+        let per_agent = report["per_agent_usage"]
+            .as_object()
+            .expect("per-agent block");
+        let tokens = &per_agent["rapid"]["tokens_per_verified_success"];
         assert_eq!(
-            rapid["tokens_per_verified_success"]["tokens"].as_u64(),
+            tokens["tokens_all_measured_attempts_per_success"].as_u64(),
+            Some(501_999),
+            "failed attempts count toward spend"
+        );
+        assert_eq!(tokens["attempts_measured"].as_u64(), Some(3));
+        assert_eq!(tokens["attempts_missing_usage"].as_u64(), Some(1));
+        assert_eq!(tokens["complete_coverage"].as_bool(), Some(false));
+        assert_eq!(tokens["lower_bound"].as_bool(), Some(true));
+        assert_eq!(
+            tokens["successful_attempts_only_average"].as_u64(),
             Some(2000)
         );
-        assert!(rapid.get("cost_per_verified_success").is_none());
-        // grok: (500+1500)/2 = 1000 tokens; (1000+3000)/2 = 2000 micros.
-        let grok = &per_agent["grok"];
-        assert_eq!(grok["tokens_per_verified_success"]["tokens"].as_u64(), Some(1000));
-        assert_eq!(
-            grok["cost_per_verified_success"]["usd_micros"].as_u64(),
-            Some(2000)
-        );
-        assert_eq!(
-            grok["cost_per_verified_success"]["over_tasks_with_reported_cost"].as_u64(),
-            Some(2)
-        );
-        // The human summary names each metric line with its agent.
-        assert!(lines.contains("rapid tokens/verified-success: 2000"));
-        assert!(lines.contains("grok cost/verified-success: $0.0020"));
-        // Failure lines carry the agent so the report is attributable.
-        assert!(lines.contains("a-3 [bugfix] (rapid) failed"));
+        assert!(lines.contains("lower_bound=true"));
     }
 
     #[test]
-    fn summarize_without_usage_reports_no_metrics() {
-        let results = vec![task("x-1", None, "passed", None, None)];
-        let (report, lines) = summarize("offline", &results);
-        assert!(report.get("per_agent_usage").is_none());
-        assert_eq!(lines.lines().count(), 1, "only the headline, no metric lines");
+    fn accounting_with_zero_successes_publishes_no_rate() {
+        let results = vec![
+            task("a-1", Some("rapid"), "failed", Some(1000), None),
+            task("a-2", Some("rapid"), "failed", Some(2000), None),
+        ];
+        let (report, _) = summarize("live", &results);
+        let rapid = &report["per_agent_usage"]["rapid"];
+        assert_eq!(rapid["verified_successes"].as_u64(), Some(0));
+        assert!(
+            rapid.get("tokens_per_verified_success").is_none(),
+            "a rate over zero successes would be a lie"
+        );
+        assert!(rapid["note"].as_str().unwrap().contains("undefined"));
     }
 
     #[test]
-    fn task_stderr_mentioning_skip_never_downgrades_a_failure() {
-        // Found in the live equal-surface window: a task's stderr contained
-        // "hits beyond offset skipped: 0" and the substring heuristic
-        // recorded a real non-zero exit as `skipped`. Only harness-produced
-        // reasons classify as skips now.
-        let harness_skip = |reason: &str| {
-            reason.starts_with("model not usable") || reason.starts_with("vacuous task")
+    fn accounting_with_no_measurements_reports_unknown_not_zero() {
+        let results = vec![
+            task("a-1", Some("rapid"), "passed", None, None),
+            task("a-2", Some("rapid"), "failed", None, None),
+        ];
+        let (report, _) = summarize("live", &results);
+        let rapid = &report["per_agent_usage"]["rapid"];
+        assert_eq!(rapid["verified_successes"].as_u64(), Some(1));
+        assert!(
+            rapid.get("tokens_per_verified_success").is_none(),
+            "unknown is not zero"
+        );
+    }
+
+    #[test]
+    fn accounting_keeps_measured_cost_and_estimate_separate_and_includes_skipped_arms() {
+        let mut passed = task("g-1", Some("grok"), "passed", Some(500), Some(1000));
+        passed.cost_estimate_usd_micros = Some(700);
+        let mut failed = task("g-2", Some("grok"), "failed", Some(1500), Some(3000));
+        failed.cost_estimate_usd_micros = Some(2100);
+        let skipped = {
+            let mut t = task("k-1", Some("kimi"), "skipped", None, None);
+            t.failure_kind = Some("infrastructure".to_owned());
+            t.reason = Some("infrastructure: competitor kimi not found on PATH".to_owned());
+            t
         };
-        assert!(harness_skip("model not usable: no credentials"));
-        assert!(harness_skip("vacuous task (verify passes before any change)"));
-        assert!(!harness_skip(
-            "rapid exited non-zero: [stderr] hits beyond offset skipped: 0"
+        let results = vec![passed, failed, skipped];
+        let (report, _) = summarize("live", &results);
+        let grok = &report["per_agent_usage"]["grok"];
+        // Measured cost: (1000 + 3000) / 1 success = 4000 — the failed
+        // attempt's spend is included.
+        assert_eq!(
+            grok["cost_per_verified_success"]["usd_micros_all_measured_attempts_per_success"]
+                .as_u64(),
+            Some(4000)
+        );
+        // Estimate kept in its own block, never summed with measured.
+        assert_eq!(
+            grok["cost_estimate_per_verified_success"]["usd_micros_all_measured_attempts_per_success"]
+                .as_u64(),
+            Some(2800)
+        );
+        // The requested-but-absent arm is IN the report.
+        let outcomes = &report["per_agent_outcomes"];
+        assert_eq!(outcomes["kimi"]["skipped"].as_u64(), Some(1));
+        assert_eq!(outcomes["kimi"]["total"].as_u64(), Some(1));
+    }
+
+    // -- gate ---------------------------------------------------------------
+
+    #[test]
+    fn exit_gate_fails_empty_failed_or_skipped_runs() {
+        assert_eq!(eval_exit_code(&[]), 1, "empty results cannot pass");
+        assert_eq!(eval_exit_code(&[task("a", None, "passed", None, None)]), 0);
+        assert_eq!(eval_exit_code(&[task("a", None, "failed", None, None)]), 1);
+        let mut skipped = task("a", None, "skipped", None, None);
+        skipped.failure_kind = Some("infrastructure".to_owned());
+        assert_eq!(eval_exit_code(&[skipped]), 1, "all-skipped cannot pass");
+        assert_eq!(
+            eval_exit_code(&[
+                task("a", None, "passed", None, None),
+                task("b", None, "skipped", None, None)
+            ]),
+            1,
+            "an incomplete comparison cannot pass"
+        );
+    }
+
+    // -- typed classification ----------------------------------------------
+
+    #[test]
+    fn timeouts_and_agent_failures_are_failures_never_skips() {
+        assert!(!RunFailure::Timeout.is_harness_skip());
+        assert_eq!(RunFailure::Timeout.kind(), "timeout");
+        let nonzero = RunFailure::AgentNonZero {
+            snippet: "[stderr] hits beyond offset skipped: 0".to_owned(),
+        };
+        assert!(
+            !nonzero.is_harness_skip(),
+            "stderr text never reclassifies a failure"
+        );
+        assert_eq!(nonzero.kind(), "agent_non_zero");
+        assert!(RunFailure::Vacuous.is_harness_skip());
+        assert!(RunFailure::Materialize("disk full".into()).is_harness_skip());
+        assert!(RunFailure::PreVerifyError("python3 missing".into()).is_harness_skip());
+    }
+
+    // -- supervised subprocess execution ------------------------------------
+
+    fn noisy_python(seconds: u64, megabytes: u64) -> Command {
+        let mut command = Command::new("python3");
+        command.arg("-c").arg(format!(
+            r#"import sys, time
+for i in range({megabytes} * 64):
+    sys.stdout.write("x" * 16384)
+    sys.stderr.write("y" * 16384)
+    if i % 8 == 0:
+        sys.stdout.flush(); sys.stderr.flush()
+sys.stdout.flush(); sys.stderr.flush()
+print("DONE-STDOUT")
+print("DONE-STDERR", file=sys.stderr)
+time.sleep({seconds})
+"#
         ));
+        command
+    }
+
+    #[test]
+    fn verbose_output_cannot_manufacture_a_timeout() {
+        // 4 MiB to EACH stream. Under the old poll-then-read runner this
+        // blocks at the 64 KiB pipe buffer and reports an artificial
+        // timeout; with concurrent draining it completes.
+        let started = std::time::Instant::now();
+        let out = run_supervised(
+            &mut noisy_python(0, 4),
+            None,
+            Duration::from_secs(60),
+            1024 * 1024,
+        )
+        .expect("supervised run");
+        assert!(out.success, "verbose child completed");
+        assert!(!out.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(55));
+        assert!(out.stdout.contains("DONE-STDOUT"));
+        assert!(out.stderr.contains("DONE-STDERR"));
+    }
+
+    #[test]
+    fn retained_output_is_bounded_and_keeps_the_tail() {
+        let mut command = Command::new("python3");
+        command.arg("-c").arg(
+            r#"import sys
+print("START-MARKER")
+for i in range(64):
+    sys.stdout.write("x" * 16384)
+sys.stdout.write("END-MARKER")
+sys.stdout.flush()
+"#,
+        );
+        let out = run_supervised(&mut command, None, Duration::from_secs(60), 8 * 1024)
+            .expect("supervised run");
+        assert!(out.success);
+        assert_eq!(
+            out.stdout_total,
+            64 * 16384 + "START-MARKER\n".len() as u64 + "END-MARKER".len() as u64
+        );
+        assert!(
+            out.stdout_dropped > 0,
+            "excess bytes were consumed, not kept"
+        );
+        assert!(out.stdout.len() <= 8 * 1024, "retained output is bounded");
+        assert!(
+            out.stdout.contains("END-MARKER"),
+            "the tail is what is kept"
+        );
+        assert!(!out.stdout.contains("START-MARKER"));
+    }
+
+    #[test]
+    fn timeout_kills_the_whole_process_group() {
+        // The child spawns a grandchild that sleeps for a long time; both
+        // carry a unique marker. The supervised run times out at 2s; then
+        // NEITHER process may survive.
+        let unique = format!("rapidlm-eval-group-{}", std::process::id());
+        let mut command = Command::new("python3");
+        command.arg("-c").arg(format!(
+            r#"import subprocess
+subprocess.run(["python3", "-c", "import time; time.sleep(300)  # {unique}-grandchild"])
+print("{unique}-child-after")"#
+        ));
+        let started = std::time::Instant::now();
+        let out = run_supervised(&mut command, None, Duration::from_secs(2), 4096)
+            .expect("supervised run");
+        assert!(out.timed_out, "the run was killed at the ceiling");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "kill returned promptly"
+        );
+        assert!(!out.success);
+        // Both markers must be gone. Retry briefly: SIGKILL delivery to the
+        // group is immediate, but reap latency can leave zombies for a few
+        // hundred ms.
+        let mut survived = String::new();
+        for _ in 0..20 {
+            let pgrep = Command::new("sh")
+                .arg("-c")
+                .arg(format!("pgrep -f '{unique}' || true"))
+                .output()
+                .expect("pgrep");
+            survived = String::from_utf8_lossy(&pgrep.stdout).into_owned();
+            if survived.trim().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            survived.trim().is_empty(),
+            "process-group members survived the timeout: {survived}"
+        );
+    }
+
+    #[test]
+    fn stdin_is_delivered_without_blocking_the_runner() {
+        let mut command = Command::new("cat");
+        let out = run_supervised(
+            &mut command,
+            Some(b"hello stdin"),
+            Duration::from_secs(10),
+            4096,
+        )
+        .expect("supervised run");
+        assert!(out.success);
+        assert_eq!(out.stdout, "hello stdin");
+    }
+
+    // -- grading pipeline (negative + positive controls) ---------------------
+
+    /// Materialize `task` in a fresh temp dir and return its path.
+    fn scratch_for(task: &BenchTask, tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-grading-{}-{tag}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        materialize(&dir, task).expect("materialize");
+        dir
+    }
+
+    fn tests_like_task() -> BenchTask {
+        // Mirrors the shape of a real `tests` task: agent writes
+        // test_calc.py; the implementation is protected; one mutant per
+        // requested function.
+        BenchTask {
+            id: "tests-ctl".to_owned(),
+            category: "tests".to_owned(),
+            prompt: "write tests".to_owned(),
+            setup: vec![(
+                "calc.py".to_owned(),
+                "def add(a, b):\n    return a + b\n\ndef neg(x):\n    return -x\n".to_owned(),
+            )],
+            gold: vec![(String::new(), String::new())],
+            verify: "python3 -B test_calc.py".to_owned(),
+            verify_fails_before: true,
+            protected: vec!["calc.py".to_owned()],
+            mutants: vec![
+                (
+                    "calc.py".to_owned(),
+                    "def add(a, b):\n    return a - b\n\ndef neg(x):\n    return -x\n".to_owned(),
+                ),
+                (
+                    "calc.py".to_owned(),
+                    "def add(a, b):\n    return a + b\n\ndef neg(x):\n    return x\n".to_owned(),
+                ),
+            ],
+        }
+    }
+
+    fn write_scratch(dir: &Path, name: &str, contents: &str) {
+        std::fs::write(dir.join(name), contents).expect("write scratch file");
+    }
+
+    #[test]
+    fn grading_positive_control_gold_submission_passes() {
+        let task = tests_like_task();
+        let dir = scratch_for(&task, "gold");
+        // The anti-vacuity gate runs BEFORE any submission exists: the bare
+        // module must fail the judge.
+        assert_eq!(prechange_check(&dir, &task), Ok(()));
+        // Simulate the gold submission: meaningful tests covering BOTH
+        // requested functions, each able to kill its mutant.
+        write_scratch(
+            &dir,
+            "test_calc.py",
+            "from calc import add, neg\nassert add(4, 2) == 6\nassert add(-1, 0) == -1\nassert neg(5) == -5\nassert neg(-2) == 2\nprint('OK')\n",
+        );
+        assert_eq!(grade_submission(&dir, &task), Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_test_file_is_rejected_by_mutation_check() {
+        let task = tests_like_task();
+        let dir = scratch_for(&task, "empty");
+        // The demonstrated grading defect: `python3 -B test_calc.py` with an
+        // EMPTY test file exits 0. The mutation check must reject it.
+        write_scratch(&dir, "test_calc.py", "");
+        assert_eq!(
+            grade_submission(&dir, &task),
+            Err(GradeFailure::MutationSurvived {
+                file: "calc.py".to_owned()
+            }),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn weakened_assertions_are_rejected() {
+        let task = tests_like_task();
+        let dir = scratch_for(&task, "weakened");
+        // Tests `add` but says nothing about `neg`: the neg mutant survives.
+        write_scratch(
+            &dir,
+            "test_calc.py",
+            "from calc import add\nassert add(4, 2) == 6\nassert add(-1, 0) == -1\nprint('OK')\n",
+        );
+        assert_eq!(
+            grade_submission(&dir, &task),
+            Err(GradeFailure::MutationSurvived {
+                file: "calc.py".to_owned()
+            }),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hard_coded_assertion_free_output_is_rejected() {
+        let task = tests_like_task();
+        let dir = scratch_for(&task, "hardcoded");
+        // A "test" that only prints: every mutant survives it.
+        write_scratch(&dir, "test_calc.py", "print('OK')\n");
+        assert_eq!(
+            grade_submission(&dir, &task),
+            Err(GradeFailure::MutationSurvived {
+                file: "calc.py".to_owned()
+            }),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tampering_with_a_protected_test_file_is_rejected() {
+        // Bugfix-shaped task: the test file is the judge AND is protected.
+        let task = BenchTask {
+            id: "bugfix-ctl".to_owned(),
+            category: "bugfix".to_owned(),
+            prompt: "fix add".to_owned(),
+            setup: vec![
+                (
+                    "calc.py".to_owned(),
+                    "def add(a, b):\n    return a - b\n".to_owned(),
+                ),
+                (
+                    "test_calc.py".to_owned(),
+                    "from calc import add\nassert add(4, 2) == 6\nprint('OK')\n".to_owned(),
+                ),
+            ],
+            gold: vec![(
+                "calc.py".to_owned(),
+                "def add(a, b):\n    return a + b\n".to_owned(),
+            )],
+            verify: "python3 -B test_calc.py".to_owned(),
+            verify_fails_before: true,
+            protected: vec!["test_calc.py".to_owned()],
+            mutants: vec![],
+        };
+        let dir = scratch_for(&task, "tamper");
+        assert_eq!(
+            prechange_check(&dir, &task),
+            Ok(()),
+            "the task is not vacuous"
+        );
+        // The agent "solves" the task by weakening the test instead.
+        write_scratch(&dir, "test_calc.py", "print('OK')\n");
+        assert_eq!(
+            grade_submission(&dir, &task),
+            Err(GradeFailure::Integrity {
+                path: "test_calc.py".to_owned()
+            }),
+        );
+        // Deleting the judge is the same violation.
+        std::fs::remove_file(dir.join("test_calc.py")).expect("remove");
+        assert_eq!(
+            grade_submission(&dir, &task),
+            Err(GradeFailure::Integrity {
+                path: "test_calc.py".to_owned()
+            }),
+        );
+        // The honest fix passes.
+        write_scratch(
+            &dir,
+            "test_calc.py",
+            "from calc import add\nassert add(4, 2) == 6\nprint('OK')\n",
+        );
+        write_scratch(&dir, "calc.py", "def add(a, b):\n    return a + b\n");
+        assert_eq!(grade_submission(&dir, &task), Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hard_coding_a_protected_runner_is_rejected() {
+        // Recovery-shaped task: run.sh is the harness file and is protected;
+        // replacing the pipeline with `echo PIPELINE-OK` is tampering.
+        let task = BenchTask {
+            id: "recovery-ctl".to_owned(),
+            category: "recovery".to_owned(),
+            prompt: "repair pipeline".to_owned(),
+            setup: vec![
+                ("pipeline.py".to_owned(), "raise SystemExit(1)\n".to_owned()),
+                ("run.sh".to_owned(), "python3 -B pipeline.py\n".to_owned()),
+            ],
+            gold: vec![("pipeline.py".to_owned(), "print('ok')\n".to_owned())],
+            verify: "sh run.sh".to_owned(),
+            verify_fails_before: true,
+            protected: vec!["run.sh".to_owned()],
+            mutants: vec![],
+        };
+        let dir = scratch_for(&task, "hardcode-runsh");
+        write_scratch(&dir, "run.sh", "echo PIPELINE-OK\n");
+        assert_eq!(
+            grade_submission(&dir, &task),
+            Err(GradeFailure::Integrity {
+                path: "run.sh".to_owned()
+            }),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vacuous_tasks_and_broken_environments_are_distinguished() {
+        // Vacuous: the verify passes with no changes at all.
+        let vacuous = BenchTask {
+            id: "vac-ctl".to_owned(),
+            category: "bugfix".to_owned(),
+            prompt: "nothing".to_owned(),
+            setup: vec![("m.py".to_owned(), "x = 1\n".to_owned())],
+            gold: vec![],
+            verify: "true".to_owned(),
+            verify_fails_before: true,
+            protected: vec![],
+            mutants: vec![],
+        };
+        let dir = scratch_for(&vacuous, "vacuous");
+        assert_eq!(prechange_check(&dir, &vacuous), Err(GradeFailure::Vacuous));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Broken environment: the verify cannot EXECUTE — infrastructure,
+        // not a failing submission.
+        let broken = BenchTask {
+            verify: "definitely-not-a-real-interpreter-3b7f test_m.py".to_owned(),
+            ..vacuous.clone()
+        };
+        let dir = scratch_for(&broken, "broken");
+        match prechange_check(&dir, &broken) {
+            Err(GradeFailure::Infrastructure { .. }) => {}
+            other => panic!("expected infrastructure, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn suite_digest_is_stable_and_sensitive_to_changes() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-digest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("a.json"), "{\"id\":\"a\"}").expect("write");
+        std::fs::write(dir.join("b.json"), "{\"id\":\"b\"}").expect("write");
+        let first = suite_digest(&dir).expect("digest");
+        assert_eq!(suite_digest(&dir).expect("digest"), first, "stable");
+        std::fs::write(dir.join("b.json"), "{\"id\":\"b2\"}").expect("write");
+        assert_ne!(suite_digest(&dir).expect("digest"), first, "sensitive");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_requested_arm_is_planned_even_when_absent() {
+        let arms = plan_arms(Path::new("/nonexistent-self"));
+        let names: Vec<&str> = arms.iter().map(|arm| arm.name.as_str()).collect();
+        assert!(names.contains(&"rapid"));
+        assert_eq!(arms[0].name, "rapid");
+        assert!(arms[0].state.is_ok(), "our own arm is always ready");
+        for recipe in RECIPES {
+            assert!(
+                names.contains(&recipe.name),
+                "requested competitor {} must appear in the plan",
+                recipe.name
+            );
+        }
+        // Every arm carries its pin so provenance records what was required.
+        for arm in &arms {
+            assert!(!arm.pinned_version.is_empty());
+        }
+    }
+
+    #[test]
+    fn load_suite_parses_protected_and_mutants() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-suite-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("t.json"),
+            r#"{"id":"t","category":"tests","prompt":"p","setup":{"m.py":"x = 1\n"},
+                "gold":{},"verify":"true","verify_fails_before":true,
+                "protected":["m.py"],
+                "mutants":[{"file":"m.py","contents":"x = 2\n"}]}"#,
+        )
+        .expect("write");
+        let tasks = load_suite(&dir).expect("load");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].protected, vec!["m.py".to_owned()]);
+        assert_eq!(
+            tasks[0].mutants,
+            vec![("m.py".to_owned(), "x = 2\n".to_owned())]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

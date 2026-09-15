@@ -10,5 +10,8 @@
     "lists.py": "def drop_last(xs):\n    return xs[:-1]\n"
   },
   "verify": "python3 -B test_lists.py",
-  "verify_fails_before": true
+  "verify_fails_before": true,
+  "protected": [
+    "test_lists.py"
+  ]
 }

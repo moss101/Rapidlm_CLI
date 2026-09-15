@@ -10,5 +10,8 @@
     "stats.py": "def median(xs):\n    ys = sorted(xs)\n    n = len(ys)\n    mid = n // 2\n    if n % 2:\n        return ys[mid]\n    return (ys[mid - 1] + ys[mid]) / 2\n"
   },
   "verify": "python3 -B test_stats.py",
-  "verify_fails_before": true
+  "verify_fails_before": true,
+  "protected": [
+    "test_stats.py"
+  ]
 }

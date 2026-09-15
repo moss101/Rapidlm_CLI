@@ -10,5 +10,8 @@
     "calc.py": "def mul(a, b):\n    return a * b\n"
   },
   "verify": "python3 -B test_calc.py",
-  "verify_fails_before": true
+  "verify_fails_before": true,
+  "protected": [
+    "test_calc.py"
+  ]
 }

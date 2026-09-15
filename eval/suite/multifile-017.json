@@ -1,7 +1,7 @@
 {
   "id": "multifile-017",
   "category": "multifile",
-  "prompt": "The requirement changed: config.SCHEME must be \"https\" (it is \"http\"). Update config.py, keep client.py and worker.py working, and make the check pass: python3 -B -c 'import config, sys; sys.exit(0 if config.SCHEME == \"https\" else 1)' && python3 -B test_config.py",
+  "prompt": "The requirement changed: config.SCHEME must be \"https\" (it is \"http\"). Update config.py, keep client.py and worker.py working, and make the check pass: python3 -B -c 'import config, sys; sys.exit(0 if config.SCHEME == \"https\" else 1)' && python3 -B test_config.py. Do not modify test_config.py.",
   "setup": {
     "config.py": "SCHEME = \"http\"\n",
     "client.py": "import config\n\ndef value():\n    return config.SCHEME\n",
@@ -12,5 +12,8 @@
     "config.py": "SCHEME = \"https\"\n"
   },
   "verify": "python3 -B -c 'import config, sys; sys.exit(0 if config.SCHEME == \"https\" else 1)' && python3 -B test_config.py",
-  "verify_fails_before": true
+  "verify_fails_before": true,
+  "protected": [
+    "test_config.py"
+  ]
 }

@@ -1,7 +1,7 @@
 {
   "id": "tests-023",
   "category": "tests",
-  "prompt": "mathutil.py has no tests. Write test_mathutil.py that imports every public function (square, cube) and asserts their documented behavior, then make it pass.",
+  "prompt": "mathutil.py has no tests. Write test_mathutil.py that imports every public function (square, cube) and asserts their documented behavior, then make it pass. Do not modify mathutil.py.",
   "setup": {
     "mathutil.py": "def square(x):\n    return x * x\n\n\ndef cube(x):\n    return x * x * x\n\n"
   },
@@ -9,5 +9,18 @@
     "test_mathutil.py": "from mathutil import square, cube\nassert square(3) == 9\nassert cube(2) == 8\nprint('OK')\n"
   },
   "verify": "python3 -B test_mathutil.py",
-  "verify_fails_before": true
+  "verify_fails_before": true,
+  "protected": [
+    "mathutil.py"
+  ],
+  "mutants": [
+    {
+      "file": "mathutil.py",
+      "contents": "def square(x):\n    return x + x\n\n\ndef cube(x):\n    return x * x * x\n\n"
+    },
+    {
+      "file": "mathutil.py",
+      "contents": "def square(x):\n    return x * x\n\n\ndef cube(x):\n    return x * x\n\n"
+    }
+  ]
 }

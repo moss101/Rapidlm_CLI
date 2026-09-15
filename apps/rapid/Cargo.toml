@@ -66,6 +66,10 @@ kernel = { path = "../../crates/kernel" }
 # writes (materialize a candidate edit, run diagnostics, only then commit).
 workspace = { path = "../../crates/workspace" }
 sha2 = "0.10"
+# process-signal: the canonical process-group isolate/terminate primitives
+# shared with the supervisor and sandbox backends; eval subprocess
+# supervision reuses them instead of hand-rolling setsid/kill.
+process-signal = { path = "../../crates/process-signal" }
 # tui: terminal lifecycle, reducer, and slash-command dispatch. Domain state
 # stays in the kernel; this crate only projects and forwards commands.
 tui = { path = "../../crates/tui" }

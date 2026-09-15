@@ -1017,7 +1017,9 @@ impl<T: McpTransport> McpSession<T> {
         // Skip server->client notification frames (no id) before the reply;
         // the transport itself decides what "exchange" means (newline
         // framing for stdio, one authorized POST for streamable HTTP).
-        let response = self.transport.exchange_skipping_notifications(&request, id, cancel)?;
+        let response = self
+            .transport
+            .exchange_skipping_notifications(&request, id, cancel)?;
         parse_tools_list_result(&response, id)
     }
 
@@ -1036,7 +1038,9 @@ impl<T: McpTransport> McpSession<T> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let request = encode_tools_call(id, name, arguments)?;
-        let response = self.transport.exchange_skipping_notifications(&request, id, cancel)?;
+        let response = self
+            .transport
+            .exchange_skipping_notifications(&request, id, cancel)?;
         parse_tools_call_result(&response, id)
     }
 

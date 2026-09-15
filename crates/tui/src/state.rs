@@ -2592,10 +2592,9 @@ mod tests {
         );
         // The completed turn's text is the transcript entry; deltas left none.
         assert!(
-            state
-                .transcript
-                .iter()
-                .any(|entry| matches!(entry, TranscriptEntry::Assistant { text } if text == "Hello")),
+            state.transcript.iter().any(
+                |entry| matches!(entry, TranscriptEntry::Assistant { text } if text == "Hello")
+            ),
             "the final answer lands once"
         );
     }

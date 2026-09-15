@@ -11130,14 +11130,10 @@ base_url = "http://127.0.0.1:11434/v1"
 
     #[test]
     fn usage_file_flag_carries_the_path_and_stays_absent_without_it() {
-        let with: Vec<String> = [
-            "prompt",
-            "--usage-file",
-            "/tmp/rapid-usage/eval-task.json",
-        ]
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect();
+        let with: Vec<String> = ["prompt", "--usage-file", "/tmp/rapid-usage/eval-task.json"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
         let parsed = parse_exec_args(&with).expect("parses");
         assert_eq!(
             parsed.usage_file,

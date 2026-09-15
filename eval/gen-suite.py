@@ -6,12 +6,26 @@ carries a gold patch, and names a verification command (exit 0 = correct).
 The verification command is an external judge: it runs after whatever the
 agent did and is the only scoring signal. `{RAPID}` in a verify command names
 the rapid binary itself.
+
+Grading version 2 additions (enforced by the runner, all stored OUTSIDE the
+agent-editable scratch):
+
+- `protected`: paths that must remain byte-identical to their setup
+  contents after the run — the judge files and harness files the prompt
+  forbids touching. Deletion counts as tampering.
+- `mutants`: deliberately broken implementations, one per requested
+  function for test-authoring tasks. The submission must FAIL against
+  every mutant, which rejects empty test files, zero discovered tests,
+  weakened assertions, and hard-coded outputs.
+
+The gold tests below are written to kill every mutant, which the offline
+run re-proves end to end through the real grading pipeline.
 """
 import json, os
 
 SUITE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "suite")
 
-def write_task(task_id, category, prompt, setup, gold, verify, fails_before=True):
+def write_task(task_id, category, prompt, setup, gold, verify, fails_before=True, protected=None, mutants=None):
     spec = {
         "id": task_id,
         "category": category,
@@ -21,6 +35,10 @@ def write_task(task_id, category, prompt, setup, gold, verify, fails_before=True
         "verify": verify,
         "verify_fails_before": fails_before,
     }
+    if protected:
+        spec["protected"] = protected
+    if mutants:
+        spec["mutants"] = [{"file": f, "contents": c} for f, c in mutants]
     with open(os.path.join(SUITE, task_id + ".json"), "w") as f:
         json.dump(spec, f, indent=2)
         f.write("\n")
@@ -73,6 +91,7 @@ for module, func, buggy, fixed, symptom in BUGS:
         {module + ".py": buggy, "test_" + module + ".py": test},
         {module + ".py": fixed},
         "python3 -B test_" + module + ".py",
+        protected=["test_" + module + ".py"],
     )
     N += 1
 
@@ -100,49 +119,81 @@ for key, old_value, new_value in MULTIFILE:
         "multifile-%03d" % N, "multifile",
         "The requirement changed: config." + key + " must be " + new_value + " (it is "
         + old_value + "). Update config.py, keep client.py and worker.py working, and make the check pass: "
-        + check,
+        + check + ". Do not modify test_config.py.",
         setup,
         {"config.py": key + " = " + new_value + "\n"},
         check,
+        protected=["test_config.py"],
     )
     N += 1
 
 # ------------------------------------------------------------------ tests x8
+# Each function: (correct definition, mutant definition); CHECK_ASSERTS maps
+# function name -> the gold asserts that kill its mutant. The gold tests kill
+# every mutant, so the offline gold run re-proves the matrix; an agent
+# submission that skips a function leaves that function's mutant alive and
+# is rejected.
 TESTS = [
-    ("pathutil", {"basename": 'def basename(p):\n    return p.rsplit("/", 1)[-1]\n',
-                  "ext": "def ext(p):\n    return p.rsplit('.', 1)[-1] if '.' in p else ''\n"},
-     ['assert basename("/x/y.py") == "y.py"', 'assert ext("y.py") == "py"']),
-    ("numutil", {"clamp": "def clamp(x, lo, hi):\n    return max(lo, min(hi, x))\n",
-                 "sign": "def sign(x):\n    return (x > 0) - (x < 0)\n"},
-     ['assert clamp(9, 0, 5) == 5', 'assert sign(-3) == -1 and sign(0) == 0 and sign(4) == 1']),
-    ("strutil", {"split_words": "def split_words(s):\n    return s.split()\n",
-                 "join_words": "def join_words(ws):\n    return ' '.join(ws)\n"},
-     ['assert split_words("a b") == ["a", "b"]', 'assert join_words(["a", "b"]) == "a b"']),
-    ("logutil", {"level_name": "def level_name(n):\n    return {10: 'DEBUG', 20: 'INFO'}.get(n, 'OTHER')\n",
-                 "enabled": "def enabled(n):\n    return n >= 20\n"},
-     ['assert level_name(20) == "INFO"', 'assert enabled(10) is False and enabled(20) is True']),
-    ("mathutil", {"square": "def square(x):\n    return x * x\n", "cube": "def cube(x):\n    return x * x * x\n"},
-     ['assert square(3) == 9', 'assert cube(2) == 8']),
-    ("listutil", {"dedupe": "def dedupe(xs):\n    return list(dict.fromkeys(xs))\n",
-                  "flatten": "def flatten(xss):\n    return [x for xs in xss for x in xs]\n"},
-     ['assert dedupe([1, 1, 2]) == [1, 2]', 'assert flatten([[1], [2, 3]]) == [1, 2, 3]']),
-    ("dictutil", {"merge": "def merge(a, b):\n    return {**a, **b}\n",
-                  "invert": "def invert(d):\n    return {v: k for k, v in d.items()}\n"},
-     ['assert merge({"a": 1}, {"b": 2}) == {"a": 1, "b": 2}', 'assert invert({"a": 1}) == {1: "a"}']),
-    ("textutil", {"wrap": "def wrap(s, n):\n    return s[:n]\n", "indent": "def indent(s):\n    return '  ' + s\n"},
-     ['assert wrap("abcdef", 3) == "abc"', 'assert indent("x") == "  x"']),
+    ("pathutil",
+     {"basename": ('def basename(p):\n    return p.rsplit("/", 1)[-1]\n', 'def basename(p):\n    return p\n'),
+      "ext": ("def ext(p):\n    return p.rsplit('.', 1)[-1] if '.' in p else ''\n", "def ext(p):\n    return p\n")},
+     {"basename": ['assert basename("/x/y.py") == "y.py"'],
+      "ext": ['assert ext("y.py") == "py"']}),
+    ("numutil",
+     {"clamp": ("def clamp(x, lo, hi):\n    return max(lo, min(hi, x))\n", "def clamp(x, lo, hi):\n    return min(hi, x)\n"),
+      "sign": ("def sign(x):\n    return (x > 0) - (x < 0)\n", "def sign(x):\n    return 1 if x > 0 else 0\n")},
+     {"clamp": ['assert clamp(9, 0, 5) == 5', 'assert clamp(-1, 0, 5) == 0'],
+      "sign": ['assert sign(-3) == -1 and sign(0) == 0 and sign(4) == 1']}),
+    ("strutil",
+     {"split_words": ("def split_words(s):\n    return s.split()\n", "def split_words(s):\n    return [s]\n"),
+      "join_words": ("def join_words(ws):\n    return ' '.join(ws)\n", "def join_words(ws):\n    return ''.join(ws)\n")},
+     {"split_words": ['assert split_words("a b") == ["a", "b"]'],
+      "join_words": ['assert join_words(["a", "b"]) == "a b"']}),
+    ("logutil",
+     {"level_name": ("def level_name(n):\n    return {10: 'DEBUG', 20: 'INFO'}.get(n, 'OTHER')\n", "def level_name(n):\n    return 'OTHER'\n"),
+      "enabled": ("def enabled(n):\n    return n >= 20\n", "def enabled(n):\n    return True\n")},
+     {"level_name": ['assert level_name(20) == "INFO"', 'assert level_name(10) == "DEBUG"'],
+      "enabled": ['assert enabled(10) is False and enabled(20) is True']}),
+    ("mathutil",
+     {"square": ("def square(x):\n    return x * x\n", "def square(x):\n    return x + x\n"),
+      "cube": ("def cube(x):\n    return x * x * x\n", "def cube(x):\n    return x * x\n")},
+     {"square": ['assert square(3) == 9'],
+      "cube": ['assert cube(2) == 8']}),
+    ("listutil",
+     {"dedupe": ("def dedupe(xs):\n    return list(dict.fromkeys(xs))\n", "def dedupe(xs):\n    return xs\n"),
+      "flatten": ("def flatten(xss):\n    return [x for xs in xss for x in xs]\n", "def flatten(xss):\n    return xss\n")},
+     {"dedupe": ['assert dedupe([1, 1, 2]) == [1, 2]'],
+      "flatten": ['assert flatten([[1], [2, 3]]) == [1, 2, 3]']}),
+    ("dictutil",
+     {"merge": ("def merge(a, b):\n    return {**a, **b}\n", "def merge(a, b):\n    return a\n"),
+      "invert": ("def invert(d):\n    return {v: k for k, v in d.items()}\n", "def invert(d):\n    return d\n")},
+     {"merge": ['assert merge({"a": 1}, {"b": 2}) == {"a": 1, "b": 2}'],
+      "invert": ['assert invert({"a": 1}) == {1: "a"}']}),
+    ("textutil",
+     {"wrap": ("def wrap(s, n):\n    return s[:n]\n", "def wrap(s, n):\n    return s\n"),
+      "indent": ("def indent(s):\n    return '  ' + s\n", "def indent(s):\n    return s\n")},
+     {"wrap": ['assert wrap("abcdef", 3) == "abc"'],
+      "indent": ['assert indent("x") == "  x"']}),
 ]
-for module, funcs, checks in TESTS:
+for module, funcs, asserts in TESTS:
     names = list(funcs.keys())
-    setup = {module + ".py": "\n\n".join(funcs.values()) + "\n"}
-    gold_test = "from " + module + " import " + ", ".join(names) + "\n" + "\n".join(checks) + "\nprint('OK')\n"
+    setup = {module + ".py": "\n\n".join(funcs[name][0] for name in names) + "\n"}
+    gold_lines = [line for name in names for line in asserts[name]]
+    mutants = []
+    for name in names:
+        broken = {other: funcs[other][1] if other == name else funcs[other][0] for other in names}
+        mutants.append((module + ".py", "\n\n".join(broken[other] for other in names) + "\n"))
+    gold_test = "from " + module + " import " + ", ".join(names) + "\n" + "\n".join(gold_lines) + "\nprint('OK')\n"
     write_task(
         "tests-%03d" % N, "tests",
         module + ".py has no tests. Write test_" + module + ".py that imports every public function ("
-        + ", ".join(names) + ") and asserts their documented behavior, then make it pass.",
+        + ", ".join(names) + ") and asserts their documented behavior, then make it pass. "
+        + "Do not modify " + module + ".py.",
         setup,
         {"test_" + module + ".py": gold_test},
         "python3 -B test_" + module + ".py",
+        protected=[module + ".py"],
+        mutants=mutants,
     )
     N += 1
 
@@ -162,7 +213,7 @@ PIPELINE_FIXED = (
 for index in range(7):
     write_task(
         "recovery-%03d" % N, "recovery",
-        "sh run.sh fails partway through the pipeline. Diagnose the failure, repair it, and make sh run.sh print PIPELINE-OK.",
+        "sh run.sh fails partway through the pipeline. Diagnose the failure, repair it, and make sh run.sh print PIPELINE-OK. Do not change run.sh.",
         {
             "pipeline.py": PIPELINE,
             "input.txt": "hello pipeline\n",
@@ -170,10 +221,14 @@ for index in range(7):
         },
         {"pipeline.py": PIPELINE_FIXED},
         "sh run.sh | grep PIPELINE-OK",
+        protected=["run.sh"],
     )
     N += 1
 
 # --------------------------------------------------------------- workflow x7
+# The judge checks REQUIRED STRUCTURE AND BEHAVIOR, not merely successful
+# compilation: the playbook must contain exactly a `task` step named build
+# and a `verification` step named check depending on build with a command.
 for index in range(7):
     bad = {
         "name": "broken-%d" % index,
@@ -190,13 +245,67 @@ for index in range(7):
              "depends_on": ["build"], "command": "true"},
         ],
     }
+    structural = (
+        'import json; p = json.load(open("playbook.json")); '
+        'steps = {s["key"]: s for s in p["steps"]}; '
+        'assert set(steps) == {"build", "check"}, steps; '
+        'assert steps["build"]["kind"] == "task"; '
+        'assert steps["check"]["kind"] == "verification"; '
+        'assert steps["check"]["depends_on"] == ["build"]; '
+        'assert steps["check"].get("command")'
+    )
+    check = (
+        "{RAPID} playbook-compile playbook.json > /dev/null && python3 -B -c '" + structural + "'"
+    )
     write_task(
         "workflow-%03d" % N, "workflow",
         "playbook.json fails to compile because its dependencies form a cycle. Replace it with a valid two-step playbook: a `task` step named build, and a `verification` step named check that depends on build and runs `true`. Verify with: {RAPID} playbook-compile playbook.json",
         {"playbook.json": json.dumps(bad, indent=2)},
         {"playbook.json": json.dumps(good, indent=2)},
-        "{RAPID} playbook-compile playbook.json > /dev/null",
+        check,
     )
     N += 1
 
 print("tasks written:", N - 1)
+
+# --------------------------------------------------------------------------
+# Self-check: for every task with mutants, the gold patch must PASS the
+# verify command on the unmutated repo and must KILL every mutant. A matrix
+# the gold tests cannot satisfy would silently poison every eval run.
+import shutil, subprocess, tempfile
+
+survivors = []
+gold_failures = []
+for fname in sorted(os.listdir(SUITE)):
+    if not fname.endswith(".json"):
+        continue
+    with open(os.path.join(SUITE, fname)) as f:
+        spec = json.load(f)
+    if not spec.get("mutants"):
+        continue
+    verify = spec["verify"].replace("{RAPID}", "rapid")
+    cases = [("gold", {**spec["setup"], **spec["gold"]})]
+    for m in spec["mutants"]:
+        cases.append(("mutant:" + m["file"], {**spec["setup"], m["file"]: m["contents"]}))
+    for label, files in cases:
+        # Rebuild the scratch: setup + gold, then overwrite the mutation
+        # target for mutant runs.
+        d = tempfile.mkdtemp()
+        try:
+            for path, contents in files.items():
+                full = os.path.join(d, path)
+                os.makedirs(os.path.dirname(full) or d, exist_ok=True)
+                with open(full, "w") as g:
+                    g.write(contents)
+            run = subprocess.run(["sh", "-c", verify], cwd=d, capture_output=True)
+            if label == "gold" and run.returncode != 0:
+                gold_failures.append((spec["id"], run.returncode))
+            if label != "gold" and run.returncode == 0:
+                survivors.append((spec["id"], label))
+        finally:
+            shutil.rmtree(d)
+if gold_failures:
+    raise SystemExit("GOLD PATCH FAILS ITS OWN VERIFY: %r" % gold_failures)
+if survivors:
+    raise SystemExit("MUTANT SURVIVED THE GOLD TESTS: %r" % survivors)
+print("self-check: gold passes its verify; every mutant killed")

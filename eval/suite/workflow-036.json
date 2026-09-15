@@ -8,6 +8,6 @@
   "gold": {
     "playbook.json": "{\n  \"name\": \"fixed-2\",\n  \"steps\": [\n    {\n      \"key\": \"build\",\n      \"kind\": \"task\",\n      \"label\": \"build the artifact\"\n    },\n    {\n      \"key\": \"check\",\n      \"kind\": \"verification\",\n      \"label\": \"check the artifact\",\n      \"depends_on\": [\n        \"build\"\n      ],\n      \"command\": \"true\"\n    }\n  ]\n}"
   },
-  "verify": "{RAPID} playbook-compile playbook.json > /dev/null",
+  "verify": "{RAPID} playbook-compile playbook.json > /dev/null && python3 -B -c 'import json; p = json.load(open(\"playbook.json\")); steps = {s[\"key\"]: s for s in p[\"steps\"]}; assert set(steps) == {\"build\", \"check\"}, steps; assert steps[\"build\"][\"kind\"] == \"task\"; assert steps[\"check\"][\"kind\"] == \"verification\"; assert steps[\"check\"][\"depends_on\"] == [\"build\"]; assert steps[\"check\"].get(\"command\")'",
   "verify_fails_before": true
 }

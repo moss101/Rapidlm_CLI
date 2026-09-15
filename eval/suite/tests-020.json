@@ -1,13 +1,26 @@
 {
   "id": "tests-020",
   "category": "tests",
-  "prompt": "numutil.py has no tests. Write test_numutil.py that imports every public function (clamp, sign) and asserts their documented behavior, then make it pass.",
+  "prompt": "numutil.py has no tests. Write test_numutil.py that imports every public function (clamp, sign) and asserts their documented behavior, then make it pass. Do not modify numutil.py.",
   "setup": {
     "numutil.py": "def clamp(x, lo, hi):\n    return max(lo, min(hi, x))\n\n\ndef sign(x):\n    return (x > 0) - (x < 0)\n\n"
   },
   "gold": {
-    "test_numutil.py": "from numutil import clamp, sign\nassert clamp(9, 0, 5) == 5\nassert sign(-3) == -1 and sign(0) == 0 and sign(4) == 1\nprint('OK')\n"
+    "test_numutil.py": "from numutil import clamp, sign\nassert clamp(9, 0, 5) == 5\nassert clamp(-1, 0, 5) == 0\nassert sign(-3) == -1 and sign(0) == 0 and sign(4) == 1\nprint('OK')\n"
   },
   "verify": "python3 -B test_numutil.py",
-  "verify_fails_before": true
+  "verify_fails_before": true,
+  "protected": [
+    "numutil.py"
+  ],
+  "mutants": [
+    {
+      "file": "numutil.py",
+      "contents": "def clamp(x, lo, hi):\n    return min(hi, x)\n\n\ndef sign(x):\n    return (x > 0) - (x < 0)\n\n"
+    },
+    {
+      "file": "numutil.py",
+      "contents": "def clamp(x, lo, hi):\n    return max(lo, min(hi, x))\n\n\ndef sign(x):\n    return 1 if x > 0 else 0\n\n"
+    }
+  ]
 }

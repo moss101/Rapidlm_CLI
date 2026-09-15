@@ -1,13 +1,26 @@
 {
   "id": "tests-022",
   "category": "tests",
-  "prompt": "logutil.py has no tests. Write test_logutil.py that imports every public function (level_name, enabled) and asserts their documented behavior, then make it pass.",
+  "prompt": "logutil.py has no tests. Write test_logutil.py that imports every public function (level_name, enabled) and asserts their documented behavior, then make it pass. Do not modify logutil.py.",
   "setup": {
     "logutil.py": "def level_name(n):\n    return {10: 'DEBUG', 20: 'INFO'}.get(n, 'OTHER')\n\n\ndef enabled(n):\n    return n >= 20\n\n"
   },
   "gold": {
-    "test_logutil.py": "from logutil import level_name, enabled\nassert level_name(20) == \"INFO\"\nassert enabled(10) is False and enabled(20) is True\nprint('OK')\n"
+    "test_logutil.py": "from logutil import level_name, enabled\nassert level_name(20) == \"INFO\"\nassert level_name(10) == \"DEBUG\"\nassert enabled(10) is False and enabled(20) is True\nprint('OK')\n"
   },
   "verify": "python3 -B test_logutil.py",
-  "verify_fails_before": true
+  "verify_fails_before": true,
+  "protected": [
+    "logutil.py"
+  ],
+  "mutants": [
+    {
+      "file": "logutil.py",
+      "contents": "def level_name(n):\n    return 'OTHER'\n\n\ndef enabled(n):\n    return n >= 20\n\n"
+    },
+    {
+      "file": "logutil.py",
+      "contents": "def level_name(n):\n    return {10: 'DEBUG', 20: 'INFO'}.get(n, 'OTHER')\n\n\ndef enabled(n):\n    return True\n\n"
+    }
+  ]
 }

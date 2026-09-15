@@ -1,7 +1,7 @@
 {
   "id": "tests-026",
   "category": "tests",
-  "prompt": "textutil.py has no tests. Write test_textutil.py that imports every public function (wrap, indent) and asserts their documented behavior, then make it pass.",
+  "prompt": "textutil.py has no tests. Write test_textutil.py that imports every public function (wrap, indent) and asserts their documented behavior, then make it pass. Do not modify textutil.py.",
   "setup": {
     "textutil.py": "def wrap(s, n):\n    return s[:n]\n\n\ndef indent(s):\n    return '  ' + s\n\n"
   },
@@ -9,5 +9,18 @@
     "test_textutil.py": "from textutil import wrap, indent\nassert wrap(\"abcdef\", 3) == \"abc\"\nassert indent(\"x\") == \"  x\"\nprint('OK')\n"
   },
   "verify": "python3 -B test_textutil.py",
-  "verify_fails_before": true
+  "verify_fails_before": true,
+  "protected": [
+    "textutil.py"
+  ],
+  "mutants": [
+    {
+      "file": "textutil.py",
+      "contents": "def wrap(s, n):\n    return s\n\n\ndef indent(s):\n    return '  ' + s\n\n"
+    },
+    {
+      "file": "textutil.py",
+      "contents": "def wrap(s, n):\n    return s[:n]\n\n\ndef indent(s):\n    return s\n\n"
+    }
+  ]
 }

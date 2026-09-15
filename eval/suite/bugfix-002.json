@@ -10,5 +10,8 @@
     "strs.py": "def shout(s):\n    return s.upper()\n"
   },
   "verify": "python3 -B test_strs.py",
-  "verify_fails_before": true
+  "verify_fails_before": true,
+  "protected": [
+    "test_strs.py"
+  ]
 }

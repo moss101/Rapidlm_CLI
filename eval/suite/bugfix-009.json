@@ -10,5 +10,8 @@
     "calc.py": "def neg(x):\n    return -x\n"
   },
   "verify": "python3 -B test_calc.py",
-  "verify_fails_before": true
+  "verify_fails_before": true,
+  "protected": [
+    "test_calc.py"
+  ]
 }
