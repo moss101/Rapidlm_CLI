@@ -1,0 +1,205 @@
+{
+  "failed": 0,
+  "grading_version": "2",
+  "kind": "mechanical validation (scripted gold trajectories; says nothing about model quality)",
+  "mode": "offline",
+  "passed": 12,
+  "per_agent_outcomes": {
+    "runner": {
+      "failed": 0,
+      "passed": 12,
+      "skipped": 0,
+      "total": 12
+    }
+  },
+  "per_agent_usage": {
+    "runner": {
+      "attempts": 12,
+      "tokens_per_verified_success": {
+        "attempts_measured": 12,
+        "attempts_missing_usage": 0,
+        "complete_coverage": true,
+        "lower_bound": false,
+        "successful_attempts_measured": 12,
+        "successful_attempts_only_average": 32,
+        "tokens_all_measured_attempts_per_success": 32
+      },
+      "verified_successes": 12
+    }
+  },
+  "provenance": {
+    "arms": [
+      {
+        "name": "rapid",
+        "observed_version": "0.1.0",
+        "pinned_version": "0.1.0",
+        "runnable": true,
+        "skip_reason": null
+      },
+      {
+        "name": "grok",
+        "observed_version": "grok 1.0.30 (04b7ffed98c6)",
+        "pinned_version": "1.0.30",
+        "runnable": true,
+        "skip_reason": null
+      },
+      {
+        "name": "kimi",
+        "observed_version": null,
+        "pinned_version": "0.43.0",
+        "runnable": false,
+        "skip_reason": "infrastructure: competitor kimi not found on PATH"
+      },
+      {
+        "name": "qwen",
+        "observed_version": "0.22.2",
+        "pinned_version": "0.22.2",
+        "runnable": true,
+        "skip_reason": null
+      }
+    ],
+    "budgets": {
+      "live_task_timeout_secs": 600,
+      "max_file_bytes": 16384,
+      "max_tasks": 64,
+      "probe_timeout_secs": 120
+    },
+    "environment": {
+      "arch": "aarch64",
+      "family": "unix",
+      "os": "macos"
+    },
+    "grading": {
+      "mutation_timeout_secs": 120,
+      "vacuity_timeout_secs": 60,
+      "verify_timeout_secs": 120,
+      "version": "2"
+    },
+    "mode": "offline",
+    "model": {
+      "rapid_active_model": "unconfigured",
+      "rapid_model_env_override": null
+    },
+    "permissions": {
+      "grant_shell": false,
+      "rapid_permission_mode": "acceptEdits",
+      "trust_granted_per_scratch": true
+    },
+    "repository": {
+      "commit": "bc87a89b696234c48065eb45e2f67cbffbca34fd",
+      "dirty": true
+    },
+    "runner": {
+      "name": "rapid",
+      "version": "0.1.0"
+    },
+    "suite": {
+      "dir": "eval/suite",
+      "hash_sha256": "415784d33e2a14612f6ef689f6679ee6d6f811104ac970d6b0dea89b15bae873",
+      "task_ids": [
+        "errors-deploy-pipeline",
+        "errors-interrupted-refactor",
+        "integration-post-rename-imports",
+        "integration-two-feature-merge",
+        "refactor-backoff-consolidation",
+        "refactor-discount-consolidation",
+        "refactor-logfmt-consolidation",
+        "refactor-normalize-consolidation",
+        "repo-context-scattered-contracts",
+        "repo-navigate-fixed-window",
+        "repo-navigate-shutdown",
+        "repo-navigate-sweeper-config"
+      ],
+      "tasks": 12
+    },
+    "timestamp_unix_secs": 1789495192
+  },
+  "results": [
+    {
+      "category": "errors",
+      "id": "errors-deploy-pipeline",
+      "outcome": "passed",
+      "tokens": 40,
+      "wall_ms": 612
+    },
+    {
+      "category": "errors",
+      "id": "errors-interrupted-refactor",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 195
+    },
+    {
+      "category": "integration",
+      "id": "integration-post-rename-imports",
+      "outcome": "passed",
+      "tokens": 30,
+      "wall_ms": 149
+    },
+    {
+      "category": "integration",
+      "id": "integration-two-feature-merge",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 199
+    },
+    {
+      "category": "refactor",
+      "id": "refactor-backoff-consolidation",
+      "outcome": "passed",
+      "tokens": 50,
+      "wall_ms": 216
+    },
+    {
+      "category": "refactor",
+      "id": "refactor-discount-consolidation",
+      "outcome": "passed",
+      "tokens": 50,
+      "wall_ms": 272
+    },
+    {
+      "category": "refactor",
+      "id": "refactor-logfmt-consolidation",
+      "outcome": "passed",
+      "tokens": 50,
+      "wall_ms": 224
+    },
+    {
+      "category": "refactor",
+      "id": "refactor-normalize-consolidation",
+      "outcome": "passed",
+      "tokens": 50,
+      "wall_ms": 217
+    },
+    {
+      "category": "context",
+      "id": "repo-context-scattered-contracts",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 192
+    },
+    {
+      "category": "navigate",
+      "id": "repo-navigate-fixed-window",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 198
+    },
+    {
+      "category": "navigate",
+      "id": "repo-navigate-shutdown",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 186
+    },
+    {
+      "category": "navigate",
+      "id": "repo-navigate-sweeper-config",
+      "outcome": "passed",
+      "tokens": 20,
+      "wall_ms": 198
+    }
+  ],
+  "skipped": 0,
+  "tasks": 12
+}

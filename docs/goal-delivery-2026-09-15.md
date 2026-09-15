@@ -170,3 +170,99 @@ Legend: **verified** = implemented + regression-tested through production entry 
    `docs/reference/cli-command-reference.md`'s "actually dispatches" note
    was the only doc-sync contract affected and still passes its source
    check.
+
+## 5. Same-day follow-up: sign-off blockers closed
+
+The implementation recheck of this record found four P1 and two P2 blocks.
+All four P1s are closed in this window; the P2s are closed or corrected as
+the goal allowed.
+
+### P1 — broken-pipeline judge (FIXED)
+
+`eval/suite/errors-deploy-pipeline.json`'s judge was `sh deploy.sh | grep
+DEPLOY-OK` — a pipeline whose exit status is grep's, so a submission whose
+migration printed DEPLOY-OK and exited 1 passed every post-run check. The
+judge now (a) requires deploy.sh's OWN exit status, (b) validates the
+pipeline's artifacts (`migrations/applied.json`, `seed/manifest.json`)
+independently of the banner, and (c) clears generated artifacts before each
+run so a mutant cannot survive on outputs left by an earlier verification
+pass. Four mutation checks pin each tool. Three negative-control tests were
+added to `eval_serve::tests` (print-then-exit-1 rejected; exit-0-without-
+artifacts rejected; gold passes all mutants), and the full suite validates
+offline 12/12 through the real turn loop with the new judge.
+
+### P1 — detached-agent watchdog leak (FIXED)
+
+An ordinarily completed child marked its job terminal, released its
+concurrency slot, and then blocked forever on `watchdog.join()` — nothing
+ever stopped the watchdog on the success path, so repeated detached tasks
+accumulated worker threads despite the bound. The inline path's
+`ParentCancelBridge` idiom (explicit stop + Drop fallback) is now the shared
+`ChildCancelWatchdog`, used by both paths; the detached worker stops its
+watchdog explicitly before exiting, and a worker-liveness counter on the
+registry (`detached_workers_alive`) gives the lifecycle an observable. The
+regression test
+(`detached_spawn_worker_threads_exit_after_ordinary_completion`) fails with
+the defect reintroduced (verified: "4 still alive") and passes with the fix.
+
+### P1 — evidence invalidation disconnected (FIXED)
+
+`invalidate_subject` had zero production callers. A successful
+`workspace_write`/`workspace_patch` on a trusted surface now drives
+`GoalHost::stale_all_fresh_evidence()` through `update_evidence`'s
+cross-process lock (the same transaction every other evidence writer uses),
+installed via `ExecTools::set_evidence_invalidator` in both the interactive
+and headless turn builders. The semantics are deliberately conservative:
+any tree change stales every fresh record (a recorded check speaks about
+the whole tree), so the completion gate can only under-count and refuse,
+never count proof that predates the edit. Failures are best-effort but
+never silent — the tool result carries a warning. Tests cover the store
+semantics, the hook wiring (fires on success only), and the durable
+end-to-end path (persist → write → reload → stale).
+
+### P1 — no complete live computer-use workflow (FIXED on macOS AX)
+
+`LiveMacosAxHost` was a fail-closed stub. It is now a real host: the
+`osascript`/System Events scripting bridge — no unsafe code, no
+ApplicationServices link. The probe is bounded and prompt-free in contract
+(a pending consent dialog counts as not trusted); the snapshot walks
+visible processes → windows (name, position, size, AXMain) → first-level
+UI elements (role, name) into bounded, fenced observations; acts support
+click, set-value/keystroke typing, key codes, focus/raise, and close, with
+literals AppleScript-escaped and secret handles never resolved to
+plaintext. Window refs are globally unique per snapshot; the generation is
+a STATE version (unchanged desktop re-captures under the same generation,
+which the actor's `require_current` demands); window addressing uses the
+snapshot-time ordinal because titles churn. The live workflow test
+(`live_workflow_observes_acts_verifies_and_recovers`, `#[ignore]`d by
+default) ran GREEN on a trusted desktop this window: health → observe →
+act (real AXRaise) → verify (re-observe) → recover (superseded observation
+→ typed `StaleObservation` → fresh observe). `/computer observe` reaches
+this path today. The Playwright browser backend remains an in-process
+stand-in — live browser drivers stay unsupported and documented as such.
+
+### P2 — evaluation classification, pricing, arms, provenance (CLOSED)
+
+- `run_live_agent` mapped every pre-change error to `Vacuous`; it now
+  preserves the typed split (vacuous vs `PreVerifyError` → infrastructure).
+- Cost estimation no longer prices every run at grok-4.6's rates: a rate
+  catalog carries the model + retrieval basis, the estimate is produced
+  only when the resolved rapid model matches a catalog entry, and the
+  basis (or its absence) is recorded in provenance under
+  `cost_estimate.basis`.
+- `--arms` rejects unknown names with a typed error instead of silently
+  shrinking the run.
+- Provenance now records the full invocation per arm (bin + args), trials,
+  the requested-arm list, and per-run resolved model identity when the
+  agent's own output reports it (`model` on usage/results).
+
+### P2 — continuation and suite axes (CORRECTED, as the goal allowed)
+
+Durable child-session continuation is NOT delivered: a detached child runs
+to completion or cancellation and a re-spawn starts a fresh child (state
+lives in the retained worktree, not the process — documented at
+`execute_task_spawn_detached`). Tool auto-repair remains a library
+primitive with no production caller; smart phase routing remains limited.
+The provider-interruption/approval-suspension/merge-conflict/MCP-ACP-
+streaming axes remain covered at the runtime level, not as suite tasks.
+None of these is counted as newly implemented.
