@@ -2046,7 +2046,6 @@ N\tTextEdit\t1\t3\tAXStaticText\tweird\tname\n";
                 trust; run with `cargo test -p computer-use -- --ignored` on \
                 a desktop where the host terminal is trusted"]
     fn live_workflow_observes_acts_verifies_and_recovers() {
-        use crate::desktop::backend::test_support::window_ref;
         let actor = DesktopActor::new(MacosDesktopBackend::live());
         let cancel = CancellationToken::new();
         // AUTHORIZE: health is the typed trust gate. No prompt, no grant —

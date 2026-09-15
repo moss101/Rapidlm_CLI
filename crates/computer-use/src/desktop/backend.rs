@@ -931,15 +931,8 @@ impl DesktopTargetRef {
 pub(crate) mod test_support {
     use super::{
         AccessibilityNodeRef, ActionKind, DesktopTargetRef, ObservationId, Point,
-        ResolvedDesktopTarget, WindowRef,
+        ResolvedDesktopTarget,
     };
-
-    pub(crate) fn window_ref(observation: ObservationId, stable_ref: &str) -> WindowRef {
-        WindowRef {
-            observation,
-            stable_ref: stable_ref.to_owned(),
-        }
-    }
 
     pub(crate) fn node_ref(
         observation: ObservationId,
