@@ -20,6 +20,9 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Live text-delta sink shared with the interactive surface.
+pub(crate) type DeltaSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_runtime::{
@@ -132,7 +135,7 @@ pub struct ConfiguredModel<'store> {
     /// Live text-delta sink (delivery goal §2): when set, provider text
     /// deltas stream to it while the response arrives. `None` keeps the
     /// non-streaming path.
-    delta_sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    delta_sink: Option<DeltaSink>,
     /// Cumulative provider-reported token split (input / cached-input /
     /// output), shared with the caller that owns this binding. Opt-in via
     /// [`Self::set_usage_totals`]; machine readers (the eval harness, CI
@@ -296,7 +299,7 @@ impl<'store> ConfiguredModel<'store> {
     /// re-derive it from `active.entry` a second time at a different call
     /// site, which could silently drift from what the real request sends.
     /// Attach the live text-delta sink. Idempotent; later calls replace.
-    pub fn set_delta_sink(&mut self, sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>) {
+    pub fn set_delta_sink(&mut self, sink: Option<DeltaSink>) {
         self.delta_sink = sink;
     }
 
@@ -391,19 +394,19 @@ impl LiveModelCall for ConfiguredModel<'_> {
             return Err(ModelStepError::Cancelled);
         }
         let (output, usage_detail) = fold_stream(&stream, request_bytes)?;
-        if let (Some(totals), Some(detail)) = (&self.usage_totals, usage_detail) {
-            if let Ok(mut totals) = totals.lock() {
-                totals.input_tokens = totals.input_tokens.saturating_add(detail.input_tokens);
-                totals.output_tokens = totals.output_tokens.saturating_add(detail.output_tokens);
-                // Cached sum stays Some only while every reported step
-                // itemizes its cache hit count; a step that omits it makes
-                // the running sum partially unknown, i.e. `None`.
-                totals.cached_tokens = match (totals.cached_tokens, detail.cached_tokens) {
-                    (None, next) => next,
-                    (Some(sum), Some(next)) => Some(sum.saturating_add(next)),
-                    (Some(_), None) | (None, Some(_)) => None,
-                };
-            }
+        if let (Some(totals), Some(detail)) = (&self.usage_totals, usage_detail)
+            && let Ok(mut totals) = totals.lock()
+        {
+            totals.input_tokens = totals.input_tokens.saturating_add(detail.input_tokens);
+            totals.output_tokens = totals.output_tokens.saturating_add(detail.output_tokens);
+            // Cached sum stays Some only while every reported step
+            // itemizes its cache hit count; a step that omits it makes
+            // the running sum partially unknown, i.e. `None`.
+            totals.cached_tokens = match (totals.cached_tokens, detail.cached_tokens) {
+                (None, Some(next)) => Some(next),
+                (Some(sum), Some(next)) => Some(sum.saturating_add(next)),
+                (Some(_), None) | (None, None) => None,
+            };
         }
         Ok(output)
     }
@@ -486,17 +489,15 @@ impl LiveModelCall for SelectedModel<'_> {
         }
     }
 
-    fn set_delta_sink(&mut self, sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>) {
-        match self {
-            Self::Configured(model) => model.set_delta_sink(sink),
-            _ => {}
+    fn set_delta_sink(&mut self, sink: Option<DeltaSink>) {
+        if let Self::Configured(model) = self {
+            model.set_delta_sink(sink)
         }
     }
 
     fn set_usage_totals(&mut self, totals: Option<UsageTotalsHandle>) {
-        match self {
-            Self::Configured(model) => model.set_usage_totals(totals),
-            _ => {}
+        if let Self::Configured(model) = self {
+            model.set_usage_totals(totals)
         }
     }
 }
@@ -874,7 +875,7 @@ fn fold_stream(
     // (not available at this call site) would be fabricating a number, not
     // estimating one. `None` means "unknown," never "free" or "zero" — see
     // `ModelStepOutput`'s own doc comment.
-    let cost_usd_micros = usage.and_then(|u| usage_cost_micros(u));
+    let cost_usd_micros = usage.and_then(usage_cost_micros);
     // The provider-reported split, when it actually reported one (never the
     // estimate fallback above): machine readers price the turn from this.
     let usage_detail = usage.and_then(|u| {
@@ -1274,7 +1275,7 @@ mod tests {
                 usage,
             },
         ]);
-        let (output, detail) = fold_stream(&stream, 0).expect("fold");
+        let (output, _detail) = fold_stream(&stream, 0).expect("fold");
         match output {
             ModelStepOutput::ToolCalls { calls, tokens, .. } => {
                 assert_eq!(calls.len(), 1);
@@ -1368,7 +1369,7 @@ mod tests {
                 usage,
             },
         ]);
-        let (output, detail) = fold_stream(&stream, 0).expect("fold");
+        let (output, _detail) = fold_stream(&stream, 0).expect("fold");
         match output {
             ModelStepOutput::ToolCalls { calls, .. } => {
                 assert_eq!(calls.len(), 2);

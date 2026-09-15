@@ -23,7 +23,7 @@
 //!   verified": `verified: true` requires every verification step to have
 //!   run *in this invocation* against the current tree.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -31,7 +31,7 @@ use kernel::KernelClient as _;
 use protocol::{ArtifactId, GraphId};
 use scheduler::graph::RuntimeGraph;
 use scheduler::kinds::NodeKind;
-use scheduler::playbook::{self, PlaybookStep, PlaybookTemplate, compile};
+use scheduler::playbook::{PlaybookStep, PlaybookTemplate, compile};
 
 use crate::approvals::{ApprovalRequest, ApprovalSink, LedgerApprovalSink};
 
@@ -230,13 +230,11 @@ pub fn load_playbook(path: &Path) -> Result<(PlaybookFile, RuntimeGraph), Workfl
                     });
                 }
             }
-            NodeKind::AskUser => {
-                if step.question.is_none() {
-                    return Err(WorkflowError::InvalidStep {
-                        key: step.key.clone(),
-                        reason: "an ask_user step needs a `question`".to_owned(),
-                    });
-                }
+            NodeKind::AskUser if step.question.is_none() => {
+                return Err(WorkflowError::InvalidStep {
+                    key: step.key.clone(),
+                    reason: "an ask_user step needs a `question`".to_owned(),
+                });
             }
             _ => {}
         }
@@ -349,7 +347,7 @@ pub fn load_run(
             state.fresh_verification.remove(&key);
         }
         for step in &playbook.steps {
-            if step.depends_on.iter().any(|dep| *dep == key)
+            if step.depends_on.contains(&key)
                 && state.steps.get(&step.key) == Some(&StepState::Succeeded)
             {
                 queue.push(step.key.clone());
@@ -594,10 +592,10 @@ pub fn execute_run(
     let steps_by_key: BTreeMap<&str, &Step> =
         playbook.steps.iter().map(|s| (s.key.as_str(), s)).collect();
     let record = |events: &Option<Arc<Mutex<Vec<String>>>>, line: String| {
-        if let Some(events) = events {
-            if let Ok(mut buffer) = events.lock() {
-                buffer.push(line);
-            }
+        if let Some(events) = events
+            && let Ok(mut buffer) = events.lock()
+        {
+            buffer.push(line);
         }
     };
 
@@ -957,7 +955,8 @@ mod tests {
         }
     }
 
-    fn context(root: &Path) -> RunContext<'static> {
+    #[allow(dead_code)]
+    fn context(_root: &Path) -> RunContext<'static> {
         unreachable!()
     }
 
@@ -980,7 +979,7 @@ mod tests {
         )
         .unwrap();
         match load_playbook(&path) {
-            Err(WorkflowError::Compiler(playbook::PlaybookError::DependencyCycle)) => {}
+            Err(WorkflowError::Compiler(scheduler::playbook::PlaybookError::DependencyCycle)) => {}
             other => panic!("expected a cycle error, got {other:?}"),
         }
         let missing_command = dir.join("missing.json");
@@ -1222,7 +1221,7 @@ mod tests {
         std::fs::write(dir.join("lib.rs"), "fn a() { /* changed */ }").unwrap();
         let mut resumed = load_run(&root, &playbook, &state.run_id).expect("loads");
         assert_eq!(resumed.steps.get("check"), Some(&StepState::Pending));
-        assert!(resumed.fresh_verification.get("check").is_none());
+        assert!(!resumed.fresh_verification.contains_key("check"));
         let outcome = execute_run(
             &playbook,
             &mut resumed,

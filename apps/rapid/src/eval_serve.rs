@@ -464,9 +464,9 @@ fn run_supervised(
         }
     }
     let empty = BoundedTail::new(retain_bytes);
-    let stdout_tail = stdout_tail.unwrap_or_else(|| empty);
+    let stdout_tail = stdout_tail.unwrap_or(empty);
     let empty = BoundedTail::new(retain_bytes);
-    let stderr_tail = stderr_tail.unwrap_or_else(|| empty);
+    let stderr_tail = stderr_tail.unwrap_or(empty);
     Ok(SupervisedOutput {
         success: !timed_out && status.is_some_and(|status| status.success()),
         timed_out,
@@ -1120,7 +1120,7 @@ pub struct ArmPlan {
 fn probe_binary(name: &str) -> bool {
     Command::new("sh")
         .arg("-c")
-        .arg(&format!("command -v {name} >/dev/null 2>&1"))
+        .arg(format!("command -v {name} >/dev/null 2>&1"))
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
@@ -2283,7 +2283,7 @@ mod tests {
 
     #[test]
     fn repeated_trials_report_variation_and_flag_flaky_tasks() {
-        let mut attempt = |trial: u64, passed: bool| {
+        let attempt = |trial: u64, passed: bool| {
             let mut t = task(
                 "a-1",
                 Some("rapid"),

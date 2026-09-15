@@ -205,7 +205,7 @@ impl Connection {
         let stream_control: Arc<Mutex<Option<Sender<StreamCommand>>>> = Arc::new(Mutex::new(None));
         loop {
             let frame = read_request(&mut reader, &cancel)?;
-            let (kind, id, method, params) = match parse_request(&frame) {
+            let (_kind, id, method, params) = match parse_request(&frame) {
                 Some(parsed) => parsed,
                 None => {
                     if frame.get("kind").and_then(serde_json::Value::as_str) == Some("cancel") {
@@ -313,7 +313,7 @@ impl Connection {
                         .rewind(kernel::RewindSession::new(session, to_seq)),
                 )
                 .map_err(|err| err.to_string())?;
-                snapshot_json(&rewound.snapshot())
+                snapshot_json(rewound.snapshot())
             }
             "turns.submit" => {
                 let session = session_of(params)?;
@@ -468,7 +468,7 @@ impl Connection {
                 Ok(None) => {
                     std::thread::sleep(std::time::Duration::from_millis(25));
                 }
-                Err(err) => {
+                Err(_err) => {
                     let cursor = stream.cursor();
                     let frame = serde_json::json!({
                         "schema": "rapidlm.sdk.rpc",

@@ -385,6 +385,9 @@ pub struct LedgerApprovalSink {
     client: InProcessKernelClient,
     session_id: protocol::SessionId,
     actor: ActorRef,
+    /// Retained as the sink's workspace identity for diagnostics and future
+    /// scoping; the journal itself keys off the ledger client.
+    #[allow(dead_code)]
     root: PathBuf,
 }
 

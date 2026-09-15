@@ -3079,7 +3079,7 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // (interactive), or discarded when the child failed.
         let mut diff_note = String::new();
         if let Some(views) = self.agent_views.as_ref() {
-            if let Some(view) = &held_view {
+            if let Some(_view) = &held_view {
                 diff_note = views.diff_stat(agent).unwrap_or_default();
             }
             let held = held_view.is_some();
@@ -5309,10 +5309,9 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
                     if let (Some(id), Some(state)) = (
                         payload.get("id").and_then(serde_json::Value::as_str),
                         payload.get("state").and_then(serde_json::Value::as_str),
-                    ) {
-                        if let Some(entry) = latest.iter_mut().find(|entry| entry.0 == id) {
-                            entry.2 = state.to_owned();
-                        }
+                    ) && let Some(entry) = latest.iter_mut().find(|entry| entry.0 == id)
+                    {
+                        entry.2 = state.to_owned();
                     }
                 }
                 _ => {}
@@ -6118,24 +6117,22 @@ denied\n",
                     );
                     return Ok(());
                 }
-                if remember {
-                    if let Some(pattern) = remembered_pattern(item.payload()) {
-                        match crate::permissions_cli::record_persisted_grant(
-                            self.root,
-                            self.user_home,
-                            &pattern,
-                        ) {
-                            Ok(true) => {
-                                self.append_command_output(format!(
+                if remember && let Some(pattern) = remembered_pattern(item.payload()) {
+                    match crate::permissions_cli::record_persisted_grant(
+                        self.root,
+                        self.user_home,
+                        &pattern,
+                    ) {
+                        Ok(true) => {
+                            self.append_command_output(format!(
                                     "remembered: {pattern} is approved for this project (rapid permissions revoke {pattern} to undo)"
                                 ));
-                            }
-                            Ok(false) => {}
-                            Err(reason) => {
-                                self.append_command_error(format!(
+                        }
+                        Ok(false) => {}
+                        Err(reason) => {
+                            self.append_command_error(format!(
                                     "/approvals: the remembered grant could not be recorded: {reason}; approving once instead"
                                 ));
-                            }
                         }
                     }
                 }
@@ -6215,7 +6212,7 @@ denied\n",
             request = request.remembering();
         }
         block_on(self.client.approve(request), self.cancel)?;
-        let Some(suspended) =
+        let Some(_suspended) =
             crate::approvals::recorded_suspension(self.client, self.session_id, token)
         else {
             self.append_command_error(
@@ -8640,8 +8637,10 @@ pub(crate) fn spawn_acp_turn(
         // state here) except the mode override, which is the serve's own
         // shared cell: a `session/set_mode` switch must reach every later
         // turn of the session.
-        let mut shared = SessionShared::default();
-        shared.permission_mode_override = mode_override;
+        let shared = SessionShared {
+            permission_mode_override: mode_override,
+            ..SessionShared::default()
+        };
         let outcome = catching_panics(std::panic::AssertUnwindSafe(|| {
             run_interactive_turn(
                 &client,
@@ -8680,7 +8679,6 @@ pub(crate) fn acp_resolve_and_continue(
     call_id: &str,
     approve: bool,
 ) -> Result<(), String> {
-    use kernel::KernelClient as _;
     let tip = block_on_session_tip(client, session_id)?;
     let decision = if approve {
         kernel::ApprovalDecision::Approved
@@ -8692,7 +8690,7 @@ pub(crate) fn acp_resolve_and_continue(
         kernel::ResolveApproval::new(session_id, tip, decision, actor.clone(), TraceId::new())
             .with_wait_token(token),
     )?;
-    let suspended = crate::approvals::recorded_suspension(client, session_id, token)
+    let _suspended = crate::approvals::recorded_suspension(client, session_id, token)
         .ok_or_else(|| "the paused turn's resumable state could not be loaded".to_owned())?;
     let decision = if approve {
         ContinuationDecision::Execute
@@ -8751,7 +8749,6 @@ pub(crate) enum ContinuationDecision {
 /// replays the suspension, resolves the pending call per `decision`, and
 /// continues the model loop from the recorded history.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn spawn_continuation_turn(
     client: InProcessKernelClient,
     session_id: protocol::SessionId,
@@ -8796,6 +8793,7 @@ fn spawn_continuation_turn(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_continuation_turn(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
@@ -8833,9 +8831,8 @@ fn run_continuation_turn(
 /// replaced by its post-resolution outcome — so no committed side effect is
 /// repeated and the model's working memory is exactly what it was when the
 /// turn paused.
-#[allow(clippy::too_many_arguments)]
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 fn run_continuation_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
@@ -9865,7 +9862,7 @@ pub(crate) fn run_workflow_agent_step(
     let mut warn: &mut dyn FnMut(&str) = &mut |_| {};
     let (mut tools, permission_lattice) =
         build_interactive_turn_tools(root, trusted, None, None)
-            .map_err(|outcome| "workflow step could not build its tools".to_owned())?;
+            .map_err(|_outcome| "workflow step could not build its tools".to_owned())?;
     let _policy_version = apply_managed_ceilings(&mut tools);
     tools.share_mcp(&Default::default());
     let (_reminder_floor, reminder_block) = interactive_reminders(root, &mut warn);
@@ -17871,7 +17868,6 @@ cancelled and not turned into a turn interrupt:\n{painted}"
     }
 
     #[test]
-    #[test]
     fn model_select_switches_lists_and_clears_through_the_session() {
         let _lock = lock_terminal();
         let env = TempEnv::create();
@@ -18041,7 +18037,6 @@ api_key = "k"
         close_stream(&mut stream);
     }
 
-    #[test]
     #[test]
     fn computer_observe_reports_the_typed_platform_gate_not_a_stub() {
         // `/computer observe` runs the production desktop stack. On this

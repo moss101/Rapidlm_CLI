@@ -471,15 +471,13 @@ impl SubagentRegistry {
 
     /// Try to claim one of the session's detached-concurrency slots.
     fn claim_detached(&self) -> bool {
-        let current = self
-            .detached_running
+        self.detached_running
             .fetch_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
                 |count| (count < MAX_DETACHED_SUBAGENTS as u64).then_some(count + 1),
             )
-            .is_ok();
-        current
+            .is_ok()
     }
 
     /// Release a claimed detached-concurrency slot.
@@ -1893,6 +1891,10 @@ impl WorkspaceTools {
         self.sandbox_confinement_required = required;
     }
 
+    /// Status (2026-09-15): no production caller reads the flag back today
+    /// (the setter is the wired side, driven by the sandbox gate); kept as
+    /// the typed accessor for the tool surface.
+    #[allow(dead_code)]
     pub(crate) fn sandbox_confinement_required(&self) -> bool {
         self.sandbox_confinement_required
     }
@@ -2185,19 +2187,19 @@ impl WorkspaceTools {
             // approval, not a denial: record the request (action, scope,
             // diff), then stop the turn for a human decision. Recording is
             // fail-closed — if the journaling fails, the call stays denied.
-            if matches!(decision, crate::permissions::Decision::Ask(_)) {
-                if let Some(sink) = self.approval_sink.as_ref() {
-                    let request = crate::approvals::build_request(
-                        call.tool(),
-                        call.call_id(),
-                        call.arguments(),
-                        &self.root,
-                    );
-                    if let Ok(_token) = sink.request(&request) {
-                        return Ok(ToolStepResult::ApprovalRequired {
-                            call_id: call.call_id().to_owned(),
-                        });
-                    }
+            if matches!(decision, crate::permissions::Decision::Ask(_))
+                && let Some(sink) = self.approval_sink.as_ref()
+            {
+                let request = crate::approvals::build_request(
+                    call.tool(),
+                    call.call_id(),
+                    call.arguments(),
+                    &self.root,
+                );
+                if let Ok(_token) = sink.request(&request) {
+                    return Ok(ToolStepResult::ApprovalRequired {
+                        call_id: call.call_id().to_owned(),
+                    });
                 }
             }
             return Ok(ToolStepResult::Denied {
@@ -5742,7 +5744,7 @@ pub(crate) fn connect_mcp_server(
 /// `crate::mcp_http::RapidHttpIo`, and the same JSON-RPC handshake the
 /// stdio path runs happens over the streamable transport.
 fn connect_mcp_http(
-    server: &McpServerConfig,
+    _server: &McpServerConfig,
     http: &McpHttpEndpoint,
 ) -> Result<ConnectedMcpServer, McpConnectError> {
     use mcp::transport::{
@@ -5863,10 +5865,10 @@ impl Drop for McpConnection {
         // An HTTP session has no child to reap, but its transport owns a
         // connection the protocol closes with a `close` notification — send
         // it best-effort so the server does not keep session state forever.
-        if let Some(session) = self.session.as_mut() {
-            if let Ok(session) = session.get_mut() {
-                session.close(&capability_broker::CancellationToken::new());
-            }
+        if let Some(session) = self.session.as_mut()
+            && let Ok(session) = session.get_mut()
+        {
+            session.close(&capability_broker::CancellationToken::new());
         }
     }
 }
@@ -5910,11 +5912,16 @@ pub(crate) mod mcp_session_box {
 
     /// Either kind of live MCP session behind one type, so `McpConnection`
     /// and the tool-call path do not need to be generic.
+    /// Status (2026-09-15): the session `tools_*` API is not yet driven by
+    /// the production tool-call path (dynamic MCP tools register through
+    /// the registry instead); kept as the typed surface for that wiring.
+    #[allow(dead_code, clippy::large_enum_variant)]
     pub enum AnySession {
         Stdio(SessionBox),
         Http(HttpSession),
     }
 
+    #[allow(dead_code)]
     impl AnySession {
         pub fn tools_list(
             &mut self,

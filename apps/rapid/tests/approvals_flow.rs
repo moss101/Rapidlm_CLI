@@ -173,7 +173,7 @@ impl ModelDriver for ScriptedModel {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pop_front()
-            .unwrap_or_else(|| Err(ModelStepError::Failed))
+            .unwrap_or(Err(ModelStepError::Failed))
     }
 }
 

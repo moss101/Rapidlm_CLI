@@ -8,6 +8,11 @@
 //!
 //! Repairs are bounded to [`MAX_REPAIR_PASSES`] and [`MAX_REPAIR_RULES`] and
 //! each is recorded in a hash-bound [`RepairRecord`] for telemetry.
+//!
+//! Status (2026-09-15): this is a library primitive with NO production
+//! caller — `rapid`'s tool dispatch surfaces handled argument errors
+//! directly instead of attempting repair. Do not advertise automatic
+//! tool-call repair as a delivered product behavior.
 
 use std::error::Error;
 use std::fmt;

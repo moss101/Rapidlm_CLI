@@ -19,7 +19,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "generate": "node scripts/generate-wire-types.mjs",
     "generate:check": "node scripts/generate-wire-types.mjs --check",
-    "test": "node --experimental-strip-types --test test/generated.test.ts"
+    "test": "node --experimental-strip-types --test test/client.test.ts test/compat.test.ts test/generated.test.ts test/local.test.ts"
   },
   "engines": {
     "node": "24.19.0"

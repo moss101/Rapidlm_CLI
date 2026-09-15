@@ -360,10 +360,10 @@ fn run_bounded_command(
         match child.try_wait().map_err(|err| err.to_string())? {
             Some(status) => {
                 let mut text = String::new();
-                if let Some(mut stdout) = child.stdout.take() {
+                if let Some(stdout) = child.stdout.take() {
                     let _ = stdout.take(8 * 1024).read_to_string(&mut text);
                 }
-                if let Some(mut stderr) = child.stderr.take() {
+                if let Some(stderr) = child.stderr.take() {
                     let _ = stderr.take(4 * 1024).read_to_string(&mut text);
                 }
                 return Ok(CommandResult {

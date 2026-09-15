@@ -1721,7 +1721,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             ))
         };
 
-        let mut state = reduce(
+        let state = reduce(
             AppState::new(),
             &event(
                 1,

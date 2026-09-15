@@ -26,7 +26,7 @@
 //! the user to verify with their own tooling (signing keys are an
 //! operator credential this binary deliberately does not hold).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 pub const UPDATE_USAGE: &str = "\
@@ -258,7 +258,7 @@ pub fn run_update(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandE
     let bin = std::env::current_exe()
         .map_err(|err| crate::p9_commands::P9CommandError::Agent(err.to_string()))?;
     let manifest_bytes =
-        fetch(&url, 64 * 1024).map_err(|err| crate::p9_commands::P9CommandError::Agent(err))?;
+        fetch(&url, 64 * 1024).map_err(crate::p9_commands::P9CommandError::Agent)?;
     let manifest_text = String::from_utf8(manifest_bytes)
         .map_err(|err| crate::p9_commands::P9CommandError::Agent(err.to_string()))?;
     let manifest =
@@ -271,11 +271,9 @@ pub fn run_update(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandE
         );
         return Ok(0);
     }
-    if !force {
-        if let Err(reason) = ensure_newer(&current, &manifest.version) {
-            println!("{reason}");
-            return Ok(0);
-        }
+    if !force && let Err(reason) = ensure_newer(&current, &manifest.version) {
+        println!("{reason}");
+        return Ok(0);
     }
     let artifact = fetch(&manifest.url, 256 * 1024 * 1024)
         .map_err(crate::p9_commands::P9CommandError::Agent)?;
@@ -294,6 +292,7 @@ pub fn run_update(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     /// A controllable stand-in binary: a shell script whose `--version`
     /// prints whatever the file says. The update machinery must treat it

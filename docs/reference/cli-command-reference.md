@@ -40,7 +40,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 | `rapid permissions list|allow|revoke` | persisted per-project tool grants; see the permissions section below |
 | `rapid hooks list|test|enable|disable` | lifecycle hooks |
 | `rapid skills list|show|enable|disable` | skills |
-| `rapid eval run|compare|report` | evaluation harness |
+| `rapid eval --offline\|--live [--grant-shell] [--trials <n>] [--arms <names>] [--suite <dir>] [--scratch <dir>]` | evaluation harness (shipped): three suites (`eval/suite` representative, `eval/suite-smoke` mechanical smoke, `eval/suite-heldout` held-out), grading v2 outside the agent workspace (protected-file integrity, verification, mutation checks), typed infrastructure skips via a health probe, per-arm accounting with coverage/lower-bound flags, full provenance; exit 0 only when every task of every requested arm passed — see `eval/README.md` |
 | `rapid inspect <session/run>` | diagnostic state |
 | `rapid export` | transcript/events/graph/evidence bundle |
 | `rapid doctor` | offline, read-only diagnosis of environment/home/config/model/context-budget/project/trust/sandbox/git/scanner/hooks/MCP/plugins and security posture (see the doctor section below) |

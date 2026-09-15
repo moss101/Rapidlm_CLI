@@ -1715,10 +1715,7 @@ impl SseTextDeltaParser {
     pub fn feed(&mut self, chunk: &str, on_text: &mut dyn FnMut(&str)) -> usize {
         self.buffer.push_str(chunk);
         let mut emitted = 0usize;
-        loop {
-            let Some(end) = self.buffer.find("\n\n") else {
-                break;
-            };
+        while let Some(end) = self.buffer.find("\n\n") {
             let block = self.buffer[..end].to_string();
             self.buffer.drain(..end + 2);
             let mut data = String::new();
@@ -1752,63 +1749,6 @@ impl SseTextDeltaParser {
         }
         emitted
     }
-}
-
-/// Streaming body reader: mirrors `read_http_response_impl`'s header
-/// handling, then forwards every newly-read body byte batch (UTF-8-safe
-/// per batch) while returning the complete raw response for the canonical
-/// parse. Chunked framing is decoded at completion by the caller's normal
-/// path; identity/EOF-framed SSE streams genuinely stream.
-fn read_streaming_body<S: Read + Write>(
-    stream: &mut S,
-    max_body: usize,
-    cancel: &CancellationToken,
-    deadline: Instant,
-    on_chunk: &mut dyn FnMut(&str),
-) -> Result<Vec<u8>, ProviderError> {
-    let raw = read_until_limit_opts(stream, max_body + 16 * 1024, cancel, deadline, false)?;
-    let split = find_header_body_split(&raw).ok_or(ProviderError::Permanent)?;
-    let mut body = raw[split + 4..].to_vec();
-    if !body.is_empty()
-        && let Ok(text) = std::str::from_utf8(&body)
-    {
-        on_chunk(text);
-    }
-    let header_text = std::str::from_utf8(&raw[..split]).map_err(|_| ProviderError::Permanent)?;
-    let mut content_length: Option<usize> = None;
-    for line in header_text.split("\r\n").skip(1) {
-        if let Some((name, value)) = line.split_once(':')
-            && name.trim().eq_ignore_ascii_case("content-length")
-        {
-            content_length = value.trim().parse::<usize>().ok();
-        }
-    }
-    let mut fed = body.len();
-    loop {
-        if body.len() >= max_body {
-            return Err(ProviderError::BoundExceeded);
-        }
-        let mut buf = [0u8; 2048];
-        let want = (max_body - body.len()).min(buf.len());
-        let n = read_some(stream, &mut buf[..want], cancel, deadline)?;
-        if n == 0 {
-            break;
-        }
-        body.extend_from_slice(&buf[..n]);
-        if body.len() > fed
-            && let Ok(text) = std::str::from_utf8(&body[fed..])
-        {
-            on_chunk(text);
-        }
-        fed = body.len();
-        if let Some(length) = content_length
-            && body.len() >= length
-        {
-            body.truncate(length);
-            break;
-        }
-    }
-    Ok(raw)
 }
 
 fn sse_data_blocks(body: &str) -> Vec<String> {

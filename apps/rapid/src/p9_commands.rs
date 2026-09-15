@@ -105,7 +105,7 @@ human decision (resume with --resume / resolve with --resolve) · 1 failed ·
 /// `rapid run` — execute (and resume) a playbook workflow through
 /// `crate::workflow`. See `RUN_USAGE`.
 pub fn run_run_command(args: &[String]) -> Result<i32, P9CommandError> {
-    use crate::workflow::{self, RunOutcome, StepState, WorkflowError};
+    use crate::workflow::{self, RunOutcome};
     use std::sync::{Arc, Mutex};
 
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -119,7 +119,7 @@ pub fn run_run_command(args: &[String]) -> Result<i32, P9CommandError> {
     let mut status: Option<String> = None;
     let mut resolve: Option<String> = None;
     let mut resolve_action: Option<String> = None;
-    let mut resolve_answer: Option<String> = None;
+    let _resolve_answer: Option<String> = None;
     let mut retry_step: Option<String> = None;
     let mut parallel = workflow::DEFAULT_MAX_PARALLEL;
     let mut iterator = args.iter();
@@ -265,8 +265,7 @@ pub fn run_run_command(args: &[String]) -> Result<i32, P9CommandError> {
     let agent_step: workflow::AgentStepFn = Arc::new(move |_key, task| {
         crate::interactive::run_workflow_agent_step(&root_for_steps, trusted_step, task)
     });
-    let command_step: workflow::CommandStepFn =
-        Arc::new(|command, timeout_secs| run_bounded_command(command, timeout_secs));
+    let command_step: workflow::CommandStepFn = Arc::new(run_bounded_command);
     let root_for_human = root.clone();
     let client_for_human = client.clone();
     let actor_for_human = actor.clone();
@@ -296,7 +295,6 @@ pub fn run_run_command(args: &[String]) -> Result<i32, P9CommandError> {
     );
     // Flush the run's progress events into its ledger session.
     {
-        use kernel::KernelClient as _;
         if let Ok(lines) = events.lock() {
             for line in lines.iter() {
                 let value: serde_json::Value =
@@ -414,7 +412,6 @@ fn settle_resolved_waits(
     session: protocol::SessionId,
     actor: &event_ledger::event::ActorRef,
 ) {
-    use kernel::KernelClient as _;
     let pending = crate::approvals::pending_approvals(client, session);
     let waiting: Vec<String> = state
         .steps
@@ -494,7 +491,7 @@ fn run_bounded_command(command: &str, timeout_secs: u64) -> Result<String, Strin
         match child.try_wait().map_err(|err| err.to_string())? {
             Some(status) => {
                 let mut output = String::new();
-                if let Some(mut stdout) = child.stdout.take() {
+                if let Some(stdout) = child.stdout.take() {
                     use std::io::Read as _;
                     let _ = stdout.take(4 * 1024).read_to_string(&mut output);
                 }
@@ -688,13 +685,12 @@ fn find_wait_session(
         let Ok(session) = summary.session_id.parse::<protocol::SessionId>() else {
             continue;
         };
-        if let Ok(pendings) = block_on_kernel(client.pending_approvals(session)) {
-            if pendings
+        if let Ok(pendings) = block_on_kernel(client.pending_approvals(session))
+            && pendings
                 .iter()
                 .any(|pending| pending.payload().id == wait_token)
-            {
-                return Some(session);
-            }
+        {
+            return Some(session);
         }
     }
     None
@@ -3441,10 +3437,10 @@ fn sbom_from_lock(lock_path: &str) -> Option<serde_json::Value> {
     let mut name: Option<String> = None;
     let mut version: Option<String> = None;
     let mut is_workspace_member = false;
-    let mut flush = |name: &mut Option<String>,
-                     version: &mut Option<String>,
-                     member: &mut bool,
-                     components: &mut Vec<serde_json::Value>| {
+    let flush = |name: &mut Option<String>,
+                 version: &mut Option<String>,
+                 member: &mut bool,
+                 components: &mut Vec<serde_json::Value>| {
         if let (Some(n), Some(v)) = (name.take(), version.take()) {
             components.push(serde_json::json!({
                 "type": "library",

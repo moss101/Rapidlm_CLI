@@ -833,6 +833,10 @@ impl<I: StreamableHttpIo, Rsv: NetworkResolver> McpTransport for StreamableHttpT
 
     /// Streamable HTTP answers every POST within its own response: the
     /// id-matched reply IS the body (a notification POST's body is empty).
+    /// Unwired in production today — `rapid` speaks stdio only — kept as
+    /// the transport's own contract surface (see the `tools_list` /
+    /// `tools_call` session API).
+    #[allow(dead_code)]
     fn exchange_skipping_notifications(
         &mut self,
         request: &[u8],
@@ -1055,6 +1059,10 @@ impl<T: McpTransport> McpSession<T> {
     /// until either the matching response arrives or `recv_frame` itself
     /// errors out (cancellation, I/O timeout, or the peer closing), which
     /// already bounds how long a dead/hung connection can block.
+    /// Status (2026-09-15): the `McpSession` tools API this serves is not
+    /// called by `rapid` yet (stdio tools flow uses raw frames), so this
+    /// private helper is deliberately kept with its callers.
+    #[allow(dead_code)]
     fn exchange_skipping_notifications(
         &mut self,
         request: &[u8],

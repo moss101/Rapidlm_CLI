@@ -46,7 +46,7 @@ impl StreamableHttpIo for RapidHttpIo {
             } else {
                 token.clone()
             })
-            .map_err(|err| TransportError::HandshakeFailed)?,
+            .map_err(|_err| TransportError::HandshakeFailed)?,
             timeout,
             256 * 1024,
         );
@@ -89,7 +89,7 @@ impl StreamableHttpIo for RapidHttpIo {
                 &token,
                 &router_cancel,
             )
-            .map_err(|err| map_provider_error(err))?;
+            .map_err(map_provider_error)?;
 
         // Map the raw response back into the transport's typed shape: the
         // session id and redirect location come from headers only.

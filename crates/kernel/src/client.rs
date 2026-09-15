@@ -992,7 +992,7 @@ impl InProcessKernelClient {
                         &ledger_live(),
                     )
                     .map(|_| ()),
-                TurnOutcome::Interrupted | TurnOutcome::Waiting { .. } => self
+                TurnOutcome::Interrupted | TurnOutcome::Waiting => self
                     .ledger
                     .append(
                         req.session_id,
@@ -1001,7 +1001,7 @@ impl InProcessKernelClient {
                         TurnInterruptedPayload {
                             turn_id: req.turn_id,
                             reason: match &req.outcome {
-                                TurnOutcome::Waiting { .. } => InterruptReason::ApprovalPending,
+                                TurnOutcome::Waiting => InterruptReason::ApprovalPending,
                                 _ => InterruptReason::ClientRequested,
                             },
                         },
@@ -1326,12 +1326,11 @@ impl InProcessKernelClient {
                     pending.push(PendingApproval { seq, payload });
                     let _ = &pending;
                 }
-            } else if event.kind() == EventKind::ApprovalResolved {
-                if let Ok(resolved) =
+            } else if event.kind() == EventKind::ApprovalResolved
+                && let Ok(resolved) =
                     serde_json::from_value::<ApprovalResolvedPayload>(event.payload().clone())
-                {
-                    pending.retain(|request| request.payload.id != resolved.wait_token);
-                }
+            {
+                pending.retain(|request| request.payload.id != resolved.wait_token);
             }
         }
         Ok(pending)

@@ -892,8 +892,7 @@ pub fn select_active_model_with_override(
                     id: id.to_owned(),
                     available: config.model_ids(),
                 },
-            )
-            .into());
+            ));
         }
         effective_env.retain(|(key, _)| key != DEFAULT_MODEL_ENV);
         config.models.default = Some(id.to_owned());

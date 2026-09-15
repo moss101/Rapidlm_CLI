@@ -466,7 +466,7 @@ pub trait LiveModelCall {
     /// it while the response arrives (delivery goal §2 progressive
     /// streaming). Default: no-op for models/drivers that do not support
     /// live deltas (scripted, unconfigured).
-    fn set_delta_sink(&mut self, sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>) {
+    fn set_delta_sink(&mut self, sink: Option<crate::model::DeltaSink>) {
         let _ = sink;
     }
 
@@ -1730,7 +1730,7 @@ where
 {
     let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let cost = CostAccumulator::new();
-    let turn_diag = diag.clone();
+    let _turn_diag = diag.clone();
     let supervised = SupervisedModel {
         inner: backing,
         counter: std::sync::Arc::clone(&counter),

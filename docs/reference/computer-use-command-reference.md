@@ -1,5 +1,15 @@
 # Computer Use Command Reference
 
+> **Delivery status (2026-09-15).** Shipped today: the interactive entry
+> points `/computer observe` and `/computer test` run the production stack
+> (`ComputerUseRuntime` policies over `DesktopActor` over the platform AX
+> host) and fail CLOSED with typed reasons — on this build the live host
+> never links the OS Accessibility framework (`forbid(unsafe_code)`), so
+> observations are gated behind OS trust that cannot be confirmed here.
+> `/computer record` and the CLI grammar below remain the TARGET spec: no
+> live browser/desktop driver is implemented (the Playwright boundary has
+> only an in-process stand-in), so no end-to-end live workflow is claimed.
+
 Model-facing contracts stay small (`computer.observe`, `computer.act`, `browser.act`, `mobile.act`); the CLI exposes ergonomic subcommands.
 
 ```text

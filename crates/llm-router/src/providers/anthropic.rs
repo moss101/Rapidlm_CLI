@@ -605,10 +605,7 @@ impl AnthropicSseTextDeltaParser {
     pub fn feed(&mut self, chunk: &str, on_text: &mut dyn FnMut(&str)) -> usize {
         self.buffer.push_str(chunk);
         let mut emitted = 0usize;
-        loop {
-            let Some(end) = self.buffer.find("\n\n") else {
-                break;
-            };
+        while let Some(end) = self.buffer.find("\n\n") {
             let block = self.buffer[..end].to_string();
             self.buffer.drain(..end + 2);
             let mut data = String::new();

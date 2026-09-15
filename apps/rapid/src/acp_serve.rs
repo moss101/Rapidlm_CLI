@@ -19,7 +19,6 @@
 //!
 //! Frames are newline-delimited JSON-RPC over stdio (`crates/acp::stdio`).
 
-use std::io::Stdin;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -27,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use acp::stdio::{FrameReader, FrameWriter, JsonRpcId, JsonRpcMessage, MAX_FRAME_BYTES};
 use acp::v1::{MappedEvent, V1Adapter, map_kernel_event};
 use kernel::InProcessKernelClient;
-use protocol::{ProjectId, SessionId};
+use protocol::ProjectId;
 
 use crate::interactive::{acp_resolve_and_continue, spawn_acp_turn};
 
@@ -476,20 +475,6 @@ fn stream_prompt(
 
 const LOOP_DOWN: &str = "the editor's transport closed";
 const ACP_DISCONNECT: &str = "clean disconnect";
-
-fn permission_of(mapped: &MappedEvent) -> Option<&acp::v1::PermissionRequest> {
-    match mapped {
-        MappedEvent::PermissionRequired(request) => Some(request),
-        _ => None,
-    }
-}
-
-fn update_of(mapped: &MappedEvent) -> Option<&acp::v1::SessionUpdateNotification> {
-    match mapped {
-        MappedEvent::SessionUpdate(update) => Some(update),
-        _ => None,
-    }
-}
 
 fn permission_approves(decision: &serde_json::Value) -> bool {
     match decision.get("outcome") {
