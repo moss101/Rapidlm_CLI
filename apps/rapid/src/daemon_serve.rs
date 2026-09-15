@@ -528,6 +528,7 @@ fn write_frame(
         .map_err(|err| err.to_string())
 }
 
+#[cfg(unix)]
 fn read_request(
     reader: &mut FrameReader<impl std::io::Read>,
     cancel: &acp::stdio::CancellationToken,
@@ -539,6 +540,7 @@ fn read_request(
     serde_json::from_slice(&frame).map_err(|err| err.to_string())
 }
 
+#[cfg(unix)]
 fn parse_request(
     frame: &serde_json::Value,
 ) -> Option<(String, serde_json::Value, String, serde_json::Value)> {
@@ -560,6 +562,7 @@ fn parse_request(
     ))
 }
 
+#[cfg(unix)]
 fn hello_ok(id: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "schema": "rapidlm.sdk.rpc",
@@ -572,6 +575,7 @@ fn hello_ok(id: serde_json::Value) -> serde_json::Value {
     })
 }
 
+#[cfg(unix)]
 fn response_ok(id: &serde_json::Value, result: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "schema": "rapidlm.sdk.rpc",
@@ -582,6 +586,7 @@ fn response_ok(id: &serde_json::Value, result: serde_json::Value) -> serde_json:
     })
 }
 
+#[cfg(unix)]
 fn error_frame(id: &serde_json::Value, code: &str, message: &str) -> serde_json::Value {
     serde_json::json!({
         "schema": "rapidlm.sdk.rpc",
@@ -592,10 +597,12 @@ fn error_frame(id: &serde_json::Value, code: &str, message: &str) -> serde_json:
     })
 }
 
+#[cfg(unix)]
 fn hello_frame_id(hello: &serde_json::Value) -> serde_json::Value {
     hello.get("id").cloned().unwrap_or(serde_json::Value::Null)
 }
 
+#[cfg(unix)]
 fn session_of(params: &serde_json::Value) -> Result<SessionId, String> {
     let raw = params
         .get("session_id")
@@ -605,6 +612,7 @@ fn session_of(params: &serde_json::Value) -> Result<SessionId, String> {
         .map_err(|_| format!("session_id {raw:?} is not a session id"))
 }
 
+#[cfg(unix)]
 fn uuid_field(params: &serde_json::Value, field: &str) -> Result<SessionId, String> {
     let raw = params
         .get(field)
@@ -614,6 +622,7 @@ fn uuid_field(params: &serde_json::Value, field: &str) -> Result<SessionId, Stri
         .map_err(|_| format!("{field} {raw:?} is not an id"))
 }
 
+#[cfg(unix)]
 fn u64_field(params: &serde_json::Value, field: &str) -> Result<u64, String> {
     params
         .get(field)
@@ -621,6 +630,7 @@ fn u64_field(params: &serde_json::Value, field: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("missing or invalid {field}"))
 }
 
+#[cfg(unix)]
 fn trace_id_of(params: &serde_json::Value) -> protocol::TraceId {
     params
         .get("trace_id")
@@ -631,10 +641,12 @@ fn trace_id_of(params: &serde_json::Value) -> protocol::TraceId {
 
 /// The exact wire shape `decodeSession` accepts (unknown fields are
 /// rejected by the SDK, so this stays minimal and precise).
+#[cfg(unix)]
 fn snapshot_json(snapshot: &kernel::SessionSnapshot) -> Result<serde_json::Value, String> {
     serde_json::to_value(snapshot).map_err(|err| err.to_string())
 }
 
+#[cfg(unix)]
 fn turn_handle_json(handle: &kernel::TurnHandle) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({
         "session_id": handle.session_id().to_string(),
