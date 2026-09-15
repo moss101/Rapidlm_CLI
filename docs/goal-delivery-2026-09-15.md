@@ -275,3 +275,21 @@ primitive with no production caller; smart phase routing remains limited.
 The provider-interruption/approval-suspension/merge-conflict/MCP-ACP-
 streaming axes remain covered at the runtime level, not as suite tasks.
 None of these is counted as newly implemented.
+
+### Verification of the follow-up (HEAD `18d9c4d`)
+
+- Offline representative suite with the hardened judge: **12/12 passed**
+  (`eval/results/offline-1789495192.json`).
+- Live representative re-run: grok **12/12** on the new judge
+  (`eval/results/live-1789500016.json`); rapid arm provider-blocked
+  (typed skips) — same-model parity remains unmeasured and is not claimed.
+- CI: run `35018258270` **green** (ubuntu/macos/windows build + lint +
+  SDK gates), release-matrix run `35018257916` **green** for this exact
+  commit — the first release matrix to cover the post-delivery
+  implementation.
+- **Windows limitation preserved**: the windows Test step still reports
+  the same 45 runtime test failures (27 + 11 + 3 + 4, project-trust
+  catalog groups and peers) inside a green job — `ci.yml`'s
+  `continue-on-error` masks them, so a green Windows job remains no proof
+  of Windows runtime correctness. The limitation stands until those
+  runtime tests pass.
