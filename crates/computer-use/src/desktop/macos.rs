@@ -1,14 +1,15 @@
-//! macOS Accessibility adapter behind [`DesktopBackend`].
+//! macOS AX adapter behind [`DesktopBackend`].
 //!
 //! AX windows/nodes become stable-per-observation target refs. Trust is
 //! probed without prompting (T-CU-01). Stale AX elements map to retryable
 //! [`DesktopError::StaleObservation`] (T-CU-02). Secret handles stay opaque
 //! (T-CU-03). Coordinate injection is never implied by AX support (T-CU-02).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use capability_broker::CancellationToken;
 
@@ -106,9 +107,46 @@ pub struct MacosDesktopBackend<H = LiveMacosAxHost> {
     host: H,
 }
 
-/// Platform probe only. Does not link ApplicationServices or prompt TCC.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct LiveMacosAxHost;
+/// Live macOS host: real Accessibility access through the `osascript` /
+/// System Events scripting bridge — the automation surface the OS supports
+/// without this crate linking ApplicationServices (it is
+/// `forbid(unsafe_code)`). The probe never prompts for, grants, or changes
+/// OS privacy settings: a TCC consent dialog that is still pending surfaces
+/// as a bounded timeout, reported exactly like a denial.
+#[derive(Debug, Default)]
+pub struct LiveMacosAxHost {
+    /// Snapshot generation counter; refs carry it, so a ref from an older
+    /// observation never resolves against a newer snapshot's locators. The
+    /// generation identifies a STATE version, not a call count: an
+    /// unchanged desktop re-captures under the SAME generation (the actor's
+    /// `require_current` recaptures and demands an unchanged generation
+    /// between observe and act), and only a changed walk bumps it.
+    generation: AtomicU64,
+    /// Content hash → generation of the last snapshot, for the
+    /// unchanged-state check above.
+    last_state: Mutex<Option<(u64, u64)>>,
+    /// Observation-bound element locators from the LATEST snapshot: node or
+    /// window ref → its `System Events` path. Replaced wholesale on every
+    /// snapshot, so a stale ref misses and the backend maps the miss to the
+    /// retryable [`DesktopError::StaleObservation`] (T-CU-02).
+    locators: Mutex<HashMap<String, ElementLocator>>,
+}
+
+/// Where an observed element lived in the System Events object tree when
+/// its snapshot was taken — the path an action re-walks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ElementLocator {
+    process: String,
+    /// Window ordinal within the process at snapshot time: the System
+    /// Events addressing an act re-walks. Deliberately the ordinal, never
+    /// the title — titles churn between observation and act.
+    window_index: usize,
+    /// UI-element ordinal within the window; `None` for window-level refs.
+    element_index: Option<usize>,
+    /// Observed AX role, used to pick how a typed value is delivered
+    /// (`set value` on text roles, `keystroke` otherwise).
+    role: String,
+}
 
 /// In-process AX stand-in. No host Accessibility API or input injection.
 pub struct ScriptedMacosAxHost {
@@ -335,7 +373,7 @@ impl MacosAxSnapshot {
 impl MacosDesktopBackend<LiveMacosAxHost> {
     pub fn live() -> Self {
         Self {
-            host: LiveMacosAxHost,
+            host: LiveMacosAxHost::default(),
         }
     }
 }
@@ -438,22 +476,572 @@ impl<H: MacosAxHost> DesktopBackend for MacosDesktopBackend<H> {
 }
 
 impl LiveMacosAxHost {
-    pub const fn new() -> Self {
-        Self
+    /// The no-prompt trust probe: System Events reports whether the calling
+    /// context has Accessibility (`UI elements enabled`). Requires no Apple
+    /// Event the caller could act on; first-ever use may still surface the
+    /// OS's own Automation consent dialog — pending consent bounds out to a
+    /// timeout, reported as not trusted, never as granted.
+    const PROBE_SCRIPT: &str = "tell application \"System Events\" to UI elements enabled";
+
+    /// Bounded AX walk: visible processes → windows (name, position, size)
+    /// → first-level UI elements (role, name), as TAB-separated rows.
+    /// `F` frontmost process, `W` window, `N` element. Names are untrusted
+    /// data and may be `missing value`; every field read is individually
+    /// `try`-wrapped so one hostile element cannot fail the walk.
+    const SNAPSHOT_SCRIPT: &str = r#"set TAB to character id 9
+set LF to linefeed
+set out to ""
+tell application "System Events"
+	set frontApp to ""
+	try
+		set frontApp to name of first application process whose frontmost is true
+	end try
+	set out to "F" & TAB & frontApp & LF
+	set pcount to 0
+	repeat with p in (application processes whose visible is true)
+		set pcount to pcount + 1
+		if pcount > 6 then exit repeat
+		set pname to name of p
+		set widx to 0
+		try
+			repeat with w in windows of p
+				set widx to widx + 1
+				if widx > 4 then exit repeat
+				set wname to ""
+				try
+					set wname to name of w
+				end try
+				set wx to 0
+				set wy to 0
+				set ww to 0
+				set wh to 0
+				set wfocused to false
+				try
+					set wx to item 1 of (get position of w)
+					set wy to item 2 of (get position of w)
+					set ww to item 1 of (get size of w)
+					set wh to item 2 of (get size of w)
+				end try
+				try
+					set wfocused to (get value of attribute "AXMain" of w)
+				end try
+				set out to out & "W" & TAB & pname & TAB & wname & TAB & wx & TAB & wy & TAB & ww & TAB & wh & TAB & wfocused & LF
+				set eidx to 0
+				try
+					repeat with e in UI elements of w
+						set eidx to eidx + 1
+						if eidx > 24 then exit repeat
+						set erole to ""
+						try
+							set erole to role of e
+						end try
+						set ename to ""
+						try
+							set ename to name of e
+						end try
+						set out to out & "N" & TAB & pname & TAB & widx & TAB & eidx & TAB & erole & TAB & ename & LF
+					end repeat
+				end try
+			end repeat
+		end try
+	end repeat
+end tell
+return out"#;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Resolve a current-snapshot ref to its locator. A miss is the stale
+    /// observation case: the ref names an element from an earlier (or
+    /// fabricated) snapshot.
+    fn current_locator(&self, id: &str) -> Result<ElementLocator, DesktopError> {
+        let locators = self.locators.lock().unwrap_or_else(|p| p.into_inner());
+        locators
+            .get(id)
+            .cloned()
+            .ok_or(DesktopError::TargetNotFound)
+    }
+
+    /// Translate a validated action against its resolved target into the
+    /// AppleScript that performs it. Pure — the caller runs it.
+    fn plan_act(
+        &self,
+        action: &DesktopAction,
+        resolved: &ResolvedDesktopTarget,
+    ) -> Result<String, DesktopError> {
+        match action {
+            DesktopAction::Click { .. } => {
+                if let Some(node) = resolved.node() {
+                    let loc = self.current_locator(node)?;
+                    if loc.element_index.is_none() {
+                        return Err(DesktopError::TargetNotFound);
+                    }
+                    Ok(tell_events(&format!(
+                        "tell process \"{}\"\n\tclick {}\nend tell",
+                        apple_quote(&loc.process),
+                        element_path(&loc),
+                    )))
+                } else if let Some(win) = resolved.window() {
+                    let loc = self.current_locator(win)?;
+                    Ok(raise_window_script(&loc))
+                } else {
+                    Err(DesktopError::TargetNotFound)
+                }
+            }
+            DesktopAction::TypeText { value, .. } => {
+                // Secret handles never resolve to plaintext here (T-CU-03):
+                // the host has no broker, so a handle cannot be typed.
+                let SecretAwareString::Literal(text) = value else {
+                    return Err(DesktopError::CapabilityUnavailable);
+                };
+                let quoted = apple_quote(text);
+                if let Some(node) = resolved.node() {
+                    let loc = self.current_locator(node)?;
+                    if is_text_role(&loc.role) {
+                        return Ok(tell_events(&format!(
+                            "tell process \"{}\"\n\tset value of {} to \"{}\"\nend tell",
+                            apple_quote(&loc.process),
+                            element_path(&loc),
+                            quoted,
+                        )));
+                    }
+                    // Non-text target: keystroke to the frontmost app after
+                    // focusing the observed element.
+                    let focus = focus_element_statement(&loc);
+                    return Ok(tell_events(&format!("{focus}\n\tkeystroke \"{quoted}\"",)));
+                }
+                Ok(tell_events(&format!("keystroke \"{quoted}\"")))
+            }
+            DesktopAction::Key { key, target } => {
+                let stroke = key_statement(key.as_str())?;
+                let focus = match target.as_ref().and_then(|_| resolved.node()) {
+                    Some(node) => focus_element_statement(&self.current_locator(node)?),
+                    None => String::new(),
+                };
+                Ok(tell_events(
+                    &format!("{focus}\n\t{stroke}").trim_end().to_owned(),
+                ))
+            }
+            DesktopAction::Chord { keys } => {
+                // System Events has no simultaneous-chord primitive for
+                // arbitrary key sets, and its parseable keys carry no
+                // modifiers — a single-key "chord" is a key, anything else
+                // is reported unsupported rather than faked.
+                let [only] = keys.as_slice() else {
+                    return Err(DesktopError::CapabilityUnavailable);
+                };
+                let stroke = key_statement(only.as_str())?;
+                Ok(tell_events(&stroke))
+            }
+            DesktopAction::FocusWindow { .. } | DesktopAction::CloseWindow { .. } => {
+                let win = resolved.window().ok_or(DesktopError::TargetNotFound)?;
+                let loc = self.current_locator(win)?;
+                if action_matches_window(&loc) {
+                    if matches!(action, DesktopAction::CloseWindow { .. }) {
+                        Ok(tell_events(&format!(
+                            "tell process \"{}\"\n\tclick (first UI element of {} whose subrole is \"AXCloseButton\")\nend tell",
+                            apple_quote(&loc.process),
+                            window_path(&loc),
+                        )))
+                    } else {
+                        Ok(raise_window_script(&loc))
+                    }
+                } else {
+                    Err(DesktopError::TargetNotFound)
+                }
+            }
+            // The adapter advertises no pointer-wheel, resize, app-launch,
+            // or coordinate surface (see `DesktopCapabilities::semantic`);
+            // semantic AX support never implies coordinate injection
+            // (T-CU-02). Reported unsupported, never faked.
+            DesktopAction::Scroll { .. }
+            | DesktopAction::ResizeWindow { .. }
+            | DesktopAction::LaunchApp { .. }
+            | DesktopAction::CoordinateFallback { .. } => Err(DesktopError::CapabilityUnavailable),
+        }
+    }
+
+    /// Parse one bounded `SNAPSHOT_SCRIPT` output into a snapshot,
+    /// recording every element's locator under its observation-bound ref.
+    /// Pure — tests feed recorded transcripts.
+    fn parse_snapshot(
+        &self,
+        raw: &str,
+        generation: u64,
+        locators: &mut HashMap<String, ElementLocator>,
+    ) -> Result<MacosAxSnapshot, DesktopError> {
+        let mut windows = Vec::new();
+        let mut nodes = Vec::new();
+        // Window refs are globally unique per snapshot (a per-process
+        // ordinal would collide across processes); the locator's
+        // window_index stays per-process, which is the System Events
+        // addressing space an act re-walks.
+        let mut next_window_ordinal = 0usize;
+        // (process, window ordinal) → (win ref, observed title) the node
+        // rows point at; the title rides on the node's locator because a
+        // named window re-anchors an act more stably than an ordinal.
+        let mut window_refs: HashMap<(String, usize), (String, String)> = HashMap::new();
+        let mut frontmost = String::new();
+        for line in raw.lines() {
+            let fields: Vec<&str> = line.split('\t').collect();
+            match fields.first().copied() {
+                // `F` names the frontmost process: a window is only "the
+                // focused window" when it is its app's AXMain window AND
+                // its app is frontmost (every app has a main window, but
+                // only the front app's is the key window).
+                Some("F") => {
+                    frontmost = fields.get(1).copied().unwrap_or("").trim().to_owned();
+                }
+                Some("W") if fields.len() >= 8 => {
+                    let nums = &fields[fields.len() - 5..];
+                    let (x, y, w, h) = match (
+                        nums[0].trim().parse::<i32>(),
+                        nums[1].trim().parse::<i32>(),
+                        nums[2].trim().parse::<i32>(),
+                        nums[3].trim().parse::<i32>(),
+                    ) {
+                        (Ok(x), Ok(y), Ok(w), Ok(h)) => (x, y, w, h),
+                        _ => continue,
+                    };
+                    let process = fields[1].trim().to_owned();
+                    let focused = nums[4].trim() == "true" && process == frontmost;
+                    // A tab inside a window title shifts the columns; the
+                    // title is everything between the process and the
+                    // geometry, joined back with spaces.
+                    let title = fields[2..fields.len() - 5].join(" ");
+                    let title = clean_field(&title);
+                    let index = window_refs
+                        .keys()
+                        .filter(|(proc, _)| proc == &process)
+                        .count()
+                        + 1;
+                    next_window_ordinal += 1;
+                    let id = format!("{}{generation}:{}", WINDOW_REF_PREFIX, next_window_ordinal);
+                    let window = MacosAxWindow::new(
+                        &id,
+                        &title,
+                        Some(&process),
+                        super::backend::Rect::new(x, y, x.saturating_add(w), y.saturating_add(h)),
+                        focused,
+                        false,
+                    )?;
+                    locators.insert(
+                        id.clone(),
+                        ElementLocator {
+                            process: process.clone(),
+                            window_index: index,
+                            element_index: None,
+                            role: String::new(),
+                        },
+                    );
+                    window_refs.insert((process.clone(), index), (id, title));
+                    windows.push(window);
+                }
+                Some("N") if fields.len() >= 6 => {
+                    let process = fields[1].trim().to_owned();
+                    let (Ok(window_index), Ok(element_index)) = (
+                        fields[2].trim().parse::<usize>(),
+                        fields[3].trim().parse::<usize>(),
+                    ) else {
+                        continue;
+                    };
+                    let role = clean_field(fields[4]);
+                    let name = clean_field(&fields[5..].join(" "));
+                    let Some((window_id, _window_title)) =
+                        window_refs.get(&(process.clone(), window_index))
+                    else {
+                        continue;
+                    };
+                    let id = format!("{}{generation}:{}", NODE_REF_PREFIX, nodes.len() + 1);
+                    let actions = role_actions(&role);
+                    let node = MacosAxNode::new(
+                        &id,
+                        window_id,
+                        &role,
+                        &name,
+                        None,
+                        &actions,
+                        role == SECURE_TEXT_ROLE,
+                    )?;
+                    locators.insert(
+                        id,
+                        ElementLocator {
+                            process,
+                            window_index,
+                            element_index: Some(element_index),
+                            role,
+                        },
+                    );
+                    nodes.push(node);
+                    if nodes.len() >= MAX_NODES {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        MacosAxSnapshot::new(generation, live_geometry(), windows, nodes)
+    }
+}
+
+/// 1920×1080 stand-in geometry: AX-only observations carry no coordinate
+/// targets (`coordinate_fallback` is off), so this bounds derived rects
+/// rather than locating anything. Distinct from `default_geometry`'s
+/// scripted-test value so a live transcript can never be confused with a
+/// scripted one.
+fn live_geometry() -> DisplayGeometry {
+    DisplayGeometry::new(1920, 1080).expect("1920x1080 is inside the geometry bounds")
+}
+
+/// The one role whose value is a secret (T-CU-03).
+const SECURE_TEXT_ROLE: &str = "AXSecureTextField";
+
+/// `System Events` path for a locator's window: the snapshot-time ordinal
+/// within its process. Deliberately NOT the window title — titles churn
+/// (a terminal retitles on every prompt), while the ordinal is stable from
+/// observation through the act that follows it.
+fn window_path(loc: &ElementLocator) -> String {
+    format!("window {}", loc.window_index)
+}
+
+fn element_path(loc: &ElementLocator) -> String {
+    match loc.element_index {
+        Some(index) => format!("UI element {index} of {}", window_path(loc)),
+        None => window_path(loc),
+    }
+}
+
+fn tell_events(body: &str) -> String {
+    format!("tell application \"System Events\"\n{body}\nend tell")
+}
+
+fn raise_window_script(loc: &ElementLocator) -> String {
+    tell_events(&format!(
+        "set frontmost of process \"{}\" to true\ntell process \"{}\"\n\tperform action \"AXRaise\" of {}\nend tell",
+        apple_quote(&loc.process),
+        apple_quote(&loc.process),
+        window_path(loc),
+    ))
+}
+
+fn focus_element_statement(loc: &ElementLocator) -> String {
+    format!(
+        "tell process \"{}\"\n\tset focused of {} to true\nend tell",
+        apple_quote(&loc.process),
+        element_path(loc),
+    )
+}
+
+/// Roles whose value is text the `set value` verb addresses.
+fn is_text_role(role: &str) -> bool {
+    matches!(
+        role,
+        "AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox"
+    )
+}
+
+/// Whether a locator denotes a window (not an element within one).
+fn action_matches_window(loc: &ElementLocator) -> bool {
+    loc.element_index.is_none()
+}
+
+/// The AX actions an observed role affords. Conservative: a role not in
+/// this table affords nothing.
+fn role_actions(role: &str) -> Vec<MacosAxAction> {
+    let press = matches!(
+        role,
+        "AXButton"
+            | "AXLink"
+            | "AXCheckBox"
+            | "AXRadioButton"
+            | "AXPopUpButton"
+            | "AXMenuButton"
+            | "AXMenuBarItem"
+            | "AXMenuItem"
+    );
+    let value = is_text_role(role) || role == SECURE_TEXT_ROLE;
+    let pick = matches!(role, "AXMenuItem" | "AXMenu");
+    let confirm = role == "AXCheckBox" || is_text_role(role);
+    let mut actions = Vec::new();
+    if press {
+        actions.push(MacosAxAction::Press);
+    }
+    if value {
+        actions.push(MacosAxAction::SetValue);
+    }
+    if confirm {
+        actions.push(MacosAxAction::Confirm);
+    }
+    if pick {
+        actions.push(MacosAxAction::Pick);
+    }
+    actions
+}
+
+/// Named key → AppleScript `key code`; a single character → `keystroke`.
+fn key_statement(raw: &str) -> Result<String, DesktopError> {
+    const ENTER: u32 = 36;
+    let code = match raw {
+        "Enter" => ENTER,
+        "Tab" => 48,
+        "Escape" => 53,
+        "Backspace" => 51,
+        "Delete" => 117,
+        "Space" => 49,
+        "Home" => 115,
+        "End" => 119,
+        "PageUp" => 116,
+        "PageDown" => 121,
+        "ArrowUp" => 126,
+        "ArrowDown" => 125,
+        "ArrowLeft" => 123,
+        "ArrowRight" => 124,
+        other => {
+            let mut chars = other.chars();
+            let (Some(only), None) = (chars.next(), chars.next()) else {
+                return Err(DesktopError::KeyInvalid);
+            };
+            return Ok(format!("keystroke \"{}\"", apple_quote(&only.to_string())));
+        }
+    };
+    Ok(format!("key code {code}"))
+}
+
+/// Escape `text` as an AppleScript double-quoted literal body: backslashes
+/// and quotes escaped, control characters dropped (never sent to a shell
+/// or the scripting bridge).
+fn apple_quote(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if (c as u32) < 0x20 || (c as u32) == 0x7f => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Normalize an observed field: `missing value` and bounds-checking
+/// sentinels become empty, embedded tabs/newlines collapse to spaces.
+fn clean_field(text: &str) -> String {
+    let cleaned = text.replace(['\t', '\n', '\r'], " ");
+    if cleaned == "missing value" {
+        String::new()
+    } else {
+        cleaned
+    }
+}
+
+/// Drain one child pipe to the end on its own thread, capped at `cap`
+/// bytes. Reading only after `wait` would deadlock on a full pipe.
+fn join_drain<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+    cap: usize,
+) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            buf.truncate(cap);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    })
+}
+
+/// One bounded `osascript` run. Stdout can be substantial (a snapshot), so
+/// both pipes are drained on dedicated threads — no wait-then-read
+/// deadlock on a filled pipe. Cancel kills the child and reports
+/// [`DesktopError::Cancelled`]; the timeout kills it and reports
+/// [`DesktopError::Backend`] (the probe maps its own timeout to a
+/// not-trusted verdict).
+fn run_osascript(
+    script: &str,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<String, DesktopError> {
+    if !cfg!(target_os = "macos") {
+        return Err(DesktopError::HealthFailed);
+    }
+    let started = Instant::now();
+    let mut child = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|_| DesktopError::HealthFailed)?;
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    // Both pipes drain on dedicated threads: reading only after `wait`
+    // would deadlock once a snapshot fills the 64KiB pipe buffer.
+    let stdout_task = join_drain(stdout_pipe, 1024 * 1024);
+    let stderr_task = join_drain(stderr_pipe, 4096);
+    let outcome = loop {
+        if cancel.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            break Err(DesktopError::Cancelled);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = stdout_task.join().unwrap_or_default();
+                let stderr = stderr_task.join().unwrap_or_default();
+                if status.success() {
+                    break Ok(stdout);
+                }
+                break Err(classify_osascript_failure(&stderr));
+            }
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(DesktopError::Backend);
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => break Err(DesktopError::Backend),
+        }
+    };
+    outcome
+}
+
+/// Map `osascript`'s failure output onto the typed error: an element that
+/// no longer exists is the retryable stale-observation case, permission
+/// errors stay typed, everything else is a backend failure.
+fn classify_osascript_failure(stderr: &str) -> DesktopError {
+    if stderr.contains("-1728")
+        || stderr.contains("Can\u{2019}t get")
+        || stderr.contains("Can't get")
+    {
+        DesktopError::TargetNotFound
+    } else if stderr.contains("-1743")
+        || stderr.contains("-25211")
+        || stderr.contains("not allowed")
+        || stderr.contains("assistive")
+    {
+        DesktopError::PermissionMissing
+    } else {
+        DesktopError::Backend
     }
 }
 
 impl MacosAxHost for LiveMacosAxHost {
     fn probe(&self, cancel: &CancellationToken) -> Result<MacosAxProbe, DesktopError> {
         check_cancel(cancel)?;
-        // Never pass kAXTrustedCheckOptionPrompt. This crate does not link
-        // ApplicationServices (`forbid(unsafe_code)`), so trust cannot be
-        // confirmed and is reported missing rather than assumed granted.
-        Ok(MacosAxProbe::new(
-            cfg!(target_os = "macos"),
-            false,
-            cfg!(target_os = "macos"),
-        ))
+        if !cfg!(target_os = "macos") {
+            return Ok(MacosAxProbe::new(false, false, false));
+        }
+        // Bounded, no-prompt: a pending consent dialog times out into the
+        // same "not trusted" verdict as an explicit denial.
+        let trusted = matches!(
+            run_osascript(Self::PROBE_SCRIPT, Duration::from_secs(3), cancel),
+            Ok(output) if output.trim() == "true"
+        );
+        Ok(MacosAxProbe::new(true, trusted, true))
     }
 
     fn snapshot(
@@ -462,18 +1050,33 @@ impl MacosAxHost for LiveMacosAxHost {
         request: &DesktopObserveRequest,
     ) -> Result<MacosAxSnapshot, DesktopError> {
         check_cancel(request.cancel())?;
-        if cfg!(target_os = "macos") {
-            Err(DesktopError::PermissionMissing)
-        } else {
-            Err(DesktopError::HealthFailed)
+        if !cfg!(target_os = "macos") {
+            return Err(DesktopError::HealthFailed);
         }
+        let raw = run_osascript(Self::SNAPSHOT_SCRIPT, request.timeout(), request.cancel())?;
+        // The generation is the STATE version: unchanged content keeps the
+        // previous generation (an act's require_current recapture must see
+        // the same generation its observation had); changed content bumps.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&raw, &mut hasher);
+        let state = std::hash::Hasher::finish(&hasher);
+        let mut last = self.last_state.lock().unwrap_or_else(|p| p.into_inner());
+        let generation = match *last {
+            Some((prev_state, prev_generation)) if prev_state == state => prev_generation,
+            _ => self.generation.fetch_add(1, Ordering::SeqCst) + 1,
+        };
+        *last = Some((state, generation));
+        let mut locators = HashMap::new();
+        let snapshot = self.parse_snapshot(&raw, generation, &mut locators)?;
+        *self.locators.lock().unwrap_or_else(|p| p.into_inner()) = locators;
+        Ok(snapshot)
     }
 
     fn act(
         &self,
         _session: DesktopSessionId,
-        _action: &DesktopAction,
-        _resolved: &ResolvedDesktopTarget,
+        action: &DesktopAction,
+        resolved: &ResolvedDesktopTarget,
         timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<(), DesktopError> {
@@ -481,11 +1084,11 @@ impl MacosAxHost for LiveMacosAxHost {
             return Err(DesktopError::TimeoutInvalid);
         }
         check_cancel(cancel)?;
-        if cfg!(target_os = "macos") {
-            Err(DesktopError::PermissionMissing)
-        } else {
-            Err(DesktopError::HealthFailed)
+        if !cfg!(target_os = "macos") {
+            return Err(DesktopError::HealthFailed);
         }
+        let script = self.plan_act(action, resolved)?;
+        run_osascript(&script, timeout, cancel).map(|_| ())
     }
 }
 
@@ -1240,30 +1843,276 @@ mod tests {
     }
 
     #[test]
-    fn live_host_never_prompts_and_fails_closed() {
-        let backend = MacosDesktopBackend::live();
-        let health = backend.health(&CancellationToken::new()).expect("health");
-        assert!(!health.is_available());
-        if cfg!(target_os = "macos") {
-            assert_eq!(
-                health.reason(),
-                Some(DesktopHealthReason::PermissionMissing)
-            );
-        } else {
+    fn live_host_probe_tracks_the_bridge_and_still_fails_closed_without_trust() {
+        // The live host runs the real bounded System Events check, so its
+        // verdict tracks the actual OS trust state instead of the hardcoded
+        // "never trusted" the stub reported. The contract that must hold
+        // everywhere: the verdict is typed, bounded, and on the bridge's
+        // answer — never assumed granted, and a pending consent dialog
+        // counts as not granted. Off the platform, everything fails closed.
+        let cancel = CancellationToken::new();
+        let probe = LiveMacosAxHost::default()
+            .probe(&cancel)
+            .expect("typed probe verdict");
+        if !cfg!(target_os = "macos") {
+            assert!(!probe.macos() && !probe.trusted());
+            let backend = MacosDesktopBackend::live();
+            let health = backend.health(&cancel).expect("health");
+            assert!(!health.is_available());
             assert_eq!(
                 health.reason(),
                 Some(DesktopHealthReason::PlatformUnsupported)
             );
-        }
-        let session = DesktopSessionId::new();
-        let err = backend
-            .capture(session, &DesktopObserveRequest::new())
-            .unwrap_err();
-        if cfg!(target_os = "macos") {
-            assert_eq!(err, DesktopError::PermissionMissing);
-        } else {
+            let err = backend
+                .capture(DesktopSessionId::new(), &DesktopObserveRequest::new())
+                .unwrap_err();
             assert_eq!(err, DesktopError::HealthFailed);
+            return;
         }
+        // On macOS: the probe's verdict must equal what the same bridge
+        // reports under the same bound.
+        let bridge_trusted = matches!(
+            run_osascript(LiveMacosAxHost::PROBE_SCRIPT, Duration::from_secs(3), &cancel),
+            Ok(output) if output.trim() == "true"
+        );
+        assert_eq!(
+            probe.trusted(),
+            bridge_trusted,
+            "the probe must report the bridge's actual trust state"
+        );
+        let backend = MacosDesktopBackend::live();
+        let health = backend.health(&cancel).expect("health");
+        assert_eq!(health.is_available(), bridge_trusted);
+        if !bridge_trusted {
+            let err = backend
+                .capture(DesktopSessionId::new(), &DesktopObserveRequest::new())
+                .unwrap_err();
+            assert_eq!(err, DesktopError::PermissionMissing);
+        }
+    }
+
+    #[test]
+    fn live_snapshot_parse_and_locators_are_observation_bound() {
+        // A recorded transcript of SNAPSHOT_SCRIPT output parses into
+        // windows/nodes with generation-bound refs and complete locators;
+        // the next generation invalidates every previous ref.
+        let host = LiveMacosAxHost::default();
+        let transcript = "F\tTextEdit\n\
+W\tTextEdit\tnotes.txt\t10\t20\t800\t600\ttrue\n\
+N\tTextEdit\t1\t1\tAXButton\tSave\n\
+N\tTextEdit\t1\t2\tAXSecureTextField\tmissing value\n\
+N\tTextEdit\t1\t3\tAXStaticText\tweird\tname\n";
+        let mut locators = HashMap::new();
+        let snapshot = host
+            .parse_snapshot(transcript, 7, &mut locators)
+            .expect("parse");
+        assert_eq!(snapshot.windows().len(), 1);
+        let window = &snapshot.windows()[0];
+        assert_eq!(window.id(), "win:7:1");
+        assert_eq!(window.title(), "notes.txt");
+        assert_eq!(window.app(), Some("TextEdit"));
+        assert!(window.is_focused(), "frontmost process marks focus");
+        assert_eq!(snapshot.nodes().len(), 3);
+        let button = &snapshot.nodes()[0];
+        assert_eq!(button.id(), "ax:7:1");
+        assert!(button.actions().contains(&MacosAxAction::Press));
+        let secure = &snapshot.nodes()[1];
+        assert!(secure.is_sensitive(), "secure fields are sensitive");
+        assert!(secure.actions().contains(&MacosAxAction::SetValue));
+        let weird = &snapshot.nodes()[2];
+        assert_eq!(weird.name(), "weird name", "embedded tabs collapse");
+        // Locators re-walk the recorded System Events paths.
+        assert_eq!(locators["win:7:1"].process, "TextEdit");
+        assert_eq!(locators["win:7:1"].element_index, None);
+        assert_eq!(locators["ax:7:1"].element_index, Some(1));
+        assert_eq!(locators["ax:7:1"].role, "AXButton");
+        // Generation numbering is carried by the refs: a ref from an older
+        // generation never resolves after the map is replaced.
+        let stale: HashMap<String, ElementLocator> = locators
+            .drain()
+            .filter(|(id, _)| id.contains(":7:"))
+            .collect();
+        let _ = host.parse_snapshot(transcript, 8, &mut locators);
+        assert!(
+            !stale
+                .iter()
+                .any(|(id, _)| locators.contains_key(id.as_str()))
+        );
+    }
+
+    #[test]
+    fn live_act_scripts_and_bounds() {
+        use crate::desktop::backend::test_support::{point, resolved_target, target_node};
+        use crate::desktop::backend::{KeyCode, ObservationId};
+        // Planned act scripts address the recorded System Events path; a
+        // stale or fabricated ref is the retryable not-found case; surface
+        // gaps stay typed instead of faked.
+        let host = LiveMacosAxHost::default();
+        let mut locators = HashMap::new();
+        let _ = host
+            .parse_snapshot(
+                "F\tTextEdit\nW\tTextEdit\tnotes.txt\t0\t0\t800\t600\ttrue\nN\tTextEdit\t1\t2\tAXTextField\tbody\n",
+                1,
+                &mut locators,
+            )
+            .expect("parse");
+        *host.locators.lock().unwrap_or_else(|p| p.into_inner()) = locators;
+
+        let observation = ObservationId::new();
+        let target = target_node(observation, "win:1:1", "ax:1:1");
+        let node_resolution = resolved_target(
+            ActionKind::Click,
+            None,
+            Some("ax:1:1".to_owned()),
+            true,
+            false,
+        );
+        // A text-field click addresses the element path inside the process.
+        let click = DesktopAction::click(target).expect("click");
+        let script = host.plan_act(&click, &node_resolution).expect("plan");
+        assert!(
+            script.contains("click UI element 2 of window 1"),
+            "acts address the snapshot-time window ordinal: {script}"
+        );
+        assert!(script.contains("tell process \"TextEdit\""), "{script}");
+        // Text into a text role uses `set value`, never keystroke, and the
+        // literal is quoted so it cannot break out of the AppleScript.
+        let type_target = target_node(observation, "win:1:1", "ax:1:1");
+        let type_text = DesktopAction::TypeText {
+            target: type_target,
+            value: SecretAwareString::literal("hello \"world\"").expect("literal"),
+        };
+        let script = host
+            .plan_act(
+                &type_text,
+                &resolved_target(
+                    ActionKind::TypeText,
+                    None,
+                    Some("ax:1:1".to_owned()),
+                    true,
+                    false,
+                ),
+            )
+            .expect("plan");
+        assert!(script.contains("set value of"), "{script}");
+        assert!(script.contains("hello \\\"world\\\""), "escaping: {script}");
+        // A stale ref is not-found (the backend maps it to StaleObservation).
+        let stale = host.plan_act(
+            &click,
+            &resolved_target(
+                ActionKind::Click,
+                None,
+                Some("ax:0:9".to_owned()),
+                true,
+                false,
+            ),
+        );
+        assert_eq!(stale.unwrap_err(), DesktopError::TargetNotFound);
+        // Coordinate fallback is never implied by AX support (T-CU-02).
+        let point = DesktopAction::CoordinateFallback {
+            point: point(5, 5),
+            button: MouseButton::Left,
+            count: 1,
+        };
+        assert_eq!(
+            host.plan_act(
+                &point,
+                &resolved_target(ActionKind::CoordinateFallback, None, None, true, false)
+            )
+            .unwrap_err(),
+            DesktopError::CapabilityUnavailable
+        );
+        // Keys become key codes.
+        let enter = DesktopAction::key(KeyCode::parse("Enter").expect("key"));
+        let script = host
+            .plan_act(
+                &enter,
+                &resolved_target(ActionKind::Key, None, None, false, false),
+            )
+            .expect("plan");
+        assert!(script.contains("key code 36"), "{script}");
+    }
+
+    #[test]
+    fn apple_quote_never_breaks_out_of_a_literal() {
+        assert_eq!(apple_quote("plain"), "plain");
+        assert_eq!(apple_quote("sa\"fe"), "sa\\\"fe");
+        assert_eq!(apple_quote("back\\slash"), "back\\\\slash");
+        assert_eq!(apple_quote("no\ncontrols\r"), "nocontrols");
+    }
+
+    #[test]
+    #[ignore = "live macOS AX: needs a WindowServer session and Accessibility \
+                trust; run with `cargo test -p computer-use -- --ignored` on \
+                a desktop where the host terminal is trusted"]
+    fn live_workflow_observes_acts_verifies_and_recovers() {
+        use crate::desktop::backend::test_support::window_ref;
+        let actor = DesktopActor::new(MacosDesktopBackend::live());
+        let cancel = CancellationToken::new();
+        // AUTHORIZE: health is the typed trust gate. No prompt, no grant —
+        // an untrusted host stops here with the typed reason.
+        let health = actor.health(&cancel).expect("health");
+        assert!(
+            health.is_available(),
+            "grant Accessibility to the host terminal in System Settings, then rerun"
+        );
+        let session = DesktopSessionId::new();
+        let observe_request = || {
+            DesktopObserveRequest::new()
+                .with_cancel(cancel.clone())
+                .with_timeout(Duration::from_secs(20))
+                .expect("observe timeout")
+        };
+        // OBSERVE: real windows from the running session.
+        let observation = actor.observe(session, observe_request()).expect("observe");
+        assert!(
+            !observation.windows().is_empty(),
+            "a logged-in desktop session has windows"
+        );
+        // ACT on the already-focused window: a real AXRaise with a
+        // deterministic, non-disruptive postcondition.
+        let target = observation
+            .focused_window()
+            .cloned()
+            .or_else(|| observation.windows().first().map(|w| w.window().clone()))
+            .expect("a focused window");
+        let action = DesktopAction::FocusWindow {
+            window: target.clone(),
+        };
+        let act_request = DesktopActionRequest::new(observation.id(), action)
+            .with_cancel(cancel.clone())
+            .with_timeout(Duration::from_secs(15))
+            .expect("act timeout");
+        actor.act(session, act_request).expect("raise");
+        // VERIFY: a fresh observation still enumerates the window (the
+        // raise neither closed nor moved it out of the session).
+        let verify = actor
+            .observe(session, observe_request())
+            .expect("re-observe");
+        assert!(
+            verify
+                .windows()
+                .iter()
+                .any(|w| w.window().stable_ref() == target.stable_ref()
+                    || w.title() == target.stable_ref()),
+            "the raised window must survive into the verifying observation"
+        );
+        // RECOVER: an action bound to the superseded first observation
+        // fails with the RETRYABLE stale-observation error, and a fresh
+        // observation makes the workflow proceed again.
+        let stale_action = DesktopAction::FocusWindow {
+            window: target.clone(),
+        };
+        let stale_request = DesktopActionRequest::new(observation.id(), stale_action)
+            .with_cancel(cancel.clone())
+            .with_timeout(Duration::from_secs(15))
+            .expect("act timeout");
+        let err = actor.act(session, stale_request).unwrap_err();
+        assert_eq!(err, DesktopError::StaleObservation);
+        let recovered = actor
+            .observe(session, observe_request())
+            .expect("re-observe");
+        assert!(!recovered.windows().is_empty());
     }
 
     #[test]

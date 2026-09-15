@@ -3980,6 +3980,12 @@ pub(crate) fn exec_turn(
     // reported, never force-applied). See `agent_views.rs`.
     tools.set_subagent_auto_integrate_mode(true);
     tools.set_trace_calls(true);
+    // Headless runs mutate the workspace too: the same durable-evidence
+    // staleness contract as the interactive turn (see
+    // `evidence_invalidator_for`).
+    if let Some((root, TrustStatus::Trusted)) = &workspace {
+        tools.set_evidence_invalidator(evidence_invalidator_for(root));
+    }
     // Managed-policy disk/network ceilings (Modbit `CAP-001`/`WRK-017`):
     // narrow-only, so a missing or default policy is simply a no-op here.
     // Re-loading rather than threading the value out of
@@ -6874,7 +6880,7 @@ denied\n",
         let runtime = crate::computer_runtime::ComputerUseRuntime::new(self.session_id);
         let cancel = capability_broker::CancellationToken::new();
         let backend = computer_use::desktop::macos::MacosDesktopBackend::new(
-            computer_use::desktop::macos::LiveMacosAxHost,
+            computer_use::desktop::macos::LiveMacosAxHost::new(),
         );
         let actor = computer_use::desktop::backend::DesktopActor::new(backend);
         let session = computer_use::desktop::backend::DesktopSessionId::new();
@@ -6964,7 +6970,7 @@ denied\n",
         );
         let cancel = capability_broker::CancellationToken::new();
         let backend = computer_use::desktop::macos::MacosDesktopBackend::new(
-            computer_use::desktop::macos::LiveMacosAxHost,
+            computer_use::desktop::macos::LiveMacosAxHost::new(),
         );
         let actor = computer_use::desktop::backend::DesktopActor::new(backend);
         match actor.health(&cancel) {
@@ -8407,13 +8413,49 @@ fn build_interactive_turn_tools(
                 });
             }
         };
-    let tools = if trusted {
+    let mut tools = if trusted {
         ExecTools::workspace_with_permissions(root, permission_lattice.clone())
             .unwrap_or_else(|_| ExecTools::noop())
     } else {
         ExecTools::noop()
     };
+    if trusted {
+        tools.set_evidence_invalidator(evidence_invalidator_for(root));
+    }
     Ok((tools, permission_lattice))
+}
+
+/// The workspace-mutation → durable-evidence bridge: after a successful
+/// `workspace_write`/`workspace_patch`, every fresh record in the project's
+/// goal-evidence doc goes stale, under `GoalHost::update_evidence`'s
+/// cross-process lock — the same transaction every other evidence writer
+/// commits through, so a concurrent `goal claim` or evidence record cannot
+/// be lost to this one. Deliberately conservative semantics (see
+/// `EvidenceStore::invalidate_all_fresh`): a recorded check speaks about
+/// the whole tree, so any tree change stales it, and the completion gate
+/// then demands evidence recorded after the last change instead of proof
+/// that predates the code it claims to verify. Best-effort on failure — a
+/// lock/IO error must not turn a completed write into a failure — but not
+/// silent: the tool result carries the warning. A project with no evidence
+/// doc (the common case) short-circuits before any lock or file write.
+fn evidence_invalidator_for(root: &Path) -> crate::exec_tools::EvidenceInvalidator {
+    let evidence_path = root.join(PROJECT_MARKER).join(EVIDENCE_FILE);
+    std::sync::Arc::new(move |_subject: &str| {
+        if !evidence_path.exists() {
+            return Ok(0);
+        }
+        let mut host = GoalHost::new();
+        host.update_evidence(
+            &evidence_path,
+            |host| -> Result<usize, std::convert::Infallible> {
+                Ok(host.stale_all_fresh_evidence())
+            },
+        )
+        .map_err(|err| match err {
+            GoalTransactionError::Persist(persist) => persist.to_string(),
+            GoalTransactionError::Mutate(void) => match void {},
+        })
+    })
 }
 
 /// The reminder roster's block and floor for an interactive turn, read the
@@ -10980,6 +11022,78 @@ mod tests {
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
     static TERMINAL_LOCK: Mutex<()> = Mutex::new(());
+
+    // --- Workspace-write → durable evidence invalidation ------------------
+
+    #[test]
+    fn a_workspace_write_stales_persisted_goal_evidence() {
+        use agent_runtime::{
+            EvidenceKind, EvidenceProducer, EvidenceSource, EvidenceSpec, EvidenceStatus,
+            TEST_PASSED,
+        };
+        use protocol::{ArtifactId, EvidenceId, GoalId};
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-evidence-invalidate-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(dir.join(PROJECT_MARKER)).expect("project dir");
+        let evidence_path = dir.join(PROJECT_MARKER).join(EVIDENCE_FILE);
+
+        // One fresh record, persisted through the same locked transaction
+        // every other evidence writer commits through.
+        let mut host = GoalHost::new();
+        host.update_evidence(
+            &evidence_path,
+            |host| -> Result<(), std::convert::Infallible> {
+                let spec = EvidenceSpec::new(
+                    EvidenceId::new(),
+                    GoalId::new(),
+                    EvidenceKind::Test,
+                    TEST_PASSED,
+                    EvidenceProducer::System,
+                    EvidenceSource::new(ArtifactId::from_bytes(b"rapidlm-invalidate-test")),
+                    EvidenceStatus::Passed,
+                    "src/lib.rs",
+                )
+                .expect("spec")
+                .with_command("cargo test")
+                .expect("command");
+                host.record_evidence(spec).expect("record");
+                Ok(())
+            },
+        )
+        .expect("record transaction");
+
+        // The hook the turn tools install: reports the staled record.
+        let invalidate = evidence_invalidator_for(&dir);
+        assert_eq!(invalidate("src/lib.rs").expect("invalidate"), 1);
+
+        // Durable: a fresh load sees the record stale, so the completion
+        // gate can no longer count proof that predates the edit.
+        let mut host = GoalHost::new();
+        host.reload_evidence(&evidence_path).expect("reload");
+        let store = host.evidence().store();
+        assert_eq!(store.len(), 1);
+        assert!(!store.records()[0].freshness().is_fresh());
+
+        // A project with no evidence doc — the common case — short-circuits
+        // before any lock or file write: nothing is created, nothing fails.
+        let empty = std::env::temp_dir().join(format!(
+            "rapidlm-evidence-invalidate-empty-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&empty).expect("empty dir");
+        let invalidate = evidence_invalidator_for(&empty);
+        assert_eq!(invalidate("src/lib.rs").expect("no-op"), 0);
+        assert!(
+            !empty.join(PROJECT_MARKER).join(EVIDENCE_FILE).exists(),
+            "no evidence doc was created by the hook"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
 
     #[test]
     fn merge_settings_rules_never_truncates_a_second_files_deny_rule() {
@@ -18046,10 +18160,11 @@ api_key = "k"
 
     #[test]
     fn computer_observe_reports_the_typed_platform_gate_not_a_stub() {
-        // `/computer observe` runs the production desktop stack. On this
-        // build the live AX host fails closed by design (it never links
-        // ApplicationServices), so the command must surface the TYPED gate
-        // and the operator's next step — not a generic "not available".
+        // `/computer observe` runs the production desktop stack against the
+        // REAL host. Its output must be one of the two genuine outcomes:
+        // on a trusted desktop a fenced observation of the actual windows,
+        // everywhere else the TYPED gate with the operator's next step —
+        // never a generic "not available" stub.
         let _lock = lock_terminal();
         let env = TempEnv::create();
         fs::create_dir_all(env.project.join(PROJECT_MARKER)).expect("marker");
@@ -18062,14 +18177,21 @@ api_key = "k"
         let painted = report
             .rendered_output
             .expect("capture_render was requested");
+        let observed = painted.contains("computer-use observation (");
+        let gated = painted.contains("computer-use observation is blocked")
+            && painted.contains("health reason:");
         assert!(
-            painted.contains("computer-use observation is blocked"),
-            "typed gate message expected:\n{painted}"
+            observed || gated,
+            "either a live fenced observation or the typed gate is required:\n{painted}"
         );
-        assert!(
-            painted.contains("health reason:"),
-            "the typed health reason must be named:\n{painted}"
-        );
+        if !observed {
+            // Where the host cannot confirm trust, the gate names the
+            // grant path instead of leaving a dead end.
+            assert!(
+                painted.contains("System Settings"),
+                "the gate must say how to authorize:\n{painted}"
+            );
+        }
         assert!(
             !painted.contains("not available"),
             "the action is wired now; the old unsupported text must be gone:\n{painted}"

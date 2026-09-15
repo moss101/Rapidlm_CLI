@@ -923,6 +923,66 @@ impl DesktopTargetRef {
     }
 }
 
+/// Test-side constructors for the observation-bound ref/resolution types.
+/// The real constructors live behind the actor's resolve pipeline (an
+/// action is only ever resolved against a CURRENT observation); adapters'
+/// unit tests need to build the same shapes directly.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{
+        AccessibilityNodeRef, ActionKind, DesktopTargetRef, ObservationId, Point,
+        ResolvedDesktopTarget, WindowRef,
+    };
+
+    pub(crate) fn window_ref(observation: ObservationId, stable_ref: &str) -> WindowRef {
+        WindowRef {
+            observation,
+            stable_ref: stable_ref.to_owned(),
+        }
+    }
+
+    pub(crate) fn node_ref(
+        observation: ObservationId,
+        window: &str,
+        stable_ref: &str,
+    ) -> AccessibilityNodeRef {
+        AccessibilityNodeRef {
+            observation,
+            window: window.to_owned(),
+            stable_ref: stable_ref.to_owned(),
+        }
+    }
+
+    pub(crate) fn target_node(
+        observation: ObservationId,
+        window: &str,
+        stable_ref: &str,
+    ) -> DesktopTargetRef {
+        DesktopTargetRef::Accessibility(node_ref(observation, window, stable_ref))
+    }
+
+    pub(crate) fn resolved_target(
+        kind: ActionKind,
+        window: Option<String>,
+        node: Option<String>,
+        interactive: bool,
+        sensitive: bool,
+    ) -> ResolvedDesktopTarget {
+        ResolvedDesktopTarget {
+            kind,
+            window,
+            node,
+            point: None,
+            interactive,
+            sensitive,
+        }
+    }
+
+    pub(crate) fn point(x: i32, y: i32) -> Point {
+        Point { x, y }
+    }
+}
+
 impl WindowInfo {
     pub fn window(&self) -> &WindowRef {
         &self.window
