@@ -153,9 +153,14 @@ Legend: **verified** = implemented + regression-tested through production entry 
 3. **Same-model competitor comparison**: blocked on x.ai credentials.
 4. **Qwen authentication / kimi installation**: typed skips; rerun
    `rapid eval --live --arms rapid,qwen` once credentials/drivers exist.
-5. **Scale**: the representative suite is 12+4 tasks with repeated-trial
-   support — far smaller than SWE-bench-scale programs; results are
-   directional, not certification.
+5. **Scale and suite axes**: the representative suite is 12+4 tasks with
+   repeated-trial support — far smaller than SWE-bench-scale programs;
+   results are directional, not certification. Of the goal's task axes,
+   provider-interruption/cancellation/restart, approval suspension,
+   concurrent-subagent merge conflicts, and MCP/ACP/streaming workflows are
+   covered at the RUNTIME level (crash-recovery tests, detached-subagent
+   tests, ACP adapter suites, eval typed timeouts) rather than as suite
+   tasks — extending the suite to those axes is future work.
 6. **Release-matrix CI** for this exact commit: `ci.yml` runs on the push of
    this commit; `release-matrix.yml` remains dispatch/tag-driven.
 7. **ci.yml had been red on main before this window** — the pre-existing
