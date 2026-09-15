@@ -62,6 +62,10 @@ Exit codes: 0 clean shutdown · 2 usage · 1 bind/serve failure.
 ";
 
 /// `rapid daemon`.
+// On non-Unix the cfg(not(unix)) refusal block ends in a `return` that is
+// the function tail there (the Unix `serve_unix` tail is cfg'd out), which
+// needless_return would flag.
+#[cfg_attr(not(unix), allow(clippy::needless_return))]
 pub fn run_daemon(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandError> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print!("{DAEMON_USAGE}");
@@ -163,6 +167,7 @@ fn serve_unix(
     Ok(0)
 }
 
+#[cfg(unix)]
 fn user_home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
