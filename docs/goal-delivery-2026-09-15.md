@@ -89,10 +89,10 @@ file, or command output retained in-repo).
 |---|---|---|
 | SDK test command executes all intended test files | done | `pnpm test` now runs all four files: 28 tests, 4 suites, 0 failures (was 8 tests / 1 file). `sdk/typescript/package.json`. |
 | Formatting clean | done | `cargo fmt --all -- --check` clean (fixed eval runner, interactive, model, mcp transport, tui state). |
-| Lint clean (`clippy -D warnings`) | done | `cargo clippy --workspace --all-targets --locked -- -D warnings` exits 0 after mechanical fixes (collapsible ifs, unused imports/vars, redundant closures, while-let, complex types, duplicated attributes). |
-| Full supported-platform Rust suite | done (local) | `cargo test --workspace --locked --no-fail-fast` — see run log referenced in the delivery report; CI `ci.yml` re-proves on ubuntu/macos/windows per push. |
+| Lint clean (`clippy -D warnings`) | done | `cargo clippy --workspace --all-targets --locked -- -D warnings` exits 0 after mechanical fixes (collapsible ifs, unused imports/vars, redundant closures, while-let, complex types, duplicated attributes). Commit `82a6510`. Notable: ci.yml's lint/test steps had ALREADY been failing on main before this window (the 09-14 "green" runs were release-matrix build smokes, not ci.yml) — restoring it to green is part of this delivery. |
+| Full supported-platform Rust suite | done (CI) | Local full-workspace run stalls at 0% CPU (the assessment's documented local startup pathology), so the equivalent evidence is CI `ci.yml` run `34968859120` (ubuntu/macos/windows: fmt + clippy -D warnings + `cargo test --workspace` + schema fixtures), which also surfaced and allowed fixing the pre-existing red: 2 stale mcp_cli expectations (streamable-HTTP servers are first-class now), 1 sandbox truth test (approval gate preempted the confinement refusal on Linux), 1 help-marker test needing the new wired-command markers, and 3 timing races in this window's own new tests. rapid lib locally: 815 passed / 0 failed. |
 | Typecheck + schema checks | done | `pnpm typecheck` 0 errors; `pnpm generate:check` no drift. |
-| Release smoke | via CI | `release-matrix.yml` (macos/ubuntu/windows build + binary smokes + clean-env smoke) — triggered for tag/dispatch; the retained evidence for this window is the 2026-09-14 green run plus this window's local smokes (`rapid eval --offline` invocations, trust-grant, health probes). |
+| Release smoke | via CI | `release-matrix.yml` (macos/ubuntu/windows build + binary smokes + clean-env smoke) — dispatch/tag-driven; the retained evidence is the 2026-09-14 green run (34888814182) plus this window's local smokes (`rapid eval --offline` invocations, trust-grant, health probes). |
 | Unsupported vs supported platforms distinguished | done (pre-existing + kept) | Windows cargo test `continue-on-error` is explicit and documented in `ci.yml`; the daemon's Unix-socket path compiles to a typed refusal on non-Unix. |
 | Local startup delays investigated | done | Local `cargo test` binary startup stalls sample as `_dyld_start` (dynamic linker), before test execution — OS-level, not application code; no OS protections weakened; CI provides the equivalent stable environment. |
 | No assertions weakened / gates relaxed | done | All changes add checks; the only gate change makes the eval exit STRICTER (skips now fail). |
@@ -158,3 +158,10 @@ Legend: **verified** = implemented + regression-tested through production entry 
    directional, not certification.
 6. **Release-matrix CI** for this exact commit: `ci.yml` runs on the push of
    this commit; `release-matrix.yml` remains dispatch/tag-driven.
+7. **ci.yml had been red on main before this window** — the pre-existing
+   failures (stale mcp_cli "stdio only" expectations from before
+   streamable-HTTP support, the sandbox truth test's approval-gate
+   preemption on Linux, and the help-marker drift) are fixed here;
+   `docs/reference/cli-command-reference.md`'s "actually dispatches" note
+   was the only doc-sync contract affected and still passes its source
+   check.

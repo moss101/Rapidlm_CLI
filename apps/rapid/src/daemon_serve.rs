@@ -26,6 +26,9 @@
 //! against the local daemon token (`~/.rapidlm/daemon.token`) when one
 //! exists — a wrong token is rejected before any RPC is served.
 
+// Unix-only serving writes frames + flushes; on Windows the daemon path is
+// a typed refusal, so the trait import would be dead there.
+#[cfg(unix)]
 use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
