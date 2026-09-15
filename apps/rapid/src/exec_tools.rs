@@ -7629,8 +7629,20 @@ mod tests {
         let summary = spawn_detached(&mut tools, &cancel, "c-cancel");
         let job = job_id_from(&summary);
         assert_eq!(tools.subagent_registry.running_detached(), 1);
+        // The child registers itself on its own thread; wait for that
+        // registration instead of racing it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let agent = loop {
+            if let Some(agent) = tools.subagent_registry.running().first() {
+                break *agent;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never registered with the session"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
         // Cancel through the registry (what `/agents cancel` drives).
-        let agent = tools.subagent_registry.running()[0];
         assert!(tools.subagent_registry.cancel(agent));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let status = loop {
@@ -7679,11 +7691,13 @@ mod tests {
         }
         // Cleanup: stop every blocking child so the test binary exits.
         tools.subagent_registry.cancel_all();
-        for _ in 0..50 {
-            if tools.subagent_registry.running_detached() == 0 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while tools.subagent_registry.running_detached() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancelled children never released their slots"
+            );
+            std::thread::sleep(Duration::from_millis(25));
         }
         assert_eq!(tools.subagent_registry.running_detached(), 0);
     }
@@ -14321,7 +14335,16 @@ mod sandbox_truth_tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut tools = ExecTools::workspace(&dir).expect("tools");
+        // Bypass mode so the approval gate does not preempt the check under
+        // test: this platform has no confining backend, and the shell call
+        // must reach the confinement truth and fail closed THERE.
+        let mut tools = ExecTools::workspace_with_permissions(
+            &dir,
+            crate::permissions::PermissionLattice::new(
+                crate::permissions::PermissionMode::BypassPermissions,
+            ),
+        )
+        .expect("tools");
         if let ExecTools::Workspace(inner) = &mut tools {
             inner.set_sandbox_confinement_required(true);
         }

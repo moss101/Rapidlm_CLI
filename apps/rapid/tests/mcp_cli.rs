@@ -224,14 +224,17 @@ fn a_rejected_entry_is_reported_with_its_real_reason() {
     );
     let run = fixture.run(&["mcp", "list"]);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
+    // Streamable-HTTP servers are first-class now (mcp_http): `remote`
+    // LISTES as a configured server, so the rejections are the name and
+    // args entries only.
     assert!(
-        run.stdout.contains("servers=1 rejected=3"),
+        run.stdout.contains("servers=2 rejected=2"),
         "{}",
         run.stdout
     );
     assert!(
-        run.stdout.contains("stdio only"),
-        "the remote entry must say why: {}",
+        run.stdout.contains("server=remote"),
+        "the http entry must be listed as a configured server: {}",
         run.stdout
     );
     assert!(
@@ -375,12 +378,14 @@ fn a_real_turn_warns_on_stderr_about_an_entry_it_skipped() {
     // visible: the turn that would have registered the server says so too,
     // the same way a broken reminder roster or a failed fallback model does.
     // Provider connectivity is irrelevant here — the warning is emitted
-    // while integrations load, before any model call — so the config points
-    // at a closed loopback port and the turn is expected to fail.
+    // while integrations load, before any model call. Streamable HTTP is
+    // first-class now, so the skip scenario is a MALFORMED remote entry
+    // (an http entry with no `url`): it parses as a rejection, and the
+    // turn must say so instead of silently dropping it.
     let fixture = fixture("turnwarning");
     fixture.settings(
         ".rapidlm/settings.json",
-        r#"{"mcpServers": {"remote": {"type": "http", "url": "https://example.com/mcp"}}}"#,
+        r#"{"mcpServers": {"remote": {"type": "http"}}}"#,
     );
     fixture.grant_trust();
     let config = fixture.home.join(".rapidlm").join("config.toml");
@@ -413,7 +418,7 @@ fn a_real_turn_warns_on_stderr_about_an_entry_it_skipped() {
         "the turn silently skipped a configured server:\n{stderr}"
     );
     assert!(
-        stderr.contains("stdio only"),
+        stderr.contains("an http entry needs a `url`"),
         "the warning must carry the real reason:\n{stderr}"
     );
 }

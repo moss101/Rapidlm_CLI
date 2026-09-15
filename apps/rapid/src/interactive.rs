@@ -17465,18 +17465,25 @@ was already finished"
         // test terminal and the head scrolls out of the captured frame; the
         // whole catalog's verdicts are asserted directly by `command_help`'s
         // own `the_rendered_help_marks_only_what_is_missing`.
-        for command in ["/playbook ", "/plugins "] {
+        for command in ["/playbook ", "/trace "] {
             let row = row_for(command);
             assert!(
                 row.trim_start().starts_with('!'),
                 "`{command}` should be marked unavailable: {row}"
             );
         }
-        let mcp = row_for("/mcp ");
-        assert!(
-            mcp.trim_start().starts_with('~'),
-            "`/mcp` should be marked partly unavailable: {mcp}"
-        );
+        // Partly available: plugin install/remove/report are wired through
+        // the trust ledger (elevation stays argv); `/computer` runs the
+        // production observe/test stack while `record` stays unwired; and
+        // `/mcp` lists real servers while some subcommands stay out of
+        // grammar.
+        for command in ["/plugins ", "/computer ", "/mcp "] {
+            let row = row_for(command);
+            assert!(
+                row.trim_start().starts_with('~'),
+                "`{command}` should be marked partly unavailable: {row}"
+            );
+        }
         // A fully working command is unmarked.
         let permissions = row_for("/permissions ");
         assert!(

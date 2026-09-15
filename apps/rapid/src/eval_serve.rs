@@ -2452,12 +2452,15 @@ print("{unique}-child-after")"#
         assert!(!out.success);
         // Both markers must be gone. Retry briefly: SIGKILL delivery to the
         // group is immediate, but reap latency can leave zombies for a few
-        // hundred ms.
+        // hundred ms. The `[g]` character class keeps the probe from
+        // matching ITS OWN wrapper shell — `sh -c "pgrep -f X"` carries X
+        // in its argv, and without the class pgrep reports the probe
+        // itself as a survivor (the flake this test once showed on CI).
         let mut survived = String::new();
-        for _ in 0..20 {
+        for _ in 0..50 {
             let pgrep = Command::new("sh")
                 .arg("-c")
-                .arg(format!("pgrep -f '{unique}' || true"))
+                .arg(format!("pgrep -f '{unique}-[gc]' || true"))
                 .output()
                 .expect("pgrep");
             survived = String::from_utf8_lossy(&pgrep.stdout).into_owned();
