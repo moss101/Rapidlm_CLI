@@ -414,6 +414,11 @@ pub struct SubagentRegistry {
     /// Detached (`background: true`) children running right now,
     /// session-shared so the concurrency bound counts across turns.
     detached_running: Arc<std::sync::atomic::AtomicU64>,
+    /// Detached worker threads alive right now — spawned through watchdog
+    /// joined and closure exited. `detached_running` above releases when
+    /// the job turns terminal, which is BEFORE its worker exits; this
+    /// count is the one that catches a worker stranded past completion.
+    workers_alive: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SubagentRegistry {
@@ -485,31 +490,56 @@ impl SubagentRegistry {
         self.detached_running
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// Detached worker threads that have not fully exited (watchdog joined,
+    /// closure left). Zero while no detached child was ever started.
+    #[cfg(test)]
+    pub(crate) fn detached_workers_alive(&self) -> usize {
+        self.workers_alive.load(std::sync::atomic::Ordering::SeqCst) as usize
+    }
 }
 
-/// Propagates the parent turn's cancellation to a child's own token — the
-/// tokens have no parent/child link, so a poller carries it — for as long
-/// as the child runs. Stopped explicitly when the child returns; `Drop` is
-/// the fallback for the path that does not get there.
-struct ParentCancelBridge {
+/// Marks one detached worker thread alive for its whole closure: the count
+/// drops only after the worker's watchdog is stopped and joined, on the
+/// ordinary path or unwind. What a terminal job status cannot show.
+struct DetachedWorkerGuard(Arc<std::sync::atomic::AtomicU64>);
+
+impl Drop for DetachedWorkerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Cancels a child's token when a watched condition fires — the carrier
+/// for cancellation sources whose observation point is inside a runner:
+/// the parent turn's token (inline children) and a background job's
+/// cancelled flag (detached children). Every user gets the same lifecycle
+/// contract: the poller is stopped explicitly when the child returns, and
+/// `Drop` is the fallback for any other path out of the worker. A poller
+/// only its own cancellation could end strands the caller's thread in
+/// `join` forever — completed detached children used to leak their worker
+/// thread exactly this way: the job went terminal, the concurrency slot
+/// was released, but the worker blocked joining a watchdog nothing stopped.
+struct ChildCancelWatchdog {
     stop: Arc<AtomicBool>,
     watchdog: Option<std::thread::JoinHandle<()>>,
 }
 
-impl ParentCancelBridge {
-    const POLL: Duration = Duration::from_millis(50);
-
-    fn start(parent: &CancellationToken, child: CancellationToken) -> Self {
+impl ChildCancelWatchdog {
+    fn start(
+        child: CancellationToken,
+        poll: Duration,
+        fires: impl Fn() -> bool + Send + 'static,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let parent = parent.clone();
         let stop_flag = Arc::clone(&stop);
         let watchdog = std::thread::spawn(move || {
             while !stop_flag.load(Ordering::Relaxed) {
-                if parent.is_cancelled() {
+                if fires() {
                     child.cancel();
                     return;
                 }
-                std::thread::sleep(Self::POLL);
+                std::thread::sleep(poll);
             }
         });
         Self {
@@ -526,7 +556,7 @@ impl ParentCancelBridge {
     }
 }
 
-impl Drop for ParentCancelBridge {
+impl Drop for ChildCancelWatchdog {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(watchdog) = self.watchdog.take() {
@@ -1455,7 +1485,21 @@ pub struct WorkspaceTools {
     /// Known secret values to scrub from captured `shell_exec` output before
     /// it becomes a tool result — see `set_redaction`'s own doc comment.
     redaction: Option<security::RedactionSnapshot>,
+    /// See [`EvidenceInvalidator`]. `None` where no durable goal-evidence
+    /// store exists (most surfaces) — writes then carry no invalidation
+    /// duty and cost nothing.
+    evidence_invalidate: Option<EvidenceInvalidator>,
 }
+
+/// Installed by hosts that persist a durable goal-evidence store: called
+/// after a SUCCESSFUL `workspace_write`/`workspace_patch` of a
+/// workspace-relative path. Recorded verification evidence (a test run, a
+/// build, a scan) speaks about the tree as a whole, so a change to any file
+/// can invalidate any recorded check — the hook is what marks the store.
+/// Returns the number of records staled, or why the marking failed; the
+/// tool result carries both outcomes so a failed invalidation is never
+/// invisible to the agent that caused it.
+pub type EvidenceInvalidator = Arc<dyn Fn(&str) -> Result<usize, String> + Send + Sync>;
 
 impl WorkspaceTools {
     /// Bind the tools to a workspace root. The root is canonicalized once so
@@ -1507,6 +1551,7 @@ impl WorkspaceTools {
             max_subagent_spawns: MAX_SUBAGENT_SPAWNS_PER_TURN,
             write_locks: WriteLocks::default(),
             redaction: None,
+            evidence_invalidate: None,
         })
     }
 
@@ -1663,6 +1708,18 @@ impl WorkspaceTools {
     /// its parent's rather than left unscrubbed by default.
     pub(crate) fn share_redaction(&mut self, redaction: Option<security::RedactionSnapshot>) {
         self.redaction = redaction;
+    }
+
+    /// Install the durable-evidence invalidation hook (see
+    /// [`EvidenceInvalidator`]). Hosts that keep a goal-evidence store
+    /// install one so recorded verification goes stale when the workspace
+    /// changes; deliberately NOT propagated to subagent children — a child
+    /// runs in its own worktree view, whose writes reach the parent tree
+    /// only through `/agents integrate`, and staling on isolated work is
+    /// noise, not safety (the conservative direction is unchanged: main-
+    /// surface writes always stale).
+    pub fn set_evidence_invalidator(&mut self, hook: EvidenceInvalidator) {
+        self.evidence_invalidate = Some(hook);
     }
 
     /// Scrub known secret values from already-bounded `shell_exec` output
@@ -2293,7 +2350,7 @@ impl WorkspaceTools {
                 ))),
             });
         }
-        let result = match call.tool() {
+        let mut result = match call.tool() {
             WORKSPACE_WRITE_TOOL => self.execute_write(call, cancel),
             WORKSPACE_READ_TOOL => self.execute_read(call, cancel),
             REPO_READ_TOOL => self.execute_repo_read(call, cancel),
@@ -2334,6 +2391,49 @@ impl WorkspaceTools {
                 })
             }
         }?;
+        // A successful workspace mutation stales durable verification
+        // evidence (see `EvidenceInvalidator`); the outcome rides on the
+        // summary the model sees, so a failed invalidation is never
+        // invisible to the agent that caused it. Runs before post_tool_use
+        // hooks so they observe the completed, annotated result.
+        if matches!(call.tool(), WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL)
+            && let Some(invalidate) = &self.evidence_invalidate
+        {
+            let note = match &result {
+                ToolStepResult::Succeeded { summary, .. } => {
+                    let parsed = if call.tool() == WORKSPACE_WRITE_TOOL {
+                        parse_write_args(call.arguments())
+                            .ok()
+                            .map(|args| args.path)
+                    } else {
+                        parse_patch_args(call.arguments()).ok().map(|a| a.path)
+                    };
+                    match parsed {
+                        Some(path) => match invalidate(&path) {
+                            Ok(0) => None,
+                            Ok(n) => Some(format!(
+                                "{summary}\n[evidence: {n} record(s) marked stale by this write]"
+                            )),
+                            Err(err) => Some(format!(
+                                "{summary}\n[WARNING: durable evidence invalidation failed: \
+                                 {err}; recorded verification evidence may look fresher \
+                                 than it is]"
+                            )),
+                        },
+                        // The executors already rejected unparseable
+                        // arguments; a parse failure here cannot correspond
+                        // to a succeeded write.
+                        None => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(summary) = note
+                && let ToolStepResult::Succeeded { call_id, .. } = result
+            {
+                result = ToolStepResult::Succeeded { call_id, summary };
+            }
+        }
         // Post-tool-use hooks observe the completed call; their output is
         // recorded on the result the model sees.
         if !self.hooks.post_tool_use.is_empty()
@@ -3734,7 +3834,10 @@ read with job_output, in this turn or a later one — the job is stopped when th
             &args.agent_type,
             &bounded_text(args.prompt.as_bytes(), MAX_AGENT_TASK_BYTES),
         );
-        let bridge = ParentCancelBridge::start(cancel, child_cancel.clone());
+        let bridge = ChildCancelWatchdog::start(child_cancel.clone(), Duration::from_millis(50), {
+            let parent = cancel.clone();
+            move || parent.is_cancelled()
+        });
         let outcome = runner.run(
             agent_id,
             &args.prompt,
@@ -3863,17 +3966,24 @@ read with job_output, in this turn or a later one — the job is stopped when th
         let watchdog_flag = shared.cancelled.clone();
         let watchdog_token = child_cancel.clone();
         std::thread::spawn(move || {
+            registry
+                .workers_alive
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _worker_alive = DetachedWorkerGuard(registry.workers_alive.clone());
             // Forward `/jobs cancel` (the job's cancelled flag) to the
             // child's token, whose observation point is inside the runner.
-            let watchdog = std::thread::spawn(move || {
-                while !watchdog_token.is_cancelled() {
-                    if watchdog_flag.load(Ordering::SeqCst) {
-                        watchdog_token.cancel();
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-            });
+            // The explicit `watchdog.stop()` before this worker exits is
+            // what an ordinary completion needs: the job flag never fires
+            // and the child token is never cancelled on that path, so a
+            // poll loop without its own stop signal would run forever and
+            // strand this worker in `join` — the thread leak that let
+            // repeated detached tasks accumulate workers despite the
+            // concurrency bound. `Drop` covers the paths that never reach
+            // the explicit stop.
+            let watchdog =
+                ChildCancelWatchdog::start(watchdog_token, Duration::from_millis(200), move || {
+                    watchdog_flag.load(Ordering::SeqCst)
+                });
             let lifecycle = ChildLifecycle::begin(
                 &registry,
                 events.as_ref(),
@@ -3936,7 +4046,9 @@ read with job_output, in this turn or a later one — the job is stopped when th
                     Err(reason) => JobState::Failed(reason.clone()),
                 };
             }
-            let _ = watchdog.join();
+            // The worker's exit: stop the watchdog and wait for it. Reaching
+            // here is what an ordinarily completed child used to miss.
+            watchdog.stop();
         });
         Ok(ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
@@ -6401,6 +6513,15 @@ impl ExecTools {
         }
     }
 
+    /// Attach the durable-evidence invalidation hook (no-op on the no-op
+    /// surface — an untrusted project refuses every write long before any
+    /// invalidation could matter).
+    pub fn set_evidence_invalidator(&mut self, hook: EvidenceInvalidator) {
+        if let Self::Workspace(tools) = self {
+            tools.set_evidence_invalidator(hook);
+        }
+    }
+
     /// Attach the interactive answer source for `ask_user` (no-op on the
     /// no-op surface). The continuation path uses a one-shot source carrying
     /// the operator's recorded answer.
@@ -7614,6 +7735,132 @@ mod tests {
             tools.subagent_registry.running_detached(),
             0,
             "the concurrency slot is released"
+        );
+    }
+
+    #[test]
+    fn detached_spawn_worker_threads_exit_after_ordinary_completion() {
+        // Lifecycle regression: an ordinarily completed child used to
+        // strand its worker on `watchdog.join()` — the job went terminal
+        // and the concurrency slot was released, but the worker (and the
+        // watchdog it joined) never exited, so repeated detached tasks
+        // accumulated threads session-wide despite the bound. The tests
+        // above passed through all of that; only the worker-exit signal
+        // below catches it.
+        let root = TempRoot::new("detached-spawn-worker-exit");
+        let mut tools = permissive_workspace(&root.0);
+        tools.subagents = Some(Arc::new(DetachedFakeRunner {
+            delay: Duration::from_millis(50),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        }) as Arc<dyn SubagentRunner>);
+        let cancel = CancellationToken::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut jobs = Vec::new();
+        for i in 0..MAX_DETACHED_SUBAGENTS {
+            let summary = spawn_detached(&mut tools, &cancel, &format!("c-exit{i}"));
+            jobs.push(job_id_from(&summary));
+        }
+        // Every job reaches terminal state (what the pre-existing checks
+        // verify)...
+        for job in &jobs {
+            loop {
+                let text = job_status_text(&mut tools, &cancel, job);
+                if !text.contains("running") {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "job {job} never went terminal: {text}"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+        assert_eq!(
+            tools.subagent_registry.running_detached(),
+            0,
+            "the concurrency slot is released"
+        );
+        // ...and then the part the leak defeated: every worker thread must
+        // actually EXIT — watchdog stopped and joined — once its job is
+        // terminal.
+        while tools.subagent_registry.detached_workers_alive() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker threads survived their jobs' completion: {} still alive",
+                tools.subagent_registry.detached_workers_alive()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn successful_writes_fire_the_evidence_invalidator_failed_ones_do_not() {
+        let root = TempRoot::new("evidence-invalidate-hook");
+        let mut tools = permissive_workspace(&root.0);
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        tools.set_evidence_invalidator(Arc::new(move |path| {
+            sink.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(path.to_owned());
+            Ok(1)
+        }));
+        let cancel = CancellationToken::new();
+        // A successful write fires the hook with the workspace-relative
+        // path, and the summary records the staling so the model sees it.
+        let call = make_call(
+            "w1",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"src/lib.rs","content":"hi"}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("v");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(
+                    summary.contains("1 record(s) marked stale"),
+                    "the model must see the invalidation: {summary}"
+                );
+            }
+            other => panic!("expected write success, got {other:?}"),
+        }
+        // A successful patch fires it too.
+        std::fs::create_dir_all(root.0.join("src")).expect("dir");
+        std::fs::write(root.0.join("src/lib.rs"), "hi").expect("seed");
+        let call = make_call(
+            "p1",
+            WORKSPACE_PATCH_TOOL,
+            r#"{"path":"src/lib.rs","old":"hi","new":"bye","replace_all":false}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("v");
+        assert!(matches!(
+            tools.execute(&validated, &cancel).expect("execute"),
+            ToolStepResult::Succeeded { .. }
+        ));
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|p| p.into_inner()),
+            vec!["src/lib.rs".to_owned(), "src/lib.rs".to_owned()],
+            "both successful mutations staled evidence"
+        );
+        // A refused write must not stale anything: the hook only fires on
+        // mutations that actually happened.
+        let before = seen.lock().unwrap_or_else(|p| p.into_inner()).len();
+        let call = make_call(
+            "w2",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"../escape.txt","content":"x"}"#,
+        );
+        let refused = match tools.validate(&call, &cancel) {
+            Err(_) => true,
+            Ok(validated) => matches!(
+                tools.execute(&validated, &cancel).expect("execute"),
+                ToolStepResult::Failed { .. } | ToolStepResult::Denied { .. }
+            ),
+        };
+        assert!(refused, "the escape write must not succeed");
+        assert_eq!(
+            seen.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            before,
+            "a refused write staled nothing"
         );
     }
 
