@@ -183,11 +183,13 @@ mod tests {
     #[test]
     fn pty_is_a_typed_unsupported_error_off_unix() {
         let err = PtySession::spawn(test_fixtures::tool_static("echo"), &["hi"], || false)
+            .map(|_| ())
             .expect_err("no pty");
         assert_eq!(err, PtyError::Unsupported);
         assert_ne!(err, PtyError::ScriptUnavailable);
         // Cancellation is still checked first.
         let err = PtySession::spawn(test_fixtures::tool_static("echo"), &["hi"], || true)
+            .map(|_| ())
             .expect_err("cancelled");
         assert_eq!(err, PtyError::Cancelled);
     }
