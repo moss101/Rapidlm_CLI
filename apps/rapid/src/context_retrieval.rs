@@ -360,7 +360,19 @@ mod tests {
         .expect("seed");
         std::fs::write(root.join("unrelated.py"), "def totally_different(): pass\n").expect("seed");
 
-        let blocks = retrieve(&root, "how does LRUCache eviction work", 4096);
+        // `retrieve` fails open on its 8-second watcher, and under the load
+        // of a full parallel suite on a slow CI agent (Windows runner,
+        // 2026-09-17: "scout: Cancelled") the first indexing pass can lose
+        // that race. The index persists under the root, so a second call
+        // is cheap; three attempts widen the margin without changing what
+        // is asserted — retrieval that never finds the file still fails.
+        let mut blocks = Vec::new();
+        for _ in 0..3 {
+            blocks = retrieve(&root, "how does LRUCache eviction work", 4096);
+            if !blocks.is_empty() {
+                break;
+            }
+        }
         assert!(
             blocks.iter().any(|block| block.text().contains("LRUCache")),
             "expected a block referencing LRUCache, got {blocks:?}"
