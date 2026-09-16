@@ -1585,7 +1585,9 @@ fn remove_dir_if_exists(path: &Path) -> Result<bool, BrowserSessionError> {
     }
 }
 
-fn load_persisted_cookies(profile_dir: &Path) -> Result<Vec<BrowserCookie>, BrowserSessionError> {
+pub(crate) fn load_persisted_cookies(
+    profile_dir: &Path,
+) -> Result<Vec<BrowserCookie>, BrowserSessionError> {
     let path = profile_dir.join(COOKIES_FILE);
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
@@ -1615,7 +1617,7 @@ fn load_persisted_cookies(profile_dir: &Path) -> Result<Vec<BrowserCookie>, Brow
     Ok(cookies)
 }
 
-fn save_persisted_cookies(
+pub(crate) fn save_persisted_cookies(
     profile_dir: &Path,
     cookies: &[BrowserCookie],
 ) -> Result<(), BrowserSessionError> {

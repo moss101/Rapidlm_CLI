@@ -14,6 +14,9 @@ event-ledger = { path = "../event-ledger" }
 # capability-broker: CancellationToken is the cooperative cancel contract used
 # at session launch and crash cleanup.
 capability-broker = { path = "../capability-broker" }
+# serde_json: MIT/Apache-2.0, already a workspace dependency. The DevTools
+# protocol the live Chromium driver speaks is JSON-RPC over a WebSocket.
+serde_json = "1"
 
 [dev-dependencies]
 # Integration fixtures name ArtifactStore / lease / ErrorCode types directly.

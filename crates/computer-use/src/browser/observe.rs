@@ -358,6 +358,27 @@ impl PageNode {
         Self::build(role, name, None, None, true, true, false)
     }
 
+    /// Every field, for a live capture that has read them off a real page.
+    pub(crate) fn from_capture(
+        role: &str,
+        name: &str,
+        test_id: Option<&str>,
+        input_type: Option<&str>,
+        interactive: bool,
+        from_accessibility: bool,
+        from_dom: bool,
+    ) -> Result<Self, ObserveError> {
+        Self::build(
+            role,
+            name,
+            test_id,
+            input_type,
+            interactive,
+            from_accessibility,
+            from_dom,
+        )
+    }
+
     pub fn role(&self) -> &str {
         &self.role
     }
@@ -414,6 +435,23 @@ impl PageNode {
 }
 
 impl PageSnapshot {
+    /// A capture assembled by a live page backend.
+    pub(crate) fn from_capture(
+        url: String,
+        title: String,
+        document_generation: u64,
+        nodes: Vec<PageNode>,
+        screenshot: Option<RawScreenshot>,
+    ) -> Self {
+        Self {
+            url,
+            title,
+            document_generation,
+            nodes,
+            screenshot,
+        }
+    }
+
     pub fn url(&self) -> &str {
         &self.url
     }
@@ -1193,7 +1231,8 @@ fn derive_targets(nodes: &[PageNode]) -> Result<DerivedTargets, ObserveError> {
                 dom_interactive = dom_interactive.saturating_add(1);
             }
         }
-        if node.interactive && !is_sensitive_node(node) && node.test_id.is_none() {
+        let readable = node.from_accessibility && !node.name.is_empty();
+        if (node.interactive || readable) && !is_sensitive_node(node) && node.test_id.is_none() {
             let key = (node.role.clone(), node.name.clone());
             *role_name_counts.entry(key).or_insert(0) += 1;
         }
@@ -1201,7 +1240,13 @@ fn derive_targets(nodes: &[PageNode]) -> Result<DerivedTargets, ObserveError> {
 
     let mut targets = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
-        if !node.interactive && node.test_id.is_none() {
+        // A target is something an action can name (interactive, or pinned
+        // by a test id) or something a verification can read: a node the
+        // accessibility tree exposes under a name (a heading, a status
+        // line). The latter is reported with `interactive: false`, so the
+        // model sees what can be read but not clicked.
+        let readable = node.from_accessibility && !node.name.is_empty();
+        if !node.interactive && node.test_id.is_none() && !readable {
             continue;
         }
         if targets.len() >= MAX_TARGETS {
