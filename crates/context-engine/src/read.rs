@@ -539,14 +539,15 @@ fn resolve_file(root: &Path, rel: &RepoPath) -> Result<PathBuf, ReadError> {
     if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
         return Err(ReadError::PathEscapesRoot);
     }
-    let root_canon = fs::canonicalize(root).map_err(|_| ReadError::NotFound)?;
+    let root_canon = protocol::host_path::canonicalize(root).map_err(|_| ReadError::NotFound)?;
     let abs = root_canon.join(rel.as_str());
     let meta = fs::symlink_metadata(&abs).map_err(|_| ReadError::NotFound)?;
     if meta.file_type().is_symlink() || !meta.file_type().is_file() {
         return Err(ReadError::NotFound);
     }
     let parent = abs.parent().ok_or(ReadError::PathEscapesRoot)?;
-    let parent_canon = fs::canonicalize(parent).map_err(|_| ReadError::PathEscapesRoot)?;
+    let parent_canon =
+        protocol::host_path::canonicalize(parent).map_err(|_| ReadError::PathEscapesRoot)?;
     if !parent_canon.starts_with(&root_canon) {
         return Err(ReadError::PathEscapesRoot);
     }

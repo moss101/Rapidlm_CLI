@@ -829,7 +829,8 @@ pub(crate) fn canonicalize_root(root: &Path) -> Result<PathBuf, DirectError> {
     if !meta.is_dir() {
         return Err(DirectError::InvalidRoot);
     }
-    let canonical = fs::canonicalize(root).map_err(|_| DirectError::InvalidRoot)?;
+    let canonical =
+        protocol::host_path::canonicalize(root).map_err(|_| DirectError::InvalidRoot)?;
     if !canonical.is_dir() {
         return Err(DirectError::InvalidRoot);
     }
@@ -911,7 +912,7 @@ pub(crate) fn resolve_under_root(
             } else {
                 current.join(target)
             };
-            let followed = match fs::canonicalize(&next) {
+            let followed = match protocol::host_path::canonicalize(&next) {
                 Ok(canon) => canon,
                 Err(_) if last && rules.missing_ok => {
                     confine_logical(&next, root)?;
@@ -942,7 +943,8 @@ pub(crate) fn resolve_under_root(
             if !meta.is_file() && mode != DirectResolveMode::Delete {
                 return Err(DirectError::NotAFile);
             }
-            let host = fs::canonicalize(&candidate).map_err(|_| DirectError::Io)?;
+            let host =
+                protocol::host_path::canonicalize(&candidate).map_err(|_| DirectError::Io)?;
             confine(&host, root)?;
             let logical = relativize(&host, root)?;
             if mode.is_mutating() {
@@ -957,7 +959,7 @@ pub(crate) fn resolve_under_root(
         if !meta.is_dir() {
             return Err(DirectError::NotADirectory);
         }
-        current = fs::canonicalize(&candidate).map_err(|_| DirectError::Io)?;
+        current = protocol::host_path::canonicalize(&candidate).map_err(|_| DirectError::Io)?;
         confine(&current, root)?;
         i += 1;
     }
@@ -995,7 +997,7 @@ pub(crate) fn read_confined(
     host: &Path,
     max_file_bytes: usize,
 ) -> Result<Vec<u8>, DirectError> {
-    let canon = fs::canonicalize(host).map_err(|err| {
+    let canon = protocol::host_path::canonicalize(host).map_err(|err| {
         if err.kind() == io::ErrorKind::NotFound {
             DirectError::NotFound
         } else {
@@ -1019,14 +1021,15 @@ pub(crate) fn read_confined(
     if bytes.len() > max_file_bytes {
         return Err(DirectError::BoundExceeded);
     }
-    let again = fs::canonicalize(host).map_err(|_| DirectError::Io)?;
+    let again = protocol::host_path::canonicalize(host).map_err(|_| DirectError::Io)?;
     confine(&again, root)?;
     Ok(bytes)
 }
 
 fn write_confined(root: &Path, dest: &Path, bytes: &[u8]) -> Result<(), DirectError> {
     let parent = dest.parent().ok_or(DirectError::UnresolvedParent)?;
-    let parent_canon = fs::canonicalize(parent).map_err(|_| DirectError::UnresolvedParent)?;
+    let parent_canon =
+        protocol::host_path::canonicalize(parent).map_err(|_| DirectError::UnresolvedParent)?;
     confine(&parent_canon, root)?;
     if !is_real_dir(&parent_canon)? {
         return Err(DirectError::NotADirectory);
@@ -1065,7 +1068,7 @@ fn write_confined(root: &Path, dest: &Path, bytes: &[u8]) -> Result<(), DirectEr
             return Err(DirectError::PathEscape);
         }
         confine(
-            &fs::canonicalize(&parent_canon).map_err(|_| DirectError::Io)?,
+            &protocol::host_path::canonicalize(&parent_canon).map_err(|_| DirectError::Io)?,
             root,
         )?;
         fs::rename(&tmp, &dest_path).map_err(|_| DirectError::Io)?;
@@ -1073,7 +1076,8 @@ fn write_confined(root: &Path, dest: &Path, bytes: &[u8]) -> Result<(), DirectEr
         if final_meta.file_type().is_symlink() {
             return Err(DirectError::PathEscape);
         }
-        let final_canon = fs::canonicalize(&dest_path).map_err(|_| DirectError::Io)?;
+        let final_canon =
+            protocol::host_path::canonicalize(&dest_path).map_err(|_| DirectError::Io)?;
         confine(&final_canon, root)?;
         Ok(())
     })();
@@ -1085,7 +1089,7 @@ fn write_confined(root: &Path, dest: &Path, bytes: &[u8]) -> Result<(), DirectEr
 
 fn delete_confined(root: &Path, host: &Path) -> Result<(), DirectError> {
     let parent = host.parent().ok_or(DirectError::UnresolvedParent)?;
-    let parent_canon = fs::canonicalize(parent).map_err(|_| DirectError::Io)?;
+    let parent_canon = protocol::host_path::canonicalize(parent).map_err(|_| DirectError::Io)?;
     confine(&parent_canon, root)?;
     if !is_real_dir(&parent_canon)? {
         return Err(DirectError::PathEscape);

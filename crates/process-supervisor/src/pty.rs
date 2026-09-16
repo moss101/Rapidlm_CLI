@@ -29,6 +29,10 @@ pub struct PtySession {
 pub enum PtyError {
     SpawnFailed,
     ScriptUnavailable,
+    /// This target has no pseudo-terminal allocator this module can use:
+    /// `script(1)` is a Unix utility, and Windows' ConPTY needs FFI the
+    /// crate forbids. Reported before anything is spawned.
+    Unsupported,
     Cancelled,
     Io,
 }
@@ -38,6 +42,7 @@ impl fmt::Display for PtyError {
         f.write_str(match self {
             Self::SpawnFailed => "PTY child spawn failed",
             Self::ScriptUnavailable => "script(1) utility not found",
+            Self::Unsupported => "PTY sessions are unsupported on this platform",
             Self::Cancelled => "PTY session cancelled",
             Self::Io => "PTY I/O error",
         })
@@ -91,6 +96,9 @@ impl PtySession {
     ) -> Result<Self, PtyError> {
         if cancelled() {
             return Err(PtyError::Cancelled);
+        }
+        if !cfg!(unix) {
+            return Err(PtyError::Unsupported);
         }
         let mut command = Command::new("script");
         script_args(&mut command, program, args);
@@ -169,6 +177,22 @@ impl PtySession {
 mod tests {
     use super::*;
 
+    /// The non-Unix contract: a typed refusal before any spawn, distinct
+    /// from a Unix host that merely lacks `script(1)`.
+    #[cfg(not(unix))]
+    #[test]
+    fn pty_is_a_typed_unsupported_error_off_unix() {
+        let err = PtySession::spawn(test_fixtures::tool_static("echo"), &["hi"], || false)
+            .expect_err("no pty");
+        assert_eq!(err, PtyError::Unsupported);
+        assert_ne!(err, PtyError::ScriptUnavailable);
+        // Cancellation is still checked first.
+        let err = PtySession::spawn(test_fixtures::tool_static("echo"), &["hi"], || true)
+            .expect_err("cancelled");
+        assert_eq!(err, PtyError::Cancelled);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn pty_child_sees_terminal_semantics() {
         let mut session = PtySession::spawn("/usr/bin/tty", &[], || false).expect("spawn tty");
@@ -180,6 +204,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn pty_echo_produces_real_output() {
         let mut session =
@@ -191,6 +216,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn pty_cleanup_after_kill_leaves_no_orphan() {
         let cancel_called = std::sync::atomic::AtomicBool::new(false);

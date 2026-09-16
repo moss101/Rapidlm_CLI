@@ -1104,9 +1104,13 @@ fn is_safe_host_path(path: &Path) -> bool {
     }
     path.components().all(|part| match part {
         std::path::Component::RootDir | std::path::Component::Normal(_) => true,
-        std::path::Component::CurDir
-        | std::path::Component::ParentDir
-        | std::path::Component::Prefix(_) => false,
+        // A plain drive (`C:`) is how every absolute path starts on Windows;
+        // UNC shares, device paths and verbatim (`\\?\`) prefixes are not
+        // local files simctl could ever be handed.
+        std::path::Component::Prefix(prefix) => {
+            matches!(prefix.kind(), std::path::Prefix::Disk(_))
+        }
+        std::path::Component::CurDir | std::path::Component::ParentDir => false,
     })
 }
 
@@ -1408,11 +1412,22 @@ mod tests {
         );
     }
 
+    /// An absolute host path for a literal fixture: `/tmp/<name>` on Unix,
+    /// `C:\tmp\<name>` on Windows (where `/tmp/…` is drive-relative and
+    /// rightly not absolute). Nothing is created on disk.
+    fn tmp(name: &str) -> String {
+        if cfg!(windows) {
+            format!("C:\\tmp\\{}", name.replace('/', "\\"))
+        } else {
+            format!("/tmp/{name}")
+        }
+    }
+
     #[test]
     fn argv_fixtures_cover_boot_install_launch_screenshot_status() {
         let udid = fixture_udid();
-        let app = AppBundlePath::parse("/tmp/Fixture.app").expect("app");
-        let dest = ScreenshotPath::parse("/tmp/screen.png").expect("png");
+        let app = AppBundlePath::parse(tmp("Fixture.app")).expect("app");
+        let dest = ScreenshotPath::parse(tmp("screen.png")).expect("png");
         let bundle = BundleId::parse("com.example.fixture").expect("bundle");
 
         let boot = simctl_argv(&TypedSimctlCommand::Boot { udid: udid.clone() });
@@ -1424,7 +1439,12 @@ mod tests {
         });
         assert_eq!(
             install,
-            ["simctl", "install", udid.as_str(), "/tmp/Fixture.app"]
+            [
+                "simctl",
+                "install",
+                udid.as_str(),
+                tmp("Fixture.app").as_str()
+            ]
         );
 
         let launch = simctl_argv(&TypedSimctlCommand::Launch {
@@ -1447,7 +1467,7 @@ mod tests {
                 "io",
                 udid.as_str(),
                 "screenshot",
-                "/tmp/screen.png"
+                tmp("screen.png").as_str()
             ]
         );
 
@@ -1595,34 +1615,36 @@ mod tests {
         BundleId::parse("com.example.fixture").expect("ok");
 
         for raw in [
-            "Fixture.app",
-            "/tmp/../Fixture.app",
-            "/tmp/Fixture.app;rm",
-            "/tmp/Fixture.app && wipe",
-            "/tmp/Fixture.app|$HOME",
-            "/tmp/Fixture",
+            "Fixture.app".to_owned(),
+            tmp("../Fixture.app"),
+            tmp("Fixture.app;rm"),
+            tmp("Fixture.app && wipe"),
+            tmp("Fixture.app|$HOME"),
+            tmp("Fixture"),
+            r"\\server\share\Fixture.app".to_owned(),
+            r"\\?\C:\tmp\Fixture.app".to_owned(),
         ] {
             assert_eq!(
-                AppBundlePath::parse(raw).expect_err(raw),
+                AppBundlePath::parse(&raw).expect_err(&raw),
                 IosSimctlError::InvalidAppPath,
                 "{raw}"
             );
         }
-        AppBundlePath::parse("/tmp/Fixture.app").expect("app");
+        AppBundlePath::parse(tmp("Fixture.app")).expect("app");
 
         for raw in [
-            "screen.png",
-            "/tmp/../screen.png",
-            "/tmp/screen.png;rm",
-            "/tmp/screen.jpg",
+            "screen.png".to_owned(),
+            tmp("../screen.png"),
+            tmp("screen.png;rm"),
+            tmp("screen.jpg"),
         ] {
             assert_eq!(
-                ScreenshotPath::parse(raw).expect_err(raw),
+                ScreenshotPath::parse(&raw).expect_err(&raw),
                 IosSimctlError::InvalidScreenshotPath,
                 "{raw}"
             );
         }
-        ScreenshotPath::parse("/tmp/screen.png").expect("png");
+        ScreenshotPath::parse(tmp("screen.png")).expect("png");
     }
 
     #[test]

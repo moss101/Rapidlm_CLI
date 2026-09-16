@@ -581,7 +581,7 @@ impl AndroidManager {
     ) -> Result<Self, AndroidManagerError> {
         let root = root.as_ref();
         fs::create_dir_all(root).map_err(|_| AndroidManagerError::Io)?;
-        let root = fs::canonicalize(root).map_err(|_| AndroidManagerError::Io)?;
+        let root = protocol::host_path::canonicalize(root).map_err(|_| AndroidManagerError::Io)?;
         fs::create_dir_all(root.join("devices")).map_err(|_| AndroidManagerError::Io)?;
         Ok(Self {
             inner: Arc::new(ManagerInner {
@@ -2091,7 +2091,7 @@ mod tests {
         assert_eq!(handle.adb_port(), MIN_CONSOLE_PORT + 1);
         assert_eq!(handle.serial().as_str(), "emulator-5554");
         assert_eq!(handle.generation(), 1);
-        let root = fs::canonicalize(&env.root).expect("canonical root");
+        let root = protocol::host_path::canonicalize(&env.root).expect("canonical root");
         assert!(handle.data_dir().starts_with(&root));
         assert!(handle.data_dir().join("ISOLATED").exists());
         let marker = fs::read_to_string(handle.data_dir().join("ISOLATED")).expect("marker");

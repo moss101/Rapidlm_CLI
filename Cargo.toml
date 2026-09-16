@@ -31,6 +31,7 @@ members = [
     "crates/plugin-host",
     "crates/telemetry",
     "crates/tui",
+    "crates/test-fixtures",
 ]
 
 [workspace.package]

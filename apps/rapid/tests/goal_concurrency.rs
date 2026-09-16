@@ -120,15 +120,14 @@ fn trusted_project(home: &Path, project: &Path) {
             .output()
             .expect("git config");
     }
-    let root = std::fs::canonicalize(project).expect("canonical root");
+    let root = protocol::host_path::canonicalize(project).expect("canonical root");
     let trust_dir = home.join(".rapidlm");
     std::fs::create_dir_all(&trust_dir).expect("rapidlm home");
+    // JSON-encoded: a Windows path's backslashes are escapes to the parser.
+    let root_json = serde_json::to_string(root.to_str().expect("utf-8 root")).expect("json");
     std::fs::write(
         trust_dir.join("project-trust.json"),
-        format!(
-            "{{\"schema\":1,\"records\":[{{\"canonical_root\":\"{}\",\"status\":\"trusted\"}}]}}",
-            root.to_str().expect("utf-8 root")
-        ),
+        format!("{{\"schema\":1,\"records\":[{{\"canonical_root\":{root_json},\"status\":\"trusted\"}}]}}"),
     )
     .expect("trust catalog");
 }

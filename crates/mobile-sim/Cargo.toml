@@ -16,6 +16,9 @@ event-ledger = { path = "../event-ledger" }
 capability-broker = { path = "../capability-broker" }
 
 [dev-dependencies]
+# test-fixtures: absolute paths of the POSIX fixture programs the
+# process-driving tests run, on every CI host. Test-only.
+test-fixtures = { path = "../test-fixtures" }
 # Integration fixtures name CancellationToken / ErrorCode on production mocks.
 capability-broker = { path = "../capability-broker" }
 protocol = { path = "../protocol" }

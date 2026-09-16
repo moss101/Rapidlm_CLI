@@ -448,9 +448,10 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("root");
-        std::fs::canonicalize(&root).expect("canonicalize")
+        protocol::host_path::canonicalize(&root).expect("canonicalize")
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn sh_scanner(id: &str, sarif_body: &str) -> ScannerEntry {
         let config = ExternalScannerConfig::new(
             id,
@@ -465,13 +466,20 @@ mod tests {
         }
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     const CLEAN_SARIF: &str =
         r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"fakescan"}},"results":[]}]}"#;
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn finding_sarif() -> String {
         r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"fakescan"}},"results":[{"ruleId":"no-eval","level":"error","message":{"text":"eval is unsafe"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/app.rs"},"region":{"byteOffset":10,"byteLength":4}}}]}]}]}"#.to_owned()
     }
 
+    // Runs a real scanner through the host-restricted sandbox, which needs
+    // POSIX governance; off Unix the tier is unavailable and
+    // `an_uninstalled_scanner_reports_unavailable_not_an_error` is the
+    // contract that still holds (unavailable never becomes pass).
+    #[cfg(unix)]
     #[test]
     fn a_real_sandboxed_scanner_with_no_findings_passes_the_gate() {
         let root = temp_workspace("clean");
@@ -486,6 +494,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Runs a real scanner through the host-restricted sandbox, which needs
+    // POSIX governance; off Unix the tier is unavailable and
+    // `an_uninstalled_scanner_reports_unavailable_not_an_error` is the
+    // contract that still holds (unavailable never becomes pass).
+    #[cfg(unix)]
     #[test]
     fn a_real_sandboxed_scanner_with_a_finding_blocks_the_gate_by_default() {
         let root = temp_workspace("finding");
@@ -503,6 +516,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Runs a real scanner through the host-restricted sandbox, which needs
+    // POSIX governance; off Unix the tier is unavailable and
+    // `an_uninstalled_scanner_reports_unavailable_not_an_error` is the
+    // contract that still holds (unavailable never becomes pass).
+    #[cfg(unix)]
     #[test]
     fn dismissing_the_only_finding_turns_the_gate_clean_again() {
         let root = temp_workspace("dismissed");
@@ -526,6 +544,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Runs a real scanner through the host-restricted sandbox, which needs
+    // POSIX governance; off Unix the tier is unavailable and
+    // `an_uninstalled_scanner_reports_unavailable_not_an_error` is the
+    // contract that still holds (unavailable never becomes pass).
+    #[cfg(unix)]
     #[test]
     fn a_warn_disposition_finds_but_does_not_block() {
         let root = temp_workspace("warn");

@@ -153,17 +153,15 @@ fn drain_capped<R: Read>(mut pipe: R, cap: usize) -> DrainedStdout {
 mod tests {
     use super::*;
 
-    fn require_bin(path: &str) -> &Path {
-        let p = Path::new(path);
-        assert!(p.is_file(), "missing test fixture binary {path}");
-        p
+    fn require_bin(name: &str) -> std::path::PathBuf {
+        test_fixtures::tool(name)
     }
 
     #[test]
     fn plain_echo_succeeds_and_captures_stdout() {
-        let echo = require_bin("/bin/echo");
+        let echo = require_bin("echo");
         let out = run_bounded_capturing_stdout(
-            echo,
+            &echo,
             ["hello"],
             None,
             Duration::from_secs(5),
@@ -176,9 +174,9 @@ mod tests {
 
     #[test]
     fn nonzero_exit_is_reported() {
-        let cmd = require_bin("/usr/bin/false");
+        let cmd = require_bin("false");
         let err = run_bounded_capturing_stdout(
-            cmd,
+            &cmd,
             std::iter::empty::<&str>(),
             None,
             Duration::from_secs(5),
@@ -191,9 +189,9 @@ mod tests {
 
     #[test]
     fn output_past_the_pipe_buffer_does_not_deadlock() {
-        let dd = require_bin("/bin/dd");
+        let dd = require_bin("dd");
         let out = run_bounded_capturing_stdout(
-            dd,
+            &dd,
             ["if=/dev/zero", "bs=1024", "count=200"],
             None,
             Duration::from_secs(5),
@@ -207,9 +205,9 @@ mod tests {
 
     #[test]
     fn truncation_at_a_small_cap_still_drains_without_deadlock() {
-        let dd = require_bin("/bin/dd");
+        let dd = require_bin("dd");
         let err = run_bounded_capturing_stdout(
-            dd,
+            &dd,
             ["if=/dev/zero", "bs=1024", "count=200"],
             None,
             Duration::from_secs(5),
@@ -222,9 +220,9 @@ mod tests {
 
     #[test]
     fn zero_timeout_is_rejected_before_spawning() {
-        let echo = require_bin("/bin/echo");
+        let echo = require_bin("echo");
         let err = run_bounded_capturing_stdout(
-            echo,
+            &echo,
             ["hi"],
             None,
             Duration::ZERO,
@@ -237,12 +235,18 @@ mod tests {
 
     #[test]
     fn already_cancelled_token_is_rejected_before_spawning() {
-        let echo = require_bin("/bin/echo");
+        let echo = require_bin("echo");
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let err =
-            run_bounded_capturing_stdout(echo, ["hi"], None, Duration::from_secs(5), 1024, &cancel)
-                .expect_err("cancelled");
+        let err = run_bounded_capturing_stdout(
+            &echo,
+            ["hi"],
+            None,
+            Duration::from_secs(5),
+            1024,
+            &cancel,
+        )
+        .expect_err("cancelled");
         assert_eq!(err, HostRunError::Cancelled);
     }
 }

@@ -17,11 +17,13 @@ use std::time::{Duration, Instant};
 use capability_broker::{CancellationToken, CanonicalHostPath, Capability, CapabilityLease};
 use process_signal::{isolate_process_group, terminate_process_group_default};
 
-use crate::backends::process_sample::{first_existing, sample_process_group};
+use crate::backends::process_sample::{
+    first_existing, group_accounting_available, sample_process_group,
+};
 use protocol::{LeaseId, RepoPath, SandboxTier};
 
 use crate::backend::{
-    BackendHealth, IsolationStrength, MountCapability, MountMode, NetworkCapability,
+    BackendHealth, HealthReason, IsolationStrength, MountCapability, MountMode, NetworkCapability,
     ResourceCapability, ResourceUsage, SandboxBackend, SandboxCapabilities, SandboxError,
     SandboxExecRequest, SandboxExecResult, SandboxExit, SandboxExitReason, SandboxHandle,
     SandboxId, SandboxMount, SandboxNetwork, SandboxSpec,
@@ -242,6 +244,19 @@ impl SandboxBackend for HostRestrictedBackend {
 
     fn health(&self, cancel: &CancellationToken) -> Result<BackendHealth, SandboxError> {
         check_cancel(cancel)?;
+        // This tier's whole governance is POSIX: `ulimit -t` through a
+        // POSIX shell for the CPU limit and `ps`/`pgrep` for process-group
+        // accounting. A host without them (Windows, or a minimal image) is
+        // reported unavailable here rather than discovered as a
+        // `ResourceLimit` failure at the first `prepare` — the same
+        // evidence-based answer the container and gVisor backends give for
+        // a missing runtime.
+        if first_existing(POSIX_SH).is_none() || !group_accounting_available() {
+            return BackendHealth::unavailable(
+                HealthReason::PlatformUnsupported,
+                Some(HOST_VERSION),
+            );
+        }
         BackendHealth::available(Some(HOST_VERSION))
     }
 
@@ -461,7 +476,8 @@ fn join_host(
 }
 
 pub(crate) fn resolve_existing_dir(path: &Path) -> Result<CanonicalHostPath, SandboxError> {
-    let canon = fs::canonicalize(path).map_err(|_| SandboxError::ForbiddenMount)?;
+    let canon =
+        protocol::host_path::canonicalize(path).map_err(|_| SandboxError::ForbiddenMount)?;
     let meta = fs::metadata(&canon).map_err(|_| SandboxError::ForbiddenMount)?;
     if !meta.is_dir() {
         return Err(SandboxError::ForbiddenMount);
@@ -476,7 +492,8 @@ fn resolve_existing_file(path: &str) -> Result<CanonicalHostPath, SandboxError> 
     if is_forbidden_host_source(requested.as_str()) {
         return Err(SandboxError::ForbiddenMount);
     }
-    let canon = fs::canonicalize(requested.as_str()).map_err(|_| SandboxError::ForbiddenMount)?;
+    let canon = protocol::host_path::canonicalize(requested.as_str())
+        .map_err(|_| SandboxError::ForbiddenMount)?;
     if !canon.is_file() {
         return Err(SandboxError::ForbiddenMount);
     }
@@ -606,7 +623,7 @@ fn require_cpu_rlimit(cpu_millis: u32) -> Result<(), SandboxError> {
 }
 
 fn require_group_accounting() -> Result<(), SandboxError> {
-    if crate::backends::process_sample::group_accounting_available() {
+    if group_accounting_available() {
         Ok(())
     } else {
         Err(SandboxError::ResourceLimit)
@@ -973,25 +990,16 @@ mod tests {
 
     const CANARY: &str = "canary-secret-PLAINTEXT-do-not-leak-7c1e9b";
 
-    fn host_tool(candidates: &[&'static str]) -> &'static str {
-        for path in candidates {
-            if Path::new(path).is_file() {
-                return path;
-            }
-        }
-        panic!("no host tool among {candidates:?}");
-    }
-
     fn true_bin() -> &'static str {
-        host_tool(&["/usr/bin/true", "/bin/true", "/bin/echo"])
+        test_fixtures::tool_static("true")
     }
 
     fn sleep_bin() -> &'static str {
-        host_tool(&["/bin/sleep", "/usr/bin/sleep"])
+        test_fixtures::tool_static("sleep")
     }
 
     fn sh_bin() -> &'static str {
-        host_tool(&["/bin/sh", "/usr/bin/sh"])
+        test_fixtures::tool_static("sh")
     }
 
     struct TempWorkspace {
@@ -1004,7 +1012,7 @@ mod tests {
             let path = std::env::temp_dir()
                 .join(format!("rapidlm-host-sbx-{}", protocol::RuntimeId::new()));
             fs::create_dir_all(&path).expect("temp workspace");
-            let canon = fs::canonicalize(&path).expect("canonicalize");
+            let canon = protocol::host_path::canonicalize(&path).expect("canonicalize");
             let host =
                 CanonicalHostPath::from_resolved(canon.to_str().expect("utf8")).expect("host");
             Self { path, host }
@@ -1207,6 +1215,9 @@ capability = "fs.read"
         assert!(!caps.network().proxy_supported());
     }
 
+    // Needs the POSIX governance (`ulimit`, `ps`) a prepared session runs
+    // under; the Windows-side contract is `unavailable_without_posix_governance`.
+    #[cfg(unix)]
     #[test]
     fn doctor_and_health_warn_that_isolation_is_not_strong() {
         let mut mgr = SandboxManager::new();
@@ -1474,6 +1485,9 @@ capability = "fs.read"
         assert_eq!(err, SandboxError::InvalidSpec);
     }
 
+    // Needs the POSIX governance (`ulimit`, `ps`) a prepared session runs
+    // under; the Windows-side contract is `unavailable_without_posix_governance`.
+    #[cfg(unix)]
     #[test]
     fn prepare_exec_destroy_enforces_lease_and_labels_plan() {
         let backend = HostRestrictedBackend::new();
@@ -1528,6 +1542,9 @@ capability = "fs.read"
         );
     }
 
+    // Needs the POSIX governance (`ulimit`, `ps`) a prepared session runs
+    // under; the Windows-side contract is `unavailable_without_posix_governance`.
+    #[cfg(unix)]
     #[test]
     fn timeout_and_cancellation_are_explicit_terminal_statuses() {
         let backend = HostRestrictedBackend::new();
@@ -1598,6 +1615,9 @@ capability = "fs.read"
         backend.destroy(&handle, &live).expect("destroy");
     }
 
+    // Needs the POSIX governance (`ulimit`, `ps`) a prepared session runs
+    // under; the Windows-side contract is `unavailable_without_posix_governance`.
+    #[cfg(unix)]
     #[test]
     fn exec_result_output_is_bounded_by_the_spec_output_limit() {
         let backend = HostRestrictedBackend::new();
@@ -1672,6 +1692,9 @@ capability = "fs.read"
         backend.destroy(&handle, &live).expect("destroy");
     }
 
+    // Needs the POSIX governance (`ulimit`, `ps`) a prepared session runs
+    // under; the Windows-side contract is `unavailable_without_posix_governance`.
+    #[cfg(unix)]
     #[test]
     fn exec_cannot_widen_timeout_or_output_and_resource_limits_are_bounded() {
         let backend = HostRestrictedBackend::new();
@@ -1745,6 +1768,9 @@ capability = "fs.read"
         backend.destroy(&handle, &live).expect("destroy");
     }
 
+    // Needs the POSIX governance (`ulimit`, `ps`) a prepared session runs
+    // under; the Windows-side contract is `unavailable_without_posix_governance`.
+    #[cfg(unix)]
     #[test]
     fn relative_executable_is_rejected() {
         let backend = HostRestrictedBackend::new();
@@ -1762,6 +1788,36 @@ capability = "fs.read"
             SandboxError::ForbiddenMount
         );
         backend.destroy(&handle, &live).expect("destroy");
+    }
+
+    /// The Windows-side contract: no POSIX shell for `ulimit` and no
+    /// `ps`/`pgrep` means the tier is reported unavailable by `health`, the
+    /// manager will not select it, and a direct `prepare` fails closed with
+    /// `ResourceLimit` — never a session that silently runs unlimited.
+    #[cfg(not(unix))]
+    #[test]
+    fn unavailable_without_posix_governance() {
+        let backend = HostRestrictedBackend::new();
+        let live = CancellationToken::new();
+        let health = backend.health(&live).expect("health");
+        assert!(!health.is_available());
+        assert_eq!(health.version(), Some(HOST_VERSION));
+
+        let ws = TempWorkspace::new();
+        let spec = host_spec(&ws);
+        assert_eq!(
+            backend
+                .prepare(&spec, &proc_lease(), &live)
+                .expect_err("no governance"),
+            SandboxError::ResourceLimit
+        );
+
+        let mut mgr = SandboxManager::new();
+        mgr.register(Box::new(HostRestrictedBackend::new()))
+            .expect("register");
+        let reports = mgr.doctor(&live).expect("doctor");
+        assert_eq!(reports.len(), 1);
+        assert!(!reports[0].health().is_available());
     }
 
     #[test]

@@ -694,7 +694,7 @@ impl World {
         std::fs::write(view_a.join("src").join("safe.txt"), b"approved\n").expect("safe");
         #[cfg(unix)]
         let view_a_host = CanonicalHostPath::from_resolved(
-            std::fs::canonicalize(&view_a)
+            protocol::host_path::canonicalize(&view_a)
                 .unwrap_or_else(|_| view_a.clone())
                 .to_str()
                 .expect("utf8"),
@@ -991,7 +991,7 @@ impl LiveFs {
 #[cfg(unix)]
 fn canonical_text(path: &Path) -> String {
     std::fs::create_dir_all(path).expect("mkdir");
-    std::fs::canonicalize(path)
+    protocol::host_path::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())
         .to_str()
         .expect("utf8")

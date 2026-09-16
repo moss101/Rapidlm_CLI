@@ -765,10 +765,10 @@ capability = "proc.exec"
             PolicyRevision::of_stack(&policies),
         );
 
-        // Production runner drives a real OS child (/bin/cat echoes stdin).
-        let tmp = std::env::temp_dir().canonicalize().expect("tmp");
+        // Production runner drives a real OS child (`cat` echoes stdin).
+        let tmp = protocol::host_path::canonicalize(std::env::temp_dir()).expect("tmp");
         let mut runner = SupervisedCliRunner::new(
-            vec!["/bin/cat".to_owned()],
+            vec![test_fixtures::tool_str("cat")],
             tmp,
             principal.clone(),
             session_id,

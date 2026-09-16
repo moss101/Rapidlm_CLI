@@ -1450,7 +1450,11 @@ env_key = ["MISSING_A", "PRESENT_B"]
         match selection {
             ModelSelection::Unconfigured { searched } => {
                 assert_eq!(searched.len(), 1);
-                assert!(searched[0].ends_with(".rapidlm/config.toml"));
+                assert!(
+                    Path::new(&searched[0]).ends_with(Path::new(".rapidlm").join("config.toml")),
+                    "{}",
+                    searched[0]
+                );
             }
             other => panic!("expected unconfigured, got {other:?}"),
         }

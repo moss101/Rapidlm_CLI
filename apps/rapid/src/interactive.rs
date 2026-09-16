@@ -2229,7 +2229,7 @@ pub(crate) fn persisted_grants_for(
     let Ok(text) = fs::read_to_string(&store_path) else {
         return Vec::new();
     };
-    let Ok(canonical) = fs::canonicalize(root) else {
+    let Ok(canonical) = protocol::host_path::canonicalize(root) else {
         return Vec::new();
     };
     let Ok(grants) = crate::permissions::parse_grants(&text) else {
@@ -4808,10 +4808,14 @@ fn run_started_session(
     // — it does not synthesize one at startup — so without this, `ui.
     // viewport()` would stay stuck at `Viewport::default()`'s 80x24 for a
     // real terminal of any other size until the user happened to resize it.
-    // Best-effort: a non-tty (headless test runs, `RecordingBackend`) simply
-    // leaves the existing default in place, which scripted tests already
-    // override deterministically with their own leading `Resize` input.
-    if let Ok((width, height)) = crossterm::terminal::size() {
+    // Only for a real terminal: a scripted session has no terminal to size
+    // to and keeps the default (or its own leading `Resize` input). Probing
+    // anyway used to pick up whatever console the *test runner* happened to
+    // have — on a Windows CI agent a one-row window, so every frame painted
+    // one blank line — and made headless runs depend on the host.
+    if matches!(inputs, InputSource::Crossterm)
+        && let Ok((width, height)) = crossterm::terminal::size()
+    {
         ui = reduce(
             ui,
             &UiEvent::Local(LocalUiEvent::SetViewport { width, height }),
@@ -10640,13 +10644,26 @@ pub(crate) fn detect_project_root(
     cwd: &Path,
     cancel: &CancellationToken,
 ) -> Result<PathBuf, InteractiveError> {
+    detect_project_root_excluding(cwd, existing_user_config_dir().as_deref(), cancel)
+}
+
+/// [`detect_project_root`] with the user configuration directory passed in
+/// (see [`is_project_marker`]); the process-environment lookup lives in the
+/// caller so this walk can be tested against a fixture home.
+fn detect_project_root_excluding(
+    cwd: &Path,
+    user_config_dir: Option<&Path>,
+    cancel: &CancellationToken,
+) -> Result<PathBuf, InteractiveError> {
     let mut current = cwd.to_path_buf();
     for depth in 0..=MAX_PROJECT_WALK_DEPTH {
         cancel.check().map_err(|_| InteractiveError::Cancelled)?;
         if depth == MAX_PROJECT_WALK_DEPTH {
             return Err(InteractiveError::InvalidProjectRoot);
         }
-        if current.join(PROJECT_MARKER).exists() || current.join(GIT_MARKER).exists() {
+        if is_project_marker(&current.join(PROJECT_MARKER), user_config_dir)
+            || current.join(GIT_MARKER).exists()
+        {
             return canonicalize_dir(&current);
         }
         match current.parent() {
@@ -10655,6 +10672,48 @@ pub(crate) fn detect_project_root(
         }
     }
     Err(InteractiveError::InvalidProjectRoot)
+}
+
+/// Whether a `.rapidlm` directory found while walking up from the working
+/// directory marks a *project*. The user's own configuration directory —
+/// `$RAPIDLM_HOME`, else `~/.rapidlm` — has the same name and is not one:
+/// treating it as a marker made every unmarked directory beneath the home
+/// (`~/scratch`, a temp directory under `%USERPROFILE%\AppData` on
+/// Windows) resolve its project root to the home itself, so `goal.json`,
+/// the session ledger and the todo list landed in the user config directory
+/// instead of beside the work. Compared by canonical identity so a symlinked
+/// home still matches.
+fn existing_user_config_dir() -> Option<PathBuf> {
+    // The same precedence as `user_home_from`, without its create-if-missing:
+    // a directory that does not exist cannot be mistaken for a marker, and
+    // detecting a project root must not leave a `~/.rapidlm` behind.
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let value = |key: &str| {
+        env.iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+            .filter(|value| !value.is_empty())
+    };
+    let candidate = match value(RAPIDLM_HOME_ENV) {
+        Some(home) => PathBuf::from(home),
+        None => {
+            PathBuf::from(value(HOME_ENV).or_else(|| value(USERPROFILE_ENV))?).join(PROJECT_MARKER)
+        }
+    };
+    protocol::host_path::canonicalize(candidate).ok()
+}
+
+fn is_project_marker(marker: &Path, user_config_dir: Option<&Path>) -> bool {
+    if !marker.exists() {
+        return false;
+    }
+    let Some(user_config_dir) = user_config_dir else {
+        return true;
+    };
+    match protocol::host_path::canonicalize(marker) {
+        Ok(canonical) => canonical != user_config_dir,
+        Err(_) => true,
+    }
 }
 
 fn gather_config_sources(
@@ -10774,7 +10833,8 @@ fn resolve_user_home(options: &InteractiveOptions) -> Result<PathBuf, Interactiv
 }
 
 pub(crate) fn canonicalize_dir(path: &Path) -> Result<PathBuf, InteractiveError> {
-    let canonical = fs::canonicalize(path).map_err(|_| InteractiveError::InvalidProjectRoot)?;
+    let canonical = protocol::host_path::canonicalize(path)
+        .map_err(|_| InteractiveError::InvalidProjectRoot)?;
     if !canonical.is_absolute() {
         return Err(InteractiveError::InvalidProjectRoot);
     }
@@ -11597,7 +11657,7 @@ base_url = "http://127.0.0.1:11434/v1"
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("dir");
-        let root = fs::canonicalize(&dir).expect("canonicalize");
+        let root = protocol::host_path::canonicalize(&dir).expect("canonicalize");
 
         // Exactly what the interactive turn builds, with production's own
         // `forced_mode: None`.
@@ -11789,15 +11849,18 @@ approval gap has been closed and this characterization test should be rewritten:
         std::fs::create_dir_all(&dir).expect("dir");
         let capture = dir.join("fired.txt");
         let script_path = dir.join("note.sh");
-        std::fs::write(&script_path, format!("echo fired > {}", capture.display()))
-            .expect("write script");
+        std::fs::write(
+            &script_path,
+            format!("echo fired > {}", test_fixtures::sh_quote(&capture)),
+        )
+        .expect("write script");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod");
         }
-        let hook = format!("sh {}", script_path.display());
+        let hook = format!("sh {}", test_fixtures::sh_quote(&script_path));
 
         // Simulate an early-return exit path: the guard is constructed,
         // configured, and then the enclosing scope ends (an early `return`
@@ -11937,7 +12000,7 @@ approval gap has been closed and this characterization test should be rewritten:
     }
 
     fn identity_for(project: &Path) -> ProjectIdentity {
-        let root = fs::canonicalize(project).expect("canon");
+        let root = protocol::host_path::canonicalize(project).expect("canon");
         ProjectIdentity::new(root, None).expect("identity")
     }
 
@@ -13991,7 +14054,7 @@ subcommand"
             "local command output is session-local by design and must not appear to persist:\n{painted}"
         );
         // The grant itself is durable — it is the *transcript line* that is not.
-        let canonical = fs::canonicalize(&env.project).expect("canonicalize");
+        let canonical = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
         assert!(!persisted_grants_for(&canonical, &env.user_home).is_empty());
     }
 
@@ -14234,7 +14297,7 @@ subcommand"
         // the turn runs in — not whatever `.rapidlm/reminders.toml` the
         // process happens to be standing next to.
         let env = TempEnv::create();
-        let root = fs::canonicalize(&env.project).expect("canonicalize");
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
         fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
         fs::write(
             root.join(PROJECT_MARKER).join("reminders.toml"),
@@ -14258,7 +14321,7 @@ subcommand"
         // second project with its own roster gets its own, and neither can
         // see the other's.
         let other = TempEnv::create();
-        let other_root = fs::canonicalize(&other.project).expect("canonicalize");
+        let other_root = protocol::host_path::canonicalize(&other.project).expect("canonicalize");
         fs::create_dir_all(other_root.join(PROJECT_MARKER)).expect("marker");
         fs::write(
             other_root.join(PROJECT_MARKER).join("reminders.toml"),
@@ -14499,7 +14562,7 @@ that is no longer there"
         // TUI already walked up to the nearest marker; this is the same rule
         // for everything else.
         let env = TempEnv::create();
-        let root = fs::canonicalize(&env.project).expect("canonicalize");
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
         fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
         let nested = root.join("crates").join("deep").join("src");
         fs::create_dir_all(&nested).expect("nested dirs");
@@ -14525,7 +14588,7 @@ that is no longer there"
         // project store at the repository root rather than beside whatever
         // file the developer happened to be editing.
         let env = TempEnv::create();
-        let root = fs::canonicalize(&env.project).expect("canonicalize");
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
         fs::remove_dir_all(root.join(PROJECT_MARKER)).ok();
         fs::create_dir_all(root.join(GIT_MARKER)).expect("git marker");
         let nested = root.join("src");
@@ -14543,7 +14606,7 @@ that is no longer there"
         // directory — so `rapid goal create` in a scratch directory keeps
         // working.
         let dir = TempEnv::create();
-        let bare = fs::canonicalize(&dir.project)
+        let bare = protocol::host_path::canonicalize(&dir.project)
             .expect("canonicalize")
             .join("scratch");
         fs::create_dir_all(&bare).expect("scratch");
@@ -14551,11 +14614,48 @@ that is no longer there"
         let resolved = project_path_in(&bare, GOAL_FILE);
         assert!(
             resolved.starts_with(&bare)
-                || resolved.starts_with(fs::canonicalize(&dir.project).expect("c")),
+                || resolved
+                    .starts_with(protocol::host_path::canonicalize(&dir.project).expect("c")),
             "an unmarked directory falls back to itself or its nearest marker: {}",
             resolved.display()
         );
         assert!(resolved.ends_with(Path::new(PROJECT_MARKER).join(GOAL_FILE)));
+    }
+
+    #[test]
+    fn the_user_config_dir_is_not_a_project_marker() {
+        // `~/.rapidlm` is the user's configuration directory, not a project.
+        // A scratch directory beneath the home with no marker of its own
+        // must resolve to itself, not to the home — otherwise the goal
+        // file and session ledger of every unmarked directory under `~`
+        // (on Windows, every temp directory) land in the user config dir.
+        let env = TempEnv::create();
+        let home = protocol::host_path::canonicalize(&env.root).expect("home");
+        let user_config = home.join(PROJECT_MARKER);
+        fs::create_dir_all(&user_config).expect("user config dir");
+        let scratch = home.join("scratch").join("deeper");
+        fs::create_dir_all(&scratch).expect("scratch");
+        let cancel = CancellationToken::new();
+
+        let resolved =
+            detect_project_root_excluding(&scratch, Some(&user_config), &cancel).expect("root");
+        assert_eq!(resolved, scratch, "the home's .rapidlm is not a marker");
+
+        // The exclusion is by identity, so a *real* project marker beneath
+        // the home still wins, and the home's own `.git` still counts.
+        let project = home.join("proj2");
+        fs::create_dir_all(project.join(PROJECT_MARKER)).expect("project marker");
+        let inside = project.join("src");
+        fs::create_dir_all(&inside).expect("src");
+        assert_eq!(
+            detect_project_root_excluding(&inside, Some(&user_config), &cancel).expect("root"),
+            project
+        );
+        fs::create_dir_all(home.join(GIT_MARKER)).expect("git marker");
+        assert_eq!(
+            detect_project_root_excluding(&scratch, Some(&user_config), &cancel).expect("root"),
+            home
+        );
     }
 
     #[test]
@@ -14585,7 +14685,7 @@ that is no longer there"
         // turn — not a second read of the file with its own bounds, which
         // would answer that question with something the model never saw.
         let env = TempEnv::create();
-        let root = fs::canonicalize(&env.project).expect("canonicalize");
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
         fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
         // Deliberately past `MAX_MEMORY_INDEX_LINES`, so a raw read of the
         // file and the bounded read the model gets actually differ — with a
@@ -14802,7 +14902,7 @@ question the panel answers"
         // turn: no hooks, no reminders, no proactive retrieval. One setup
         // now serves both paths.
         let env = TempEnv::create();
-        let root = fs::canonicalize(&env.project).expect("canonicalize");
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
         fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
         // A pre-tool hook that denies every call, naming itself.
         fs::write(
@@ -14877,7 +14977,7 @@ question the panel answers"
         // with the turn count and, after, the summary's size — on a trusted
         // project only, like every hook.
         let env = TempEnv::create();
-        let root = fs::canonicalize(&env.project).expect("canonicalize");
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
         fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
         // Hooks run in the process's working directory, as headless hooks
         // do: absolute targets.
@@ -15101,7 +15201,7 @@ for line in sys.stdin:
             {"type": "text", "text": "call number " + str(calls)}]}})
 "#;
         let env = TempEnv::create();
-        let root = fs::canonicalize(&env.project).expect("canonicalize");
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
         fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
         let script_path = root.join("mcp-count-server.py");
         fs::write(&script_path, SERVER_SCRIPT).expect("write server");
@@ -15847,7 +15947,7 @@ for line in sys.stdin:
         // stderr writes, which the alt screen turns into a staircase. They
         // are the user's to read, so they go in the transcript.
         let env = TempEnv::create();
-        let root = fs::canonicalize(&env.project).expect("canonicalize");
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
         fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
         fs::write(
             root.join(PROJECT_MARKER).join("reminders.toml"),
@@ -16458,7 +16558,10 @@ not this session's own earlier output"
         let mut session = ScriptedSession::create(&env);
         session.run_turn(
             "start a slow one",
-            ScriptedModel::background_job_then_answer(&["/bin/sleep", "30"], "started"),
+            ScriptedModel::background_job_then_answer(
+                &[test_fixtures::tool_static("sleep"), "30"],
+                "started",
+            ),
         );
         assert_eq!(
             session.state().jobs().values().next().expect("job").state(),
@@ -16519,7 +16622,10 @@ was already finished"
         let mut session = ScriptedSession::create(&env);
         session.run_turn(
             "start a slow one",
-            ScriptedModel::background_job_then_answer(&["/bin/sleep", "30"], "started"),
+            ScriptedModel::background_job_then_answer(
+                &[test_fixtures::tool_static("sleep"), "30"],
+                "started",
+            ),
         );
 
         let jobs = session.state().jobs();
@@ -16543,7 +16649,10 @@ was already finished"
             tui::state::JobLifecycle::Started,
             "and still running a turn later: {job:?}"
         );
-        assert_eq!(job.command(), Some("/bin/sleep 30"));
+        assert_eq!(
+            job.command(),
+            Some(format!("{} 30", test_fixtures::tool_static("sleep")).as_str())
+        );
     }
 
     #[test]
@@ -16558,7 +16667,10 @@ was already finished"
         let mut session = ScriptedSession::create(&env);
         session.run_turn(
             "start a slow one",
-            ScriptedModel::background_job_then_answer(&["/bin/sleep", "30"], "started"),
+            ScriptedModel::background_job_then_answer(
+                &[test_fixtures::tool_static("sleep"), "30"],
+                "started",
+            ),
         );
         assert_eq!(
             session
@@ -16605,7 +16717,10 @@ was already finished"
         let mut session = ScriptedSession::create(&env);
         session.run_turn(
             "start the build",
-            ScriptedModel::background_job_then_answer(&["/bin/echo", "building"], "started it"),
+            ScriptedModel::background_job_then_answer(
+                &[test_fixtures::tool_static("echo"), "building"],
+                "started it",
+            ),
         );
 
         // `job.started` is appended by the tool call itself, so it is in the
@@ -16615,7 +16730,7 @@ was already finished"
         let job = jobs.values().next().expect("one job");
         assert_eq!(
             job.command(),
-            Some("/bin/echo building"),
+            Some(format!("{} building", test_fixtures::tool_static("echo")).as_str()),
             "the panel needs to say what is running, not just a uuid"
         );
         // Completion is reported by the job's own supervisor thread, which
@@ -16644,7 +16759,7 @@ was already finished"
             &tui::state::CancellationToken::new(),
         );
         assert!(
-            painted[0].contains("/bin/echo building"),
+            painted[0].contains(&format!("{} building", test_fixtures::tool_static("echo"))),
             "the jobs panel must show the command: {painted:?}"
         );
     }
@@ -16668,7 +16783,11 @@ was already finished"
             // test passed with the whole feature reverted. The product of
             // the two operands appears only in what the process printed.
             ScriptedModel::background_job_then_answer(
-                &["/bin/sh", "-c", "echo $((123456789 * 2))"],
+                &[
+                    test_fixtures::tool_static("sh"),
+                    "-c",
+                    "echo $((123456789 * 2))",
+                ],
                 "started it",
             ),
         );
@@ -16754,11 +16873,17 @@ was already finished"
         let mut session = ScriptedSession::create(&env);
         session.run_turn(
             "start the first",
-            ScriptedModel::background_job_then_answer(&["/bin/echo", "first-job"], "ok"),
+            ScriptedModel::background_job_then_answer(
+                &[test_fixtures::tool_static("echo"), "first-job"],
+                "ok",
+            ),
         );
         session.run_turn(
             "start the second",
-            ScriptedModel::background_job_then_answer(&["/bin/echo", "second-job"], "ok"),
+            ScriptedModel::background_job_then_answer(
+                &[test_fixtures::tool_static("echo"), "second-job"],
+                "ok",
+            ),
         );
         let jobs = session.state().jobs().clone();
         assert_eq!(jobs.len(), 2, "two jobs must be projected: {jobs:?}");
@@ -16832,14 +16957,14 @@ was already finished"
         session.run_turn(
             "start the first",
             ScriptedModel::background_job_then_answer(
-                &["/bin/sh", "-c", "echo $((111 * 3))"],
+                &[test_fixtures::tool_static("sh"), "-c", "echo $((111 * 3))"],
                 "ok",
             ),
         );
         session.run_turn(
             "start the second",
             ScriptedModel::background_job_then_answer(
-                &["/bin/sh", "-c", "echo $((222 * 3))"],
+                &[test_fixtures::tool_static("sh"), "-c", "echo $((222 * 3))"],
                 "ok",
             ),
         );
@@ -16915,7 +17040,7 @@ was already finished"
         session.run_turn(
             "start a job that writes once more before it exits",
             ScriptedModel::background_job_then_answer(
-                &["/bin/sh", "-c", script.as_str()],
+                &[test_fixtures::tool_static("sh"), "-c", script.as_str()],
                 "started it",
             ),
         );
@@ -17027,7 +17152,7 @@ was already finished"
             "start a job that keeps writing",
             ScriptedModel::background_job_then_answer(
                 &[
-                    "/bin/sh",
+                    test_fixtures::tool_static("sh"),
                     "-c",
                     "echo $((1000 + 1)); sleep 1; echo $((2000 + 2))",
                 ],
@@ -17352,7 +17477,10 @@ was already finished"
         let mut session = ScriptedSession::create(&env);
         session.run_turn(
             "start a slow one",
-            ScriptedModel::background_job_then_answer(&["/bin/sleep", "30"], "started"),
+            ScriptedModel::background_job_then_answer(
+                &[test_fixtures::tool_static("sleep"), "30"],
+                "started",
+            ),
         );
         let job = session.state().jobs().values().next().expect("job").clone();
         assert_eq!(job.state(), tui::state::JobLifecycle::Started);
@@ -17461,10 +17589,9 @@ was already finished"
                 }
             }
         }
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .expect("workspace root");
+        let root =
+            protocol::host_path::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+                .expect("workspace root");
         let mut named = std::collections::BTreeSet::new();
         for text in &texts {
             for token in text.split(|c: char| {
@@ -17804,7 +17931,7 @@ the user was in is no longer the one they are in:\n{painted}"
             "the rejection must be reported as a command error:\n{painted}"
         );
         // Proof the session really kept going: the command after it ran.
-        let canonical = fs::canonicalize(&env.project).expect("canonicalize");
+        let canonical = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
         assert_eq!(
             persisted_grants_for(&canonical, &env.user_home)
                 .iter()
@@ -17895,7 +18022,7 @@ cancelled and not turned into a turn interrupt:\n{painted}"
 
         // Read back the way a real run does: the production reader, against
         // the home this session used.
-        let canonical = fs::canonicalize(&env.project).expect("canonicalize");
+        let canonical = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
         let grants = persisted_grants_for(&canonical, &env.user_home);
         assert_eq!(
             grants
@@ -17920,7 +18047,7 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let canonical = fs::canonicalize(&env.project).expect("canonicalize");
+        let canonical = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
         assert_eq!(
             persisted_grants_for(&canonical, &env.user_home)
                 .iter()
@@ -17966,7 +18093,7 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             .rendered_output
             .expect("capture_render was requested");
         assert!(painted.contains("not a valid pattern"), "{painted}");
-        let canonical = fs::canonicalize(&env.project).expect("canonicalize");
+        let canonical = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
         assert!(
             persisted_grants_for(&canonical, &env.user_home).is_empty(),
             "a refused pattern must not be written"
@@ -17984,7 +18111,7 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         ]))
         .expect("run");
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
-        let canonical = fs::canonicalize(&env.project).expect("canonicalize");
+        let canonical = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
         assert!(persisted_grants_for(&canonical, &env.user_home).is_empty());
     }
 
@@ -18283,7 +18410,7 @@ api_key = "k"
         )
         .expect("settings");
         // Grant in *this session's* home only.
-        let canonical = fs::canonicalize(&env.project).expect("canonicalize");
+        let canonical = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
         let identity = ProjectIdentity::new(&canonical, None).expect("identity");
         ProjectTrustStore::open(env.user_home.join(TRUST_CATALOG_NAME))
             .set(&identity, TrustStatus::Trusted, &CancellationToken::new())
@@ -19845,7 +19972,7 @@ pre-approve it with `rapid permissions allow <tool>`";
         let resolved = resolve_project(&options).expect("resolve");
         assert_eq!(
             resolved.ledger_path.parent().expect("rapidlm dir"),
-            fs::canonicalize(&env.project)
+            protocol::host_path::canonicalize(&env.project)
                 .expect("canon")
                 .join(PROJECT_MARKER)
                 .as_path()

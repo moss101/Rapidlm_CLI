@@ -199,7 +199,7 @@ fn resolve(env: &PermissionsEnv) -> Result<Project, String> {
         None => user_home_from(&env.env)
             .ok_or_else(|| "no RapidLM home directory could be resolved".to_owned())?,
     };
-    // `persisted_grants_for` looks grants up under `fs::canonicalize(root)`,
+    // `persisted_grants_for` looks grants up under `protocol::host_path::canonicalize(root)`,
     // so the key written here must be produced the same way or a grant would
     // be recorded under a path no run ever queries.
     //
@@ -208,7 +208,7 @@ fn resolve(env: &PermissionsEnv) -> Result<Project, String> {
     // a reachable bug — which is why the test below proves the *end-to-end*
     // agreement through a symlinked working directory rather than asserting
     // this line in isolation, where it cannot fail.
-    let canonical = std::fs::canonicalize(&found.root)
+    let canonical = protocol::host_path::canonicalize(&found.root)
         .map_err(|err| format!("{} could not be canonicalized: {err}", found.root.display()))?;
     let trust = trust_of(&canonical, &home, &cancel);
     Ok(Project {
@@ -231,7 +231,7 @@ pub(crate) fn record_persisted_grant(
 ) -> Result<bool, String> {
     let parsed =
         ToolPattern::parse(pattern).ok_or_else(|| format!("invalid grant pattern: {pattern}"))?;
-    let canonical = std::fs::canonicalize(project_root).map_err(|err| {
+    let canonical = protocol::host_path::canonicalize(project_root).map_err(|err| {
         format!(
             "{} could not be canonicalized: {err}",
             project_root.display()
@@ -638,7 +638,7 @@ mod tests {
         }
 
         fn trust(&self) {
-            let canonical = std::fs::canonicalize(&self.project).expect("canonicalize");
+            let canonical = protocol::host_path::canonicalize(&self.project).expect("canonicalize");
             let identity = ProjectIdentity::new(&canonical, None).expect("identity");
             ProjectTrustStore::open(self.home.join(TRUST_CATALOG_NAME))
                 .set(&identity, TrustStatus::Trusted, &CancellationToken::new())
@@ -667,7 +667,7 @@ mod tests {
         use agent_runtime::ToolDriver;
 
         let fixture = Fixture::new("effective");
-        let canonical = std::fs::canonicalize(&fixture.project).expect("canonicalize");
+        let canonical = protocol::host_path::canonicalize(&fixture.project).expect("canonicalize");
 
         let lattice = |fixture: &Fixture| {
             PermissionLattice::new(PermissionMode::Default).with_grants(
@@ -721,7 +721,7 @@ mod tests {
     #[cfg(unix)]
     fn a_grant_made_through_a_symlinked_path_is_still_found_by_a_real_run() {
         // The store is keyed by canonical root and `persisted_grants_for`
-        // looks it up with `fs::canonicalize(root)`. A grant recorded under
+        // looks it up with `protocol::host_path::canonicalize(root)`. A grant recorded under
         // any other spelling of the same directory would be invisible at run
         // time while this command still reported success.
         //
@@ -734,7 +734,7 @@ mod tests {
         std::os::unix::fs::symlink(&fixture.project, &link).expect("symlink");
         assert_ne!(
             link,
-            std::fs::canonicalize(&link).expect("canonicalize"),
+            protocol::host_path::canonicalize(&link).expect("canonicalize"),
             "precondition: the symlinked path differs from the real one"
         );
 
@@ -748,7 +748,7 @@ mod tests {
         assert_eq!(outcome.exit, 0, "{}", outcome.text);
 
         // Looked up the way a real run does, from the real directory.
-        let canonical = std::fs::canonicalize(&fixture.project).expect("canonicalize");
+        let canonical = protocol::host_path::canonicalize(&fixture.project).expect("canonicalize");
         let grants = crate::interactive::persisted_grants_for(&canonical, &fixture.home);
         assert_eq!(
             grants.iter().map(ToolPattern::render).collect::<Vec<_>>(),
@@ -1073,7 +1073,7 @@ mod tests {
         let text = std::fs::read_to_string(fixture.store()).expect("store");
         let grants = crate::permissions::parse_grants(&text).expect("parses");
         for index in 0..count {
-            let root = std::fs::canonicalize(fixture.root.join(format!("p{index}")))
+            let root = protocol::host_path::canonicalize(fixture.root.join(format!("p{index}")))
                 .expect("canonicalize");
             assert_eq!(
                 grants

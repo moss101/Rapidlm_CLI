@@ -752,6 +752,29 @@ mod tests {
     const FP_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const GOLDEN: &str = r#"{"records":[{"canonical_root":"/tmp/rapidlm-trust-golden","status":"trusted","vcs_remote_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"schema":1}"#;
 
+    /// An absolute root that is valid on this host: `/tmp/<name>` on Unix,
+    /// `C:\tmp\<name>` on Windows (a bare `/tmp/…` is drive-relative there
+    /// and rightly rejected by `CanonicalRoot::parse`). Nothing is created
+    /// on disk; these are identity strings only.
+    fn tmp_root(name: &str) -> String {
+        if cfg!(windows) {
+            format!("C:\\tmp\\{}", name.replace('/', "\\"))
+        } else {
+            format!("/tmp/{name}")
+        }
+    }
+
+    fn json_string(text: &str) -> String {
+        serde_json::to_string(text).expect("json string")
+    }
+
+    /// `GOLDEN` with the root rewritten for this host; byte-identical to the
+    /// constant on Unix.
+    fn golden() -> String {
+        let root = json_string(&tmp_root("rapidlm-trust-golden"));
+        GOLDEN.replace("\"/tmp/rapidlm-trust-golden\"", &root)
+    }
+
     struct TempCatalog {
         dir: PathBuf,
         path: PathBuf,
@@ -803,7 +826,7 @@ mod tests {
     fn missing_catalog_is_untrusted() {
         let tmp = TempCatalog::create();
         let store = tmp.store();
-        let id = identity("/tmp/rapidlm-trust-missing", Some(FP_A));
+        let id = identity(&tmp_root("rapidlm-trust-missing"), Some(FP_A));
         assert_eq!(
             store.get(&id, &live()).expect("get"),
             TrustStatus::Untrusted
@@ -816,7 +839,7 @@ mod tests {
     fn set_then_get_round_trips_trusted() {
         let tmp = TempCatalog::create();
         let store = tmp.store();
-        let id = identity("/tmp/rapidlm-trust-roundtrip", Some(FP_A));
+        let id = identity(&tmp_root("rapidlm-trust-roundtrip"), Some(FP_A));
         store.set(&id, TrustStatus::Trusted, &live()).expect("set");
         assert_eq!(store.get(&id, &live()).expect("get"), TrustStatus::Trusted);
     }
@@ -824,7 +847,7 @@ mod tests {
     #[test]
     fn replay_after_reopen_preserves_trusted() {
         let tmp = TempCatalog::create();
-        let id = identity("/tmp/rapidlm-trust-replay", Some(FP_A));
+        let id = identity(&tmp_root("rapidlm-trust-replay"), Some(FP_A));
         tmp.store()
             .set(&id, TrustStatus::Trusted, &live())
             .expect("set");
@@ -839,7 +862,7 @@ mod tests {
     fn explicit_untrusted_overwrites_grant() {
         let tmp = TempCatalog::create();
         let store = tmp.store();
-        let id = identity("/tmp/rapidlm-trust-revoke", Some(FP_A));
+        let id = identity(&tmp_root("rapidlm-trust-revoke"), Some(FP_A));
         store.set(&id, TrustStatus::Trusted, &live()).expect("set");
         store
             .set(&id, TrustStatus::Untrusted, &live())
@@ -854,11 +877,11 @@ mod tests {
     fn fingerprint_change_does_not_inherit_trust() {
         let tmp = TempCatalog::create();
         let store = tmp.store();
-        let trusted = identity("/tmp/rapidlm-trust-fp", Some(FP_A));
+        let trusted = identity(&tmp_root("rapidlm-trust-fp"), Some(FP_A));
         store
             .set(&trusted, TrustStatus::Trusted, &live())
             .expect("set");
-        let spoofed = identity("/tmp/rapidlm-trust-fp", Some(FP_B));
+        let spoofed = identity(&tmp_root("rapidlm-trust-fp"), Some(FP_B));
         assert_eq!(
             store.get(&spoofed, &live()).expect("spoof"),
             TrustStatus::Untrusted
@@ -878,11 +901,11 @@ mod tests {
     fn missing_fingerprint_after_grant_is_material_change() {
         let tmp = TempCatalog::create();
         let store = tmp.store();
-        let trusted = identity("/tmp/rapidlm-trust-fp-optional", Some(FP_A));
+        let trusted = identity(&tmp_root("rapidlm-trust-fp-optional"), Some(FP_A));
         store
             .set(&trusted, TrustStatus::Trusted, &live())
             .expect("set");
-        let bare = identity("/tmp/rapidlm-trust-fp-optional", None);
+        let bare = identity(&tmp_root("rapidlm-trust-fp-optional"), None);
         assert_eq!(
             store.get(&bare, &live()).expect("bare"),
             TrustStatus::Untrusted
@@ -895,14 +918,17 @@ mod tests {
         let store = tmp.store();
         store
             .set(
-                &identity("/tmp/rapidlm-trust-moved-a", Some(FP_A)),
+                &identity(&tmp_root("rapidlm-trust-moved-a"), Some(FP_A)),
                 TrustStatus::Trusted,
                 &live(),
             )
             .expect("set");
         assert_eq!(
             store
-                .get(&identity("/tmp/rapidlm-trust-moved-b", Some(FP_A)), &live())
+                .get(
+                    &identity(&tmp_root("rapidlm-trust-moved-b"), Some(FP_A)),
+                    &live()
+                )
                 .expect("moved"),
             TrustStatus::Untrusted
         );
@@ -914,7 +940,7 @@ mod tests {
         let store = tmp.store();
         store
             .set(
-                &identity("/tmp/rapidlm-trust-root", Some(FP_A)),
+                &identity(&tmp_root("rapidlm-trust-root"), Some(FP_A)),
                 TrustStatus::Trusted,
                 &live(),
             )
@@ -922,7 +948,7 @@ mod tests {
         assert_eq!(
             store
                 .get(
-                    &identity("/tmp/rapidlm-trust-root-evil", Some(FP_A)),
+                    &identity(&tmp_root("rapidlm-trust-root-evil"), Some(FP_A)),
                     &live()
                 )
                 .expect("sibling"),
@@ -940,13 +966,13 @@ mod tests {
     fn device_hint_change_invalidates_trust() {
         let tmp = TempCatalog::create();
         let store = tmp.store();
-        let trusted =
-            identity("/tmp/rapidlm-trust-dev", Some(FP_A)).with_device_hint(DeviceHint::new(1, 10));
+        let trusted = identity(&tmp_root("rapidlm-trust-dev"), Some(FP_A))
+            .with_device_hint(DeviceHint::new(1, 10));
         store
             .set(&trusted, TrustStatus::Trusted, &live())
             .expect("set");
-        let moved_inode =
-            identity("/tmp/rapidlm-trust-dev", Some(FP_A)).with_device_hint(DeviceHint::new(1, 99));
+        let moved_inode = identity(&tmp_root("rapidlm-trust-dev"), Some(FP_A))
+            .with_device_hint(DeviceHint::new(1, 99));
         assert_eq!(
             store.get(&moved_inode, &live()).expect("inode"),
             TrustStatus::Untrusted
@@ -957,13 +983,13 @@ mod tests {
     fn manifest_hash_change_invalidates_trust() {
         let tmp = TempCatalog::create();
         let store = tmp.store();
-        let trusted = identity("/tmp/rapidlm-trust-manifest", Some(FP_A))
+        let trusted = identity(&tmp_root("rapidlm-trust-manifest"), Some(FP_A))
             .with_manifest_hash(FP_A)
             .expect("hash");
         store
             .set(&trusted, TrustStatus::Trusted, &live())
             .expect("set");
-        let changed = identity("/tmp/rapidlm-trust-manifest", Some(FP_A))
+        let changed = identity(&tmp_root("rapidlm-trust-manifest"), Some(FP_A))
             .with_manifest_hash(FP_B)
             .expect("hash");
         assert_eq!(
@@ -976,14 +1002,14 @@ mod tests {
     fn lexical_normalization_is_the_comparison_key() {
         let tmp = TempCatalog::create();
         let store = tmp.store();
-        let granted = identity("/tmp/rapidlm-trust-norm/./proj", Some(FP_A));
+        let granted = identity(&tmp_root("rapidlm-trust-norm/./proj"), Some(FP_A));
         store
             .set(&granted, TrustStatus::Trusted, &live())
             .expect("set");
-        let same = identity("/tmp/rapidlm-trust-norm/foo/../proj", Some(FP_A));
+        let same = identity(&tmp_root("rapidlm-trust-norm/foo/../proj"), Some(FP_A));
         assert_eq!(
             granted.canonical_root().as_str(),
-            "/tmp/rapidlm-trust-norm/proj"
+            tmp_root("rapidlm-trust-norm/proj")
         );
         assert_eq!(same.canonical_root(), granted.canonical_root());
         assert_eq!(
@@ -1014,24 +1040,27 @@ mod tests {
         let store = tmp.store();
         store
             .set(
-                &identity("/tmp/rapidlm-trust-golden", Some(FP_A)),
+                &identity(&tmp_root("rapidlm-trust-golden"), Some(FP_A)),
                 TrustStatus::Trusted,
                 &live(),
             )
             .expect("set");
         let bytes = fs::read(&tmp.path).expect("read catalog");
-        assert_eq!(String::from_utf8(bytes).expect("utf8"), GOLDEN);
+        assert_eq!(String::from_utf8(bytes).expect("utf8"), golden());
     }
 
     #[test]
     fn leftover_part_file_is_not_consulted() {
         let tmp = TempCatalog::create();
         let part = part_path(&tmp.path);
-        fs::write(&part, GOLDEN).expect("part");
+        fs::write(&part, golden()).expect("part");
         let store = tmp.store();
         assert_eq!(
             store
-                .get(&identity("/tmp/rapidlm-trust-golden", Some(FP_A)), &live())
+                .get(
+                    &identity(&tmp_root("rapidlm-trust-golden"), Some(FP_A)),
+                    &live()
+                )
                 .expect("part ignored"),
             TrustStatus::Untrusted
         );
@@ -1043,7 +1072,10 @@ mod tests {
         fs::write(&tmp.path, "{not-json").expect("corrupt");
         let err = tmp
             .store()
-            .get(&identity("/tmp/rapidlm-trust-corrupt", Some(FP_A)), &live())
+            .get(
+                &identity(&tmp_root("rapidlm-trust-corrupt"), Some(FP_A)),
+                &live(),
+            )
             .expect_err("corrupt");
         assert_eq!(err, ProjectTrustError::CatalogCorrupt);
     }
@@ -1053,12 +1085,15 @@ mod tests {
         let tmp = TempCatalog::create();
         fs::write(
             &tmp.path,
-            r#"{"schema":1,"records":[{"canonical_root":"/tmp/rapidlm-trust-allow","status":"allow"}]}"#,
+            format!(
+                r#"{{"schema":1,"records":[{{"canonical_root":{},"status":"allow"}}]}}"#,
+                json_string(&tmp_root("rapidlm-trust-allow"))
+            ),
         )
         .expect("write");
         let err = tmp
             .store()
-            .get(&identity("/tmp/rapidlm-trust-allow", None), &live())
+            .get(&identity(&tmp_root("rapidlm-trust-allow"), None), &live())
             .expect_err("allow");
         assert_eq!(err, ProjectTrustError::CatalogCorrupt);
     }
@@ -1069,7 +1104,7 @@ mod tests {
         fs::write(&tmp.path, r#"{"schema":1,"records":[],"trusted":true}"#).expect("write");
         let err = tmp
             .store()
-            .get(&identity("/tmp/rapidlm-trust-extra", None), &live())
+            .get(&identity(&tmp_root("rapidlm-trust-extra"), None), &live())
             .expect_err("extra");
         assert_eq!(err, ProjectTrustError::CatalogCorrupt);
     }
@@ -1080,7 +1115,7 @@ mod tests {
         fs::write(&tmp.path, r#"{"schema":2,"records":[]}"#).expect("write");
         let err = tmp
             .store()
-            .get(&identity("/tmp/rapidlm-trust-schema", None), &live())
+            .get(&identity(&tmp_root("rapidlm-trust-schema"), None), &live())
             .expect_err("schema");
         assert_eq!(err, ProjectTrustError::UnsupportedSchema { found: 2 });
     }
@@ -1091,7 +1126,7 @@ mod tests {
         fs::write(&tmp.path, vec![b'x'; 128]).expect("write");
         let err = tmp
             .bounded(8, 64)
-            .get(&identity("/tmp/rapidlm-trust-size", None), &live())
+            .get(&identity(&tmp_root("rapidlm-trust-size"), None), &live())
             .expect_err("size");
         assert_eq!(
             err,
@@ -1108,14 +1143,14 @@ mod tests {
         let store = tmp.bounded(1, MAX_CATALOG_BYTES);
         store
             .set(
-                &identity("/tmp/rapidlm-trust-one", Some(FP_A)),
+                &identity(&tmp_root("rapidlm-trust-one"), Some(FP_A)),
                 TrustStatus::Trusted,
                 &live(),
             )
             .expect("first");
         let err = store
             .set(
-                &identity("/tmp/rapidlm-trust-two", Some(FP_A)),
+                &identity(&tmp_root("rapidlm-trust-two"), Some(FP_A)),
                 TrustStatus::Trusted,
                 &live(),
             )
@@ -1123,7 +1158,7 @@ mod tests {
         assert_eq!(err, ProjectTrustError::TooManyRecords);
         store
             .set(
-                &identity("/tmp/rapidlm-trust-one", Some(FP_B)),
+                &identity(&tmp_root("rapidlm-trust-one"), Some(FP_B)),
                 TrustStatus::Untrusted,
                 &live(),
             )
@@ -1153,7 +1188,7 @@ mod tests {
         let store = tmp.store();
         store
             .set(
-                &identity("/tmp/rapidlm-trust-lock-ok", Some(FP_A)),
+                &identity(&tmp_root("rapidlm-trust-lock-ok"), Some(FP_A)),
                 TrustStatus::Trusted,
                 &live(),
             )
@@ -1167,14 +1202,14 @@ mod tests {
         let store = tmp.bounded(1, MAX_CATALOG_BYTES);
         store
             .set(
-                &identity("/tmp/rapidlm-trust-lock-err-one", Some(FP_A)),
+                &identity(&tmp_root("rapidlm-trust-lock-err-one"), Some(FP_A)),
                 TrustStatus::Trusted,
                 &live(),
             )
             .expect("first");
         let err = store
             .set(
-                &identity("/tmp/rapidlm-trust-lock-err-two", Some(FP_A)),
+                &identity(&tmp_root("rapidlm-trust-lock-err-two"), Some(FP_A)),
                 TrustStatus::Trusted,
                 &live(),
             )
@@ -1191,7 +1226,7 @@ mod tests {
         cancel.cancel();
         let err = store
             .set(
-                &identity("/tmp/rapidlm-trust-lock-cancel", Some(FP_A)),
+                &identity(&tmp_root("rapidlm-trust-lock-cancel"), Some(FP_A)),
                 TrustStatus::Trusted,
                 &cancel,
             )
@@ -1216,7 +1251,7 @@ mod tests {
                 let barrier = std::sync::Arc::clone(&barrier);
                 let store = tmp.store();
                 std::thread::spawn(move || {
-                    let id = identity(&format!("/tmp/rapidlm-trust-race-{i}"), Some(FP_A));
+                    let id = identity(&tmp_root(&format!("rapidlm-trust-race-{i}")), Some(FP_A));
                     barrier.wait();
                     store.set(&id, TrustStatus::Trusted, &live())
                 })
@@ -1231,7 +1266,7 @@ mod tests {
 
         let reloaded = tmp.store();
         for i in 0..WRITERS {
-            let id = identity(&format!("/tmp/rapidlm-trust-race-{i}"), Some(FP_A));
+            let id = identity(&tmp_root(&format!("rapidlm-trust-race-{i}")), Some(FP_A));
             assert_eq!(
                 reloaded.get(&id, &live()).expect("get"),
                 TrustStatus::Trusted,
@@ -1256,7 +1291,7 @@ mod tests {
     #[test]
     fn concurrent_set_and_self_healing_get_never_lose_a_fresh_grant() {
         let tmp = TempCatalog::create();
-        let root = "/tmp/rapidlm-trust-race-root";
+        let root = &tmp_root("rapidlm-trust-race-root");
         let stale = identity(root, Some(FP_A));
         tmp.store()
             .set(&stale, TrustStatus::Trusted, &live())
@@ -1303,7 +1338,7 @@ mod tests {
     fn cancelled_get_and_set_fail() {
         let tmp = TempCatalog::create();
         let store = tmp.store();
-        let id = identity("/tmp/rapidlm-trust-cancel", Some(FP_A));
+        let id = identity(&tmp_root("rapidlm-trust-cancel"), Some(FP_A));
         let cancel = CancellationToken::new();
         cancel.cancel();
         assert_eq!(
@@ -1320,7 +1355,7 @@ mod tests {
 
     #[test]
     fn errors_do_not_echo_rejected_fingerprint() {
-        let err = ProjectIdentity::new("/tmp/proj", Some("super-secret-password@host"))
+        let err = ProjectIdentity::new(tmp_root("proj"), Some("super-secret-password@host"))
             .expect_err("secret fp");
         assert_eq!(err, ProjectTrustError::InvalidFingerprint);
         let rendered = format!("{err:?}{err}");
@@ -1333,7 +1368,7 @@ mod tests {
         let store = tmp.store();
         store
             .set(
-                &identity("/tmp/rapidlm-trust-debug", Some(FP_A)),
+                &identity(&tmp_root("rapidlm-trust-debug"), Some(FP_A)),
                 TrustStatus::Trusted,
                 &live(),
             )

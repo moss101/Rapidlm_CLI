@@ -136,7 +136,7 @@ impl TrustedProject {
         let home = temp_dir(&format!("{tag}-home"));
         let project = temp_dir(&format!("{tag}-proj"));
         std::fs::create_dir_all(project.join(".rapidlm")).expect("project marker");
-        let root = std::fs::canonicalize(&project).expect("canon");
+        let root = protocol::host_path::canonicalize(&project).expect("canon");
         let identity = ProjectIdentity::new(root, None).expect("identity");
         let store = ProjectTrustStore::open(home.join(".rapidlm/project-trust.json"));
         store
@@ -404,12 +404,6 @@ fn bench_f_drained_notification_reaches_the_provider_request() {
         "expected at least three provider requests"
     );
     let third = &requests[2];
-    std::fs::write("/tmp/bench-f-third-request.txt", third).expect("dump");
-    for (index, request) in requests.iter().enumerate() {
-        let _ = std::fs::write(format!("/tmp/bench-f-all-{index}.txt"), request);
-    }
-    eprintln!("dumped {} requests", requests.len());
-    eprintln!("dumped third request ({} bytes)", third.len());
     assert!(
         third.contains("background_jobs"),
         "synthetic background_jobs call missing from request"

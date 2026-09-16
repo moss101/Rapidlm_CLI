@@ -253,8 +253,7 @@ fn ripple_advisory_inner(root: &Path, path: &str, cancel: &CancellationToken) ->
 }
 
 fn build_manifest(root: &Path, cancel: &CancellationToken) -> Result<WorkspaceManifest, String> {
-    let canonical = root
-        .canonicalize()
+    let canonical = protocol::host_path::canonicalize(root)
         .map_err(|err| format!("canonicalize root: {err}"))?;
     let manifest_toml = format!(
         "schema = 1\n[[repos]]\nalias = \"main\"\nroot = {:?}\nmode = \"read_write\"\n",

@@ -1195,7 +1195,7 @@ fn probe_dir() -> Option<PathBuf> {
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).ok()?;
-    match std::fs::canonicalize(&dir) {
+    match protocol::host_path::canonicalize(&dir) {
         Ok(canonical) => Some(canonical),
         Err(_) => {
             // The directory was created; do not leave it behind just because

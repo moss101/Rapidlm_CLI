@@ -193,8 +193,7 @@ mod tests {
         assert_eq!(sup.info().state, PreviewState::Starting);
         // Spawn a long-running process to simulate a dev server.
         // In production this would be `npx serve` or similar.
-        let result = sup.start("/bin/sleep", &["60"], 1000);
-        // On this system /bin/sleep should be available.
+        let result = sup.start(test_fixtures::tool_static("sleep"), &["60"], 1000);
         match &result {
             Ok(()) => {
                 assert_eq!(sup.info().state, PreviewState::Ready);

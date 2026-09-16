@@ -210,7 +210,7 @@ pub fn discover_instructions(
                  total: &mut usize,
                  seen: &mut Vec<PathBuf>|
      -> Result<(), RulesError> {
-        let canonical = fs::canonicalize(&path).unwrap_or(path);
+        let canonical = protocol::host_path::canonicalize(&path).unwrap_or(path);
         if seen.contains(&canonical) {
             return Ok(());
         }
@@ -337,7 +337,7 @@ fn canonical_dir(path: &Path) -> Result<PathBuf, RulesError> {
     if meta.file_type().is_symlink() || !meta.is_dir() {
         return Err(RulesError::InvalidRoot);
     }
-    let canonical = fs::canonicalize(path).map_err(|_| RulesError::InvalidRoot)?;
+    let canonical = protocol::host_path::canonicalize(path).map_err(|_| RulesError::InvalidRoot)?;
     let again = fs::symlink_metadata(&canonical).map_err(|_| RulesError::InvalidRoot)?;
     if again.file_type().is_symlink() || !again.is_dir() {
         return Err(RulesError::InvalidRoot);
@@ -351,7 +351,7 @@ fn resolve_scope_dir(scope: &Path) -> Result<PathBuf, RulesError> {
     }
     // A scope that itself is a directory is used directly; otherwise the task
     // file may not exist yet, so use its parent directory.
-    if let Ok(canonical) = fs::canonicalize(scope)
+    if let Ok(canonical) = protocol::host_path::canonicalize(scope)
         && fs::metadata(&canonical)
             .map(|m| m.is_dir())
             .unwrap_or(false)
@@ -359,7 +359,8 @@ fn resolve_scope_dir(scope: &Path) -> Result<PathBuf, RulesError> {
         return Ok(canonical);
     }
     let parent = scope.parent().ok_or(RulesError::PathEscape)?;
-    let canonical = fs::canonicalize(parent).map_err(|_| RulesError::PathEscape)?;
+    let canonical =
+        protocol::host_path::canonicalize(parent).map_err(|_| RulesError::PathEscape)?;
     if fs::metadata(&canonical)
         .map(|m| m.is_dir())
         .unwrap_or(false)

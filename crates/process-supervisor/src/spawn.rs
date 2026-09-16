@@ -1230,7 +1230,7 @@ capability = "fs.read"
     }
 
     fn temp_cwd() -> CanonicalHostPath {
-        let tmp = std::env::temp_dir().canonicalize().expect("temp");
+        let tmp = protocol::host_path::canonicalize(std::env::temp_dir()).expect("temp");
         let rendered = tmp.to_str().expect("utf8 temp").replace('\\', "/");
         CanonicalHostPath::from_resolved(&rendered).expect("cwd")
     }
@@ -1348,8 +1348,7 @@ capability = "fs.read"
             .wait_with_output()
             .expect("wait");
         let got = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let expected = Path::new(&cwd)
-            .canonicalize()
+        let expected = protocol::host_path::canonicalize(Path::new(&cwd))
             .expect("canon cwd")
             .to_string_lossy()
             .into_owned();

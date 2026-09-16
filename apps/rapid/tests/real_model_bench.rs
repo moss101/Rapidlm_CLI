@@ -43,7 +43,7 @@ impl RealProject {
             .map_err(|err| format!("write config: {err}"))?;
         let project = temp_dir(&format!("realbench-{tag}-proj"));
         std::fs::create_dir_all(project.join(".rapidlm")).expect("project marker");
-        let root = std::fs::canonicalize(&project).expect("canon");
+        let root = protocol::host_path::canonicalize(&project).expect("canon");
         let identity = ProjectIdentity::new(root, None).expect("identity");
         let store = ProjectTrustStore::open(home.join("project-trust.json"));
         store

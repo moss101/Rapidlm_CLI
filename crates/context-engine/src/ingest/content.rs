@@ -510,14 +510,14 @@ fn resolve_regular_file(root: &Path, rel: &RepoPath) -> Result<PathBuf, ContentE
     if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
         return Err(ContentError::PathEscapesRoot);
     }
-    let root_canon = fs::canonicalize(root).map_err(ContentError::from_io)?;
+    let root_canon = protocol::host_path::canonicalize(root).map_err(ContentError::from_io)?;
     let abs = abs_in(&root_canon, rel.as_str());
     let meta = fs::symlink_metadata(&abs).map_err(ContentError::from_io)?;
     if meta.file_type().is_symlink() || !meta.file_type().is_file() {
         return Err(ContentError::NotRegularFile);
     }
     let parent = abs.parent().ok_or(ContentError::PathEscapesRoot)?;
-    let parent_canon = fs::canonicalize(parent).map_err(ContentError::from_io)?;
+    let parent_canon = protocol::host_path::canonicalize(parent).map_err(ContentError::from_io)?;
     if !path_within(&parent_canon, &root_canon) {
         return Err(ContentError::PathEscapesRoot);
     }

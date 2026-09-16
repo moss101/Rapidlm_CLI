@@ -220,13 +220,21 @@ mod platform {
         if matches!(signal, GroupSignal::Kill) {
             command.arg("/F");
         }
-        let status = command
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .env_clear()
-            .status()
-            .map_err(|_| SignalError::Failed)?;
+            .env_clear();
+        // `taskkill` needs `SystemRoot` to initialise (it reaches the
+        // process list through system COM/WMI components that locate
+        // themselves through it); with a fully empty environment it exits
+        // without terminating anything, the leader is then killed alone by
+        // the caller's fallback, and every grandchild survives the cancel.
+        // Nothing else from the ambient environment is forwarded.
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", system_root);
+        }
+        let status = command.status().map_err(|_| SignalError::Failed)?;
         // 128 is taskkill's "process not found".
         if status.success() || status.code() == Some(128) {
             Ok(())

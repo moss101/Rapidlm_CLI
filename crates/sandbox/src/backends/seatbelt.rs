@@ -622,7 +622,7 @@ mod tests {
                 protocol::RuntimeId::new()
             ));
             fs::create_dir_all(&path).expect("temp workspace");
-            let canon = fs::canonicalize(&path).expect("canonicalize");
+            let canon = protocol::host_path::canonicalize(&path).expect("canonicalize");
             let host =
                 CanonicalHostPath::from_resolved(canon.to_str().expect("utf8")).expect("host");
             Self { path, host }

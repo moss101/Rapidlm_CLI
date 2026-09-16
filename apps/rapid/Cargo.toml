@@ -90,3 +90,9 @@ jsonschema = { version = "0.52.0", default-features = false }
 # to a direct dep for `--jsonl`'s RFC3339 `time` field. `formatting`-only:
 # this crate only ever stamps "now", never parses a caller-supplied one.
 time = { version = "0.3.55", default-features = false, features = ["formatting"] }
+
+[dev-dependencies]
+# test-fixtures: resolves the POSIX fixture programs (`sh`, `sleep`, `cat`,
+# …) the process-driving tests run to their absolute path on this host, on
+# Windows included (Git for Windows' usr/bin). Test-only.
+test-fixtures = { path = "../../crates/test-fixtures" }

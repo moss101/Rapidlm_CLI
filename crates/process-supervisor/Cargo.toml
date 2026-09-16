@@ -30,3 +30,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # rustix: safe POSIX openpt/grantpt/unlockpt/ptsname for PTY allocation (P7-003).
 rustix = { version = "0.38", features = ["pty", "termios", "std"] }
+
+[dev-dependencies]
+# test-fixtures: absolute paths of the POSIX fixture programs the
+# process-driving tests run, on every CI host. Test-only.
+test-fixtures = { path = "../test-fixtures" }

@@ -117,7 +117,7 @@ pub struct LiveHostResolver;
 
 impl LiveHostResolver {
     fn canonicalize(requested: &str) -> Result<String, ()> {
-        let canonical = std::fs::canonicalize(requested).map_err(|_| ())?;
+        let canonical = protocol::host_path::canonicalize(requested).map_err(|_| ())?;
         let text = canonical.to_str().ok_or(())?;
         // `std::fs::canonicalize` on Windows returns a `\\?\`-prefixed
         // (verbatim) path; `CanonicalHostPath::from_resolved` rejects UNC
@@ -126,8 +126,8 @@ impl LiveHostResolver {
         // not a workaround for anything unusual — strip the prefix, which
         // still names the identical real path, just in the same non-
         // verbatim form every other caller already produces.
-        let stripped = text.strip_prefix(r"\\?\").unwrap_or(text);
-        Ok(stripped.to_owned())
+        let stripped = protocol::host_path::simplified_str(text).unwrap_or_else(|| text.to_owned());
+        Ok(stripped)
     }
 }
 
@@ -263,6 +263,16 @@ impl CanonicalHostPath {
         if path.is_empty() {
             return Err(CommandNormalizeError::EmptyCwd);
         }
+        // A resolver that canonicalized through the OS on Windows hands
+        // back the verbatim disk form (`\\?\C:\…`). That names a local
+        // drive path, not a network share, so it is the same identity as
+        // the plain form every other caller produces — accept it as such.
+        // A real UNC path (`\\server\share`, `\\?\UNC\…`) stays rejected.
+        let path = match protocol::host_path::simplified_str(path) {
+            Some(plain) if !is_unc(&plain) => plain,
+            _ => path.to_owned(),
+        };
+        let path = path.as_str();
         if is_unc(path) {
             return Err(CommandNormalizeError::Unc);
         }
@@ -919,6 +929,31 @@ mod tests {
     }
 
     #[test]
+    fn resolved_verbatim_drive_path_is_the_plain_drive_identity() {
+        // `std::fs::canonicalize` on Windows yields `\\?\C:\…`; that is the
+        // same local path as `C:/…`, not a network share.
+        let verbatim = CanonicalHostPath::from_resolved(r"\\?\C:\Users\r\proj").expect("local");
+        assert_eq!(verbatim.as_str(), "C:/Users/r/proj");
+        assert_eq!(
+            verbatim,
+            CanonicalHostPath::from_resolved(r"C:\Users\r\proj").expect("plain")
+        );
+        // Verbatim UNC still names a share and still fails closed.
+        assert_eq!(
+            CanonicalHostPath::from_resolved(r"\\?\UNC\server\share\x").expect_err("unc"),
+            CommandNormalizeError::Unc
+        );
+        assert_eq!(
+            CanonicalHostPath::from_resolved(r"\\server\share").expect_err("unc"),
+            CommandNormalizeError::Unc
+        );
+        assert_eq!(
+            CanonicalHostPath::from_resolved(r"\\?\pipe\x").expect_err("device"),
+            CommandNormalizeError::Unc
+        );
+    }
+
+    #[test]
     fn unc_and_nul_and_control_fail_closed() {
         let cancel = CancellationToken::new();
         let resolver = fixture();
@@ -1135,7 +1170,8 @@ mod tests {
                 &CanonicalHostPath::from_resolved(dir.0.to_str().expect("utf8 path")).expect("cwd"),
             )
             .expect("resolve through symlink");
-        let canonical_real = std::fs::canonicalize(&real_target).expect("canonicalize real target");
+        let canonical_real =
+            protocol::host_path::canonicalize(&real_target).expect("canonicalize real target");
         assert_eq!(resolved.as_str(), canonical_real.to_str().expect("utf8"));
     }
 

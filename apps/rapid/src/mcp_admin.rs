@@ -924,7 +924,7 @@ mod tests {
 
         fn set_trust(&self, status: TrustStatus) {
             let cancel = CancellationToken::new();
-            let canonical = std::fs::canonicalize(&self.project).expect("canonicalize");
+            let canonical = protocol::host_path::canonicalize(&self.project).expect("canonicalize");
             let identity = ProjectIdentity::new(&canonical, None).expect("identity");
             ProjectTrustStore::open(self.home.join(TRUST_CATALOG_NAME))
                 .set(&identity, status, &cancel)
@@ -1340,7 +1340,11 @@ mod tests {
         );
         assert!(outcome.text.contains("removed srv"), "{}", outcome.text);
         assert!(
-            outcome.text.contains("warning:") && outcome.text.contains(".claude/settings.json"),
+            outcome.text.contains("warning:")
+                && outcome
+                    .text
+                    .replace('\\', "/")
+                    .contains(".claude/settings.json"),
             "the file it could not read is still reported:\n{}",
             outcome.text
         );

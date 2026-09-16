@@ -183,7 +183,7 @@ pub fn apply_update(
         );
     }
     // Then the artifact must run and claim the manifest's version.
-    let staged = bin.with_extension("update-new");
+    let staged = sibling_variant(bin, "update-new");
     std::fs::write(&staged, artifact_bytes).map_err(|err| format!("staging write: {err}"))?;
     #[cfg(unix)]
     {
@@ -201,7 +201,7 @@ pub fn apply_update(
     }
     // Atomic swap with rollback: old aside, new in, smoke-run; on failure
     // the old binary returns.
-    let backup = bin.with_extension("update-old");
+    let backup = sibling_variant(bin, "update-old");
     let _ = std::fs::remove_file(&backup);
     std::fs::rename(bin, &backup).map_err(|err| format!("backup rename: {err}"))?;
     if let Err(err) = std::fs::rename(&staged, bin) {
@@ -289,26 +289,84 @@ pub fn run_update(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandE
     }
 }
 
+/// The staging / backup sibling of `bin`: `rapid.update-new`, or, when the
+/// binary carries an executable extension, `rapid.update-new.exe` — the
+/// extension stays last so the staged artifact is still something the OS
+/// will run for the smoke test. `Path::with_extension` used to produce
+/// `rapid.update-new` from `rapid.exe`, which Windows will not execute, so
+/// every update there failed its smoke run and rolled back.
+fn sibling_variant(bin: &Path, tag: &str) -> std::path::PathBuf {
+    let name = bin.file_name().unwrap_or_default();
+    let mut out = std::ffi::OsString::new();
+    let executable_ext = bin
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .filter(|ext| ["exe", "cmd", "bat", "com"].contains(&ext.to_ascii_lowercase().as_str()));
+    match executable_ext {
+        Some(ext) => {
+            out.push(bin.file_stem().unwrap_or_default());
+            out.push(".");
+            out.push(tag);
+            out.push(".");
+            out.push(ext);
+        }
+        None => {
+            out.push(name);
+            out.push(".");
+            out.push(tag);
+        }
+    }
+    bin.with_file_name(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// A controllable stand-in binary: a shell script whose `--version`
-    /// prints whatever the file says. The update machinery must treat it
-    /// exactly like a real binary — checksum, smoke run, atomic swap.
+    /// A controllable stand-in binary: a script whose `--version` prints
+    /// whatever the file says — `sh` on Unix, a `.cmd` batch file on
+    /// Windows (which `Command` runs through `cmd.exe`). The update
+    /// machinery must treat it exactly like a real binary — checksum, smoke
+    /// run, atomic swap.
     fn make_bin(dir: &Path, name: &str, version: &str) -> PathBuf {
-        let path = dir.join(name);
-        let body = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"rapid {version} (RapidLM CLI)\"; fi\n"
-        );
-        std::fs::write(&path, body).unwrap();
+        let path = bin_path(dir, name);
+        std::fs::write(&path, version_script(version)).unwrap();
+        mark_executable(&path);
+        path
+    }
+
+    /// The stand-in's path: bare on Unix, `.cmd` on Windows.
+    fn bin_path(dir: &Path, name: &str) -> PathBuf {
+        if cfg!(windows) {
+            dir.join(format!("{name}.cmd"))
+        } else {
+            dir.join(name)
+        }
+    }
+
+    fn version_script(version: &str) -> Vec<u8> {
+        if cfg!(windows) {
+            format!("@echo off\r\nif \"%~1\"==\"--version\" echo rapid {version} (RapidLM CLI)\r\n")
+                .into_bytes()
+        } else {
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"rapid {version} (RapidLM CLI)\"; fi\n"
+            )
+            .into_bytes()
+        }
+    }
+
+    fn mark_executable(path: &Path) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        path
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
     }
 
     fn manifest_for(bin_bytes: &[u8], version: &str) -> UpdateManifest {
@@ -330,30 +388,44 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let bin = make_bin(&dir, "rapid", "0.1.0");
-        let new_bytes = b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"rapid 0.2.0 (RapidLM CLI)\"; fi\n";
+        let new_bytes = version_script("0.2.0");
         let new_version = "0.2.0";
-        let bin_copy = dir.join("rapid-real");
-        std::fs::write(&bin_copy, b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"rapid 0.1.0 (RapidLM CLI)\"; fi\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin_copy, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let bin_copy = make_bin(&dir, "rapid-real", "0.1.0");
 
         // The update runs against the copy so `running_version(bin)` sees
         // the scripted old version through the whole flow.
-        let manifest = manifest_for(new_bytes, new_version);
+        let manifest = manifest_for(&new_bytes, new_version);
         let message =
-            apply_update(&bin_copy, &manifest, new_bytes, false).expect("update succeeds");
+            apply_update(&bin_copy, &manifest, &new_bytes, false).expect("update succeeds");
         assert!(message.contains("0.1.0 -> 0.2.0"), "{message}");
         let swapped = std::fs::read(&bin_copy).unwrap();
         assert_eq!(swapped, new_bytes);
         assert!(running_version(&bin_copy).unwrap() == "0.2.0");
         // No leftovers.
-        assert!(!dir.join("rapid-real.update-new").exists());
-        assert!(!dir.join("rapid-real.update-old").exists());
+        assert!(!sibling_variant(&bin_copy, "update-new").exists());
+        assert!(!sibling_variant(&bin_copy, "update-old").exists());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = bin;
+    }
+
+    #[test]
+    fn staging_and_backup_names_keep_an_executable_extension_last() {
+        assert_eq!(
+            sibling_variant(Path::new("/opt/rapid"), "update-new"),
+            PathBuf::from("/opt/rapid.update-new")
+        );
+        assert_eq!(
+            sibling_variant(Path::new("/opt/rapid-0.1"), "update-old"),
+            PathBuf::from("/opt/rapid-0.1.update-old")
+        );
+        assert_eq!(
+            sibling_variant(Path::new(r"C:\tools\rapid.exe"), "update-new"),
+            PathBuf::from(r"C:\tools\rapid.update-new.exe")
+        );
+        assert_eq!(
+            sibling_variant(Path::new("x/rapid-real.CMD"), "update-old"),
+            PathBuf::from("x/rapid-real.update-old.CMD")
+        );
     }
 
     #[test]
@@ -366,13 +438,9 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let bin_copy = dir.join("rapid-real");
+        let bin_copy = bin_path(&dir, "rapid-real");
         std::fs::write(&bin_copy, b"old").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin_copy, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        mark_executable(&bin_copy);
         let manifest = UpdateManifest {
             version: "0.2.0".to_owned(),
             sha256: "0".repeat(64),
@@ -395,22 +463,18 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let bin_copy = dir.join("rapid-real");
+        let bin_copy = bin_path(&dir, "rapid-real");
         std::fs::write(&bin_copy, b"old").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin_copy, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        mark_executable(&bin_copy);
         // The artifact's checksum matches the manifest but it claims the
         // wrong version — exactly what a truncated or mis-built artifact
         // looks like.
-        let bytes = b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"rapid 9.9.9 (RapidLM CLI)\"; fi\n";
-        let manifest = manifest_for(bytes, "0.2.0");
-        let error = apply_update(&bin_copy, &manifest, bytes, true).expect_err("refused");
+        let bytes = version_script("9.9.9");
+        let manifest = manifest_for(&bytes, "0.2.0");
+        let error = apply_update(&bin_copy, &manifest, &bytes, true).expect_err("refused");
         assert!(error.contains("old binary untouched"), "{error}");
         assert_eq!(std::fs::read(&bin_copy).unwrap(), b"old");
-        assert!(!dir.join("rapid-real.update-new").exists());
+        assert!(!sibling_variant(&bin_copy, "update-new").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

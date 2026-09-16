@@ -188,7 +188,7 @@ pub(crate) fn resolve_program(root: &Path, program: &str) -> Result<String, Sand
     } else {
         return resolve_program_on_path(program);
     };
-    std::fs::canonicalize(&candidate)
+    protocol::host_path::canonicalize(&candidate)
         .ok()
         .filter(|p| p.is_file())
         .and_then(|p| p.to_str().map(str::to_owned))
@@ -199,7 +199,7 @@ fn resolve_program_on_path(program: &str) -> Result<String, SandboxRunError> {
     let path_var = std::env::var_os("PATH").ok_or(SandboxRunError::ProgramNotFound)?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(program);
-        if let Ok(canon) = std::fs::canonicalize(&candidate)
+        if let Ok(canon) = protocol::host_path::canonicalize(&candidate)
             && canon.is_file()
             && let Some(s) = canon.to_str()
         {
@@ -362,7 +362,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("root");
-        std::fs::canonicalize(&root).expect("canonicalize")
+        protocol::host_path::canonicalize(&root).expect("canonicalize")
     }
 
     #[test]

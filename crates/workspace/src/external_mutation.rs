@@ -753,7 +753,8 @@ fn canonicalize_root(root: &Path) -> Result<PathBuf, MutationError> {
     if meta.file_type().is_symlink() || !meta.is_dir() {
         return Err(MutationError::InvalidRoot);
     }
-    let canonical = fs::canonicalize(root).map_err(|_| MutationError::InvalidRoot)?;
+    let canonical =
+        protocol::host_path::canonicalize(root).map_err(|_| MutationError::InvalidRoot)?;
     let again = fs::symlink_metadata(&canonical).map_err(|_| MutationError::InvalidRoot)?;
     if again.file_type().is_symlink() || !again.is_dir() {
         return Err(MutationError::InvalidRoot);
@@ -803,7 +804,7 @@ fn read_confined(
     if meta.len() > max_file_bytes as u64 {
         return Err(MutationError::BoundExceeded);
     }
-    let canon = fs::canonicalize(host).map_err(|_| MutationError::Io)?;
+    let canon = protocol::host_path::canonicalize(host).map_err(|_| MutationError::Io)?;
     confine_canon(&canon, root)?;
     let again = fs::symlink_metadata(&canon).map_err(|_| MutationError::Io)?;
     if again.file_type().is_symlink() || !again.is_file() {
@@ -817,7 +818,7 @@ fn read_confined(
     if bytes.len() > max_file_bytes {
         return Err(MutationError::BoundExceeded);
     }
-    let verify = fs::canonicalize(host).map_err(|_| MutationError::Io)?;
+    let verify = protocol::host_path::canonicalize(host).map_err(|_| MutationError::Io)?;
     confine_canon(&verify, root)?;
     Ok(bytes)
 }

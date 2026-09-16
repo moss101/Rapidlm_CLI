@@ -566,15 +566,12 @@ fn a_settings_file_that_cannot_be_read_is_reported_not_denied() {
         ".rapidlm/settings.json",
         r#"{"mcpServers": {"srv": {"command": "true"}}}"#,
     );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            fixture.project.join(".rapidlm/settings.json"),
-            std::fs::Permissions::from_mode(0o000),
-        )
-        .expect("chmod");
-    }
+    // Make the file unopenable on every host: a directory in its place
+    // reads as EISDIR / access denied, never as NotFound (a mode-000 file
+    // would only do that on Unix, and not at all for root).
+    let settings = fixture.project.join(".rapidlm/settings.json");
+    std::fs::remove_file(&settings).expect("remove");
+    std::fs::create_dir(&settings).expect("directory in the file's place");
     let run = fixture.run(&["mcp", "list"]);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert!(
@@ -587,15 +584,6 @@ fn a_settings_file_that_cannot_be_read_is_reported_not_denied() {
         "the real reason must be reported:\n{}",
         run.stdout
     );
-    // Restore so the fixture's own cleanup can remove it.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(
-            fixture.project.join(".rapidlm/settings.json"),
-            std::fs::Permissions::from_mode(0o644),
-        );
-    }
 }
 
 #[test]

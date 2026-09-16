@@ -1516,8 +1516,7 @@ impl WorkspaceTools {
         if !root.is_dir() {
             return Err(ToolSetupError::RootNotADirectory);
         }
-        let root = root
-            .canonicalize()
+        let root = protocol::host_path::canonicalize(root)
             .map_err(|_| ToolSetupError::RootUnresolvable)?;
         Ok(Self {
             root,
@@ -2038,7 +2037,8 @@ impl WorkspaceTools {
         for component in components {
             current.push(component);
             if current.symlink_metadata().is_ok() {
-                let resolved = current.canonicalize().map_err(|_| ToolStepError::Invalid)?;
+                let resolved = protocol::host_path::canonicalize(&current)
+                    .map_err(|_| ToolStepError::Invalid)?;
                 if !resolved.starts_with(self.root()) {
                     return Err(ToolStepError::Invalid);
                 }
@@ -2054,7 +2054,8 @@ impl WorkspaceTools {
         // a not-yet-created file (nothing to check) is left to the loop
         // above.
         if target.symlink_metadata().is_ok() {
-            let resolved = target.canonicalize().map_err(|_| ToolStepError::Invalid)?;
+            let resolved =
+                protocol::host_path::canonicalize(&target).map_err(|_| ToolStepError::Invalid)?;
             if !resolved.starts_with(self.root()) {
                 return Err(ToolStepError::Invalid);
             }
@@ -4243,7 +4244,7 @@ fn walk_text_files(
         let relative = entry
             .path()
             .strip_prefix(root)
-            .map(|rel| rel.to_string_lossy().into_owned())
+            .map(repo_relative_text)
             .unwrap_or(name.clone());
         visit(&relative, &String::from_utf8_lossy(&bytes));
     }
@@ -4288,10 +4289,22 @@ fn walk_all_files(
         let relative = entry
             .path()
             .strip_prefix(root)
-            .map(|rel| rel.to_string_lossy().into_owned())
+            .map(repo_relative_text)
             .unwrap_or(name.clone());
         visit(&relative);
     }
+}
+
+/// A walked path relative to the root, in the `/`-separated form the
+/// tools' contract promises. `Path::to_string_lossy` would render the
+/// host separator, and on Windows that `\` is not a separator to the glob
+/// matcher (`*` would then cross into `src\c.rs`) or to the model reading
+/// the result.
+fn repo_relative_text(rel: &Path) -> String {
+    rel.components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Pure relative-path checks shared by validation and execution: non-empty,
@@ -8762,6 +8775,7 @@ mod tests {
     /// `external_scan.rs::tests::sh_scanner`'s own fixture exactly — this
     /// runs through the real `SandboxedScannerExec`/`SandboxManager`/lease
     /// ceremony, not a stub.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn write_sh_scanner_config(root: &Path, sarif_body: &str) {
         let json = serde_json::json!({
             "schema": 1,
@@ -8779,13 +8793,19 @@ mod tests {
         .expect("write scanners.json");
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     const CLEAN_SARIF_FIXTURE: &str =
         r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"fakescan"}},"results":[]}]}"#;
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn finding_sarif_fixture() -> String {
         r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"fakescan"}},"results":[{"ruleId":"no-eval","level":"error","message":{"text":"eval is unsafe"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/app.rs"},"region":{"byteOffset":10,"byteLength":4}}}]}]}]}"#.to_owned()
     }
 
+    // Runs the configured scanner through the host-restricted sandbox (POSIX
+    // governance); the Windows-side contract is
+    // `git_commit_is_blocked_when_the_configured_scanner_cannot_run_here`.
+    #[cfg(unix)]
     #[test]
     fn git_commit_is_blocked_by_a_configured_external_scanner_finding() {
         let root = TempRoot::new("commit-gate-external-scanner-finding");
@@ -8846,6 +8866,10 @@ mod tests {
         );
     }
 
+    // Runs the configured scanner through the host-restricted sandbox (POSIX
+    // governance); the Windows-side contract is
+    // `git_commit_is_blocked_when_the_configured_scanner_cannot_run_here`.
+    #[cfg(unix)]
     #[test]
     fn git_commit_succeeds_when_the_configured_external_scanner_is_clean() {
         let root = TempRoot::new("commit-gate-external-scanner-clean");
@@ -8959,6 +8983,10 @@ mod tests {
         }
     }
 
+    // Runs the configured scanner through the host-restricted sandbox (POSIX
+    // governance); the Windows-side contract is
+    // `git_commit_is_blocked_when_the_configured_scanner_cannot_run_here`.
+    #[cfg(unix)]
     #[test]
     fn git_commit_is_blocked_by_a_configured_but_uninstalled_scanner() {
         // Distinct from the malformed-config test above (the config itself
@@ -9028,6 +9056,82 @@ mod tests {
                 assert!(detail.contains("fakescan"), "{detail}");
             }
             other => panic!("expected an uninstalled scanner to block the commit, got {other:?}"),
+        }
+        let log = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["log", "--oneline"])
+            .output()
+            .expect("git log");
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).lines().count(),
+            1,
+            "only the seed commit"
+        );
+    }
+
+    /// Off Unix the host-restricted sandbox tier is unavailable, so a
+    /// configured external scanner cannot run at all. Per `security::gate`
+    /// ("unavailable and error never become pass") the commit gate must
+    /// still block — a scan that could not happen is not a clean scan.
+    #[cfg(not(unix))]
+    #[test]
+    fn git_commit_is_blocked_when_the_configured_scanner_cannot_run_here() {
+        let root = TempRoot::new("commit-gate-external-scanner-no-sandbox");
+        git_init(&root.0);
+        let configure = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root.0)
+                .args(args)
+                .output()
+                .expect("git config");
+            assert!(out.status.success());
+        };
+        configure(&["config", "user.name", "t"]);
+        configure(&["config", "user.email", "t@t.invalid"]);
+        fs::create_dir_all(root.0.join(".rapidlm")).expect("dir");
+        let json = serde_json::json!({
+            "schema": 1,
+            "scanners": [{
+                "id": "fakescan",
+                "kind": "sast",
+                "argv": [test_fixtures::tool_str("true")],
+            }],
+        });
+        fs::write(
+            root.0.join(crate::external_scan::SCANNERS_CONFIG_PATH),
+            serde_json::to_vec(&json).expect("serialize"),
+        )
+        .expect("write scanners.json");
+
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        fs::write(root.0.join("app.rs"), b"fn main() {}\n").expect("write file");
+        let stage = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(["add", "app.rs"])
+            .output()
+            .expect("git add");
+        assert!(stage.status.success());
+
+        let commit_call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            r#"{"argv":["git","commit","-m","add app"]}"#,
+        );
+        let validated = tools.validate(&commit_call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed {
+                handled, detail, ..
+            } => {
+                assert!(handled);
+                let detail = detail.expect("detail");
+                assert!(detail.contains("commit blocked"), "{detail}");
+                assert!(detail.contains("fakescan"), "{detail}");
+            }
+            other => panic!("a scanner that cannot run must block the commit, got {other:?}"),
         }
         let log = std::process::Command::new("git")
             .arg("-C")
@@ -9190,12 +9294,8 @@ mod tests {
     #[test]
     fn commit_gate_still_blocks_when_argv0_is_a_resolved_path_to_git() {
         let (root, _token) = commit_gate_bypass_fixture();
-        let git_path = std::process::Command::new("which")
-            .arg("git")
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned());
+        let git_path =
+            test_fixtures::find_on_path("git").map(|path| path.to_string_lossy().into_owned());
         let Some(git_path) = git_path else {
             // No resolvable `git` on this host's PATH to test against;
             // skip rather than fail on an environment this fix doesn't
@@ -9590,6 +9690,10 @@ mod tests {
         );
     }
 
+    // Runs the configured scanner through the host-restricted sandbox (POSIX
+    // governance); the Windows-side contract is
+    // `git_commit_is_blocked_when_the_configured_scanner_cannot_run_here`.
+    #[cfg(unix)]
     #[test]
     fn git_merge_is_blocked_by_a_configured_external_scanner_finding() {
         // Same shape as `git_commit_is_blocked_by_a_configured_external_
@@ -10816,7 +10920,7 @@ mod tests {
             SHELL_EXEC_TOOL,
             &format!(
                 r#"{{"argv":["sh","-c","echo escaped > {}"],"sandbox":true,"timeout_ms":10000}}"#,
-                outside.display()
+                test_fixtures::sh_quote(&outside)
             ),
         );
         let validated = tools.validate(&call, &cancel).expect("validate");
@@ -10880,7 +10984,7 @@ mod tests {
             SHELL_EXEC_TOOL,
             &format!(
                 r#"{{"argv":["sh","-c","echo $$ > {} && sleep 30"],"sandbox":true,"timeout_ms":20000}}"#,
-                pid_path.display()
+                test_fixtures::sh_quote(&pid_path)
             ),
         );
         let validated = tools.validate(&call, &cancel).expect("validate");
@@ -10892,11 +10996,7 @@ mod tests {
         }
 
         fn alive(pid: i32) -> bool {
-            std::process::Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false)
+            u32::try_from(pid).is_ok_and(test_fixtures::process_alive)
         }
         let mut pid = None;
         for _ in 0..150 {
@@ -12178,7 +12278,7 @@ mod tests {
             SHELL_EXEC_TOOL,
             &format!(
                 r#"{{"argv":["sh","-c","echo $$ > {} && sleep 30"],"background":true}}"#,
-                pid_path.display()
+                test_fixtures::sh_quote(&pid_path)
             ),
         );
         let validated = tools.validate(&call, &cancel).expect("validate");
@@ -12214,11 +12314,7 @@ mod tests {
         }
 
         fn alive(pid: i32) -> bool {
-            std::process::Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false)
+            u32::try_from(pid).is_ok_and(test_fixtures::process_alive)
         }
         let mut pid = None;
         for _ in 0..100 {
@@ -14016,11 +14112,7 @@ time.sleep(30)
         tools.register_mcp_servers(&servers);
 
         fn alive(pid: i32) -> bool {
-            std::process::Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false)
+            u32::try_from(pid).is_ok_and(test_fixtures::process_alive)
         }
 
         let mut pid = None;
@@ -14102,11 +14194,7 @@ time.sleep(30)
         };
 
         fn alive(pid: i32) -> bool {
-            std::process::Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false)
+            u32::try_from(pid).is_ok_and(test_fixtures::process_alive)
         }
 
         let connected = connect_mcp_server(&server).expect("server comes up");

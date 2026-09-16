@@ -355,7 +355,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
-        format!("sh {}", path.display())
+        format!("sh {}", test_fixtures::sh_quote(&path))
     }
 
     #[test]
@@ -407,7 +407,11 @@ exit 0"#,
         let dir = std::env::temp_dir().join(format!("hook-stdin-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let capture = dir.join("captured.json");
-        let hook = script(&dir, "capture.sh", &format!("cat > {}", capture.display()));
+        let hook = script(
+            &dir,
+            "capture.sh",
+            &format!("cat > {}", test_fixtures::sh_quote(&capture)),
+        );
         let input = r#"{"tool":"repo_read","arguments":{"path":"a.txt"}}"#;
         assert_eq!(
             run_pre_tool_hooks(&[hook], "repo_read", r#"{"path":"a.txt"}"#, HOOK_TIMEOUT),
@@ -442,26 +446,51 @@ exit 0"#,
         let dir = std::env::temp_dir().join(format!("hook-env-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let capture = dir.join("env.txt");
-        let hook = format!("env > {}", capture.display());
+        // Cargo sets `CARGO_MANIFEST_DIR` (and the rest of `CARGO_*`) in
+        // every test binary's environment: a variable this process is
+        // guaranteed to have and no hook is ever forwarded. If it reaches
+        // the hook, the ambient environment leaked — the same assertion on
+        // every platform.
+        const CANARY_NAME: &str = "CARGO_MANIFEST_DIR";
+        assert!(
+            std::env::var_os(CANARY_NAME).is_some(),
+            "the test binary itself carries the canary"
+        );
+        let hook = format!(
+            "{} > {}",
+            test_fixtures::sh_quote(&test_fixtures::tool("env")),
+            test_fixtures::sh_quote(&capture)
+        );
         assert_eq!(
             run_pre_tool_hooks(&[hook], "repo_read", "{}", HOOK_TIMEOUT),
             PreHookOutcome::Allowed
         );
         let captured = std::fs::read_to_string(&capture).expect("captured env");
-        // The four we deliberately forward, plus what `sh` itself injects
-        // even under `env -i` (confirmed via `env -i PATH=/usr/bin:/bin sh
-        // -c 'env'`: PWD, SHLVL, and `_`) — not something our own spawn
-        // code passes through. Anything outside this set had to come from
-        // the real process environment, which env_clear() must stop.
-        const ALLOWED: &[&str] = &["PATH", "HOME", "LANG", "TMPDIR", "PWD", "SHLVL", "_"];
-        for line in captured.lines() {
-            let Some((key, _)) = line.split_once('=') else {
-                continue;
-            };
-            assert!(
-                ALLOWED.contains(&key),
-                "hook subprocess must not inherit ambient env var {key:?}: {captured}"
-            );
+        assert!(
+            !captured.lines().any(|line| line.starts_with(CANARY_NAME)),
+            "hook subprocess must not inherit the ambient environment: {captured}"
+        );
+        // On Unix the exact set is known: the four we deliberately forward,
+        // plus what `sh` itself injects even under `env -i` (confirmed via
+        // `env -i PATH=/usr/bin:/bin sh -c 'env'`: PWD, SHLVL, and `_`) —
+        // not something our own spawn code passes through. Anything outside
+        // this set had to come from the real process environment, which
+        // env_clear() must stop. (`cmd.exe` and the MSYS runtime add their
+        // own set on Windows — COMSPEC, PATHEXT, the `=D:` drive cwd
+        // pseudo-variables, … — which is why the canary is the assertion
+        // that holds everywhere.)
+        #[cfg(unix)]
+        {
+            const ALLOWED: &[&str] = &["PATH", "HOME", "LANG", "TMPDIR", "PWD", "SHLVL", "_"];
+            for line in captured.lines() {
+                let Some((key, _)) = line.split_once('=') else {
+                    continue;
+                };
+                assert!(
+                    ALLOWED.contains(&key),
+                    "hook subprocess must not inherit ambient env var {key:?}: {captured}"
+                );
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -539,7 +568,7 @@ exit 0"#,
         let hook = script(
             &dir,
             "notify.sh",
-            &format!("cat > {}\nexit 7", capture.display()),
+            &format!("cat > {}\nexit 7", test_fixtures::sh_quote(&capture)),
         );
         let output = run_notify_hooks(
             &[hook],

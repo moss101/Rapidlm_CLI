@@ -1197,7 +1197,8 @@ mod tests {
 
     #[test]
     fn agent_cli_command_runs_supervised_child_end_to_end() {
-        let args: Vec<String> = ["echo via external agent boundary", "--", "/bin/cat"]
+        let cat = test_fixtures::tool_str("cat");
+        let args: Vec<String> = ["echo via external agent boundary", "--", cat.as_str()]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -1887,6 +1888,10 @@ mod scan_tests {
         assert!(matches!(run_scan(&args), Err(P9CommandError::Scan(_))));
     }
 
+    // Runs the scanner through the host-restricted sandbox, which needs
+    // POSIX governance; the Windows-side contract is
+    // `without_a_sandbox_a_configured_scanner_blocks_the_gate`.
+    #[cfg(unix)]
     #[test]
     fn a_clean_scanner_exits_zero() {
         let root = temp_root("clean");
@@ -1896,6 +1901,10 @@ mod scan_tests {
         assert_eq!(code, 0);
     }
 
+    // Runs the scanner through the host-restricted sandbox, which needs
+    // POSIX governance; the Windows-side contract is
+    // `without_a_sandbox_a_configured_scanner_blocks_the_gate`.
+    #[cfg(unix)]
     #[test]
     fn a_scanner_with_a_finding_exits_nonzero_and_a_dismissed_one_exits_zero() {
         let root = temp_root("finding");
@@ -1931,6 +1940,24 @@ mod scan_tests {
         assert_eq!(code, 0, "a fully-dismissed finding must not keep blocking");
     }
 
+    /// Where the host-restricted sandbox is unavailable (no POSIX `ulimit`
+    /// and `ps` — Windows), a configured scanner cannot run, and per
+    /// `security::gate`'s contract "unavailable never becomes pass": the
+    /// gate blocks and `rapid scan` exits nonzero, rather than quietly
+    /// passing a scan that never happened.
+    #[cfg(not(unix))]
+    #[test]
+    fn without_a_sandbox_a_configured_scanner_blocks_the_gate() {
+        let root = temp_root("no-sandbox");
+        write_scanners(&root, vec![sh_scanner("fakescan", CLEAN_SARIF)]);
+        let args = vec!["--root".to_owned(), root.to_string_lossy().into_owned()];
+        assert_eq!(run_scan(&args).expect("scan"), 1);
+    }
+
+    // Runs the scanner through the host-restricted sandbox, which needs
+    // POSIX governance; the Windows-side contract is
+    // `without_a_sandbox_a_configured_scanner_blocks_the_gate`.
+    #[cfg(unix)]
     #[test]
     fn scanner_filter_selects_only_the_named_scanner() {
         let root = temp_root("filter");

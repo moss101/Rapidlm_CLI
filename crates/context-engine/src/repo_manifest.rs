@@ -370,8 +370,8 @@ fn ensure_writable(repo: &RepoSpec) -> Result<&RepoSpec, ManifestError> {
 }
 
 fn canonicalize_workspace(workspace_root: &Path) -> Result<PathBuf, ManifestError> {
-    let canonical =
-        std::fs::canonicalize(workspace_root).map_err(|_| ManifestError::WorkspaceRootInvalid)?;
+    let canonical = protocol::host_path::canonicalize(workspace_root)
+        .map_err(|_| ManifestError::WorkspaceRootInvalid)?;
     if !canonical.is_dir() {
         return Err(ManifestError::WorkspaceRootInvalid);
     }
@@ -416,9 +416,10 @@ fn canonicalize_root(
     } else {
         workspace_root.join(raw)
     };
-    let canonical = std::fs::canonicalize(&joined).map_err(|_| ManifestError::RootNotFound {
-        alias: alias.to_owned(),
-    })?;
+    let canonical =
+        protocol::host_path::canonicalize(&joined).map_err(|_| ManifestError::RootNotFound {
+            alias: alias.to_owned(),
+        })?;
     if !canonical.is_dir() {
         return Err(ManifestError::RootNotDirectory {
             alias: alias.to_owned(),
@@ -680,11 +681,15 @@ mode = "read_only"
         assert_eq!(docs_spec.mode(), RepoAccessMode::ReadOnly);
         assert_eq!(
             core_spec.root().as_path(),
-            fs::canonicalize(&core).expect("canon core").as_path()
+            protocol::host_path::canonicalize(&core)
+                .expect("canon core")
+                .as_path()
         );
         assert_eq!(
             docs_spec.root().as_path(),
-            fs::canonicalize(&docs).expect("canon docs").as_path()
+            protocol::host_path::canonicalize(&docs)
+                .expect("canon docs")
+                .as_path()
         );
         assert_ne!(core_spec.id(), docs_spec.id());
         assert_eq!(

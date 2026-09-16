@@ -604,7 +604,7 @@ capability = "proc.exec"
     }
 
     fn temp_cwd() -> capability_broker::CanonicalHostPath {
-        let tmp = std::env::temp_dir().canonicalize().expect("temp");
+        let tmp = protocol::host_path::canonicalize(std::env::temp_dir()).expect("temp");
         let rendered = tmp.to_str().expect("utf8 temp").replace('\\', "/");
         capability_broker::CanonicalHostPath::from_resolved(&rendered).expect("cwd")
     }

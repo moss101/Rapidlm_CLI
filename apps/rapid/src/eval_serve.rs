@@ -2543,13 +2543,17 @@ time.sleep({seconds})
     #[test]
     fn retained_output_is_bounded_and_keeps_the_tail() {
         let mut command = Command::new("python3");
+        // Bytes through the binary buffer: text-mode stdout would turn the
+        // newline into `\r\n` on Windows and the exact total below would be
+        // one byte off there.
         command.arg("-c").arg(
             r#"import sys
-print("START-MARKER")
+out = sys.stdout.buffer
+out.write(b"START-MARKER\n")
 for i in range(64):
-    sys.stdout.write("x" * 16384)
-sys.stdout.write("END-MARKER")
-sys.stdout.flush()
+    out.write(b"x" * 16384)
+out.write(b"END-MARKER")
+out.flush()
 "#,
         );
         let out = run_supervised(&mut command, None, Duration::from_secs(60), 8 * 1024)
@@ -2598,22 +2602,17 @@ print("{unique}-child-after")"#
         // matching ITS OWN wrapper shell — `sh -c "pgrep -f X"` carries X
         // in its argv, and without the class pgrep reports the probe
         // itself as a survivor (the flake this test once showed on CI).
-        let mut survived = String::new();
+        let mut survived = Vec::new();
         for _ in 0..50 {
-            let pgrep = Command::new("sh")
-                .arg("-c")
-                .arg(format!("pgrep -f '{unique}-[gc]' || true"))
-                .output()
-                .expect("pgrep");
-            survived = String::from_utf8_lossy(&pgrep.stdout).into_owned();
-            if survived.trim().is_empty() {
+            survived = test_fixtures::processes_mentioning(&unique);
+            if survived.is_empty() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
         assert!(
-            survived.trim().is_empty(),
-            "process-group members survived the timeout: {survived}"
+            survived.is_empty(),
+            "process-group members survived the timeout: {survived:?}"
         );
     }
 

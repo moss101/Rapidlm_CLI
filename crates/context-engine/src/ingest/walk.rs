@@ -434,7 +434,7 @@ fn start_repo(spec: &RepoSpec, limits: &WalkLimits) -> Result<RepoWalk, WalkErro
     if meta.file_type().is_symlink() || !meta.is_dir() {
         return Err(WalkError::RootInvalid);
     }
-    let canon = fs::canonicalize(root).map_err(WalkError::from_io)?;
+    let canon = protocol::host_path::canonicalize(root).map_err(WalkError::from_io)?;
     if canon != root {
         return Err(WalkError::RootInvalid);
     }
@@ -464,7 +464,7 @@ fn push_dir(walk: &mut RepoWalk, limits: &WalkLimits, rel: String, depth: usize)
         return Step::Continue;
     }
     let abs = abs_in(&walk.root, &rel);
-    let canon = match fs::canonicalize(&abs) {
+    let canon = match protocol::host_path::canonicalize(&abs) {
         Ok(canon) => canon,
         Err(_) => return Step::Continue,
     };
@@ -521,7 +521,7 @@ fn read_ignore_source(
         Err(_) => return Ok(None),
     };
     if meta.file_type().is_symlink() {
-        let resolved = match fs::canonicalize(path) {
+        let resolved = match protocol::host_path::canonicalize(path) {
             Ok(resolved) => resolved,
             Err(_) => return Ok(None),
         };

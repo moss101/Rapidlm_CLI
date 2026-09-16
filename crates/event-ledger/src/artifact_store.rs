@@ -164,7 +164,7 @@ impl ArtifactStore {
     ) -> Result<Self, ArtifactError> {
         let root = root.as_ref();
         fs::create_dir_all(root)?;
-        let root = fs::canonicalize(root)?;
+        let root = protocol::host_path::canonicalize(root)?;
         let blobs = root.join(BLOBS_DIR);
         let tmp = root.join(TMP_DIR);
         fs::create_dir_all(&blobs)?;

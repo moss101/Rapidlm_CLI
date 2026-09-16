@@ -16,3 +16,8 @@ process-signal = { path = "../process-signal" }
 # is the cooperative cancel contract; CanonicalHostPath / SecretHandle are
 # already-normalized mount sources and opaque secret ids.
 capability-broker = { path = "../capability-broker" }
+
+[dev-dependencies]
+# test-fixtures: absolute paths of the POSIX fixture programs the
+# process-driving tests run, on every CI host. Test-only.
+test-fixtures = { path = "../test-fixtures" }

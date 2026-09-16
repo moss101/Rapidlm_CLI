@@ -2076,8 +2076,11 @@ mod tests {
         let lease = try_acquire_driver_lease(&goal_path).expect("lease");
         let lock_path = GoalLock::lock_path(&goal_path, GOAL_DRIVER_LOCK_FILE);
         assert!(lock_path.exists());
+        // Size from metadata, not a read: while the lease holds the OS lock,
+        // Windows refuses reads of the locked range (error 33), and reading
+        // the file as data is exactly what this test says never happens.
         assert_eq!(
-            fs::read(&lock_path).expect("read lock file").len(),
+            fs::metadata(&lock_path).expect("stat lock file").len(),
             0,
             "the driver lock file must stay empty — only its existence as a lock target matters"
         );

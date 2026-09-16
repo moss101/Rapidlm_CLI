@@ -437,7 +437,8 @@ impl GitWorktreeStore {
         if !is_real_dir(&record.worktree_path)? {
             return Err(GitWorktreeError::PathEscape);
         }
-        let canon = fs::canonicalize(&record.worktree_path).map_err(|_| GitWorktreeError::Io)?;
+        let canon = protocol::host_path::canonicalize(&record.worktree_path)
+            .map_err(|_| GitWorktreeError::Io)?;
         confine_dir(&canon, &self.rapidlm_dir.join(WORKTREES_DIR))?;
         let head_after = self.user_head(cancel)?;
         if head_after.sha != head_before.sha || head_after.symbolic != head_before.symbolic {
@@ -842,7 +843,8 @@ fn canonicalize_dir(path: &Path) -> Result<PathBuf, GitWorktreeError> {
     if !meta.is_dir() || meta.file_type().is_symlink() {
         return Err(GitWorktreeError::InvalidRoot);
     }
-    let canonical = fs::canonicalize(path).map_err(|_| GitWorktreeError::InvalidRoot)?;
+    let canonical =
+        protocol::host_path::canonicalize(path).map_err(|_| GitWorktreeError::InvalidRoot)?;
     if !canonical.is_dir() {
         return Err(GitWorktreeError::InvalidRoot);
     }
@@ -1097,7 +1099,7 @@ fn ensure_real_dir(path: &Path, root: &Path) -> Result<(), GitWorktreeError> {
         Err(_) => return Err(GitWorktreeError::Io),
     }
     confine_dir(
-        &fs::canonicalize(path).map_err(|_| GitWorktreeError::Io)?,
+        &protocol::host_path::canonicalize(path).map_err(|_| GitWorktreeError::Io)?,
         root,
     )
 }
@@ -1128,7 +1130,8 @@ fn confine_child(path: &Path, root: &Path) -> Result<(), GitWorktreeError> {
 
 fn atomic_write(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), GitWorktreeError> {
     let parent = dest.parent().ok_or(GitWorktreeError::Io)?;
-    let parent_canon = fs::canonicalize(parent).map_err(|_| GitWorktreeError::Io)?;
+    let parent_canon =
+        protocol::host_path::canonicalize(parent).map_err(|_| GitWorktreeError::Io)?;
     confine_dir(&parent_canon, root)?;
     if !is_real_dir(&parent_canon)? {
         return Err(GitWorktreeError::PathEscape);
@@ -1175,7 +1178,7 @@ fn read_confined_file(
     if meta.file_type().is_symlink() || !meta.is_file() {
         return Err(GitWorktreeError::MetadataCorrupt);
     }
-    let canon = fs::canonicalize(path).map_err(|_| GitWorktreeError::Io)?;
+    let canon = protocol::host_path::canonicalize(path).map_err(|_| GitWorktreeError::Io)?;
     confine_child(&canon, root)?;
     if meta.len() > max_bytes as u64 {
         return Err(GitWorktreeError::BoundExceeded);

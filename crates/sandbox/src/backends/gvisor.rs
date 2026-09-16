@@ -861,7 +861,8 @@ fn resolve_existing_dir(path: &Path) -> Result<CanonicalHostPath, SandboxError> 
     if is_forbidden_host_source(requested) || is_docker_socket(requested) {
         return Err(SandboxError::ForbiddenMount);
     }
-    let canon = fs::canonicalize(path).map_err(|_| SandboxError::ForbiddenMount)?;
+    let canon =
+        protocol::host_path::canonicalize(path).map_err(|_| SandboxError::ForbiddenMount)?;
     let meta = fs::metadata(&canon).map_err(|_| SandboxError::ForbiddenMount)?;
     if !meta.is_dir() {
         return Err(SandboxError::ForbiddenMount);
@@ -879,7 +880,8 @@ fn resolve_existing_file(path: &str) -> Result<CanonicalHostPath, SandboxError> 
     if is_forbidden_host_source(requested.as_str()) || is_docker_socket(requested.as_str()) {
         return Err(SandboxError::ForbiddenMount);
     }
-    let canon = fs::canonicalize(requested.as_str()).map_err(|_| SandboxError::ForbiddenMount)?;
+    let canon = protocol::host_path::canonicalize(requested.as_str())
+        .map_err(|_| SandboxError::ForbiddenMount)?;
     if !canon.is_file() {
         return Err(SandboxError::ForbiddenMount);
     }
@@ -1968,7 +1970,7 @@ mod tests {
             let path = std::env::temp_dir()
                 .join(format!("rapidlm-gvisor-sbx-{}", protocol::RuntimeId::new()));
             fs::create_dir_all(&path).expect("temp workspace");
-            let canon = fs::canonicalize(&path).expect("canonicalize");
+            let canon = protocol::host_path::canonicalize(&path).expect("canonicalize");
             let host =
                 CanonicalHostPath::from_resolved(canon.to_str().expect("utf8")).expect("host");
             Self { path, host }

@@ -558,7 +558,7 @@ impl BrowserManager {
     ) -> Result<Self, BrowserSessionError> {
         let root = root.as_ref();
         fs::create_dir_all(root).map_err(|_| BrowserSessionError::Io)?;
-        let root = fs::canonicalize(root).map_err(|_| BrowserSessionError::Io)?;
+        let root = protocol::host_path::canonicalize(root).map_err(|_| BrowserSessionError::Io)?;
         for child in ["sessions", "profiles", "traces"] {
             fs::create_dir_all(root.join(child)).map_err(|_| BrowserSessionError::Io)?;
         }

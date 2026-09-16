@@ -12,3 +12,8 @@ protocol = { path = "../protocol" }
 serde = { version = "1", features = ["derive"] }
 # serde_json: MIT/Apache-2.0; closed-schema decode so unknown fields/kinds fail.
 serde_json = "1"
+
+[dev-dependencies]
+# test-fixtures: absolute paths of the POSIX fixture programs the
+# process-driving tests run, on every CI host. Test-only.
+test-fixtures = { path = "../test-fixtures" }

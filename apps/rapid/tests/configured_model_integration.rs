@@ -590,7 +590,7 @@ impl TrustedProject {
         let project = temp_dir(&format!("{tag}-proj"));
         std::fs::create_dir_all(project.join(".rapidlm")).expect("project marker");
         std::fs::write(project.join("notes.txt"), "alpha\n").expect("seed");
-        let root = std::fs::canonicalize(&project).expect("canon");
+        let root = protocol::host_path::canonicalize(&project).expect("canon");
         let identity = kernel::ProjectIdentity::new(root, None).expect("identity");
         let store = kernel::ProjectTrustStore::open(home.join(".rapidlm/project-trust.json"));
         store

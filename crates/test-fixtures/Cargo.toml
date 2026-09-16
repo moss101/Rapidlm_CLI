@@ -1,0 +1,11 @@
+[package]
+name = "test-fixtures"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Test-only: locates the POSIX fixture tools (`echo`, `sleep`, `sh`, …) the
+# process-driving tests run, on every host the CI matrix covers. A leaf with
+# no dependencies so any crate can list it under [dev-dependencies].
+[dependencies]
