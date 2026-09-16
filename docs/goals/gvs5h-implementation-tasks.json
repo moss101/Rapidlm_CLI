@@ -1,0 +1,1003 @@
+{
+  "schema": "rapidlm.goal-workplan/v1",
+  "artifact_kind": "planning_worklist_not_runtime_configuration",
+  "goal_id": "GVS-RAPIDLM-01",
+  "title": "Deliver adaptive, verified orchestration in RapidLM",
+  "created": "2026-09-15",
+  "baseline_commit": "bc87a89b696234c48065eb45e2f67cbffbca34fd",
+  "specification": "docs/goals/gvs5h-end-to-end-implementation.md",
+  "research": "docs/research/gvs5h-integration-2026-09-15.md",
+  "task_count": 34,
+  "status_values": [
+    "pending",
+    "in_progress",
+    "blocked",
+    "complete"
+  ],
+  "completion_rule": "Mark a task complete only with evidence. Overall completion requires all required functional, live evaluation, platform, documentation and release-decision evidence. Do not infer runtime configuration or scheduling from this planning artifact.",
+  "phases": [
+    {
+      "id": "P0",
+      "name": "Baseline and contracts"
+    },
+    {
+      "id": "P1",
+      "name": "Durability and freshness"
+    },
+    {
+      "id": "P2",
+      "name": "Candidates and working knowledge"
+    },
+    {
+      "id": "P3",
+      "name": "Live sequential execution"
+    },
+    {
+      "id": "P4",
+      "name": "Adaptive execution and concurrency"
+    },
+    {
+      "id": "P5",
+      "name": "User and adapter surfaces"
+    },
+    {
+      "id": "P6",
+      "name": "Evaluation and release decision"
+    },
+    {
+      "id": "P7",
+      "name": "Final checks and evidence"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "GVS-001",
+      "title": "Audit current baseline and map existing work",
+      "phase": "P0",
+      "status": "complete",
+      "depends_on": [],
+      "acceptance_criteria": [
+        "AC-01"
+      ],
+      "owners": [
+        "apps/rapid",
+        "crates",
+        "docs"
+      ],
+      "implementation": [
+        "Record commit, dirty state, supported platforms and current entry-point call paths.",
+        "Recheck research gaps against source; map existing V3 task IDs and already-delivered functionality."
+      ],
+      "validation": [
+        "Produce a source-linked baseline/ownership matrix and preserve unrelated working changes."
+      ],
+      "evidence": [
+        "docs/goals/gvs5h-phase0-baseline-2026-09-17.md — baseline commit, dirty state, platform contract (Windows now a test gate), entry-point call paths, every research lead rechecked against source with file:line, existing-work map with reachability, V3 manifest discrepancies (P2-007/P2-023), source ownership matrix"
+      ]
+    },
+    {
+      "id": "GVS-002",
+      "title": "Specify architecture and compatibility contracts",
+      "phase": "P0",
+      "status": "complete",
+      "depends_on": [
+        "GVS-001"
+      ],
+      "acceptance_criteria": [
+        "AC-01"
+      ],
+      "owners": [
+        "docs/adrs",
+        "docs/api-contracts",
+        "crates/protocol"
+      ],
+      "implementation": [
+        "Record an ADR for extending the existing graph/supervisor rather than adding an engine.",
+        "Define record ownership, lifecycle, publication reconciliation, config precedence and schema/migration strategy."
+      ],
+      "validation": [
+        "Trace every proposed authoritative mutation to an existing owner; document handling of old data and clients."
+      ],
+      "evidence": [
+        "docs/adrs/0021-verified-orchestration-extends-graph-and-supervisor.md — extend Supervisor/GraphService/TransactionManager rather than add an engine; record ownership and versioned shapes; lifecycle mapping (Paused added); normative publication ordering with journal reconciliation; config precedence and CLI override; additive schema/migration strategy with typed unsupported-replay outcome"
+      ]
+    },
+    {
+      "id": "GVS-003",
+      "title": "Preregister evaluation and freeze baseline",
+      "phase": "P0",
+      "status": "complete",
+      "depends_on": [
+        "GVS-001",
+        "GVS-002"
+      ],
+      "acceptance_criteria": [
+        "AC-01",
+        "AC-22",
+        "AC-24"
+      ],
+      "owners": [
+        "eval",
+        "docs/evaluation-specs"
+      ],
+      "implementation": [
+        "Pin baseline build, dataset splits, grader version, controlled arms and model/backend settings.",
+        "Declare aggregate budgets, statistical method, promotion gates, development-versus-held-out separation and provenance fields."
+      ],
+      "validation": [
+        "Retain experiment protocol before tuning; verify no held-out answer leakage into task packets."
+      ],
+      "evidence": [
+        "docs/evaluation-specs/gvs5h-experiment-preregistration.md — frozen promotion gates (quality/efficiency routes, latency and correctness guards), pinned grader v2 and splits, 64-task shard rule, arms A–F, task-clustered bootstrap statistics, provenance fields, leakage controls, amendment log"
+      ]
+    },
+    {
+      "id": "GVS-004",
+      "title": "Define versioned orchestration records",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "GVS-002"
+      ],
+      "acceptance_criteria": [
+        "AC-02",
+        "AC-03",
+        "AC-08",
+        "AC-13",
+        "AC-21"
+      ],
+      "owners": [
+        "crates/protocol",
+        "crates/agent-runtime",
+        "crates/event-ledger"
+      ],
+      "implementation": [
+        "Extend existing ID/schema types for run, attempt, finding, candidate, check, verdict, reservation and decision records.",
+        "Reference large bodies through existing artifact storage; implement bounds, redaction and additive evolution."
+      ],
+      "validation": [
+        "Round-trip schemas; reject invalid IDs/oversized content; test old-reader/new-reader compatibility and fixture changes."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-005",
+      "title": "Persist and replay complete graph state",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "GVS-004"
+      ],
+      "acceptance_criteria": [
+        "AC-02"
+      ],
+      "owners": [
+        "crates/scheduler",
+        "crates/event-ledger",
+        "crates/kernel"
+      ],
+      "implementation": [
+        "Persist sufficient graph/proposal data or immutable references for reconstruction.",
+        "Rebuild definitions, revisions, node states and orchestration projections; handle historical missing payloads explicitly."
+      ],
+      "validation": [
+        "Restart after each durable transition; compare replayed and uninterrupted state; inject duplicate, missing and corrupt records."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-006",
+      "title": "Make acceptance and publication recovery-safe",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "GVS-004",
+        "GVS-005"
+      ],
+      "acceptance_criteria": [
+        "AC-03"
+      ],
+      "owners": [
+        "crates/agent-runtime/src/orchestration",
+        "crates/scheduler",
+        "crates/event-ledger",
+        "crates/workspace"
+      ],
+      "implementation": [
+        "Refactor acceptance into durable event-derived transitions shared by graph and goal projections.",
+        "Define prepared/applied/reconciled publication receipts and idempotent request handling across database/filesystem boundaries."
+      ],
+      "validation": [
+        "Inject append failures and crashes around publication; assert no false completion, split projections or double patch application."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-007",
+      "title": "Bind evidence to real identities and invalidate on writes",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "GVS-004"
+      ],
+      "acceptance_criteria": [
+        "AC-04"
+      ],
+      "owners": [
+        "apps/rapid/src/goal_claim.rs",
+        "crates/agent-runtime/src/evidence.rs",
+        "crates/workspace",
+        "crates/context-engine"
+      ],
+      "implementation": [
+        "Compute canonical candidate, test-definition and relevant environment digests instead of goal-metadata identity.",
+        "Wire production workspace and dependency changes to evidence/finding invalidation."
+      ],
+      "validation": [
+        "Modify code, tests and relevant environment after verification; refuse stale acceptance and retain unaffected evidence where justified."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-008",
+      "title": "Recover runs, reservations and uncertain effects",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "GVS-005",
+        "GVS-006",
+        "GVS-007"
+      ],
+      "acceptance_criteria": [
+        "AC-05",
+        "AC-19"
+      ],
+      "owners": [
+        "crates/kernel",
+        "crates/event-ledger",
+        "crates/agent-runtime"
+      ],
+      "implementation": [
+        "Restore active work as paused and reconcile attempts, child resources and prepared effects.",
+        "Recover budget reservations and artifact references without replaying uncertain external effects."
+      ],
+      "validation": [
+        "Kill/restart at queued, running, checking, acceptance and publication boundaries; require paused recovery and explicit reconciliation."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-009",
+      "title": "Capture correct isolated candidate snapshots",
+      "phase": "P2",
+      "status": "pending",
+      "depends_on": [
+        "GVS-004",
+        "GVS-007"
+      ],
+      "acceptance_criteria": [
+        "AC-06"
+      ],
+      "owners": [
+        "crates/workspace",
+        "apps/rapid/src/agent_views.rs",
+        "apps/rapid/src/interactive.rs"
+      ],
+      "implementation": [
+        "Snapshot authorized staged, unstaged and relevant untracked content from the actual starting workspace.",
+        "Use actual attempt/agent/view identities and preserve baseline provenance for each child; reject unsupported isolation."
+      ],
+      "validation": [
+        "Run children on dirty workspaces and successive candidates; prove user changes are preserved and parallel writers share no mutable view."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-010",
+      "title": "Preserve incumbents and stage candidate publication",
+      "phase": "P2",
+      "status": "pending",
+      "depends_on": [
+        "GVS-006",
+        "GVS-009"
+      ],
+      "acceptance_criteria": [
+        "AC-07"
+      ],
+      "owners": [
+        "crates/workspace",
+        "crates/agent-runtime/src/orchestration",
+        "apps/rapid/src/agent_views.rs"
+      ],
+      "implementation": [
+        "Keep immutable candidate patches with predecessor/check references and an incumbent selection policy.",
+        "Stage integration against an expected parent snapshot; retain failed/conflicting candidates without modifying the parent."
+      ],
+      "validation": [
+        "Reject regression candidates, concurrent parent edits and conflicting patches; verify publication receipts and incumbent retention."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-011",
+      "title": "Implement versioned working findings",
+      "phase": "P2",
+      "status": "pending",
+      "depends_on": [
+        "GVS-004",
+        "GVS-005",
+        "GVS-007"
+      ],
+      "acceptance_criteria": [
+        "AC-08"
+      ],
+      "owners": [
+        "crates/agent-runtime/src/orchestration",
+        "crates/context-engine"
+      ],
+      "implementation": [
+        "Persist supported/refuted/superseded findings, source references, dependency hashes and negative results.",
+        "Build bounded run-state and human-readable note projections from existing stores; never treat exports as authority."
+      ],
+      "validation": [
+        "Replay findings after restart; exclude stale dependencies; retain superseded evidence; show edited exports cannot change task acceptance."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-012",
+      "title": "Compile fresh role-specific context",
+      "phase": "P2",
+      "status": "pending",
+      "depends_on": [
+        "GVS-009",
+        "GVS-011"
+      ],
+      "acceptance_criteria": [
+        "AC-09"
+      ],
+      "owners": [
+        "crates/context-engine",
+        "crates/agent-runtime/src/context_recovery.rs",
+        "apps/rapid/src/host.rs"
+      ],
+      "implementation": [
+        "Compile objectives, constraints, selected code, findings, gaps and candidate refs using existing token/output reserves.",
+        "Create separate worker, planner, verifier and alternative-attempt views without full parent transcripts."
+      ],
+      "validation": [
+        "Force context pressure and truncation; preserve mandatory requirements/rules/evidence and reject oversized packets rather than silently dropping obligations."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-013",
+      "title": "Implement live typed role drivers",
+      "phase": "P3",
+      "status": "pending",
+      "depends_on": [
+        "GVS-002",
+        "GVS-012"
+      ],
+      "acceptance_criteria": [
+        "AC-10"
+      ],
+      "owners": [
+        "crates/agent-runtime/src/agent_executor.rs",
+        "apps/rapid/src/host.rs",
+        "apps/rapid/src/model.rs"
+      ],
+      "implementation": [
+        "Provide planner, explorer/retriever, implementer, verifier and strategist adapters over the existing live executor.",
+        "Apply correct AgentRole, tool projection, capability ceilings, structured parsing and bounded malformed-output repair."
+      ],
+      "validation": [
+        "Exercise production adapters with deterministic malformed/correct outputs and live smoke; prove proposals alone cannot mutate host authority."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-014",
+      "title": "Connect bounded deterministic check execution",
+      "phase": "P3",
+      "status": "pending",
+      "depends_on": [
+        "GVS-004",
+        "GVS-009",
+        "GVS-016"
+      ],
+      "acceptance_criteria": [
+        "AC-11"
+      ],
+      "owners": [
+        "apps/rapid/src/goal_claim.rs",
+        "crates/process-supervisor",
+        "crates/sandbox",
+        "crates/tool-gateway"
+      ],
+      "implementation": [
+        "Run checks through shared supervised process and policy paths; drain bounded output and clean process groups.",
+        "Emit candidate-bound receipts with exit/timeout/cancel status, check identity and required discovery/behavior evidence."
+      ],
+      "validation": [
+        "Reject matching stdout plus nonzero exit, timeout, missing discovery and prohibited actions; verify bounded output and cancellation cleanup."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-015",
+      "title": "Enforce independent verification for every candidate",
+      "phase": "P3",
+      "status": "pending",
+      "depends_on": [
+        "GVS-006",
+        "GVS-007",
+        "GVS-010",
+        "GVS-013",
+        "GVS-014"
+      ],
+      "acceptance_criteria": [
+        "AC-12"
+      ],
+      "owners": [
+        "crates/agent-runtime/src/orchestration",
+        "apps/rapid/src/goal_claim.rs"
+      ],
+      "implementation": [
+        "Use a fresh read-only verifier packet and requirement-linked deterministic evidence to create verdicts/gaps.",
+        "Make changed finalization, repair and merge candidates pass identical gates; prevent self-reports from satisfying evidence."
+      ],
+      "validation": [
+        "Reject false done, stale identity, dangling evidence and unchecked finalizer output; prove verifier writes fail at the executor boundary."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-016",
+      "title": "Enforce shared run budget reservations",
+      "phase": "P3",
+      "status": "pending",
+      "depends_on": [
+        "GVS-004",
+        "GVS-008"
+      ],
+      "acceptance_criteria": [
+        "AC-13"
+      ],
+      "owners": [
+        "crates/agent-runtime",
+        "crates/llm-router",
+        "apps/rapid/src/host.rs"
+      ],
+      "implementation": [
+        "Reserve run-wide token/cost/time/tool/concurrency capacity before every call or check, including a verification reserve.",
+        "Settle every attempt and retry idempotently; preserve unknown usage and reconcile interrupted requests."
+      ],
+      "validation": [
+        "Stress simultaneous reservations, provider retries and late settlements; no per-child budget reset, double settlement or free finalizer."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-017",
+      "title": "Deliver sequential graph-backed pilot",
+      "phase": "P3",
+      "status": "pending",
+      "depends_on": [
+        "GVS-005",
+        "GVS-008",
+        "GVS-010",
+        "GVS-013",
+        "GVS-014",
+        "GVS-015",
+        "GVS-016"
+      ],
+      "acceptance_criteria": [
+        "AC-14"
+      ],
+      "owners": [
+        "crates/scheduler/src/orch.rs",
+        "apps/rapid/src/workflow.rs",
+        "apps/rapid/src/host.rs"
+      ],
+      "implementation": [
+        "Map live role/check/verification attempts onto canonical graph revisions and bridge the existing workflow runner.",
+        "Execute plan-to-worker-to-check-to-verdict-to-publish with one model and one writer; keep deterministic transitions model-free."
+      ],
+      "validation": [
+        "Complete a real multi-file task through the production entry point; replay its run and verify all calls, receipts and publication identity."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-018",
+      "title": "Add bounded adaptive effort and replanning",
+      "phase": "P4",
+      "status": "pending",
+      "depends_on": [
+        "GVS-003",
+        "GVS-011",
+        "GVS-017"
+      ],
+      "acceptance_criteria": [
+        "AC-15"
+      ],
+      "owners": [
+        "crates/agent-runtime/src/orchestration/policy.rs",
+        "crates/agent-runtime/src/delegation.rs",
+        "crates/scheduler"
+      ],
+      "implementation": [
+        "Select direct versus full workflow using a recorded inspectable policy and configured ceilings.",
+        "Use gap/check/patch/evidence stagnation signals to repair or replan by appending revisions, with finite convergence limits."
+      ],
+      "validation": [
+        "Test simple tasks avoid unnecessary manager calls; repeated unchanged failures trigger a justified new action; all paths terminate within bounds."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-019",
+      "title": "Add fresh alternative attempts and evidence-based selection",
+      "phase": "P4",
+      "status": "pending",
+      "depends_on": [
+        "GVS-012",
+        "GVS-015",
+        "GVS-018"
+      ],
+      "acceptance_criteria": [
+        "AC-16"
+      ],
+      "owners": [
+        "crates/agent-runtime/src/orchestration",
+        "crates/context-engine"
+      ],
+      "implementation": [
+        "Dispatch a bounded alternative with earlier proposed solutions omitted but user rules and verified repository facts retained.",
+        "Select challengers using the same checks and acceptance policy; treat agreement or confidence as insufficient proof."
+      ],
+      "validation": [
+        "Seed an incorrect early plan; inspect alternative packet independence and show an unverified challenger cannot displace the incumbent."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-020",
+      "title": "Wire purpose-aware model profile routing",
+      "phase": "P4",
+      "status": "pending",
+      "depends_on": [
+        "GVS-013",
+        "GVS-016",
+        "GVS-017"
+      ],
+      "acceptance_criteria": [
+        "AC-17"
+      ],
+      "owners": [
+        "crates/llm-router",
+        "apps/rapid/src/model.rs",
+        "apps/rapid/src/user_config.rs"
+      ],
+      "implementation": [
+        "Carry plan/code/review purposes and configured role profiles into actual provider requests.",
+        "Respect supported reasoning/structured-output capabilities and explicit fallback policy; record routes and retry spend."
+      ],
+      "validation": [
+        "Capture provider-bound requests to prove routes are used; test unsupported settings, fallback attribution and shared-budget enforcement."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-021",
+      "title": "Enable safe selective concurrency",
+      "phase": "P4",
+      "status": "pending",
+      "depends_on": [
+        "GVS-010",
+        "GVS-015",
+        "GVS-016",
+        "GVS-018",
+        "GVS-019",
+        "GVS-020"
+      ],
+      "acceptance_criteria": [
+        "AC-18"
+      ],
+      "owners": [
+        "crates/scheduler",
+        "crates/agent-pool",
+        "crates/workspace",
+        "apps/rapid/src/exec_tools.rs"
+      ],
+      "implementation": [
+        "Schedule bounded parallel read-only tasks and isolated candidate attempts with shared resource reservations.",
+        "Compose accepted changes in a staging view and rerun integration checks even for non-overlapping file edits."
+      ],
+      "validation": [
+        "Exercise overlap, cross-file API regression, resource starvation and failed children; prove isolation and no unverified integration."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-022",
+      "title": "Complete lifecycle propagation and resumable child handling",
+      "phase": "P4",
+      "status": "pending",
+      "depends_on": [
+        "GVS-008",
+        "GVS-017",
+        "GVS-021"
+      ],
+      "acceptance_criteria": [
+        "AC-05",
+        "AC-19"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "crates/kernel",
+        "crates/agent-runtime"
+      ],
+      "implementation": [
+        "Unify pause/cancel/approval/input waits and resume through existing parent/child registries and graph state.",
+        "Fence late child results and publication; retain useful artifacts and release resources/reservations correctly."
+      ],
+      "validation": [
+        "Cancel parent and child at each phase, restart during approval wait and deliver late completion; no unauthorized replay or publication."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-023",
+      "title": "Expose configuration and CLI/headless/workflow entry",
+      "phase": "P5",
+      "status": "pending",
+      "depends_on": [
+        "GVS-017",
+        "GVS-018",
+        "GVS-020",
+        "GVS-022"
+      ],
+      "acceptance_criteria": [
+        "AC-20"
+      ],
+      "owners": [
+        "crates/protocol/src/config.rs",
+        "apps/rapid/src/main.rs",
+        "apps/rapid/src/headless",
+        "apps/rapid/src/workflow.rs"
+      ],
+      "implementation": [
+        "Preserve off/verified mode and add bounded strategy settings and execution overrides with existing precedence.",
+        "Route all exposed entry points through the same host; remove unchecked child auto-integration from verified paths."
+      ],
+      "validation": [
+        "CLI contract tests cover enable/disable, invalid settings, managed ceilings, headless verification and unchanged off-mode behavior."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-024",
+      "title": "Integrate terminal status and control",
+      "phase": "P5",
+      "status": "pending",
+      "depends_on": [
+        "GVS-023"
+      ],
+      "acceptance_criteria": [
+        "AC-20"
+      ],
+      "owners": [
+        "crates/tui",
+        "apps/rapid/src/interactive.rs"
+      ],
+      "implementation": [
+        "Render active task, candidate, check/verdict state, remaining budget and meaningful strategy changes from projections.",
+        "Connect inspect/pause/cancel/resume to existing actions and persist effective run config at safe boundaries."
+      ],
+      "validation": [
+        "Drive the real interactive dispatcher through success, repair, pause/resume and cancel; UI never invents completion or leaks secrets."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-025",
+      "title": "Expose shared adapter and SDK contracts",
+      "phase": "P5",
+      "status": "pending",
+      "depends_on": [
+        "GVS-004",
+        "GVS-023"
+      ],
+      "acceptance_criteria": [
+        "AC-21"
+      ],
+      "owners": [
+        "apps/rapid/src/daemon_serve.rs",
+        "apps/rapid/src/acp_serve.rs",
+        "crates/acp",
+        "sdk/typescript"
+      ],
+      "implementation": [
+        "Expose applicable run controls/events/results through existing daemon/ACP/SDK paths and truthful capability negotiation.",
+        "Generate additive wire types and fixtures; preserve old-client behavior when orchestration is unavailable or off."
+      ],
+      "validation": [
+        "Run adapter round-trip, version-compatibility, capability-advertisement and generated-schema drift checks."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-026",
+      "title": "Document user flows and delivered architecture",
+      "phase": "P5",
+      "status": "pending",
+      "depends_on": [
+        "GVS-023",
+        "GVS-024",
+        "GVS-025"
+      ],
+      "acceptance_criteria": [
+        "AC-20",
+        "AC-21",
+        "AC-26"
+      ],
+      "owners": [
+        "docs",
+        "system-prompts"
+      ],
+      "implementation": [
+        "Write enabling, inspecting, resuming and interpreting evidence examples using actual delivered commands.",
+        "Update stale architecture claims, role/tool policy, defaults, unsupported surfaces and upstream attribution where material was reused."
+      ],
+      "validation": [
+        "Check examples against implemented help/config contracts and source links; remove claims of unmeasured improvement."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-027",
+      "title": "Implement controlled evaluation arms and complete accounting",
+      "phase": "P6",
+      "status": "pending",
+      "depends_on": [
+        "GVS-003",
+        "GVS-004",
+        "GVS-016",
+        "GVS-017"
+      ],
+      "acceptance_criteria": [
+        "AC-22"
+      ],
+      "owners": [
+        "apps/rapid/src/eval_serve.rs",
+        "crates/harness",
+        "eval"
+      ],
+      "implementation": [
+        "Add baseline, sequential, enhanced, independent-sampling and mixed-route arms with fixed task/model/tool provenance.",
+        "Support deterministic sharding or a validated loader limit change; account for all attempts, cache/retry usage and missing measurements."
+      ],
+      "validation": [
+        "Negative controls reject missing arms, all-skipped reports, silent truncation and false verified-success metrics; shards aggregate without duplicates."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-028",
+      "title": "Build development and held-out task suites",
+      "phase": "P6",
+      "status": "pending",
+      "depends_on": [
+        "GVS-003"
+      ],
+      "acceptance_criteria": [
+        "AC-23"
+      ],
+      "owners": [
+        "eval",
+        "docs/evaluation-specs"
+      ],
+      "implementation": [
+        "Create the 24-task development pilot and at least 100 independent held-out repository tasks across required languages and behaviors.",
+        "Keep hidden grading outside agent-visible workspaces; add discovery, protected-file and mutation checks plus positive controls."
+      ],
+      "validation": [
+        "Gold fixes pass and vacuous/wrong/tampered submissions fail; verify task independence, split integrity and lack of answer leakage."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-029",
+      "title": "Exercise required negative and chaos matrix",
+      "phase": "P6",
+      "status": "pending",
+      "depends_on": [
+        "GVS-007",
+        "GVS-008",
+        "GVS-010",
+        "GVS-015",
+        "GVS-016",
+        "GVS-021",
+        "GVS-022"
+      ],
+      "acceptance_criteria": [
+        "AC-02",
+        "AC-03",
+        "AC-04",
+        "AC-05",
+        "AC-07",
+        "AC-11",
+        "AC-12",
+        "AC-13",
+        "AC-18",
+        "AC-19",
+        "AC-23"
+      ],
+      "owners": [
+        "crates/kernel/tests",
+        "crates/harness",
+        "apps/rapid/tests",
+        "eval"
+      ],
+      "implementation": [
+        "Implement the goal's 20 failure scenarios at production boundaries using fault injection and real workspace/process behavior.",
+        "Retain reproducible artifacts and assertions tying user-visible state to ledger/evidence truth."
+      ],
+      "validation": [
+        "Every required negative case and corresponding positive control passes; replay/crash probes do not rely solely on in-memory fakes."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-030",
+      "title": "Run repeated held-out live experiments",
+      "phase": "P6",
+      "status": "pending",
+      "depends_on": [
+        "GVS-018",
+        "GVS-019",
+        "GVS-020",
+        "GVS-023",
+        "GVS-027",
+        "GVS-028",
+        "GVS-029"
+      ],
+      "acceptance_criteria": [
+        "AC-22",
+        "AC-24"
+      ],
+      "owners": [
+        "eval/results",
+        "docs/evaluation-specs"
+      ],
+      "implementation": [
+        "Use available configured providers under an explicit experiment spending ceiling; capture model/backend and environment identities.",
+        "Run preregistered same-model and mixed-route arms with repeated trials and preserve failures, charges, partial usage and latency."
+      ],
+      "validation": [
+        "Required arms actually execute; retain exact configs, predictions and external grader results; report missing dependencies without substituting offline evidence."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-031",
+      "title": "Analyze benefit and record release decision",
+      "phase": "P6",
+      "status": "pending",
+      "depends_on": [
+        "GVS-003",
+        "GVS-030"
+      ],
+      "acceptance_criteria": [
+        "AC-24"
+      ],
+      "owners": [
+        "docs/research",
+        "eval/results"
+      ],
+      "implementation": [
+        "Compute paired task-level uncertainty, all-attempt cost per verified success and median/p95 latency.",
+        "Apply frozen quality/efficiency/correctness/latency gates; document promotion, experimental-only or do-not-promote outcome and any bounded follow-up tuning."
+      ],
+      "validation": [
+        "An independent recalculation matches report totals; no selective exclusions, pooled incompatible budgets or unsupported quality claims."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-032",
+      "title": "Complete final repository and platform checks",
+      "phase": "P7",
+      "status": "pending",
+      "depends_on": [
+        "GVS-024",
+        "GVS-025",
+        "GVS-026",
+        "GVS-027",
+        "GVS-028",
+        "GVS-029"
+      ],
+      "acceptance_criteria": [
+        "AC-25"
+      ],
+      "owners": [
+        ".github/workflows",
+        "apps/rapid/tests",
+        "crates",
+        "sdk/typescript"
+      ],
+      "implementation": [
+        "Run relevant targeted checks, then required fmt/lint/workspace/schema/SDK gates on the delivered code.",
+        "Validate supported platform behavior and off-mode regressions; use equivalent retained CI evidence if local infrastructure prevents execution."
+      ],
+      "validation": [
+        "All required supported-platform gates pass at the relevant commit; informational or unexecuted checks remain explicitly labelled."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-033",
+      "title": "Rehearse migration, disable and recovery runbooks",
+      "phase": "P7",
+      "status": "pending",
+      "depends_on": [
+        "GVS-005",
+        "GVS-006",
+        "GVS-008",
+        "GVS-023",
+        "GVS-026",
+        "GVS-032"
+      ],
+      "acceptance_criteria": [
+        "AC-02",
+        "AC-05",
+        "AC-26"
+      ],
+      "owners": [
+        "docs",
+        "crates/kernel",
+        "crates/event-ledger"
+      ],
+      "implementation": [
+        "Test upgrade from historical state, disabling new runs, draining/cancelling active work and recovery from interrupted migration.",
+        "Define downgrade compatibility and preserve artifacts; never promise old binaries can read unsupported new state."
+      ],
+      "validation": [
+        "Run documented upgrade/recovery/disable scenarios on retained fixtures; no data loss, autonomous resumed work or stranded publication."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "GVS-034",
+      "title": "Assemble acceptance evidence and final handoff",
+      "phase": "P7",
+      "status": "pending",
+      "depends_on": [
+        "GVS-031",
+        "GVS-032",
+        "GVS-033"
+      ],
+      "acceptance_criteria": [
+        "AC-01",
+        "AC-24",
+        "AC-25",
+        "AC-26"
+      ],
+      "owners": [
+        "docs/goals",
+        "docs/development-ledger.md"
+      ],
+      "implementation": [
+        "Link all 26 criteria and 34 tasks to code revisions, tests, durable artifacts and live results; reconcile existing project tracking.",
+        "Deliver configuration/migration examples, limitations and release decision; mark goal complete only after every required deliverable has evidence."
+      ],
+      "validation": [
+        "Acceptance matrix has no unexplained gaps; final claims match the exact evaluated/delivered versions and ordinary execution remains compatible."
+      ],
+      "evidence": []
+    }
+  ]
+}
