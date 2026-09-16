@@ -973,6 +973,10 @@ fn check_cancel(cancel: &CancellationToken) -> Result<(), SandboxError> {
     }
 }
 
+// The exec-path tests are `cfg(unix)` (see `unavailable_without_posix_governance`
+// for the other half); the helpers and imports they share are dead on Windows,
+// and `-D warnings` there is not a finding about them.
+#[cfg_attr(not(unix), allow(dead_code, unused_imports))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -113,6 +113,12 @@ mod tests {
         let ours = canonicalize(&dir).expect("temp dir canonicalizes");
         let theirs = std::fs::canonicalize(&dir).expect("std canonicalizes");
         assert_eq!(ours, simplified(&theirs));
+        if cfg!(unix) {
+            // Identical to std on Unix: there is no prefix to strip there.
+            assert_eq!(ours, theirs);
+        } else {
+            assert!(theirs.to_string_lossy().starts_with(r"\\?\"));
+        }
         assert!(!ours.to_string_lossy().starts_with(r"\\?\"));
         assert!(ours.is_absolute());
         assert!(ours.is_dir());

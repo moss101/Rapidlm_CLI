@@ -291,10 +291,11 @@ pub fn run_update(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandE
 
 /// The staging / backup sibling of `bin`: `rapid.update-new`, or, when the
 /// binary carries an executable extension, `rapid.update-new.exe` — the
-/// extension stays last so the staged artifact is still something the OS
-/// will run for the smoke test. `Path::with_extension` used to produce
-/// `rapid.update-new` from `rapid.exe`, which Windows will not execute, so
-/// every update there failed its smoke run and rolled back.
+/// extension stays last, so a `.cmd`/`.bat` launcher (the test stand-in on
+/// Windows) is still something the OS will run for the smoke test, and a
+/// real `.exe` keeps its conventional name. `Path::with_extension` used to
+/// *replace* the last dotted segment instead: `rapid.exe` → `rapid.update-new`
+/// and `rapid-0.1` → `rapid-0.update-new`.
 fn sibling_variant(bin: &Path, tag: &str) -> std::path::PathBuf {
     let name = bin.file_name().unwrap_or_default();
     let mut out = std::ffi::OsString::new();

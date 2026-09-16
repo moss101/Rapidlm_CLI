@@ -119,13 +119,10 @@ impl LiveHostResolver {
     fn canonicalize(requested: &str) -> Result<String, ()> {
         let canonical = protocol::host_path::canonicalize(requested).map_err(|_| ())?;
         let text = canonical.to_str().ok_or(())?;
-        // `std::fs::canonicalize` on Windows returns a `\\?\`-prefixed
-        // (verbatim) path; `CanonicalHostPath::from_resolved` rejects UNC
-        // paths outright, which would otherwise make every real resolution
-        // fail closed on that platform. Documented Rust stdlib behavior,
-        // not a workaround for anything unusual — strip the prefix, which
-        // still names the identical real path, just in the same non-
-        // verbatim form every other caller already produces.
+        // `protocol::host_path::canonicalize` already hands back the plain
+        // (non-verbatim) form on Windows, and `from_resolved` accepts the
+        // verbatim-drive form too; `simplified_str` here is belt and braces
+        // for a caller that resolved through std directly.
         let stripped = protocol::host_path::simplified_str(text).unwrap_or_else(|| text.to_owned());
         Ok(stripped)
     }

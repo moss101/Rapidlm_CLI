@@ -1856,6 +1856,7 @@ mod scan_tests {
     const CLEAN_SARIF: &str =
         r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"fakescan"}},"results":[]}]}"#;
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn finding_sarif() -> String {
         r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"fakescan"}},"results":[{"ruleId":"no-eval","level":"error","message":{"text":"eval is unsafe"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/app.rs"},"region":{"byteOffset":10,"byteLength":4}}}]}]}]}"#.to_owned()
     }

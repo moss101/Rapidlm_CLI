@@ -355,7 +355,12 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
-        format!("sh {}", test_fixtures::sh_quote(&path))
+        // The hook line is handed to `sh -c` on Unix and `cmd /C` on
+        // Windows; neither needs quoting for a temp-dir path (no spaces),
+        // and `cmd` would not understand POSIX quotes anyway. Forward
+        // slashes so `sh` on Windows does not read the backslashes as
+        // escapes.
+        format!("sh {}", test_fixtures::slash_path(&path))
     }
 
     #[test]
@@ -456,10 +461,17 @@ exit 0"#,
             std::env::var_os(CANARY_NAME).is_some(),
             "the test binary itself carries the canary"
         );
-        let hook = format!(
-            "{} > {}",
-            test_fixtures::sh_quote(&test_fixtures::tool("env")),
-            test_fixtures::sh_quote(&capture)
+        // The redirect lives inside a script `sh` parses on every host;
+        // `cmd /C` would parse a bare `env > file` line itself on Windows
+        // and does not understand POSIX quoting.
+        let hook = script(
+            &dir,
+            "env.sh",
+            &format!(
+                "{} > {}",
+                test_fixtures::sh_quote(&test_fixtures::tool("env")),
+                test_fixtures::sh_quote(&capture)
+            ),
         );
         assert_eq!(
             run_pre_tool_hooks(&[hook], "repo_read", "{}", HOOK_TIMEOUT),

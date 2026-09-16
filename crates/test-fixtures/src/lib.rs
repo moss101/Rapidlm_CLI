@@ -277,9 +277,16 @@ mod tests {
     #[test]
     fn process_probes_see_a_live_sleeper_and_not_a_reaped_one() {
         let marker = format!("rapidlm-fixture-probe-{}", std::process::id());
+        // A compound command: `sh -c 'sleep 30'` would exec the sleep in
+        // place of the shell (bash does, and so the marker in the shell's
+        // argv would vanish with it); a loop keeps the shell — and its
+        // argv — alive as the process the probe must see.
         let mut child = std::process::Command::new(sh())
             .arg("-c")
-            .arg(format!("{} 30 # {marker}", tool_str("sleep")))
+            .arg(format!(
+                "while :; do {} 1; done # {marker}",
+                tool_str("sleep")
+            ))
             .spawn()
             .expect("spawn sleeper");
         let pid = child.id();

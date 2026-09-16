@@ -2348,7 +2348,9 @@ pub(crate) fn resolve_project_root(
 ) -> Result<FoundProject, String> {
     let cwd = canonicalize_dir(cwd).map_err(|err| format!("{err}"))?;
     let root = detect_project_root(&cwd, cancel).map_err(|err| format!("{err}"))?;
-    let marker = if root.join(PROJECT_MARKER).exists() {
+    // The same rule the walk applied: the user config dir is not a marker.
+    let user_config_dir = existing_user_config_dir();
+    let marker = if is_project_marker(&root.join(PROJECT_MARKER), user_config_dir.as_deref()) {
         Some(PROJECT_MARKER)
     } else if root.join(GIT_MARKER).exists() {
         Some(GIT_MARKER)
@@ -10687,11 +10689,13 @@ fn existing_user_config_dir() -> Option<PathBuf> {
     // The same precedence as `user_home_from`, without its create-if-missing:
     // a directory that does not exist cannot be mistaken for a marker, and
     // detecting a project root must not leave a `~/.rapidlm` behind.
-    let env: Vec<(String, String)> = std::env::vars().collect();
+    // `vars_os`, not `vars`: this runs on every project-root resolution and
+    // a non-UTF-8 entry elsewhere in the environment must not panic it.
+    let env: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
     let value = |key: &str| {
         env.iter()
             .find(|(name, _)| name == key)
-            .map(|(_, value)| value.as_str())
+            .and_then(|(_, value)| value.to_str())
             .filter(|value| !value.is_empty())
     };
     let candidate = match value(RAPIDLM_HOME_ENV) {
@@ -11860,7 +11864,7 @@ approval gap has been closed and this characterization test should be rewritten:
             std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod");
         }
-        let hook = format!("sh {}", test_fixtures::sh_quote(&script_path));
+        let hook = format!("sh {}", test_fixtures::slash_path(&script_path));
 
         // Simulate an early-return exit path: the guard is constructed,
         // configured, and then the enclosing scope ends (an early `return`
