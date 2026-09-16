@@ -56,15 +56,14 @@ jobs:
       - name: Lint
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      # Windows builds and lints as a gate — every `cfg` hole is a red push —
-      # but its test suite is informational: the suite's fixtures are Unix
-      # (`/bin/sh`, `/tmp`, symlinks, `script(1)`), and the product decision
-      # on 2026-09-12 was to keep Windows compiling rather than port them
-      # yet. `docs/getting-started.md` says the same to the user. A failing
-      # Windows Test step is visible in the job log and not a red commit.
+      # Every platform's test suite is a gate, Windows included (since
+      # 2026-09-17: the suite's fixtures resolve `sh`/`echo`/`sleep` per host
+      # through `crates/test-fixtures` — Git for Windows' usr/bin there — and
+      # the POSIX-only tiers (PTY via `script(1)`, the host-restricted
+      # sandbox) report typed unavailability with Windows-side contract
+      # tests). A failing Windows test is a red commit like any other.
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
-        continue-on-error: ${{ matrix.os == 'windows-latest' }}
 
       - name: Schema fixtures
         run: cargo test --locked -p protocol --test schema_fixtures

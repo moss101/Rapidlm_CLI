@@ -8363,7 +8363,7 @@ mod tests {
                 "c1",
                 SHELL_EXEC_TOOL,
                 serde_json::to_string(&serde_json::json!({
-                    "argv": ["/bin/sleep", "30"],
+                    "argv": [test_fixtures::tool_str("sleep"), "30"],
                     "background": true,
                 }))
                 .expect("encode call")
@@ -14118,12 +14118,24 @@ for line in sys.stdin:
                     "SDKROOT",
                     "__CF_USER_TEXT_ENCODING",
                 ];
+                // On Windows the platform base set (`protocol::host_env`) is
+                // forwarded too; Python reports names upper-cased there.
+                let platform_base = |key: &str| {
+                    protocol::host_env::WINDOWS_BASE_ENV
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(key))
+                };
                 for key in keys_line.split(',').filter(|k| !k.is_empty()) {
                     assert!(
-                        ALLOWED.contains(&key),
+                        ALLOWED.contains(&key) || (cfg!(windows) && platform_base(key)),
                         "MCP server process must not inherit ambient env var {key:?}: {summary}"
                     );
                 }
+                // And the ambient canary every test binary carries must not.
+                assert!(
+                    !keys_line.split(',').any(|key| key.starts_with("CARGO_")),
+                    "{summary}"
+                );
             }
             other => panic!("expected env listing, got {other:?}"),
         }
