@@ -132,17 +132,18 @@ fn hook_shell(command: &str) -> Command {
     let (shell, flag, keep): (&str, &str, &[&str]) =
         ("sh", "-c", &["PATH", "HOME", "LANG", "TMPDIR"]);
     #[cfg(not(unix))]
-    let (shell, flag, keep): (&str, &str, &[&str]) = (
-        "cmd",
-        "/C",
-        &["PATH", "USERPROFILE", "TEMP", "TMP", "SystemRoot"],
-    );
+    let (shell, flag, keep): (&str, &str, &[&str]) = ("cmd", "/C", &["PATH"]);
     let mut builder = Command::new(shell);
     builder.arg(flag).arg(command).env_clear();
     for key in keep {
         if let Ok(value) = std::env::var(key) {
             let _ = builder.env(key, value);
         }
+    }
+    // What the OS itself needs to start a child (`SystemRoot`, `COMSPEC`,
+    // `TEMP`, … on Windows; nothing on Unix), stated once in `host_env`.
+    for (key, value) in protocol::host_env::platform_base_env() {
+        let _ = builder.env(key, value);
     }
     builder
 }

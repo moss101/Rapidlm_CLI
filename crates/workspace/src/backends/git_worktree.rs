@@ -1274,6 +1274,9 @@ mod tests {
         ));
         fs::create_dir_all(&dir).expect("mkdir");
         git_ok(&dir, &["init", "-b", "user-main"]);
+        // Byte-exact checkout assertions: Git for Windows' default
+        // `core.autocrlf=true` would turn `\n` into `\r\n` on checkout.
+        git_ok(&dir, &["config", "core.autocrlf", "false"]);
         git_ok(
             &dir,
             &[
@@ -1699,6 +1702,9 @@ mod tests {
         ));
         fs::create_dir_all(&dir).expect("mkdir");
         git_ok(&dir, &["init", "-b", "user-main"]);
+        // Byte-exact checkout assertions: Git for Windows' default
+        // `core.autocrlf=true` would turn `\n` into `\r\n` on checkout.
+        git_ok(&dir, &["config", "core.autocrlf", "false"]);
         git_ok(
             &dir,
             &[

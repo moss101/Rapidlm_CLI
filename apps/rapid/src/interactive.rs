@@ -2349,8 +2349,8 @@ pub(crate) fn resolve_project_root(
     let cwd = canonicalize_dir(cwd).map_err(|err| format!("{err}"))?;
     let root = detect_project_root(&cwd, cancel).map_err(|err| format!("{err}"))?;
     // The same rule the walk applied: the user config dir is not a marker.
-    let user_config_dir = existing_user_config_dir();
-    let marker = if is_project_marker(&root.join(PROJECT_MARKER), user_config_dir.as_deref()) {
+    let excluded: Vec<PathBuf> = existing_user_config_dir().into_iter().collect();
+    let marker = if is_project_marker(&root.join(PROJECT_MARKER), &excluded) {
         Some(PROJECT_MARKER)
     } else if root.join(GIT_MARKER).exists() {
         Some(GIT_MARKER)
@@ -10646,15 +10646,16 @@ pub(crate) fn detect_project_root(
     cwd: &Path,
     cancel: &CancellationToken,
 ) -> Result<PathBuf, InteractiveError> {
-    detect_project_root_excluding(cwd, existing_user_config_dir().as_deref(), cancel)
+    let excluded: Vec<PathBuf> = existing_user_config_dir().into_iter().collect();
+    detect_project_root_excluding(cwd, &excluded, cancel)
 }
 
-/// [`detect_project_root`] with the user configuration directory passed in
-/// (see [`is_project_marker`]); the process-environment lookup lives in the
-/// caller so this walk can be tested against a fixture home.
+/// [`detect_project_root`] with the user configuration directories passed
+/// in (see [`is_project_marker`]); the process-environment lookup lives in
+/// the caller so this walk can be tested against a fixture home.
 fn detect_project_root_excluding(
     cwd: &Path,
-    user_config_dir: Option<&Path>,
+    excluded: &[PathBuf],
     cancel: &CancellationToken,
 ) -> Result<PathBuf, InteractiveError> {
     let mut current = cwd.to_path_buf();
@@ -10663,7 +10664,7 @@ fn detect_project_root_excluding(
         if depth == MAX_PROJECT_WALK_DEPTH {
             return Err(InteractiveError::InvalidProjectRoot);
         }
-        if is_project_marker(&current.join(PROJECT_MARKER), user_config_dir)
+        if is_project_marker(&current.join(PROJECT_MARKER), excluded)
             || current.join(GIT_MARKER).exists()
         {
             return canonicalize_dir(&current);
@@ -10707,15 +10708,15 @@ fn existing_user_config_dir() -> Option<PathBuf> {
     protocol::host_path::canonicalize(candidate).ok()
 }
 
-fn is_project_marker(marker: &Path, user_config_dir: Option<&Path>) -> bool {
+fn is_project_marker(marker: &Path, excluded: &[PathBuf]) -> bool {
     if !marker.exists() {
         return false;
     }
-    let Some(user_config_dir) = user_config_dir else {
+    if excluded.is_empty() {
         return true;
-    };
+    }
     match protocol::host_path::canonicalize(marker) {
-        Ok(canonical) => canonical != user_config_dir,
+        Ok(canonical) => !excluded.iter().any(|dir| *dir == canonical),
         Err(_) => true,
     }
 }
@@ -14640,9 +14641,14 @@ that is no longer there"
         let scratch = home.join("scratch").join("deeper");
         fs::create_dir_all(&scratch).expect("scratch");
         let cancel = CancellationToken::new();
+        // The fixture home stands in for `~`; on a host whose temp dir lives
+        // beneath the *real* home (Windows) that real `~/.rapidlm` is above
+        // the fixture too and is excluded by the same rule.
+        let mut excluded = vec![user_config.clone()];
+        excluded.extend(existing_user_config_dir());
+        let walk = |cwd: &Path| detect_project_root_excluding(cwd, &excluded, &cancel);
 
-        let resolved =
-            detect_project_root_excluding(&scratch, Some(&user_config), &cancel).expect("root");
+        let resolved = walk(&scratch).expect("root");
         assert_eq!(resolved, scratch, "the home's .rapidlm is not a marker");
 
         // The exclusion is by identity, so a *real* project marker beneath
@@ -14651,15 +14657,9 @@ that is no longer there"
         fs::create_dir_all(project.join(PROJECT_MARKER)).expect("project marker");
         let inside = project.join("src");
         fs::create_dir_all(&inside).expect("src");
-        assert_eq!(
-            detect_project_root_excluding(&inside, Some(&user_config), &cancel).expect("root"),
-            project
-        );
+        assert_eq!(walk(&inside).expect("root"), project);
         fs::create_dir_all(home.join(GIT_MARKER)).expect("git marker");
-        assert_eq!(
-            detect_project_root_excluding(&scratch, Some(&user_config), &cancel).expect("root"),
-            home
-        );
+        assert_eq!(walk(&scratch).expect("root"), home);
     }
 
     #[test]

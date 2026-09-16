@@ -3,6 +3,7 @@
 pub mod artifact;
 pub mod config;
 pub mod error;
+pub mod host_env;
 pub mod host_path;
 pub mod id;
 pub mod remote_worker;

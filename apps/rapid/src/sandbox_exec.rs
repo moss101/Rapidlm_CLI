@@ -181,9 +181,10 @@ pub(crate) fn build_spec(
 /// run a relative/unresolved program (see its `relative_executable_is_rejected`
 /// test) — unlike `std::process::Command`, it does no implicit PATH search.
 pub(crate) fn resolve_program(root: &Path, program: &str) -> Result<String, SandboxRunError> {
-    let candidate = if program.starts_with('/') {
-        Path::new(program).to_path_buf()
-    } else if program.contains('/') {
+    let as_path = Path::new(program);
+    let candidate = if as_path.is_absolute() {
+        as_path.to_path_buf()
+    } else if program.contains(['/', '\\']) {
         root.join(program)
     } else {
         return resolve_program_on_path(program);
@@ -195,15 +196,39 @@ pub(crate) fn resolve_program(root: &Path, program: &str) -> Result<String, Sand
         .ok_or(SandboxRunError::ProgramNotFound)
 }
 
+/// The executable-name suffixes a bare program name may resolve with:
+/// none on Unix; on Windows `PATHEXT`'s (default `.EXE;.CMD;.BAT;.COM`), the
+/// way `CreateProcess` and every shell there resolve `sh` to `sh.exe`.
+fn program_suffixes() -> Vec<String> {
+    let mut suffixes = vec![String::new()];
+    if cfg!(windows) {
+        let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".into());
+        suffixes.extend(
+            pathext
+                .split(';')
+                .map(str::trim)
+                .filter(|ext| !ext.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    suffixes
+}
+
 fn resolve_program_on_path(program: &str) -> Result<String, SandboxRunError> {
     let path_var = std::env::var_os("PATH").ok_or(SandboxRunError::ProgramNotFound)?;
+    let suffixes = program_suffixes();
     for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(program);
-        if let Ok(canon) = protocol::host_path::canonicalize(&candidate)
-            && canon.is_file()
-            && let Some(s) = canon.to_str()
-        {
-            return Ok(s.to_owned());
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        for suffix in &suffixes {
+            let candidate = dir.join(format!("{program}{suffix}"));
+            if let Ok(canon) = protocol::host_path::canonicalize(&candidate)
+                && canon.is_file()
+                && let Some(s) = canon.to_str()
+            {
+                return Ok(s.to_owned());
+            }
         }
     }
     Err(SandboxRunError::ProgramNotFound)
@@ -365,6 +390,10 @@ mod tests {
         protocol::host_path::canonicalize(&root).expect("canonicalize")
     }
 
+    // Runs through the host-restricted tier, which needs POSIX governance
+    // (`ulimit`, `ps`); the Windows-side contract is
+    // `run_sandboxed_reports_the_tier_unavailable_off_unix`.
+    #[cfg(unix)]
     #[test]
     fn run_sandboxed_executes_and_captures_real_output() {
         let root = temp_root("basic");
@@ -381,6 +410,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Runs through the host-restricted tier, which needs POSIX governance
+    // (`ulimit`, `ps`); the Windows-side contract is
+    // `run_sandboxed_reports_the_tier_unavailable_off_unix`.
+    #[cfg(unix)]
     #[test]
     fn run_sandboxed_runs_with_cwd_at_the_mounted_workspace_root() {
         let root = temp_root("cwd");
@@ -396,6 +429,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Runs through the host-restricted tier, which needs POSIX governance
+    // (`ulimit`, `ps`); the Windows-side contract is
+    // `run_sandboxed_reports_the_tier_unavailable_off_unix`.
+    #[cfg(unix)]
     #[test]
     fn run_sandboxed_reports_a_nonzero_exit_without_erroring() {
         let root = temp_root("nonzero");
@@ -405,6 +442,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Runs through the host-restricted tier, which needs POSIX governance
+    // (`ulimit`, `ps`); the Windows-side contract is
+    // `run_sandboxed_reports_the_tier_unavailable_off_unix`.
+    #[cfg(unix)]
     #[test]
     fn run_sandboxed_times_out_a_long_running_command() {
         let root = temp_root("timeout");
@@ -414,6 +455,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Runs through the host-restricted tier, which needs POSIX governance
+    // (`ulimit`, `ps`); the Windows-side contract is
+    // `run_sandboxed_reports_the_tier_unavailable_off_unix`.
+    #[cfg(unix)]
     #[test]
     fn run_sandboxed_survives_a_moderately_cpu_heavy_command() {
         // Regression: SandboxSpec::builder's own generic default
@@ -443,6 +488,52 @@ mod tests {
         let output = String::from_utf8_lossy(&outcome.output);
         assert!(output.contains("done-looping"), "{output}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Off Unix the host-restricted tier reports itself unavailable, and a
+    /// sandboxed run fails closed with that typed error — after the program
+    /// itself resolved (`sh` → `sh.exe` through `PATHEXT`), so the failure
+    /// names the real reason rather than a missing program.
+    #[cfg(not(unix))]
+    #[test]
+    fn run_sandboxed_reports_the_tier_unavailable_off_unix() {
+        let root = temp_root("no-tier");
+        assert!(
+            resolve_program(&root, "sh")
+                .expect("sh resolves through PATHEXT")
+                .to_ascii_lowercase()
+                .ends_with("sh.exe")
+        );
+        let argv = vec!["sh".to_owned(), "-c".to_owned(), "true".to_owned()];
+        let err = run_sandboxed(&root, &argv, Duration::from_secs(5), 4096)
+            .expect_err("no POSIX governance here");
+        assert!(
+            matches!(
+                err,
+                SandboxRunError::Sandbox(
+                    SandboxError::TierUnavailable
+                        | SandboxError::HealthFailed
+                        | SandboxError::ResourceLimit
+                )
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn program_resolution_accepts_absolute_and_relative_paths_on_this_host() {
+        let root = temp_root("resolve");
+        let sh = test_fixtures::tool("sh");
+        let resolved = resolve_program(&root, sh.to_str().expect("utf8")).expect("absolute");
+        assert!(Path::new(&resolved).is_file());
+        assert!(matches!(
+            resolve_program(&root, "rapidlm-definitely-not-a-program"),
+            Err(SandboxRunError::ProgramNotFound)
+        ));
+        assert!(matches!(
+            resolve_program(&root, "sub/missing"),
+            Err(SandboxRunError::ProgramNotFound)
+        ));
     }
 
     #[test]

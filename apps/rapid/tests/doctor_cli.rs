@@ -604,12 +604,15 @@ fn configured_hooks_scanners_mcp_and_plugins_are_reported_without_being_executed
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     }
+    // The script path is JSON-encoded: a Windows path's backslashes are
+    // escapes to the settings parser, and a settings file that does not
+    // parse reads as "no hooks configured".
+    let script_json = serde_json::to_string(&script.display().to_string()).expect("json");
     std::fs::write(
         fixture.project.join(".rapidlm").join("settings.json"),
         format!(
-            r#"{{"hooks":{{"pre_tool_use":["{}","./definitely-absent-hook.sh"]}},
-                "mcpServers":{{"demo":{{"command":"/bin/echo","args":["hi"]}}}}}}"#,
-            script.display()
+            r#"{{"hooks":{{"pre_tool_use":[{script_json},"./definitely-absent-hook.sh"]}},
+                "mcpServers":{{"demo":{{"command":"/bin/echo","args":["hi"]}}}}}}"#
         ),
     )
     .expect("settings");

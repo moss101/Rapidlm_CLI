@@ -178,6 +178,46 @@ pub struct ClaimOutcome {
     pub citations: Vec<EvidenceLedgerRef>,
 }
 
+/// Split an operator-authorized check command into argv: whitespace
+/// separated, with double quotes grouping a token that contains spaces (a
+/// program under `C:\Program Files`, a path with a space). No shell is
+/// involved and nothing else is interpreted — no escapes, no variables, no
+/// globs. An unterminated quote is an invalid command.
+fn split_check_command(command: &str) -> Result<Vec<String>, GoalClaimError> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_token = false;
+    let mut quoted = false;
+    for ch in command.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                in_token = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if in_token {
+                    tokens.push(std::mem::take(&mut current));
+                    in_token = false;
+                }
+            }
+            c => {
+                current.push(c);
+                in_token = true;
+            }
+        }
+    }
+    if quoted {
+        return Err(GoalClaimError::InvalidCommand);
+    }
+    if in_token {
+        tokens.push(current);
+    }
+    if tokens.is_empty() {
+        return Err(GoalClaimError::InvalidCommand);
+    }
+    Ok(tokens)
+}
+
 struct CheckRun {
     passed: bool,
     timed_out: bool,
@@ -196,12 +236,12 @@ struct CheckRun {
 /// success case and get misreported as timed out even though it had already
 /// finished — a real risk for anything as ordinary as a verbose test run.
 fn run_check_command(spec: &CheckSpec, timeout: Duration) -> Result<CheckRun, GoalClaimError> {
-    let mut parts = spec.command.split_whitespace();
-    let Some(program) = parts.next() else {
+    let tokens = split_check_command(&spec.command)?;
+    let Some((program, args)) = tokens.split_first() else {
         return Err(GoalClaimError::InvalidCommand);
     };
     let mut command = Command::new(program);
-    command.args(parts);
+    command.args(args);
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -861,6 +901,17 @@ mod tests {
         host
     }
 
+    /// `echo ok` / `false` / `sleep 5` as a check command line on this host:
+    /// the fixture tool quoted (its path has a space on Windows) plus args.
+    fn tool_command(name: &str, args: &str) -> String {
+        let program = test_fixtures::tool_str(name);
+        if args.is_empty() {
+            format!("\"{program}\"")
+        } else {
+            format!("\"{program}\" {args}")
+        }
+    }
+
     fn claim(checks: Vec<(&str, &str)>) -> GoalClaim {
         let checks: Vec<CheckSpec> = checks
             .into_iter()
@@ -882,7 +933,7 @@ mod tests {
             &mut host,
             &dir.join(crate::goal_host::EVIDENCE_FILE),
             &ledger,
-            claim(vec![("c1", "/bin/echo ok")]),
+            claim(vec![("c1", tool_command("echo", "ok").as_str())]),
             &CancellationToken::new(),
         )
         .expect("claim runs");
@@ -913,7 +964,7 @@ mod tests {
             &mut host,
             &dir.join(crate::goal_host::EVIDENCE_FILE),
             &ledger,
-            claim(vec![("c1", "/usr/bin/false")]),
+            claim(vec![("c1", tool_command("false", "").as_str())]),
             &CancellationToken::new(),
         )
         .expect("claim runs");
@@ -938,7 +989,7 @@ mod tests {
             &mut host,
             &dir.join(crate::goal_host::EVIDENCE_FILE),
             &ledger,
-            claim(vec![("c1", "/bin/echo ok")]),
+            claim(vec![("c1", tool_command("echo", "ok").as_str())]),
             &CancellationToken::new(),
         )
         .expect("claim runs");
@@ -963,7 +1014,7 @@ mod tests {
             "host claim",
             vec![CheckSpec {
                 requirement_id: "c1".into(),
-                command: "/bin/sleep 5".into(),
+                command: tool_command("sleep", "5"),
             }],
             1,
         )
@@ -993,7 +1044,7 @@ mod tests {
             &mut host,
             &ledger_dir.join(crate::goal_host::EVIDENCE_FILE),
             &ledger,
-            claim(vec![("nope", "/bin/echo ok")]),
+            claim(vec![("nope", tool_command("echo", "ok").as_str())]),
             &CancellationToken::new(),
         )
         .expect_err("unknown requirement");
@@ -1040,6 +1091,34 @@ mod tests {
             requirement_id: requirement_id.to_owned(),
             command: command.to_owned(),
         }
+    }
+
+    #[test]
+    fn check_commands_split_on_whitespace_with_double_quoted_groups() {
+        assert_eq!(
+            split_check_command("cargo test --lib").expect("plain"),
+            ["cargo", "test", "--lib"]
+        );
+        assert_eq!(
+            split_check_command(r#""C:/Program Files/Git/usr/bin/echo.exe" ok"#).expect("quoted"),
+            ["C:/Program Files/Git/usr/bin/echo.exe", "ok"]
+        );
+        assert_eq!(
+            split_check_command(r#"tool "two words" x"#).expect("mid"),
+            ["tool", "two words", "x"]
+        );
+        assert_eq!(
+            split_check_command(r#"a "" b"#).expect("empty"),
+            ["a", "", "b"]
+        );
+        assert!(matches!(
+            split_check_command(r#"tool "unterminated"#),
+            Err(GoalClaimError::InvalidCommand)
+        ));
+        assert!(matches!(
+            split_check_command("   "),
+            Err(GoalClaimError::InvalidCommand)
+        ));
     }
 
     /// dd's output (200 KiB) comfortably exceeds every common OS pipe buffer

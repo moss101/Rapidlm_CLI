@@ -509,6 +509,9 @@ mod tests {
         assert!(git(&["init", "-q"]).status.success());
         git(&["config", "user.email", "test@rapidlm.dev"]);
         git(&["config", "user.name", "RapidLM Test"]);
+        // Byte-exact content assertions below: Git for Windows defaults to
+        // `core.autocrlf=true`, which would check `\n` out as `\r\n`.
+        git(&["config", "core.autocrlf", "false"]);
         std::fs::write(root.join("base.txt"), "base content\n").unwrap();
         assert!(git(&["add", "-A"]).status.success());
         assert!(git(&["commit", "-q", "-m", "base"]).status.success());

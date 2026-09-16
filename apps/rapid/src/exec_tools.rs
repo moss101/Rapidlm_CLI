@@ -229,6 +229,13 @@ struct JobShared {
     /// model polls with — see `JobRegistry::start`.
     ledger_id: protocol::JobId,
     cancelled: Arc<AtomicBool>,
+    /// Set by [`stop_if_running`] once it has actually sent the kill to a
+    /// child that was still running. `cancelled` alone says a stop was
+    /// *requested*; this says the stop is what ended the child — which is
+    /// the fact the supervisor needs, because on Windows a killed process
+    /// carries an ordinary exit code (`TerminateProcess` sets 1) and cannot
+    /// be told from a real exit by the status alone.
+    killed: Arc<AtomicBool>,
     output: Arc<Mutex<Vec<u8>>>,
     overflow: Arc<AtomicBool>,
     state: Arc<Mutex<JobState>>,
@@ -664,6 +671,7 @@ impl JobRegistry {
         let shared = JobShared {
             ledger_id,
             cancelled: Arc::new(AtomicBool::new(false)),
+            killed: Arc::new(AtomicBool::new(false)),
             output: Arc::new(Mutex::new(Vec::new())),
             overflow: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(JobState::Running)),
@@ -728,6 +736,33 @@ impl JobRegistry {
         Some((text, truncated))
     }
 
+    /// The OS pid of the job's child, while it is alive. Test-only: what a
+    /// process-liveness probe needs to prove a job really was stopped,
+    /// without asking the shell for `$$` (not a Windows pid under MSYS).
+    #[cfg(test)]
+    pub(crate) fn child_pid(&self, handle: &str) -> Option<u32> {
+        let jobs = self.table.jobs.lock().ok()?;
+        let job = jobs.get(handle)?;
+        let child = job.child.lock().ok()?;
+        child.as_ref().map(std::process::Child::id)
+    }
+
+    /// The spooled output of the job `handle`, for a test's failure message.
+    #[cfg(test)]
+    pub(crate) fn spooled_output(&self, handle: &str) -> String {
+        let Ok(jobs) = self.table.jobs.lock() else {
+            return String::new();
+        };
+        jobs.get(handle)
+            .and_then(|job| {
+                job.output
+                    .lock()
+                    .ok()
+                    .map(|buf| String::from_utf8_lossy(&buf).into_owned())
+            })
+            .unwrap_or_default()
+    }
+
     /// Adopt `session`'s job table, so jobs started by this turn live in —
     /// and outlive it in — the session's own table.
     ///
@@ -772,6 +807,7 @@ impl JobRegistry {
         let shared = JobShared {
             ledger_id,
             cancelled: Arc::new(AtomicBool::new(false)),
+            killed: Arc::new(AtomicBool::new(false)),
             output: Arc::new(Mutex::new(Vec::new())),
             overflow: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(JobState::Running)),
@@ -790,14 +826,7 @@ impl JobRegistry {
         let program = argv[0].clone();
         let rest: Vec<String> = argv[1..].to_vec();
         let dir = cwd.to_path_buf();
-        let env_pairs: Vec<(String, String)> = ["PATH", "HOME", "LANG", "TMPDIR"]
-            .iter()
-            .filter_map(|key| {
-                std::env::var(key)
-                    .ok()
-                    .map(|value| ((*key).to_owned(), value))
-            })
-            .collect();
+        let env_pairs: Vec<(String, String)> = child_base_env();
         let worker = shared.clone();
         let spawned = std::thread::Builder::new()
             .name("rapidlm-job".to_owned())
@@ -819,14 +848,22 @@ impl JobRegistry {
                         for (key, value) in &env_pairs {
                             let _ = command.env(key, value);
                         }
-                        command.spawn().ok()
+                        Some(command.spawn())
                     })
                 };
                 let mut child = match spawned_child {
-                    Some(child) => child,
-                    None => {
+                    Some(Ok(child)) => child,
+                    other => {
+                        // The OS reason travels with the failure: "spawn
+                        // failed" alone left a model (and a CI log) guessing
+                        // between a missing program, a permission problem
+                        // and a broken environment.
+                        let reason = match other {
+                            Some(Err(err)) => format!("spawn failed: {err}"),
+                            _ => "spawn failed: job table unavailable".to_owned(),
+                        };
                         if let Ok(mut state) = worker.state.lock() {
-                            *state = JobState::Failed("spawn failed".to_owned());
+                            *state = JobState::Failed(reason);
                         }
                         if let Some(events) = finish.as_ref() {
                             events.finished(ledger_id, "failed", None);
@@ -907,13 +944,18 @@ impl JobRegistry {
                         // and the panel showed the same way.
                         //
                         // The distinguishing fact is *how* it ended, not
-                        // merely that `cancelled` is set: a child that
-                        // exited on its own carries a real exit code, while
-                        // one we killed was signalled and carries none. So a
-                        // fast command that finished a moment before
-                        // teardown keeps its true result, and only a job
-                        // actually stopped mid-run is reported as cancelled.
-                        if status.code().is_none() && worker.cancelled.load(Ordering::SeqCst) {
+                        // merely that `cancelled` is set: `stop_if_running`
+                        // records `killed` only when its kill reached a
+                        // child that was still running. So a fast command
+                        // that finished a moment before teardown keeps its
+                        // true result, and only a job actually stopped
+                        // mid-run is reported as cancelled. (A signalled
+                        // Unix child carries no exit code; a terminated
+                        // Windows child carries `1` — which is why the
+                        // status alone was never enough to tell.)
+                        let killed_by_us = worker.killed.load(Ordering::SeqCst)
+                            || (status.code().is_none() && worker.cancelled.load(Ordering::SeqCst));
+                        if killed_by_us {
                             if let Ok(mut state) = worker.state.lock() {
                                 *state = JobState::Failed("cancelled".to_owned());
                             }
@@ -1029,6 +1071,7 @@ impl JobRegistry {
         let shared = JobShared {
             ledger_id,
             cancelled: Arc::new(AtomicBool::new(false)),
+            killed: Arc::new(AtomicBool::new(false)),
             output: Arc::new(Mutex::new(Vec::new())),
             overflow: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(JobState::Running)),
@@ -1268,7 +1311,11 @@ fn stop_if_running(job: &JobShared) -> bool {
     if let Ok(mut child) = job.child.try_lock()
         && let Some(child) = child.as_mut()
     {
-        let _ = child.kill();
+        // Only a child that is still running when the kill lands was
+        // stopped by us; one that had already exited keeps its own result.
+        if matches!(child.try_wait(), Ok(None)) && child.kill().is_ok() {
+            job.killed.store(true, Ordering::SeqCst);
+        }
     }
     true
 }
@@ -3136,10 +3183,8 @@ read with job_output, in this turn or a later one — the job is stopped when th
             .args(&args.argv[1..])
             .current_dir(self.root())
             .env_clear();
-        for key in ["PATH", "HOME", "LANG", "TMPDIR"] {
-            if let Ok(value) = std::env::var(key) {
-                let _ = command.env(key, value);
-            }
+        for (key, value) in child_base_env() {
+            let _ = command.env(key, value);
         }
         command
             .stdin(std::process::Stdio::null())
@@ -5793,6 +5838,26 @@ impl std::fmt::Display for McpConnectError {
 /// process's whole environment (API keys for the model provider included).
 const MCP_INHERITED_ENV: [&str; 4] = ["PATH", "HOME", "LANG", "TMPDIR"];
 
+/// The environment a tool-spawned child starts with after `env_clear()`:
+/// the four variables a program needs to find other programs, a home, a
+/// locale and a temp directory, plus — on Windows only — the variables the
+/// OS loader, `cmd.exe` and the MSYS runtime need to start at all
+/// (`SystemRoot`, `COMSPEC`, `PATHEXT`, `TEMP`/`TMP`, …; see
+/// `protocol::host_env`). None of them carries a secret; everything else in
+/// the ambient environment stays out.
+fn child_base_env() -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = ["PATH", "HOME", "LANG", "TMPDIR"]
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| ((*key).to_owned(), value))
+        })
+        .collect();
+    pairs.extend(protocol::host_env::platform_base_env());
+    pairs
+}
+
 /// Bring one configured MCP server up: spawn it with the bounded
 /// environment, run the `initialize` handshake, and list its tools.
 ///
@@ -5821,6 +5886,9 @@ pub(crate) fn connect_mcp_server(
         if let Ok(value) = std::env::var(key) {
             let _ = command.env(key, value);
         }
+    }
+    for (key, value) in protocol::host_env::platform_base_env() {
+        let _ = command.env(key, value);
     }
     // Configured env last, so a server may deliberately override an
     // inherited variable (e.g. a scoped HOME) rather than being unable to.
@@ -8661,6 +8729,7 @@ mod tests {
             );
         };
         run(&["init", "-b", "main"]);
+        run(&["config", "core.autocrlf", "false"]);
         fs::write(dir.join("seed.txt"), b"seed\n").expect("seed");
         run(&["add", "seed.txt"]);
         run(&[
@@ -12272,13 +12341,12 @@ mod tests {
 
         // A long job is observable as running, then actually killed when
         // the real registry holding it drops (not a decoy instance).
-        let pid_path = root.0.join("long.pid");
         let call = make_call(
             "c2",
             SHELL_EXEC_TOOL,
             &format!(
-                r#"{{"argv":["sh","-c","echo $$ > {} && sleep 30"],"background":true}}"#,
-                test_fixtures::sh_quote(&pid_path)
+                r#"{{"argv":["{}","30"],"background":true}}"#,
+                test_fixtures::tool_str("sleep")
             ),
         );
         let validated = tools.validate(&call, &cancel).expect("validate");
@@ -12313,21 +12381,21 @@ mod tests {
             other => panic!("expected unknown-job failure, got {other:?}"),
         }
 
-        fn alive(pid: i32) -> bool {
-            u32::try_from(pid).is_ok_and(test_fixtures::process_alive)
-        }
+        let alive = test_fixtures::process_alive;
         let mut pid = None;
         for _ in 0..100 {
-            if let Ok(contents) = fs::read_to_string(&pid_path)
-                && let Ok(parsed) = contents.trim().parse::<i32>()
-            {
-                pid = Some(parsed);
+            if let Some(found) = tools.jobs.child_pid(&long_id) {
+                pid = Some(found);
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let pid = pid.expect("long job wrote its pid");
-        assert!(alive(pid), "long job must still be running before drop");
+        let pid = pid.expect("long job has a live child");
+        assert!(
+            alive(pid),
+            "long job must still be running before drop; output so far: {:?}",
+            tools.jobs.spooled_output(&long_id)
+        );
 
         // Shutdown path: dropping the real WorkspaceTools (and the
         // JobRegistry it owns) must kill the still-running child, not just

@@ -390,9 +390,15 @@ fn t009_required_stronger_tier_does_not_downgrade() {
     let host_health = HostRestrictedBackend::new()
         .health(&live)
         .expect("host health");
-    assert!(
+    // On a POSIX host the weaker tier is live, so a downgrade would be
+    // tempting and the loop below proves it never happens. Where the host
+    // tier itself is unavailable (Windows: no `ulimit`/`ps` governance)
+    // there is nothing to downgrade to, and the same loop proves the
+    // required tier fails closed rather than falling anywhere.
+    assert_eq!(
         host_health.is_available(),
-        "host-restricted must stay available so a downgrade would be tempting"
+        cfg!(unix),
+        "host-restricted availability follows the host's POSIX governance"
     );
 
     for required in [SandboxTier::Container, SandboxTier::Gvisor] {

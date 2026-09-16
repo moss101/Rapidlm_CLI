@@ -1479,9 +1479,18 @@ capability = "net.connect"
         let keychain = UnimplementedPlatformKeychain::new();
         let request = healthy_request(&keychain, SandboxObservation::Manager(&manager));
         let report = evaluate_doctor(&request, &CancellationToken::new()).expect("run");
+        // A live host-restricted tier is weak isolation (Warn). Where the
+        // host has no POSIX governance for it (Windows) the tier reports
+        // itself unavailable, and the doctor says so rather than warning
+        // about a tier that cannot run.
+        let expected = if cfg!(unix) {
+            DoctorStatus::Warn
+        } else {
+            DoctorStatus::Unavailable
+        };
         assert_eq!(
             status_of(&report, DoctorCheckId::SandboxAvailability),
-            DoctorStatus::Warn
+            expected
         );
     }
 

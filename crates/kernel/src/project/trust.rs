@@ -757,11 +757,13 @@ mod tests {
     /// and rightly rejected by `CanonicalRoot::parse`). Nothing is created
     /// on disk; these are identity strings only.
     fn tmp_root(name: &str) -> String {
-        if cfg!(windows) {
+        let root = if cfg!(windows) {
             format!("C:\\tmp\\{}", name.replace('/', "\\"))
         } else {
             format!("/tmp/{name}")
-        }
+        };
+        // `tmp_root("")` is the parent itself, without a trailing separator.
+        root.trim_end_matches(['/', '\\']).to_owned()
     }
 
     fn json_string(text: &str) -> String {
@@ -956,7 +958,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .get(&identity("/tmp", Some(FP_A)), &live())
+                .get(&identity(&tmp_root(""), Some(FP_A)), &live())
                 .expect("parent"),
             TrustStatus::Untrusted
         );

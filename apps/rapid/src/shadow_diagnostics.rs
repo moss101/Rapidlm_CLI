@@ -342,6 +342,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         git(&dir, &["init", "-b", "main"]);
+        git(&dir, &["config", "core.autocrlf", "false"]);
         std::fs::write(dir.join("seed.txt"), b"seed\n").expect("seed");
         git(&dir, &["add", "seed.txt"]);
         git(
