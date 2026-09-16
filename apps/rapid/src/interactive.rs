@@ -10716,7 +10716,7 @@ fn is_project_marker(marker: &Path, excluded: &[PathBuf]) -> bool {
         return true;
     }
     match protocol::host_path::canonicalize(marker) {
-        Ok(canonical) => !excluded.iter().any(|dir| *dir == canonical),
+        Ok(canonical) => !excluded.contains(&canonical),
         Err(_) => true,
     }
 }

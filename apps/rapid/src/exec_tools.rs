@@ -836,7 +836,7 @@ impl JobRegistry {
                 // before the loop re-locks to publish the child).
                 let spawned_child = {
                     let mut slot = worker.child.lock().ok();
-                    slot.as_mut().and_then(|_slot| {
+                    slot.as_mut().map(|_slot| {
                         let mut command = std::process::Command::new(&program);
                         command
                             .args(&rest)
@@ -848,7 +848,7 @@ impl JobRegistry {
                         for (key, value) in &env_pairs {
                             let _ = command.env(key, value);
                         }
-                        Some(command.spawn())
+                        command.spawn()
                     })
                 };
                 let mut child = match spawned_child {
