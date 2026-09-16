@@ -731,7 +731,7 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
     Subcommand {
         name: "browser",
         operands: "<url> [--step <spec>]... [--screenshot] [--json] [--root <dir>]",
-        summary: "drive a real headless Chromium through observe/act/verify",
+        summary: "drive a real headless Chromium",
         own_help: true,
         handler: SubcommandHandler::P9(crate::browser_cli::run_browser),
     },

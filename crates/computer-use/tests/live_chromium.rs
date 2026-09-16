@@ -383,13 +383,16 @@ fn a_real_chromium_is_observed_driven_and_verified_end_to_end() {
     .expect("scroll");
     assert_eq!(scrolled.status(), ActionStatus::Executed);
 
-    // A screenshot is a bounded PNG artifact, not bytes in the model view.
+    // A screenshot is a bounded artifact, not bytes in the model view — and
+    // with a password field on this page it is the redacted marker, never
+    // the pixels (T-CU-03).
     let shot = actor
         .observer()
         .observe_with(&session, ObserveRequest::new().with_screenshot(true))
         .expect("observe with screenshot");
     let meta = shot.screenshot().expect("screenshot metadata");
     assert!(meta.width() > 0 && meta.height() > 0);
+    assert!(meta.masked(), "a page with a password field is masked");
     let bytes = env
         .artifacts
         .get(
@@ -397,7 +400,10 @@ fn a_real_chromium_is_observed_driven_and_verified_end_to_end() {
             &event_ledger::artifact_store::CancellationToken::new(),
         )
         .expect("screenshot artifact");
-    assert!(bytes.starts_with(b"\x89PNG"), "a real PNG was persisted");
+    assert!(
+        !bytes.starts_with(b"\x89PNG"),
+        "the pixels of a sensitive page must not be persisted"
+    );
 
     // Link navigation through a click changes the document; stale
     // observations are refused afterwards.
@@ -424,6 +430,22 @@ fn a_real_chromium_is_observed_driven_and_verified_end_to_end() {
     )
     .expect("verify second");
     assert_eq!(second.status(), VerificationStatus::Passed);
+    // No sensitive field here: the screenshot is the real PNG.
+    let shot = actor
+        .observer()
+        .observe_with(&session, ObserveRequest::new().with_screenshot(true))
+        .expect("observe second page with screenshot");
+    let meta = shot.screenshot().expect("screenshot metadata");
+    assert!(!meta.masked());
+    assert_eq!((meta.width(), meta.height()), (1280, 720));
+    let bytes = env
+        .artifacts
+        .get(
+            &meta.artifact().id,
+            &event_ledger::artifact_store::CancellationToken::new(),
+        )
+        .expect("screenshot artifact");
+    assert!(bytes.starts_with(b"\x89PNG"), "a real PNG was persisted");
     let stale = act(
         &session,
         first.id(),
