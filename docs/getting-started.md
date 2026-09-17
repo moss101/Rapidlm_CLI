@@ -146,6 +146,26 @@ degrading: on a platform that cannot confine, the call is refused with the
 reason rather than running unprotected. `rapid doctor` probes the same
 backends and reports which tiers are available on this machine.
 
+## A real browser, one command
+
+`rapid browser <url>` launches the Chromium-family browser already on your machine (Google
+Chrome, Chromium or Microsoft Edge; `RAPIDLM_BROWSER_PATH` overrides discovery) headless, opens
+an isolated context, navigates, runs `--step` actions through the same observe/act/verify path
+the agent runtime uses, and prints what the page looks like to the model — URL, title and the
+semantic targets (locators only; field values are never read). Screenshots and the session
+trace are stored as artifacts under `.rapidlm/browser/`.
+
+```sh
+rapid browser https://example.test/ \
+  --step 'type:email=me@example.test' \
+  --step 'click:sign-in' \
+  --step 'expect-url:https://example.test/home' \
+  --screenshot
+```
+
+`rapid browser --help` lists every step kind. Only Chromium engines are live; a page with a
+password field gets a redacted screenshot, not pixels.
+
 ## Where to next
 
 - [`docs/reference/cli-command-reference.md`](reference/cli-command-reference.md) —
