@@ -357,11 +357,13 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         // The hook line is handed to `sh -c` on Unix and `cmd /C` on
-        // Windows. Double quotes are the one quoting both understand (a
-        // profile such as `C:\Users\John Smith` puts a space in the temp
-        // path); forward slashes so `sh` on Windows does not read the
-        // backslashes as escapes.
-        format!("sh \"{}\"", test_fixtures::slash_path(&path))
+        // Windows. Unquoted: `cmd /C` re-escapes double quotes on their
+        // way into `sh` (Windows CI, 2026-09-17: `sh: \C:/…/ok.sh": No such
+        // file`), and the CI temp path has no spaces. Forward slashes so
+        // `sh` on Windows does not read the backslashes as escapes. A
+        // profile with a space in its temp path is a known limitation of
+        // these fixtures, not of hooks (a user's hook line is their own).
+        format!("sh {}", test_fixtures::slash_path(&path))
     }
 
     #[test]

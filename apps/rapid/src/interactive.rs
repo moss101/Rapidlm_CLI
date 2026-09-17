@@ -11872,7 +11872,7 @@ approval gap has been closed and this characterization test should be rewritten:
             std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod");
         }
-        let hook = format!("sh \"{}\"", test_fixtures::slash_path(&script_path));
+        let hook = format!("sh {}", test_fixtures::slash_path(&script_path));
 
         // Simulate an early-return exit path: the guard is constructed,
         // configured, and then the enclosing scope ends (an early `return`

@@ -23,8 +23,15 @@ use crate::migrations::{MigrationError, MigrationRunner};
 /// Maximum UTF-8 bytes accepted in a serialized event payload.
 pub const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
 
-/// Bounded SQLite lock wait. Matches the ledger busy-timeout recovery rule.
-const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
+/// Bounded SQLite lock wait. Writers serialise through IMMEDIATE
+/// transactions with `synchronous=FULL`, so under contention an append
+/// waits for every earlier writer's fsync; on a slow disk sixteen
+/// concurrent writers exceeded five seconds (Windows CI, 2026-09-17,
+/// `concurrent_append_produces_gap_free_unique_seqs`: "database is
+/// locked"). An event ledger prefers a long wait to a lost append; thirty
+/// seconds is still bounded, and a lock held that long is a stuck writer,
+/// not contention.
+const BUSY_TIMEOUT: Duration = Duration::from_millis(30_000);
 
 /// File-backed event ledger. Connections are opened per operation so writers
 /// serialize through SQLite IMMEDIATE transactions rather than a process lock.
