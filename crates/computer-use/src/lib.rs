@@ -37,6 +37,7 @@ pub mod desktop {
 
 pub mod browser {
     pub mod action;
+    pub mod cdp;
     pub mod fence;
     pub mod observe;
     pub mod policy;
@@ -45,12 +46,14 @@ pub mod browser {
     pub mod takeover;
     pub mod trace;
     pub mod verify;
+    pub mod ws;
     pub use action::{
         ActRequest, ActionError, ActionKind, ActionReceipt, ActionReceiptId, ActionStatus,
         BrowserActor, DEFAULT_ACT_TIMEOUT, FakePageActor, KeyCode, MAX_ACT_TIMEOUT,
         MAX_CLICK_COUNT, MAX_SCROLL_ABS, MAX_STABLE_REF_BYTES, MAX_TYPE_BYTES, MouseButton,
         PageActor, ResolvedTarget, SecretAwareString, TargetSelector, UiAction, act,
     };
+    pub use cdp::{BROWSER_PATH_ENV, BrowserDiscoveryError, ChromiumCdpBackend, ChromiumLaunch};
     pub use fence::{FenceError, FencedContent, SurfaceSource, TrustClass};
     pub use observe::{
         AccessibilitySnapshotRef, BrowserObserver, DomSnapshotRef, FakePage, MAX_NAME_BYTES,

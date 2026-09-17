@@ -5,6 +5,7 @@
 pub mod acp_serve;
 pub mod agent_views;
 pub mod approvals;
+pub mod browser_cli;
 pub mod command_help;
 pub mod computer_runtime;
 pub mod context_retrieval;

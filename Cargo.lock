@@ -248,6 +248,7 @@ dependencies = [
  "capability-broker",
  "event-ledger",
  "protocol",
+ "serde_json",
 ]
 
 [[package]]

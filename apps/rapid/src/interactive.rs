@@ -729,6 +729,13 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         handler: SubcommandHandler::P9(crate::p9_commands::run_scan),
     },
     Subcommand {
+        name: "browser",
+        operands: "<url> [--step <spec>]... [--screenshot] [--json] [--root <dir>]",
+        summary: "drive a real headless Chromium",
+        own_help: true,
+        handler: SubcommandHandler::P9(crate::browser_cli::run_browser),
+    },
+    Subcommand {
         name: "findings",
         operands: "list|dismiss",
         summary: "persisted scanner findings",
