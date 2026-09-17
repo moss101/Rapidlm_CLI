@@ -3190,7 +3190,18 @@ read with job_output, in this turn or a later one — the job is stopped when th
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let mut child = command.spawn().map_err(|_| ToolStepError::Failed)?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                // The OS reason, as the background-job path already reports
+                // it: a model told only "failed" retries blindly.
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&format!("spawn failed: {err}"))),
+                });
+            }
+        };
         // Drain stdout/stderr on background threads concurrently with the
         // wait loop below, mirroring `JobRegistry::start`'s own pattern —
         // polling `try_wait()` without ever reading the pipes deadlocks the

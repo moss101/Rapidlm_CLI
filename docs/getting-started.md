@@ -33,8 +33,10 @@ runtime and nothing is written outside the directories named below.
 
 **Windows.** The archive is a real build of the same code, and CI's Windows job runs the full
 test suite on every push as a gate (since 2026-09-17), the same as macOS and Linux. What differs
-there is stated rather than emulated: hooks run under `cmd /C` instead of `sh -c`; background jobs
-and cancellations are stopped as process trees through `taskkill`; the PTY session and the
+there is stated rather than emulated: hooks run under `cmd /C` instead of `sh -c`; a cancelled
+`shell_exec` background job is terminated as a process, not a tree (a `cmd /C build.bat` job's own
+children can outlive it), while supervised children — external agents, evaluation runs and the
+sandbox backends — are stopped as trees through `taskkill`; the PTY session and the
 host-restricted sandbox tier need POSIX tools (`script(1)`, `ulimit`, `ps`) and report themselves
 unavailable, so `shell_exec` with `sandbox: true` and configured external scanners fail closed
 rather than run unconfined; and the daemon and its socket are Unix-only. Git for Windows is

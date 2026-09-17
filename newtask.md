@@ -8432,6 +8432,92 @@ Gatekeeper assessment of every freshly built dylib from three concurrent cargo w
 plausible cause and is a system setting, so the owner's; `fmt --check` is clean and the CI run on
 `a151550` is the evidence, recorded in the boundary below once it lands.
 
+## Session boundary, 2026-09-17 — Windows as a real gate, a live browser driver, GVS5H Phase 0
+
+The `/goal` for this session had three parts. What landed, with the commit for each:
+
+**1. Windows runtime tests pass for real; the Windows Test step is a gate.** The "45 failures"
+the recheck document reported came from a truncated log download; the full log for `22bdc48`
+had **175** failing tests across 13 binaries. Six commits on `main` (`aa6efda`, `e3eef31`,
+`8682059`, `77e279f`, `21b90b7`, `0f38049`, plus `e2ae513`) took that to zero and removed the
+`continue-on-error` from `.github/workflows/ci.yml`; `docs/getting-started.md` now says what
+Windows is. The root causes, in the order they explained the most failures:
+
+- `std::fs::canonicalize` on Windows returns verbatim `\\?\C:\…` paths, and every host-path
+  validator, confinement check, git argv and `core.hooksPath` in the workspace rejected or
+  mismatched them. `protocol::host_path::canonicalize` returns the plain form and replaced all
+  112 call sites; `CanonicalHostPath::from_resolved` accepts the verbatim-drive form (UNC and
+  device forms still fail closed; `resolved_verbatim_drive_path_is_the_plain_drive_identity`).
+- **A product bug on every platform, found only because Windows temp lives under the home:**
+  project-root detection (`detect_project_root`) treated the user's own `~/.rapidlm` as a
+  project marker, so any unmarked directory beneath `$HOME` (`~/scratch`; every Windows temp
+  dir) resolved its project root to the home and wrote `goal.json`, the session ledger and
+  trust records into the user config directory. `is_project_marker` excludes the user config
+  dir by canonical identity (`the_user_config_dir_is_not_a_project_marker`); `resolve_project_root`
+  applies the same rule when naming the marker. Behaviour change on Unix too: a `~/scratch`
+  session used to land in `~/.rapidlm` and now lands in `~/scratch/.rapidlm`; records written
+  under the home by the old rule are not migrated (they were misplaced, and guessing which
+  belonged where is worse than leaving them).
+- Cancelled background jobs were reported "completed exit 1" on Windows: the supervisor told a
+  kill from an exit by the absence of an exit code — a Unix fact; `TerminateProcess` hands
+  back `1`. `JobShared.killed` is set only when `stop_if_running`'s kill reached a running
+  child, and that classifies the end.
+- Children spawned after `env_clear()` got only PATH/HOME/LANG/TMPDIR; on Windows the loader,
+  `cmd.exe`, `taskkill` and the MSYS runtime also need `SystemRoot`/`COMSPEC`/`PATHEXT`/`TEMP`…
+  — `protocol::host_env::WINDOWS_BASE_ENV`, forwarded once from every tool/job/hook/MCP spawn,
+  and `SystemRoot` for `taskkill` (without it no process tree was ever killed on Windows).
+- `repo_glob`/`repo_grep` rendered `src\c.rs` so `*` crossed directories; `rapid update`
+  replaced the extension when naming the staged binary (`rapid.exe` → `rapid.update-new`);
+  goal-claim check commands could not name a program under `C:\Program Files`
+  (`split_check_command`, double-quoted groups, no shell); `sandbox_exec::resolve_program`
+  treated only `/`-rooted paths as absolute and never tried `sh.exe`; headless TUI runs probed
+  the CI agent's console size and painted one blank row; simctl host paths rejected every drive
+  prefix; `existing_user_config_dir` read `std::env::vars()` (panics on a non-UTF-8 entry).
+- The POSIX-only tiers are typed, not emulated: `PtyError::Unsupported` off Unix,
+  `HostRestrictedBackend::health` unavailable on evidence (no `/bin/sh`, no `ps`/`pgrep`),
+  the commit-scanner gate and `rapid scan` fail closed there — each with a `cfg(not(unix))`
+  contract test beside the `cfg(unix)` behaviour tests.
+- Tests: the new `crates/test-fixtures` crate resolves `sh`/`echo`/`sleep`/`cat`/`dd`/… per host
+  (Git for Windows' `usr/bin` on Windows; `find_on_path` with PATHEXT; `process_alive` and
+  `processes_mentioning` probes on both families; `sh_quote`/`slash_path` for script bodies);
+  git fixtures set `core.autocrlf=false`; paths go into JSON through a JSON encoder; the kernel
+  trust suite uses host-valid roots; the MCP and hook ambient-env tests carry a `CARGO_*`
+  canary so they cannot pass by allowlisting alone.
+
+**Verification.** No revert cycles this time: this machine could not compile for most of the
+session (see the machine note in the 2026-09-10 boundary — `rustc` in state `U` for over an
+hour, `syspolicyd` hot), so CI was the loop: seven Windows runs, 175 → 45 (lint) → 21 → 2 →
+1 (a load-sensitive `context_retrieval` first-index race, widened to three attempts) → 0.
+Linux and macOS stayed green on every push except one clippy pair (`21b90b7`). Two background
+adversarial self-reviews ran (one on `aa6efda`, one on the follow-ups); the first found seven
+real items, all fixed in `e3eef31` — the one that mattered most was that `sh -c 'sleep 30 #
+marker'` execs the sleep in place of the shell on macOS/dash, so a liveness probe marker
+vanished from the process table.
+
+**2. Live browser driver** (PR #1, branch `live-browser-driver`, `9af8a44` + `4474298`; merged
+to `main` once CI on all three runners is green): `computer_use::browser::cdp::ChromiumCdpBackend`
+is the first real implementation of the `PlaywrightBackend`/`PageCapture`/`PageActor` seams —
+headless Chrome/Chromium/Edge over the DevTools Protocol through a dependency-free loopback
+WebSocket client (`browser::ws`). Real input events, navigation with load wait, isolated
+contexts, cookies, localStorage, PNG screenshots, the existing trace format; field values never
+read, secret handles refused, non-Chromium engines a typed `Unavailable`. `rapid browser <url>
+--step …` is the one-shot user surface. `crates/computer-use/tests/live_chromium.rs` drives a
+real Chrome end to end on every CI runner; its first CI run reached the screenshot assertion
+with every action and verification holding, and the assertion was the bug (a page with a
+password field persists the redacted marker, not pixels).
+
+**3. GVS5H Phase 0** (`7aeb2bb`): GVS-001..003 delivered as research before any orchestration
+code — `docs/goals/gvs5h-phase0-baseline-2026-09-17.md` (every research lead rechecked against
+source, three new findings: `GraphService`/`GraphBackedRun` and `TransactionManager` have no
+production caller; the V3 manifest marks graph persistence/resume satisfied although the graph
+cannot be rebuilt from its events), ADR 0021 (extend, wire, no second engine; record ownership;
+normative publication ordering), and the experiment preregistration (frozen gates, grader v2,
+splits, arms A–F, statistics). Phase 1 reordered: production caller first.
+
+**Still not delivered (by design, unchanged):** durable child-session continuation, tool
+auto-repair production wiring, smart phase routing. **Not attempted:** the GVS5H Phase 1
+implementation (GVS-004..008); the ADR is the plan for it.
+
 ## Session boundary, 2026-09-10 — durable state for the next session
 
 Seventy-three commits across five days, `dbeb2c2`..HEAD, all pushed to `origin/main`. Baseline before

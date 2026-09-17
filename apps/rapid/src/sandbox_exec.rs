@@ -526,6 +526,11 @@ mod tests {
         let sh = test_fixtures::tool("sh");
         let resolved = resolve_program(&root, sh.to_str().expect("utf8")).expect("absolute");
         assert!(Path::new(&resolved).is_file());
+        // A path with a separator resolves beneath the workspace root.
+        std::fs::create_dir_all(root.join("tools")).expect("tools dir");
+        std::fs::copy(&sh, root.join("tools").join("copied")).expect("copy");
+        let relative = resolve_program(&root, "tools/copied").expect("relative");
+        assert!(Path::new(&relative).starts_with(&root), "{relative}");
         assert!(matches!(
             resolve_program(&root, "rapidlm-definitely-not-a-program"),
             Err(SandboxRunError::ProgramNotFound)

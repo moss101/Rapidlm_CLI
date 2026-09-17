@@ -357,11 +357,11 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         // The hook line is handed to `sh -c` on Unix and `cmd /C` on
-        // Windows; neither needs quoting for a temp-dir path (no spaces),
-        // and `cmd` would not understand POSIX quotes anyway. Forward
-        // slashes so `sh` on Windows does not read the backslashes as
-        // escapes.
-        format!("sh {}", test_fixtures::slash_path(&path))
+        // Windows. Double quotes are the one quoting both understand (a
+        // profile such as `C:\Users\John Smith` puts a space in the temp
+        // path); forward slashes so `sh` on Windows does not read the
+        // backslashes as escapes.
+        format!("sh \"{}\"", test_fixtures::slash_path(&path))
     }
 
     #[test]
