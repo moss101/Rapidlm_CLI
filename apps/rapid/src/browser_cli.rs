@@ -290,7 +290,6 @@ fn drive_session(
     out: &mut String,
 ) -> Result<bool, String> {
     let mut all_held = true;
-    let mut lease = lease_for_url(&args.url)?;
     let blank = observe(session, actor.observer()).map_err(|err| format!("observe: {err}"))?;
     // The receipt of the most recent action: verification is anchored to
     // it, so an expectation states "after that action, this holds now".
@@ -298,7 +297,7 @@ fn drive_session(
         session,
         blank.id(),
         UiAction::navigate(&args.url).map_err(|err| format!("url: {err}"))?,
-        &lease,
+        &lease_for_url(&args.url)?,
         actor,
     )
     .map_err(|err| format!("navigate: {err}"))?;
@@ -326,7 +325,6 @@ fn drive_session(
                 Some(UiAction::scroll(0, *dy).map_err(|err| format!("{label} scroll: {err}"))?)
             }
             Step::Navigate(url) => {
-                lease = lease_for_url(url)?;
                 Some(UiAction::navigate(url).map_err(|err| format!("{label} navigate: {err}"))?)
             }
             Step::ExpectUrl(_)
@@ -337,6 +335,14 @@ fn drive_session(
         };
         match action {
             Some(action) => {
+                // One lease per step, for the origin the actor will check:
+                // the destination for a navigation, the current page for
+                // everything else. Minted per step rather than once because
+                // a lease's TTL is shorter than a long run.
+                let lease = match &action {
+                    UiAction::Navigate { url } => lease_for_url(url)?,
+                    _ => lease_for_url(current.url())?,
+                };
                 last_receipt = act(session, current.id(), action, &lease, actor)
                     .map_err(|err| format!("{label} {}: {err}", describe_step(step)))?;
             }
@@ -522,11 +528,16 @@ fn json_opt(text: Option<&str>) -> String {
     text.map(json_string).unwrap_or_else(|| "null".to_owned())
 }
 
-/// A single-use `browser.navigate` lease for the URL's origin, minted the
-/// same way `shell_exec`'s sandbox path mints its `proc.exec` lease: a
-/// fixed always-`ask` rule the invoking human resolves by running the
-/// command. The user typed the URL; that is the approval.
+/// A `browser.navigate` lease for the URL's origin, minted the same way
+/// `shell_exec`'s sandbox path mints its `proc.exec` lease: a fixed
+/// always-`ask` rule the invoking human resolves by running the command.
+/// The user typed the URL (or clicked their way to the page); that is the
+/// approval. `about:blank` has no origin and the actor exempts it, so any
+/// lease serves the first navigation.
 fn lease_for_url(url: &str) -> Result<CapabilityLease, String> {
+    if url == "about:blank" {
+        return Err("about:blank has no origin to lease".to_owned());
+    }
     let origin_text = origin_of(url)?;
     let origin = Origin::parse(&origin_text).map_err(|err| format!("origin: {err:?}"))?;
     let capability = Capability::BrowserNavigate;

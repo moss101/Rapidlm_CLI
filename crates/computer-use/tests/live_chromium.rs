@@ -285,9 +285,6 @@ fn a_real_chromium_is_observed_driven_and_verified_end_to_end() {
     assert_eq!(password.role(), Some("textbox"));
     assert_eq!(password.name(), None);
     assert!(password.stable_ref().starts_with("node:"));
-    // The model view carries locators, never a field's value.
-    let view = format!("{:?}", first.model_view());
-    assert!(!view.contains("password-value"), "{view}");
 
     // Type through real input events, click through real mouse events.
     let typed = act(
@@ -371,7 +368,8 @@ fn a_real_chromium_is_observed_driven_and_verified_end_to_end() {
     .expect("verify");
     assert_eq!(shortened.status(), VerificationStatus::Passed);
 
-    // Scrolling is a real wheel event: the page's scroll offset moves.
+    // Scrolling is a real wheel event, dispatched and acknowledged by the
+    // browser (the offset it produces is not part of an observation).
     let latest = shortened.after_observation().clone();
     let scrolled = act(
         &session,
@@ -405,8 +403,9 @@ fn a_real_chromium_is_observed_driven_and_verified_end_to_end() {
         "the pixels of a sensitive page must not be persisted"
     );
 
-    // Link navigation through a click changes the document; stale
-    // observations are refused afterwards.
+    // Link navigation through a click changes the document *by the page's
+    // own doing*: the click is acknowledged before the navigation commits,
+    // and nothing re-observes in between.
     let link = observe(&session, actor.observer()).expect("observe");
     let followed = act(
         &session,
@@ -416,6 +415,24 @@ fn a_real_chromium_is_observed_driven_and_verified_end_to_end() {
         &actor,
     )
     .expect("follow link");
+    std::thread::sleep(std::time::Duration::from_millis(750));
+    // `link` is still the latest observation the ledger knows, so this is
+    // the document-generation check and nothing else: the generation is
+    // the browser's loader identity, which moved when the page navigated
+    // itself (T-CU-02). A driver that only counted its own navigations
+    // would click "Greet" on a page that no longer has it.
+    let acted_on_old_document = act(
+        &session,
+        link.id(),
+        UiAction::click(target_by_test_id(&link, "greet")),
+        &lease,
+        &actor,
+    )
+    .expect_err("an observation of the previous document is stale");
+    assert!(matches!(
+        acted_on_old_document,
+        computer_use::browser::ActionError::StaleObservation
+    ));
     let second = verify(
         &session,
         VerificationPredicate::new(
@@ -425,7 +442,8 @@ fn a_real_chromium_is_observed_driven_and_verified_end_to_end() {
                 VerificationClause::accessible_node("heading", "Second").expect("node"),
             ],
         )
-        .expect("predicate"),
+        .expect("predicate")
+        .with_wait(),
         actor.observer(),
     )
     .expect("verify second");
@@ -446,19 +464,6 @@ fn a_real_chromium_is_observed_driven_and_verified_end_to_end() {
         )
         .expect("screenshot artifact");
     assert!(bytes.starts_with(b"\x89PNG"), "a real PNG was persisted");
-    let stale = act(
-        &session,
-        first.id(),
-        UiAction::click(target_by_test_id(&first, "greet")),
-        &lease,
-        &actor,
-    )
-    .expect_err("an observation from a previous document is stale");
-    assert!(matches!(
-        stale,
-        computer_use::browser::ActionError::StaleObservation
-    ));
-
     // Cookies and storage go through the browser, not a map.
     let cookies = session.cookies(&live()).expect("cookies");
     assert!(

@@ -11,11 +11,14 @@
 //!
 //! Targets are resolved the way the observer promises: a capture collects
 //! the page's interactive and named elements in document order and pins
-//! them on the page (`window.__rapidlmTargets`); an action re-captures, the
-//! actor checks the observation is not stale, and the resolved index names
-//! the same element the model was shown. Input goes through
+//! them in an *isolated world* the page cannot see (`__rapidlmTargets`);
+//! an action re-captures, the actor checks the observation is not stale
+//! (the document generation is the browser-reported `loaderId`, so a
+//! navigation the page made itself counts), and the resolved index names
+//! the element the collector found. Input goes through
 //! `Input.dispatchMouseEvent` / `Input.insertText` / `Input.dispatchKeyEvent`
-//! — the browser's own input pipeline, not synthetic DOM events.
+//! — the browser's own input pipeline, not synthetic DOM events. The URL
+//! and title are read from the browser process, never from page script.
 //!
 //! Only Chromium engines are live; a WebKit or Firefox request is a typed
 //! `Unavailable`, never a silent Chromium substitution.
@@ -33,7 +36,10 @@ use serde_json::{Value, json};
 use super::action::{
     ActionError, KeyCode, MouseButton, PageActor, ResolvedTarget, SecretAwareString,
 };
-use super::observe::{ObserveError, PageCapture, PageNode, PageSnapshot, RawScreenshot};
+use super::observe::{
+    MAX_NAME_BYTES, MAX_ROLE_BYTES, MAX_TEST_ID_BYTES, MAX_TITLE_BYTES, MAX_URL_BYTES,
+    ObserveError, PageCapture, PageNode, PageSnapshot, RawScreenshot,
+};
 use super::session::{
     BrowserCookie, BrowserEngine, BrowserSessionError, BrowserSessionId, NewContextRequest,
     PlaywrightBackend, PlaywrightBrowserId, PlaywrightContextId,
@@ -230,7 +236,18 @@ struct LiveContext {
     browser: PlaywrightBrowserId,
     cdp_context: String,
     session: String,
+    /// Document generation: bumped whenever the main frame's `loaderId`
+    /// changes — a navigation the driver made *or the page made* (link,
+    /// redirect, script). Read from the browser at every capture, so an
+    /// observation of the previous document is stale (T-CU-02) no matter
+    /// who navigated.
     generation: u64,
+    loader_id: Option<String>,
+    /// The isolated world the collector and the actions run in. The page
+    /// cannot see or rewrite its globals and prototypes, so `String`,
+    /// `getBoundingClientRect`, `__rapidlmTargets` mean what they say
+    /// (T-CU-01). Recreated whenever the document changes.
+    isolated_context: Option<(String, u64)>,
     trace: Option<Vec<String>>,
     profile_dir: PathBuf,
     persist: bool,
@@ -240,9 +257,11 @@ struct LiveContext {
 
 impl Drop for LiveBrowser {
     fn drop(&mut self) {
-        self.conn.close();
+        // Kill first: a wedged browser with a full receive buffer would
+        // otherwise hold the close frame's write for the whole write timeout.
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.conn.close();
         let _ = std::fs::remove_dir_all(&self.user_data_dir);
     }
 }
@@ -311,13 +330,19 @@ impl ChromiumCdpBackend {
             // throwaway profile and isolated contexts.
             command.arg("--no-sandbox");
         }
-        let mut child = command
-            .spawn()
-            .map_err(|_| BrowserSessionError::Unavailable)?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or(BrowserSessionError::Unavailable)?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&user_data_dir);
+                return Err(BrowserSessionError::Unavailable);
+            }
+        };
+        let Some(stderr) = child.stderr.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&user_data_dir);
+            return Err(BrowserSessionError::Unavailable);
+        };
         let endpoint = match wait_for_devtools_endpoint(stderr, self.launch.launch_timeout, cancel)
         {
             Ok(endpoint) => endpoint,
@@ -375,7 +400,13 @@ impl ChromiumCdpBackend {
                 return Err(BrowserSessionError::SessionCrashed);
             }
         }
-        op(&mut browser.conn, ctx)
+        let result = op(&mut browser.conn, ctx);
+        if browser.conn.is_dead() {
+            // A desynchronised or closed socket cannot be recovered; the
+            // browser is retired so the next launch starts a fresh one.
+            browser.crashed = true;
+        }
+        result
     }
 
     fn capture(
@@ -386,11 +417,25 @@ impl ChromiumCdpBackend {
     ) -> Result<PageSnapshot, BrowserSessionError> {
         self.with_context(context, cancel, |conn, ctx| {
             conn.drain_events(ctx, cancel)?;
+            // The URL and the document identity come from the browser
+            // process, never from page script: `Page.getFrameTree` names the
+            // main frame's URL and its `loaderId`, which changes with every
+            // document. A page can override `String` or `location` getters
+            // in its own world; it cannot touch this.
+            let (frame_id, url, loader_id) = main_frame(conn, &ctx.session, cancel)?;
+            if ctx.loader_id.as_deref() != Some(loader_id.as_str()) {
+                ctx.generation = ctx.generation.saturating_add(1);
+                ctx.loader_id = Some(loader_id);
+                ctx.isolated_context = None;
+                ctx.targets = 0;
+            }
+            let world = isolated_world(conn, ctx, &frame_id, cancel)?;
             let collected = conn.call(
                 Some(&ctx.session),
                 "Runtime.evaluate",
                 json!({
                     "expression": COLLECT_TARGETS_JS,
+                    "contextId": world,
                     "returnByValue": true,
                     "awaitPromise": false,
                 }),
@@ -401,8 +446,8 @@ impl ChromiumCdpBackend {
                 .and_then(|result| result.get("value"))
                 .cloned()
                 .ok_or(BrowserSessionError::Backend)?;
-            let url = value["url"].as_str().unwrap_or("").to_owned();
-            let title = value["title"].as_str().unwrap_or("").to_owned();
+            let title = bounded_text(value["title"].as_str().unwrap_or(""), MAX_TITLE_BYTES);
+            let url = bounded_text(&url, MAX_URL_BYTES);
             let raw_nodes = value["nodes"].as_array().cloned().unwrap_or_default();
             ctx.targets = raw_nodes.len();
             // Which collected elements the accessibility tree also exposes:
@@ -411,17 +456,25 @@ impl ChromiumCdpBackend {
             let ax_refs = accessible_refs(conn, &ctx.session, cancel).unwrap_or_default();
             let mut nodes = Vec::with_capacity(raw_nodes.len());
             for (index, raw) in raw_nodes.iter().enumerate() {
-                let role = raw["role"].as_str().unwrap_or("generic");
-                let name = raw["name"].as_str().unwrap_or("");
-                let test_id = raw["testId"].as_str();
-                let input_type = raw["inputType"].as_str();
+                // Every text field is bounded here, by bytes and at a char
+                // boundary, before the observer's own bound check — a page
+                // is not allowed to make the whole capture fail with a long
+                // `role` attribute or an accented name.
+                let role = bounded_text(raw["role"].as_str().unwrap_or("generic"), MAX_ROLE_BYTES);
+                let name = bounded_text(raw["name"].as_str().unwrap_or(""), MAX_NAME_BYTES);
+                let test_id = raw["testId"]
+                    .as_str()
+                    .map(|t| bounded_text(t, MAX_TEST_ID_BYTES));
+                let input_type = raw["inputType"]
+                    .as_str()
+                    .map(|t| bounded_text(t, MAX_ROLE_BYTES));
                 let interactive = raw["interactive"].as_bool().unwrap_or(false);
                 let from_accessibility = ax_refs.contains(&(index as u32));
                 let node = PageNode::from_capture(
-                    role,
-                    name,
-                    test_id,
-                    input_type,
+                    if role.is_empty() { "generic" } else { &role },
+                    &name,
+                    test_id.as_deref().filter(|t| !t.is_empty()),
+                    input_type.as_deref().filter(|t| !t.is_empty()),
                     interactive,
                     from_accessibility,
                     true,
@@ -430,7 +483,16 @@ impl ChromiumCdpBackend {
                 nodes.push(node);
             }
             let screenshot = if include_screenshot {
-                Some(capture_screenshot(conn, &ctx.session, cancel)?)
+                // A screenshot the observer could not persist (over its byte
+                // bound) drops the screenshot, not the observation.
+                match capture_screenshot(conn, &ctx.session, cancel) {
+                    Ok(shot) => Some(shot),
+                    Err(BrowserSessionError::Backend) => {
+                        trace_line(ctx, "{\"event\":\"screenshot.dropped\"}");
+                        None
+                    }
+                    Err(err) => return Err(err),
+                }
             } else {
                 None
             };
@@ -459,8 +521,11 @@ impl ChromiumCdpBackend {
         if index as usize >= ctx.targets {
             return Err(ActionError::StaleObservation);
         }
+        let Some((_, world)) = ctx.isolated_context else {
+            return Err(ActionError::StaleObservation);
+        };
         let expression = format!(
-            "(() => {{ const t = window.__rapidlmTargets; if (!t || !t[{index}]) return null; \
+            "(() => {{ const t = globalThis.__rapidlmTargets; if (!t || !t[{index}]) return null; \
 const el = t[{index}]; el.scrollIntoView({{block: 'center', inline: 'center'}}); \
 const r = el.getBoundingClientRect(); \
 return {{x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height}}; }})()"
@@ -469,7 +534,7 @@ return {{x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.heig
             .call(
                 Some(&ctx.session),
                 "Runtime.evaluate",
-                json!({"expression": expression, "returnByValue": true}),
+                json!({"expression": expression, "contextId": world, "returnByValue": true}),
                 cancel,
             )
             .map_err(map_session_to_action)?;
@@ -524,7 +589,11 @@ return {{x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.heig
             .conn
             .drain_events(ctx, cancel)
             .map_err(map_session_to_action)?;
-        op(&mut browser.conn, ctx)
+        let result = op(&mut browser.conn, ctx);
+        if browser.conn.is_dead() {
+            browser.crashed = true;
+        }
+        result
     }
 }
 
@@ -630,7 +699,10 @@ impl PlaywrightBackend for ChromiumCdpBackend {
                 if alive {
                     return Ok(id);
                 }
-                browser.crashed = true;
+                // Dead: retire it now rather than keeping the process record
+                // (and any half-alive children) until the backend drops.
+                state.browsers.remove(&id);
+                state.live_chromium = None;
             }
         }
         // Launch outside the lock: it takes seconds and must observe cancel.
@@ -672,56 +744,20 @@ impl PlaywrightBackend for ChromiumCdpBackend {
             .as_str()
             .ok_or(BrowserSessionError::Backend)?
             .to_owned();
-        let _ = conn.call(
-            None,
-            "Browser.setDownloadBehavior",
-            json!({
-                "behavior": "allow",
-                "browserContextId": cdp_context,
-                "downloadPath": request.downloads_dir.display().to_string(),
-                "eventsEnabled": false,
-            }),
-            cancel,
-        );
-        let target = conn.call(
-            None,
-            "Target.createTarget",
-            json!({
-                "url": "about:blank",
-                "browserContextId": cdp_context,
-                "width": VIEWPORT.0,
-                "height": VIEWPORT.1,
-            }),
-            cancel,
-        )?;
-        let target_id = target["targetId"]
-            .as_str()
-            .ok_or(BrowserSessionError::Backend)?
-            .to_owned();
-        let attached = conn.call(
-            None,
-            "Target.attachToTarget",
-            json!({"targetId": target_id, "flatten": true}),
-            cancel,
-        )?;
-        let session = attached["sessionId"]
-            .as_str()
-            .ok_or(BrowserSessionError::Backend)?
-            .to_owned();
-        conn.call(Some(&session), "Page.enable", json!({}), cancel)?;
-        conn.call(Some(&session), "Runtime.enable", json!({}), cancel)?;
-        let _ = conn.call(Some(&session), "Accessibility.enable", json!({}), cancel);
-        conn.call(
-            Some(&session),
-            "Emulation.setDeviceMetricsOverride",
-            json!({
-                "width": VIEWPORT.0,
-                "height": VIEWPORT.1,
-                "deviceScaleFactor": 1,
-                "mobile": false,
-            }),
-            cancel,
-        )?;
+        // Anything failing after the CDP context exists disposes it again,
+        // so a half-built context never lingers in the browser.
+        let session = match attach_page(conn, &cdp_context, request.downloads_dir, cancel) {
+            Ok(session) => session,
+            Err(err) => {
+                let _ = conn.call(
+                    None,
+                    "Target.disposeBrowserContext",
+                    json!({"browserContextId": cdp_context}),
+                    cancel,
+                );
+                return Err(err);
+            }
+        };
         let id = PlaywrightContextId::from_raw(state.next_id);
         state.next_id = state
             .next_id
@@ -732,6 +768,8 @@ impl PlaywrightBackend for ChromiumCdpBackend {
             cdp_context,
             session,
             generation: 0,
+            loader_id: None,
+            isolated_context: None,
             trace: request.trace.then(|| {
                 vec![
                     TRACE_MAGIC.to_owned(),
@@ -834,8 +872,13 @@ impl PlaywrightBackend for ChromiumCdpBackend {
     ) -> Result<(), BrowserSessionError> {
         check_cancel(cancel)?;
         let mut state = self.lock()?;
-        if let Some(live) = state.browsers.get_mut(&browser) {
-            live.crashed = true;
+        // Dropping the record kills the process and removes its profile;
+        // the contexts that lived in it are closed by the same drop.
+        state.browsers.remove(&browser);
+        for ctx in state.contexts.values_mut() {
+            if ctx.browser == browser {
+                ctx.closed = true;
+            }
         }
         if state.live_chromium == Some(browser) {
             state.live_chromium = None;
@@ -870,7 +913,7 @@ impl PlaywrightBackend for ChromiumCdpBackend {
         check_cancel(cancel)?;
         let mut state = self.lock()?;
         let state = &mut *state;
-        let Some(ctx) = state.contexts.get_mut(&context) else {
+        let Some(mut ctx) = state.contexts.remove(&context) else {
             return Ok(());
         };
         if ctx.closed {
@@ -884,7 +927,7 @@ impl PlaywrightBackend for ChromiumCdpBackend {
             return Ok(());
         }
         if persist && ctx.persist {
-            let cookies = read_cookies(&mut browser.conn, ctx, cancel)?;
+            let cookies = read_cookies(&mut browser.conn, &ctx, cancel)?;
             super::session::save_persisted_cookies(&ctx.profile_dir, &cookies)?;
         }
         let _ = browser.conn.call(
@@ -960,10 +1003,10 @@ impl PageActor for ChromiumCdpBackend {
     ) -> Result<(), ActionError> {
         // Secret handles carry no text this driver could type: the broker
         // never hands the value to the model side, and this backend is on
-        // the model side of that line. Refuse with a typed error rather
-        // than typing the handle's name into the page.
+        // the model side of that line. A driver that cannot materialise the
+        // handle is unavailable for that action — never a typed handle name.
         let Some(text) = value.as_literal() else {
-            return Err(ActionError::PolicyDenied);
+            return Err(ActionError::Unavailable);
         };
         self.act(context, cancel, |conn, ctx| {
             let (x, y) = Self::target_center(conn, ctx, target, cancel)?;
@@ -973,15 +1016,18 @@ impl PageActor for ChromiumCdpBackend {
             mouse_event(conn, ctx, "mousePressed", x, y, "left", 1, cancel)?;
             mouse_event(conn, ctx, "mouseReleased", x, y, "left", 1, cancel)?;
             let index = target.index();
+            let Some((_, world)) = ctx.isolated_context else {
+                return Err(ActionError::StaleObservation);
+            };
             conn.call(
                 Some(&ctx.session),
                 "Runtime.evaluate",
                 json!({"expression": format!(
-                    "(() => {{ const el = window.__rapidlmTargets && window.__rapidlmTargets[{index}]; \
+                    "(() => {{ const t = globalThis.__rapidlmTargets; const el = t && t[{index}]; \
 if (!el) return false; el.focus(); \
 if ('value' in el && typeof el.value === 'string') {{ el.value = ''; }} \
 else if (el.isContentEditable) {{ el.textContent = ''; }} return true; }})()"
-                ), "returnByValue": true}),
+                ), "contextId": world, "returnByValue": true}),
                 cancel,
             )
             .map_err(map_session_to_action)?;
@@ -994,7 +1040,10 @@ else if (el.isContentEditable) {{ el.textContent = ''; }} return true; }})()"
             .map_err(map_session_to_action)?;
             trace_line(
                 ctx,
-                &format!("{{\"event\":\"type\",\"target\":{index},\"bytes\":{}}}", text.len()),
+                &format!(
+                    "{{\"event\":\"type\",\"target\":{index},\"bytes\":{}}}",
+                    text.len()
+                ),
             );
             Ok(())
         })
@@ -1105,9 +1154,12 @@ else if (el.isContentEditable) {{ el.textContent = ''; }} return true; }})()"
             if result.get("errorText").and_then(Value::as_str).is_some() {
                 return Err(ActionError::UrlInvalid);
             }
-            ctx.generation = ctx.generation.saturating_add(1);
+            // The generation moves when the next capture sees the new
+            // `loaderId`; the old collection is unusable from here on.
+            let loader = result["loaderId"].as_str().map(str::to_owned);
             ctx.targets = 0;
-            conn.wait_for_load(ctx, navigation_timeout, cancel)
+            ctx.isolated_context = None;
+            conn.wait_for_load(ctx, loader.as_deref(), navigation_timeout, cancel)
                 .map_err(map_session_to_action)?;
             trace_line(ctx, "{\"event\":\"navigate\"}");
             Ok(())
@@ -1116,14 +1168,21 @@ else if (el.isContentEditable) {{ el.textContent = ''; }} return true; }})()"
 }
 
 /// One DevTools WebSocket with request/response correlation. Events that
-/// arrive while waiting for a response are kept and folded into the
-/// context (main-frame navigations bump the document generation).
+/// arrive while waiting for a response are kept (bounded) and folded into
+/// the context; JavaScript dialogs are answered as they open so a page
+/// cannot wedge the driver behind an `alert()`.
 struct CdpConnection {
     ws: WebSocket,
     next_id: u64,
     events: Vec<Value>,
     command_timeout: Duration,
 }
+
+/// Most buffered events kept between drains. Page-controlled streams
+/// (console output, DOM mutations) must not grow memory while a command is
+/// pending; older events are dropped first — the driver acts on the
+/// browser's *current* state at every capture, never on replayed events.
+const MAX_BUFFERED_EVENTS: usize = 256;
 
 impl CdpConnection {
     fn connect(endpoint: &str, command_timeout: Duration) -> Result<Self, WsError> {
@@ -1140,6 +1199,12 @@ impl CdpConnection {
         self.ws.close();
     }
 
+    /// Whether the socket is beyond use (closed, desynchronised, or failed
+    /// mid-frame). The owner retires the browser when this is set.
+    fn is_dead(&self) -> bool {
+        self.ws.is_dead()
+    }
+
     fn call(
         &mut self,
         session: Option<&str>,
@@ -1148,13 +1213,7 @@ impl CdpConnection {
         cancel: &CancellationToken,
     ) -> Result<Value, BrowserSessionError> {
         check_cancel(cancel)?;
-        let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
-        let mut message = json!({"id": id, "method": method, "params": params});
-        if let Some(session) = session {
-            message["sessionId"] = Value::String(session.to_owned());
-        }
-        self.ws.send_text(&message.to_string()).map_err(map_ws)?;
+        let id = self.send(session, method, params)?;
         let deadline = Instant::now() + self.command_timeout;
         loop {
             check_cancel(cancel)?;
@@ -1165,15 +1224,60 @@ impl CdpConnection {
             let value: Value =
                 serde_json::from_str(&text).map_err(|_| BrowserSessionError::Backend)?;
             if value.get("id").and_then(Value::as_u64) == Some(id) {
-                if value.get("error").is_some() {
+                if let Some(error) = value.get("error") {
+                    // Protocol-level text (never page content): the one line
+                    // a failing driver run needs in its log.
+                    eprintln!(
+                        "cdp: {method} failed: {}",
+                        error.get("message").and_then(Value::as_str).unwrap_or("?")
+                    );
                     return Err(BrowserSessionError::Backend);
                 }
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
             }
             if value.get("method").is_some() {
-                self.events.push(value);
+                self.note_incoming_event(value)?;
             }
         }
+    }
+
+    /// Send one request without waiting; returns its id.
+    fn send(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> Result<u64, BrowserSessionError> {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        let mut message = json!({"id": id, "method": method, "params": params});
+        if let Some(session) = session {
+            message["sessionId"] = Value::String(session.to_owned());
+        }
+        self.ws.send_text(&message.to_string()).map_err(map_ws)?;
+        Ok(id)
+    }
+
+    /// An event that arrived while a command was pending. A JavaScript
+    /// dialog is answered immediately — dismissed, or accepted for
+    /// `beforeunload` so a navigation can proceed — because the renderer's
+    /// main thread is blocked until it is, and every later command would
+    /// time out. Everything else is buffered, bounded.
+    fn note_incoming_event(&mut self, event: Value) -> Result<(), BrowserSessionError> {
+        if event["method"].as_str() == Some("Page.javascriptDialogOpening") {
+            let accept = event["params"]["type"].as_str() == Some("beforeunload");
+            let session = event["sessionId"].as_str().map(str::to_owned);
+            let _ = self.send(
+                session.as_deref(),
+                "Page.handleJavaScriptDialog",
+                json!({"accept": accept}),
+            );
+        }
+        if self.events.len() >= MAX_BUFFERED_EVENTS {
+            self.events.remove(0);
+        }
+        self.events.push(event);
+        Ok(())
     }
 
     /// Fold buffered events into the context.
@@ -1190,55 +1294,51 @@ impl CdpConnection {
         Ok(())
     }
 
-    /// Wait for the page's load event after `Page.navigate`.
+    /// Wait for the navigation `Page.navigate` started to reach a loaded
+    /// document: the main frame's `loaderId` is the one the navigation
+    /// returned (so a load event of the *previous* document, or a page-
+    /// initiated navigation racing ours, cannot satisfy it) and its
+    /// `document.readyState` is `complete`. Polled through ordinary
+    /// commands with the ordinary timeout — no socket-timeout games, so a
+    /// busy renderer is waited for, not mistaken for a failure. A
+    /// navigation that has not loaded by `timeout` is an error, never a
+    /// silent success.
     fn wait_for_load(
         &mut self,
         ctx: &mut LiveContext,
+        loader: Option<&str>,
         timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<(), BrowserSessionError> {
         let deadline = Instant::now() + timeout;
-        self.ws
-            .set_read_timeout(Duration::from_millis(250))
-            .map_err(map_ws)?;
-        let result = loop {
+        loop {
             check_cancel(cancel)?;
-            if Instant::now() > deadline {
-                break Ok(());
-            }
-            match self.ws.recv_text() {
-                Ok(text) => {
-                    let value: Value =
-                        serde_json::from_str(&text).map_err(|_| BrowserSessionError::Backend)?;
-                    if value.get("method").is_some() {
-                        let loaded = value["method"].as_str() == Some("Page.loadEventFired")
-                            && value["sessionId"].as_str() == Some(ctx.session.as_str());
-                        note_event(ctx, &value);
-                        if loaded {
-                            break Ok(());
-                        }
-                    }
-                }
-                Err(WsError::Timeout) => {
-                    // Poll the document state: a page that loaded before
-                    // the event was subscribed never fires it again.
-                    let ready = self.call(
+            let (frame_id, _url, current_loader) = main_frame(self, &ctx.session, cancel)?;
+            let same_document = loader.is_none_or(|wanted| wanted == current_loader);
+            if same_document {
+                // The isolated world is per document: create it now so the
+                // readiness probe runs where the page cannot interfere.
+                if let Ok(world) = isolated_world(self, ctx, &frame_id, cancel)
+                    && let Ok(ready) = self.call(
                         Some(&ctx.session),
                         "Runtime.evaluate",
-                        json!({"expression": "document.readyState", "returnByValue": true}),
+                        json!({
+                            "expression": "document.readyState",
+                            "contextId": world,
+                            "returnByValue": true,
+                        }),
                         cancel,
-                    )?;
-                    if ready["result"]["value"].as_str() == Some("complete") {
-                        break Ok(());
-                    }
+                    )
+                    && ready["result"]["value"].as_str() == Some("complete")
+                {
+                    return Ok(());
                 }
-                Err(err) => break Err(map_ws(err)),
             }
-        };
-        self.ws
-            .set_read_timeout(self.command_timeout)
-            .map_err(map_ws)?;
-        result
+            if Instant::now() > deadline {
+                return Err(BrowserSessionError::Backend);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -1249,11 +1349,75 @@ fn note_event(ctx: &mut LiveContext, event: &Value) {
     if event["method"].as_str() == Some("Page.frameNavigated")
         && event["params"]["frame"]["parentId"].is_null()
     {
-        // A navigation the driver did not initiate (redirect, link, script):
-        // the previous observation's targets no longer describe this page.
+        // The main frame navigated — by the driver or by the page (redirect,
+        // link, script). The previous collection no longer describes this
+        // document; the next capture reads the new `loaderId` and moves the
+        // generation.
         ctx.targets = 0;
+        ctx.isolated_context = None;
         trace_line(ctx, "{\"event\":\"frame.navigated\"}");
     }
+}
+
+/// The main frame's `(frameId, url, loaderId)` as the browser reports them.
+fn main_frame(
+    conn: &mut CdpConnection,
+    session: &str,
+    cancel: &CancellationToken,
+) -> Result<(String, String, String), BrowserSessionError> {
+    let tree = conn.call(Some(session), "Page.getFrameTree", json!({}), cancel)?;
+    let frame = &tree["frameTree"]["frame"];
+    let frame_id = frame["id"].as_str().ok_or(BrowserSessionError::Backend)?;
+    let url = frame["url"].as_str().unwrap_or("");
+    let loader = frame["loaderId"]
+        .as_str()
+        .ok_or(BrowserSessionError::Backend)?;
+    Ok((frame_id.to_owned(), url.to_owned(), loader.to_owned()))
+}
+
+/// The execution context of this document's isolated world, created on
+/// first use per document. Page script cannot see the world's globals or
+/// alter its prototypes, so what the collector and the actions evaluate is
+/// the driver's own code over the shared DOM.
+fn isolated_world(
+    conn: &mut CdpConnection,
+    ctx: &mut LiveContext,
+    frame_id: &str,
+    cancel: &CancellationToken,
+) -> Result<u64, BrowserSessionError> {
+    if let Some((frame, world)) = &ctx.isolated_context
+        && frame == frame_id
+    {
+        return Ok(*world);
+    }
+    let created = conn.call(
+        Some(&ctx.session),
+        "Page.createIsolatedWorld",
+        json!({"frameId": frame_id, "worldName": "rapidlm", "grantUniveralAccess": false}),
+        cancel,
+    )?;
+    let world = created["executionContextId"]
+        .as_u64()
+        .ok_or(BrowserSessionError::Backend)?;
+    ctx.isolated_context = Some((frame_id.to_owned(), world));
+    Ok(world)
+}
+
+/// `text` cut to at most `max_bytes` on a char boundary, with control
+/// characters (which the observer's bounds refuse) replaced by spaces.
+fn bounded_text(text: &str, max_bytes: usize) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if cleaned.len() <= max_bytes {
+        return cleaned;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !cleaned.is_char_boundary(end) {
+        end -= 1;
+    }
+    cleaned[..end].to_owned()
 }
 
 /// Read Chrome's `DevTools listening on ws://…` line from stderr, then keep
@@ -1387,6 +1551,70 @@ fn capture_screenshot(
     let data = shot["data"].as_str().ok_or(BrowserSessionError::Backend)?;
     let bytes = base64_decode(data).ok_or(BrowserSessionError::Backend)?;
     RawScreenshot::new(bytes, width.max(1), height.max(1)).map_err(|_| BrowserSessionError::Backend)
+}
+
+/// Create the context's page target, attach a flattened session to it and
+/// put it in the driver's shape: downloads to the session's directory,
+/// `Page` events on (dialogs, navigations), the fixed viewport.
+fn attach_page(
+    conn: &mut CdpConnection,
+    cdp_context: &str,
+    downloads_dir: &Path,
+    cancel: &CancellationToken,
+) -> Result<String, BrowserSessionError> {
+    let _ = conn.call(
+        None,
+        "Browser.setDownloadBehavior",
+        json!({
+            "behavior": "allow",
+            "browserContextId": cdp_context,
+            "downloadPath": downloads_dir.display().to_string(),
+            "eventsEnabled": false,
+        }),
+        cancel,
+    );
+    let target = conn.call(
+        None,
+        "Target.createTarget",
+        json!({
+            "url": "about:blank",
+            "browserContextId": cdp_context,
+            "width": VIEWPORT.0,
+            "height": VIEWPORT.1,
+        }),
+        cancel,
+    )?;
+    let target_id = target["targetId"]
+        .as_str()
+        .ok_or(BrowserSessionError::Backend)?
+        .to_owned();
+    let attached = conn.call(
+        None,
+        "Target.attachToTarget",
+        json!({"targetId": target_id, "flatten": true}),
+        cancel,
+    )?;
+    let session = attached["sessionId"]
+        .as_str()
+        .ok_or(BrowserSessionError::Backend)?
+        .to_owned();
+    // `Page.enable` for dialogs and frame events; no `Runtime.enable` — it
+    // is not needed for `Runtime.evaluate` and would subscribe this session
+    // to every page-controlled console/exception event.
+    conn.call(Some(&session), "Page.enable", json!({}), cancel)?;
+    let _ = conn.call(Some(&session), "Accessibility.enable", json!({}), cancel);
+    conn.call(
+        Some(&session),
+        "Emulation.setDeviceMetricsOverride",
+        json!({
+            "width": VIEWPORT.0,
+            "height": VIEWPORT.1,
+            "deviceScaleFactor": 1,
+            "mobile": false,
+        }),
+        cancel,
+    )?;
+    Ok(session)
 }
 
 fn read_cookies(
@@ -1746,16 +1974,21 @@ const COLLECT_TARGETS_JS: &str = r#"(() => {
     }
     if (tag === 'img') return text(el.getAttribute('alt'));
     const title = el.getAttribute('title');
+    // A landmark's name is its label, never its whole subtree's text.
+    if (['navigation', 'main', 'form', 'region', 'complementary', 'banner', 'contentinfo'].includes(role || '')) {
+      return title ? text(title) : '';
+    }
     const content = text(el.textContent);
     if (content) return content;
     if (title) return text(title);
     return '';
   };
   const visible = (el) => {
-    const style = window.getComputedStyle(el);
-    if (style.display === 'none' || style.visibility === 'hidden') return false;
     if (el.getAttribute('aria-hidden') === 'true') return false;
-    return true;
+    // `checkVisibility` accounts for hidden ancestors (a closed dialog's
+    // controls); the rect check is the fallback for older engines.
+    if (typeof el.checkVisibility === 'function') return el.checkVisibility();
+    return el.getClientRects().length > 0;
   };
   const targets = [];
   const nodes = [];
@@ -1781,8 +2014,8 @@ const COLLECT_TARGETS_JS: &str = r#"(() => {
     if (el.tagName.toLowerCase() === 'input') node.inputType = (el.getAttribute('type') || 'text').toLowerCase();
     nodes.push(node);
   }
-  window.__rapidlmTargets = targets;
-  return { url: String(document.location.href), title: String(document.title), nodes: nodes };
+  globalThis.__rapidlmTargets = targets;
+  return { title: '' + document.title, nodes: nodes };
 })()"#;
 
 #[cfg(test)]
@@ -1900,6 +2133,9 @@ mod tests {
         assert!(COLLECT_TARGETS_JS.trim_start().starts_with("(() => {"));
         assert!(COLLECT_TARGETS_JS.trim_end().ends_with("})()"));
         assert!(COLLECT_TARGETS_JS.contains("__rapidlmTargets"));
+        // The URL comes from the browser (`Page.getFrameTree`), never from
+        // page script — nothing in the collector reads `location`.
+        assert!(!COLLECT_TARGETS_JS.contains("location"));
         // The only `.value` read is the label of a button-type input; a
         // textbox's contents are never part of the capture.
         let reads: Vec<&str> = COLLECT_TARGETS_JS

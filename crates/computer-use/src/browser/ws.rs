@@ -5,7 +5,7 @@
 //! surface this needs: an HTTP/1.1 upgrade, masked client text frames, and
 //! unmasked server text/continuation/ping/close frames. No TLS, no
 //! extensions, no compression — and no dependency: the workspace keeps its
-//! dependency profile deliberately small, and the ~200 lines here are the
+//! dependency profile deliberately small, and the ~250 lines here are the
 //! part of the protocol a loopback control channel actually uses.
 //!
 //! Every read is bounded by the socket read timeout the caller sets, so a
@@ -48,12 +48,20 @@ impl std::fmt::Display for WsError {
 
 impl std::error::Error for WsError {}
 
+/// `(fin, opcode, payload, mask)` of one frame as read off the wire.
+type FrameBody = (bool, u8, Vec<u8>, Option<[u8; 4]>);
+
 /// One client connection. Not shareable across threads; the owner serialises
 /// request/response pairs on top of it.
 pub struct WebSocket {
     stream: TcpStream,
     fragments: Vec<u8>,
     mask_seed: u32,
+    /// Set once the byte stream can no longer be trusted: the peer closed,
+    /// a frame exceeded the bound (its payload is still on the wire), or a
+    /// read/write failed part-way through a frame. Every later call fails
+    /// with `Closed`; the owner replaces the connection.
+    dead: bool,
 }
 
 impl std::fmt::Debug for WebSocket {
@@ -89,6 +97,7 @@ impl WebSocket {
             stream,
             fragments: Vec::new(),
             mask_seed: seed(),
+            dead: false,
         };
         socket.handshake(authority, path)?;
         Ok(socket)
@@ -136,13 +145,27 @@ Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n
         Ok(())
     }
 
+    /// Whether this connection is beyond use (see the `dead` field).
+    pub fn is_dead(&self) -> bool {
+        self.dead
+    }
+
     /// Send one text frame.
     pub fn send_text(&mut self, text: &str) -> Result<(), WsError> {
+        if self.dead {
+            return Err(WsError::Closed);
+        }
         self.send_frame(0x1, text.as_bytes())
+            .inspect_err(|_| self.dead = true)
     }
 
     /// Receive the next complete text message, answering pings on the way.
+    /// A read timeout between frames leaves the connection usable; a
+    /// timeout or error *inside* a frame, or an oversized frame, does not.
     pub fn recv_text(&mut self) -> Result<String, WsError> {
+        if self.dead {
+            return Err(WsError::Closed);
+        }
         loop {
             let (fin, opcode, payload) = self.read_frame()?;
             match opcode {
@@ -168,6 +191,7 @@ Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n
                 }
                 0x8 => {
                     let _ = self.send_frame(0x8, &[]);
+                    self.dead = true;
                     return Err(WsError::Closed);
                 }
                 0x9 => self.send_frame(0xA, &payload)?,
@@ -179,7 +203,10 @@ Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n
 
     /// Best-effort close frame; the peer closing the TCP stream ends it.
     pub fn close(&mut self) {
-        let _ = self.send_frame(0x8, &[]);
+        if !self.dead {
+            let _ = self.send_frame(0x8, &[]);
+        }
+        self.dead = true;
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 
@@ -209,32 +236,53 @@ Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n
 
     fn read_frame(&mut self) -> Result<(bool, u8, Vec<u8>), WsError> {
         let mut head = [0u8; 2];
-        self.read_exact(&mut head)?;
-        let fin = head[0] & 0x80 != 0;
-        let opcode = head[0] & 0x0f;
-        let masked = head[1] & 0x80 != 0;
-        let mut len = u64::from(head[1] & 0x7f);
-        if len == 126 {
-            let mut ext = [0u8; 2];
-            self.read_exact(&mut ext)?;
-            len = u64::from(u16::from_be_bytes(ext));
-        } else if len == 127 {
-            let mut ext = [0u8; 8];
-            self.read_exact(&mut ext)?;
-            len = u64::from_be_bytes(ext);
+        // Before any byte of a frame has been consumed a timeout is benign:
+        // the stream is still aligned on a frame boundary.
+        match self.read_exact(&mut head) {
+            Ok(()) => {}
+            Err(WsError::Timeout) => return Err(WsError::Timeout),
+            Err(err) => {
+                self.dead = true;
+                return Err(err);
+            }
         }
-        if len > MAX_FRAME_BYTES as u64 {
-            return Err(WsError::FrameBound);
-        }
-        let mask = if masked {
-            let mut key = [0u8; 4];
-            self.read_exact(&mut key)?;
-            Some(key)
-        } else {
-            None
+        let inner = |this: &mut Self| -> Result<FrameBody, WsError> {
+            let fin = head[0] & 0x80 != 0;
+            let opcode = head[0] & 0x0f;
+            let masked = head[1] & 0x80 != 0;
+            let mut len = u64::from(head[1] & 0x7f);
+            if len == 126 {
+                let mut ext = [0u8; 2];
+                this.read_exact(&mut ext)?;
+                len = u64::from(u16::from_be_bytes(ext));
+            } else if len == 127 {
+                let mut ext = [0u8; 8];
+                this.read_exact(&mut ext)?;
+                len = u64::from_be_bytes(ext);
+            }
+            if len > MAX_FRAME_BYTES as u64 {
+                return Err(WsError::FrameBound);
+            }
+            let mask = if masked {
+                let mut key = [0u8; 4];
+                this.read_exact(&mut key)?;
+                Some(key)
+            } else {
+                None
+            };
+            let mut payload = vec![0u8; len as usize];
+            this.read_exact(&mut payload)?;
+            Ok((fin, opcode, payload, mask))
         };
-        let mut payload = vec![0u8; len as usize];
-        self.read_exact(&mut payload)?;
+        // Anything that fails once the header has been read leaves the
+        // stream mid-frame: unrecoverable, so the connection is retired.
+        let (fin, opcode, mut payload, mask) = match inner(self) {
+            Ok(frame) => frame,
+            Err(err) => {
+                self.dead = true;
+                return Err(err);
+            }
+        };
         if let Some(key) = mask {
             for (index, byte) in payload.iter_mut().enumerate() {
                 *byte ^= key[index % 4];
@@ -452,6 +500,49 @@ Connection: Upgrade\r\nSec-WebSocket-Accept: unchecked\r\n\r\n",
         let started = std::time::Instant::now();
         assert_eq!(socket.recv_text().expect_err("silent"), WsError::Timeout);
         assert!(started.elapsed() < Duration::from_secs(2));
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn a_timeout_inside_a_frame_retires_the_connection_but_between_frames_does_not() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                assert_eq!(stream.read(&mut byte).expect("read"), 1);
+                request.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n")
+                .expect("upgrade");
+            // A whole frame, then a pause, then half a frame and silence.
+            stream.write_all(&[0x81, 0x02, b'o', b'k']).expect("frame");
+            std::thread::sleep(Duration::from_millis(300));
+            stream.write_all(&[0x81, 0x04, b'h', b'a']).expect("half");
+            std::thread::sleep(Duration::from_millis(600));
+        });
+        let mut socket =
+            WebSocket::connect(&format!("ws://127.0.0.1:{port}/"), Duration::from_secs(5))
+                .expect("connect");
+        socket
+            .set_read_timeout(Duration::from_millis(100))
+            .expect("timeout");
+        assert_eq!(socket.recv_text().expect("first"), "ok");
+        // Between frames: a timeout, and the socket is still fine.
+        assert_eq!(socket.recv_text().expect_err("pause"), WsError::Timeout);
+        assert!(!socket.is_dead());
+        // Inside a frame: the same timeout retires it.
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(
+            socket.recv_text().expect_err("half frame"),
+            WsError::Timeout
+        );
+        assert!(socket.is_dead());
+        assert_eq!(socket.recv_text().expect_err("dead"), WsError::Closed);
+        assert_eq!(socket.send_text("x").expect_err("dead"), WsError::Closed);
         server.join().expect("server");
     }
 
