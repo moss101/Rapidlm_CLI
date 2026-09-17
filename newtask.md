@@ -8486,16 +8486,22 @@ Windows is. The root causes, in the order they explained the most failures:
 
 **Verification.** No revert cycles this time: this machine could not compile for most of the
 session (see the machine note in the 2026-09-10 boundary — `rustc` in state `U` for over an
-hour, `syspolicyd` hot), so CI was the loop: seven Windows runs, 175 → 45 (lint) → 21 → 2 →
-1 (a load-sensitive `context_retrieval` first-index race, widened to three attempts) → 0.
-Linux and macOS stayed green on every push except one clippy pair (`21b90b7`). Two background
-adversarial self-reviews ran (one on `aa6efda`, one on the follow-ups); the first found seven
-real items, all fixed in `e3eef31` — the one that mattered most was that `sh -c 'sleep 30 #
-marker'` execs the sleep in place of the shell on macOS/dash, so a liveness probe marker
-vanished from the process table.
+hour, `syspolicyd` hot), so CI was the loop: Windows runs went 175 → 45 (lint) → 21 → 2 →
+1 (a load-sensitive `context_retrieval` first-index race, widened to three attempts) → 0
+(run 35163406404, the first fully green gated run). Linux and macOS stayed green on every push
+except one clippy pair (`21b90b7`) and one classification slip (`3cede29`, fixed in
+`63c81c5`). Three background adversarial self-reviews ran (`aa6efda`; the follow-ups; the
+browser PR); every verified finding was fixed (`e3eef31`, `3cede29`, `86a9dbc`, `b29cac7`) —
+the ones that mattered most: `sh -c 'sleep 30 # marker'` execs the sleep in place of the shell
+on macOS/dash so a liveness marker vanished; the browser driver took the page URL and the
+document generation from page script (a page could spoof `url_equals` and never make an
+observation stale); and a doc line claimed job cancellation uses `taskkill` when it does not.
+Two load-sensitivity fixes landed on the gated Windows runner: the `context_retrieval` retry
+above and the event ledger's SQLite busy timeout (5 s → 30 s: sixteen fsync'd writers on the
+runner's disk exceeded it; a lost append is worse than a bounded wait).
 
-**2. Live browser driver** (PR #1, branch `live-browser-driver`, `9af8a44` + `4474298`; merged
-to `main` once CI on all three runners is green): `computer_use::browser::cdp::ChromiumCdpBackend`
+**2. Live browser driver** (PR #1 — `9af8a44`, `4474298`, `86a9dbc`, merged as `fc5dfbc` after
+run 35167476607 was green on all four jobs): `computer_use::browser::cdp::ChromiumCdpBackend`
 is the first real implementation of the `PlaywrightBackend`/`PageCapture`/`PageActor` seams —
 headless Chrome/Chromium/Edge over the DevTools Protocol through a dependency-free loopback
 WebSocket client (`browser::ws`). Real input events, navigation with load wait, isolated
@@ -8504,9 +8510,14 @@ read, secret handles refused, non-Chromium engines a typed `Unavailable`. `rapid
 --step …` is the one-shot user surface. `crates/computer-use/tests/live_chromium.rs` drives a
 real Chrome end to end on every CI runner; its first CI run reached the screenshot assertion
 with every action and verification holding, and the assertion was the bug (a page with a
-password field persists the redacted marker, not pixels).
+password field persists the redacted marker, not pixels). The PR review then hardened the
+driver (`86a9dbc`): URL and document identity from `Page.getFrameTree` (the `loaderId` is the
+generation, so a page-initiated navigation makes the old observation stale — tested), the
+collector and actions in an isolated world, a loader-correlated load wait, bounded events and
+text, JavaScript dialogs answered, dead sockets retired, per-step leases in the CLI. Not
+delivered: model-facing `browser_observe`/`browser_act` tools for the agent runtime.
 
-**3. GVS5H Phase 0** (`7aeb2bb`): GVS-001..003 delivered as research before any orchestration
+**3. GVS5H Phase 0** (`7aeb2bb`; delivery record `docs/goal-delivery-2026-09-17.md`, `d196b1c`): GVS-001..003 delivered as research before any orchestration
 code — `docs/goals/gvs5h-phase0-baseline-2026-09-17.md` (every research lead rechecked against
 source, three new findings: `GraphService`/`GraphBackedRun` and `TransactionManager` have no
 production caller; the V3 manifest marks graph persistence/resume satisfied although the graph
