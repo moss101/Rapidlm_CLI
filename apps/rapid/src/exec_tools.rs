@@ -3193,13 +3193,12 @@ read with job_output, in this turn or a later one — the job is stopped when th
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
-                // The OS reason, as the background-job path already reports
-                // it: a model told only "failed" retries blindly.
-                return Ok(ToolStepResult::Failed {
-                    call_id: call.call_id().to_owned(),
-                    handled: true,
-                    detail: Some(bounded_detail(&format!("spawn failed: {err}"))),
-                });
+                // A program that cannot be started is a hard tool failure
+                // (the turn stops with "tool step failed"), unchanged; the
+                // OS reason goes to the diagnostic stream so a log says
+                // *why* — `ToolStepError::Failed` itself carries no text.
+                crate::exec_diag::stderr_line(&format!("tool shell_exec: spawn failed: {err}"));
+                return Err(ToolStepError::Failed);
             }
         };
         // Drain stdout/stderr on background threads concurrently with the
