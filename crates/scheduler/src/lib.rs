@@ -24,7 +24,7 @@ pub use graph::{Edge, EdgeCondition, GraphDiff, Node, NodeExplain, ReadyContext,
 pub use kinds::{EdgeKind, NodeKind, NodeState};
 pub use orch::{GraphBackedRun, RunPlan};
 pub use proposal::{EdgeSpec, GraphProposal, NodeSpec, ProposalError};
-pub use service::{GraphError, GraphReplay, GraphService};
+pub use service::{AcceptanceEvent, GraphError, GraphReplay, GraphService};
 
 #[cfg(test)]
 mod tests {

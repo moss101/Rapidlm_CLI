@@ -11,7 +11,7 @@ use protocol::{GraphId, NodeId, ProjectId, SessionId};
 
 use crate::kinds::{EdgeKind, NodeKind, NodeState};
 use crate::proposal::{EdgeSpec, GraphProposal, NodeSpec, ProposalError};
-use crate::service::{GraphError, GraphService};
+use crate::service::{AcceptanceEvent, GraphError, GraphService};
 
 /// The task/verification nodes a run starts with, hanging off the goal root
 /// the graph is created with. Edges are among plan nodes; every node without
@@ -147,15 +147,28 @@ impl GraphBackedRun {
         })
     }
 
-    /// Host-only acceptance: the supervisor accepts (it alone can reach
-    /// `Accepted`), then the goal and any verification node that has not
-    /// already succeeded are marked succeeded on the graph — a verification
-    /// node that never ran (the default shape's `verify`) stands for the
-    /// supervisor's own verification, and acceptance is what completes it.
+    /// Host-only acceptance, derived from one durable record (GVS-006).
+    ///
+    /// The old shape performed three-plus durable writes — the supervisor's
+    /// transition, then a `set_state` per graph node — so a crash between
+    /// them left the two projections disagreeing about whether the run was
+    /// accepted. Now: validate both sides, append **one**
+    /// `orchestration.task_accepted` carrying the goal node, the
+    /// verification nodes, the task and the candidate digest, and only once
+    /// that is durable reduce it into the supervisor and the graph. A failed
+    /// append leaves neither advanced; a replay of the record rebuilds both.
+    ///
     /// A verification node that failed, was cancelled, superseded or
     /// invalidated blocks acceptance before anything is touched: the
     /// graph's record of a failed check is never overwritten by an accept.
+    /// A verification node that never ran is completed by the acceptance
+    /// itself — it stands for the supervisor's own verification.
     pub fn accept(&mut self) -> Result<(), SupervisorError> {
+        // Idempotent: an already-accepted run answers from what it holds
+        // rather than appending a second acceptance.
+        if self.supervisor.state() == OrchestrationState::Accepted {
+            return Ok(());
+        }
         let snapshot = self
             .graphs
             .snapshot(self.graph_id)
@@ -174,25 +187,24 @@ impl GraphBackedRun {
         if blocked {
             return Err(SupervisorError::MissingEvidence);
         }
-        let pending: Vec<NodeId> = self
-            .verify_nodes
-            .iter()
-            .copied()
-            .filter(|id| {
-                snapshot
-                    .node(*id)
-                    .is_some_and(|node| node.state != NodeState::Succeeded)
-            })
-            .collect();
-        self.supervisor.accept()?;
+        // Validates every host precondition and mutates nothing.
+        let record = self.supervisor.acceptance_record()?;
+        let event = AcceptanceEvent {
+            graph_id: self.graph_id,
+            goal_node: self.goal_node,
+            verify_nodes: self.verify_nodes.clone(),
+            task_id: record.task_id.to_string(),
+            candidate_digest: record.candidate_digest.clone(),
+            verdict: format!("{:?}", record.verdict),
+        };
+        // The single durable write. Everything after this is reduction.
         self.graphs
-            .set_state(self.graph_id, self.goal_node, NodeState::Succeeded)
+            .append_acceptance(&event)
             .map_err(|e| SupervisorError::Sink(e.to_string()))?;
-        for id in pending {
-            self.graphs
-                .set_state(self.graph_id, id, NodeState::Succeeded)
-                .map_err(|e| SupervisorError::Sink(e.to_string()))?;
-        }
+        self.supervisor.apply_acceptance(&record)?;
+        self.graphs
+            .apply_accepted(&event)
+            .map_err(|e| SupervisorError::Sink(e.to_string()))?;
         Ok(())
     }
 
@@ -427,19 +439,13 @@ mod tests {
         assert_eq!(run.orchestration_state(), OrchestrationState::Verified);
     }
 
-    fn state_changes(run: &GraphBackedRun, session: SessionId) -> Vec<(String, String)> {
+    /// Every event in the session, as kinds in ledger order.
+    fn event_kinds(run: &GraphBackedRun, session: SessionId) -> Vec<EventKind> {
         let cancel = event_ledger::ledger::CancellationToken::new();
         let last = run.graphs.last_seq().unwrap();
         (1..=last)
             .filter_map(|seq| run.graphs.ledger().get(session, seq, &cancel).ok())
-            .filter(|event| event.kind() == EventKind::GraphNodeStateChanged)
-            .map(|event| {
-                let payload = event.payload();
-                (
-                    payload["node_id"].as_str().unwrap_or("").to_owned(),
-                    payload["state"].as_str().unwrap_or("").to_owned(),
-                )
-            })
+            .map(|event| event.kind())
             .collect()
     }
 
@@ -594,7 +600,7 @@ mod tests {
         run.graphs
             .set_state(run.graph_id, failed, NodeState::Failed)
             .unwrap();
-        let before = state_changes(&run, session).len();
+        let before = event_kinds(&run, session).len();
         assert_eq!(run.accept(), Err(SupervisorError::MissingEvidence));
         assert_eq!(
             run.orchestration_state(),
@@ -602,31 +608,94 @@ mod tests {
             "the supervisor was not touched"
         );
         assert_eq!(
-            state_changes(&run, session).len(),
+            event_kinds(&run, session).len(),
             before,
-            "nothing appended"
+            "a refused acceptance appends nothing"
         );
         let snap = run.graphs.snapshot(run.graph_id).unwrap();
         assert_eq!(snap.nodes[&run.goal_node].state, NodeState::Pending);
         assert_eq!(snap.nodes[&failed].state, NodeState::Failed);
 
-        // Once the failed check is re-run and passes, acceptance marks the
-        // goal — and only the goal: the succeeded checks are not re-stated.
+        // Once the failed check is re-run and passes, acceptance is exactly
+        // one durable record — not a transition plus a write per node — and
+        // both projections are reduced from it.
         run.graphs.retry(run.graph_id, failed).unwrap();
         run.graphs
             .set_state(run.graph_id, failed, NodeState::Succeeded)
             .unwrap();
-        let before = state_changes(&run, session).len();
+        let before = event_kinds(&run, session).len();
         run.accept().expect("accept");
         assert_eq!(run.orchestration_state(), OrchestrationState::Accepted);
-        let appended: Vec<(String, String)> = state_changes(&run, session)
+        let appended: Vec<EventKind> = event_kinds(&run, session)
             .into_iter()
             .skip(before)
             .collect();
         assert_eq!(
             appended,
-            vec![(run.goal_node.to_string(), "succeeded".to_owned())]
+            vec![EventKind::OrchestrationTaskAccepted],
+            "one record, no per-node state events"
+        );
+        let snap = run.graphs.snapshot(run.graph_id).unwrap();
+        assert_eq!(snap.nodes[&run.goal_node].state, NodeState::Succeeded);
+        assert_eq!(snap.nodes[&ran].state, NodeState::Succeeded);
+        assert_eq!(snap.nodes[&failed].state, NodeState::Succeeded);
+
+        // Repeating the request appends nothing and answers the same.
+        let before = event_kinds(&run, session).len();
+        run.accept().expect("idempotent");
+        assert_eq!(event_kinds(&run, session).len(), before);
+        assert_eq!(run.orchestration_state(), OrchestrationState::Accepted);
+
+        // And the durable record alone rebuilds the accepted graph.
+        let replayed = match run.graphs.replay(session).expect("replay") {
+            crate::service::GraphReplay::Rebuilt(graphs) => graphs,
+            other => panic!("expected a rebuild, got {other:?}"),
+        };
+        assert_eq!(
+            &replayed[&run.graph_id],
+            run.graphs.snapshot(run.graph_id).unwrap(),
+            "replayed == uninterrupted, acceptance included"
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failed_acceptance_append_leaves_both_projections_untouched() {
+        // The whole point of one durable record: if it cannot be written,
+        // neither the supervisor nor the graph may claim the run accepted.
+        let dir = scratch("accept-append-fails");
+        let ledger = EventLedger::open(dir.join("l.db")).unwrap();
+        let session = SessionId::new();
+        let id = GoalId::new();
+        let ev = EvidenceId::new();
+        let mut run = GraphBackedRun::start(
+            contract(id),
+            WorkspaceIdentity::new("sha256:aa"),
+            drivers(id, ev),
+            ledger,
+            session,
+            ProjectId::new(),
+        )
+        .expect("start");
+        verify_through(&mut run, id, ev);
+        // The ledger connects per call; with its file gone the acceptance
+        // record cannot be appended.
+        let _ = fs::remove_dir_all(&dir);
+        let outcome = run.accept();
+        assert!(
+            matches!(outcome, Err(SupervisorError::Sink(_))),
+            "expected a sink failure, got {outcome:?}"
+        );
+        assert_eq!(
+            run.orchestration_state(),
+            OrchestrationState::Verified,
+            "no false completion: the supervisor did not advance"
+        );
+        let snap = run.graphs.snapshot(run.graph_id).unwrap();
+        assert_eq!(
+            snap.nodes[&run.goal_node].state,
+            NodeState::Pending,
+            "no split projection: the graph did not advance either"
+        );
     }
 }

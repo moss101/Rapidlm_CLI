@@ -996,8 +996,21 @@ mod tests {
         assert!(middle.contains(&expect("right", "succeeded")));
         assert_eq!(seen[6], expect("check", "running"));
         assert_eq!(seen[7], expect("check", "succeeded"));
-        assert_eq!(seen[8], expect("goal", "succeeded"));
-        assert_eq!(seen.len(), 9);
+        assert_eq!(
+            seen.len(),
+            8,
+            "the goal's completion is the acceptance record, not a node event"
+        );
+        // Acceptance is exactly one durable record, and it is the last
+        // thing the run appends to the graph's stream (GVS-006).
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|k| **k == EventKind::OrchestrationTaskAccepted)
+                .count(),
+            1,
+            "one acceptance record"
+        );
 
         // Resuming the finished run: nothing runs again, the graph mirrors
         // the recorded states, and with no check run *in this invocation*
@@ -1223,8 +1236,16 @@ mod tests {
                 expect("gate", "succeeded"),
                 expect("verify", "running"),
                 expect("verify", "succeeded"),
-                expect("goal", "succeeded"),
-            ]
+            ],
+            "the goal's completion rides the acceptance record, not a node event"
+        );
+        assert_eq!(
+            kinds(&root, session2)
+                .iter()
+                .filter(|k| **k == EventKind::OrchestrationTaskAccepted)
+                .count(),
+            1,
+            "one acceptance record"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

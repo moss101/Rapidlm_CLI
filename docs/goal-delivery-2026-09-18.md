@@ -1,4 +1,4 @@
-# Goal delivery — GVS5H Phase 1, first two slices: production caller + replay reducer (2026-09-18)
+# Goal delivery — GVS5H Phase 1, first three slices: production caller, replay reducer, single-event acceptance (2026-09-18)
 
 Baseline: `b63793a` (the last commit of the 2026-09-17 delivery). Scope: the first Phase 1
 slice ADR 0021 §"Consequences" orders before everything else — a production caller for
@@ -63,14 +63,25 @@ A second review of those fixes found a regression they introduced and two gaps, 
 | Historical (pre-payload) events are explicit, not guessed | done | A `graph.created`/`graph.revision_committed` without its payload reduces the whole replay to `GraphReplay::Unsupported { first_seq }` (`replay_reports_unsupported_for_a_pre_payload_created_event`); nothing in production created graphs before this, so no real history is affected |
 | Full crash-at-each-boundary matrix; a resume-time caller | pending | The reducer is the durability primitive GVS-006 (single-event acceptance) and GVS-008 (recovery) consume; `VerifiedRun` still mirrors the run-state file at resume. GVS-005's crash-injection matrix lands with GVS-008 |
 
+## Third slice: acceptance is one durable record (GVS-006, core)
+
+Before: `Supervisor::accept` applied the transition and emitted in memory, then `GraphBackedRun::accept` called `set_state` once per node — three or more durable writes with no single acceptance record, so a crash between them left the supervisor and the graph disagreeing about whether the run was accepted (the baseline audit's confirmed finding).
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| Validation is separable from reduction | done | `Supervisor::acceptance_record()` checks state, verdict, attestation identity and evidence for every mandatory requirement, and mutates nothing; `apply_acceptance(&record)` only reduces (and is idempotent, refusing a record for another task). `accept()` remains both for `goal claim`, which owns no second projection |
+| Acceptance is one durable append, before any mutation | done | `GraphBackedRun::accept` appends a single `orchestration.task_accepted` carrying the goal node, verification nodes, task id, candidate digest and verdict, then reduces both projections; `accept_refuses_while_a_verification_node_failed_and_skips_succeeded_ones` asserts the appended kinds are exactly `[OrchestrationTaskAccepted]` — no per-node state events |
+| A failed append is no false completion and no split projection | done | `a_failed_acceptance_append_leaves_both_projections_untouched`: with the ledger file gone the accept returns `Sink`, the supervisor stays `Verified` and the goal node stays `Pending`. Revert-cycled — the old shape advances the supervisor to `Accepted` while the append fails |
+| The record alone rebuilds the acceptance | done | `GraphService::replay` folds `orchestration.task_accepted`, so the replayed graph equals the live one with acceptance included (asserted in the same test); an acceptance for a graph the session never created (a `goal claim` acceptance) is skipped rather than failing the replay |
+| Repeating the request cannot apply twice | done | An already-`Accepted` run returns `Ok` without appending (asserted); `apply_acceptance` is a no-op in that state |
+| Publication receipts (prepared → applied → reconciled via `TransactionManager`) | pending | The other half of GVS-006; it lands with the workspace-transaction wiring, which `agent_views::integrate` also needs |
+
 ## Explicitly not delivered (later Phase 1 slices, unchanged plan)
 
 - **Replay (GVS-005):** a resumed run opens a *fresh* graph in a new ledger session and sets its
   nodes to the recorded step states; the run-state file — not the events — is still the
   cross-invocation authority, and attempt counts across invocations are its. The
   `OrchestrationRecord` pointer is what the reducer will start from.
-- **Single-event acceptance (GVS-006):** `GraphBackedRun::accept` is still the supervisor's
-  transition followed by graph `set_state` calls.
 - **Identities (GVS-007):** the workspace identity is the digest of the steps' `watch` globs
   (nothing, for a playbook without them), with `require_workspace_identity: false` as in `goal
   claim`.

@@ -8468,6 +8468,15 @@ before any persistence work — and that is what landed
   same validator and folding state/attempts changes, with pre-payload history reported as
   `GraphReplay::Unsupported { first_seq }` rather than guessed. Restart-and-compare tested. The
   reducer is the primitive single-event acceptance (GVS-006) and recovery (GVS-008) consume next.
+- Third slice (single-event acceptance, GVS-006 core): `Supervisor::accept` splits into
+  `acceptance_record()` (validates, mutates nothing) and `apply_acceptance()` (reduces,
+  idempotent); `GraphBackedRun::accept` appends ONE `orchestration.task_accepted` carrying the
+  goal node, verification nodes, task id, candidate digest and verdict, then reduces both
+  projections from it. The old shape was a transition plus a durable write per node, so a crash
+  between them left the supervisor and the graph disagreeing — revert-cycled: with the append
+  failing, the old code reaches `Accepted` while nothing is durable, the new code stays
+  `Verified` with the graph untouched. `replay` folds the acceptance, so a rebuild reproduces it.
+  Publication receipts (prepared/applied/reconciled via `TransactionManager`) are the pending half.
 - Not delivered, by the plan's order: a resume-time replay caller (a resumed run still opens a
   fresh graph and mirrors the run-state file, which stays the resume authority), single-event
   acceptance, real identities, recovery of a `Running` step from a crashed invocation, and

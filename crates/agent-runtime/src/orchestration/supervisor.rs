@@ -147,6 +147,31 @@ pub struct OrchestrationSnapshot {
     pub last_discovery: Option<DiscoveryResult>,
 }
 
+/// What one acceptance asserts: the task, the verdict that justified it,
+/// the candidate it accepts and the workspace the attestation spoke about.
+/// [`Supervisor::acceptance_record`] produces it by validating;
+/// [`Supervisor::apply_acceptance`] consumes it by reducing. A caller that
+/// owns more than one projection appends it durably in between, so both
+/// projections are derived from one record instead of racing several
+/// writes (ADR 0021 §2, GVS-006).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AcceptanceRecord {
+    pub task_id: GoalId,
+    pub verdict: Verdict,
+    /// Content digest of the accepted [`CandidateCompletion`] — the
+    /// candidate's identity until GVS-004 introduces a `CandidateId`.
+    pub candidate_digest: String,
+    pub workspace_identity: WorkspaceIdentity,
+}
+
+/// Stable content digest of a candidate completion. Serialization of an
+/// owned value cannot fail; an empty digest would still be stable, so the
+/// fallback is inert rather than a panic.
+fn candidate_digest(candidate: &CandidateCompletion) -> String {
+    let bytes = serde_json::to_vec(candidate).unwrap_or_default();
+    protocol::ArtifactId::from_bytes(&bytes).to_string()
+}
+
 /// Host-owned supervisor. Disabled unless constructed explicitly.
 pub struct Supervisor {
     snapshot: OrchestrationSnapshot,
@@ -657,7 +682,28 @@ impl Supervisor {
     }
 
     /// Host-only accept. Implementer claims never call this.
+    ///
+    /// Validation and reduction in one step, for a caller with nothing else
+    /// to keep in agreement. A caller that also owns a second projection
+    /// (the Runtime Graph) uses [`Self::acceptance_record`] and
+    /// [`Self::apply_acceptance`] instead, so one durable acceptance record
+    /// can be appended between them and both projections derived from it.
     pub fn accept(&mut self) -> Result<(), SupervisorError> {
+        let record = self.acceptance_record()?;
+        self.apply_acceptance(&record)
+    }
+
+    /// Validate that this run may be accepted and describe the acceptance,
+    /// mutating nothing. Every precondition the host gate enforces is
+    /// checked here: the state, the recorded verdict, the attestation's
+    /// workspace identity, and evidence for every mandatory requirement.
+    ///
+    /// Returning a record rather than performing the transition is what
+    /// makes acceptance event-derived (ADR 0021 §2): the caller appends the
+    /// record durably first and only then calls [`Self::apply_acceptance`],
+    /// so a crash between the two leaves the durable stream — not a
+    /// half-updated projection — as the authority.
+    pub fn acceptance_record(&self) -> Result<AcceptanceRecord, SupervisorError> {
         if self.snapshot.state != OrchestrationState::Verified {
             return Err(SupervisorError::Transition(
                 TransitionError::InvalidTransition,
@@ -687,6 +733,31 @@ impl Supervisor {
         }
         if !self.mandatory_evidence_present() {
             return Err(SupervisorError::MissingEvidence);
+        }
+        let candidate = self
+            .snapshot
+            .last_candidate
+            .as_ref()
+            .ok_or(SupervisorError::MissingCandidate)?;
+        Ok(AcceptanceRecord {
+            task_id: self.snapshot.contract.id,
+            verdict: verdict.verdict,
+            candidate_digest: candidate_digest(candidate),
+            workspace_identity: self.snapshot.current_identity.clone(),
+        })
+    }
+
+    /// Reduce a durable acceptance record into this snapshot. In-memory
+    /// only: the record is already durable when this runs, so nothing here
+    /// can fail for want of storage. Refuses a record for another task, and
+    /// is idempotent for the record already applied — replaying the durable
+    /// stream must not double-apply.
+    pub fn apply_acceptance(&mut self, record: &AcceptanceRecord) -> Result<(), SupervisorError> {
+        if record.task_id != self.snapshot.contract.id {
+            return Err(SupervisorError::InvalidOutput);
+        }
+        if self.snapshot.state == OrchestrationState::Accepted {
+            return Ok(());
         }
         self.apply(OrchestrationTransition::Accept)?;
         self.emit(OrchestrationEventKind::TaskAccepted, "accepted by host")?;

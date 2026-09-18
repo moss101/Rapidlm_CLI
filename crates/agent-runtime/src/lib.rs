@@ -127,13 +127,14 @@ pub use goal::state::{
     MAX_GOAL_STATEMENT_BYTES,
 };
 pub use orchestration::{
-    AcceptanceCriterion, AcceptancePolicy, AgentContextPacket, CandidateCompletion, CheckResult,
-    CheckRunner, CheckStatus, CompletionClaim, DiscoveryResult, EvidenceNode, EvidenceTrust,
-    Explorer, GapNode, Implementer, MAX_ID_BYTES, OrchestrationBudget, OrchestrationEvidenceKind,
-    OrchestrationState, PlanResult, Planner, RequirementClaim, RequirementClaimStatus,
-    RequirementNode, RequirementPriority, Retriever, Strategist, StrategyRevision, Supervisor,
-    SupervisorDrivers, SupervisorError, TaskComplexity, TaskContract, TransitionError, Verdict,
-    VerificationCheck, VerificationPolicy, VerificationVerdict, WorkspaceIdentity, WorkspacePolicy,
+    AcceptanceCriterion, AcceptancePolicy, AcceptanceRecord, AgentContextPacket,
+    CandidateCompletion, CheckResult, CheckRunner, CheckStatus, CompletionClaim, DiscoveryResult,
+    EvidenceNode, EvidenceTrust, Explorer, GapNode, Implementer, MAX_ID_BYTES, OrchestrationBudget,
+    OrchestrationEvidenceKind, OrchestrationState, PlanResult, Planner, RequirementClaim,
+    RequirementClaimStatus, RequirementNode, RequirementPriority, Retriever, Strategist,
+    StrategyRevision, Supervisor, SupervisorDrivers, SupervisorError, TaskComplexity, TaskContract,
+    TransitionError, Verdict, VerificationCheck, VerificationPolicy, VerificationVerdict,
+    WorkspaceIdentity, WorkspacePolicy,
 };
 pub use prompt::{
     CORE_SYSTEM_V2, CORE_SYSTEM_V2_HASH, CORE_SYSTEM_VERSION, DEFAULT_COMPILE_TIMEOUT,

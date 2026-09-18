@@ -38,6 +38,31 @@ pub enum GraphReplay {
     Unsupported { first_seq: u64 },
 }
 
+/// The one durable record an acceptance appends (GVS-006). It carries
+/// everything both projections need: which supervisor run was accepted
+/// (`task_id`, `candidate_digest`, `verdict`) and which graph nodes the
+/// acceptance completes (`goal_node`, `verify_nodes`). Appended once,
+/// before either projection is touched, and folded back by
+/// [`GraphService::replay`].
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AcceptanceEvent {
+    pub graph_id: GraphId,
+    pub goal_node: NodeId,
+    pub verify_nodes: Vec<NodeId>,
+    pub task_id: String,
+    pub candidate_digest: String,
+    pub verdict: String,
+}
+
+impl AcceptanceEvent {
+    /// Every graph node this acceptance marks succeeded, goal first.
+    fn completed_nodes(&self) -> Vec<NodeId> {
+        let mut nodes = vec![self.goal_node];
+        nodes.extend(self.verify_nodes.iter().copied());
+        nodes
+    }
+}
+
 fn parse_graph_id(payload: &serde_json::Value, seq: u64) -> Result<GraphId, GraphError> {
     payload
         .get("graph_id")
@@ -590,12 +615,74 @@ impl GraphService {
                     }
                     graph.revision = graph.revision.saturating_add(1);
                 }
+                // The one acceptance record, reduced exactly as the live
+                // path reduces it (GVS-006): the same goal and verification
+                // nodes become `Succeeded`.
+                EventKind::OrchestrationTaskAccepted => {
+                    let event: AcceptanceEvent = serde_json::from_value(payload.clone())
+                        .map_err(|e| GraphError::Ledger(format!("acceptance seq {seq}: {e}")))?;
+                    let Some(graph) = graphs.get_mut(&event.graph_id) else {
+                        // An acceptance for a graph this session never
+                        // created (a `goal claim` acceptance has no graph
+                        // at all): not this reducer's business.
+                        continue;
+                    };
+                    for id in event.completed_nodes() {
+                        let node = graph.nodes.get_mut(&id).ok_or_else(|| {
+                            GraphError::Ledger(format!(
+                                "seq {seq}: acceptance names an unknown node"
+                            ))
+                        })?;
+                        if node.state == NodeState::Succeeded {
+                            continue;
+                        }
+                        node.state = NodeState::Succeeded;
+                        graph.revision = graph.revision.saturating_add(1);
+                    }
+                }
                 // A rejected proposal changed nothing; every other kind
                 // belongs to some other family.
                 _ => {}
             }
         }
         Ok(GraphReplay::Rebuilt(graphs))
+    }
+
+    /// Append the single durable acceptance record. Nothing is reduced
+    /// here: the caller applies [`Self::apply_accepted`] and the
+    /// supervisor's own reduction only after this returns, so a failure to
+    /// append leaves both projections untouched rather than half-advanced.
+    pub fn append_acceptance(&mut self, event: &AcceptanceEvent) -> Result<(), GraphError> {
+        let payload = serde_json::to_value(event)
+            .map_err(|err| GraphError::Ledger(format!("acceptance payload: {err}")))?;
+        self.append(EventKind::OrchestrationTaskAccepted, payload)
+    }
+
+    /// Reduce an already-durable acceptance into the in-memory graph: the
+    /// goal and every verification node it names become `Succeeded`. No
+    /// append — the record this derives from is already on the ledger, and
+    /// appending again would make acceptance several writes once more.
+    /// Idempotent: a node already `Succeeded` is left alone, so replaying
+    /// the same record cannot advance the revision twice.
+    pub fn apply_accepted(&mut self, event: &AcceptanceEvent) -> Result<(), GraphError> {
+        let graph = self
+            .graphs
+            .get_mut(&event.graph_id)
+            .ok_or(GraphError::UnknownGraph)?;
+        for id in event.completed_nodes() {
+            let node = graph
+                .nodes
+                .get_mut(&id)
+                .ok_or(GraphError::Proposal(ProposalError::UnknownNode))?;
+            if node.state == NodeState::Succeeded {
+                continue;
+            }
+            node.state = NodeState::Succeeded;
+            graph.revision = graph.revision.saturating_add(1);
+        }
+        let out = graph.clone();
+        self.history.entry(event.graph_id).or_default().push(out);
+        Ok(())
     }
 
     fn append(&mut self, kind: EventKind, payload: serde_json::Value) -> Result<(), GraphError> {
