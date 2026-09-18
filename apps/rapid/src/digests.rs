@@ -25,7 +25,7 @@
 //! unavailable digests never compare equal to each other either, so an
 //! uncomputable identity can never be mistaken for a matching one.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -63,6 +63,16 @@ const TOOLCHAIN: &[(&str, &[&str])] = &[
 /// establish must never compare equal to one we could, nor to another
 /// failure.
 pub fn workspace_digest(root: &Path) -> String {
+    // `git status` reports paths relative to the repository top level, not
+    // to the process's directory. Joining them onto an arbitrary `root`
+    // silently missed every file when `root` was a subdirectory, leaving a
+    // digest over path names alone — two different edits to the same set of
+    // files then hashed identically, which is exactly the false identity
+    // match this exists to prevent. Resolve the top level and join there.
+    let Some(top) = git_output(root, &["rev-parse", "--show-toplevel"]) else {
+        return unavailable("workspace.toplevel");
+    };
+    let top = PathBuf::from(String::from_utf8_lossy(&top).trim().to_owned());
     let Some(head) = git_output(root, &["rev-parse", "HEAD"]) else {
         return unavailable("workspace.head");
     };
@@ -82,11 +92,29 @@ pub fn workspace_digest(root: &Path) -> String {
     material.extend_from_slice(b"rapidlm.workspace/v1\0");
     material.extend_from_slice(String::from_utf8_lossy(&head).trim().as_bytes());
     material.push(0);
-    material.extend_from_slice(&status);
     for path in status_paths(&status) {
+        if is_tool_state(&path) {
+            continue;
+        }
+        // The status codes matter (a deletion differs from an edit), so the
+        // per-path entry carries them; the raw blob is not hashed directly
+        // because it would re-admit the tool-state paths filtered out above.
+        material.extend_from_slice(status_code_for(&status, &path).as_bytes());
+        material.push(0);
+    }
+    for path in status_paths(&status) {
+        // RapidLM's own bookkeeping is not the user's work: `goal.json` and
+        // `goal-evidence.json` are rewritten by the very commands that
+        // record and invalidate evidence, so counting them would make the
+        // workspace identity change when nothing but the tool's own state
+        // did — and that is precisely what would make a strict
+        // stale-workspace gate refuse valid acceptances.
+        if is_tool_state(&path) {
+            continue;
+        }
         material.extend_from_slice(path.as_bytes());
         material.push(0);
-        match read_bounded(&root.join(&path)) {
+        match read_bounded(&top.join(&path)) {
             Some(bytes) => material.extend_from_slice(&bytes),
             // A path in the status that cannot be read (a deletion, a
             // permission error) contributes its absence, not nothing.
@@ -174,6 +202,28 @@ fn status_paths(status: &[u8]) -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+/// RapidLM's own state under the project marker, which changes as a side
+/// effect of the very commands that compute this digest.
+fn is_tool_state(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    normalized == ".rapidlm" || normalized.starts_with(".rapidlm/")
+}
+
+/// The `XY` status code recorded for `path`, or an empty string when the
+/// entry cannot be located (it then contributes only its name and content).
+fn status_code_for(status: &[u8], wanted: &str) -> String {
+    for field in status.split(|b| *b == 0) {
+        if field.len() < 4 {
+            continue;
+        }
+        let (code, path) = field.split_at(3);
+        if String::from_utf8_lossy(path) == wanted {
+            return String::from_utf8_lossy(code).into_owned();
+        }
+    }
+    String::new()
 }
 
 fn read_bounded(path: &Path) -> Option<Vec<u8>> {
@@ -302,6 +352,53 @@ mod tests {
         );
         std::fs::write(dir.join("new.txt"), "new\n").unwrap();
         assert_ne!(first, workspace_digest(&dir), "an untracked file counts");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_digest_sees_content_from_a_subdirectory_too() {
+        // `git status` paths are repo-root-relative, so joining them onto a
+        // subdirectory `root` missed every file and left a digest over path
+        // names alone — two different edits then hashed identically.
+        let dir = repo("subdir");
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested/keep.txt"), "one\n").unwrap();
+        let from_top = workspace_digest(&dir);
+        let from_sub = workspace_digest(&dir.join("nested"));
+        assert!(!is_unavailable(&from_sub), "{from_sub}");
+        assert_eq!(
+            from_top, from_sub,
+            "the same tree, wherever it is read from"
+        );
+
+        // And from the subdirectory, a content change still moves it.
+        std::fs::write(dir.join("nested/keep.txt"), "two\n").unwrap();
+        assert_ne!(
+            from_sub,
+            workspace_digest(&dir.join("nested")),
+            "content must change the identity from a subdirectory too"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_tools_own_state_does_not_move_the_workspace_identity() {
+        // `.rapidlm/goal.json` and `goal-evidence.json` are rewritten by the
+        // very commands that record and invalidate evidence; counting them
+        // would make the identity change when only bookkeeping did.
+        let dir = repo("tool-state");
+        let before = workspace_digest(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).unwrap();
+        std::fs::write(dir.join(".rapidlm/goal.json"), "{\"goal\":1}").unwrap();
+        std::fs::write(dir.join(".rapidlm/goal-evidence.json"), "{\"records\":[]}").unwrap();
+        assert_eq!(
+            before,
+            workspace_digest(&dir),
+            "the tool's own state is not the user's work"
+        );
+        // A real file still moves it.
+        std::fs::write(dir.join("real.txt"), "work\n").unwrap();
+        assert_ne!(before, workspace_digest(&dir));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -128,6 +128,15 @@ impl<T: Serialize> RecordEnvelope<T> {
         };
         let value = serde_json::to_value(&envelope)
             .map_err(|err| RecordError::Malformed(err.to_string()))?;
+        // `flatten` merges the body's keys into the same map, so a body with
+        // its own `record` field would overwrite the kind marker and make
+        // the record unreadable as itself — a silent loss, so it is refused.
+        if value.get("record").and_then(serde_json::Value::as_str) != Some(kind.wire().as_str()) {
+            return Err(RecordError::Malformed(
+                "the record body defines its own `record` field, which would displace the kind marker"
+                    .to_owned(),
+            ));
+        }
         let bytes = serde_json::to_vec(&value)
             .map_err(|err| RecordError::Malformed(err.to_string()))?
             .len();
@@ -285,6 +294,18 @@ mod tests {
             },
             "a major bump is the one non-additive change, so it is skipped and reported"
         );
+    }
+
+    #[test]
+    fn a_body_that_would_displace_the_kind_marker_is_refused() {
+        #[derive(Serialize)]
+        struct Shadow {
+            record: &'static str,
+        }
+        match RecordEnvelope::write(CANDIDATE, Shadow { record: "mine/v9" }) {
+            Err(RecordError::Malformed(detail)) => assert!(detail.contains("record"), "{detail}"),
+            other => panic!("a shadowing body must be refused, got {other:?}"),
+        }
     }
 
     #[test]

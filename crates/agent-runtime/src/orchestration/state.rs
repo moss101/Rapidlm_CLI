@@ -63,9 +63,12 @@ pub enum OrchestrationTransition {
     BeginReverification,
     Accept,
     /// Suspend a live run, keeping its progress (recovery's entry point).
+    ///
+    /// There is deliberately no `Resume` transition: leaving `Paused` goes
+    /// to whichever phase the run was interrupted in, which this enum cannot
+    /// name. [`crate::orchestration::Supervisor::resume_paused`] performs it
+    /// from the recorded phase instead.
     Pause,
-    /// Leave `Paused` for the phase the run was interrupted in.
-    Resume,
     Block,
     Fail,
     Cancel,
@@ -158,7 +161,6 @@ impl OrchestrationTransition {
             Self::Block => "block",
             Self::Fail => "fail",
             Self::Pause => "pause",
-            Self::Resume => "resume",
             Self::Cancel => "cancel",
         }
     }

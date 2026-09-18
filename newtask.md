@@ -8483,9 +8483,13 @@ before any persistence work — and that is what landed
   digests are real (each failing closed to an `unavailable:` value that matches nothing), so
   `goal claim`'s identity is the tree rather than a hash of the goal text; `invalidate_subject`
   got its first production caller and the gap where `git apply` bypassed the evidence hook is
-  closed; `OrchestrationState::Paused` plus `Supervisor::pause`/`resume_paused` restore an
-  interrupted run to exactly the phase it was in; and orchestration records are versioned with
-  additive evolution (unknown fields ignored, foreign records and future majors typed skips).
+  closed; `OrchestrationState::Paused` plus `Supervisor::pause`/`resume_paused` can restore an
+  interrupted run to exactly the phase it was in — the machinery, not yet a caller, because
+  nothing reconstructs a `Supervisor` after a restart until the snapshot has a reducer; and
+  orchestration records are versioned with additive evolution (unknown fields ignored, foreign
+  records and future majors typed skips). The stale-workspace gate is still not armed:
+  `current_identity` is never refreshed after the work, so it compares a value with itself —
+  only the value is now meaningful.
   **`TransactionManager` is deliberately not on the publication path**: it stages into an
   in-memory overlay ("Parent checkout is not written") that nothing materializes, so routing
   integrate through it would have stopped the child's work reaching the user's files — the

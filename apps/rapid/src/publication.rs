@@ -51,6 +51,17 @@ use protocol::{ArtifactId, ProjectId, SessionId};
 /// The action name every workspace publication fingerprints under.
 pub const PUBLISH_ACTION: &str = "workspace.publish";
 
+/// `reconcile_ref` for an in-flight effect that recovery found *did* reach
+/// the tree. Only this (and `Committed`) means "already published".
+pub const RECONCILED_APPLIED: &str = "applied: observed in the tree";
+
+/// `reconcile_ref` for an in-flight effect that recovery found did *not*
+/// reach the tree. The work still needs publishing, so a later request for
+/// the same effect must be allowed to run rather than answered "already
+/// applied" — answering otherwise tells a caller its patch is in the tree
+/// when it is not, and a caller that believes that discards the source.
+pub const RECONCILED_NOT_APPLIED: &str = "not-applied: absent from the tree";
+
 /// Proof that one patch became parent-visible: which revision it was applied
 /// onto and what was applied. The `CommitReceipt` contract of ADR 0021 §4
 /// (parent revision + patch hash + change count), carried by a record the
@@ -183,6 +194,12 @@ impl PublicationRequest<'_> {
         .map_err(|err: JournalError| PublicationError::Journal(err.to_string()))
     }
 
+    /// This request's effect identity, for scoping a recovery pass to the
+    /// one operation the caller can actually evidence.
+    pub fn fingerprint(&self) -> Result<EffectFingerprint, PublicationError> {
+        Ok(EffectFingerprint::compute(&self.spec()?))
+    }
+
     fn receipt(&self, operation: OperationId) -> PublicationReceipt {
         PublicationReceipt {
             operation,
@@ -219,9 +236,18 @@ where
         .map_err(|err| PublicationError::Journal(err.to_string()))?
     {
         match previous.state() {
-            OperationState::Committed | OperationState::Reconciled => {
+            OperationState::Committed => {
                 return Ok(Published::AlreadyApplied(request.receipt(previous.id())));
             }
+            // Reconciled says the effect is settled, not that it landed:
+            // recovery records both outcomes in this state. Only a
+            // reconciliation that observed the effect in the tree may answer
+            // "already applied"; one that observed its absence must let the
+            // request run, and an unlabelled one is not evidence of anything.
+            OperationState::Reconciled if previous.reconcile_ref() == Some(RECONCILED_APPLIED) => {
+                return Ok(Published::AlreadyApplied(request.receipt(previous.id())));
+            }
+            OperationState::Reconciled => {}
             OperationState::Failed => {}
             state @ (OperationState::Prepared
             | OperationState::Executing
@@ -263,9 +289,15 @@ where
             Ok(Published::Applied(request.receipt(operation)))
         }
         Err(detail) => {
-            // The effect did not happen; the record says so, so recovery has
-            // nothing to reconcile.
-            let _ = journal.journal.fail(operation, &cancel);
+            // The effect did not happen; the record must say so, or the next
+            // attempt meets an in-flight record it cannot distinguish from a
+            // real crash. A failure to record that is itself reported rather
+            // than swallowed.
+            journal.journal.fail(operation, &cancel).map_err(|err| {
+                PublicationError::Journal(format!(
+                    "the effect failed ({detail}) and the failure could not be recorded: {err}"
+                ))
+            })?;
             Err(PublicationError::Failed(detail))
         }
     }
@@ -284,6 +316,9 @@ pub struct RecoveryReport {
     /// In-flight operations left for a human: the reconciler could not tell
     /// whether the effect landed.
     pub undecided: Vec<OperationId>,
+    /// In-flight operations belonging to a different effect, left untouched
+    /// because this caller holds no evidence about them.
+    pub untouched: Vec<OperationId>,
 }
 
 /// What the world says about an in-flight effect.
@@ -311,6 +346,7 @@ pub enum Settlement {
 /// closed as failed and a fresh request is free to run.
 pub fn recover<F>(
     journal: &PublicationJournal,
+    only: EffectFingerprint,
     mut settle: F,
 ) -> Result<RecoveryReport, PublicationError>
 where
@@ -323,6 +359,16 @@ where
         .map_err(|err| PublicationError::Journal(err.to_string()))?;
     let mut report = RecoveryReport::default();
     for record in pending {
+        // The publication session is project-wide, so `pending` also returns
+        // other agents' in-flight work. A caller can only evidence the effect
+        // it holds the patch for; settling someone else's record from this
+        // patch would write a terminal answer with no basis — and could
+        // reconcile a live operation out from under the process performing
+        // it. Anything else is left exactly as it was.
+        if record.fingerprint() != only {
+            report.untouched.push(record.id());
+            continue;
+        }
         match record.state() {
             // Nothing happened: close it so a retry is clean. The journal's
             // closed machine has no `Prepared → Failed` edge (its only exit
@@ -353,14 +399,14 @@ where
                     Settlement::Applied => {
                         journal
                             .journal
-                            .reconcile(record.id(), "applied: observed in the tree", &cancel)
+                            .reconcile(record.id(), RECONCILED_APPLIED, &cancel)
                             .map_err(|err| PublicationError::Journal(err.to_string()))?;
                         report.reconciled.push(record.id());
                     }
                     Settlement::NotApplied => {
                         journal
                             .journal
-                            .reconcile(record.id(), "not-applied: absent from the tree", &cancel)
+                            .reconcile(record.id(), RECONCILED_NOT_APPLIED, &cancel)
                             .map_err(|err| PublicationError::Journal(err.to_string()))?;
                         report.reconciled.push(record.id());
                     }

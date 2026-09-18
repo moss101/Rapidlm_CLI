@@ -147,7 +147,10 @@ pub struct OrchestrationSnapshot {
     pub last_discovery: Option<DiscoveryResult>,
     /// The phase a paused run was interrupted in, so [`Supervisor::resume_paused`]
     /// returns to exactly it. `None` unless the run is [`OrchestrationState::Paused`].
-    /// Added with a default so an older snapshot still resumes (ADR 0021).
+    ///
+    /// The snapshot moves between processes by value, not by serde — this
+    /// type carries no `Serialize`/`Deserialize` — so a durable restore
+    /// still depends on the record set GVS-004 defines.
     pub paused_from: Option<OrchestrationState>,
 }
 

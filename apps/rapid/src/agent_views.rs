@@ -242,14 +242,24 @@ impl AgentViewManager {
             ),
         )
         .map_err(|err| err.to_string())?;
-        // Settle whatever a previous crashed run left in flight before
-        // attempting anything new, or a publication interrupted mid-apply
-        // would block this one forever with `InFlight`. Whether the earlier
-        // patch landed is decided by the tree itself: a patch that still
-        // applies cleanly was never applied.
+        let request = crate::publication::PublicationRequest {
+            principal: &agent.to_string(),
+            parent_revision: &parent_revision,
+            base_revision: &child.base_commit,
+            patch: &patch,
+            change_count: files.len(),
+        };
+        // Settle what a previous crashed run left in flight for *this exact
+        // effect* before attempting it again, or a publication interrupted
+        // mid-apply would block this one forever with `InFlight`. Scoped to
+        // this request's fingerprint: the publication session is
+        // project-wide, and this caller holds evidence about its own patch
+        // only. Whether that patch landed is decided by the tree itself — a
+        // patch that still reverse-applies is present.
         let settle_root = root.to_path_buf();
         let settle_patch = patch.clone();
-        let _ = crate::publication::recover(&journal, |_record| {
+        let fingerprint = request.fingerprint().map_err(|err| err.to_string())?;
+        let report = crate::publication::recover(&journal, fingerprint, |_record| {
             match run_git_stdin(
                 &settle_root,
                 &["apply", "--check", "--reverse", "-"],
@@ -259,14 +269,15 @@ impl AgentViewManager {
                 Ok(_) => crate::publication::Settlement::Applied,
                 Err(_) => crate::publication::Settlement::NotApplied,
             }
-        });
-        let request = crate::publication::PublicationRequest {
-            principal: &agent.to_string(),
-            parent_revision: &parent_revision,
-            base_revision: &child.base_commit,
-            patch: &patch,
-            change_count: files.len(),
-        };
+        })
+        .map_err(|err| err.to_string())?;
+        if !report.undecided.is_empty() {
+            return Err(format!(
+                "a previous publication of this patch is in an undecided state ({} operation(s)); \
+                 it must be settled before integrating again",
+                report.undecided.len()
+            ));
+        }
         let published = crate::publication::publish(&journal, &request, || {
             // Plain apply (no 3way): every patched file is provably unchanged
             // in the parent, so the patch applies cleanly or not at all.
@@ -738,8 +749,12 @@ mod tests {
             Err(PublicationError::InFlight { .. })
         ));
 
-        // Recovery settles it from the world's own evidence.
-        let report = recover(&journal, |_record| Settlement::Applied).expect("recover");
+        // Recovery settles it from the world's own evidence — and only the
+        // effect the caller can evidence.
+        let report = recover(&journal, record.fingerprint(), |_record| {
+            Settlement::Applied
+        })
+        .expect("recover");
         assert_eq!(report.reconciled, vec![record.id()]);
         assert!(report.undecided.is_empty());
         assert_eq!(
@@ -772,7 +787,10 @@ mod tests {
             .journal()
             .mark_executing(second.id(), &Default::default())
             .expect("executing");
-        let report = recover(&journal, |_record| Settlement::Unknown).expect("recover");
+        let report = recover(&journal, second.fingerprint(), |_record| {
+            Settlement::Unknown
+        })
+        .expect("recover");
         assert_eq!(report.undecided, vec![second.id()]);
         assert_eq!(
             journal
@@ -782,6 +800,139 @@ mod tests {
                 .state(),
             OperationState::Uncertain,
             "an undecidable effect stays uncertain rather than being guessed"
+        );
+    }
+
+    #[test]
+    fn recovery_never_settles_an_effect_the_caller_holds_no_evidence_about() {
+        // The publication session is project-wide, so `pending` also returns
+        // other agents' in-flight work. Settling someone else's record from
+        // this caller's patch would write a terminal answer with no basis —
+        // and could reconcile a live operation out from under the process
+        // performing it.
+        use crate::publication::{PublicationJournal, PublicationRequest, recover};
+        use event_ledger::journal::OperationState;
+
+        let repo = repo("publication-scope");
+        let ledger_path = crate::interactive::project_ledger_path(
+            &repo.root.join(crate::interactive::PROJECT_MARKER),
+        );
+        let journal = PublicationJournal::for_project(&ledger_path).expect("journal");
+
+        let other = journal
+            .journal()
+            .prepare(
+                journal.session(),
+                &event_ledger::journal::EffectSpec::new(
+                    crate::publication::PUBLISH_ACTION,
+                    "another-agent",
+                    "rev-other",
+                    "base=other patch=other",
+                )
+                .expect("spec"),
+                event_ledger::journal::IdempotencyClass::AtMostOnce,
+                &Default::default(),
+            )
+            .expect("prepare");
+        journal
+            .journal()
+            .mark_executing(other.id(), &Default::default())
+            .expect("executing");
+
+        // This caller recovers its OWN effect, which has nothing pending.
+        let mine = PublicationRequest {
+            principal: "me",
+            parent_revision: "rev-mine",
+            base_revision: "base-mine",
+            patch: b"mine",
+            change_count: 1,
+        };
+        let report = recover(&journal, mine.fingerprint().expect("fp"), |_| {
+            panic!("no record of this effect exists, so nothing may be settled")
+        })
+        .expect("recover");
+        assert_eq!(report.untouched, vec![other.id()]);
+        assert!(report.reconciled.is_empty() && report.abandoned.is_empty());
+        assert_eq!(
+            journal
+                .journal()
+                .load(other.id(), &Default::default())
+                .expect("load")
+                .state(),
+            OperationState::Executing,
+            "another agent's live operation must be left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn an_effect_reconciled_as_not_applied_is_never_reported_already_applied() {
+        // `Reconciled` says the effect is settled, not that it landed. If a
+        // not-applied reconciliation answered "already applied", integrate
+        // would report success and then reset+clean the child's worktree —
+        // destroying work that never reached the tree.
+        use crate::publication::{
+            PublicationJournal, PublicationRequest, Published, RECONCILED_NOT_APPLIED, publish,
+        };
+
+        let repo = repo("publication-not-applied");
+        let ledger_path = crate::interactive::project_ledger_path(
+            &repo.root.join(crate::interactive::PROJECT_MARKER),
+        );
+        let journal = PublicationJournal::for_project(&ledger_path).expect("journal");
+        let request = PublicationRequest {
+            principal: "agent",
+            parent_revision: "rev-1",
+            base_revision: "base-1",
+            patch: b"patch",
+            change_count: 1,
+        };
+        let spec = event_ledger::journal::EffectSpec::new(
+            crate::publication::PUBLISH_ACTION,
+            "agent",
+            "rev-1",
+            format!(
+                "base=base-1 patch={}",
+                protocol::ArtifactId::from_bytes(b"patch")
+            ),
+        )
+        .expect("spec");
+        let record = journal
+            .journal()
+            .prepare(
+                journal.session(),
+                &spec,
+                event_ledger::journal::IdempotencyClass::AtMostOnce,
+                &Default::default(),
+            )
+            .expect("prepare");
+        journal
+            .journal()
+            .mark_executing(record.id(), &Default::default())
+            .expect("executing");
+        journal
+            .journal()
+            .mark_uncertain(record.id(), &Default::default())
+            .expect("uncertain");
+        journal
+            .journal()
+            .reconcile(record.id(), RECONCILED_NOT_APPLIED, &Default::default())
+            .expect("reconciled as not applied");
+
+        // The work still needs publishing, so the request must run.
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&ran);
+        let outcome = publish(&journal, &request, move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .expect("publishes");
+        assert!(
+            matches!(outcome, Published::Applied(_)),
+            "a not-applied reconciliation must not answer AlreadyApplied: {outcome:?}"
+        );
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the effect must actually run"
         );
     }
 
@@ -804,7 +955,10 @@ mod tests {
                     crate::publication::PUBLISH_ACTION,
                     "agent",
                     "rev-1",
-                    "base=base-1 patch=abc",
+                    format!(
+                        "base=base-1 patch={}",
+                        protocol::ArtifactId::from_bytes(b"abc")
+                    ),
                 )
                 .expect("spec"),
                 event_ledger::journal::IdempotencyClass::AtMostOnce,
@@ -813,10 +967,6 @@ mod tests {
             .expect("prepare");
 
         // Nothing started, so recovery closes it and a fresh request runs.
-        let report = recover(&journal, |_| Settlement::Unknown).expect("recover");
-        assert_eq!(report.abandoned.len(), 1);
-        assert!(report.reconciled.is_empty() && report.undecided.is_empty());
-
         let request = PublicationRequest {
             principal: "agent",
             parent_revision: "rev-1",
@@ -824,6 +974,13 @@ mod tests {
             patch: b"abc",
             change_count: 1,
         };
+        let report = recover(&journal, request.fingerprint().expect("fp"), |_| {
+            Settlement::Unknown
+        })
+        .expect("recover");
+        assert_eq!(report.abandoned.len(), 1);
+        assert!(report.reconciled.is_empty() && report.undecided.is_empty());
+
         assert!(matches!(
             publish(&journal, &request, || Ok(())).expect("runs after recovery"),
             Published::Applied(_)
