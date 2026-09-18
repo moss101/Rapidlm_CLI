@@ -24,7 +24,7 @@ pub use graph::{Edge, EdgeCondition, GraphDiff, Node, NodeExplain, ReadyContext,
 pub use kinds::{EdgeKind, NodeKind, NodeState};
 pub use orch::{GraphBackedRun, RunPlan};
 pub use proposal::{EdgeSpec, GraphProposal, NodeSpec, ProposalError};
-pub use service::{GraphError, GraphService};
+pub use service::{GraphError, GraphReplay, GraphService};
 
 #[cfg(test)]
 mod tests {
@@ -40,6 +40,106 @@ mod tests {
         let ledger = EventLedger::open(dir.join("ledger.db")).expect("ledger");
         let svc = GraphService::open(ledger, SessionId::new(), ProjectId::new()).expect("open");
         (svc, dir)
+    }
+
+    /// A second `GraphService` over the same ledger file and session — what
+    /// a process restart sees.
+    fn reopen(dir: &std::path::Path, session: SessionId) -> GraphService {
+        let ledger = EventLedger::open(dir.join("ledger.db")).expect("ledger");
+        GraphService::open(ledger, session, ProjectId::new()).expect("reopen")
+    }
+
+    #[test]
+    fn replay_rebuilds_the_live_graphs_after_a_restart_at_every_transition() {
+        let (mut svc, dir) = open_service();
+        let session = svc.session();
+        // Build a non-trivial history: a graph, a proposal that adds a task
+        // and a verification node with edges, a fan-out, a state change, a
+        // failure and a retry — every event kind the reducer folds.
+        let graph = svc.create("root").expect("create");
+        let task = NodeId::new();
+        let verify = NodeId::new();
+        svc.propose(
+            graph.graph_id,
+            GraphProposal {
+                base_revision: 1,
+                add_nodes: vec![
+                    NodeSpec::new(task, NodeKind::Task, "implement").with_max_attempts(2),
+                    NodeSpec::new(verify, NodeKind::Verification, "verify"),
+                ],
+                add_edges: vec![
+                    EdgeSpec {
+                        from: graph.root,
+                        to: task,
+                        kind: EdgeKind::DecomposesInto,
+                        condition: EdgeCondition::default(),
+                    },
+                    EdgeSpec {
+                        from: task,
+                        to: verify,
+                        kind: EdgeKind::DependsOn,
+                        condition: EdgeCondition::default(),
+                    },
+                ],
+                supersede: vec![],
+                invalidate: vec![],
+            },
+        )
+        .expect("propose");
+        svc.fan_out(graph.graph_id, task, 2).expect("fanout");
+        svc.set_state(graph.graph_id, task, NodeState::Running)
+            .expect("running");
+        svc.set_state(graph.graph_id, task, NodeState::Failed)
+            .expect("failed");
+        svc.retry(graph.graph_id, task).expect("retry");
+
+        // A second service over the same file rebuilds the identical graph.
+        let live = svc.snapshot(graph.graph_id).expect("live").clone();
+        let replayed = match reopen(&dir, session).replay(session).expect("replay") {
+            GraphReplay::Rebuilt(graphs) => graphs,
+            other => panic!("expected a rebuild, got {other:?}"),
+        };
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[&graph.graph_id], live, "replayed == uninterrupted");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn replay_reports_unsupported_for_a_pre_payload_created_event() {
+        // Simulate history from before payload-complete events: a
+        // `graph.created` with only ids (no `graph`), appended straight to
+        // the ledger, must make the whole replay `Unsupported`, not a guess.
+        let (svc, dir) = open_service();
+        let session = svc.session();
+        let cancel = event_ledger::ledger::CancellationToken::new();
+        let actor = event_ledger::event::ActorRef::new(
+            event_ledger::event::ActorKind::System,
+            &protocol::EventId::new().to_string(),
+        )
+        .unwrap();
+        svc.ledger()
+            .append(
+                session,
+                actor,
+                EventKind::GraphCreated,
+                serde_json::json!({
+                    "graph_id": protocol::GraphId::new().to_string(),
+                    "revision": 1,
+                    "root": NodeId::new().to_string(),
+                }),
+                &event_ledger::ledger::AppendOptions {
+                    redaction: protocol::RedactionClass::Public,
+                    trace_id: protocol::TraceId::new(),
+                    expected_seq: None,
+                },
+                &cancel,
+            )
+            .expect("append");
+        match svc.replay(session).expect("replay") {
+            GraphReplay::Unsupported { first_seq } => assert_eq!(first_seq, 1),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

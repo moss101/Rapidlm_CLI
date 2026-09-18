@@ -1,4 +1,4 @@
-# Goal delivery — GVS5H Phase 1, first slice: the production caller (2026-09-18)
+# Goal delivery — GVS5H Phase 1, first two slices: production caller + replay reducer (2026-09-18)
 
 Baseline: `b63793a` (the last commit of the 2026-09-17 delivery). Scope: the first Phase 1
 slice ADR 0021 §"Consequences" orders before everything else — a production caller for
@@ -53,6 +53,15 @@ A second review of those fixes found a regression they introduced and two gaps, 
   `retry()` requires `attempts < max_attempts` and does not count itself, and the
   `graph.node_state_changed` payload carries `attempts`. `docs/development-ledger.md` P2-016/017
   updated to say so.
+
+## Second slice: payload-complete graph events and a replay reducer (GVS-005, partial)
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| Graph events carry enough to rebuild | done | `GraphCreated` gains the whole `graph`, `GraphRevisionCommitted` the validated `proposal` (`crates/scheduler/src/service.rs`); `GraphNodeStateChanged` already carried `node_id`/`state`/`attempts`. SDK wire types are unchanged — graph payloads are opaque `JsonValue` there |
+| A reducer rebuilds a session's graphs from events alone | done | `GraphService::replay(session) -> GraphReplay` re-applies each proposal through the same `validate_and_apply` and folds node-state/attempts changes, skipping non-graph events; `replay_rebuilds_the_live_graphs_after_a_restart_at_every_transition` builds a create/propose/fan-out/run/fail/retry history through the live API, reopens the ledger, and asserts the replayed graph equals the uninterrupted one |
+| Historical (pre-payload) events are explicit, not guessed | done | A `graph.created`/`graph.revision_committed` without its payload reduces the whole replay to `GraphReplay::Unsupported { first_seq }` (`replay_reports_unsupported_for_a_pre_payload_created_event`); nothing in production created graphs before this, so no real history is affected |
+| Full crash-at-each-boundary matrix; a resume-time caller | pending | The reducer is the durability primitive GVS-006 (single-event acceptance) and GVS-008 (recovery) consume; `VerifiedRun` still mirrors the run-state file at resume. GVS-005's crash-injection matrix lands with GVS-008 |
 
 ## Explicitly not delivered (later Phase 1 slices, unchanged plan)
 

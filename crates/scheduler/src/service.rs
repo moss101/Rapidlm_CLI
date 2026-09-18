@@ -29,6 +29,23 @@ pub enum GraphError {
     InvalidState,
 }
 
+/// Outcome of [`GraphService::replay`]. `Rebuilt` carries the reconstructed
+/// `graphs` map; `Unsupported` reports the first pre-payload event that
+/// cannot be rebuilt, rather than returning a partial or guessed graph.
+#[derive(Debug, Eq, PartialEq)]
+pub enum GraphReplay {
+    Rebuilt(BTreeMap<GraphId, RuntimeGraph>),
+    Unsupported { first_seq: u64 },
+}
+
+fn parse_graph_id(payload: &serde_json::Value, seq: u64) -> Result<GraphId, GraphError> {
+    payload
+        .get("graph_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| GraphError::Ledger(format!("seq {seq}: bad graph_id")))
+}
+
 impl GraphService {
     pub fn open(
         ledger: EventLedger,
@@ -74,6 +91,9 @@ impl GraphService {
                 "graph_id": graph_id.to_string(),
                 "revision": 1,
                 "root": root.to_string(),
+                // The whole graph, so a restart rebuilds it without guessing
+                // (ADR 0021 §2). Serialization cannot fail for an owned graph.
+                "graph": serde_json::to_value(&graph).unwrap_or(json!(null)),
             }),
         )?;
         self.graphs.insert(graph_id, graph.clone());
@@ -99,6 +119,9 @@ impl GraphService {
                         "graph_id": graph_id.to_string(),
                         "revision": next.revision,
                         "base_revision": proposal.base_revision,
+                        // The validated proposal, re-applied deterministically
+                        // on replay through the same `validate_and_apply`.
+                        "proposal": serde_json::to_value(&proposal).unwrap_or(json!(null)),
                     }),
                 )?;
                 self.graphs.insert(graph_id, next.clone());
@@ -487,6 +510,92 @@ impl GraphService {
             .filter(|e| e.from == node_id)
             .map(|e| e.to)
             .collect())
+    }
+
+    /// Rebuild every graph in `session` from its durable events alone — the
+    /// reducer ADR 0021 §2 requires, so a restart restores the same `graphs`
+    /// map a live `GraphService` held. The session may carry non-graph
+    /// events (session, run progress, orchestration); they are skipped.
+    ///
+    /// A `graph.created`/`graph.revision_committed` event written before this
+    /// slice carried no `graph`/`proposal` payload and cannot be rebuilt;
+    /// rather than guess, the whole replay returns
+    /// [`GraphReplay::Unsupported`] naming the first such sequence. Nothing
+    /// in production created graphs before payload-complete events, so no
+    /// real history is affected — the variant exists so the reducer is
+    /// honest by construction.
+    pub fn replay(&self, session: SessionId) -> Result<GraphReplay, GraphError> {
+        let cancel = event_ledger::ledger::CancellationToken::new();
+        let last = self
+            .ledger
+            .last_seq(session, &cancel)
+            .map_err(|e| GraphError::Ledger(e.to_string()))?;
+        let mut graphs: BTreeMap<GraphId, RuntimeGraph> = BTreeMap::new();
+        for seq in 1..=last {
+            let envelope = match self.ledger.get(session, seq, &cancel) {
+                Ok(envelope) => envelope,
+                Err(err) => return Err(GraphError::Ledger(err.to_string())),
+            };
+            let payload = envelope.payload();
+            match envelope.kind() {
+                EventKind::GraphCreated => {
+                    let Some(graph) = payload.get("graph").filter(|g| !g.is_null()) else {
+                        return Ok(GraphReplay::Unsupported { first_seq: seq });
+                    };
+                    let graph: RuntimeGraph = serde_json::from_value(graph.clone())
+                        .map_err(|e| GraphError::Ledger(format!("graph.created seq {seq}: {e}")))?;
+                    graphs.insert(graph.graph_id, graph);
+                }
+                EventKind::GraphRevisionCommitted => {
+                    let Some(proposal) = payload.get("proposal").filter(|p| !p.is_null()) else {
+                        return Ok(GraphReplay::Unsupported { first_seq: seq });
+                    };
+                    let proposal: GraphProposal = serde_json::from_value(proposal.clone())
+                        .map_err(|e| {
+                            GraphError::Ledger(format!("graph.revision_committed seq {seq}: {e}"))
+                        })?;
+                    let graph_id = parse_graph_id(payload, seq)?;
+                    let current = graphs.get(&graph_id).ok_or_else(|| {
+                        GraphError::Ledger(format!("seq {seq}: revision for an unknown graph"))
+                    })?;
+                    let next = crate::proposal::validate_and_apply(current, &proposal)
+                        .map_err(GraphError::Proposal)?;
+                    graphs.insert(graph_id, next);
+                }
+                EventKind::GraphNodeStateChanged => {
+                    let graph_id = parse_graph_id(payload, seq)?;
+                    let node_id: NodeId = payload
+                        .get("node_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| GraphError::Ledger(format!("seq {seq}: bad node_id")))?;
+                    let state: NodeState = payload
+                        .get("state")
+                        .cloned()
+                        .and_then(|v| serde_json::from_value(v).ok())
+                        .ok_or_else(|| GraphError::Ledger(format!("seq {seq}: bad state")))?;
+                    let attempts = payload
+                        .get("attempts")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|n| n as u32);
+                    let graph = graphs.get_mut(&graph_id).ok_or_else(|| {
+                        GraphError::Ledger(format!("seq {seq}: state change for an unknown graph"))
+                    })?;
+                    let node = graph.nodes.get_mut(&node_id).ok_or_else(|| {
+                        GraphError::Ledger(format!("seq {seq}: state change for an unknown node"))
+                    })?;
+                    node.state = state;
+                    if let Some(attempts) = attempts {
+                        node.attempts = attempts;
+                    }
+                    graph.revision = graph.revision.saturating_add(1);
+                }
+                // A rejected proposal changed nothing; every other kind
+                // belongs to some other family.
+                _ => {}
+            }
+        }
+        Ok(GraphReplay::Rebuilt(graphs))
     }
 
     fn append(&mut self, kind: EventKind, payload: serde_json::Value) -> Result<(), GraphError> {

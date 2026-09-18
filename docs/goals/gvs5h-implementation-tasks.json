@@ -1006,6 +1006,12 @@
       "date": "2026-09-18",
       "note": "First slice per ADR 0021 (production caller before persistence): `rapid run --orchestration verified` drives a playbook through scheduler::GraphService/GraphBackedRun (apps/rapid/src/workflow_verified.rs); every step transition is a durable graph event, the verification steps are the supervisor's contract, and `verified` is the supervisor's acceptance. Not a GVS-004..008 completion: replay (GVS-005), single-event acceptance (GVS-006), real identities (GVS-007) and recovery (GVS-008) remain pending; the run-state file now carries the graph/session pointer they need.",
       "evidence": "docs/goal-delivery-2026-09-18.md"
+    },
+    {
+      "phase": "P1",
+      "date": "2026-09-18",
+      "note": "Second slice per ADR 0021 (payload-complete events + reducer): `GraphCreated` now carries the whole `graph`, `GraphRevisionCommitted` the validated `proposal` (crates/scheduler/src/service.rs); `GraphService::replay(session) -> GraphReplay` rebuilds the live `graphs` map from a session's durable events alone, re-applying proposals through the same `validate_and_apply` and folding node-state/attempts changes. A pre-payload `graph.created`/`graph.revision_committed` reduces to `GraphReplay::Unsupported { first_seq }` rather than a guess (nothing in production created graphs before this, so no real history is affected). Tested: a restart after a create/propose/fan-out/run/fail/retry history replays byte-identical to the uninterrupted graph, and a pre-payload event yields Unsupported. Not yet a resume-time caller: `VerifiedRun` still mirrors the run-state file (GVS-006 single-event acceptance and GVS-008 recovery are the reducer's consumers, next in the order). GVS-005 partial: replay proven; the acceptance criterion's crash-at-each-boundary matrix lands with GVS-008.",
+      "evidence": "crates/scheduler/src/service.rs (replay, GraphReplay); crates/scheduler/src/lib.rs tests replay_rebuilds_the_live_graphs_after_a_restart_at_every_transition, replay_reports_unsupported_for_a_pre_payload_created_event"
     }
   ]
 }

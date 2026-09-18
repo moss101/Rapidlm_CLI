@@ -8462,10 +8462,16 @@ before any persistence work — and that is what landed
   found that `--retry` never un-cancelled dependents (its own doc promised it did) and that the
   cleared freshness was not persisted on a no-op resume. All fixed with revert-cycled tests; the
   delivery record lists them.
-- Not delivered, by the plan's order: replay from events (a resumed run opens a fresh graph and
-  mirrors the recorded step states; the run-state file stays the resume authority and now
-  carries the graph/session pointer), single-event acceptance, real identities, recovery of a
-  `Running` step from a crashed invocation.
+- Second slice (payload-complete events + reducer, GVS-005): `GraphCreated` now carries the whole
+  graph and `GraphRevisionCommitted` the validated proposal; `GraphService::replay(session)`
+  rebuilds a session's graphs from its durable events alone, re-applying proposals through the
+  same validator and folding state/attempts changes, with pre-payload history reported as
+  `GraphReplay::Unsupported { first_seq }` rather than guessed. Restart-and-compare tested. The
+  reducer is the primitive single-event acceptance (GVS-006) and recovery (GVS-008) consume next.
+- Not delivered, by the plan's order: a resume-time replay caller (a resumed run still opens a
+  fresh graph and mirrors the run-state file, which stays the resume authority), single-event
+  acceptance, real identities, recovery of a `Running` step from a crashed invocation, and
+  GVS-005's crash-at-each-boundary matrix (lands with GVS-008).
 
 ## Session boundary, 2026-09-17 — Windows as a real gate, a live browser driver, GVS5H Phase 0
 
