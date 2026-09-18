@@ -47,6 +47,8 @@ use scheduler::graph::EdgeCondition;
 use scheduler::kinds::{EdgeKind, NodeKind, NodeState};
 use scheduler::{EdgeSpec, GraphBackedRun, GraphError, NodeSpec, RunPlan};
 
+use serde::Deserialize as _;
+
 use crate::workflow::{PlaybookFile, RunState, Step, StepState, evidence_digest};
 
 /// Longest verification command an evidence record can cite
@@ -126,8 +128,29 @@ pub struct OrchestrationRecord {
     /// reduce it back rather than starting a fresh run that has forgotten
     /// what the last one established (GVS-008). Absent on a record written
     /// before the snapshot was serializable, which simply starts fresh.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Read leniently: a snapshot this binary cannot decode must not make
+    /// the whole run state unloadable — the run itself is still resumable
+    /// from its step records, and losing the ability to recover the
+    /// supervisor is far better than losing the run.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_snapshot"
+    )]
     pub snapshot: Option<agent_runtime::orchestration::OrchestrationSnapshot>,
+}
+
+/// Decode a persisted snapshot, treating one this binary cannot read as
+/// absent rather than failing the whole `RunState`.
+fn lenient_snapshot<'de, D>(
+    deserializer: D,
+) -> Result<Option<agent_runtime::orchestration::OrchestrationSnapshot>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 /// The supervisor's verdict on a finished run.
@@ -615,8 +638,14 @@ impl VerifiedRun {
     /// caller decides when (or whether) to re-enter the phase it was
     /// interrupted in, because an interrupted run may have left effects that
     /// a reconciliation has to settle first.
-    pub fn recovered_state(state: &RunState) -> Option<OrchestrationState> {
-        let snapshot = state.orchestration.as_ref()?.snapshot.clone()?;
+    pub fn recovered_state(state: &RunState) -> Result<Option<OrchestrationState>, String> {
+        let Some(snapshot) = state
+            .orchestration
+            .as_ref()
+            .and_then(|record| record.snapshot.clone())
+        else {
+            return Ok(None);
+        };
         let recovered = agent_runtime::orchestration::Supervisor::recover(
             snapshot,
             SupervisorDrivers {
@@ -631,8 +660,11 @@ impl VerifiedRun {
                 }),
             },
         )
-        .ok()?;
-        Some(recovered.state())
+        // Swallowing this would report "nothing to recover" for a run that
+        // genuinely left effects in flight, and it would then restart fresh
+        // — the hazard `Paused` exists to prevent.
+        .map_err(|err| format!("the recorded run could not be recovered: {err}"))?;
+        Ok(Some(recovered.state()))
     }
 
     pub fn graph_id(&self) -> protocol::GraphId {
@@ -1378,7 +1410,7 @@ mod tests {
         let playbook = diamond();
         let mut state = RunState::new(new_run_id(), &playbook, Path::new("d.json"));
         assert_eq!(
-            VerifiedRun::recovered_state(&state),
+            VerifiedRun::recovered_state(&state).expect("no error"),
             None,
             "a fresh run has nothing to recover"
         );
@@ -1401,7 +1433,7 @@ mod tests {
         // The accepted run recovers as accepted — a finished run must not be
         // reopened by a restart.
         assert_eq!(
-            VerifiedRun::recovered_state(&state),
+            VerifiedRun::recovered_state(&state).expect("no error"),
             Some(OrchestrationState::Accepted)
         );
 
@@ -1415,9 +1447,64 @@ mod tests {
             "the run was mid-flight when it was recorded"
         );
         assert_eq!(
-            VerifiedRun::recovered_state(&midway),
+            VerifiedRun::recovered_state(&midway).expect("no error"),
             Some(OrchestrationState::Paused),
             "an interrupted run comes back paused, not running"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unreadable_snapshot_does_not_make_the_whole_run_state_unloadable() {
+        // The snapshot is a large structure inside the run-state file. If a
+        // binary that cannot decode it failed the whole `RunState`, a single
+        // schema change would brick every existing run — so it is read
+        // leniently and the run stays resumable from its step records.
+        let root = scratch("lenient");
+        let playbook = diamond();
+        let mut state = RunState::new(new_run_id(), &playbook, Path::new("d.json"));
+        state.steps.insert("start".into(), StepState::Succeeded);
+        state.orchestration = Some(OrchestrationRecord {
+            mode: "verified".into(),
+            session: "s".into(),
+            graph_id: "g".into(),
+            task_id: "t".into(),
+            state: "Implementing".into(),
+            accepted: false,
+            snapshot: None,
+        });
+        crate::workflow::save_run(&root, &state).expect("save");
+
+        // Corrupt just the snapshot, as a future schema change would.
+        let path = root
+            .join(".rapidlm")
+            .join("runs")
+            .join(format!("{}.json", state.run_id));
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["orchestration"]["snapshot"] = serde_json::json!({"from": "a newer binary"});
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let reloaded = crate::workflow::load_run(&root, &playbook, &state.run_id)
+            .expect("the run state still loads");
+        assert_eq!(
+            reloaded.steps.get("start"),
+            Some(&StepState::Succeeded),
+            "the run's own progress survives an undecodable snapshot"
+        );
+        assert!(
+            reloaded
+                .orchestration
+                .as_ref()
+                .expect("the record itself survives")
+                .snapshot
+                .is_none(),
+            "the unreadable snapshot is simply absent"
+        );
+        assert_eq!(
+            VerifiedRun::recovered_state(&reloaded).expect("no error"),
+            None,
+            "and there is nothing to recover from it"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

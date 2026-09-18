@@ -8496,8 +8496,9 @@ before any persistence work — and that is what landed
   ("Parent checkout is not written" — nothing materialized an overlay), so the missing capability
   was added rather than worked around. `TransactionManager::materialize` writes a committed
   publication into a real tree, and `integrate` stages the child's changes as a `SemanticPatch`,
-  previews the merge, commits the transaction — whose required checks re-verify the parent
-  revision and every preimage — and materializes it under the journal's at-most-once record. The
+  previews the merge, commits the transaction, and materializes it under the journal's
+  at-most-once record (two-phase: bodies are written to siblings first and renamed only once all
+  exist, and a partial write is recorded `Uncertain`, never `Failed`). The
   `CommitReceipt` is the publication receipt. The caller's check *command* is deliberately not a
   verification hook: a hook runs before the checkout is written, so a command reading the real
   tree would test the unmodified files.

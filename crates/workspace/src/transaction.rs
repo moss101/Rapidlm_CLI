@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard};
 
@@ -145,9 +145,16 @@ pub enum TransactionError {
     },
     Apply(ApplyError),
     Patch(PatchError),
-    /// A committed publication could not be written into the checkout. The
-    /// tree may be partly updated; the caller's journal decides what to do.
+    /// A committed publication could not be written into the checkout, and
+    /// nothing was published: the tree is byte-identical.
     Materialize,
+    /// A committed publication was only partly written: some paths are
+    /// published and some are not. The caller must reconcile — recording
+    /// this as a plain failure would claim the tree is untouched when it is
+    /// not.
+    MaterializePartial {
+        published: usize,
+    },
     LockPoisoned,
     UnknownVariant,
     UnsupportedSchema,
@@ -461,10 +468,12 @@ impl TransactionManager {
     /// [`RepoPath`], which rejects absolute paths, drive letters, UNC
     /// prefixes and `..`, so every write lands under `root`.
     ///
-    /// Returns the number of paths written or removed. Not atomic across
-    /// files: a failure part-way leaves the earlier writes in place and
-    /// reports the path that failed, which is why the caller journals this
-    /// as an at-most-once effect and reconciles rather than retrying blindly.
+    /// Returns the number of paths written or removed. A failure before
+    /// anything is published is [`TransactionError::Materialize`] and leaves
+    /// the tree byte-identical; a failure after the first path is published
+    /// is [`TransactionError::MaterializePartial`], which tells the caller
+    /// the tree is in an in-between state that must be reconciled rather
+    /// than recorded as "the effect did not happen".
     pub fn materialize(
         &self,
         receipt: &CommitReceipt,
@@ -477,17 +486,22 @@ impl TransactionManager {
                 transaction_id: receipt.transaction_id(),
             },
         )?;
-        let mut written = 0usize;
+        // Two phases, so a failure that can be foreseen happens before the
+        // tree changes at all. Every new body is written to a sibling
+        // temporary first; only once all of them exist are they renamed into
+        // place. Renaming within a directory is the cheapest near-atomic
+        // step the filesystem offers, so the window in which the tree is
+        // half-published shrinks to the renames themselves — and the
+        // failures that actually happen (no space, a read-only file, a
+        // missing directory) all occur in phase one, where nothing has been
+        // published yet.
+        let mut pending: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut deletions: Vec<PathBuf> = Vec::new();
         for path in overlay.staged_paths() {
             check_cancel(cancel)?;
             let target = root.join(path.as_str());
             if overlay.is_deleted(path) {
-                match std::fs::remove_file(&target) {
-                    Ok(()) => written += 1,
-                    // Already gone is the state the overlay asks for.
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => return Err(TransactionError::Materialize),
-                }
+                deletions.push(target);
                 continue;
             }
             let Some(file) = overlay.get(path) else {
@@ -496,9 +510,41 @@ impl TransactionManager {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).map_err(|_| TransactionError::Materialize)?;
             }
-            std::fs::write(&target, file.bytes()).map_err(|_| TransactionError::Materialize)?;
-            set_executable(&target, file.executable())?;
+            let staging = staging_path(&target);
+            std::fs::write(&staging, file.bytes()).map_err(|_| TransactionError::Materialize)?;
+            if set_executable(&staging, file.executable()).is_err() {
+                let _ = std::fs::remove_file(&staging);
+                return Err(TransactionError::Materialize);
+            }
+            pending.push((staging, target));
+        }
+
+        // Phase two. A failure here can leave the tree partly published, so
+        // it is reported as its own error: the caller must reconcile rather
+        // than record "the effect did not happen".
+        let mut written = 0usize;
+        for (index, (staging, target)) in pending.iter().enumerate() {
+            let interrupted = cancel.is_cancelled();
+            if interrupted || std::fs::rename(staging, target).is_err() {
+                for (leftover, _) in &pending[index..] {
+                    let _ = std::fs::remove_file(leftover);
+                }
+                let clean = if interrupted {
+                    TransactionError::Cancelled
+                } else {
+                    TransactionError::Materialize
+                };
+                return Err(partial_or(written, clean));
+            }
             written += 1;
+        }
+        for target in deletions {
+            match std::fs::remove_file(&target) {
+                Ok(()) => written += 1,
+                // Already gone is the state the overlay asks for.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(partial_or(written, TransactionError::Materialize)),
+            }
         }
         Ok(written)
     }
@@ -658,6 +704,9 @@ impl fmt::Display for TransactionError {
             Self::Materialize => {
                 f.write_str("workspace publication could not be written to the checkout")
             }
+            Self::MaterializePartial { .. } => {
+                f.write_str("workspace publication was only partly written and must be reconciled")
+            }
             Self::BoundExceeded => f.write_str("workspace transaction resource bound exceeded"),
             Self::TransactionLimit { .. } => f.write_str("workspace transaction limit reached"),
             Self::Apply(err) => write!(f, "{err}"),
@@ -756,6 +805,24 @@ struct RawCommitReceipt {
 
 /// Apply the overlay's executable bit. A no-op off Unix, where the mode is
 /// not part of the file's identity.
+/// Where a body is written before it is renamed into place.
+fn staging_path(target: &Path) -> PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(".rapidlm-publish");
+    target.with_file_name(name)
+}
+
+/// `Materialize` while nothing is published, `MaterializePartial` once
+/// something is: the difference decides whether a caller may record the
+/// effect as not having happened.
+fn partial_or(published: usize, clean: TransactionError) -> TransactionError {
+    if published == 0 {
+        clean
+    } else {
+        TransactionError::MaterializePartial { published }
+    }
+}
+
 #[cfg(unix)]
 fn set_executable(path: &Path, executable: bool) -> Result<(), TransactionError> {
     use std::os::unix::fs::PermissionsExt;

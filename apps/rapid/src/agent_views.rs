@@ -49,6 +49,18 @@ pub struct ChildView {
     pub base_commit: String,
 }
 
+/// One entry of the child's `git diff --raw` against its base.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ChildChange {
+    /// `A`dded, `M`odified, `D`eleted, `R`enamed, `C`opied, `T`ype-changed.
+    status: char,
+    /// The destination file mode; `120000` is a symlink, `100755` executable.
+    dst_mode: String,
+    path: String,
+    /// The source path of a rename or copy.
+    source: Option<String>,
+}
+
 /// A publication staged and committed in the transaction manager, waiting to
 /// be written into the checkout. Held together because materializing needs
 /// the same manager that issued the receipt.
@@ -190,7 +202,7 @@ impl AgentViewManager {
     fn stage_publication(
         root: &Path,
         child: &ChildView,
-        files: &[String],
+        changes: &[ChildChange],
         agent: AgentId,
         parent_revision: &str,
     ) -> Result<StagedPublication, String> {
@@ -230,33 +242,64 @@ impl AgentViewManager {
             .quiesce(child_view.id(), &cancel)
             .map_err(|err| format!("quiesce: {err}"))?;
 
+        // Every path git named must produce an op. A path that is readable
+        // nowhere is never benign — it means the listing and the trees
+        // disagree — so it is an error rather than a silent no-op, which is
+        // how a change could previously vanish while the run reported
+        // success and then deleted the worktree holding it.
         let mut ops = Vec::new();
-        for file in files {
-            let repo_path = protocol::RepoPath::parse(file)
-                .map_err(|_| format!("'{file}' is not a repository-relative path"))?;
-            let in_parent = std::fs::read(root.join(file)).ok();
-            let child_file = child.worktree.join(file);
-            let in_child = std::fs::read(&child_file).ok();
-            match (in_parent, in_child) {
-                (Some(before), Some(after)) => {
-                    ops.push(PatchOp::delete_file(
-                        repo_path.clone(),
-                        protocol::ArtifactId::from_bytes(&before),
-                    ));
-                    ops.push(
-                        PatchOp::create_file(repo_path, after, is_executable(&child_file))
-                            .map_err(|err| format!("staging '{file}': {err:?}"))?,
-                    );
+        let delete = |path: &str| -> Result<PatchOp, String> {
+            let repo_path = protocol::RepoPath::parse(path)
+                .map_err(|_| format!("'{path}' is not a repository-relative path"))?;
+            let before = std::fs::read(root.join(path))
+                .map_err(|err| format!("reading the parent's '{path}': {err}"))?;
+            Ok(PatchOp::delete_file(
+                repo_path,
+                protocol::ArtifactId::from_bytes(&before),
+            ))
+        };
+        let create = |path: &str| -> Result<PatchOp, String> {
+            let repo_path = protocol::RepoPath::parse(path)
+                .map_err(|_| format!("'{path}' is not a repository-relative path"))?;
+            let source = child.worktree.join(path);
+            let after = std::fs::read(&source)
+                .map_err(|err| format!("reading the child's '{path}': {err}"))?;
+            PatchOp::create_file(repo_path, after, is_executable(&source))
+                .map_err(|err| format!("staging '{path}': {err:?}"))
+        };
+
+        for change in changes {
+            // A symlink's bytes are its target, so publishing it as a
+            // regular file would silently turn a link into a copy. The
+            // overlay has no symlink slot, so this is refused rather than
+            // quietly changed.
+            if change.dst_mode == "120000" {
+                return Err(format!(
+                    "'{}' is a symlink; publishing symlinks is not supported yet, \
+                     so the view is kept for a manual merge",
+                    change.path
+                ));
+            }
+            match change.status {
+                // A rename is the one case the old listing could not even
+                // see: the source must be deleted, not left behind.
+                'R' => {
+                    let source = change
+                        .source
+                        .as_deref()
+                        .ok_or_else(|| "a rename without a source".to_owned())?;
+                    ops.push(delete(source)?);
+                    ops.push(create(&change.path)?);
                 }
-                (None, Some(after)) => ops.push(
-                    PatchOp::create_file(repo_path, after, is_executable(&child_file))
-                        .map_err(|err| format!("staging '{file}': {err:?}"))?,
-                ),
-                (Some(before), None) => ops.push(PatchOp::delete_file(
-                    repo_path,
-                    protocol::ArtifactId::from_bytes(&before),
-                )),
-                (None, None) => {}
+                'C' => ops.push(create(&change.path)?),
+                'D' => ops.push(delete(&change.path)?),
+                'A' => ops.push(create(&change.path)?),
+                // Modified or type-changed: whole-file replacement, so a
+                // binary body and a mode change both survive.
+                _ => {
+                    ops.push(delete(&change.path)?);
+                    ops.push(create(&change.path)?);
+                }
             }
         }
 
@@ -315,18 +358,80 @@ impl AgentViewManager {
         )
     }
 
-    /// Changed-file names (for conflict reporting and the integration
-    /// receipt), from the same diff the patch was built from.
-    fn child_changed_files(child: &ChildView) -> Result<Vec<String>, String> {
+    /// What the child changed, as structured entries.
+    ///
+    /// `--raw -z -M` rather than `--name-only`, for three reasons that each
+    /// cost correctness under the older listing:
+    ///
+    /// - a **rename** prints only its destination under `--name-only`, so
+    ///   reconstructing a publication from that list created the new file and
+    ///   left the old one behind;
+    /// - a path with any non-ASCII byte is **quoted** by default
+    ///   (`"caf\303\251.rs"`), which is not the path and reads nowhere; `-z`
+    ///   emits raw bytes with NUL separators and no quoting;
+    /// - the raw format carries the **file modes**, so a symlink (`120000`)
+    ///   is recognisable instead of being silently published as a regular
+    ///   file containing its target's bytes.
+    fn child_changes(child: &ChildView) -> Result<Vec<ChildChange>, String> {
         let output = run_git_bytes(
             &child.worktree,
-            &["diff", "--name-only", &child.base_commit],
-            1024 * 1024,
+            &["diff", "--raw", "-z", "-M", &child.base_commit],
+            4 * 1024 * 1024,
         )?;
-        Ok(String::from_utf8_lossy(&output)
-            .lines()
-            .map(str::to_owned)
-            .collect())
+        let mut fields = output.split(|b| *b == 0).filter(|f| !f.is_empty());
+        let mut changes = Vec::new();
+        while let Some(meta) = fields.next() {
+            if !meta.starts_with(b":") {
+                // Every entry begins with the `:<modes> <shas> <status>`
+                // field; anything else means the format changed under us.
+                return Err("unrecognized git raw diff output".to_owned());
+            }
+            let meta = String::from_utf8_lossy(meta).into_owned();
+            let mut parts = meta.split_whitespace();
+            let _src_mode = parts.next().unwrap_or_default().trim_start_matches(':');
+            let dst_mode = parts.next().unwrap_or_default().to_owned();
+            let _src_sha = parts.next();
+            let _dst_sha = parts.next();
+            let status = parts.next().unwrap_or_default().to_owned();
+            let first = fields
+                .next()
+                .map(|f| String::from_utf8_lossy(f).into_owned())
+                .ok_or_else(|| "git raw diff entry without a path".to_owned())?;
+            // Rename and copy carry a second path: source first, then
+            // destination.
+            let renamed = status.starts_with('R') || status.starts_with('C');
+            let (source, path) = if renamed {
+                let second = fields
+                    .next()
+                    .map(|f| String::from_utf8_lossy(f).into_owned())
+                    .ok_or_else(|| "git rename entry without a destination".to_owned())?;
+                (Some(first), second)
+            } else {
+                (None, first)
+            };
+            changes.push(ChildChange {
+                status: status.chars().next().unwrap_or('M'),
+                dst_mode,
+                path,
+                source,
+            });
+        }
+        Ok(changes)
+    }
+
+    /// Every path a change set touches, destination and rename source alike —
+    /// what conflict reporting and the integration receipt name.
+    fn changed_paths(changes: &[ChildChange]) -> Vec<String> {
+        let mut paths = Vec::new();
+        for change in changes {
+            if let Some(source) = &change.source {
+                paths.push(source.clone());
+            }
+            paths.push(change.path.clone());
+        }
+        paths.sort();
+        paths.dedup();
+        paths
     }
 
     /// Apply the child's patch to the parent tree.
@@ -352,7 +457,8 @@ impl AgentViewManager {
             self.cleanup(root, agent)?;
             return Ok((IntegrationOutcome::NothingToApply, None));
         }
-        let files = Self::child_changed_files(&child)?;
+        let changes = Self::child_changes(&child)?;
+        let files = Self::changed_paths(&changes);
         // Conflict detection at file granularity, decided BEFORE anything is
         // written: a file the parent changed since the child's base is a
         // conflict, and the parent is left byte-identical. Deliberately
@@ -431,13 +537,24 @@ impl AgentViewManager {
         // parent revision plus patch hash — is the publication receipt, and
         // the journal records the one materializing write as the
         // at-most-once effect.
-        let staged = Self::stage_publication(root, &child, &files, agent, &parent_revision)?;
+        let staged = Self::stage_publication(root, &child, &changes, agent, &parent_revision)?;
         let published = crate::publication::publish(&journal, &request, || {
             staged
                 .manager
                 .materialize(&staged.receipt, root, &CancellationToken::new())
                 .map(|_| ())
-                .map_err(|err| format!("the publication could not be written: {err}"))
+                .map_err(|err| {
+                    let detail = format!("the publication could not be written: {err}");
+                    // A partly-written publication is not "nothing happened":
+                    // the journal must record it as uncertain so recovery
+                    // settles it instead of a retry republishing over it.
+                    match err {
+                        workspace::transaction::TransactionError::MaterializePartial { .. } => {
+                            crate::publication::EffectFailure::Partial(detail)
+                        }
+                        _ => crate::publication::EffectFailure::Untouched(detail),
+                    }
+                })
         })
         .map_err(|err| err.to_string())?;
         let _receipt = match published {
@@ -971,7 +1088,20 @@ mod tests {
         let staged = AgentViewManager::stage_publication(
             &repo.root,
             &view,
-            &["child.txt".to_owned(), "blob.bin".to_owned()],
+            &[
+                ChildChange {
+                    status: 'A',
+                    dst_mode: "100644".to_owned(),
+                    path: "child.txt".to_owned(),
+                    source: None,
+                },
+                ChildChange {
+                    status: 'A',
+                    dst_mode: "100644".to_owned(),
+                    path: "blob.bin".to_owned(),
+                    source: None,
+                },
+            ],
             agent,
             &parent_before,
         )
@@ -996,6 +1126,123 @@ mod tests {
             vec![0u8, 159, 146, 150],
             "a non-UTF-8 file survives the staged publication"
         );
+    }
+
+    #[test]
+    fn a_rename_publishes_as_a_rename_and_does_not_leave_the_old_file_behind() {
+        // `git diff --name-only` prints only a rename's destination, so a
+        // publication reconstructed from that list created the new file and
+        // left the old one in the parent — a duplicate module, reported as a
+        // clean integration, with the worktree holding the truth deleted.
+        let repo = repo("publication-rename");
+        std::fs::write(repo.root.join("old.txt"), "content\n").unwrap();
+        git_in(&repo.root, &["add", "-A"]);
+        git_in(&repo.root, &["commit", "-qm", "add old"]);
+
+        let manager = AgentViewManager::new();
+        let agent = AgentId::new();
+        let view = manager.create_for(&repo.root, agent).expect("view");
+        git_in(&view.worktree, &["mv", "old.txt", "new.txt"]);
+
+        let (outcome, held) = manager
+            .integrate(&repo.root, agent, None)
+            .expect("integrates");
+        assert!(
+            matches!(outcome, IntegrationOutcome::Integrated { .. }),
+            "{outcome:?}"
+        );
+        assert!(held.is_none());
+        assert!(
+            repo.root.join("new.txt").exists(),
+            "the destination must be published"
+        );
+        assert!(
+            !repo.root.join("old.txt").exists(),
+            "the rename source must be removed, not left behind"
+        );
+    }
+
+    #[test]
+    fn a_non_ascii_path_is_published_rather_than_silently_dropped() {
+        // git quotes non-ASCII paths by default (`"caf\303\251.rs"`), which
+        // is not a path and reads nowhere — the change used to vanish while
+        // the run reported success and deleted the worktree.
+        let repo = repo("publication-unicode");
+        let manager = AgentViewManager::new();
+        let agent = AgentId::new();
+        let view = manager.create_for(&repo.root, agent).expect("view");
+        std::fs::write(view.worktree.join("café.rs"), "fn main() {}\n").unwrap();
+
+        let (outcome, _held) = manager
+            .integrate(&repo.root, agent, None)
+            .expect("integrates");
+        assert!(
+            matches!(outcome, IntegrationOutcome::Integrated { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.root.join("café.rs")).expect("published"),
+            "fn main() {}\n"
+        );
+    }
+
+    #[test]
+    fn a_modified_and_a_deleted_file_both_publish() {
+        // The common case — the child edits an existing file — plus a
+        // deletion, neither of which any earlier test exercised.
+        let repo = repo("publication-modify");
+        std::fs::write(repo.root.join("keep.txt"), "before\n").unwrap();
+        std::fs::write(repo.root.join("gone.txt"), "doomed\n").unwrap();
+        git_in(&repo.root, &["add", "-A"]);
+        git_in(&repo.root, &["commit", "-qm", "seed"]);
+
+        let manager = AgentViewManager::new();
+        let agent = AgentId::new();
+        let view = manager.create_for(&repo.root, agent).expect("view");
+        std::fs::write(view.worktree.join("keep.txt"), "after\n").unwrap();
+        std::fs::remove_file(view.worktree.join("gone.txt")).unwrap();
+
+        let (outcome, _held) = manager
+            .integrate(&repo.root, agent, None)
+            .expect("integrates");
+        assert!(
+            matches!(outcome, IntegrationOutcome::Integrated { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.root.join("keep.txt")).expect("modified"),
+            "after\n",
+            "a modification must reach the parent"
+        );
+        assert!(
+            !repo.root.join("gone.txt").exists(),
+            "a deletion must reach the parent"
+        );
+    }
+
+    #[test]
+    fn a_symlink_is_refused_rather_than_published_as_a_regular_file() {
+        // A symlink's bytes are its target, so publishing it as a regular
+        // file silently turns a link into a copy. The overlay has no symlink
+        // slot, so the publication is refused and the view kept.
+        #[cfg(unix)]
+        {
+            let repo = repo("publication-symlink");
+            let manager = AgentViewManager::new();
+            let agent = AgentId::new();
+            let view = manager.create_for(&repo.root, agent).expect("view");
+            std::fs::write(view.worktree.join("target.txt"), "real\n").unwrap();
+            std::os::unix::fs::symlink("target.txt", view.worktree.join("link.txt")).unwrap();
+
+            let err = manager
+                .integrate(&repo.root, agent, None)
+                .expect_err("refuses a symlink");
+            assert!(err.contains("symlink"), "{err}");
+            assert!(
+                !repo.root.join("link.txt").exists(),
+                "nothing is published when the publication is refused"
+            );
+        }
     }
 
     #[test]
@@ -1310,8 +1557,12 @@ mod tests {
             patch: b"patch",
             change_count: 2,
         };
-        let err = publish(&journal, &request, || Err("the apply failed".to_owned()))
-            .expect_err("propagates the failure");
+        let err = publish(&journal, &request, || {
+            Err(crate::publication::EffectFailure::Untouched(
+                "the apply failed".to_owned(),
+            ))
+        })
+        .expect_err("propagates the failure");
         assert!(matches!(err, PublicationError::Failed(ref d) if d == "the apply failed"));
 
         // Recorded as Failed — so recovery has nothing to reconcile — and a

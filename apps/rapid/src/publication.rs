@@ -106,6 +106,28 @@ pub enum PublicationError {
     /// The effect itself failed; the caller's detail explains it and the
     /// tree is unchanged.
     Failed(String),
+    /// The effect was partly applied. The record is `Uncertain`, not
+    /// `Failed`: the tree is in an in-between state and a retry must not
+    /// simply republish over it.
+    PartiallyApplied(String),
+}
+
+/// How an effect failed, which decides what the journal records.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EffectFailure {
+    /// Nothing was applied; the tree is exactly as it was.
+    Untouched(String),
+    /// Some of the effect landed. Recording this as a plain failure would
+    /// claim the tree is untouched when it is not.
+    Partial(String),
+}
+
+impl core::fmt::Display for EffectFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Untouched(detail) | Self::Partial(detail) => f.write_str(detail),
+        }
+    }
 }
 
 impl core::fmt::Display for PublicationError {
@@ -118,6 +140,11 @@ impl core::fmt::Display for PublicationError {
                 state.as_str()
             ),
             Self::Failed(detail) => write!(f, "{detail}"),
+            Self::PartiallyApplied(detail) => write!(
+                f,
+                "the publication was only partly applied ({detail}); the tree is in an \
+                 in-between state and must be reconciled before another attempt"
+            ),
         }
     }
 }
@@ -222,7 +249,7 @@ pub fn publish<F>(
     apply: F,
 ) -> Result<Published, PublicationError>
 where
-    F: FnOnce() -> Result<(), String>,
+    F: FnOnce() -> Result<(), EffectFailure>,
 {
     let cancel = CancellationToken::new();
     let spec = request.spec()?;
@@ -288,17 +315,30 @@ where
                 .map_err(|err| PublicationError::Journal(err.to_string()))?;
             Ok(Published::Applied(request.receipt(operation)))
         }
-        Err(detail) => {
-            // The effect did not happen; the record must say so, or the next
-            // attempt meets an in-flight record it cannot distinguish from a
-            // real crash. A failure to record that is itself reported rather
-            // than swallowed.
+        // The effect provably did not happen: record it, so the next attempt
+        // does not meet an in-flight record it cannot tell from a real crash.
+        Err(EffectFailure::Untouched(detail)) => {
             journal.journal.fail(operation, &cancel).map_err(|err| {
                 PublicationError::Journal(format!(
                     "the effect failed ({detail}) and the failure could not be recorded: {err}"
                 ))
             })?;
             Err(PublicationError::Failed(detail))
+        }
+        // The effect may be partly done. Recording `Failed` would claim the
+        // tree is untouched when it is not, and the next attempt would
+        // republish over a half-published tree. `Uncertain` is what this is,
+        // and recovery settles it from the tree itself.
+        Err(EffectFailure::Partial(detail)) => {
+            journal
+                .journal
+                .mark_uncertain(operation, &cancel)
+                .map_err(|err| {
+                    PublicationError::Journal(format!(
+                        "the effect was partly applied ({detail}) and that could not be recorded: {err}"
+                    ))
+                })?;
+            Err(PublicationError::PartiallyApplied(detail))
         }
     }
 }
