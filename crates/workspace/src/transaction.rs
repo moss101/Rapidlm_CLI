@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard};
 
@@ -144,6 +145,9 @@ pub enum TransactionError {
     },
     Apply(ApplyError),
     Patch(PatchError),
+    /// A committed publication could not be written into the checkout. The
+    /// tree may be partly updated; the caller's journal decides what to do.
+    Materialize,
     LockPoisoned,
     UnknownVariant,
     UnsupportedSchema,
@@ -442,6 +446,63 @@ impl TransactionManager {
         }
     }
 
+    /// Write a committed publication into a real checkout.
+    ///
+    /// `commit_transaction` makes an overlay *parent-visible*; until this
+    /// runs the publication exists only in memory — `begin_transaction`'s
+    /// own contract is that the parent checkout is not written. Materializing
+    /// is therefore the last step of a publication that has to reach a user's
+    /// files, and it is deliberately separate: staging, verification and
+    /// visibility are all decided before anything on disk changes, so a
+    /// refusal at any of those points leaves the tree byte-identical.
+    ///
+    /// Only a receipt this manager issued can be materialized, and only
+    /// while its overlay is still the parent-visible one. Paths come from
+    /// [`RepoPath`], which rejects absolute paths, drive letters, UNC
+    /// prefixes and `..`, so every write lands under `root`.
+    ///
+    /// Returns the number of paths written or removed. Not atomic across
+    /// files: a failure part-way leaves the earlier writes in place and
+    /// reports the path that failed, which is why the caller journals this
+    /// as an at-most-once effect and reconciles rather than retrying blindly.
+    pub fn materialize(
+        &self,
+        receipt: &CommitReceipt,
+        root: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<usize, TransactionError> {
+        check_cancel(cancel)?;
+        let overlay = self.parent_overlay(receipt.parent_view_id()).ok_or(
+            TransactionError::TransactionNotFound {
+                transaction_id: receipt.transaction_id(),
+            },
+        )?;
+        let mut written = 0usize;
+        for path in overlay.staged_paths() {
+            check_cancel(cancel)?;
+            let target = root.join(path.as_str());
+            if overlay.is_deleted(path) {
+                match std::fs::remove_file(&target) {
+                    Ok(()) => written += 1,
+                    // Already gone is the state the overlay asks for.
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return Err(TransactionError::Materialize),
+                }
+                continue;
+            }
+            let Some(file) = overlay.get(path) else {
+                continue;
+            };
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|_| TransactionError::Materialize)?;
+            }
+            std::fs::write(&target, file.bytes()).map_err(|_| TransactionError::Materialize)?;
+            set_executable(&target, file.executable())?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
     /// Discard a staged parent overlay. Committed visibility cannot be undone.
     pub fn rollback(
         &self,
@@ -594,6 +655,9 @@ impl fmt::Display for TransactionError {
             Self::GitScopeRequired => {
                 f.write_str("mutating .git requires a dedicated git capability")
             }
+            Self::Materialize => {
+                f.write_str("workspace publication could not be written to the checkout")
+            }
             Self::BoundExceeded => f.write_str("workspace transaction resource bound exceeded"),
             Self::TransactionLimit { .. } => f.write_str("workspace transaction limit reached"),
             Self::Apply(err) => write!(f, "{err}"),
@@ -688,6 +752,31 @@ struct RawCommitReceipt {
     preview_hash: ArtifactId,
     patch_hash: ArtifactId,
     change_count: usize,
+}
+
+/// Apply the overlay's executable bit. A no-op off Unix, where the mode is
+/// not part of the file's identity.
+#[cfg(unix)]
+fn set_executable(path: &Path, executable: bool) -> Result<(), TransactionError> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path).map_err(|_| TransactionError::Materialize)?;
+    let mut perms = meta.permissions();
+    let mode = perms.mode();
+    let wanted = if executable {
+        mode | 0o111
+    } else {
+        mode & !0o111
+    };
+    if mode != wanted {
+        perms.set_mode(wanted);
+        std::fs::set_permissions(path, perms).map_err(|_| TransactionError::Materialize)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path, _executable: bool) -> Result<(), TransactionError> {
+    Ok(())
 }
 
 fn stage_preview(
@@ -1046,6 +1135,73 @@ mod tests {
         assert_eq!(receipt.change_count(), 1);
         assert_eq!(fs::read(fx.dir.join("src/lib.rs")).expect("disk"), b"hello");
         assert!(source.journal().expect("journal").is_empty());
+    }
+
+    #[test]
+    fn materialize_writes_a_committed_publication_into_the_checkout() {
+        // `commit_transaction` makes an overlay parent-visible but leaves the
+        // checkout alone by design, so a publication that has to reach a
+        // user's files needs this last step. Staging, verification and
+        // visibility are all decided first: until materialize runs the tree
+        // is byte-identical.
+        let (_registry, child, parent, fx) = fixture_parent();
+        let source = fx.backend.as_ref().expect("backend");
+        let manager = TransactionManager::new();
+        let preview =
+            conflict_free_preview(&child, &parent, vec![replace("src/lib.rs", 0, 5, "world")]);
+        let tx = manager
+            .begin_transaction(&preview, &parent, source, author(), &cancel())
+            .expect("begin");
+        let receipt = manager
+            .commit_transaction(tx, &parent, &[&AcceptHook], &cancel())
+            .expect("commit");
+        assert_eq!(
+            fs::read(fx.dir.join("src/lib.rs")).expect("disk"),
+            b"hello",
+            "committing alone must not touch the checkout"
+        );
+
+        let written = manager
+            .materialize(&receipt, &fx.dir, &cancel())
+            .expect("materialize");
+        assert_eq!(written, 1);
+        assert_eq!(
+            fs::read(fx.dir.join("src/lib.rs")).expect("disk"),
+            b"world",
+            "the publication is now in the user's files"
+        );
+        assert_eq!(
+            fs::read(fx.dir.join("src/keep.rs")).expect("disk"),
+            b"keep",
+            "an untouched path stays as it was"
+        );
+    }
+
+    #[test]
+    fn materialize_refuses_a_receipt_this_manager_never_issued() {
+        let (_registry, child, parent, fx) = fixture_parent();
+        let source = fx.backend.as_ref().expect("backend");
+        let issuer = TransactionManager::new();
+        let preview =
+            conflict_free_preview(&child, &parent, vec![replace("src/lib.rs", 0, 5, "world")]);
+        let tx = issuer
+            .begin_transaction(&preview, &parent, source, author(), &cancel())
+            .expect("begin");
+        let receipt = issuer
+            .commit_transaction(tx, &parent, &[&AcceptHook], &cancel())
+            .expect("commit");
+
+        // A different manager holds no such publication and must not write.
+        let stranger = TransactionManager::new();
+        assert!(matches!(
+            stranger.materialize(&receipt, &fx.dir, &cancel()),
+            Err(TransactionError::TransactionNotFound { .. })
+        ));
+        assert_eq!(
+            fs::read(fx.dir.join("src/lib.rs")).expect("disk"),
+            b"hello",
+            "a refused materialize leaves the tree byte-identical"
+        );
     }
 
     #[test]

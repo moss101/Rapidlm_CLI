@@ -125,7 +125,11 @@ pub struct SupervisorDrivers {
 }
 
 /// Serializable orchestration snapshot for resume.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// Additive by construction: every field that arrived after v1 carries a
+/// serde default, so a snapshot written by an older binary still loads
+/// (GVS-004's rule, applied to the one record that crosses a restart).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OrchestrationSnapshot {
     pub state: OrchestrationState,
     pub contract: TaskContract,
@@ -148,9 +152,10 @@ pub struct OrchestrationSnapshot {
     /// The phase a paused run was interrupted in, so [`Supervisor::resume_paused`]
     /// returns to exactly it. `None` unless the run is [`OrchestrationState::Paused`].
     ///
-    /// The snapshot moves between processes by value, not by serde — this
-    /// type carries no `Serialize`/`Deserialize` — so a durable restore
-    /// still depends on the record set GVS-004 defines.
+    /// Defaulted on read, so a snapshot written before this field existed
+    /// still loads and simply resumes unpaused — the additive rule GVS-004
+    /// sets, applied to the one record that crosses a restart.
+    #[serde(default)]
     pub paused_from: Option<OrchestrationState>,
 }
 
@@ -288,6 +293,30 @@ impl Supervisor {
             OrchestrationEventKind::TaskContractCreated,
             "contract accepted",
         )?;
+        Ok(supervisor)
+    }
+
+    /// Restore a run that a previous process was executing, **paused**.
+    ///
+    /// The reducer half of recovery (GVS-008): a snapshot says where a run
+    /// had got to, and this turns it back into a live `Supervisor` without
+    /// resuming the phase it was interrupted in. That matters because an
+    /// interrupted run may have left an effect in flight — a publication
+    /// part-written, a check half-run — which a reconciliation or a human
+    /// has to settle before the run advances. A terminal run is restored as
+    /// it was: there is nothing to pause and nothing in flight.
+    ///
+    /// [`Self::resume_paused`] is the explicit step back into the recorded
+    /// phase, so nothing restarts by accident.
+    pub fn recover(
+        snapshot: OrchestrationSnapshot,
+        drivers: SupervisorDrivers,
+    ) -> Result<Self, SupervisorError> {
+        let mut supervisor = Self::resume(snapshot, drivers)?;
+        let state = supervisor.snapshot.state;
+        if !state.is_terminal() && state != OrchestrationState::Paused {
+            supervisor.pause()?;
+        }
         Ok(supervisor)
     }
 
@@ -1870,6 +1899,99 @@ mod tests {
         assert_eq!(resumed.snapshot().paused_from, None);
         // Resuming a run that is not paused is refused rather than guessed.
         assert!(resumed.resume_paused().is_err());
+    }
+
+    #[test]
+    fn a_recovered_run_reduces_from_a_serialized_snapshot_and_comes_back_paused() {
+        // GVS-008's reducer: a snapshot crosses a process boundary as data,
+        // and the run comes back paused rather than resuming a phase whose
+        // in-flight effects nobody has settled yet.
+        let id = GoalId::new();
+        let eid = evidence_id();
+        let mut sup = start_with(FakeScript {
+            task_id: id,
+            evidence: vec![eid],
+            include_evidence: true,
+            refute_n: 0,
+            fail_checks: false,
+        });
+        record_supporting_evidence(&mut sup, eid);
+        drive_to_implementing(&mut sup);
+        sup.advance().unwrap();
+        sup.run_checks().unwrap();
+        let interrupted = sup.state();
+
+        // Through serde, as a restart would.
+        let encoded = serde_json::to_string(sup.snapshot()).expect("snapshot serializes");
+        let restored: OrchestrationSnapshot =
+            serde_json::from_str(&encoded).expect("and deserializes");
+        assert_eq!(&restored, sup.snapshot(), "the snapshot round-trips");
+
+        let mut recovered = Supervisor::recover(
+            restored,
+            SupervisorDrivers::fakes(FakeScript {
+                task_id: id,
+                evidence: vec![eid],
+                include_evidence: true,
+                refute_n: 0,
+                fail_checks: false,
+            }),
+        )
+        .expect("recovers");
+        assert_eq!(
+            recovered.state(),
+            OrchestrationState::Paused,
+            "an interrupted run comes back paused, not running"
+        );
+        assert_eq!(recovered.resume_paused().expect("resumes"), interrupted);
+
+        // A snapshot from before `paused_from` existed still loads.
+        let mut older: serde_json::Value = serde_json::from_str(&encoded).expect("value");
+        older
+            .as_object_mut()
+            .expect("object")
+            .remove("paused_from")
+            .expect("the field was there");
+        let older: OrchestrationSnapshot =
+            serde_json::from_value(older).expect("an older snapshot still loads");
+        assert_eq!(older.paused_from, None);
+    }
+
+    #[test]
+    fn a_terminal_run_is_recovered_as_it_was_with_nothing_to_pause() {
+        let id = GoalId::new();
+        let eid = evidence_id();
+        let mut sup = start_with(FakeScript {
+            task_id: id,
+            evidence: vec![eid],
+            include_evidence: true,
+            refute_n: 0,
+            fail_checks: false,
+        });
+        record_supporting_evidence(&mut sup, eid);
+        drive_to_implementing(&mut sup);
+        sup.advance().unwrap();
+        sup.run_checks().unwrap();
+        sup.verify().unwrap();
+        sup.accept().unwrap();
+        assert_eq!(sup.state(), OrchestrationState::Accepted);
+
+        let recovered = Supervisor::recover(
+            sup.snapshot().clone(),
+            SupervisorDrivers::fakes(FakeScript {
+                task_id: id,
+                evidence: vec![eid],
+                include_evidence: true,
+                refute_n: 0,
+                fail_checks: false,
+            }),
+        )
+        .expect("recovers");
+        assert_eq!(
+            recovered.state(),
+            OrchestrationState::Accepted,
+            "a finished run must not be reopened by a restart"
+        );
     }
 
     #[test]

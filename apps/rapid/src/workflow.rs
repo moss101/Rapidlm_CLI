@@ -1366,6 +1366,7 @@ mod tests {
             task_id: "t".into(),
             state: "Implementing".into(),
             accepted: false,
+            snapshot: None,
         });
         let agent: AgentStepFn = Arc::new(|_k, _t| Ok("n/a".into()));
         let commands: CommandStepFn = Arc::new(|_c, _t| Ok("checks pass".into()));

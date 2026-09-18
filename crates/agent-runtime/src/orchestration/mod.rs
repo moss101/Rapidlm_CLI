@@ -42,9 +42,9 @@ pub use state::{
     OrchestrationState, OrchestrationTransition, TransitionError, validate_transition,
 };
 pub use supervisor::{
-    AcceptanceRecord, AgentContextPacket, DiscoveryResult, Explorer, Implementer, PlanResult,
-    Planner, Retriever, Strategist, StrategyRevision, Supervisor, SupervisorDrivers,
-    SupervisorError, Verifier,
+    AcceptanceRecord, AgentContextPacket, DiscoveryResult, Explorer, Implementer,
+    OrchestrationSnapshot, PlanResult, Planner, Retriever, Strategist, StrategyRevision,
+    Supervisor, SupervisorDrivers, SupervisorError, Verifier,
 };
 pub use verification::{
     Attestation, RequirementVerification, RequirementVerificationStatus, Verdict,

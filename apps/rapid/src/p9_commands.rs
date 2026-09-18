@@ -1241,6 +1241,7 @@ mod tests {
             task_id: "t".into(),
             state: "Accepted".into(),
             accepted: true,
+            snapshot: None,
         });
         let report: serde_json::Value =
             serde_json::from_str(&final_report(&state, true, &[])).expect("json");

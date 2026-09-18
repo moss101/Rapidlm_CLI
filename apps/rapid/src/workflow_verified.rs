@@ -122,6 +122,12 @@ pub struct OrchestrationRecord {
     pub task_id: String,
     pub state: String,
     pub accepted: bool,
+    /// The supervisor snapshot this run reached, so a later invocation can
+    /// reduce it back rather than starting a fresh run that has forgotten
+    /// what the last one established (GVS-008). Absent on a record written
+    /// before the snapshot was serializable, which simply starts fresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<agent_runtime::orchestration::OrchestrationSnapshot>,
 }
 
 /// The supervisor's verdict on a finished run.
@@ -597,7 +603,36 @@ impl VerifiedRun {
             task_id: self.task_id.to_string(),
             state: format!("{:?}", self.run.orchestration_state()),
             accepted: self.accepted,
+            snapshot: Some(self.run.supervisor.snapshot().clone()),
         }
+    }
+
+    /// What a previous invocation's supervisor had reached, recovered as
+    /// paused — the reducer half of GVS-008 applied to this run. `None` when
+    /// there is nothing to recover, in which case the run starts fresh.
+    ///
+    /// Recovering does not resume: the restored run is `Paused`, and the
+    /// caller decides when (or whether) to re-enter the phase it was
+    /// interrupted in, because an interrupted run may have left effects that
+    /// a reconciliation has to settle first.
+    pub fn recovered_state(state: &RunState) -> Option<OrchestrationState> {
+        let snapshot = state.orchestration.as_ref()?.snapshot.clone()?;
+        let recovered = agent_runtime::orchestration::Supervisor::recover(
+            snapshot,
+            SupervisorDrivers {
+                planner: Box::new(HostBlocked),
+                explorer: Box::new(HostBlocked),
+                retriever: Box::new(HostBlocked),
+                implementer: Box::new(HostBlocked),
+                verifiers: Vec::new(),
+                strategist: Box::new(HostBlocked),
+                checks: Box::new(ReplayedChecks {
+                    results: Arc::new(Mutex::new(BTreeMap::new())),
+                }),
+            },
+        )
+        .ok()?;
+        Some(recovered.state())
     }
 
     pub fn graph_id(&self) -> protocol::GraphId {
@@ -794,6 +829,30 @@ impl Implementer for HostBlocked {
     ) -> Result<CandidateCompletion, SupervisorError> {
         Err(SupervisorError::Agent(
             "the implementer is the run's own steps".into(),
+        ))
+    }
+}
+
+impl Planner for HostBlocked {
+    fn plan(&self, _packet: &AgentContextPacket) -> Result<PlanResult, SupervisorError> {
+        Err(SupervisorError::Agent(
+            "a recovered run does not re-plan".into(),
+        ))
+    }
+}
+
+impl Explorer for HostBlocked {
+    fn explore(&self, _packet: &AgentContextPacket) -> Result<DiscoveryResult, SupervisorError> {
+        Err(SupervisorError::Agent(
+            "a recovered run does not re-explore".into(),
+        ))
+    }
+}
+
+impl Retriever for HostBlocked {
+    fn retrieve(&self, _packet: &AgentContextPacket) -> Result<DiscoveryResult, SupervisorError> {
+        Err(SupervisorError::Agent(
+            "a recovered run does not re-retrieve".into(),
         ))
     }
 }
@@ -1305,6 +1364,60 @@ mod tests {
                 reason: "denied by the operator".to_owned(),
             },
             "must not wedge on `graph and run state disagree`"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_resumed_verified_run_recovers_its_supervisor_as_paused() {
+        // GVS-008: the run-state file now carries the supervisor snapshot,
+        // so a later invocation reduces it back instead of forgetting what
+        // the last one established — and it comes back *paused*, because an
+        // interrupted run may have left effects nobody has settled.
+        let root = scratch("recovered");
+        let playbook = diamond();
+        let mut state = RunState::new(new_run_id(), &playbook, Path::new("d.json"));
+        assert_eq!(
+            VerifiedRun::recovered_state(&state),
+            None,
+            "a fresh run has nothing to recover"
+        );
+
+        let (mut run, _session) = open(&playbook, &state, &root, &root);
+        let (agent, command, human) = closures();
+        let cancel = agent_runtime::CancellationToken::new();
+        let outcome = execute_run(
+            &playbook,
+            &mut state,
+            &context(&root),
+            agent,
+            command,
+            human,
+            &cancel,
+            Some(&mut run),
+        );
+        assert_eq!(outcome, RunOutcome::Verified);
+
+        // The accepted run recovers as accepted — a finished run must not be
+        // reopened by a restart.
+        assert_eq!(
+            VerifiedRun::recovered_state(&state),
+            Some(OrchestrationState::Accepted)
+        );
+
+        // A run interrupted mid-flight recovers paused instead.
+        let mut midway = RunState::new(new_run_id(), &playbook, Path::new("d.json"));
+        let (run, _session) = open(&playbook, &midway, &root, &root);
+        midway.orchestration = Some(run.record());
+        assert_eq!(
+            run.record().state,
+            "Implementing",
+            "the run was mid-flight when it was recorded"
+        );
+        assert_eq!(
+            VerifiedRun::recovered_state(&midway),
+            Some(OrchestrationState::Paused),
+            "an interrupted run comes back paused, not running"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -8492,10 +8492,15 @@ before any persistence work — and that is what landed
   tree after verification, so acceptance compares the workspace that was verified against the one
   being accepted. `rapid run --orchestration verified` still leaves it off (its identity is the
   `watch`-glob digest, not the tree).
-  **`TransactionManager` is deliberately not on the publication path**: it stages into an
-  in-memory overlay ("Parent checkout is not written") that nothing materializes, so routing
-  integrate through it would have stopped the child's work reaching the user's files — the
-  contract is implemented, the type is not, and the reasoning is in the module doc.
+  **Publication now goes through `TransactionManager`**: it could not write a checkout at all
+  ("Parent checkout is not written" — nothing materialized an overlay), so the missing capability
+  was added rather than worked around. `TransactionManager::materialize` writes a committed
+  publication into a real tree, and `integrate` stages the child's changes as a `SemanticPatch`,
+  previews the merge, commits the transaction — whose required checks re-verify the parent
+  revision and every preimage — and materializes it under the journal's at-most-once record. The
+  `CommitReceipt` is the publication receipt. The caller's check *command* is deliberately not a
+  verification hook: a hook runs before the checkout is written, so a command reading the real
+  tree would test the unmodified files.
 - Not delivered, by the plan's order: a resume-time replay caller (a resumed run still opens a
   fresh graph and mirrors the run-state file, which stays the resume authority), single-event
   acceptance, real identities, recovery of a `Running` step from a crashed invocation, and

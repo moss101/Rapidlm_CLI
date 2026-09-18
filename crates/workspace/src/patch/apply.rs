@@ -157,6 +157,13 @@ impl StagingOverlay {
         }
     }
 
+    /// Every path this overlay stages, in order. Paired with [`Self::get`]
+    /// and [`Self::is_deleted`] it is enough to write the overlay out — the
+    /// step that turns a staged publication into files on disk.
+    pub fn staged_paths(&self) -> impl Iterator<Item = &RepoPath> {
+        self.slots.keys()
+    }
+
     pub fn is_deleted(&self, path: &RepoPath) -> bool {
         matches!(self.slots.get(path), Some(OverlaySlot::Deleted { .. }))
     }

@@ -49,6 +49,31 @@ pub struct ChildView {
     pub base_commit: String,
 }
 
+/// A publication staged and committed in the transaction manager, waiting to
+/// be written into the checkout. Held together because materializing needs
+/// the same manager that issued the receipt.
+struct StagedPublication {
+    manager: workspace::transaction::TransactionManager,
+    receipt: workspace::transaction::CommitReceipt,
+}
+
+/// Whether a path is executable. Always false off Unix, where the bit is not
+/// part of a file's identity.
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|meta| meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// What `integrate` did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IntegrationOutcome {
@@ -151,6 +176,126 @@ impl AgentViewManager {
     fn store_for(root: &Path) -> Result<GitWorktreeStore, String> {
         let cancel = CancellationToken::new();
         GitWorktreeStore::open(root, &cancel).map_err(|err| err.to_string())
+    }
+
+    /// Stage the child's changes as a workspace transaction and commit it,
+    /// leaving the publication parent-visible but not yet written.
+    ///
+    /// Every changed path becomes whole-file ops: a delete carrying the
+    /// parent's preimage hash, a create carrying the child's bytes, or both
+    /// for a modification. Whole-file rather than ranged edits because the
+    /// child's diff may be binary and because a mode change must survive;
+    /// the preimage is what makes the transaction refuse a parent that moved
+    /// under it, a stronger guarantee than the per-file check above.
+    fn stage_publication(
+        root: &Path,
+        child: &ChildView,
+        files: &[String],
+        agent: AgentId,
+        parent_revision: &str,
+    ) -> Result<StagedPublication, String> {
+        use workspace::patch::model::{PatchOp, SemanticPatch};
+
+        let cancel = CancellationToken::new();
+        let repo = RepoId::new();
+        let registry = ViewRegistry::new();
+        // The child is the git worktree the agent wrote in, and carries no
+        // write owner so it can be quiesced — a patch is previewed only
+        // against a view that has stopped changing. The parent is the
+        // project checkout, owned for the duration of the publication.
+        let child_view = registry
+            .create(
+                CreateView::new(
+                    repo,
+                    WorkspaceBackend::GitWorktree,
+                    parent_revision,
+                    ViewAccess::ReadWrite,
+                ),
+                &cancel,
+            )
+            .map_err(|err| format!("staging child view: {err}"))?;
+        let parent_view = registry
+            .create(
+                CreateView::new(
+                    repo,
+                    WorkspaceBackend::Direct,
+                    parent_revision,
+                    ViewAccess::ReadWrite,
+                )
+                .with_write_owner(agent),
+                &cancel,
+            )
+            .map_err(|err| format!("staging parent view: {err}"))?;
+        let child_view = registry
+            .quiesce(child_view.id(), &cancel)
+            .map_err(|err| format!("quiesce: {err}"))?;
+
+        let mut ops = Vec::new();
+        for file in files {
+            let repo_path = protocol::RepoPath::parse(file)
+                .map_err(|_| format!("'{file}' is not a repository-relative path"))?;
+            let in_parent = std::fs::read(root.join(file)).ok();
+            let child_file = child.worktree.join(file);
+            let in_child = std::fs::read(&child_file).ok();
+            match (in_parent, in_child) {
+                (Some(before), Some(after)) => {
+                    ops.push(PatchOp::delete_file(
+                        repo_path.clone(),
+                        protocol::ArtifactId::from_bytes(&before),
+                    ));
+                    ops.push(
+                        PatchOp::create_file(repo_path, after, is_executable(&child_file))
+                            .map_err(|err| format!("staging '{file}': {err:?}"))?,
+                    );
+                }
+                (None, Some(after)) => ops.push(
+                    PatchOp::create_file(repo_path, after, is_executable(&child_file))
+                        .map_err(|err| format!("staging '{file}': {err:?}"))?,
+                ),
+                (Some(before), None) => ops.push(PatchOp::delete_file(
+                    repo_path,
+                    protocol::ArtifactId::from_bytes(&before),
+                )),
+                (None, None) => {}
+            }
+        }
+
+        let patch = SemanticPatch::new(ops, agent, parent_revision, &cancel)
+            .map_err(|err| format!("staging patch: {err:?}"))?;
+        let empty = SemanticPatch::new(Vec::new(), agent, parent_revision, &cancel)
+            .map_err(|err| format!("staging patch: {err:?}"))?;
+        let preview =
+            workspace::merge::preview_merge(&child_view, &parent_view, &patch, &empty, &cancel)
+                .map_err(|err| format!("merge preview: {err:?}"))?;
+        if !preview.is_conflict_free() {
+            return Err("the staged publication conflicts with the parent".to_owned());
+        }
+        let backend = workspace::backends::direct::DirectBackend::open_with(
+            root,
+            parent_view.clone(),
+            workspace::backends::direct::DirectOptions::interactive(),
+            &cancel,
+        )
+        .map_err(|err| format!("workspace backend: {err}"))?;
+        let manager = workspace::transaction::TransactionManager::new();
+        let tx = manager
+            .begin_transaction(&preview, &parent_view, &backend, agent, &cancel)
+            .map_err(|err| format!("begin publication: {err}"))?;
+        // The transaction's own required checks gate visibility: the parent
+        // revision must still match and every preimage must still hold. The
+        // caller's check command is deliberately NOT a hook — a hook runs
+        // before the checkout is written, so a command that reads the real
+        // tree would test the unmodified files. It runs after materializing,
+        // as it always has.
+        let receipt = manager
+            .commit_transaction(
+                tx,
+                &parent_view,
+                &[&workspace::transaction::AcceptHook],
+                &cancel,
+            )
+            .map_err(|err| format!("publication refused: {err}"))?;
+        Ok(StagedPublication { manager, receipt })
     }
 
     /// The parent's current revision — the baseline a publication is frozen
@@ -278,17 +423,21 @@ impl AgentViewManager {
                 report.undecided.len()
             ));
         }
+        // Publication goes through `workspace::TransactionManager` (ADR 0021
+        // §4): the child's changes are staged against the parent as a
+        // semantic patch, the transaction's required checks re-verify the
+        // parent revision and every preimage, and only a committed
+        // transaction is written into the checkout. The `CommitReceipt` —
+        // parent revision plus patch hash — is the publication receipt, and
+        // the journal records the one materializing write as the
+        // at-most-once effect.
+        let staged = Self::stage_publication(root, &child, &files, agent, &parent_revision)?;
         let published = crate::publication::publish(&journal, &request, || {
-            // Plain apply (no 3way): every patched file is provably unchanged
-            // in the parent, so the patch applies cleanly or not at all.
-            run_git_stdin(root, &["apply", "-"], &patch)
+            staged
+                .manager
+                .materialize(&staged.receipt, root, &CancellationToken::new())
                 .map(|_| ())
-                .map_err(|(output, code)| {
-                    format!(
-                        "the apply failed ({code}; parent left as it was): {}",
-                        String::from_utf8_lossy(&output)
-                    )
-                })
+                .map_err(|err| format!("the publication could not be written: {err}"))
         })
         .map_err(|err| err.to_string())?;
         let _receipt = match published {
@@ -800,6 +949,52 @@ mod tests {
                 .state(),
             OperationState::Uncertain,
             "an undecidable effect stays uncertain rather than being guessed"
+        );
+    }
+
+    #[test]
+    fn publication_goes_through_a_workspace_transaction_and_its_receipt() {
+        // ADR 0021 §4: a candidate reaches the user's tree only through
+        // `TransactionManager` — staged, required-checks-verified, committed,
+        // then materialized. The receipt is the parent revision the patch was
+        // published onto plus the patch hash.
+        let repo = repo("publication-transaction");
+        let manager = AgentViewManager::new();
+        let agent = AgentId::new();
+        let view = manager.create_for(&repo.root, agent).expect("view");
+        std::fs::write(view.worktree.join("child.txt"), "from the child\n").unwrap();
+        // A binary file and an executable, to prove whole-file staging keeps
+        // both — a ranged text edit could carry neither.
+        std::fs::write(view.worktree.join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
+        let parent_before = git_in(&repo.root, &["rev-parse", "HEAD"]).trim().to_owned();
+
+        let staged = AgentViewManager::stage_publication(
+            &repo.root,
+            &view,
+            &["child.txt".to_owned(), "blob.bin".to_owned()],
+            agent,
+            &parent_before,
+        )
+        .expect("stages");
+        // Committing alone leaves the checkout untouched.
+        assert!(!repo.root.join("child.txt").exists());
+        assert_eq!(staged.receipt.parent_revision(), parent_before);
+        assert_eq!(staged.receipt.change_count(), 2);
+
+        // Materializing is what writes the files.
+        let written = staged
+            .manager
+            .materialize(&staged.receipt, &repo.root, &CancellationToken::new())
+            .expect("materialize");
+        assert_eq!(written, 2);
+        assert_eq!(
+            std::fs::read_to_string(repo.root.join("child.txt")).unwrap(),
+            "from the child\n"
+        );
+        assert_eq!(
+            std::fs::read(repo.root.join("blob.bin")).unwrap(),
+            vec![0u8, 159, 146, 150],
+            "a non-UTF-8 file survives the staged publication"
         );
     }
 
