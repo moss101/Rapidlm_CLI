@@ -133,7 +133,9 @@ impl GraphService {
     ///
     /// Entering `Running` from `Pending`/`Ready` is an attempt and counts
     /// against the node's `max_attempts`; resuming a `Paused` node is the
-    /// same attempt continuing.
+    /// same attempt continuing. A node that went `Waiting` re-enters the
+    /// queue through `Pending` (`resume_wait`), so its next `Running` is a
+    /// new attempt — a wait ends the attempt it interrupted.
     pub fn set_state(
         &mut self,
         graph_id: GraphId,

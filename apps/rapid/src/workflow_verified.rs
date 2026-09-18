@@ -645,9 +645,10 @@ fn contract(
             text: text(step),
         })
         .collect();
-    // Every step may run to its retry ceiling with its own timeout: the
-    // supervisor's wall-clock budget is that sum, so it never cuts a run
-    // short that the playbook itself allows.
+    // The contract's wall-clock budget is the sum of every step's ceiling
+    // times its attempts — what the playbook itself allows. It is recorded,
+    // not enforced: only `Supervisor::advance` checks the budget, and this
+    // run advances only before its steps run.
     let wall_clock_ms: u64 = playbook
         .steps
         .iter()
@@ -1075,6 +1076,43 @@ mod tests {
             check,
             vec!["running", "failed", "pending", "running", "succeeded"],
             "the retry is a graph transition, not a private counter"
+        );
+
+        // A retrying *dependency* keeps its dependent waiting on the graph
+        // and in the run state alike: `build` fails once, `check` is not
+        // cancelled, and the run is accepted after the retry.
+        let mut upstream = playbook.clone();
+        upstream.steps[0].max_attempts = 2;
+        upstream.steps[1].max_attempts = 1;
+        let mut state = RunState::new(new_run_id(), &upstream, Path::new("u.json"));
+        let (mut run, session) = open(&upstream, &state, &root, &root);
+        let nodes = run.nodes().clone();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builds_for_agent = Arc::clone(&builds);
+        let agent: AgentStepFn = Arc::new(move |_key, _task| {
+            if builds_for_agent.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err("transient".to_owned())
+            } else {
+                Ok("built".to_owned())
+            }
+        });
+        let (_, command, human) = closures();
+        let outcome = execute_run(
+            &upstream,
+            &mut state,
+            &context(&root),
+            agent,
+            command,
+            human,
+            &cancel,
+            Some(&mut run),
+        );
+        assert_eq!(outcome, RunOutcome::Verified);
+        let seen = transitions(&root, session, &nodes);
+        assert!(
+            !seen
+                .iter()
+                .any(|(key, state)| key == "check" && state == "cancelled")
         );
 
         // With one attempt the failure is final: the run stops before any

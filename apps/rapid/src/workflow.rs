@@ -186,6 +186,10 @@ pub fn load_playbook(path: &Path) -> Result<(PlaybookFile, RuntimeGraph), Workfl
                 })
                 .unwrap_or_default()
         };
+        // An empty `label` or `command` is the same as none: a label falls
+        // back to the key, and a command-bearing step without a real
+        // command is rejected below rather than run as `""`.
+        let field = |name: &str| field(name).filter(|value| !value.is_empty());
         steps.push(Step {
             key: key.clone(),
             kind,
@@ -657,39 +661,58 @@ pub fn execute_run(
                 reason: err.to_string(),
             }
         };
-    if let Some(verified) = orchestration.as_deref() {
-        state.orchestration = Some(verified.record());
-        save_run_ok(context.root, state);
+    // Fresh means this invocation: a verification step that passed last
+    // time is finished, not verified, until it runs again (`load_run`
+    // already drops the entries whose watched files changed; the rest are
+    // dropped here so a resume that runs nothing cannot report `verified`).
+    state.fresh_verification.clear();
+    match orchestration.as_deref() {
+        Some(verified) => {
+            state.orchestration = Some(verified.record());
+            save_run_ok(context.root, state);
+        }
+        None => {
+            // A run that started verified and continues with the mode off
+            // keeps the pointer to its graph but not its verdict: nothing
+            // on this path can accept.
+            if let Some(record) = state.orchestration.as_mut() {
+                record.state = "abandoned: resumed with orchestration.mode = off".to_owned();
+                record.accepted = false;
+                save_run_ok(context.root, state);
+            }
+        }
     }
 
     loop {
         if cancel.is_cancelled() {
             return RunOutcome::Cancelled;
         }
-        // Ready = pending/failed-with-retries whose dependencies succeeded.
+        // Ready = pending, or failed with attempts left, whose dependencies
+        // all succeeded. A dependency that failed *for good* (attempts
+        // exhausted, or cancelled) cancels its dependents; one that is
+        // still retrying merely keeps them waiting — the same rule the
+        // Runtime Graph applies (`PredecessorSucceeded`).
         let mut ready: Vec<&Step> = Vec::new();
         for step in &playbook.steps {
             match state.steps.get(&step.key) {
                 Some(StepState::Pending) => {}
-                Some(StepState::Failed { .. }) => {
-                    let attempts = state.attempts.get(&step.key).copied().unwrap_or(1);
-                    if attempts < step.max_attempts {
-                        ready.push(step);
-                    }
-                    continue;
-                }
+                Some(StepState::Failed { .. }) if !failed_for_good(state, step) => {}
                 _ => continue,
             }
             let deps_met = step
                 .depends_on
                 .iter()
                 .all(|dep| state.steps.get(dep) == Some(&StepState::Succeeded));
-            let deps_failed = step.depends_on.iter().any(|dep| {
-                matches!(
-                    state.steps.get(dep),
-                    Some(StepState::Failed { .. }) | Some(StepState::Cancelled)
-                )
-            });
+            let deps_failed = step
+                .depends_on
+                .iter()
+                .any(|dep| match state.steps.get(dep) {
+                    Some(StepState::Cancelled) => true,
+                    Some(StepState::Failed { .. }) => steps_by_key
+                        .get(dep.as_str())
+                        .is_some_and(|dep_step| failed_for_good(state, dep_step)),
+                    _ => false,
+                });
             if deps_failed {
                 // A dependency failed for good: this step can never run.
                 verified!(v => v.step_cancelled(&step.key));
@@ -728,8 +751,14 @@ pub fn execute_run(
             // Bounded parallelism: take up to `max_parallel` ready steps.
             None => ready.truncate(context.max_parallel.max(1)),
         }
+        // The whole batch starts on the graph before any run-state entry
+        // flips: a refusal partway leaves every step `Pending`, so the
+        // resume re-queues them instead of finding steps that never ran
+        // marked `Running`.
         for step in &ready {
             verified!(v => v.step_started(&step.key));
+        }
+        for step in &ready {
             state.steps.insert(step.key.clone(), StepState::Running);
             record(
                 &context.events,
@@ -767,6 +796,7 @@ pub fn execute_run(
                 }
                 Err(reason) => {
                     let refused = verified_after!(v => v.step_failed(step, &reason, false));
+                    state.attempts.insert(step.key.clone(), u32::MAX);
                     state.steps.insert(
                         step.key.clone(),
                         StepState::Failed {
@@ -888,14 +918,13 @@ pub fn execute_run(
         // A failed step that exhausted its retries ends the run with the
         // explanation; `--retry <step>` resets it.
         for step in &playbook.steps {
-            if let Some(StepState::Failed { reason, .. }) = state.steps.get(&step.key) {
-                let attempts = state.attempts.get(&step.key).copied().unwrap_or(1);
-                if attempts >= step.max_attempts {
-                    return RunOutcome::Failed {
-                        key: step.key.clone(),
-                        reason: reason.clone(),
-                    };
-                }
+            if let Some(StepState::Failed { reason, .. }) = state.steps.get(&step.key)
+                && failed_for_good(state, step)
+            {
+                return RunOutcome::Failed {
+                    key: step.key.clone(),
+                    reason: reason.clone(),
+                };
             }
         }
         let _ = failed;
@@ -962,6 +991,24 @@ pub fn execute_run(
 
 fn save_run_ok(root: &Path, state: &RunState) {
     let _ = save_run(root, state);
+}
+
+/// Attempts a step has consumed: the run's counter, or the count its
+/// `Failed` entry carries when that is higher (a human step denied or
+/// refused is recorded as `u32::MAX` — no retry — on both).
+fn attempts_used(state: &RunState, key: &str) -> u32 {
+    let recorded = match state.steps.get(key) {
+        Some(StepState::Failed { attempts, .. }) => *attempts,
+        _ => 0,
+    };
+    recorded.max(state.attempts.get(key).copied().unwrap_or(0))
+}
+
+/// A `Failed` step with no attempt left. Anything else — including a
+/// failed step the loop will retry — is not final.
+fn failed_for_good(state: &RunState, step: &Step) -> bool {
+    matches!(state.steps.get(&step.key), Some(StepState::Failed { .. }))
+        && attempts_used(state, &step.key) >= step.max_attempts
 }
 
 fn bounded(text: &str) -> String {
@@ -1134,6 +1181,203 @@ mod tests {
             }
             other => panic!("expected a missing-command error, got {other:?}"),
         }
+        // An empty command is no command; an empty label is the key.
+        let empty_command = dir.join("empty.json");
+        std::fs::write(
+            &empty_command,
+            r#"{"name":"e","steps":[{"key":"v","kind":"verification","command":""}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            load_playbook(&empty_command),
+            Err(WorkflowError::InvalidStep { .. })
+        ));
+        let empty_label = dir.join("label.json");
+        std::fs::write(
+            &empty_label,
+            r#"{"name":"l","steps":[{"key":"t","kind":"task","label":""}]}"#,
+        )
+        .unwrap();
+        let (loaded, _) = load_playbook(&empty_label).expect("loads");
+        assert_eq!(loaded.steps[0].label, "t");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_retrying_dependency_keeps_its_dependents_waiting_rather_than_cancelling_them() {
+        // `build` fails once with attempts left. Its dependent `check` must
+        // wait for the retry, not be cancelled on the first failure — the
+        // Runtime Graph's rule, and the only reading under which "retries
+        // in place" is true for a step that has dependents.
+        let dir = std::env::temp_dir().join(format!(
+            "wf-retry-dep-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.clone();
+        let playbook = playbook_file(vec![step("build", NodeKind::Task, "build"), {
+            let mut s = step("check", NodeKind::Verification, "check");
+            s.depends_on = vec!["build".into()];
+            s.command = Some("true".into());
+            s
+        }]);
+        let state = &mut RunState::new(new_run_id(), &playbook, Path::new("test.json"));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builds_for_agent = Arc::clone(&builds);
+        let agent: AgentStepFn = Arc::new(move |_key, _task| {
+            if builds_for_agent.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err("transient".into())
+            } else {
+                Ok("built".into())
+            }
+        });
+        let commands: CommandStepFn = Arc::new(|_c, _t| Ok("ok".into()));
+        let human: HumanWaitFn = Arc::new(|_s, _st| Err("none".into()));
+        let cancel = agent_runtime::CancellationToken::new();
+        let context = RunContext {
+            root: &root,
+            trusted: true,
+            max_parallel: 4,
+            events: None,
+        };
+        let outcome = execute_run(
+            &playbook, state, &context, agent, commands, human, &cancel, None,
+        );
+        assert_eq!(outcome, RunOutcome::Verified);
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        assert_eq!(state.steps.get("check"), Some(&StepState::Succeeded));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_retryable_failure_waits_for_its_dependencies_like_any_other_step() {
+        // `down` failed with attempts left while `up`, its dependency, was
+        // reset to `Pending` (a resume after its watched files changed).
+        // `down` is not ready until `up` succeeds again.
+        let dir = std::env::temp_dir().join(format!(
+            "wf-retry-wait-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.clone();
+        let playbook = playbook_file(vec![step("up", NodeKind::Task, "up"), {
+            let mut s = step("down", NodeKind::Task, "down");
+            s.depends_on = vec!["up".into()];
+            // One attempt left: starting too early would be its last.
+            s.max_attempts = 2;
+            s
+        }]);
+        let state = &mut RunState::new(new_run_id(), &playbook, Path::new("test.json"));
+        state.steps.insert(
+            "down".into(),
+            StepState::Failed {
+                reason: "earlier".into(),
+                attempts: 1,
+            },
+        );
+        state.attempts.insert("down".into(), 1);
+        // `up` takes a moment; `down` reports whether `up` had finished
+        // when it started. Re-queued alongside `up` (the old rule) it
+        // would start first.
+        let up_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let up_done_for_agent = Arc::clone(&up_done);
+        let agent: AgentStepFn = Arc::new(move |key, _task| {
+            if key == "up" {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                up_done_for_agent.store(true, Ordering::SeqCst);
+                Ok("up done".into())
+            } else if up_done_for_agent.load(Ordering::SeqCst) {
+                Ok("down ran after up".into())
+            } else {
+                Err("down started before up finished".into())
+            }
+        });
+        let commands: CommandStepFn = Arc::new(|_c, _t| Ok("ok".into()));
+        let human: HumanWaitFn = Arc::new(|_s, _st| Err("none".into()));
+        let cancel = agent_runtime::CancellationToken::new();
+        let context = RunContext {
+            root: &root,
+            trusted: true,
+            max_parallel: 4,
+            events: None,
+        };
+        let outcome = execute_run(
+            &playbook, state, &context, agent, commands, human, &cancel, None,
+        );
+        assert_eq!(outcome, RunOutcome::Verified);
+        assert_eq!(
+            state.results.get("down").map(String::as_str),
+            Some("down ran after up")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fresh_means_this_invocation_and_an_off_resume_abandons_a_verified_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "wf-fresh-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.clone();
+        let playbook = playbook_file(vec![{
+            let mut s = step("check", NodeKind::Verification, "check");
+            s.command = Some("true".into());
+            s
+        }]);
+        let state = &mut RunState::new(new_run_id(), &playbook, Path::new("test.json"));
+        state.orchestration = Some(crate::workflow_verified::OrchestrationRecord {
+            mode: "verified".into(),
+            session: "s".into(),
+            graph_id: "g".into(),
+            task_id: "t".into(),
+            state: "Implementing".into(),
+            accepted: false,
+        });
+        let agent: AgentStepFn = Arc::new(|_k, _t| Ok("n/a".into()));
+        let commands: CommandStepFn = Arc::new(|_c, _t| Ok("checks pass".into()));
+        let human: HumanWaitFn = Arc::new(|_s, _st| Err("none".into()));
+        let cancel = agent_runtime::CancellationToken::new();
+        let context = RunContext {
+            root: &root,
+            trusted: true,
+            max_parallel: 1,
+            events: None,
+        };
+        let outcome = execute_run(
+            &playbook,
+            state,
+            &context,
+            Arc::clone(&agent),
+            Arc::clone(&commands),
+            Arc::clone(&human),
+            &cancel,
+            None,
+        );
+        assert_eq!(outcome, RunOutcome::Verified);
+        let record = state.orchestration.as_ref().expect("kept as a pointer");
+        assert!(record.state.starts_with("abandoned"), "{}", record.state);
+        assert!(!record.accepted);
+        // The check passed last time; this invocation ran nothing, so the
+        // run is finished but not verified.
+        let outcome = execute_run(
+            &playbook, state, &context, agent, commands, human, &cancel, None,
+        );
+        assert_eq!(
+            outcome,
+            RunOutcome::CompletedUnverified {
+                unmet: vec!["check".into()]
+            }
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

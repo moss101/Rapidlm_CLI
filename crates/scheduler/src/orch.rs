@@ -149,10 +149,12 @@ impl GraphBackedRun {
 
     /// Host-only acceptance: the supervisor accepts (it alone can reach
     /// `Accepted`), then the goal and any verification node that has not
-    /// already succeeded are marked succeeded on the graph. A verification
-    /// node that failed, was cancelled, superseded or invalidated blocks
-    /// acceptance before anything is touched — the graph's own record of a
-    /// failed check is never overwritten by an accept.
+    /// already succeeded are marked succeeded on the graph — a verification
+    /// node that never ran (the default shape's `verify`) stands for the
+    /// supervisor's own verification, and acceptance is what completes it.
+    /// A verification node that failed, was cancelled, superseded or
+    /// invalidated blocks acceptance before anything is touched: the
+    /// graph's record of a failed check is never overwritten by an accept.
     pub fn accept(&mut self) -> Result<(), SupervisorError> {
         let snapshot = self
             .graphs

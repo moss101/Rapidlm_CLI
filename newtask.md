@@ -8451,6 +8451,12 @@ before any persistence work — and that is what landed
 - Substrate: `NodeSpec.max_attempts`; `RunPlan`/`start_planned`; `accept` refuses over a failed
   verification node. `GraphService` attempts now count runs (`→ Running`), not retries — the
   old rule let a `max_attempts: 1` node retry once and disagreed with `playbook::compile`.
+- The adversarial review of the slice found three pre-existing `rapid run` readiness bugs the
+  graph mirror exposed — a dependency's first failure cancelled its dependents (retries were
+  leaf-only), a retryable failure was re-queued without a dependency check, a pause stranded the
+  batch's other steps as `Running` — plus `fresh_verification` surviving across invocations (a
+  resume that ran nothing reported `verified: true`). All fixed with revert-cycled tests; the
+  delivery record lists them.
 - Not delivered, by the plan's order: replay from events (a resumed run opens a fresh graph and
   mirrors the recorded step states; the run-state file stays the resume authority and now
   carries the graph/session pointer), single-event acceptance, real identities, recovery of a

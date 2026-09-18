@@ -135,32 +135,32 @@ pub fn run_run_command(args: &[String]) -> Result<i32, P9CommandError> {
     let mut config_overrides: Vec<kernel::ConfigOverride> = Vec::new();
     let mut iterator = args.iter();
     while let Some(arg) = iterator.next() {
+        // A flag without its value is a usage error, not a panic.
         let mut value = |flag: &str| {
-            iterator
-                .next()
-                .map(|v| v.to_owned())
-                .unwrap_or_else(|| panic!("{flag} needs a value"))
+            iterator.next().map(|v| v.to_owned()).ok_or_else(|| {
+                eprintln!("rapid run: {flag} needs a value");
+                P9CommandError::Usage
+            })
         };
-        let _ = &mut value;
         match arg.as_str() {
-            "--resume" => resume = Some(value("--resume")),
-            "--status" => status = Some(value("--status")),
-            "--resolve" => resolve = Some(value("--resolve")),
+            "--resume" => resume = Some(value("--resume")?),
+            "--status" => status = Some(value("--status")?),
+            "--resolve" => resolve = Some(value("--resolve")?),
             "--retry" => {
                 // `--retry <run-id> <step>`: run-id here, step from the next
                 // non-flag positional.
-                resume = Some(value("--retry"));
+                resume = Some(value("--retry")?);
                 if let Some(step) = iterator.next() {
                     retry_step = Some(step.to_owned());
                 }
             }
             "--parallel" => {
-                parallel = value("--parallel")
+                parallel = value("--parallel")?
                     .parse()
                     .map_err(|_| P9CommandError::Usage)?;
             }
             "--orchestration" => {
-                config_overrides.push(orchestration_override(&value("--orchestration"))?);
+                config_overrides.push(orchestration_override(&value("--orchestration")?)?);
             }
             other if playbook_path.is_none() && resolve.is_none() => {
                 playbook_path = Some(other.to_owned());
@@ -183,11 +183,6 @@ pub fn run_run_command(args: &[String]) -> Result<i32, P9CommandError> {
             "warning: the project is not trusted; agent steps will refuse every tool call. Approve trust with `rapid trust grant`."
         );
     }
-    // `orchestration.mode` through the same precedence every other setting
-    // resolves with (CLI > env > user > workspace > defaults).
-    let config = crate::interactive::workflow_config(&root, config_overrides)
-        .map_err(P9CommandError::Agent)?;
-    let verified_mode = config.orchestration.mode == protocol::OrchestrationMode::Verified;
 
     // --status: print the run state and exit.
     if let Some(run_id) = status {
@@ -212,6 +207,14 @@ pub fn run_run_command(args: &[String]) -> Result<i32, P9CommandError> {
             .cloned();
         return resolve_command(&root, &run_id, &action, answer, args);
     }
+
+    // `orchestration.mode` through the same precedence every other setting
+    // resolves with (CLI > env > user > workspace > defaults) — only for a
+    // run that is going to execute: `--status` and `--resolve` above read
+    // and write the run state without it.
+    let config = crate::interactive::workflow_config(&root, config_overrides)
+        .map_err(P9CommandError::Agent)?;
+    let verified_mode = config.orchestration.mode == protocol::OrchestrationMode::Verified;
 
     // Fresh or resume.
     let (playbook, graph) = match (&playbook_path, &resume) {
@@ -507,6 +510,7 @@ fn settle_resolved_waits(
                 state.results.insert(key.clone(), answered);
             }
         } else {
+            state.attempts.insert(key.clone(), u32::MAX);
             state.steps.insert(
                 key.clone(),
                 crate::workflow::StepState::Failed {
@@ -1151,6 +1155,13 @@ mod tests {
             orchestration_override("sideways"),
             Err(P9CommandError::Usage)
         ));
+        assert!(
+            matches!(
+                run_run_command(&["p.json".to_owned(), "--orchestration".to_owned()]),
+                Err(P9CommandError::Usage)
+            ),
+            "a flag without its value is a usage error, not a panic"
+        );
         let cli = orchestration_override("verified").expect("verified parses");
         let loaded = kernel::load_config(&kernel::ConfigSources {
             workspace: Some(kernel::ConfigText::new(
