@@ -496,10 +496,18 @@ fn build_contract(snapshot: &GoalSnapshot) -> Result<TaskContract, SupervisorErr
     Ok(contract)
 }
 
-fn workspace_identity(snapshot: &GoalSnapshot) -> WorkspaceIdentity {
-    let json = serde_json::to_string(snapshot).unwrap_or_default();
+/// The workspace a claim is made about (GVS-007).
+///
+/// This used to hash the *goal snapshot* — the statement and criteria the
+/// user typed — so two entirely different trees carrying the same goal had
+/// the same identity and the supervisor's stale-workspace gate could not
+/// see a code change at all. It is now the real tree identity: HEAD plus
+/// every deviation from it, content included. An identity that cannot be
+/// established is `unavailable:` and compares equal to nothing, so a claim
+/// can never inherit a match it did not earn.
+fn workspace_identity(root: &Path) -> WorkspaceIdentity {
     WorkspaceIdentity {
-        hash: ArtifactId::from_bytes(json.as_bytes()).to_string(),
+        hash: crate::digests::workspace_digest(root),
     }
 }
 
@@ -774,7 +782,7 @@ pub fn run_claim(
         strategist: Box::new(HostBlocked),
         checks: Box::new(CachedChecks { results: cached }),
     };
-    let mut supervisor = Supervisor::start(contract, workspace_identity(&snapshot), drivers)
+    let mut supervisor = Supervisor::start(contract, workspace_identity(Path::new(".")), drivers)
         .map_err(GoalClaimError::Supervisor)?;
 
     // Host-owned phases only: stop before any phase that would need a model.

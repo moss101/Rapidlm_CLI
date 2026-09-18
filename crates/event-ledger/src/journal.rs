@@ -519,6 +519,52 @@ impl OperationJournal {
         self.transition(id, OperationState::Reconciled, Some(reference), cancel)
     }
 
+    /// The most recent operation in `session` with this effect fingerprint,
+    /// if any. An at-most-once effect is identified by its fingerprint, so
+    /// this is how a repeated request is answered from the journal instead
+    /// of being executed a second time (ADR 0021, publication step 6).
+    pub fn find_by_fingerprint(
+        &self,
+        session_id: SessionId,
+        fingerprint: EffectFingerprint,
+        cancel: &CancellationToken,
+    ) -> Result<Option<OperationRecord>, JournalError> {
+        cancel.check()?;
+        let conn = self.connect()?;
+        let row = conn
+            .query_row(
+                "SELECT id, state, idempotency, reconcile_ref
+                 FROM operation_journal
+                 WHERE session_id = ?1 AND fingerprint = ?2
+                 ORDER BY created_at DESC, rowid DESC
+                 LIMIT 1",
+                params![session_id.to_string(), fingerprint.as_hex()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, state, class, reconcile_ref)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(OperationRecord {
+            id: OperationId::from_str(&id)
+                .map_err(|_| JournalError::Corrupt("invalid operation id"))?,
+            session_id,
+            fingerprint,
+            state: OperationState::from_str(&state)
+                .map_err(|_| JournalError::Corrupt("unknown operation state"))?,
+            idempotency: IdempotencyClass::from_str(&class)
+                .map_err(|_| JournalError::Corrupt("unknown idempotency class"))?,
+            reconcile_ref,
+        }))
+    }
+
     pub fn load(
         &self,
         id: OperationId,

@@ -153,6 +153,13 @@ impl AgentViewManager {
         GitWorktreeStore::open(root, &cancel).map_err(|err| err.to_string())
     }
 
+    /// The parent's current revision — the baseline a publication is frozen
+    /// against, and part of its effect identity.
+    fn parent_revision(root: &Path) -> Result<String, String> {
+        let out = run_git_bytes(root, &["rev-parse", "HEAD"], 1024)?;
+        Ok(String::from_utf8_lossy(&out).trim().to_owned())
+    }
+
     /// The child's patch against its base: staged-everything diff, bounded.
     fn child_patch(child: &ChildView) -> Result<Vec<u8>, String> {
         run_git(&child.worktree, &["add", "-A", "--", "."], 4 * 1024 * 1024)?;
@@ -223,14 +230,59 @@ impl AgentViewManager {
                 Some(child),
             ));
         }
-        // Plain apply (no 3way): every patched file is provably unchanged in
-        // the parent, so the patch applies cleanly or not at all.
-        run_git_stdin(root, &["apply", "-"], &patch).map_err(|(output, code)| {
-            format!(
-                "the apply failed ({code}; parent left as it was): {}",
-                String::from_utf8_lossy(&output)
-            )
-        })?;
+        // Publication is an at-most-once effect with a receipt: the journal
+        // records prepared → executing → committed around the one write that
+        // reaches the user's tree, so a repeat is answered from the journal
+        // and a crash mid-apply is reconciled rather than replayed. A
+        // publication that cannot be journaled does not happen.
+        let parent_revision = Self::parent_revision(root)?;
+        let journal = crate::publication::PublicationJournal::for_project(
+            &crate::interactive::project_ledger_path(
+                &root.join(crate::interactive::PROJECT_MARKER),
+            ),
+        )
+        .map_err(|err| err.to_string())?;
+        let request = crate::publication::PublicationRequest {
+            principal: &agent.to_string(),
+            parent_revision: &parent_revision,
+            base_revision: &child.base_commit,
+            patch: &patch,
+            change_count: files.len(),
+        };
+        let published = crate::publication::publish(&journal, &request, || {
+            // Plain apply (no 3way): every patched file is provably unchanged
+            // in the parent, so the patch applies cleanly or not at all.
+            run_git_stdin(root, &["apply", "-"], &patch)
+                .map(|_| ())
+                .map_err(|(output, code)| {
+                    format!(
+                        "the apply failed ({code}; parent left as it was): {}",
+                        String::from_utf8_lossy(&output)
+                    )
+                })
+        })
+        .map_err(|err| err.to_string())?;
+        let _receipt = match published {
+            crate::publication::Published::Applied(receipt) => receipt,
+            // The same patch onto the same parent revision was already
+            // applied; the files are in the tree and re-applying would
+            // double-apply. Release the view as a successful integration.
+            crate::publication::Published::AlreadyApplied(receipt) => receipt,
+        };
+        // The publication changed the user's tree, and `git apply` does not
+        // go through `workspace_write`'s hook — so without this, integrating
+        // a child's patch left every recorded check looking fresh against
+        // code it never saw. Each changed file is offered as a subject; the
+        // hook stales that subject's own records and then sweeps the rest.
+        // Best effort: a failed invalidation must not undo a publication
+        // that already happened, but it is reported.
+        let invalidator = crate::interactive::evidence_invalidator_for(root);
+        for file in &files {
+            if let Err(err) = invalidator(file) {
+                eprintln!("warning: evidence invalidation after integrate failed: {err}");
+                break;
+            }
+        }
         let outcome = match check_command {
             Some(command) if !command.trim().is_empty() => {
                 match run_bounded_command(command, root, 300) {
@@ -526,6 +578,243 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "git {args:?} failed");
         String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[test]
+    fn publication_is_journaled_prepared_executing_committed_and_never_applies_twice() {
+        use crate::publication::{PublicationJournal, PublicationRequest, Published, publish};
+        use event_ledger::journal::OperationState;
+
+        let repo = repo("publication-journal");
+        let manager = AgentViewManager::new();
+        let agent = AgentId::new();
+        let view = manager.create_for(&repo.root, agent).expect("view");
+        std::fs::write(view.worktree.join("child.txt"), "from the child\n").unwrap();
+        let parent_before = git_in(&repo.root, &["rev-parse", "HEAD"]).trim().to_owned();
+
+        let (outcome, held) = manager
+            .integrate(&repo.root, agent, None)
+            .expect("integrates");
+        assert!(matches!(outcome, IntegrationOutcome::Integrated { .. }));
+        assert!(held.is_none());
+        assert!(repo.root.join("child.txt").exists());
+
+        // The publication is durable, terminal and committed.
+        let ledger_path = crate::interactive::project_ledger_path(
+            &repo.root.join(crate::interactive::PROJECT_MARKER),
+        );
+        let journal = PublicationJournal::for_project(&ledger_path).expect("journal");
+        let patch = std::fs::read_to_string(repo.root.join("child.txt")).unwrap();
+        assert!(!patch.is_empty());
+
+        // Re-publishing the SAME effect is answered from the journal: the
+        // closure that would write must not run a second time.
+        let recorded_patch = b"the recorded patch bytes";
+        let request = PublicationRequest {
+            principal: &agent.to_string(),
+            parent_revision: &parent_before,
+            base_revision: &view.base_commit,
+            patch: recorded_patch,
+            change_count: 1,
+        };
+        let first = publish(&journal, &request, || Ok(())).expect("first");
+        let receipt = match first {
+            Published::Applied(receipt) => receipt,
+            other => panic!("expected a fresh apply, got {other:?}"),
+        };
+        assert_eq!(receipt.parent_revision, parent_before);
+        assert_eq!(receipt.change_count, 1);
+        assert_eq!(
+            journal
+                .journal()
+                .load(receipt.operation, &Default::default())
+                .expect("load")
+                .state(),
+            OperationState::Committed
+        );
+
+        let again = publish(&journal, &request, || {
+            panic!("an already-committed effect must not run again")
+        })
+        .expect("answered from the journal");
+        match again {
+            Published::AlreadyApplied(second) => {
+                assert_eq!(second.operation, receipt.operation, "same operation");
+                assert_eq!(second.patch_hash, receipt.patch_hash);
+            }
+            other => panic!("expected AlreadyApplied, got {other:?}"),
+        }
+
+        // A different parent revision is a different effect and may run.
+        let moved = PublicationRequest {
+            parent_revision: "0000000000000000000000000000000000000000",
+            ..request
+        };
+        assert!(matches!(
+            publish(&journal, &moved, || Ok(())).expect("distinct effect"),
+            Published::Applied(_)
+        ));
+    }
+
+    #[test]
+    fn integrating_a_child_stales_evidence_recorded_before_it() {
+        // `git apply` writes the parent tree without going through
+        // `workspace_write`'s hook, so before this an integrated patch left
+        // every recorded check looking fresh against code it never saw.
+        use agent_runtime::{
+            Criterion, EvidenceRequirement, GoalActor, GoalBudget, GoalCommand, GoalSpec,
+        };
+        use protocol::GoalId;
+
+        let repo = repo("publication-invalidates");
+        let marker = repo.root.join(crate::interactive::PROJECT_MARKER);
+        std::fs::create_dir_all(&marker).expect("marker");
+        let evidence_path = marker.join(crate::goal_host::EVIDENCE_FILE);
+
+        // A goal with one recorded, fresh piece of evidence.
+        let mut host = crate::goal_host::GoalHost::new();
+        let goal = GoalId::new();
+        host.apply(
+            GoalCommand::Create(
+                GoalSpec::new(
+                    goal,
+                    "ship it",
+                    vec![Criterion::new("c1", "it works").expect("criterion")],
+                    GoalBudget::new(None, None, None, None),
+                    vec![EvidenceRequirement::new("c1", vec!["test".to_owned()]).expect("req")],
+                )
+                .expect("spec"),
+            ),
+            &GoalActor::Human,
+            &agent_runtime::CancellationToken::new(),
+        )
+        .expect("create");
+        host.record_evidence(
+            agent_runtime::EvidenceSpec::new(
+                protocol::EvidenceId::new(),
+                goal,
+                agent_runtime::EvidenceKind::Test,
+                agent_runtime::TEST_PASSED,
+                agent_runtime::EvidenceProducer::System,
+                agent_runtime::EvidenceSource::new(protocol::ArtifactId::from_bytes(b"out")),
+                agent_runtime::EvidenceStatus::Passed,
+                "child.txt",
+            )
+            .expect("spec")
+            .with_command("cargo test")
+            .expect("command"),
+        )
+        .expect("record");
+        host.save_evidence(&evidence_path).expect("save");
+
+        // Integrate a child: the tree changes.
+        let manager = AgentViewManager::new();
+        let agent = AgentId::new();
+        let view = manager.create_for(&repo.root, agent).expect("view");
+        std::fs::write(view.worktree.join("child.txt"), "from the child\n").unwrap();
+        manager
+            .integrate(&repo.root, agent, None)
+            .expect("integrates");
+
+        // The recorded evidence is no longer fresh.
+        let mut reloaded = crate::goal_host::GoalHost::new();
+        reloaded.load_evidence(&evidence_path).expect("reload");
+        let stale = reloaded
+            .evidence()
+            .store()
+            .records()
+            .iter()
+            .all(|record| !record.freshness().is_fresh());
+        assert!(
+            stale,
+            "publication must stale evidence recorded before it: {:?}",
+            reloaded
+                .evidence()
+                .store()
+                .records()
+                .iter()
+                .map(|r| r.freshness())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_publication_that_cannot_be_journaled_does_not_happen() {
+        // Fail closed: an at-most-once effect we cannot record is exactly
+        // the one a crash would double-apply, so integration refuses rather
+        // than writing the parent unrecorded.
+        let repo = repo("publication-unjournalable");
+        let manager = AgentViewManager::new();
+        let agent = AgentId::new();
+        let view = manager.create_for(&repo.root, agent).expect("view");
+        std::fs::write(view.worktree.join("child.txt"), "from the child\n").unwrap();
+        // The ledger path is occupied by a directory, so it cannot be opened.
+        let ledger_path = crate::interactive::project_ledger_path(
+            &repo.root.join(crate::interactive::PROJECT_MARKER),
+        );
+        let _ = std::fs::remove_file(&ledger_path);
+        std::fs::create_dir_all(&ledger_path).expect("occupy the ledger path");
+
+        let err = manager
+            .integrate(&repo.root, agent, None)
+            .expect_err("refuses without a journal");
+        assert!(err.contains("journal"), "{err}");
+        assert!(
+            !repo.root.join("child.txt").exists(),
+            "the parent tree must be untouched when the effect cannot be recorded"
+        );
+    }
+
+    #[test]
+    fn a_failed_publication_is_journaled_failed_and_leaves_the_tree_alone() {
+        use crate::publication::{
+            PublicationError, PublicationJournal, PublicationRequest, publish,
+        };
+        use event_ledger::journal::OperationState;
+
+        let repo = repo("publication-failed");
+        let ledger_path = crate::interactive::project_ledger_path(
+            &repo.root.join(crate::interactive::PROJECT_MARKER),
+        );
+        let journal = PublicationJournal::for_project(&ledger_path).expect("journal");
+        let request = PublicationRequest {
+            principal: "agent",
+            parent_revision: "abc123",
+            base_revision: "def456",
+            patch: b"patch",
+            change_count: 2,
+        };
+        let err = publish(&journal, &request, || Err("the apply failed".to_owned()))
+            .expect_err("propagates the failure");
+        assert!(matches!(err, PublicationError::Failed(ref d) if d == "the apply failed"));
+
+        // Recorded as Failed — so recovery has nothing to reconcile — and a
+        // retry of the same effect is allowed to run.
+        let record = journal
+            .journal()
+            .find_by_fingerprint(
+                journal.session(),
+                event_ledger::journal::EffectFingerprint::compute(
+                    &event_ledger::journal::EffectSpec::new(
+                        crate::publication::PUBLISH_ACTION,
+                        "agent",
+                        "abc123",
+                        format!(
+                            "base=def456 patch={}",
+                            protocol::ArtifactId::from_bytes(b"patch")
+                        ),
+                    )
+                    .expect("spec"),
+                ),
+                &Default::default(),
+            )
+            .expect("lookup")
+            .expect("a record exists");
+        assert_eq!(record.state(), OperationState::Failed);
+        assert!(
+            publish(&journal, &request, || Ok(())).is_ok(),
+            "a failed effect may be retried"
+        );
     }
 
     #[test]

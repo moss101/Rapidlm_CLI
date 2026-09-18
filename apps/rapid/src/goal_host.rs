@@ -326,6 +326,15 @@ impl GoalHost {
     /// Deliberately conservative: a recorded check speaks about the whole
     /// tree, so any tree change stales it; under-counting only makes the
     /// completion gate refuse until the check re-runs.
+    /// Stale the records that spoke about exactly this subject — the
+    /// targeted half of invalidation ([`agent_runtime::EvidenceStore::
+    /// invalidate_subject`]). A written path stales the evidence recorded
+    /// *about* that path with certainty; the tree-wide sweep then handles
+    /// the checks that spoke about everything.
+    pub fn stale_evidence_for_subject(&mut self, subject: &str) -> usize {
+        self.evidence.invalidate_subject(subject)
+    }
+
     pub fn stale_all_fresh_evidence(&mut self) -> usize {
         self.evidence.invalidate_all_fresh()
     }

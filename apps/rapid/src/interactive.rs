@@ -8451,17 +8451,23 @@ fn build_interactive_turn_tools(
 /// lock/IO error must not turn a completed write into a failure — but not
 /// silent: the tool result carries the warning. A project with no evidence
 /// doc (the common case) short-circuits before any lock or file write.
-fn evidence_invalidator_for(root: &Path) -> crate::exec_tools::EvidenceInvalidator {
+pub(crate) fn evidence_invalidator_for(root: &Path) -> crate::exec_tools::EvidenceInvalidator {
     let evidence_path = root.join(PROJECT_MARKER).join(EVIDENCE_FILE);
-    std::sync::Arc::new(move |_subject: &str| {
+    std::sync::Arc::new(move |subject: &str| {
         if !evidence_path.exists() {
             return Ok(0);
         }
+        let subject = subject.to_owned();
         let mut host = GoalHost::new();
         host.update_evidence(
             &evidence_path,
             |host| -> Result<usize, std::convert::Infallible> {
-                Ok(host.stale_all_fresh_evidence())
+                // Targeted first, so the count distinguishes records that
+                // spoke about *this* subject from the tree-wide sweep that
+                // follows; then the conservative sweep, because a recorded
+                // check speaks about the whole tree.
+                let targeted = host.stale_evidence_for_subject(&subject);
+                Ok(targeted.saturating_add(host.stale_all_fresh_evidence()))
             },
         )
         .map_err(|err| match err {

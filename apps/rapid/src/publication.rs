@@ -1,0 +1,302 @@
+//! Publication: a candidate reaches the user's tree once, with a receipt.
+//!
+//! ADR 0021 §4 asks that publication be a workspace transaction whose
+//! `CommitReceipt` is the publication receipt, with the operation journal
+//! recording prepared → applied → reconciled. Two facts about the existing
+//! code shape this module:
+//!
+//! - `workspace::TransactionManager` stages a [`workspace::patch::
+//!   SemanticPatch`] into an **in-memory** [`StagingOverlay`] and publishes
+//!   it as a parent-visible overlay; its own `begin_transaction` doc says
+//!   "Parent checkout is not written". Nothing materializes an overlay onto
+//!   disk. Routing `/agents integrate` through it as-is would replace a real
+//!   `git apply` with an overlay no one reads — the child's work would stop
+//!   reaching the user's files. So the transaction *type* is not on this
+//!   path; the transaction *contract* — a frozen parent revision, a patch
+//!   hash, a change count, checks, and one at-most-once publication — is.
+//! - `event_ledger::journal::OperationJournal` already owns exactly the
+//!   vocabulary the ADR names: [`OperationState`] is
+//!   `Prepared`/`Executing`/`Committed`/`Failed`/`Uncertain`/`Reconciled`,
+//!   with a stable [`EffectFingerprint`] and an
+//!   [`IdempotencyClass::AtMostOnce`] that recovery must never replay.
+//!
+//! So publication is journaled here and applied by git, in this order:
+//!
+//! 1. **Fingerprint** the effect from the agent, the child's base revision,
+//!    the parent's current revision and the patch hash. The same request
+//!    fingerprints the same way across processes.
+//! 2. **Answer from the journal** when that fingerprint already reached a
+//!    terminal committed state — a repeat cannot apply twice.
+//! 3. **Prepare** (`Prepared`): the effect has not started; the tree is
+//!    untouched.
+//! 4. **Execute** (`Executing`): the window in which the tree may change.
+//!    A crash here leaves a non-terminal at-most-once record, which recovery
+//!    must reconcile rather than replay — [`OperationJournal::
+//!    assert_replay_allowed`] enforces that.
+//! 5. **Commit** (`Committed`) with the receipt, or **fail** (`Failed`) with
+//!    the tree unchanged.
+//!
+//! A publication that cannot be journaled does not happen: an at-most-once
+//! effect we could not record is exactly the one a crash would double-apply.
+
+use std::path::Path;
+
+use event_ledger::journal::{
+    CancellationToken, EffectFingerprint, EffectSpec, IdempotencyClass, JournalError, OperationId,
+    OperationJournal, OperationState,
+};
+use event_ledger::ledger::EventLedger;
+use protocol::{ArtifactId, ProjectId, SessionId};
+
+/// The action name every workspace publication fingerprints under.
+pub const PUBLISH_ACTION: &str = "workspace.publish";
+
+/// Proof that one patch became parent-visible: which revision it was applied
+/// onto and what was applied. The `CommitReceipt` contract of ADR 0021 §4
+/// (parent revision + patch hash + change count), carried by a record the
+/// operation journal can answer a repeat request from.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicationReceipt {
+    /// The journal operation this publication is recorded under.
+    pub operation: OperationId,
+    /// The parent revision the patch was applied onto — the baseline the
+    /// publication was frozen against.
+    pub parent_revision: String,
+    /// Content hash of the applied patch.
+    pub patch_hash: String,
+    /// How many files the patch touched.
+    pub change_count: usize,
+}
+
+/// What a publication attempt did.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Published {
+    /// The patch was applied in this call; the receipt is fresh.
+    Applied(PublicationReceipt),
+    /// This exact effect was already committed; nothing was applied again
+    /// and the answer comes from the journal.
+    AlreadyApplied(PublicationReceipt),
+}
+
+/// Why a publication could not be recorded or completed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PublicationError {
+    /// The journal could not be opened or written. Publication fails closed:
+    /// an at-most-once effect that cannot be recorded must not be performed.
+    Journal(String),
+    /// A previous attempt at this exact effect is still in flight
+    /// (`Prepared`/`Executing`/`Uncertain`). It must be reconciled before
+    /// the same publication is attempted again — replaying it could apply
+    /// the patch twice.
+    InFlight {
+        operation: OperationId,
+        state: OperationState,
+    },
+    /// The effect itself failed; the caller's detail explains it and the
+    /// tree is unchanged.
+    Failed(String),
+}
+
+impl core::fmt::Display for PublicationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Journal(detail) => write!(f, "publication journal: {detail}"),
+            Self::InFlight { operation, state } => write!(
+                f,
+                "a previous publication ({operation}) is {} and must be reconciled first",
+                state.as_str()
+            ),
+            Self::Failed(detail) => write!(f, "{detail}"),
+        }
+    }
+}
+
+impl std::error::Error for PublicationError {}
+
+/// The project's operation journal, and the session publications are
+/// recorded in.
+pub struct PublicationJournal {
+    journal: OperationJournal,
+    session: SessionId,
+}
+
+impl PublicationJournal {
+    /// Open the project's journal, creating the publication session if it is
+    /// not there yet. The ledger lives where every other project record does.
+    pub fn for_project(ledger_path: &Path) -> Result<Self, PublicationError> {
+        if let Some(parent) = ledger_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| PublicationError::Journal(err.to_string()))?;
+        }
+        let ledger = EventLedger::open(ledger_path)
+            .map_err(|err| PublicationError::Journal(err.to_string()))?;
+        // One stable session for this project's publications: the journal
+        // answers a repeat by fingerprint within a session, so the session
+        // must be the same across processes for that to work across a
+        // restart.
+        let session = publication_session(ledger_path);
+        let cancel = event_ledger::ledger::CancellationToken::new();
+        match ledger.create_session(session, ProjectId::new(), &cancel) {
+            Ok(()) | Err(event_ledger::ledger::LedgerError::SessionExists { .. }) => {}
+            Err(err) => return Err(PublicationError::Journal(err.to_string())),
+        }
+        Ok(Self {
+            journal: OperationJournal::new(ledger),
+            session,
+        })
+    }
+
+    pub fn session(&self) -> SessionId {
+        self.session
+    }
+
+    pub fn journal(&self) -> &OperationJournal {
+        &self.journal
+    }
+}
+
+/// A publication's identity: everything that makes this the *same* effect.
+/// The parent revision is part of it, so publishing the same patch onto a
+/// moved parent is a different effect and is allowed to run.
+pub struct PublicationRequest<'a> {
+    pub principal: &'a str,
+    /// The revision the patch is applied onto.
+    pub parent_revision: &'a str,
+    /// The child's base revision, so a rebased child is a different effect.
+    pub base_revision: &'a str,
+    pub patch: &'a [u8],
+    pub change_count: usize,
+}
+
+impl PublicationRequest<'_> {
+    fn patch_hash(&self) -> String {
+        ArtifactId::from_bytes(self.patch).to_string()
+    }
+
+    fn spec(&self) -> Result<EffectSpec, PublicationError> {
+        EffectSpec::new(
+            PUBLISH_ACTION,
+            self.principal,
+            self.parent_revision,
+            format!("base={} patch={}", self.base_revision, self.patch_hash()),
+        )
+        .map_err(|err: JournalError| PublicationError::Journal(err.to_string()))
+    }
+
+    fn receipt(&self, operation: OperationId) -> PublicationReceipt {
+        PublicationReceipt {
+            operation,
+            parent_revision: self.parent_revision.to_owned(),
+            patch_hash: self.patch_hash(),
+            change_count: self.change_count,
+        }
+    }
+}
+
+/// Run `apply` as an at-most-once publication.
+///
+/// `apply` performs the real effect — the write into the user's tree — and
+/// is called exactly once, inside the `Executing` window, and only when the
+/// journal agrees this effect has not already been committed. It returns
+/// `Ok` when the tree changed and `Err(detail)` when it did not.
+pub fn publish<F>(
+    journal: &PublicationJournal,
+    request: &PublicationRequest<'_>,
+    apply: F,
+) -> Result<Published, PublicationError>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    let cancel = CancellationToken::new();
+    let spec = request.spec()?;
+    let fingerprint = EffectFingerprint::compute(&spec);
+
+    // Answered from the journal: this exact effect already happened, or a
+    // previous attempt is still in flight and must be reconciled first.
+    if let Some(previous) = journal
+        .journal
+        .find_by_fingerprint(journal.session, fingerprint, &cancel)
+        .map_err(|err| PublicationError::Journal(err.to_string()))?
+    {
+        match previous.state() {
+            OperationState::Committed | OperationState::Reconciled => {
+                return Ok(Published::AlreadyApplied(request.receipt(previous.id())));
+            }
+            OperationState::Failed => {}
+            state @ (OperationState::Prepared
+            | OperationState::Executing
+            | OperationState::Uncertain) => {
+                return Err(PublicationError::InFlight {
+                    operation: previous.id(),
+                    state,
+                });
+            }
+        }
+    }
+
+    // Prepared: recorded, not started. A crash here leaves nothing applied.
+    let record = journal
+        .journal
+        .prepare(
+            journal.session,
+            &spec,
+            IdempotencyClass::AtMostOnce,
+            &cancel,
+        )
+        .map_err(|err| PublicationError::Journal(err.to_string()))?;
+    let operation = record.id();
+
+    // Executing: the window in which the tree may change. A crash between
+    // this and the commit leaves a non-terminal at-most-once record, which
+    // recovery must reconcile rather than replay.
+    journal
+        .journal
+        .mark_executing(operation, &cancel)
+        .map_err(|err| PublicationError::Journal(err.to_string()))?;
+
+    match apply() {
+        Ok(()) => {
+            journal
+                .journal
+                .commit(operation, &cancel)
+                .map_err(|err| PublicationError::Journal(err.to_string()))?;
+            Ok(Published::Applied(request.receipt(operation)))
+        }
+        Err(detail) => {
+            // The effect did not happen; the record says so, so recovery has
+            // nothing to reconcile.
+            let _ = journal.journal.fail(operation, &cancel);
+            Err(PublicationError::Failed(detail))
+        }
+    }
+}
+
+/// A stable per-project session id for publications, derived from the
+/// ledger's own path so the same project resolves the same session across
+/// processes — the journal answers a repeat by fingerprint *within* a
+/// session, so a fresh random session every run would defeat idempotency.
+fn publication_session(ledger_path: &Path) -> SessionId {
+    let path = protocol::host_path::canonicalize(ledger_path)
+        .unwrap_or_else(|_| ledger_path.to_path_buf());
+    let digest = ArtifactId::from_bytes(
+        format!("rapidlm.publication.session/v1:{}", path.display()).as_bytes(),
+    );
+    // `ArtifactId` is a 32-byte digest; take the first 16 as the id's bytes
+    // so the mapping is deterministic and collision-resistant enough for a
+    // per-project session.
+    let bytes = digest.as_digest();
+    let hex: String = bytes[..16].iter().map(|b| format!("{b:02x}")).collect();
+    // Canonical 8-4-4-4-12 form; `SessionId`'s parser accepts any canonical
+    // UUID, so a derived (non-v7) id is a legal, stable identifier here.
+    let canonical = format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    );
+    canonical
+        .parse()
+        .expect("a 32-hex-digit digest always forms a canonical UUID")
+}
