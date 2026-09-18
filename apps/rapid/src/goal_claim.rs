@@ -472,7 +472,12 @@ fn build_contract(snapshot: &GoalSnapshot) -> Result<TaskContract, SupervisorErr
             strategist_after: 0,
             acceptance_policy: AcceptancePolicy::Strict,
             minimum_requirement_coverage: 100,
-            require_workspace_identity: false,
+            // Armed (GVS-007): the identity is now the real tree, so this
+            // gate compares the workspace the verifier attested about with
+            // the one being accepted. A tree that changed in between refuses
+            // acceptance instead of certifying evidence about code that is
+            // no longer there.
+            require_workspace_identity: true,
             allow_inconclusive_acceptance: false,
             complexity: TaskComplexity::Standard,
         },
@@ -837,6 +842,11 @@ pub fn run_claim(
         .run_checks()
         .map_err(GoalClaimError::Supervisor)?;
     let verdict = supervisor.verify().map_err(GoalClaimError::Supervisor)?;
+    // The attestation the verifier just issued carries the workspace it
+    // spoke about. Re-read the tree now, so acceptance compares what was
+    // verified against what is actually there rather than against itself —
+    // without this refresh the gate is vacuous however real the digest is.
+    supervisor.set_current_identity(workspace_identity(Path::new(".")));
     let mut accepted = false;
     if supervisor.state() == OrchestrationState::Verified {
         supervisor.accept().map_err(GoalClaimError::Supervisor)?;
@@ -960,6 +970,43 @@ mod tests {
         // The real run satisfies the criterion: the gate completes.
         assert!(host.can_complete(&CancellationToken::new()));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_claim_arms_the_stale_workspace_gate_against_a_real_tree_identity() {
+        // GVS-007: the identity used to be a hash of the goal text, so the
+        // gate was left off — turning it on would have compared a constant
+        // with itself. Now the identity is the tree, the gate is armed, and
+        // `run_claim` refreshes it after verification so acceptance compares
+        // the workspace that was verified with the one being accepted.
+        let host = host_with_requirements(&[("c1", "test")]);
+        let snapshot = host.snapshot().cloned().expect("a goal");
+        let contract = build_contract(&snapshot).expect("contract");
+        assert!(
+            contract.verification_policy.require_workspace_identity,
+            "the gate must be armed, or a changed tree can still be accepted"
+        );
+
+        // And the identity is a real tree digest, not a hash of the goal:
+        // two different goals in the same tree share it.
+        let here = workspace_identity(Path::new("."));
+        assert!(
+            !crate::digests::is_unavailable(&here.hash),
+            "this repository is a git tree, so the identity resolves: {}",
+            here.hash
+        );
+        let other = host_with_requirements(&[("c2", "build")]);
+        let other_snapshot = other.snapshot().cloned().expect("a goal");
+        assert_ne!(
+            snapshot.id(),
+            other_snapshot.id(),
+            "two distinct goals, so a goal-derived identity would differ"
+        );
+        assert_eq!(
+            here.hash,
+            workspace_identity(Path::new(".")).hash,
+            "the identity follows the tree, not the goal"
+        );
     }
 
     #[test]

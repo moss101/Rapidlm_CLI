@@ -8487,9 +8487,11 @@ before any persistence work — and that is what landed
   interrupted run to exactly the phase it was in — the machinery, not yet a caller, because
   nothing reconstructs a `Supervisor` after a restart until the snapshot has a reducer; and
   orchestration records are versioned with additive evolution (unknown fields ignored, foreign
-  records and future majors typed skips). The stale-workspace gate is still not armed:
-  `current_identity` is never refreshed after the work, so it compares a value with itself —
-  only the value is now meaningful.
+  records and future majors typed skips). The stale-workspace gate is now **armed** for
+  `goal claim`: `require_workspace_identity: true` plus a refresh of `current_identity` from the
+  tree after verification, so acceptance compares the workspace that was verified against the one
+  being accepted. `rapid run --orchestration verified` still leaves it off (its identity is the
+  `watch`-glob digest, not the tree).
   **`TransactionManager` is deliberately not on the publication path**: it stages into an
   in-memory overlay ("Parent checkout is not written") that nothing materializes, so routing
   integrate through it would have stopped the child's work reaching the user's files — the
