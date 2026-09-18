@@ -11,6 +11,7 @@ pub mod events;
 pub mod evidence;
 pub mod gaps;
 pub mod policy;
+pub mod records;
 pub mod state;
 pub mod supervisor;
 pub mod verification;
@@ -36,6 +37,7 @@ pub use policy::{
     RoleModelResolver, StagnationDetector, StagnationSignal, TaskComplexity, VerificationPolicy,
     VerifierPanel, WriteClass, profile_allows_writes,
 };
+pub use records::{MAX_RECORD_BYTES, RecordEnvelope, RecordError, RecordKind, RecordRead};
 pub use state::{
     OrchestrationState, OrchestrationTransition, TransitionError, validate_transition,
 };

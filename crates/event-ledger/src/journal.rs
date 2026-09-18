@@ -565,6 +565,50 @@ impl OperationJournal {
         }))
     }
 
+    /// Every operation in `session` that has not reached a terminal state —
+    /// the work a restart inherits. `Prepared` means the effect never
+    /// started; `Executing`/`Uncertain` mean it may have. Recovery uses this
+    /// to settle in-flight work before anything new is attempted (GVS-008).
+    pub fn pending(
+        &self,
+        session_id: SessionId,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<OperationRecord>, JournalError> {
+        cancel.check()?;
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, fingerprint, state, idempotency, reconcile_ref
+             FROM operation_journal
+             WHERE session_id = ?1 AND state IN ('prepared', 'executing', 'uncertain')
+             ORDER BY created_at ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, fp, state, class, reconcile_ref) = row?;
+            out.push(OperationRecord {
+                id: OperationId::from_str(&id)
+                    .map_err(|_| JournalError::Corrupt("invalid operation id"))?,
+                session_id,
+                fingerprint: parse_fingerprint(&fp)?,
+                state: OperationState::from_str(&state)
+                    .map_err(|_| JournalError::Corrupt("unknown operation state"))?,
+                idempotency: IdempotencyClass::from_str(&class)
+                    .map_err(|_| JournalError::Corrupt("unknown idempotency class"))?,
+                reconcile_ref,
+            });
+        }
+        Ok(out)
+    }
+
     pub fn load(
         &self,
         id: OperationId,

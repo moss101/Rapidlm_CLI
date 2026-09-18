@@ -27,6 +27,16 @@ pub enum OrchestrationState {
     Reverifying,
     Verified,
     Accepted,
+    /// Recovered but not running: the state a crashed run is restored into.
+    ///
+    /// Distinct from `Blocked` (waiting on an approval or input) and from
+    /// the terminal states: a paused run kept its progress and resumes to
+    /// exactly the phase it was interrupted in. Recovery never restores a
+    /// run straight back to a live phase — an interrupted run may have
+    /// effects in flight that a human or a reconciliation must settle
+    /// first, so `Paused` is what a restart produces and `Resume` is the
+    /// explicit step out of it (GVS-008).
+    Paused,
     Blocked,
     Failed,
     Cancelled,
@@ -52,6 +62,10 @@ pub enum OrchestrationTransition {
     BeginStrategist,
     BeginReverification,
     Accept,
+    /// Suspend a live run, keeping its progress (recovery's entry point).
+    Pause,
+    /// Leave `Paused` for the phase the run was interrupted in.
+    Resume,
     Block,
     Fail,
     Cancel,
@@ -107,6 +121,7 @@ impl OrchestrationState {
             Self::Reverifying => "reverifying",
             Self::Verified => "verified",
             Self::Accepted => "accepted",
+            Self::Paused => "paused",
             Self::Blocked => "blocked",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -142,6 +157,8 @@ impl OrchestrationTransition {
             Self::Accept => "accept",
             Self::Block => "block",
             Self::Fail => "fail",
+            Self::Pause => "pause",
+            Self::Resume => "resume",
             Self::Cancel => "cancel",
         }
     }
@@ -226,6 +243,12 @@ pub fn validate_transition(
             OrchestrationState::AwaitingVerification,
             OrchestrationTransition::BeginReverification,
         ) => OrchestrationState::Reverifying,
+        // Any live phase may pause; a paused run is already paused.
+        (_, OrchestrationTransition::Pause)
+            if !from.is_terminal() && from != OrchestrationState::Paused =>
+        {
+            OrchestrationState::Paused
+        }
         (_, OrchestrationTransition::Block) if !from.is_terminal() => OrchestrationState::Blocked,
         (_, OrchestrationTransition::Fail) if !from.is_terminal() => OrchestrationState::Failed,
         (_, OrchestrationTransition::Cancel) if !from.is_terminal() => {
@@ -292,6 +315,49 @@ mod tests {
                 OrchestrationTransition::Cancel
             ),
             Err(TransitionError::InvalidTransition)
+        );
+    }
+
+    #[test]
+    fn a_run_pauses_from_any_live_phase_and_never_from_a_terminal_one() {
+        // Recovery restores an interrupted run as `Paused`, so every live
+        // phase must have that edge — and no terminal state may acquire one,
+        // or a finished run could be reopened by a restart.
+        for from in [
+            OrchestrationState::Contracting,
+            OrchestrationState::Implementing,
+            OrchestrationState::RunningChecks,
+            OrchestrationState::Verifying,
+            OrchestrationState::Verified,
+        ] {
+            assert_eq!(
+                validate_transition(from, OrchestrationTransition::Pause),
+                Ok(OrchestrationState::Paused),
+                "{from:?} must be pausable"
+            );
+        }
+        for terminal in [
+            OrchestrationState::Accepted,
+            OrchestrationState::Blocked,
+            OrchestrationState::Failed,
+            OrchestrationState::Cancelled,
+        ] {
+            assert!(
+                validate_transition(terminal, OrchestrationTransition::Pause).is_err(),
+                "{terminal:?} is terminal and must not pause"
+            );
+        }
+        // Pausing a paused run is not a transition either.
+        assert!(
+            validate_transition(OrchestrationState::Paused, OrchestrationTransition::Pause)
+                .is_err()
+        );
+        // `Paused` is not terminal: the run still has somewhere to go.
+        assert!(!OrchestrationState::Paused.is_terminal());
+        // And it can still be cancelled outright.
+        assert_eq!(
+            validate_transition(OrchestrationState::Paused, OrchestrationTransition::Cancel),
+            Ok(OrchestrationState::Cancelled)
         );
     }
 

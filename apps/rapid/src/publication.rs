@@ -271,6 +271,109 @@ where
     }
 }
 
+/// What a recovery pass did to the work a restart inherited.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RecoveryReport {
+    /// Operations that had not started (`Prepared`): nothing happened, so
+    /// they are closed as failed and a fresh request may run.
+    pub abandoned: Vec<OperationId>,
+    /// At-most-once operations that were in flight: whether the effect
+    /// landed cannot be known from the journal alone, so they are marked
+    /// `Uncertain` and then reconciled from the world's own evidence.
+    pub reconciled: Vec<OperationId>,
+    /// In-flight operations left for a human: the reconciler could not tell
+    /// whether the effect landed.
+    pub undecided: Vec<OperationId>,
+}
+
+/// What the world says about an in-flight effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Settlement {
+    /// The effect is visible; record it as reconciled.
+    Applied,
+    /// The effect is provably absent; record it as reconciled-not-applied.
+    NotApplied,
+    /// Cannot tell. The record stays `Uncertain` for a human.
+    Unknown,
+}
+
+/// Settle the publications a restart inherited, before anything new runs.
+///
+/// An at-most-once effect that was in flight when the process died is the
+/// one case the journal cannot resolve by itself: `Executing` means the
+/// patch may or may not have reached the tree. [`ReplayPolicy`] already
+/// refuses to replay such a record; recovery's job is to turn it into a
+/// terminal one by asking the world — `settle` inspects the actual tree —
+/// so the next publication is not blocked forever by
+/// [`PublicationError::InFlight`].
+///
+/// A `Prepared` record is different: the effect had not started, so it is
+/// closed as failed and a fresh request is free to run.
+pub fn recover<F>(
+    journal: &PublicationJournal,
+    mut settle: F,
+) -> Result<RecoveryReport, PublicationError>
+where
+    F: FnMut(&event_ledger::journal::OperationRecord) -> Settlement,
+{
+    let cancel = CancellationToken::new();
+    let pending = journal
+        .journal
+        .pending(journal.session, &cancel)
+        .map_err(|err| PublicationError::Journal(err.to_string()))?;
+    let mut report = RecoveryReport::default();
+    for record in pending {
+        match record.state() {
+            // Nothing happened: close it so a retry is clean. The journal's
+            // closed machine has no `Prepared → Failed` edge (its only exit
+            // from `Prepared` is `Executing`), so closing a never-started
+            // record goes through it. The record ends `Failed`, which is the
+            // truth: the operation did not complete. Nothing is executed —
+            // the effect closure is not involved in recovery at all.
+            OperationState::Prepared => {
+                journal
+                    .journal
+                    .mark_executing(record.id(), &cancel)
+                    .map_err(|err| PublicationError::Journal(err.to_string()))?;
+                journal
+                    .journal
+                    .fail(record.id(), &cancel)
+                    .map_err(|err| PublicationError::Journal(err.to_string()))?;
+                report.abandoned.push(record.id());
+            }
+            // May or may not have happened. Never replayed — reconciled.
+            OperationState::Executing | OperationState::Uncertain => {
+                if record.state() == OperationState::Executing {
+                    journal
+                        .journal
+                        .mark_uncertain(record.id(), &cancel)
+                        .map_err(|err| PublicationError::Journal(err.to_string()))?;
+                }
+                match settle(&record) {
+                    Settlement::Applied => {
+                        journal
+                            .journal
+                            .reconcile(record.id(), "applied: observed in the tree", &cancel)
+                            .map_err(|err| PublicationError::Journal(err.to_string()))?;
+                        report.reconciled.push(record.id());
+                    }
+                    Settlement::NotApplied => {
+                        journal
+                            .journal
+                            .reconcile(record.id(), "not-applied: absent from the tree", &cancel)
+                            .map_err(|err| PublicationError::Journal(err.to_string()))?;
+                        report.reconciled.push(record.id());
+                    }
+                    Settlement::Unknown => report.undecided.push(record.id()),
+                }
+            }
+            // `pending` never returns these.
+            OperationState::Committed | OperationState::Failed | OperationState::Reconciled => {}
+        }
+    }
+    Ok(report)
+}
+
 /// A stable per-project session id for publications, derived from the
 /// ledger's own path so the same project resolves the same session across
 /// processes — the journal answers a repeat by fingerprint *within* a

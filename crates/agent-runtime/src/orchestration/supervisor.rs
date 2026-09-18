@@ -145,6 +145,10 @@ pub struct OrchestrationSnapshot {
     pub last_repair: Option<RepairDirective>,
     pub last_plan: Option<PlanResult>,
     pub last_discovery: Option<DiscoveryResult>,
+    /// The phase a paused run was interrupted in, so [`Supervisor::resume_paused`]
+    /// returns to exactly it. `None` unless the run is [`OrchestrationState::Paused`].
+    /// Added with a default so an older snapshot still resumes (ADR 0021).
+    pub paused_from: Option<OrchestrationState>,
 }
 
 /// What one acceptance asserts: the task, the verdict that justified it,
@@ -264,6 +268,7 @@ impl Supervisor {
                 last_repair: None,
                 last_plan: None,
                 last_discovery: None,
+                paused_from: None,
             },
             events: MemoryEventSink::default(),
             store: EvidenceStore::default(),
@@ -769,6 +774,39 @@ impl Supervisor {
         self.emit(OrchestrationEventKind::TaskAccepted, "accepted by host")?;
         self.snapshot.state = next;
         Ok(())
+    }
+
+    /// Suspend a live run, keeping its progress and remembering the phase to
+    /// come back to. This is what recovery puts an interrupted run into: a
+    /// restart must not resume straight into a live phase, because an
+    /// interrupted run may have effects in flight that a reconciliation or a
+    /// human has to settle first (GVS-008).
+    pub fn pause(&mut self) -> Result<(), SupervisorError> {
+        let from = self.snapshot.state;
+        self.apply(OrchestrationTransition::Pause)?;
+        self.snapshot.paused_from = Some(from);
+        Ok(())
+    }
+
+    /// Leave `Paused` for the phase the run was interrupted in. Refuses a run
+    /// that is not paused, and one whose interrupted phase was not recorded —
+    /// guessing which phase to re-enter is exactly how a recovery repeats an
+    /// effect.
+    pub fn resume_paused(&mut self) -> Result<OrchestrationState, SupervisorError> {
+        if self.snapshot.state != OrchestrationState::Paused {
+            return Err(SupervisorError::Transition(
+                TransitionError::InvalidTransition,
+            ));
+        }
+        let to = self
+            .snapshot
+            .paused_from
+            .ok_or(SupervisorError::Transition(
+                TransitionError::InvalidTransition,
+            ))?;
+        self.snapshot.state = to;
+        self.snapshot.paused_from = None;
+        Ok(to)
     }
 
     pub fn cancel(&mut self) -> Result<(), SupervisorError> {
@@ -1776,6 +1814,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resumed.state(), OrchestrationState::Refuted);
+    }
+
+    #[test]
+    fn a_recovered_run_is_paused_and_resumes_to_the_phase_it_was_interrupted_in() {
+        // GVS-008: a restart never drops an interrupted run straight back
+        // into a live phase — it restores as `Paused` and remembers where to
+        // go, so an in-flight effect can be settled first.
+        let id = GoalId::new();
+        let eid = evidence_id();
+        let mut sup = start_with(FakeScript {
+            task_id: id,
+            evidence: vec![eid],
+            include_evidence: true,
+            refute_n: 0,
+            fail_checks: false,
+        });
+        record_supporting_evidence(&mut sup, eid);
+        drive_to_implementing(&mut sup);
+        sup.advance().unwrap();
+        sup.run_checks().unwrap();
+        let interrupted = sup.state();
+        assert_eq!(interrupted, OrchestrationState::AwaitingVerification);
+
+        sup.pause().expect("pauses");
+        assert_eq!(sup.state(), OrchestrationState::Paused);
+        assert_eq!(sup.snapshot().paused_from, Some(interrupted));
+
+        // The paused snapshot survives a resume into a new process.
+        let snap = sup.snapshot().clone();
+        let mut resumed = Supervisor::resume(
+            snap,
+            SupervisorDrivers::fakes(FakeScript {
+                task_id: id,
+                evidence: vec![eid],
+                include_evidence: true,
+                refute_n: 0,
+                fail_checks: false,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.state(),
+            OrchestrationState::Paused,
+            "a restart restores the run paused, not running"
+        );
+        assert_eq!(
+            resumed.resume_paused().expect("resumes"),
+            interrupted,
+            "and returns to exactly the phase it was interrupted in"
+        );
+        assert_eq!(resumed.snapshot().paused_from, None);
+        // Resuming a run that is not paused is refused rather than guessed.
+        assert!(resumed.resume_paused().is_err());
     }
 
     #[test]

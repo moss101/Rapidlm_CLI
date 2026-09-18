@@ -1,4 +1,4 @@
-# Goal delivery — GVS5H Phase 1, first three slices: production caller, replay reducer, single-event acceptance (2026-09-18)
+# Goal delivery — GVS5H Phase 1 (2026-09-18): production caller, replay reducer, single-event acceptance, publication receipts, real identities, recovery, versioned records
 
 Baseline: `b63793a` (the last commit of the 2026-09-17 delivery). Scope: the first Phase 1
 slice ADR 0021 §"Consequences" orders before everything else — a production caller for
@@ -80,15 +80,48 @@ Before: `Supervisor::accept` applied the transition and emitted in memory, then 
 
 Two consequences worth stating rather than discovering later: the goal node's completion no longer produces a `graph.node_state_changed` event (it rides the acceptance record), so an external consumer of that published wire kind sees node states for every step but not the goal's completion; and a `graph.node_state_changed` now carries the node's `wait_token`, which `replay` restores — without it a replayed waiting node no longer knew what it waited on, and the GVS-005 "replayed == live" claim held only for wait-free histories.
 
+## Slices 4-6: publication receipts, real identities, recovery, versioned records
+
+### Publication receipts (GVS-006's other half)
+
+`/agents integrate` wrote the user's tree with `git apply` and recorded nothing, so a repeat or a crash mid-apply had no durable answer.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| Publication is at-most-once, journaled prepared → applied | done | `apps/rapid/src/publication.rs`; the fingerprint is agent + child base + parent revision + patch hash, so the same request is the same effect across processes and a moved parent is a different one |
+| A repeat cannot apply twice | done | Answered from the journal; the write closure does not run (`publication_is_journaled_...`, revert-cycled — without the journal answer the committed effect runs again) |
+| A crash mid-apply is reconciled, never replayed | done | `IdempotencyClass::AtMostOnce` ⇒ `ReplayPolicy::Reconcile`; `publication::recover` marks `Executing` → `Uncertain` and settles it from the tree (`git apply --check --reverse`), leaving a genuinely undecidable case `Uncertain` for a human rather than guessing |
+| Fail closed | done | A publication that cannot be journaled does not happen (`a_publication_that_cannot_be_journaled_does_not_happen`) |
+| Publication through `TransactionManager` | **not as written; reasoned** | `TransactionManager` stages into an in-memory overlay and its own `begin_transaction` says "Parent checkout is not written" — nothing materializes an overlay to disk. Routing integrate through it as-is would have replaced a real `git apply` with an overlay no one reads, silently ending integration. The transaction *contract* (frozen parent revision, patch hash, change count, checks, one publication) is implemented; the *type* is not on this path. Recorded in the module doc rather than left as a silent divergence |
+| Checks gate publication | **divergence, stated** | The existing contract runs the check after the apply and reports `CheckFailed` with the files applied. That is preserved rather than silently changed to a rollback; the ADR's "hooks gate publication" remains unimplemented for this path |
+
+### Real identities (GVS-007)
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| Candidate, test and environment digests | done | `apps/rapid/src/digests.rs`: the workspace (HEAD plus every deviation, content included, NUL-separated so a crafted filename cannot forge a status line), the check definition (command plus the content of files it names), the environment (toolchain versions). Each fails closed — an identity that cannot be established is `unavailable:` and compares equal to nothing, not even another failure |
+| Identity is the tree, not the goal text | done | `goal claim`'s `WorkspaceIdentity` was a hash of the *goal snapshot*, so two different trees with the same goal were indistinguishable; it is now the real workspace digest |
+| `invalidate_subject` has a production caller | done | `GoalHost::stale_evidence_for_subject`, used by the write hook alongside the conservative tree-wide sweep |
+| Production writes invalidate evidence | done | Real gap closed: `git apply` bypasses `workspace_write`'s hook, so integrating a child left every recorded check looking fresh against code it never saw (`integrating_a_child_stales_evidence_recorded_before_it`, revert-cycled — the evidence is still `[Fresh]` without it) |
+
+### Recovery (GVS-008) and versioned records (GVS-004)
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| A run recovers as paused, not running | done | `OrchestrationState::Paused` with `Pause`/`Resume`; `Supervisor::pause` records the interrupted phase and `resume_paused` returns to exactly it, refusing to guess when it was not recorded. Terminal states cannot pause (`a_run_pauses_from_any_live_phase_and_never_from_a_terminal_one`) |
+| In-flight effects are settled explicitly | done | `journal.pending()` + `publication::recover`; a never-started `Prepared` record is closed so a retry is clean (the journal's closed machine has no `Prepared → Failed` edge, so it goes through `Executing`; nothing is executed) |
+| Versioned records with additive evolution | done | `agent-runtime` `orchestration::records`: a self-describing `record: "<kind>/v<n>"` envelope, unknown fields ignored (old reader reads a new record; new reader defaults what an old one lacks), foreign records and future majors as **typed skips**, bodies bounded at 64 KiB. `protocol::CandidateId` added |
+| The supervisor snapshot's own reducer | pending | `replay` rebuilds the graph; rebuilding an `OrchestrationSnapshot` from the stream needs the full record set writing to the ledger, which these record *types* enable but do not yet wire |
+
 ## Explicitly not delivered (later Phase 1 slices, unchanged plan)
 
 - **Replay (GVS-005):** a resumed run opens a *fresh* graph in a new ledger session and sets its
   nodes to the recorded step states; the run-state file — not the events — is still the
   cross-invocation authority, and attempt counts across invocations are its. The
   `OrchestrationRecord` pointer is what the reducer will start from.
-- **Identities (GVS-007):** the workspace identity is the digest of the steps' `watch` globs
-  (nothing, for a playbook without them), with `require_workspace_identity: false` as in `goal
-  claim`.
+- **Identities (GVS-007) in `rapid run`:** the verified run's workspace identity is still the
+  digest of the steps' `watch` globs; `goal claim` uses the real tree digest, `rapid run` does not
+  yet.
 - **Recovery (GVS-008):** a step left `Running` by a crashed invocation is mirrored as
   `running` and, as on the default path, never re-queued; `reset_step` refuses it too.
 - Model-facing surfaces, `agent_views::integrate` over `TransactionManager`, and everything in

@@ -224,6 +224,10 @@ typed_id!(RuntimeId, RuntimeTag);
 typed_id!(TraceId, TraceTag);
 typed_id!(GraphId, GraphTag);
 typed_id!(NodeId, NodeTag);
+// A candidate completion's identity, so a verdict, a check receipt and a
+// publication can all name the same candidate without hashing its body
+// (ADR 0021's record table; GVS-004).
+typed_id!(CandidateId, CandidateTag);
 
 #[cfg(test)]
 mod tests {

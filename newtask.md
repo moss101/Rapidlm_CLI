@@ -8477,6 +8477,19 @@ before any persistence work — and that is what landed
   failing, the old code reaches `Accepted` while nothing is durable, the new code stays
   `Verified` with the graph untouched. `replay` folds the acceptance, so a rebuild reproduces it.
   Publication receipts (prepared/applied/reconciled via `TransactionManager`) are the pending half.
+- Slices 4-6 (publication receipts, real identities, recovery, versioned records): publication is
+  an at-most-once journaled effect with a receipt — a repeat is answered from the journal and a
+  crash mid-apply is reconciled from the tree, never replayed; the workspace/check/environment
+  digests are real (each failing closed to an `unavailable:` value that matches nothing), so
+  `goal claim`'s identity is the tree rather than a hash of the goal text; `invalidate_subject`
+  got its first production caller and the gap where `git apply` bypassed the evidence hook is
+  closed; `OrchestrationState::Paused` plus `Supervisor::pause`/`resume_paused` restore an
+  interrupted run to exactly the phase it was in; and orchestration records are versioned with
+  additive evolution (unknown fields ignored, foreign records and future majors typed skips).
+  **`TransactionManager` is deliberately not on the publication path**: it stages into an
+  in-memory overlay ("Parent checkout is not written") that nothing materializes, so routing
+  integrate through it would have stopped the child's work reaching the user's files — the
+  contract is implemented, the type is not, and the reasoning is in the module doc.
 - Not delivered, by the plan's order: a resume-time replay caller (a resumed run still opens a
   fresh graph and mirrors the run-state file, which stays the resume authority), single-event
   acceptance, real identities, recovery of a `Running` step from a crashed invocation, and

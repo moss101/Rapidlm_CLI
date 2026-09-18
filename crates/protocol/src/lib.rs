@@ -31,9 +31,9 @@ pub use error::{
     MAX_MESSAGE_BYTES, RapidErrorClass, UNKNOWN_INTERNAL_MESSAGE,
 };
 pub use id::{
-    AgentId, ContextItemId, ControlLeaseId, EventId, EvidenceId, GoalId, GraphId, HandoffId, Id,
-    IdParseError, JobId, KnowledgeId, LeaseId, MessageId, NodeId, ProjectId, RepoId, RuntimeId,
-    SessionId, TraceId, TrajectoryId, TurnId, WorkspaceViewId,
+    AgentId, CandidateId, ContextItemId, ControlLeaseId, EventId, EvidenceId, GoalId, GraphId,
+    HandoffId, Id, IdParseError, JobId, KnowledgeId, LeaseId, MessageId, NodeId, ProjectId, RepoId,
+    RuntimeId, SessionId, TraceId, TrajectoryId, TurnId, WorkspaceViewId,
 };
 pub use remote_worker::{
     CapabilityClass, CapabilityClassParseError, CapabilityLimits, ComputerUseSurface,
