@@ -24,7 +24,7 @@ pub use graph::{Edge, EdgeCondition, GraphDiff, Node, NodeExplain, ReadyContext,
 pub use kinds::{EdgeKind, NodeKind, NodeState};
 pub use orch::{GraphBackedRun, RunPlan};
 pub use proposal::{EdgeSpec, GraphProposal, NodeSpec, ProposalError};
-pub use service::{AcceptanceEvent, GraphError, GraphReplay, GraphService};
+pub use service::{ACCEPTANCE_RECORD, AcceptanceEvent, GraphError, GraphReplay, GraphService};
 
 #[cfg(test)]
 mod tests {
@@ -100,6 +100,68 @@ mod tests {
             other => panic!("expected a rebuild, got {other:?}"),
         };
         assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[&graph.graph_id], live, "replayed == uninterrupted");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn replay_restores_a_wait_token_and_ignores_another_producers_task_accepted() {
+        let (mut svc, dir) = open_service();
+        let session = svc.session();
+        let graph = svc.create("root").expect("create");
+        let ask = NodeId::new();
+        svc.propose(
+            graph.graph_id,
+            GraphProposal {
+                base_revision: 1,
+                add_nodes: vec![NodeSpec::new(ask, NodeKind::AskUser, "approve")],
+                add_edges: vec![EdgeSpec {
+                    from: graph.root,
+                    to: ask,
+                    kind: EdgeKind::DecomposesInto,
+                    condition: EdgeCondition::default(),
+                }],
+                supersede: vec![],
+                invalidate: vec![],
+            },
+        )
+        .expect("propose");
+        svc.wait(graph.graph_id, ask, "tok-42").expect("wait");
+
+        // `orchestration.task_accepted` is a shared wire kind: the
+        // supervisor's own event uses it with a different payload. One in
+        // this session must not poison the replay.
+        let cancel = event_ledger::ledger::CancellationToken::new();
+        let actor = event_ledger::event::ActorRef::new(
+            event_ledger::event::ActorKind::System,
+            &protocol::EventId::new().to_string(),
+        )
+        .unwrap();
+        svc.ledger()
+            .append(
+                session,
+                actor,
+                EventKind::OrchestrationTaskAccepted,
+                serde_json::json!({"kind": "task_accepted", "task_id": "x", "round": 1}),
+                &event_ledger::ledger::AppendOptions {
+                    redaction: protocol::RedactionClass::Public,
+                    trace_id: protocol::TraceId::new(),
+                    expected_seq: None,
+                },
+                &cancel,
+            )
+            .expect("append foreign");
+
+        let live = svc.snapshot(graph.graph_id).expect("live").clone();
+        let replayed = match reopen(&dir, session).replay(session).expect("replay") {
+            GraphReplay::Rebuilt(graphs) => graphs,
+            other => panic!("a foreign task_accepted must not fail the replay: {other:?}"),
+        };
+        assert_eq!(
+            replayed[&graph.graph_id].nodes[&ask].wait_token.as_deref(),
+            Some("tok-42"),
+            "a replayed waiting node still knows what it waits on"
+        );
         assert_eq!(replayed[&graph.graph_id], live, "replayed == uninterrupted");
         let _ = fs::remove_dir_all(dir);
     }

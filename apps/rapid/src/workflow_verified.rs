@@ -22,9 +22,10 @@
 //! graph whose nodes are set to the recorded step states (replay from the
 //! events is GVS-005); attempts across invocations are the run state's
 //! count; the workspace identity is the digest of the steps' `watch` globs,
-//! not a tree identity (GVS-007); acceptance is still the supervisor's
-//! transition followed by graph updates (single-event acceptance is
-//! GVS-006).
+//! not a tree identity (GVS-007). Acceptance *is* single-event since
+//! GVS-006 — one `orchestration.task_accepted` record that the supervisor
+//! and the graph are both reduced from — but only the graph half can be
+//! rebuilt from the stream; restoring the supervisor snapshot is GVS-008.
 
 use std::collections::BTreeMap;
 use std::path::Path;

@@ -747,11 +747,16 @@ impl Supervisor {
         })
     }
 
-    /// Reduce a durable acceptance record into this snapshot. In-memory
-    /// only: the record is already durable when this runs, so nothing here
-    /// can fail for want of storage. Refuses a record for another task, and
-    /// is idempotent for the record already applied — replaying the durable
-    /// stream must not double-apply.
+    /// Reduce a durable acceptance record into this snapshot. Refuses a
+    /// record for another task, and is idempotent for the record already
+    /// applied — replaying the durable stream must not double-apply.
+    ///
+    /// The state change is committed **last**, after every fallible step:
+    /// the transition is validated without applying it, the event is
+    /// emitted (the sink may be ledger-backed and fail), and only then does
+    /// the snapshot move. So a failure here cannot leave this projection
+    /// reporting `Accepted` while its caller's other projection — or the
+    /// durable stream — says otherwise.
     pub fn apply_acceptance(&mut self, record: &AcceptanceRecord) -> Result<(), SupervisorError> {
         if record.task_id != self.snapshot.contract.id {
             return Err(SupervisorError::InvalidOutput);
@@ -759,8 +764,10 @@ impl Supervisor {
         if self.snapshot.state == OrchestrationState::Accepted {
             return Ok(());
         }
-        self.apply(OrchestrationTransition::Accept)?;
+        let next = validate_transition(self.snapshot.state, OrchestrationTransition::Accept)
+            .map_err(SupervisorError::Transition)?;
         self.emit(OrchestrationEventKind::TaskAccepted, "accepted by host")?;
+        self.snapshot.state = next;
         Ok(())
     }
 

@@ -156,7 +156,10 @@ impl GraphBackedRun {
     /// `orchestration.task_accepted` carrying the goal node, the
     /// verification nodes, the task and the candidate digest, and only once
     /// that is durable reduce it into the supervisor and the graph. A failed
-    /// append leaves neither advanced; a replay of the record rebuilds both.
+    /// append leaves neither advanced, and [`GraphService::replay`] rebuilds
+    /// the *graph* side from the record alone. The supervisor snapshot has
+    /// no reducer of its own yet — restoring it from the stream is GVS-008 —
+    /// so this is not yet a full cross-process recovery.
     ///
     /// A verification node that failed, was cancelled, superseded or
     /// invalidated blocks acceptance before anything is touched: the
@@ -164,10 +167,18 @@ impl GraphBackedRun {
     /// A verification node that never ran is completed by the acceptance
     /// itself — it stands for the supervisor's own verification.
     pub fn accept(&mut self) -> Result<(), SupervisorError> {
-        // Idempotent: an already-accepted run answers from what it holds
-        // rather than appending a second acceptance.
+        // Idempotent: an already-accepted run appends no second record.
+        // It still reconciles the graph, because the reduction that follows
+        // an append is not itself atomic with it: if a previous call
+        // advanced the supervisor and then failed before the graph was
+        // reduced, returning `Ok` blindly would strand the graph for good.
+        // `apply_accepted` is idempotent, so a fully-reduced graph is
+        // untouched.
         if self.supervisor.state() == OrchestrationState::Accepted {
-            return Ok(());
+            return self
+                .graphs
+                .apply_accepted(self.graph_id, &self.completed_nodes())
+                .map_err(|e| SupervisorError::Sink(e.to_string()));
         }
         let snapshot = self
             .graphs
@@ -190,22 +201,35 @@ impl GraphBackedRun {
         // Validates every host precondition and mutates nothing.
         let record = self.supervisor.acceptance_record()?;
         let event = AcceptanceEvent {
+            record: crate::service::ACCEPTANCE_RECORD.to_owned(),
             graph_id: self.graph_id,
             goal_node: self.goal_node,
             verify_nodes: self.verify_nodes.clone(),
             task_id: record.task_id.to_string(),
             candidate_digest: record.candidate_digest.clone(),
-            verdict: format!("{:?}", record.verdict),
+            verdict: record.verdict,
+            workspace_identity: record.workspace_identity.hash.clone(),
         };
-        // The single durable write. Everything after this is reduction.
+        // The single durable write. Everything after this is reduction, and
+        // each reduction commits its own state last, so a failure in either
+        // leaves that projection unchanged and the durable record — which
+        // the next `accept` reconciles from — as the authority.
         self.graphs
             .append_acceptance(&event)
             .map_err(|e| SupervisorError::Sink(e.to_string()))?;
         self.supervisor.apply_acceptance(&record)?;
         self.graphs
-            .apply_accepted(&event)
+            .apply_accepted(self.graph_id, &self.completed_nodes())
             .map_err(|e| SupervisorError::Sink(e.to_string()))?;
         Ok(())
+    }
+
+    /// The graph nodes an acceptance completes: the goal, then every
+    /// verification node.
+    fn completed_nodes(&self) -> Vec<NodeId> {
+        let mut nodes = vec![self.goal_node];
+        nodes.extend(self.verify_nodes.iter().copied());
+        nodes
     }
 
     pub fn orchestration_state(&self) -> OrchestrationState {
@@ -655,6 +679,65 @@ mod tests {
             &replayed[&run.graph_id],
             run.graphs.snapshot(run.graph_id).unwrap(),
             "replayed == uninterrupted, acceptance included"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_repeated_accept_reconciles_a_graph_an_interrupted_reduction_left_behind() {
+        // The reduction that follows the durable append is not atomic with
+        // it. If a previous call advanced the supervisor and then stopped
+        // before the graph was reduced, the record is durable and the graph
+        // is stale; the next `accept` must finish the job rather than
+        // returning `Ok` on the supervisor's state alone.
+        let dir = scratch("reconcile");
+        let ledger = EventLedger::open(dir.join("l.db")).unwrap();
+        let session = SessionId::new();
+        let id = GoalId::new();
+        let ev = EvidenceId::new();
+        let mut run = GraphBackedRun::start(
+            contract(id),
+            WorkspaceIdentity::new("sha256:aa"),
+            drivers(id, ev),
+            ledger,
+            session,
+            ProjectId::new(),
+        )
+        .expect("start");
+        verify_through(&mut run, id, ev);
+        // Exactly the interrupted state: the record is appended and the
+        // supervisor reduced, but the graph never was.
+        let record = run.supervisor.acceptance_record().expect("record");
+        let event = AcceptanceEvent {
+            record: crate::service::ACCEPTANCE_RECORD.to_owned(),
+            graph_id: run.graph_id,
+            goal_node: run.goal_node,
+            verify_nodes: run.verify_nodes.clone(),
+            task_id: record.task_id.to_string(),
+            candidate_digest: record.candidate_digest.clone(),
+            verdict: record.verdict,
+            workspace_identity: record.workspace_identity.hash.clone(),
+        };
+        run.graphs.append_acceptance(&event).expect("append");
+        run.supervisor.apply_acceptance(&record).expect("reduce");
+        assert_eq!(run.orchestration_state(), OrchestrationState::Accepted);
+        assert_eq!(
+            run.graphs.snapshot(run.graph_id).unwrap().nodes[&run.goal_node].state,
+            NodeState::Pending,
+            "the graph is the stale half"
+        );
+
+        let before = event_kinds(&run, session).len();
+        run.accept().expect("reconciling accept");
+        assert_eq!(
+            event_kinds(&run, session).len(),
+            before,
+            "reconciliation appends no second record"
+        );
+        assert_eq!(
+            run.graphs.snapshot(run.graph_id).unwrap().nodes[&run.goal_node].state,
+            NodeState::Succeeded,
+            "the graph caught up"
         );
         let _ = fs::remove_dir_all(dir);
     }

@@ -38,25 +38,36 @@ pub enum GraphReplay {
     Unsupported { first_seq: u64 },
 }
 
+/// Wire marker for [`AcceptanceEvent`]. `orchestration.task_accepted` is a
+/// shared event kind — the supervisor's own `TaskAccepted` maps onto the
+/// same string — so a reducer must be able to tell this record from another
+/// producer's without guessing from a failed parse.
+pub const ACCEPTANCE_RECORD: &str = "rapidlm.graph.acceptance/v1";
+
 /// The one durable record an acceptance appends (GVS-006). It carries
 /// everything both projections need: which supervisor run was accepted
-/// (`task_id`, `candidate_digest`, `verdict`) and which graph nodes the
-/// acceptance completes (`goal_node`, `verify_nodes`). Appended once,
-/// before either projection is touched, and folded back by
-/// [`GraphService::replay`].
+/// (`task_id`, `candidate_digest`, `verdict`, `workspace_identity`) and
+/// which graph nodes the acceptance completes (`goal_node`,
+/// `verify_nodes`). Appended once, before either projection is touched, and
+/// folded back into the graph by [`GraphService::replay`].
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AcceptanceEvent {
+    /// Always [`ACCEPTANCE_RECORD`]; identifies this shape on a shared kind.
+    pub record: String,
     pub graph_id: GraphId,
     pub goal_node: NodeId,
     pub verify_nodes: Vec<NodeId>,
     pub task_id: String,
     pub candidate_digest: String,
-    pub verdict: String,
+    /// The verdict in its own serde encoding, not a `Debug` rendering: this
+    /// is a durable field a reader decodes back into a `Verdict`.
+    pub verdict: agent_runtime::orchestration::Verdict,
+    pub workspace_identity: String,
 }
 
 impl AcceptanceEvent {
     /// Every graph node this acceptance marks succeeded, goal first.
-    fn completed_nodes(&self) -> Vec<NodeId> {
+    pub fn completed_nodes(&self) -> Vec<NodeId> {
         let mut nodes = vec![self.goal_node];
         nodes.extend(self.verify_nodes.iter().copied());
         nodes
@@ -201,6 +212,10 @@ impl GraphService {
         } else {
             node.attempts
         };
+        // The wait token travels with the transition: it is part of the
+        // node's durable state, and a replay that dropped it would rebuild
+        // a waiting node that no longer knows what it waits on.
+        let wait_token = node.wait_token.clone();
         self.append(
             EventKind::GraphNodeStateChanged,
             json!({
@@ -208,6 +223,7 @@ impl GraphService {
                 "node_id": node_id.to_string(),
                 "state": state.as_str(),
                 "attempts": attempts,
+                "wait_token": wait_token,
             }),
         )?;
         let graph = self
@@ -613,18 +629,29 @@ impl GraphService {
                     if let Some(attempts) = attempts {
                         node.attempts = attempts;
                     }
+                    node.wait_token = payload
+                        .get("wait_token")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned);
                     graph.revision = graph.revision.saturating_add(1);
                 }
                 // The one acceptance record, reduced exactly as the live
                 // path reduces it (GVS-006): the same goal and verification
                 // nodes become `Succeeded`.
                 EventKind::OrchestrationTaskAccepted => {
+                    // A shared wire kind: the supervisor's own TaskAccepted
+                    // maps onto the same string. Only a payload carrying
+                    // this record's marker is ours; anything else belongs to
+                    // another producer and must not poison the replay.
+                    if payload.get("record").and_then(|v| v.as_str()) != Some(ACCEPTANCE_RECORD) {
+                        continue;
+                    }
                     let event: AcceptanceEvent = serde_json::from_value(payload.clone())
                         .map_err(|e| GraphError::Ledger(format!("acceptance seq {seq}: {e}")))?;
                     let Some(graph) = graphs.get_mut(&event.graph_id) else {
-                        // An acceptance for a graph this session never
-                        // created (a `goal claim` acceptance has no graph
-                        // at all): not this reducer's business.
+                        // Our record, but for a graph this session never
+                        // created — another run's acceptance sharing the
+                        // session. Not this replay's business.
                         continue;
                     };
                     for id in event.completed_nodes() {
@@ -658,30 +685,46 @@ impl GraphService {
         self.append(EventKind::OrchestrationTaskAccepted, payload)
     }
 
-    /// Reduce an already-durable acceptance into the in-memory graph: the
-    /// goal and every verification node it names become `Succeeded`. No
-    /// append — the record this derives from is already on the ledger, and
-    /// appending again would make acceptance several writes once more.
-    /// Idempotent: a node already `Succeeded` is left alone, so replaying
-    /// the same record cannot advance the revision twice.
-    pub fn apply_accepted(&mut self, event: &AcceptanceEvent) -> Result<(), GraphError> {
-        let graph = self
-            .graphs
-            .get_mut(&event.graph_id)
-            .ok_or(GraphError::UnknownGraph)?;
-        for id in event.completed_nodes() {
-            let node = graph
-                .nodes
-                .get_mut(&id)
-                .ok_or(GraphError::Proposal(ProposalError::UnknownNode))?;
+    /// Reduce an already-durable acceptance into the in-memory graph: each
+    /// named node becomes `Succeeded`. No append — the record this derives
+    /// from is already on the ledger, and appending again would make
+    /// acceptance several writes once more. Idempotent: a node already
+    /// `Succeeded` is left alone, so replaying the same record cannot
+    /// advance the revision twice, and a graph already fully reduced is
+    /// left exactly as it was.
+    ///
+    /// Takes the nodes rather than the record so a caller holding only the
+    /// graph's side of an acceptance — reconciling after an interrupted
+    /// reduction — can call it without reconstructing the durable record.
+    pub fn apply_accepted(
+        &mut self,
+        graph_id: GraphId,
+        nodes: &[NodeId],
+    ) -> Result<(), GraphError> {
+        // Validate every node before changing any, so an acceptance naming
+        // one unknown node cannot leave a half-reduced graph behind.
+        {
+            let graph = self.graphs.get(&graph_id).ok_or(GraphError::UnknownGraph)?;
+            if nodes.iter().any(|id| graph.node(*id).is_none()) {
+                return Err(GraphError::Proposal(ProposalError::UnknownNode));
+            }
+        }
+        for id in nodes {
+            let graph = self
+                .graphs
+                .get_mut(&graph_id)
+                .ok_or(GraphError::UnknownGraph)?;
+            let node = graph.nodes.get_mut(id).expect("checked above");
             if node.state == NodeState::Succeeded {
                 continue;
             }
             node.state = NodeState::Succeeded;
             graph.revision = graph.revision.saturating_add(1);
+            // One history entry per revision, as `set_state` records them,
+            // so `diff` can still name every intermediate revision.
+            let out = graph.clone();
+            self.history.entry(graph_id).or_default().push(out);
         }
-        let out = graph.clone();
-        self.history.entry(event.graph_id).or_default().push(out);
         Ok(())
     }
 
