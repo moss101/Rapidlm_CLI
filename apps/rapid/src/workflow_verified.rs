@@ -316,8 +316,10 @@ impl VerifiedRun {
                     self.run
                         .graphs
                         .set_state(self.run.graph_id, node, NodeState::Failed)?;
-                    let attempts = state.attempts.get(&step.key).copied().unwrap_or(1);
-                    if attempts < step.max_attempts {
+                    // The same rule the run loop applies, so the graph's
+                    // ready set matches the run state's: a failure with an
+                    // attempt left is re-queued, a final one is not.
+                    if !crate::workflow::failed_for_good(state, step) {
                         self.run.graphs.retry(self.run.graph_id, node)?;
                     }
                 }
@@ -1223,6 +1225,64 @@ mod tests {
                 expect("verify", "succeeded"),
                 expect("goal", "succeeded"),
             ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_denied_human_step_resumed_verified_re_asks_rather_than_wedging() {
+        // The state `rapid run --resolve <id> deny` leaves: the gate is
+        // `Failed{u32::MAX}` with the counter set to match (so the run loop
+        // and the graph mirror agree it is final). A `--resume
+        // --orchestration verified` must not disagree with itself — the
+        // regression was `mirror` reading only `state.attempts` (unset →
+        // "retryable") while the loop read the `Failed` count ("final"),
+        // producing `graph and run state disagree`.
+        let root = scratch("denied");
+        let playbook = PlaybookFile {
+            name: "gate".to_owned(),
+            steps: vec![
+                step("gate", NodeKind::Approval, &[]),
+                step("other", NodeKind::Task, &[]),
+                step("verify", NodeKind::Verification, &["other"]),
+            ],
+        };
+        let mut state = RunState::new(new_run_id(), &playbook, Path::new("g.json"));
+        // The state a `--resolve deny` leaves: `Failed{u32::MAX}` in the
+        // step, and — the regression — nothing in the `attempts` counter.
+        // `mirror` must read the same `failed_for_good` rule the run loop
+        // does (which folds in the `Failed` count), not the bare counter,
+        // or the graph re-queues `gate` while the loop treats it as final
+        // and `confirm_ready` reports `graph and run state disagree`.
+        state.steps.insert(
+            "gate".into(),
+            StepState::Failed {
+                reason: "denied by the operator".into(),
+                attempts: u32::MAX,
+            },
+        );
+        let (mut run, _session) = open(&playbook, &state, &root, &root);
+        let (agent, command, human) = closures();
+        let cancel = agent_runtime::CancellationToken::new();
+        let outcome = execute_run(
+            &playbook,
+            &mut state,
+            &context(&root),
+            agent,
+            command,
+            human,
+            &cancel,
+            Some(&mut run),
+        );
+        // A denied gate fails the run (the operator said no) — but through
+        // `RunOutcome::Failed`, never a self-disagreement.
+        assert_eq!(
+            outcome,
+            RunOutcome::Failed {
+                key: "gate".to_owned(),
+                reason: "denied by the operator".to_owned(),
+            },
+            "must not wedge on `graph and run state disagree`"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -13,7 +13,8 @@
 //!   pending-approval machinery the interactive TUI uses, and `rapid run
 //!   --resume` continues after a human decision — including from a
 //!   restarted process (the run state is a file under `.rapidlm/runs/`);
-//! - monitor steps poll a bounded shell condition;
+//! - monitor steps run a bounded shell command once (a repeat-until-
+//!   success poll is not implemented — they run like process steps);
 //! - failed steps retry in place; completed steps are never replayed (their
 //!   recorded outcome is the guard against repeating external effects);
 //! - steps that declare `watch` globs are **invalidated on resume** when the
@@ -667,10 +668,7 @@ pub fn execute_run(
     // dropped here so a resume that runs nothing cannot report `verified`).
     state.fresh_verification.clear();
     match orchestration.as_deref() {
-        Some(verified) => {
-            state.orchestration = Some(verified.record());
-            save_run_ok(context.root, state);
-        }
+        Some(verified) => state.orchestration = Some(verified.record()),
         None => {
             // A run that started verified and continues with the mode off
             // keeps the pointer to its graph but not its verdict: nothing
@@ -678,10 +676,13 @@ pub fn execute_run(
             if let Some(record) = state.orchestration.as_mut() {
                 record.state = "abandoned: resumed with orchestration.mode = off".to_owned();
                 record.accepted = false;
-                save_run_ok(context.root, state);
             }
         }
     }
+    // Persist the cleared freshness before the first batch, so a resume
+    // that finds nothing ready still rewrites the file rather than leaving
+    // `--status` reading a stale `[verified fresh]`.
+    save_run_ok(context.root, state);
 
     loop {
         if cancel.is_cancelled() {
@@ -851,7 +852,6 @@ pub fn execute_run(
         // Fold outcomes into the state. Every outcome is a fact that
         // already happened, so all of them are recorded before a graph
         // refusal (kept in `refused`) is allowed to end the run.
-        let mut failed: Option<(String, String)> = None;
         let mut refused: Option<crate::workflow_verified::VerifiedRunError> = None;
         let folded: BTreeMap<String, Result<String, String>> =
             outcomes.lock().map(|map| map.clone()).unwrap_or_default();
@@ -898,9 +898,6 @@ pub fn execute_run(
                                 attempts,
                             },
                         );
-                        if failed.is_none() {
-                            failed = Some((key.clone(), bounded(reason)));
-                        }
                         record(
                             &context.events,
                             serde_json::json!({ "event": "step.failed", "step": key, "attempts": attempts, "reason": bounded(reason) })
@@ -927,7 +924,6 @@ pub fn execute_run(
                 };
             }
         }
-        let _ = failed;
     }
 
     // Completion semantics: finished ≠ verified.
@@ -996,7 +992,7 @@ fn save_run_ok(root: &Path, state: &RunState) {
 /// Attempts a step has consumed: the run's counter, or the count its
 /// `Failed` entry carries when that is higher (a human step denied or
 /// refused is recorded as `u32::MAX` — no retry — on both).
-fn attempts_used(state: &RunState, key: &str) -> u32 {
+pub(crate) fn attempts_used(state: &RunState, key: &str) -> u32 {
     let recorded = match state.steps.get(key) {
         Some(StepState::Failed { attempts, .. }) => *attempts,
         _ => 0,
@@ -1006,7 +1002,7 @@ fn attempts_used(state: &RunState, key: &str) -> u32 {
 
 /// A `Failed` step with no attempt left. Anything else — including a
 /// failed step the loop will retry — is not final.
-fn failed_for_good(state: &RunState, step: &Step) -> bool {
+pub(crate) fn failed_for_good(state: &RunState, step: &Step) -> bool {
     matches!(state.steps.get(&step.key), Some(StepState::Failed { .. }))
         && attempts_used(state, &step.key) >= step.max_attempts
 }
@@ -1022,14 +1018,23 @@ fn bounded(text: &str) -> String {
     format!("{}\n… (truncated)", &text[..end])
 }
 
-/// Reset one failed step so the next resume retries it (and un-cancel its
-/// dependents). Completed steps are refused: replaying one would repeat
-/// external effects — that is the at-most-once contract, not a limitation.
-pub fn reset_step(state: &mut RunState, key: &str) -> Result<(), WorkflowError> {
+/// Reset one failed step so the next resume retries it, and un-cancel every
+/// step cancelled only because this one (transitively) failed: those
+/// dependents never ran, so re-queueing them repeats no external effect,
+/// and without it the run could never recover — a cancelled step is skipped
+/// by the readiness scan and `--retry` names one step. Completed steps are
+/// refused: replaying one would repeat external effects — the at-most-once
+/// contract, not a limitation.
+pub fn reset_step(
+    state: &mut RunState,
+    playbook: &PlaybookFile,
+    key: &str,
+) -> Result<(), WorkflowError> {
     match state.steps.get(key) {
         Some(StepState::Failed { .. }) | Some(StepState::Cancelled) => {
             state.steps.insert(key.to_owned(), StepState::Pending);
             state.attempts.remove(key);
+            uncancel_dependents(state, playbook, key);
             Ok(())
         }
         Some(StepState::Succeeded) => Err(WorkflowError::Run(format!(
@@ -1038,6 +1043,25 @@ pub fn reset_step(state: &mut RunState, key: &str) -> Result<(), WorkflowError> 
         other => Err(WorkflowError::Run(format!(
             "step '{key}' is {other:?}; only a failed or cancelled step can be retried"
         ))),
+    }
+}
+
+/// Set every `Cancelled` step reachable from `key` through the dependency
+/// graph back to `Pending`: a step is cancelled only because a dependency
+/// failed for good, so once that dependency is retried its dependents must
+/// be runnable again.
+fn uncancel_dependents(state: &mut RunState, playbook: &PlaybookFile, key: &str) {
+    let mut queue = vec![key.to_owned()];
+    while let Some(current) = queue.pop() {
+        for step in &playbook.steps {
+            if step.depends_on.iter().any(|dep| dep == &current)
+                && state.steps.get(&step.key) == Some(&StepState::Cancelled)
+            {
+                state.steps.insert(step.key.clone(), StepState::Pending);
+                state.attempts.remove(&step.key);
+                queue.push(step.key.clone());
+            }
+        }
     }
 }
 
@@ -1703,6 +1727,104 @@ mod tests {
             "re-verified against the new tree"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_resume_that_runs_nothing_persists_the_cleared_freshness() {
+        // A verification step passed last time; a resume that finds nothing
+        // ready must still rewrite the file so `--status`/`load_run` do not
+        // read a stale `[verified fresh]`.
+        let dir = std::env::temp_dir().join(format!(
+            "wf-persist-fresh-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.clone();
+        let playbook = playbook_file(vec![{
+            let mut s = step("check", NodeKind::Verification, "check");
+            s.command = Some("true".into());
+            s
+        }]);
+        let state = &mut RunState::new(new_run_id(), &playbook, Path::new("test.json"));
+        // The finished state a prior invocation saved.
+        state.steps.insert("check".into(), StepState::Succeeded);
+        state.fresh_verification.insert("check".into(), true);
+        save_run(&root, state).unwrap();
+        let agent: AgentStepFn = Arc::new(|_k, _t| Ok("n/a".into()));
+        let commands: CommandStepFn = Arc::new(|_c, _t| Ok("ok".into()));
+        let human: HumanWaitFn = Arc::new(|_s, _st| Err("none".into()));
+        let cancel = agent_runtime::CancellationToken::new();
+        let context = RunContext {
+            root: &root,
+            trusted: true,
+            max_parallel: 1,
+            events: None,
+        };
+        let outcome = execute_run(
+            &playbook, state, &context, agent, commands, human, &cancel, None,
+        );
+        assert_eq!(
+            outcome,
+            RunOutcome::CompletedUnverified {
+                unmet: vec!["check".into()]
+            }
+        );
+        // The persisted file — not just the in-memory state — is fresh-free.
+        let reloaded = load_run(&root, &playbook, &state.run_id).expect("reload");
+        assert!(
+            !reloaded.fresh_verification.contains_key("check"),
+            "the file still says fresh: {:?}",
+            reloaded.fresh_verification
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_step_uncancels_the_dependents_a_final_failure_cancelled() {
+        // `a` (final failure) → `b` → `c`. `--retry a` must restore the
+        // whole chain, not just `a`, or the run can never complete.
+        let mut state = RunState::new(new_run_id(), &playbook_file(vec![]), Path::new("test.json"));
+        let playbook = playbook_file(vec![
+            step("a", NodeKind::Task, "a"),
+            {
+                let mut s = step("b", NodeKind::Task, "b");
+                s.depends_on = vec!["a".into()];
+                s
+            },
+            {
+                let mut s = step("c", NodeKind::Task, "c");
+                s.depends_on = vec!["b".into()];
+                s
+            },
+        ]);
+        state.steps.insert(
+            "a".into(),
+            StepState::Failed {
+                reason: "final".into(),
+                attempts: 3,
+            },
+        );
+        state.attempts.insert("a".into(), 3);
+        state.steps.insert("b".into(), StepState::Cancelled);
+        state.steps.insert("c".into(), StepState::Cancelled);
+        reset_step(&mut state, &playbook, "a").expect("reset");
+        assert_eq!(state.steps.get("a"), Some(&StepState::Pending));
+        assert_eq!(
+            state.steps.get("b"),
+            Some(&StepState::Pending),
+            "un-cancelled"
+        );
+        assert_eq!(
+            state.steps.get("c"),
+            Some(&StepState::Pending),
+            "transitively"
+        );
+        assert!(!state.attempts.contains_key("a"));
+        // A succeeded step in the chain is left alone.
+        reset_step(&mut state, &playbook, "missing").unwrap_err();
     }
 
     #[test]

@@ -8451,11 +8451,16 @@ before any persistence work — and that is what landed
 - Substrate: `NodeSpec.max_attempts`; `RunPlan`/`start_planned`; `accept` refuses over a failed
   verification node. `GraphService` attempts now count runs (`→ Running`), not retries — the
   old rule let a `max_attempts: 1` node retry once and disagreed with `playbook::compile`.
-- The adversarial review of the slice found three pre-existing `rapid run` readiness bugs the
-  graph mirror exposed — a dependency's first failure cancelled its dependents (retries were
+- Two rounds of adversarial review. The first found three pre-existing `rapid run` readiness bugs
+  the graph mirror exposed — a dependency's first failure cancelled its dependents (retries were
   leaf-only), a retryable failure was re-queued without a dependency check, a pause stranded the
-  batch's other steps as `Running` — plus `fresh_verification` surviving across invocations (a
-  resume that ran nothing reported `verified: true`). All fixed with revert-cycled tests; the
+  batch's other steps as `Running` — plus `fresh_verification` surviving across invocations. The
+  second caught a regression the first round's fix introduced: the graph mirror read the retry
+  ceiling off the bare `attempts` counter while the run loop read `failed_for_good`, so a denied
+  human step (`--resolve deny`, which writes `Failed{u32::MAX}` without the counter) made a
+  verified resume disagree with itself (`graph and run state disagree`) on every attempt; it also
+  found that `--retry` never un-cancelled dependents (its own doc promised it did) and that the
+  cleared freshness was not persisted on a no-op resume. All fixed with revert-cycled tests; the
   delivery record lists them.
 - Not delivered, by the plan's order: replay from events (a resumed run opens a fresh graph and
   mirrors the recorded step states; the run-state file stays the resume authority and now

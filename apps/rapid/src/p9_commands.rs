@@ -84,8 +84,8 @@ Execute a validated playbook as a durable workflow run.
 
 Each step runs to its kind: `task`/`agent`/`plan`/`goal` steps run a real
 agent turn; `verification`/`process` steps run their `command` and require
-exit 0; `monitor` steps poll their command until it succeeds (bounded by
-`timeout_secs`); `approval` and `ask_user` steps pause the run for a human
+exit 0; `monitor` steps run their command once with a bounded timeout, like
+`process`/`verification`; `approval` and `ask_user` steps pause the run for a human
 decision and print how to resume.
 
 Independent steps run concurrently (bounded by --parallel, default 4).
@@ -269,9 +269,10 @@ pub fn run_run_command(args: &[String]) -> Result<i32, P9CommandError> {
         _ => unreachable!("matched above"),
     };
 
-    // A --retry resets one failed/cancelled step before continuing.
+    // A --retry resets one failed/cancelled step (and un-cancels its
+    // dependents) before continuing.
     if let Some(step) = retry_step {
-        workflow::reset_step(&mut state, &step)
+        workflow::reset_step(&mut state, &playbook, &step)
             .map_err(|err| P9CommandError::Agent(err.to_string()))?;
     }
 
@@ -733,6 +734,9 @@ fn resolve_command(
             state.results.insert(paused_key.clone(), answer);
         }
     } else {
+        // `u32::MAX` on both the state and the counter: a denied step is
+        // final, never retried, and `failed_for_good` reads the counter.
+        state.attempts.insert(paused_key.clone(), u32::MAX);
         state.steps.insert(
             paused_key.clone(),
             crate::workflow::StepState::Failed {
