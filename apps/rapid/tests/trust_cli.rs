@@ -34,18 +34,23 @@ fn spawn_scripted_server(body: String) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let addr = listener.local_addr().expect("local addr");
     thread::spawn(move || {
-        let Ok((mut stream, _)) = listener.accept() else {
-            return;
-        };
-        let _ = read_request(&mut stream);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let _ = stream.write_all(response.as_bytes());
-        let _ = stream.flush();
-        let _ = stream.shutdown(Shutdown::Both);
+        // Serve every connection, not just the first. A client that opens a
+        // second connection — a preflight, or a retry, seen intermittently
+        // on Windows loopback where the one-shot form failed with a provider
+        // error — must still get the scripted body rather than a connection
+        // refused. Each connection is answered in turn; the listener closes
+        // when the test process exits.
+        while let Ok((mut stream, _)) = listener.accept() {
+            let _ = read_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(Shutdown::Both);
+        }
     });
     addr
 }
