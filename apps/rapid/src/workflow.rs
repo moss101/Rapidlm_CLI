@@ -1784,21 +1784,21 @@ mod tests {
 
     #[test]
     fn reset_step_uncancels_the_dependents_a_final_failure_cancelled() {
-        // `a` (final failure) → `b` → `c`. `--retry a` must restore the
-        // whole chain, not just `a`, or the run can never complete.
+        // Diamond: `a` (final failure) → `b` and `c` → `d`. `c` already
+        // succeeded (independent of the failure); `b` and `d` were
+        // cancelled. `--retry a` must restore `a`, `b`, `d` — the steps the
+        // failure stopped — and leave the succeeded `c` alone.
         let mut state = RunState::new(new_run_id(), &playbook_file(vec![]), Path::new("test.json"));
+        let dep = |key: &str, on: &[&str]| {
+            let mut s = step(key, NodeKind::Task, key);
+            s.depends_on = on.iter().map(|d| (*d).to_owned()).collect();
+            s
+        };
         let playbook = playbook_file(vec![
             step("a", NodeKind::Task, "a"),
-            {
-                let mut s = step("b", NodeKind::Task, "b");
-                s.depends_on = vec!["a".into()];
-                s
-            },
-            {
-                let mut s = step("c", NodeKind::Task, "c");
-                s.depends_on = vec!["b".into()];
-                s
-            },
+            dep("b", &["a"]),
+            dep("c", &[]),
+            dep("d", &["b", "c"]),
         ]);
         state.steps.insert(
             "a".into(),
@@ -1809,7 +1809,8 @@ mod tests {
         );
         state.attempts.insert("a".into(), 3);
         state.steps.insert("b".into(), StepState::Cancelled);
-        state.steps.insert("c".into(), StepState::Cancelled);
+        state.steps.insert("c".into(), StepState::Succeeded);
+        state.steps.insert("d".into(), StepState::Cancelled);
         reset_step(&mut state, &playbook, "a").expect("reset");
         assert_eq!(state.steps.get("a"), Some(&StepState::Pending));
         assert_eq!(
@@ -1818,12 +1819,17 @@ mod tests {
             "un-cancelled"
         );
         assert_eq!(
-            state.steps.get("c"),
+            state.steps.get("d"),
             Some(&StepState::Pending),
-            "transitively"
+            "transitively, through b"
+        );
+        assert_eq!(
+            state.steps.get("c"),
+            Some(&StepState::Succeeded),
+            "a succeeded step is never touched"
         );
         assert!(!state.attempts.contains_key("a"));
-        // A succeeded step in the chain is left alone.
+        // An unknown step is an error, not a silent no-op.
         reset_step(&mut state, &playbook, "missing").unwrap_err();
     }
 
