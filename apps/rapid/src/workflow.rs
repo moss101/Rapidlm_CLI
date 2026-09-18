@@ -714,8 +714,20 @@ pub fn execute_run(
         }
         verified!(v => v.confirm_ready(playbook, &ready));
 
-        // Bounded parallelism: take up to `max_parallel` ready steps.
-        ready.truncate(context.max_parallel.max(1));
+        // Human steps never run concurrently with anything: they pause the
+        // whole run on the durable wait machinery. A human step in the
+        // ready set is the whole batch — the other ready steps stay
+        // `Pending` for the resume rather than being marked `Running` for a
+        // batch that never runs them.
+        let human = ready
+            .iter()
+            .copied()
+            .find(|s| matches!(s.kind, NodeKind::Approval | NodeKind::AskUser));
+        match human {
+            Some(step) => ready = vec![step],
+            // Bounded parallelism: take up to `max_parallel` ready steps.
+            None => ready.truncate(context.max_parallel.max(1)),
+        }
         for step in &ready {
             verified!(v => v.step_started(&step.key));
             state.steps.insert(step.key.clone(), StepState::Running);
@@ -727,13 +739,7 @@ pub fn execute_run(
         }
         save_run_ok(context.root, state);
 
-        // Human steps never run concurrently with anything: they pause the
-        // whole run on the durable wait machinery.
-        if let Some(step) = ready
-            .iter()
-            .copied()
-            .find(|s| matches!(s.kind, NodeKind::Approval | NodeKind::AskUser))
-        {
+        if let Some(step) = human {
             let question = step.question.clone().unwrap_or_else(|| step.label.clone());
             match request_human(step, state) {
                 Ok(wait_token) => {
@@ -1315,6 +1321,79 @@ mod tests {
             &playbook, state, &context, agent, commands, human, &cancel, None,
         );
         assert_eq!(outcome, RunOutcome::Verified);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pause_leaves_the_other_ready_steps_pending_for_the_resume() {
+        // `gate` shares its ready batch with `left` and `right`. Pausing on
+        // the gate must not strand the siblings as `Running`: they never
+        // started, and a resume has to run them.
+        let dir = std::env::temp_dir().join(format!(
+            "wf-pause-siblings-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.clone();
+        let playbook = playbook_file(vec![
+            step("left", NodeKind::Task, "left"),
+            step("gate", NodeKind::Approval, "ship it?"),
+            step("right", NodeKind::Task, "right"),
+            {
+                let mut s = step("verify", NodeKind::Verification, "verify");
+                s.depends_on = vec!["left".into(), "gate".into(), "right".into()];
+                s.command = Some("true".into());
+                s
+            },
+        ]);
+        let state = &mut RunState::new(new_run_id(), &playbook, Path::new("test.json"));
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_agent = Arc::clone(&ran);
+        let agent: AgentStepFn = Arc::new(move |key, _task| {
+            ran_agent.fetch_add(1, Ordering::SeqCst);
+            Ok(format!("done: {key}"))
+        });
+        let commands: CommandStepFn = Arc::new(|_c, _t| Ok("ok".into()));
+        let human: HumanWaitFn = Arc::new(|step, _state| Ok(format!("wait-{}", step.key)));
+        let cancel = agent_runtime::CancellationToken::new();
+        let context = RunContext {
+            root: &root,
+            trusted: true,
+            max_parallel: 4,
+            events: None,
+        };
+        let outcome = execute_run(
+            &playbook,
+            state,
+            &context,
+            Arc::clone(&agent),
+            Arc::clone(&commands),
+            Arc::clone(&human),
+            &cancel,
+            None,
+        );
+        assert!(matches!(outcome, RunOutcome::Paused { .. }), "{outcome:?}");
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "nothing ran before the pause"
+        );
+        assert_eq!(state.steps.get("left"), Some(&StepState::Pending));
+        assert_eq!(state.steps.get("right"), Some(&StepState::Pending));
+        state.steps.insert("gate".into(), StepState::Succeeded);
+        state.paused_on = None;
+        let outcome = execute_run(
+            &playbook, state, &context, agent, commands, human, &cancel, None,
+        );
+        assert_eq!(outcome, RunOutcome::Verified);
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            2,
+            "left and right ran on resume"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
