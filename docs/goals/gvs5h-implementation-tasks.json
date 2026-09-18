@@ -999,5 +999,13 @@
       ],
       "evidence": []
     }
+  ],
+  "phase_notes": [
+    {
+      "phase": "P1",
+      "date": "2026-09-18",
+      "note": "First slice per ADR 0021 (production caller before persistence): `rapid run --orchestration verified` drives a playbook through scheduler::GraphService/GraphBackedRun (apps/rapid/src/workflow_verified.rs); every step transition is a durable graph event, the verification steps are the supervisor's contract, and `verified` is the supervisor's acceptance. Not a GVS-004..008 completion: replay (GVS-005), single-event acceptance (GVS-006), real identities (GVS-007) and recovery (GVS-008) remain pending; the run-state file now carries the graph/session pointer they need.",
+      "evidence": "docs/goal-delivery-2026-09-18.md"
+    }
   ]
 }

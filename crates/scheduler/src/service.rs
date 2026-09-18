@@ -130,6 +130,10 @@ impl GraphService {
     }
 
     /// Host-only state change. Ledger append precedes the in-memory mutation.
+    ///
+    /// Entering `Running` from `Pending`/`Ready` is an attempt and counts
+    /// against the node's `max_attempts`; resuming a `Paused` node is the
+    /// same attempt continuing.
     pub fn set_state(
         &mut self,
         graph_id: GraphId,
@@ -137,22 +141,32 @@ impl GraphService {
         state: NodeState,
     ) -> Result<RuntimeGraph, GraphError> {
         let graph = self.graphs.get(&graph_id).ok_or(GraphError::UnknownGraph)?;
-        if graph.node(node_id).is_none() {
+        let Some(node) = graph.node(node_id) else {
             return Err(GraphError::Proposal(ProposalError::UnknownNode));
-        }
+        };
+        let new_attempt = state == NodeState::Running
+            && matches!(node.state, NodeState::Pending | NodeState::Ready);
+        let attempts = if new_attempt {
+            node.attempts.saturating_add(1)
+        } else {
+            node.attempts
+        };
         self.append(
             EventKind::GraphNodeStateChanged,
             json!({
                 "graph_id": graph_id.to_string(),
                 "node_id": node_id.to_string(),
                 "state": state.as_str(),
+                "attempts": attempts,
             }),
         )?;
         let graph = self
             .graphs
             .get_mut(&graph_id)
             .ok_or(GraphError::UnknownGraph)?;
-        graph.nodes.get_mut(&node_id).expect("checked").state = state;
+        let node = graph.nodes.get_mut(&node_id).expect("checked");
+        node.state = state;
+        node.attempts = attempts;
         graph.revision = graph.revision.saturating_add(1);
         let out = graph.clone();
         self.history.entry(graph_id).or_default().push(out.clone());
@@ -200,6 +214,10 @@ impl GraphService {
         self.snapshot(graph_id).cloned()
     }
 
+    /// Re-queue a failed node while an attempt remains. `attempts` counts
+    /// runs (every entry into `Running`), so a node whose `max_attempts` is
+    /// 1 never retries; the retry itself is not an attempt — the `Running`
+    /// that follows is.
     pub fn retry(
         &mut self,
         graph_id: GraphId,
@@ -214,7 +232,7 @@ impl GraphService {
         if node.state != NodeState::Failed {
             return Err(GraphError::InvalidState);
         }
-        if node.attempts.saturating_add(1) > node.max_attempts {
+        if node.attempts >= node.max_attempts {
             return Err(GraphError::InvalidState);
         }
         self.append(
@@ -224,6 +242,7 @@ impl GraphService {
                 "node_id": node_id.to_string(),
                 "state": "pending",
                 "retry": true,
+                "attempts": node.attempts,
             }),
         )?;
         let graph = self
@@ -231,7 +250,6 @@ impl GraphService {
             .get_mut(&graph_id)
             .ok_or(GraphError::UnknownGraph)?;
         let n = graph.nodes.get_mut(&node_id).expect("checked");
-        n.attempts = n.attempts.saturating_add(1);
         n.state = NodeState::Pending;
         graph.revision = graph.revision.saturating_add(1);
         let out = graph.clone();

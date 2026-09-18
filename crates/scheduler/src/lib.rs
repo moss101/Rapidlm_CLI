@@ -22,7 +22,7 @@ pub use cron::{
 
 pub use graph::{Edge, EdgeCondition, GraphDiff, Node, NodeExplain, ReadyContext, RuntimeGraph};
 pub use kinds::{EdgeKind, NodeKind, NodeState};
-pub use orch::GraphBackedRun;
+pub use orch::{GraphBackedRun, RunPlan};
 pub use proposal::{EdgeSpec, GraphProposal, NodeSpec, ProposalError};
 pub use service::{GraphError, GraphService};
 
@@ -71,14 +71,7 @@ mod tests {
                 graph.graph_id,
                 GraphProposal {
                     base_revision: 1,
-                    add_nodes: vec![NodeSpec {
-                        id: task,
-                        kind: NodeKind::Task,
-                        label: "implement".into(),
-                        workspace_key: None,
-                        resource_key: None,
-                        budget_tokens: 0,
-                    }],
+                    add_nodes: vec![NodeSpec::new(task, NodeKind::Task, "implement")],
                     add_edges: vec![EdgeSpec {
                         from: graph.root,
                         to: task,
@@ -109,22 +102,8 @@ mod tests {
             GraphProposal {
                 base_revision: 1,
                 add_nodes: vec![
-                    NodeSpec {
-                        id: a,
-                        kind: NodeKind::Task,
-                        label: "a".into(),
-                        workspace_key: None,
-                        resource_key: None,
-                        budget_tokens: 0,
-                    },
-                    NodeSpec {
-                        id: b,
-                        kind: NodeKind::Task,
-                        label: "b".into(),
-                        workspace_key: None,
-                        resource_key: None,
-                        budget_tokens: 0,
-                    },
+                    NodeSpec::new(a, NodeKind::Task, "a"),
+                    NodeSpec::new(b, NodeKind::Task, "b"),
                 ],
                 add_edges: vec![
                     EdgeSpec {
@@ -174,22 +153,8 @@ mod tests {
                 GraphProposal {
                     base_revision: 1,
                     add_nodes: vec![
-                        NodeSpec {
-                            id: t1,
-                            kind: NodeKind::Task,
-                            label: "t1".into(),
-                            workspace_key: None,
-                            resource_key: None,
-                            budget_tokens: 0,
-                        },
-                        NodeSpec {
-                            id: t2,
-                            kind: NodeKind::Task,
-                            label: "t2".into(),
-                            workspace_key: None,
-                            resource_key: None,
-                            budget_tokens: 0,
-                        },
+                        NodeSpec::new(t1, NodeKind::Task, "t1"),
+                        NodeSpec::new(t2, NodeKind::Task, "t2"),
                     ],
                     add_edges: vec![EdgeSpec {
                         from: t1,
@@ -239,14 +204,7 @@ mod tests {
             graph.graph_id,
             GraphProposal {
                 base_revision: 1,
-                add_nodes: vec![NodeSpec {
-                    id: task,
-                    kind: NodeKind::Task,
-                    label: "t".into(),
-                    workspace_key: None,
-                    resource_key: None,
-                    budget_tokens: 0,
-                }],
+                add_nodes: vec![NodeSpec::new(task, NodeKind::Task, "t")],
                 add_edges: vec![],
                 supersede: vec![],
                 invalidate: vec![],
@@ -272,14 +230,7 @@ mod tests {
             graph.graph_id,
             GraphProposal {
                 base_revision: rev,
-                add_nodes: vec![NodeSpec {
-                    id: join,
-                    kind: NodeKind::Join,
-                    label: "join".into(),
-                    workspace_key: None,
-                    resource_key: None,
-                    budget_tokens: 0,
-                }],
+                add_nodes: vec![NodeSpec::new(join, NodeKind::Join, "join")],
                 add_edges: vec![
                     EdgeSpec {
                         from: shards[0],
@@ -334,12 +285,9 @@ mod tests {
             GraphProposal {
                 base_revision: 1,
                 add_nodes: vec![NodeSpec {
-                    id: a,
-                    kind: NodeKind::Task,
-                    label: "writer".into(),
                     workspace_key: Some("ws".into()),
                     resource_key: Some("cpu".into()),
-                    budget_tokens: 0,
+                    ..NodeSpec::new(a, NodeKind::Task, "writer")
                 }],
                 add_edges: vec![],
                 supersede: vec![],
@@ -367,14 +315,7 @@ mod tests {
             g1.graph_id,
             GraphProposal {
                 base_revision: 1,
-                add_nodes: vec![NodeSpec {
-                    id: child,
-                    kind: NodeKind::Task,
-                    label: "c".into(),
-                    workspace_key: None,
-                    resource_key: None,
-                    budget_tokens: 0,
-                }],
+                add_nodes: vec![NodeSpec::new(child, NodeKind::Task, "c")],
                 add_edges: vec![EdgeSpec {
                     from: g1.root,
                     to: child,
@@ -392,18 +333,46 @@ mod tests {
             NodeState::Cancelled
         );
 
+        // Attempts count runs: each entry into `Running` from the queue is
+        // one, a retry re-queues without counting, and the ceiling is the
+        // node's `max_attempts` (3 here) — so the third failure is final.
         let g2 = svc.create("g2").unwrap();
-        svc.set_state(g2.graph_id, g2.root, NodeState::Failed)
-            .unwrap();
-        svc.retry(g2.graph_id, g2.root).unwrap();
+        for attempt in 1..=3u32 {
+            svc.set_state(g2.graph_id, g2.root, NodeState::Running)
+                .unwrap();
+            assert_eq!(
+                svc.snapshot(g2.graph_id).unwrap().nodes[&g2.root].attempts,
+                attempt
+            );
+            svc.set_state(g2.graph_id, g2.root, NodeState::Failed)
+                .unwrap();
+            if attempt < 3 {
+                svc.retry(g2.graph_id, g2.root).unwrap();
+                assert_eq!(
+                    svc.snapshot(g2.graph_id).unwrap().nodes[&g2.root].state,
+                    NodeState::Pending
+                );
+            }
+        }
         assert_eq!(
-            svc.snapshot(g2.graph_id).unwrap().nodes[&g2.root].state,
-            NodeState::Pending
+            svc.retry(g2.graph_id, g2.root),
+            Err(GraphError::InvalidState),
+            "no attempt remains"
         );
+        // Pausing and resuming a run is the same attempt continuing.
+        let paused = svc.create("paused").unwrap();
+        svc.set_state(paused.graph_id, paused.root, NodeState::Running)
+            .unwrap();
+        svc.pause(paused.graph_id, paused.root).unwrap();
+        svc.resume(paused.graph_id, paused.root).unwrap();
         assert_eq!(
-            svc.snapshot(g2.graph_id).unwrap().nodes[&g2.root].attempts,
+            svc.snapshot(paused.graph_id).unwrap().nodes[&paused.root].attempts,
             1
         );
+        // Back on g2 for the wait/invalidate/export checks below: a retry
+        // is refused, so re-queue it by hand.
+        svc.set_state(g2.graph_id, g2.root, NodeState::Pending)
+            .unwrap();
 
         svc.wait(g2.graph_id, g2.root, "tok-1").unwrap();
         assert_eq!(
@@ -422,14 +391,7 @@ mod tests {
             g3.graph_id,
             GraphProposal {
                 base_revision: 1,
-                add_nodes: vec![NodeSpec {
-                    id: leaf,
-                    kind: NodeKind::Task,
-                    label: "leaf".into(),
-                    workspace_key: None,
-                    resource_key: None,
-                    budget_tokens: 0,
-                }],
+                add_nodes: vec![NodeSpec::new(leaf, NodeKind::Task, "leaf")],
                 add_edges: vec![EdgeSpec {
                     from: g3.root,
                     to: leaf,
@@ -461,14 +423,7 @@ mod tests {
             g4.graph_id,
             GraphProposal {
                 base_revision: 1,
-                add_nodes: vec![NodeSpec {
-                    id: ask,
-                    kind: NodeKind::AskUser,
-                    label: "ask".into(),
-                    workspace_key: None,
-                    resource_key: None,
-                    budget_tokens: 0,
-                }],
+                add_nodes: vec![NodeSpec::new(ask, NodeKind::AskUser, "ask")],
                 add_edges: vec![],
                 supersede: vec![],
                 invalidate: vec![],
@@ -542,14 +497,7 @@ mod tests {
             graph.graph_id,
             GraphProposal {
                 base_revision: 1,
-                add_nodes: vec![NodeSpec {
-                    id: child,
-                    kind: NodeKind::Task,
-                    label: "c".into(),
-                    workspace_key: None,
-                    resource_key: None,
-                    budget_tokens: 0,
-                }],
+                add_nodes: vec![NodeSpec::new(child, NodeKind::Task, "c")],
                 add_edges: vec![EdgeSpec {
                     from: graph.root,
                     to: child,

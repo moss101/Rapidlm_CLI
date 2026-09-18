@@ -69,8 +69,8 @@ Update rows only after observing evidence. `NOT_STARTED → IN_PROGRESS → BLOC
 | P2-013 | P2 | VERIFIED | implementer | 2026-08-24 | 2026-08-24 |  | `GraphService::fan_out` shards 2 | same test |
 | P2-014 | P2 | VERIFIED | implementer | 2026-08-24 | 2026-08-24 |  | ReadyContext.busy_resources; `resource_and_workspace_conflicts_block_ready` | cargo test -p scheduler |
 | P2-015 | P2 | VERIFIED | implementer | 2026-08-24 | 2026-08-24 |  | ReadyContext.busy_workspaces | same test |
-| P2-016 | P2 | VERIFIED | implementer | 2026-08-24 | 2026-08-24 |  | `Node.attempts` incremented on retry | `cancel_retry_wait_invalidate_export_and_fairness` |
-| P2-017 | P2 | VERIFIED | implementer | 2026-08-24 | 2026-08-24 |  | `retry` Failed→Pending; max_attempts gate | same test |
+| P2-016 | P2 | VERIFIED | implementer | 2026-08-24 | 2026-09-18 |  | `Node.attempts` counts runs: incremented on every `Pending`/`Ready` → `Running` (2026-09-18; was incremented on retry, which let a `max_attempts: 1` node retry once and disagreed with `playbook::compile`'s per-step ceiling) | `cancel_retry_wait_invalidate_export_and_fairness` |
+| P2-017 | P2 | VERIFIED | implementer | 2026-08-24 | 2026-09-18 |  | `retry` Failed→Pending while `attempts < max_attempts`; the retry itself is not an attempt | same test; `orch::tests::a_planned_run_proposes_the_plan_under_the_goal_and_gates_on_its_edges` |
 | P2-018 | P2 | VERIFIED | implementer | 2026-08-24 | 2026-08-24 |  | `cancel_tree` cancels descendants | same test |
 | P2-019 | P2 | VERIFIED | implementer | 2026-08-24 | 2026-08-24 |  | `wait`/`resume_wait` Waiting token | same test |
 | P2-020 | P2 | VERIFIED | implementer | 2026-08-24 | 2026-08-24 |  | Approval/AskUser wait token host resume | same test AskUser node |

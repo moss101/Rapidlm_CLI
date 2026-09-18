@@ -19,6 +19,15 @@ pub struct NodeSpec {
     pub resource_key: Option<String>,
     #[serde(default)]
     pub budget_tokens: u64,
+    /// Retry ceiling [`crate::service::GraphService::retry`] enforces for
+    /// the node. A playbook step declares its own; the default matches
+    /// [`Node::new`].
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+}
+
+fn default_max_attempts() -> u32 {
+    3
 }
 
 impl NodeSpec {
@@ -30,7 +39,13 @@ impl NodeSpec {
             workspace_key: None,
             resource_key: None,
             budget_tokens: 0,
+            max_attempts: default_max_attempts(),
         }
+    }
+
+    pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = max_attempts.max(1);
+        self
     }
 }
 
@@ -88,6 +103,7 @@ pub fn validate_and_apply(
         node.workspace_key = spec.workspace_key.clone();
         node.resource_key = spec.resource_key.clone();
         node.budget_tokens = spec.budget_tokens;
+        node.max_attempts = spec.max_attempts.max(1);
         next.nodes.insert(spec.id, node);
     }
     for spec in &proposal.add_edges {

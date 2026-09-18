@@ -42,6 +42,7 @@ pub mod update_serve;
 pub mod user_config;
 pub mod web_fetch;
 pub mod workflow;
+pub mod workflow_verified;
 
 pub use interactive::{
     CLI_USAGE, InteractiveError, InteractiveInput, InteractiveOptions, InteractiveOutcome,

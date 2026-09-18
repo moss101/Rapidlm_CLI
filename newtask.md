@@ -8432,6 +8432,30 @@ Gatekeeper assessment of every freshly built dylib from three concurrent cargo w
 plausible cause and is a system setting, so the owner's; `fmt --check` is clean and the CI run on
 `a151550` is the evidence, recorded in the boundary below once it lands.
 
+## Session boundary, 2026-09-18 — GVS5H Phase 1, first slice: `rapid run --orchestration verified`
+
+`/goal continue` after the 2026-09-17 delivery. The delivered plan's next in-scope step was
+ADR 0021's first Phase 1 slice — a production caller for the graph service and the supervisor
+before any persistence work — and that is what landed
+([delivery record](docs/goal-delivery-2026-09-18.md)):
+
+- `rapid run --orchestration verified` (or `orchestration.mode = "verified"` /
+  `RAPIDLM_ORCHESTRATION_MODE=verified`, CLI > env > user > workspace through the kernel
+  loader) runs the playbook as a Runtime Graph: `apps/rapid/src/workflow_verified.rs` opens
+  `GraphBackedRun::start_planned` over the steps, `execute_run` records every transition on the
+  graph before the run state (and stops as `OrchestrationFailed` if the graph or ledger
+  refuses, or if the two disagree about what is ready), and `verified: true` is the host
+  supervisor's *acceptance* — every verification step passed in this invocation, replayed as
+  the supervisor's checks, never re-run. A playbook with no verification step is refused up
+  front. The `off` path takes the same branches it did.
+- Substrate: `NodeSpec.max_attempts`; `RunPlan`/`start_planned`; `accept` refuses over a failed
+  verification node. `GraphService` attempts now count runs (`→ Running`), not retries — the
+  old rule let a `max_attempts: 1` node retry once and disagreed with `playbook::compile`.
+- Not delivered, by the plan's order: replay from events (a resumed run opens a fresh graph and
+  mirrors the recorded step states; the run-state file stays the resume authority and now
+  carries the graph/session pointer), single-event acceptance, real identities, recovery of a
+  `Running` step from a crashed invocation.
+
 ## Session boundary, 2026-09-17 — Windows as a real gate, a live browser driver, GVS5H Phase 0
 
 The `/goal` for this session had three parts. What landed, with the commit for each:

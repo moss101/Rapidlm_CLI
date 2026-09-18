@@ -72,8 +72,9 @@ fn node_kind_from_str(raw: &str) -> Option<NodeKind> {
 
 /// `rapid playbook-compile <file.json>`: template -> initial RuntimeGraph.
 /// The compiled graph is printed as canonical JSON on stdout.
-pub const RUN_USAGE: &str = "usage: rapid run <playbook.json> [--parallel N]
-       rapid run --resume <run-id>
+pub const RUN_USAGE: &str =
+    "usage: rapid run <playbook.json> [--parallel N] [--orchestration off|verified]
+       rapid run --resume <run-id> [--orchestration off|verified]
        rapid run --status <run-id>
        rapid run --resolve <run-id> approve|deny
        rapid run --resolve <run-id> answer <text>
@@ -96,10 +97,19 @@ verification is never reported as fresh.
 
 Run state lives in .rapidlm/runs/<run-id>.json and survives restarts.
 
+--orchestration verified (or `orchestration.mode = \"verified\"` in config,
+RAPIDLM_ORCHESTRATION_MODE=verified in the environment; the flag wins)
+runs the same steps as a Runtime Graph in the project ledger: every step
+transition is a durable graph event, the verification steps are a host
+supervisor's contract, and `verified` means the supervisor accepted — every
+verification step passed in this invocation. A playbook without a
+verification step is refused in this mode. Experimental; off by default.
+
 Exit codes: 0 verified (every step succeeded and every verification ran
 fresh in this invocation) · 6 completed but unverified · 10 paused for a
-human decision (resume with --resume / resolve with --resolve) · 1 failed ·
-130 cancelled.
+human decision (resume with --resume / resolve with --resolve) · 1 failed
+(a step, or verified orchestration could not record the run) · 130
+cancelled.
 ";
 
 /// `rapid run` — execute (and resume) a playbook workflow through
@@ -122,6 +132,7 @@ pub fn run_run_command(args: &[String]) -> Result<i32, P9CommandError> {
     let _resolve_answer: Option<String> = None;
     let mut retry_step: Option<String> = None;
     let mut parallel = workflow::DEFAULT_MAX_PARALLEL;
+    let mut config_overrides: Vec<kernel::ConfigOverride> = Vec::new();
     let mut iterator = args.iter();
     while let Some(arg) = iterator.next() {
         let mut value = |flag: &str| {
@@ -148,6 +159,9 @@ pub fn run_run_command(args: &[String]) -> Result<i32, P9CommandError> {
                     .parse()
                     .map_err(|_| P9CommandError::Usage)?;
             }
+            "--orchestration" => {
+                config_overrides.push(orchestration_override(&value("--orchestration"))?);
+            }
             other if playbook_path.is_none() && resolve.is_none() => {
                 playbook_path = Some(other.to_owned());
             }
@@ -169,6 +183,11 @@ pub fn run_run_command(args: &[String]) -> Result<i32, P9CommandError> {
             "warning: the project is not trusted; agent steps will refuse every tool call. Approve trust with `rapid trust grant`."
         );
     }
+    // `orchestration.mode` through the same precedence every other setting
+    // resolves with (CLI > env > user > workspace > defaults).
+    let config = crate::interactive::workflow_config(&root, config_overrides)
+        .map_err(P9CommandError::Agent)?;
+    let verified_mode = config.orchestration.mode == protocol::OrchestrationMode::Verified;
 
     // --status: print the run state and exit.
     if let Some(run_id) = status {
@@ -259,6 +278,24 @@ pub fn run_run_command(args: &[String]) -> Result<i32, P9CommandError> {
         playbook.name,
         playbook.steps.len()
     );
+    // Verified orchestration opens the run's graph and supervisor over the
+    // same ledger session the run's waits and progress live in, before the
+    // first step runs; a playbook it cannot verify is refused here.
+    let mut verified = if verified_mode {
+        let ledger = event_ledger::ledger::EventLedger::open(&ledger_path)
+            .map_err(|err| P9CommandError::Agent(err.to_string()))?;
+        let run =
+            crate::workflow_verified::VerifiedRun::open(&playbook, &state, &root, ledger, session)
+                .map_err(|err| P9CommandError::Agent(format!("verified orchestration: {err}")))?;
+        println!(
+            "orchestration: verified (graph {} in ledger session {})",
+            run.graph_id(),
+            run.session()
+        );
+        Some(run)
+    } else {
+        None
+    };
     let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let root_for_steps = root.clone();
     let trusted_step = trusted;
@@ -292,6 +329,7 @@ pub fn run_run_command(args: &[String]) -> Result<i32, P9CommandError> {
         command_step,
         human_wait,
         &cancel,
+        verified.as_mut(),
     );
     // Flush the run's progress events into its ledger session.
     {
@@ -338,7 +376,28 @@ then resume:  rapid run --resume {}",
             Ok(JsonlExitCode::NeedsApproval.as_i32())
         }
         RunOutcome::Cancelled => Ok(130),
+        RunOutcome::OrchestrationFailed { reason } => {
+            eprintln!(
+                "run {}: verified orchestration could not record or conclude the run: {reason}",
+                state.run_id
+            );
+            eprintln!("the step results so far are saved; nothing was accepted");
+            Ok(1)
+        }
     }
+}
+
+/// `--orchestration <mode>` as the CLI-layer override of `orchestration.mode`.
+/// An unknown mode is a usage error before anything is resolved.
+fn orchestration_override(mode: &str) -> Result<kernel::ConfigOverride, P9CommandError> {
+    let mode: protocol::OrchestrationMode = mode.parse().map_err(|_| {
+        eprintln!("rapid run: --orchestration takes `off` or `verified`, not '{mode}'");
+        P9CommandError::Usage
+    })?;
+    Ok(kernel::ConfigOverride::new(
+        "orchestration.mode",
+        mode.as_str(),
+    ))
 }
 
 fn snapshot_or_create(
@@ -522,6 +581,16 @@ fn status_report(state: &crate::workflow::RunState) -> String {
         "run {} ({}): paused_on={:?}",
         state.run_id, state.playbook_name, state.paused_on
     )];
+    if let Some(orchestration) = &state.orchestration {
+        lines.push(format!(
+            "  orchestration: {} (graph {} in session {}; supervisor {}; accepted: {})",
+            orchestration.mode,
+            orchestration.graph_id,
+            orchestration.session,
+            orchestration.state,
+            orchestration.accepted
+        ));
+    }
     for key in &state.keys {
         let step_state = state
             .steps
@@ -561,7 +630,7 @@ fn status_report(state: &crate::workflow::RunState) -> String {
 }
 
 fn final_report(state: &crate::workflow::RunState, verified: bool, unmet: &[String]) -> String {
-    let report = serde_json::json!({
+    let mut report = serde_json::json!({
         "run": state.run_id,
         "playbook": state.playbook_name,
         "verified": verified,
@@ -574,6 +643,14 @@ fn final_report(state: &crate::workflow::RunState, verified: bool, unmet: &[Stri
             })
         }).collect::<Vec<_>>(),
     });
+    // Only a verified run carries the key: the default path's report is
+    // unchanged.
+    if let (Some(orchestration), Some(object)) = (&state.orchestration, report.as_object_mut()) {
+        object.insert(
+            "orchestration".to_owned(),
+            serde_json::to_value(orchestration).unwrap_or(serde_json::Value::Null),
+        );
+    }
     serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned())
 }
 
@@ -1063,6 +1140,98 @@ mod tests {
     fn temp_file(name: &str) -> PathBuf {
         let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::env::temp_dir().join(format!("rapidlm-p9-{name}-{}-{seq}", std::process::id()))
+    }
+
+    #[test]
+    fn the_orchestration_flag_is_the_cli_layer_of_the_ordinary_config_precedence() {
+        // `--orchestration verified` is a CLI override of `orchestration.mode`
+        // that the kernel loader merges above env, user and workspace
+        // documents; an unknown mode is a usage error before anything loads.
+        assert!(matches!(
+            orchestration_override("sideways"),
+            Err(P9CommandError::Usage)
+        ));
+        let cli = orchestration_override("verified").expect("verified parses");
+        let loaded = kernel::load_config(&kernel::ConfigSources {
+            workspace: Some(kernel::ConfigText::new(
+                ".rapidlm/config.toml",
+                "[orchestration]\nmode = \"off\"\n",
+            )),
+            user: None,
+            env: vec![kernel::ConfigOverride::new(
+                "RAPIDLM_ORCHESTRATION_MODE",
+                "off",
+            )],
+            cli: vec![cli],
+            cancel: kernel::CancellationToken::new(),
+        })
+        .expect("loads");
+        assert_eq!(
+            loaded.config.orchestration.mode,
+            protocol::OrchestrationMode::Verified
+        );
+        assert_eq!(
+            loaded.provenance.get("orchestration.mode"),
+            Some(&kernel::ConfigOrigin::Cli)
+        );
+        // Without the flag the environment layer decides over the workspace.
+        let loaded = kernel::load_config(&kernel::ConfigSources {
+            workspace: Some(kernel::ConfigText::new(
+                ".rapidlm/config.toml",
+                "[orchestration]\nmode = \"off\"\n",
+            )),
+            user: None,
+            env: vec![kernel::ConfigOverride::new(
+                "RAPIDLM_ORCHESTRATION_MODE",
+                "verified",
+            )],
+            cli: vec![],
+            cancel: kernel::CancellationToken::new(),
+        })
+        .expect("loads");
+        assert_eq!(
+            loaded.config.orchestration.mode,
+            protocol::OrchestrationMode::Verified
+        );
+        // And the default is off: nothing in this path changes a run that
+        // did not ask for verified orchestration.
+        let loaded = kernel::load_config(&kernel::ConfigSources {
+            workspace: None,
+            user: None,
+            env: vec![],
+            cli: vec![],
+            cancel: kernel::CancellationToken::new(),
+        })
+        .expect("loads");
+        assert_eq!(
+            loaded.config.orchestration.mode,
+            protocol::OrchestrationMode::Off
+        );
+    }
+
+    #[test]
+    fn the_run_report_names_the_orchestration_only_when_a_run_had_one() {
+        let playbook = crate::workflow::PlaybookFile {
+            name: "p".to_owned(),
+            steps: vec![],
+        };
+        let mut state = crate::workflow::RunState::new("run-1".into(), &playbook, Path::new("p"));
+        let report = final_report(&state, true, &[]);
+        assert!(!report.contains("orchestration"), "{report}");
+        assert!(!status_report(&state).contains("orchestration"));
+        state.orchestration = Some(crate::workflow_verified::OrchestrationRecord {
+            mode: "verified".into(),
+            session: "s".into(),
+            graph_id: "g".into(),
+            task_id: "t".into(),
+            state: "Accepted".into(),
+            accepted: true,
+        });
+        let report: serde_json::Value =
+            serde_json::from_str(&final_report(&state, true, &[])).expect("json");
+        assert_eq!(report["orchestration"]["graph_id"], "g");
+        assert_eq!(report["orchestration"]["accepted"], true);
+        assert!(status_report(&state).contains("orchestration: verified (graph g in session s"));
     }
 
     #[test]

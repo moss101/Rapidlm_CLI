@@ -19,7 +19,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 |---|---|
 | `rapid` | interactive TUI |
 | `rapid exec [--verbose] <prompt>` | one-shot/headless task (uses the configured model; workspace file tools behind project trust, cause-classified failures; see [model-configuration.md](model-configuration.md) and the exec section below) |
-| `rapid run <goal/playbook>` | durable graph run |
+| `rapid run <playbook.json> [--parallel N] [--orchestration off\|verified]` | durable playbook run (`--resume`/`--status`/`--resolve`/`--retry`); with `--orchestration verified` (or `orchestration.mode = "verified"` in config, `RAPIDLM_ORCHESTRATION_MODE=verified`; CLI > env > user > workspace) the same steps run as a Runtime Graph in the project ledger — every step transition a durable `graph.*` event, the verification steps a host supervisor's contract, and `verified: true` meaning the supervisor accepted (every verification step passed in this invocation). A playbook without a verification step is refused in that mode. Experimental; off by default and the default path is unchanged |
 | `rapid goal create|show|pause|resume|cancel|complete|budget|verify|evidence|claim` | goal lifecycle; `goal evidence record` citations resolve against the session ledger; `goal complete` is gated on the evidence store; `goal claim --summary S --check crit=cmd [--timeout-secs N]` runs deterministic checks for real, cites each run in the ledger, and only accepts when the host supervisor verifies every criterion |
 | `rapid resume [session-id]` | reopen the TUI on an existing session, rebuilt from this project's event ledger; with no id, the session with the most recent activity |
 | `rapid fork [checkpoint]` | non-destructive branch |

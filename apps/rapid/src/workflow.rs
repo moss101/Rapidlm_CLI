@@ -44,7 +44,7 @@ pub const DEFAULT_MAX_PARALLEL: usize = 4;
 const MAX_RESULT_BYTES: usize = 4 * 1024;
 
 /// Wall-clock ceiling for one agent step, when the playbook sets none.
-const DEFAULT_STEP_TIMEOUT_SECS: u64 = 600;
+pub(crate) const DEFAULT_STEP_TIMEOUT_SECS: u64 = 600;
 
 // ---------------------------------------------------------------------------
 // Playbook file format (superset of what `rapid playbook-compile` reads)
@@ -284,6 +284,12 @@ pub struct RunState {
     /// Pending wait recorded for a paused run (the approval machinery's
     /// token; resolution lives in the ledger).
     pub paused_on: Option<String>,
+    /// Present when the run executes under `orchestration.mode = verified`:
+    /// the graph and ledger session its transitions were appended to and
+    /// whether the supervisor accepted. Absent (and never written) on the
+    /// default path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<crate::workflow_verified::OrchestrationRecord>,
 }
 
 impl RunState {
@@ -303,6 +309,7 @@ impl RunState {
             fresh_verification: BTreeMap::new(),
             attempts: BTreeMap::new(),
             paused_on: None,
+            orchestration: None,
         }
     }
 }
@@ -548,6 +555,13 @@ pub enum RunOutcome {
         wait_token: String,
     },
     Cancelled,
+    /// Verified orchestration could not record or conclude the run (the
+    /// graph refused a transition, the ledger append failed, the supervisor
+    /// refused). The step results reached so far are saved; nothing is
+    /// accepted. Never produced on the default path.
+    OrchestrationFailed {
+        reason: String,
+    },
 }
 
 /// One step's execution context handed to the model/command executors.
@@ -580,6 +594,15 @@ pub type HumanWaitFn = Arc<dyn Fn(&Step, &RunState) -> Result<String, String> + 
 
 /// Execute (or resume) a playbook run. The step closures are injected so
 /// the CLI path and tests share this executor.
+///
+/// With `orchestration` (`orchestration.mode = verified`) every transition
+/// is recorded on the run's Runtime Graph before the run state changes,
+/// the graph must agree with the run state about what is ready, and
+/// `Verified` is the supervisor's acceptance rather than the freshness
+/// bookkeeping alone. Any refusal on that path ends the run as
+/// [`RunOutcome::OrchestrationFailed`]. With `None` this function behaves
+/// exactly as it always has.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_run(
     playbook: &PlaybookFile,
     state: &mut RunState,
@@ -588,6 +611,7 @@ pub fn execute_run(
     run_command_step: CommandStepFn,
     request_human: HumanWaitFn,
     cancel: &agent_runtime::CancellationToken,
+    mut orchestration: Option<&mut crate::workflow_verified::VerifiedRun>,
 ) -> RunOutcome {
     let steps_by_key: BTreeMap<&str, &Step> =
         playbook.steps.iter().map(|s| (s.key.as_str(), s)).collect();
@@ -598,6 +622,45 @@ pub fn execute_run(
             buffer.push(line);
         }
     };
+    // The graph refusing anything is the end of the run: save what is
+    // recorded and report why. `verified!` is for transitions that precede
+    // an effect (a start): the graph refusing means the step does not run.
+    // `verified_after!` is for facts that already happened (an outcome, a
+    // recorded wait): the run state records them regardless — a resume
+    // must not repeat an effect because the graph could not be told — and
+    // the refusal ends the run right after. Both are no-ops on the default
+    // path.
+    macro_rules! verified {
+        ($verified:ident => $call:expr) => {
+            if let Some($verified) = orchestration.as_deref_mut() {
+                if let Err(err) = $call {
+                    save_run_ok(context.root, state);
+                    return RunOutcome::OrchestrationFailed {
+                        reason: err.to_string(),
+                    };
+                }
+            }
+        };
+    }
+    macro_rules! verified_after {
+        ($verified:ident => $call:expr) => {
+            match orchestration.as_deref_mut() {
+                Some($verified) => $call.err(),
+                None => None,
+            }
+        };
+    }
+    let orchestration_failed =
+        |state: &RunState, err: crate::workflow_verified::VerifiedRunError| {
+            save_run_ok(context.root, state);
+            RunOutcome::OrchestrationFailed {
+                reason: err.to_string(),
+            }
+        };
+    if let Some(verified) = orchestration.as_deref() {
+        state.orchestration = Some(verified.record());
+        save_run_ok(context.root, state);
+    }
 
     loop {
         if cancel.is_cancelled() {
@@ -629,6 +692,7 @@ pub fn execute_run(
             });
             if deps_failed {
                 // A dependency failed for good: this step can never run.
+                verified!(v => v.step_cancelled(&step.key));
                 state.steps.insert(step.key.clone(), StepState::Cancelled);
                 record(
                     &context.events,
@@ -648,10 +712,12 @@ pub fn execute_run(
         if ready.is_empty() {
             break;
         }
+        verified!(v => v.confirm_ready(playbook, &ready));
 
         // Bounded parallelism: take up to `max_parallel` ready steps.
         ready.truncate(context.max_parallel.max(1));
         for step in &ready {
+            verified!(v => v.step_started(&step.key));
             state.steps.insert(step.key.clone(), StepState::Running);
             record(
                 &context.events,
@@ -671,6 +737,7 @@ pub fn execute_run(
             let question = step.question.clone().unwrap_or_else(|| step.label.clone());
             match request_human(step, state) {
                 Ok(wait_token) => {
+                    let refused = verified_after!(v => v.step_waiting(&step.key, &wait_token));
                     state.steps.insert(
                         step.key.clone(),
                         StepState::WaitingHuman {
@@ -679,6 +746,9 @@ pub fn execute_run(
                     );
                     state.paused_on = Some(step.key.clone());
                     save_run_ok(context.root, state);
+                    if let Some(err) = refused {
+                        return orchestration_failed(state, err);
+                    }
                     record(
                         &context.events,
                         serde_json::json!({ "event": "run.paused", "step": step.key, "wait_token": wait_token, "question": question })
@@ -690,6 +760,7 @@ pub fn execute_run(
                     };
                 }
                 Err(reason) => {
+                    let refused = verified_after!(v => v.step_failed(step, &reason, false));
                     state.steps.insert(
                         step.key.clone(),
                         StepState::Failed {
@@ -698,6 +769,9 @@ pub fn execute_run(
                         },
                     );
                     save_run_ok(context.root, state);
+                    if let Some(err) = refused {
+                        return orchestration_failed(state, err);
+                    }
                     return RunOutcome::Failed {
                         key: step.key.clone(),
                         reason: bounded(&reason),
@@ -738,13 +812,21 @@ pub fn execute_run(
             let _ = handle.join();
         }
 
-        // Fold outcomes into the state.
+        // Fold outcomes into the state. Every outcome is a fact that
+        // already happened, so all of them are recorded before a graph
+        // refusal (kept in `refused`) is allowed to end the run.
         let mut failed: Option<(String, String)> = None;
-        if let Ok(map) = outcomes.lock() {
-            for (key, result) in map.iter() {
+        let mut refused: Option<crate::workflow_verified::VerifiedRunError> = None;
+        let folded: BTreeMap<String, Result<String, String>> =
+            outcomes.lock().map(|map| map.clone()).unwrap_or_default();
+        {
+            for (key, result) in folded.iter() {
                 let step = steps_by_key[key.as_str()];
                 match result {
                     Ok(summary) => {
+                        if refused.is_none() {
+                            refused = verified_after!(v => v.step_succeeded(step, summary));
+                        }
                         state.steps.insert(key.clone(), StepState::Succeeded);
                         state.results.insert(key.clone(), bounded(summary));
                         if !step.watch.is_empty() {
@@ -768,6 +850,11 @@ pub fn execute_run(
                             .and_modify(|attempts| *attempts += 1)
                             .or_insert(1);
                         let attempts = *attempts;
+                        if refused.is_none() {
+                            refused = verified_after!(
+                                v => v.step_failed(step, reason, attempts < step.max_attempts)
+                            );
+                        }
                         state.steps.insert(
                             key.clone(),
                             StepState::Failed {
@@ -788,6 +875,9 @@ pub fn execute_run(
             }
         }
         save_run_ok(context.root, state);
+        if let Some(err) = refused {
+            return orchestration_failed(state, err);
+        }
 
         // A failed step that exhausted its retries ends the run with the
         // explanation; `--retry <step>` resets it.
@@ -813,6 +903,49 @@ pub fn execute_run(
         {
             unmet.push(step.key.clone());
         }
+    }
+    // Under verified orchestration the supervisor's acceptance is the
+    // verdict: it is reached only when every verification requirement is
+    // backed by a passing check from this invocation, and it is recorded
+    // in the run state either way.
+    if let Some(verified) = orchestration {
+        let conclusion = match verified.conclude(playbook) {
+            Ok(conclusion) => conclusion,
+            Err(err) => {
+                state.orchestration = Some(verified.record());
+                save_run_ok(context.root, state);
+                return RunOutcome::OrchestrationFailed {
+                    reason: err.to_string(),
+                };
+            }
+        };
+        state.orchestration = Some(verified.record());
+        save_run_ok(context.root, state);
+        record(
+            &context.events,
+            serde_json::json!({
+                "event": "run.concluded", "accepted": conclusion.accepted,
+                "state": format!("{:?}", conclusion.state),
+                "verdict": format!("{:?}", conclusion.verdict), "unmet": conclusion.unmet,
+            })
+            .to_string(),
+        );
+        return if conclusion.accepted {
+            RunOutcome::Verified
+        } else {
+            let mut unmet = conclusion.unmet;
+            unmet.extend(
+                playbook
+                    .steps
+                    .iter()
+                    .filter(|step| step.kind == NodeKind::Verification)
+                    .filter(|step| state.fresh_verification.get(&step.key) != Some(&true))
+                    .map(|step| step.key.clone()),
+            );
+            unmet.sort_unstable();
+            unmet.dedup();
+            RunOutcome::CompletedUnverified { unmet }
+        };
     }
     if unmet.is_empty() {
         RunOutcome::Verified
@@ -1044,7 +1177,9 @@ mod tests {
             max_parallel: 4,
             events: None,
         };
-        let outcome = execute_run(&playbook, state, &context, agent, commands, human, &cancel);
+        let outcome = execute_run(
+            &playbook, state, &context, agent, commands, human, &cancel, None,
+        );
         assert_eq!(outcome, RunOutcome::Verified);
         assert_eq!(ran.load(Ordering::SeqCst), 3, "start, left, right");
         assert_eq!(state.steps.get("check"), Some(&StepState::Succeeded));
@@ -1104,12 +1239,15 @@ mod tests {
             Arc::clone(&commands),
             Arc::clone(&human),
             &cancel,
+            None,
         );
         assert_eq!(outcome, RunOutcome::Verified);
         assert_eq!(flaky_runs.load(Ordering::SeqCst), 2, "one retry");
         // Resuming the completed run replays nothing: every step is
         // terminal and the closures must not be invoked again.
-        let outcome = execute_run(&playbook, state, &context, agent, commands, human, &cancel);
+        let outcome = execute_run(
+            &playbook, state, &context, agent, commands, human, &cancel, None,
+        );
         assert_eq!(outcome, RunOutcome::Verified);
         assert_eq!(first_runs.load(Ordering::SeqCst), 1);
         assert_eq!(flaky_runs.load(Ordering::SeqCst), 2);
@@ -1160,6 +1298,7 @@ mod tests {
             Arc::clone(&commands),
             Arc::clone(&human),
             &cancel,
+            None,
         );
         assert_eq!(
             outcome,
@@ -1172,7 +1311,9 @@ mod tests {
         // The human approves: the resolve command's transition.
         state.steps.insert("gate".into(), StepState::Succeeded);
         state.paused_on = None;
-        let outcome = execute_run(&playbook, state, &context, agent, commands, human, &cancel);
+        let outcome = execute_run(
+            &playbook, state, &context, agent, commands, human, &cancel, None,
+        );
         assert_eq!(outcome, RunOutcome::Verified);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1214,6 +1355,7 @@ mod tests {
             Arc::clone(&commands),
             Arc::clone(&human),
             &cancel,
+            None,
         );
         assert_eq!(outcome, RunOutcome::Verified);
         // The watched file changes: the recorded evidence is stale, and the
@@ -1230,6 +1372,7 @@ mod tests {
             commands,
             human,
             &cancel,
+            None,
         );
         assert_eq!(
             outcome,

@@ -9903,6 +9903,39 @@ pub(crate) fn workflow_workspace_root() -> Option<(PathBuf, bool)> {
     exec_workspace(&cancel).map(|(root, status)| (root, status == kernel::TrustStatus::Trusted))
 }
 
+/// The configuration a `rapid run` workflow executes under, resolved the
+/// way every other command resolves it — `gather_config_sources` over the
+/// project's `.rapidlm/config.toml`, the user's `config.toml`, `RAPIDLM_*`
+/// environment overrides and the command's own `cli` overrides, merged by
+/// the kernel loader (CLI > env > user > workspace > defaults).
+pub(crate) fn workflow_config(
+    root: &Path,
+    cli: Vec<ConfigOverride>,
+) -> Result<protocol::RapidConfig, String> {
+    let user_home =
+        exec_user_home().ok_or_else(|| "no RapidLM home directory resolved".to_owned())?;
+    let options = InteractiveOptions {
+        cwd: root.to_path_buf(),
+        user_home: Some(user_home.clone()),
+        // `vars_os` with non-UTF-8 entries skipped: an odd variable
+        // elsewhere in the environment must not abort a run.
+        env: std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+            .collect(),
+        cli,
+        cancel: CancellationToken::new(),
+        inputs: None,
+        terminal: None,
+        capture_render: false,
+        resume: None,
+    };
+    let sources =
+        gather_config_sources(&options, root, &user_home).map_err(|err| err.to_string())?;
+    load_config(&sources)
+        .map(|loaded| loaded.config)
+        .map_err(|err| err.to_string())
+}
+
 /// One workflow agent step: run a real turn for `task` against `root` and
 /// return its bounded terminal output. The same assembly the interactive
 /// and headless paths use — tools under the permission lattice, the model

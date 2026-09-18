@@ -3,7 +3,7 @@
 **Goal ID:** `GVS-RAPIDLM-01`  
 **Created:** 2026-09-15  
 **Planning baseline:** `bc87a89b696234c48065eb45e2f67cbffbca34fd`  
-**Status:** Phase 0 complete (2026-09-17: [baseline audit](gvs5h-phase0-baseline-2026-09-17.md), [ADR 0021](../adrs/0021-verified-orchestration-extends-graph-and-supervisor.md), [preregistration](../evaluation-specs/gvs5h-experiment-preregistration.md)); Phases 1–7 pending. The audit supersedes this document's platform note (Windows tests are a gate since 2026-09-17) and reorders Phase 1 (production caller first — see the audit's §6).  
+**Status:** Phase 0 complete (2026-09-17: [baseline audit](gvs5h-phase0-baseline-2026-09-17.md), [ADR 0021](../adrs/0021-verified-orchestration-extends-graph-and-supervisor.md), [preregistration](../evaluation-specs/gvs5h-experiment-preregistration.md)). Phase 1's first slice landed 2026-09-18 — the production caller: `rapid run --orchestration verified` drives a playbook through `GraphService`/`GraphBackedRun` with the host supervisor's acceptance as the verdict ([delivery record](../goal-delivery-2026-09-18.md)); GVS-004…008 remain pending. The audit supersedes this document's platform note (Windows tests are a gate since 2026-09-17) and reorders Phase 1 (production caller first — see the audit's §6).  
 **Design basis:** [GVS5H integration research](</Users/mohsin/projects/RapidLM CLI/docs/research/gvs5h-integration-2026-09-15.md>)  
 **Execution worklist:** [34 tasks with dependencies and evidence requirements](</Users/mohsin/projects/RapidLM CLI/docs/goals/gvs5h-implementation-tasks.json>)
 
