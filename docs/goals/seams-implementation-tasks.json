@@ -1,0 +1,1425 @@
+{
+  "schema": "rapidlm.goal-workplan/v1",
+  "artifact_kind": "planning_worklist_not_runtime_configuration",
+  "goal_id": "SEAMS-RAPIDLM-01",
+  "title": "Extension seams, background work, agent control and operability",
+  "created": "2026-09-20",
+  "baseline_commit": "89350d70b1f08e5a11ca0b80477436ad048711a4",
+  "specification": "docs/goals/seams-governing-principles.md",
+  "research": "docs/goals/seams-phase0-baseline-2026-09-20.md",
+  "task_count": 53,
+  "status_values": [
+    "pending",
+    "in_progress",
+    "blocked",
+    "complete"
+  ],
+  "completion_rule": "Mark a task complete only with evidence naming tests that were revert-cycled. Overall completion requires every task complete or explicitly re-scoped by an ADR. Do not infer runtime configuration or scheduling from this planning artifact.",
+  "phases": [
+    {
+      "id": "P0",
+      "name": "Baseline and contracts"
+    },
+    {
+      "id": "P1",
+      "name": "Tier 1 \u2014 extension seams"
+    },
+    {
+      "id": "P2",
+      "name": "Tier 2 \u2014 distribution, governance, operability"
+    },
+    {
+      "id": "P3",
+      "name": "Tier 3 \u2014 polish"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "SEAM-00-1",
+      "title": "Baseline audit and existing-work map",
+      "phase": "P0",
+      "status": "complete",
+      "depends_on": [],
+      "acceptance_criteria": [
+        "SEAMS \u00a75.1.1"
+      ],
+      "owners": [
+        "docs/goals"
+      ],
+      "implementation": [
+        "Record commit, dirty state, toolchain, required checks, platform contract.",
+        "Recheck every \u00a74 'today' claim against source with file:line; establish reachability and real remaining work per item."
+      ],
+      "validation": [
+        "Every claim marked CONFIRMED/CORRECTED/NOT FOUND with evidence; unrelated working changes preserved."
+      ],
+      "evidence": [
+        "docs/goals/seams-phase0-baseline-2026-09-20.md \u2014 baseline, cross-cutting seams table, fifteen item rechecks (eleven corrections), plan changes, three recorded decisions"
+      ]
+    },
+    {
+      "id": "SEAM-00-2",
+      "title": "ADRs for the contract changes: hook result v2, inbox edges, plan proposals",
+      "phase": "P0",
+      "status": "complete",
+      "depends_on": [
+        "SEAM-00-1"
+      ],
+      "acceptance_criteria": [
+        "SEAMS \u00a75.1.2"
+      ],
+      "owners": [
+        "docs/adrs",
+        "crates/protocol"
+      ],
+      "implementation": [
+        "Decide the versioned hook result and its mapping onto the existing approval wait.",
+        "Decide inbox message records, delivery points and continuation lineage.",
+        "Decide the plan proposal artifact, approval path and compilation through the playbook runner."
+      ],
+      "validation": [
+        "Each ADR names the existing primitive it extends and what it deliberately does not build."
+      ],
+      "evidence": [
+        "docs/adrs/0022-hook-result-v2-decisions-rewrites-and-context.md",
+        "docs/adrs/0023-inbox-edges-and-subagent-delivery-modes.md",
+        "docs/adrs/0024-plan-proposals-approved-into-the-graph.md"
+      ]
+    },
+    {
+      "id": "SEAM-00-3",
+      "title": "Worklist, development-ledger entries and governing-document corrections",
+      "phase": "P0",
+      "status": "complete",
+      "depends_on": [
+        "SEAM-00-1",
+        "SEAM-00-2"
+      ],
+      "acceptance_criteria": [
+        "SEAMS \u00a75.1.3",
+        "SEAMS \u00a75.1.4",
+        "SEAMS \u00a70.3"
+      ],
+      "owners": [
+        "docs/goals",
+        "docs/development-ledger.md"
+      ],
+      "implementation": [
+        "Write this worklist (Tier 1 first, catalog order, explicit dependencies).",
+        "Add the SEAMS section to docs/development-ledger.md.",
+        "Migrate the audit's 'today' corrections into the governing document with a pointer to the audit."
+      ],
+      "validation": [
+        "The worklist parses; every task has acceptance ids from the governing document; the governing document's acceptance criteria are untouched."
+      ],
+      "evidence": [
+        "docs/goals/seams-implementation-tasks.json",
+        "docs/development-ledger.md (SEAMS section)",
+        "docs/goals/seams-governing-principles.md (\u00a74 'today' paragraphs corrected, commit names the audit)"
+      ]
+    },
+    {
+      "id": "SEAM-01-1",
+      "title": "Hook result v2: protocol type, fixture, separated streams, allow/deny/defer",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-00-3"
+      ],
+      "acceptance_criteria": [
+        "SEAM-01 AC-01",
+        "SEAM-01 AC-02 (allow, deny, defer)",
+        "SEAM-01 AC-08 (fixture)"
+      ],
+      "owners": [
+        "apps/rapid/src/hooks.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "crates/protocol"
+      ],
+      "implementation": [
+        "Add protocol::hooks::HookResult (rapidlm.hook_result v2) with additive parsing and a fixture under crates/protocol/tests/fixtures/hooks/v2/.",
+        "run_hook_once captures stdout and stderr separately; absence of a parseable stdout result keeps v1 exit-code semantics byte-for-byte.",
+        "Pre-tool stage applies allow/deny/defer and appends hook.decided for every non-allow decision (ADR 0022 \u00a71, \u00a72, \u00a74, \u00a79)."
+      ],
+      "validation": [
+        "Every existing hook test passes unchanged; a v1 exit-code hook behaves identically (before/after transcript comparison); allow/deny/defer each have a dispatch + ledger test; malformed JSON denies; Windows runs the same tests under cmd /C."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-01-2",
+      "title": "Hook `ask` through the approval wait; headless recording sink and NeedsApproval",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-01-1"
+      ],
+      "acceptance_criteria": [
+        "SEAM-01 AC-02 (ask)",
+        "SEAM-01 AC-03"
+      ],
+      "owners": [
+        "apps/rapid/src/hooks.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "crates/protocol",
+        "apps/rapid/src/approvals.rs",
+        "apps/rapid/src/interactive.rs"
+      ],
+      "implementation": [
+        "Map a hook `ask` onto Decision::Ask with the hook's reason and source in the ApprovalRequest and approval.requested payload.",
+        "Give headless rapid exec an approval sink that records the suspension and ends the turn; exit NeedsApproval (10) when a hook asked (ADR 0022 \u00a73)."
+      ],
+      "validation": [
+        "TUI resolves a hook ask through /approvals; headless exits 10 with the wait recorded; a process restart during the ask resumes waiting with the call not re-run (ledger shows one tool.started at most)."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-01-3",
+      "title": "Rewrites: validated updated_input, journaled digests, transcript marker",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-01-1"
+      ],
+      "acceptance_criteria": [
+        "SEAM-01 AC-04"
+      ],
+      "owners": [
+        "apps/rapid/src/hooks.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "crates/protocol"
+      ],
+      "implementation": [
+        "Re-parse updated_input through the tool's own argument parser and bound; deny naming the hook on failure; last rewrite wins; a deny discards all rewrites.",
+        "Append hook.input_rewritten {hook, tool, call_id, before_digest, after_digest, before, after}; one transcript line names the hook; permission is evaluated on the rewritten input (ADR 0022 \u00a75)."
+      ],
+      "validation": [
+        "A schema-failing rewrite is denied naming the hook; a valid rewrite runs the rewritten call and the ledger carries both digests; the marker is present; revert cycle on each."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-01-4",
+      "title": "additional_context delivered after the result, fenced and bounded",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-01-1"
+      ],
+      "acceptance_criteria": [
+        "SEAM-01 AC-05"
+      ],
+      "owners": [
+        "apps/rapid/src/hooks.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "crates/protocol"
+      ],
+      "implementation": [
+        "Append additional_context inside <untrusted_context locator=\"hook:<id>\"> after the tool result, bounded by MAX_HOOK_CONTEXT_BYTES (4 KiB), redacted like the result (ADR 0022 \u00a76)."
+      ],
+      "validation": [
+        "Context appears after the result, fenced, naming the hook, cut at the bound; instructions inside are not acted on (a scripted-model test)."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-01-5",
+      "title": "New stages: user_prompt_submit, stop, stop_cancelled, blocking subagent_stop, post_tool_use_failure",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-01-1"
+      ],
+      "acceptance_criteria": [
+        "SEAM-01 AC-06"
+      ],
+      "owners": [
+        "apps/rapid/src/hooks.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "crates/protocol",
+        "apps/rapid/src/interactive.rs"
+      ],
+      "implementation": [
+        "Add the stages to HooksConfig and fire them at the documented sites; stop and stop_cancelled are chosen at the one turn-end site and are exclusive; stop_cancelled carries the reason (interrupt, denied permission, budget, max turns).",
+        "user_prompt_submit may deny with a reason and holds a queued prompt; post_tool_use_failure fires on dispatch failure or an MCP error result and cannot block (ADR 0022 \u00a77)."
+      ],
+      "validation": [
+        "Each stage has a test for the documented situation and payload; a cancelled turn fires stop_cancelled and not stop; a completed turn the reverse."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-01-6",
+      "title": "Managed gates: hooks.managed_only and hooks.denied_events",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-01-1"
+      ],
+      "acceptance_criteria": [
+        "SEAM-01 AC-07"
+      ],
+      "owners": [
+        "apps/rapid/src/managed_config.rs",
+        "apps/rapid/src/hooks.rs"
+      ],
+      "implementation": [
+        "Add the two fields to the closed [policy] set; managed_only runs only hooks the managed policy declares; denied_events skips stages by name; both narrow-only and reported with field/origin/remediation (ADR 0022 \u00a78)."
+      ],
+      "validation": [
+        "A non-managed hook is blocked under managed_only with the gate report; a denied stage does not fire; user/project settings cannot widen either."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-01-7",
+      "title": "Hooks reference page, event catalog, SDK wire kinds, stale CLI-reference row",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-01-2",
+        "SEAM-01-3",
+        "SEAM-01-4",
+        "SEAM-01-5",
+        "SEAM-01-6"
+      ],
+      "acceptance_criteria": [
+        "SEAM-01 AC-08"
+      ],
+      "owners": [
+        "docs/reference",
+        "sdk/typescript/schemas"
+      ],
+      "implementation": [
+        "Write docs/reference/hooks.md (stages, v1 and v2 contracts, failure semantics, managed gates); add hook.decided/hook.input_rewritten to docs/reference/event-catalog.md and sdk/typescript/schemas/wire.v1.json; remove the non-existent `rapid hooks` row from cli-command-reference.md (S9) and the peer-product names in hooks.rs/interactive.rs:2147 (rule 2.4)."
+      ],
+      "validation": [
+        "pnpm generate:check green; a test executes every command line in hooks.md against --help."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-02-1",
+      "title": "Preset table and `rapid setup` argument surface with --dry-run/--non-interactive/--output json",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-00-3"
+      ],
+      "acceptance_criteria": [
+        "SEAM-02 AC-01"
+      ],
+      "owners": [
+        "apps/rapid/src/user_config.rs",
+        "apps/rapid/src/model.rs",
+        "crates/llm-router",
+        "apps/rapid/src/p9_commands.rs"
+      ],
+      "implementation": [
+        "Add the preset data table (endpoint, dialect, default model, docs link, local-server flag) with tests (rule 2.2 applies to its rows only).",
+        "Add the `setup` subcommand: flag parsing, plan computation (files and keys it would write), dry-run printing exactly that plan and performing no network call and no write."
+      ],
+      "validation": [
+        "Dry-run in a temp home leaves the directory hash unchanged and opens no socket (a stub listener proves no connection); the JSON output lists the files and keys."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-02-2",
+      "title": "Live verification probe through the router with an egress receipt; typed failure classes; `doctor --live`",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-02-1"
+      ],
+      "acceptance_criteria": [
+        "SEAM-02 AC-02",
+        "SEAM-02 AC-07"
+      ],
+      "owners": [
+        "apps/rapid/src/user_config.rs",
+        "apps/rapid/src/model.rs",
+        "crates/llm-router",
+        "apps/rapid/src/p9_commands.rs",
+        "apps/rapid/src/doctor.rs",
+        "crates/security",
+        "crates/event-ledger"
+      ],
+      "implementation": [
+        "One \u226416-token request through the configured adapter, connecting through security::EgressProxy and recording journal::record_egress (its first producer); classify auth/quota/network/server/invalid to distinct exit codes and hints; proxy environment variables recognised by Http1Transport.",
+        "doctor gains an argument parser and --live runs the probe per profile as a typed check; offline output unchanged."
+      ],
+      "validation": [
+        "Against a scripted loopback server (serving every connection): 401\u2192auth, 429\u2192quota, refused connection\u2192network, 500\u2192server, garbage\u2192invalid; the config dir and keychain hash are byte-identical after each failure; the message states no files were changed; doctor offline snapshot unchanged."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-02-3",
+      "title": "Persistence: atomic 0600 write, timestamped .bak only on change, idempotent `unchanged`; keychain-referenced credentials",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-02-2"
+      ],
+      "acceptance_criteria": [
+        "SEAM-02 AC-03"
+      ],
+      "owners": [
+        "apps/rapid/src/user_config.rs",
+        "apps/rapid/src/model.rs",
+        "crates/llm-router",
+        "apps/rapid/src/p9_commands.rs",
+        "crates/auth"
+      ],
+      "implementation": [
+        "Write config.toml through exec_tools::atomic_write_with_mode at 0600; .bak only when a previous file's content changes; second identical run reports unchanged and writes nothing.",
+        "Keys arrive by --key-env or --key-stdin only; store as CredentialKind::ProviderApiKey through auth::production_backend and reference it from [model.<id>] keychain = \"<alias>\"; resolve_credential gains the keychain source; argv never carries a key."
+      ],
+      "validation": [
+        "File mode 0600; .bak present only in the changed case; unchanged on repeat; keychain typed-unavailability test where no backend exists (Windows/CI); a key on argv is a usage error."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-02-4",
+      "title": "Per-effort model identifiers and per-model retry policy",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-00-3"
+      ],
+      "acceptance_criteria": [
+        "SEAM-02 AC-04",
+        "SEAM-02 AC-05"
+      ],
+      "owners": [
+        "apps/rapid/src/user_config.rs",
+        "apps/rapid/src/model.rs",
+        "crates/llm-router",
+        "apps/rapid/src/p9_commands.rs",
+        "apps/rapid/src/host.rs"
+      ],
+      "implementation": [
+        "[model.<id>] effort_ids = { low, medium, high } resolved at route time (default the model id) for both dialects.",
+        "[model.<id>] retry = { max_attempts, base_ms, max_ms, on = [...] } overriding SupervisedModel's global ceiling and classes; non-retryable classes never retried."
+      ],
+      "validation": [
+        "Outgoing request bodies carry the per-effort id per dialect; retry override counted through a scripted failing server; an auth failure is retried zero times."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-02-5",
+      "title": "Continuation on length-truncated output and reasoning_summary",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-02-4"
+      ],
+      "acceptance_criteria": [
+        "SEAM-02 AC-06"
+      ],
+      "owners": [
+        "apps/rapid/src/user_config.rs",
+        "apps/rapid/src/model.rs",
+        "crates/llm-router",
+        "apps/rapid/src/p9_commands.rs",
+        "apps/rapid/src/host.rs",
+        "crates/agent-runtime"
+      ],
+      "implementation": [
+        "fold_stream keeps FinishReason; SupervisedModel::step issues up to continue_on_length continuation requests carrying the partial output, stitches one assistant message, appends model.continued {continuation_of, index} per continuation and decrements the budget per request; status shown in exec output and the TUI.",
+        "reasoning_summary setting for dialects that support it."
+      ],
+      "validation": [
+        "Stubbed provider: length twice then stop \u2192 one message, three ledger events, three budget decrements; continue_on_length = 0 leaves today's behaviour byte-identical (transcript diff)."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-02-6",
+      "title": "Model-configuration and getting-started documentation",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-02-3",
+        "SEAM-02-5"
+      ],
+      "acceptance_criteria": [
+        "SEAM-02 AC-08"
+      ],
+      "owners": [
+        "docs/reference/model-configuration.md",
+        "docs/getting-started.md"
+      ],
+      "implementation": [
+        "Document the full [model.<id>] key set, [models] fallback, [phases], keychain, presets, setup, doctor --live; correct the keyless-header, exit-code and doctor-exit claims; remove the peer-product name from the H1 and prose (rule 2.4)."
+      ],
+      "validation": [
+        "A test pins the documented key list to user_config's known list and the exit-code table to JsonlExitCode::ALL."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-03-1",
+      "title": "Durable job projection everywhere: session-scoped registry for daemon/ACP, detached completion, orphan reconciliation, job events in ACP and JSONL",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-00-3"
+      ],
+      "acceptance_criteria": [
+        "SEAM-03 AC-02",
+        "SEAM-03 AC-06"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/acp_serve.rs",
+        "apps/rapid/src/daemon_serve.rs",
+        "crates/acp",
+        "apps/rapid/src/headless/jsonl.rs"
+      ],
+      "implementation": [
+        "Daemon/ACP sessions own one JobRegistry for the session's lifetime instead of one per turn (disclosed behaviour change: jobs survive turns there as they do in the TUI).",
+        "Detached task_spawn emits finished; job.orphan_reconciled gets its first producer from process_supervisor::reconcile_orphans at session open; ACP session/update carries job.*; rapid exec --jsonl streams job.* records."
+      ],
+      "validation": [
+        "Kill the client, reconnect through the daemon, fold the events: rows identical to the pre-kill TUI rows; a detached child's row reaches a terminal state; a job whose process died between runs is orphan_reconciled; JSONL and TUI carry the same job events for one scripted run."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-03-2",
+      "title": "Demote a running command: keybinding and /jobs bg",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-03-1"
+      ],
+      "acceptance_criteria": [
+        "SEAM-03 AC-01"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/acp_serve.rs",
+        "apps/rapid/src/daemon_serve.rs",
+        "crates/tui"
+      ],
+      "implementation": [
+        "A running shell_exec can be demoted (TUI key and /jobs bg <id>): the turn stops waiting, the process keeps running, completion wakes the turn through drain_notifications; the transition is a job.* event."
+      ],
+      "validation": [
+        "Demote keeps the process alive and ends the turn; completion appears in the next model step; the ledger shows the transition."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-03-3",
+      "title": "/loop and `rapid loop add|list|rm` over PromptCron with lifetime, cap, recorded notifications",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-03-1"
+      ],
+      "acceptance_criteria": [
+        "SEAM-03 AC-03"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/acp_serve.rs",
+        "apps/rapid/src/daemon_serve.rs",
+        "crates/scheduler",
+        "crates/event-ledger"
+      ],
+      "implementation": [
+        "A poller inside the session loop fires due PromptCron rows as background Plan-mode turns with bounded context; rows carry a 7-day default lifetime and the store refuses the 51st active loop with a typed error; results land as notification.recorded events (the notice list becomes a projection) and never in the foreground transcript; /jobs shows next fire and expiry; deletable from the panel."
+      ],
+      "validation": [
+        "A loop fires on schedule in a test with a scripted model; its output is absent from the transcript; expiry removes it; the cap test refuses the 51st."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-03-4",
+      "title": "`monitor` tool: per-line provenance-tagged notifications, flood control, persistence, kill",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-03-3"
+      ],
+      "acceptance_criteria": [
+        "SEAM-03 AC-04"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/acp_serve.rs",
+        "apps/rapid/src/daemon_serve.rs"
+      ],
+      "implementation": [
+        "A monitor runs a command through the job path and turns each stdout line into a bounded, fenced notification.recorded; above a rate it stops itself with a notice and a hint; persistent: true lives for the session; /jobs cancel stops it."
+      ],
+      "validation": [
+        "One notification per line with provenance; a flood auto-stops; a persistent monitor survives a turn boundary and stops on cancel; Windows runs the same test through crates/test-fixtures."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-03-5",
+      "title": "Resume summary derived from non-terminal work; wait ceilings reported as still running",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-03-3"
+      ],
+      "acceptance_criteria": [
+        "SEAM-03 AC-05"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/acp_serve.rs",
+        "apps/rapid/src/daemon_serve.rs",
+        "apps/rapid/src/host.rs"
+      ],
+      "implementation": [
+        "On /resume and rapid exec --continue, derive a jobs/running block from job.*, agent.* and loop rows and inject it through host::build_packet_with; nothing stored separately.",
+        "Output/completion waits get job.wait_ceiling (default one hour); a timeout is reported as still running, not failure."
+      ],
+      "validation": [
+        "Restart with a background process alive yields the block; with nothing running, no block (compiled-context test); a wait past the ceiling reports still running."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-04-1",
+      "title": "Role overlays on the spawn path: definitions gain fields, `type` resolves through agent_defs, user-level directory",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-00-3"
+      ],
+      "acceptance_criteria": [
+        "SEAM-04 AC-04"
+      ],
+      "owners": [
+        "crates/agent-runtime",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/agent_views.rs",
+        "apps/rapid/src/p9_commands.rs"
+      ],
+      "implementation": [
+        "AgentDefinition gains base_role, instructions, model, reasoning_effort, inputs, outputs (closed schema, narrow-only validation unchanged); ~/.rapidlm/agents/ loads below the project directory and cannot shadow builtins; LiveSubagentRunner resolves task_spawn `type` through full_inventory and applies role, tool surface, model, effort and instructions; unknown type is a typed refusal (ADR 0023 \u00a75)."
+      ],
+      "validation": [
+        "An overlay requesting a tool outside its base role is rejected with field-level remediation; a valid overlay appears in /agents and rapid agents list and its model/effort reach the child's request (scripted model asserts)."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-04-2",
+      "title": "Inbox: agent.mail.sent gets its first producer; interject/steer/queue delivery in the child's turn loop",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-04-1",
+        "SEAM-03-5"
+      ],
+      "acceptance_criteria": [
+        "SEAM-04 AC-01"
+      ],
+      "owners": [
+        "crates/agent-runtime",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/agent_views.rs",
+        "crates/event-ledger"
+      ],
+      "implementation": [
+        "Append agent.mail.sent before enqueue; the turn loop consults a MessageSource at the wait (interject pre-empts), at the step boundary (steer) and after completion (queue); agent.mail.delivered records where; the transcript labels the mode (ADR 0023 \u00a71\u20132)."
+      ],
+      "validation": [
+        "Three tests prove when the child sees each mode, its ledger event and its transcript label; an undeliverable message is agent.mail.dropped with a reason."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-04-3",
+      "title": "Continue a finished child as a superseding turn in its lineage",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-04-2"
+      ],
+      "acceptance_criteria": [
+        "SEAM-04 AC-02"
+      ],
+      "owners": [
+        "crates/agent-runtime",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/agent_views.rs"
+      ],
+      "implementation": [
+        "A message to a terminal child starts a new runner turn for the same AgentId seeded with its recorded history plus the message; agent.state_changed {continued_from} carries the lineage; under the graph it is a superseding revision (ADR 0023 \u00a73)."
+      ],
+      "validation": [
+        "Messaging a completed child continues it; the original report is unchanged; the lineage is visible in /agents."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-04-4",
+      "title": "Admission: bounded FIFO in SubagentRegistry with a managed, narrow-only concurrency ceiling",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-04-1"
+      ],
+      "acceptance_criteria": [
+        "SEAM-04 AC-03"
+      ],
+      "owners": [
+        "crates/agent-runtime",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/agent_views.rs",
+        "apps/rapid/src/managed_config.rs"
+      ],
+      "implementation": [
+        "Spawns above the ceiling wait in order for a slot (queued position visible in the tool result and /agents) bounded by the turn ceiling; managed.max_concurrent_subagents narrows the built-in; the per-turn spawn budget is unchanged (ADR 0023 \u00a74)."
+      ],
+      "validation": [
+        "Spawning twice the ceiling queues in order without error; a managed ceiling cannot be exceeded by user or project configuration (gate test)."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-04-5",
+      "title": "Declared outputs checked at completion; subagent wait ceiling",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-04-1",
+        "SEAM-03-5"
+      ],
+      "acceptance_criteria": [
+        "SEAM-04 AC-05"
+      ],
+      "owners": [
+        "crates/agent-runtime",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/agent_views.rs"
+      ],
+      "implementation": [
+        "A declared output missing from the child's result is SubagentEnd::IntegrationFailed { missing_outputs }; detached children get subagent.wait_ceiling (default one hour), expiry reported as still running (ADR 0023 \u00a76\u20137)."
+      ],
+      "validation": [
+        "A missing declared output is a typed failure, never accepted; a wait past the ceiling reports still running and leaves the child alive."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-05-1",
+      "title": "Plan mode is the lattice mode: /plan, rapid exec --plan, the plan-file carve-out, the proposal type and fixture",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-01-2"
+      ],
+      "acceptance_criteria": [
+        "SEAM-05 AC-01",
+        "SEAM-05 AC-02"
+      ],
+      "owners": [
+        "apps/rapid/src/permissions.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "crates/protocol"
+      ],
+      "implementation": [
+        "/plan and --plan set PermissionMode::Plan as the effective mode under the managed ceiling; the lattice gains the .rapidlm/plans/ carve-out so ExecTools.plan_mode becomes a projection; add protocol::plan::PlanProposal v1 with a fixture (ADR 0024 \u00a71\u20132)."
+      ],
+      "validation": [
+        "A write call in plan mode is refused by PermissionLattice::evaluate (policy-layer test, not prompt); the proposal fixture round-trips; the cron path's forced Plan mode is unchanged."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-05-2",
+      "title": "Proposal submission through the approval wait; revisions; rejection; headless exit",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-05-1"
+      ],
+      "acceptance_criteria": [
+        "SEAM-05 AC-04",
+        "SEAM-05 AC-05"
+      ],
+      "owners": [
+        "apps/rapid/src/permissions.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "crates/protocol",
+        "apps/rapid/src/approvals.rs",
+        "crates/event-ledger"
+      ],
+      "implementation": [
+        "plan_exit stores the proposal artifact, renders .rapidlm/plans/<id>.md, appends plan.proposed and raises the approval request; edit before approval appends plan.revised {supersedes} and leaves the previous artifact intact; reject appends plan.rejected {reason}; headless --plan prints the proposal and exits NeedsApproval (ADR 0024 \u00a73\u20134, \u00a76)."
+      ],
+      "validation": [
+        "Editing creates a new revision and the old file/artifact are byte-identical; headless exits 10 with the proposal printed; a restart mid-wait recovers the pending approval."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-05-3",
+      "title": "Approval compiles the proposal into a verified run whose nodes and edges match the plan",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-05-2"
+      ],
+      "acceptance_criteria": [
+        "SEAM-05 AC-03"
+      ],
+      "owners": [
+        "apps/rapid/src/permissions.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "crates/protocol",
+        "apps/rapid/src/workflow.rs",
+        "apps/rapid/src/workflow_verified.rs"
+      ],
+      "implementation": [
+        "plan.approved writes the steps as a PlaybookFile and starts rapid run --orchestration verified over it; the payload carries plan_id, revision, run_id, graph_id (ADR 0024 \u00a75)."
+      ],
+      "validation": [
+        "Graph nodes and DependsOn edges equal the plan's steps and depends_on; the ledger links plan revision \u2192 run \u2192 nodes; approving a superseded revision is a typed refusal."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-06-1",
+      "title": "Signed managed policy (require_signature, detached signature, doctor origin/signature state)",
+      "phase": "P2",
+      "status": "blocked",
+      "depends_on": [
+        "SEAM-00-3"
+      ],
+      "acceptance_criteria": [
+        "SEAM-06 AC-01"
+      ],
+      "owners": [
+        "apps/rapid/src/managed_config.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/mcp_config.rs",
+        "crates/security",
+        "crates/plugin-host",
+        "apps/rapid/src/doctor.rs"
+      ],
+      "implementation": [
+        "Blocked on decision D-1 (baseline \u00a75): the workspace has no asymmetric-signature primitive. On (a): add the Ed25519 verifier in crates/security, managed.trusted_keys, <policy>.sig, fail-closed refusal before session start; reuse the verifier for the update manifest's documented signatures."
+      ],
+      "validation": [
+        "An unsigned or invalid policy under require_signature is refused before a session starts with remediation; a valid signature loads; doctor shows origin and signature state."
+      ],
+      "evidence": [
+        "decision needed \u2014 see docs/goals/seams-phase0-baseline-2026-09-20.md \u00a75 D-1"
+      ]
+    },
+    {
+      "id": "SEAM-06-2",
+      "title": "MCP and plugin-source allow/deny lists enforced before any write; trust gate on mcp add",
+      "phase": "P2",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-00-3"
+      ],
+      "acceptance_criteria": [
+        "SEAM-06 AC-02"
+      ],
+      "owners": [
+        "apps/rapid/src/managed_config.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/mcp_config.rs",
+        "crates/security",
+        "crates/plugin-host"
+      ],
+      "implementation": [
+        "managed.mcp.allowed_servers/denied_servers (name and command/URL pattern) and managed.plugins.allowed_sources enforced at mcp add, plugin install and session bind with the field/origin/remediation report; mcp add gains the trust gate it lacks (disclosed: an untrusted project's add becomes a refusal that writes nothing); mcp probe and doctor list what policy blocks."
+      ],
+      "validation": [
+        "mcp add of a denied server writes nothing (directory hash unchanged) and reports the gate; a denied plugin source likewise; an untrusted project's add is refused."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-06-3",
+      "title": "Deterministic tool-name collision rule and User-Agent on MCP HTTP and provider calls",
+      "phase": "P2",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-00-3"
+      ],
+      "acceptance_criteria": [
+        "SEAM-06 AC-03"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_http.rs",
+        "crates/llm-router"
+      ],
+      "implementation": [
+        "Surface assembly reports a collision once (built-in > plugin > MCP), keeps the namespaced mcp__<server>__<tool> reachable and dedups identical names; write_http_request and the MCP transport send User-Agent: rapid/<version>."
+      ],
+      "validation": [
+        "A tool present built-in and via MCP resolves to the built-in and stays reachable under the namespace; the header appears on both writers (scripted server asserts)."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-06-4",
+      "title": "Installer by shape: rapid mcp install --into/--discover with format-preserving edits",
+      "phase": "P2",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-06-2"
+      ],
+      "acceptance_criteria": [
+        "SEAM-06 AC-04",
+        "SEAM-06 AC-05"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_admin.rs"
+      ],
+      "implementation": [
+        "--into <path> [--format jsonc|toml|yaml] [--key <path>] [--dry-run]: format-preserving edit (comments, ordering, unrelated keys untouched), timestamped .bak, atomic 0600 write, per-user lock, unchanged on repeat, diff on dry-run; --discover scans the home/XDG roots (overridable by environment) for files whose shape declares a servers map under a small set of known key names and lists them by path (rule 2.5)."
+      ],
+      "validation": [
+        "Fixture files: the byte diff is limited to the injected block; .bak written; unchanged on the second run; nothing written under --dry-run; --discover finds neutral-named fixtures by shape only; a concurrent run is refused by the lock."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-06-5",
+      "title": "Skill package teaching external hosts to drive rapid headlessly, with a --help drift test",
+      "phase": "P2",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-01-7",
+        "SEAM-02-6"
+      ],
+      "acceptance_criteria": [
+        "SEAM-06 AC-06"
+      ],
+      "owners": [
+        "skill/SKILL.md",
+        "apps/rapid/tests"
+      ],
+      "implementation": [
+        "skill/SKILL.md (open skill format): agent-mode flags, stdout/stderr contract, exit codes, JSONL, resume rules, key handling; a sub-skill for long-running goals."
+      ],
+      "validation": [
+        "A test extracts every command line from the package and runs it against --help; no documented flag can drift."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-07-1",
+      "title": "Cost in the ledger, then rapid usage and /usage derived from it",
+      "phase": "P2",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-00-3"
+      ],
+      "acceptance_criteria": [
+        "SEAM-07 AC-01"
+      ],
+      "owners": [
+        "crates/llm-router",
+        "apps/rapid/src/host.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/p9_commands.rs",
+        "crates/tui",
+        "crates/agent-runtime",
+        "crates/event-ledger"
+      ],
+      "implementation": [
+        "model.completed gains input_tokens, output_tokens, cached_tokens and cost: AccountedCost additively; rapid usage [<session>] [--project] [--since] [--output json] [--quiet] reduces model.* events per turn with totals and TSV; reported vs estimated flagged; /usage beside /context in one tabbed modal whose context legend sums to 100%."
+      ],
+      "validation": [
+        "usage totals equal the sum of the fixture session's ledger records; estimated vs reported flagged; a pre-change ledger reduces with cost unknown, never zero."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-07-2",
+      "title": "rapid du with a reclaim plan that never deletes",
+      "phase": "P2",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-08-2"
+      ],
+      "acceptance_criteria": [
+        "SEAM-07 AC-02"
+      ],
+      "owners": [
+        "apps/rapid/src/p9_commands.rs"
+      ],
+      "implementation": [
+        "Sizes of the per-project .rapidlm tree (sessions, index, findings, runs, plans), RAPIDLM_HOME and the worktree store; --reclaim-plan lists only entries SEAM-08's rule would reclaim; the layout printed is the real one (baseline \u00a73 SEAM-07)."
+      ],
+      "validation": [
+        "du matches the filesystem for a fixture home/project within block rounding; the reclaim plan equals reclaim --dry-run."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-07-3",
+      "title": "[ui.status_line]: builtin | command | disabled with a schema-versioned payload run under the sandbox",
+      "phase": "P2",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-07-1"
+      ],
+      "acceptance_criteria": [
+        "SEAM-07 AC-03"
+      ],
+      "owners": [
+        "crates/llm-router",
+        "apps/rapid/src/host.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/p9_commands.rs",
+        "crates/tui",
+        "apps/rapid/src/sandbox_exec.rs",
+        "apps/rapid/src/user_config.rs",
+        "crates/protocol"
+      ],
+      "implementation": [
+        "type, items, command, refresh_interval (1\u201386400 s); protocol::status::StatusPayload v1 with fixture on stdin (session_id, model, effort, context.used_percent, cost, goal.state, worktree, workspace.cwd/repo, trigger); runs through run_sandboxed with a timeout; up to five lines cut at 1024 chars; last output retained on failure; a project-level command requires trust; RAPIDLM_SESSION_ID/RAPIDLM_TURN_ID exported."
+      ],
+      "validation": [
+        "Runs sandboxed; times out to the last output; honours refresh_interval; payload validates against the fixture; an untrusted project's command does not run; typed unavailability where the sandbox tier is absent."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-07-4",
+      "title": "Opt-in OTLP exporter through egress policy with a receipt",
+      "phase": "P2",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-07-1"
+      ],
+      "acceptance_criteria": [
+        "SEAM-07 AC-04"
+      ],
+      "owners": [
+        "crates/telemetry",
+        "apps/rapid/src/user_config.rs",
+        "crates/security",
+        "crates/event-ledger"
+      ],
+      "implementation": [
+        "[telemetry.otlp] endpoint (disabled by default) gives crates/telemetry its first dependent and a real OtlpTransport behind EgressProxy with record_egress; redaction first; bounded queue; loss never a caller-visible failure."
+      ],
+      "validation": [
+        "Disabled by default (no socket opened); only redacted records leave (scripted collector asserts); an egress receipt is recorded; a dead collector never fails the turn."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-08-1",
+      "title": "rapid exec --worktree and rapid goal create --worktree over GitWorktreeStore; base reuse without network",
+      "phase": "P2",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-00-3"
+      ],
+      "acceptance_criteria": [
+        "SEAM-08 AC-01",
+        "SEAM-08 AC-04"
+      ],
+      "owners": [
+        "crates/workspace",
+        "apps/rapid/src/agent_views.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/publication.rs"
+      ],
+      "implementation": [
+        "Decision D-2 recorded (recommendation: keep the store's in-repo location); --worktree [<name>] creates a view through GitWorktreeStore::create_view and roots the run's tools there; the worktree metadata gains session id; branch-tip fetch default, --full-history opt-in."
+      ],
+      "validation": [
+        "Headless --worktree leaves the primary tree's git status unchanged; base reuse creates the linked worktree with the network unreachable (proxy variables pointed at a closed port)."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-08-2",
+      "title": "Reclaim rule over the journal; rapid worktree list|reclaim [--dry-run]; journaled abandon",
+      "phase": "P2",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-08-1"
+      ],
+      "acceptance_criteria": [
+        "SEAM-08 AC-02",
+        "SEAM-08 AC-03"
+      ],
+      "owners": [
+        "crates/workspace",
+        "apps/rapid/src/agent_views.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/publication.rs",
+        "crates/event-ledger"
+      ],
+      "implementation": [
+        "A worktree is reclaimable only when its transaction is published or abandoned in the journal, no active lease/session references it and git status is clean; abandon is journaled as a workspace.abandon effect; the primary checkout is never a candidate; --dry-run lists without deleting; reclaim records the removal."
+      ],
+      "validation": [
+        "Reclaim refuses unpublished changes or an active lease; dry-run deletes nothing; a published worktree is reclaimed and the journal records it."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-09-1",
+      "title": "Persisted never-allow and always-allow answers with origin in permissions list",
+      "phase": "P2",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-01-2"
+      ],
+      "acceptance_criteria": [
+        "SEAM-09 AC-01"
+      ],
+      "owners": [
+        "apps/rapid/src/permissions.rs",
+        "apps/rapid/src/permissions_cli.rs",
+        "apps/rapid/src/interactive.rs",
+        "crates/tui",
+        "crates/security"
+      ],
+      "implementation": [
+        "Approval prompts offer never/always for MCP tools and fetch domains; deny grants persisted per project beside allow grants; permissions list shows every effective rule with its origin (persisted, settings, managed); ACP allow_always persists too."
+      ],
+      "validation": [
+        "A persisted never-allow blocks without prompting on the next run and appears with origin; revert cycle."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-09-2",
+      "title": "AST-aware shell matcher on security::tokenize_shell; safe-command list in auto mode",
+      "phase": "P2",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-09-1"
+      ],
+      "acceptance_criteria": [
+        "SEAM-09 AC-02"
+      ],
+      "owners": [
+        "apps/rapid/src/permissions.rs",
+        "apps/rapid/src/permissions_cli.rs",
+        "apps/rapid/src/interactive.rs",
+        "crates/tui",
+        "crates/security"
+      ],
+      "implementation": [
+        "Rules match the parsed script (quoted variables, pipelines, ;/&&, subshells, heredocs) so quoting neither bypasses nor over-prompts; unknown constructs prompt; auto mode allows a fixed safe list (directory creation, touch, listing)."
+      ],
+      "validation": [
+        "Matcher fixtures per construct produce the expected decision; a quoting bypass fixture is denied; the safe list is allowed only in auto."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-09-3",
+      "title": "rapid exec --allow <rule> bounded by the managed ceiling; default mode in user config",
+      "phase": "P2",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-09-1"
+      ],
+      "acceptance_criteria": [
+        "SEAM-09 AC-03"
+      ],
+      "owners": [
+        "apps/rapid/src/permissions.rs",
+        "apps/rapid/src/permissions_cli.rs",
+        "apps/rapid/src/interactive.rs",
+        "crates/tui",
+        "crates/security",
+        "apps/rapid/src/user_config.rs",
+        "apps/rapid/src/managed_config.rs"
+      ],
+      "implementation": [
+        "Repeatable --allow adds startup grants for the run, narrowed by max_permission_mode/denied_tools; [permissions] default_mode in user config below managed and above project settings."
+      ],
+      "validation": [
+        "--allow cannot exceed the managed ceiling (gate test); the user default is honoured and overridden by env."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-09-4",
+      "title": "Prompts render the full script and the file-edit diff via the existing view model",
+      "phase": "P2",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-09-1"
+      ],
+      "acceptance_criteria": [
+        "SEAM-09 AC-04"
+      ],
+      "owners": [
+        "crates/tui",
+        "apps/rapid/src/interactive.rs"
+      ],
+      "implementation": [
+        "paint_screen renders tui::ApprovalViewModel (already exported and snapshot-tested) for pending approvals: full script for shell, auto-expanded diff for edits."
+      ],
+      "validation": [
+        "Snapshot test of the production modal shows diff and script; the old three-line snapshot is replaced, not weakened."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-10-1",
+      "title": "Agent-mode flags parsed once, env mirrors, JSON error envelope with hints, headless origin tag",
+      "phase": "P3",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-00-3"
+      ],
+      "acceptance_criteria": [
+        "SEAM-10 AC"
+      ],
+      "owners": [
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/main.rs",
+        "crates/protocol",
+        "crates/kernel",
+        "apps/rapid/src/p9_commands.rs"
+      ],
+      "implementation": [
+        "--output json|text, --quiet, --non-interactive, --dry-run, --yes, --no-color, --timeout with RAPIDLM_* mirrors parsed before dispatch; non-TTY stdout defaults to JSON where a JSON form exists; protocol::cli::CliError {code, message, hint} with fixture rendered as {\"error\":{\u2026}} on stderr in JSON mode; every InteractiveError gains a hint naming the next command; session.created gains origin = headless|interactive; sessions list --origin."
+      ],
+      "validation": [
+        "Table-driven test over every subcommand; envelope fixture; exit codes unchanged (pinned); sessions list --origin filters."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-11-1",
+      "title": "MCP elicitation and form/URL consent through the approval wait, durable across restart",
+      "phase": "P3",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-01-2"
+      ],
+      "acceptance_criteria": [
+        "SEAM-11 AC (elicitation)"
+      ],
+      "owners": [
+        "crates/mcp",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/approvals.rs"
+      ],
+      "implementation": [
+        "A tool result with an input-required state and schema raises the approval wait (source mcp:<server>); the answer is carried on the retried call; server-initiated elicitation frames are surfaced, not discarded."
+      ],
+      "validation": [
+        "Round trip against a stub server; a restart mid-elicitation resumes; an invalid answer is a typed refusal."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-11-2",
+      "title": "web_search behind a backend trait with domain lists, bounded, provenance-tagged, egress under policy",
+      "phase": "P3",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-02-2"
+      ],
+      "acceptance_criteria": [
+        "SEAM-11 AC (search)"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/user_config.rs",
+        "crates/security"
+      ],
+      "implementation": [
+        "[toolset.web_search] backend, allowed_domains, excluded_domains; results fenced and bounded; egress through EgressProxy with a receipt; web_fetch gains the same receipt while there; no backend configured is typed unavailability."
+      ],
+      "validation": [
+        "Results filtered by the domain lists (stub backend); no backend \u2192 typed unavailability; receipts recorded."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-12-1",
+      "title": "RAPIDLM_SESSION_ID/RAPIDLM_TURN_ID exported; /aside as a read-only child whose answer never enters the context",
+      "phase": "P3",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-03-5",
+        "SEAM-04-1"
+      ],
+      "acceptance_criteria": [
+        "SEAM-12 AC"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/hooks.rs",
+        "apps/rapid/src/interactive.rs"
+      ],
+      "implementation": [
+        "Export both variables at the tool, hook, MCP and status-command spawn sites; /aside <question> runs a read-only child with no inbox and shows the answer without appending it."
+      ],
+      "validation": [
+        "Each spawn site receives the variables; the aside's content is provably absent from the next turn's compiled context."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-12-2",
+      "title": "Resume recap, /rename [--auto], prompt stash, /edit-prompt",
+      "phase": "P3",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-03-5"
+      ],
+      "acceptance_criteria": [
+        "SEAM-12 AC"
+      ],
+      "owners": [
+        "apps/rapid/src/interactive.rs",
+        "crates/tui",
+        "crates/event-ledger"
+      ],
+      "implementation": [
+        "A host-generated recap (last-turn summary, durations, unmet criteria) derived at resume; session.renamed event with the title as a projection; a stash keybinding; /edit-prompt in $EDITOR."
+      ],
+      "validation": [
+        "One test per item; the recap is derived (no stored copy)."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-13-1",
+      "title": "/memory flush: typed records with evidence links into the memory store and the MEMORY.md projection",
+      "phase": "P3",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-00-3"
+      ],
+      "acceptance_criteria": [
+        "SEAM-13 AC (flush)"
+      ],
+      "owners": [
+        "crates/context-engine",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/host.rs"
+      ],
+      "implementation": [
+        "context_engine::memory::MemoryStore gets its first production caller; flush writes decisions/patterns with provenance and evidence links; MEMORY.md is regenerated as a projection."
+      ],
+      "validation": [
+        "Flush writes typed records with provenance; MEMORY.md reflects them; revert cycle."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-13-2",
+      "title": "/memory consolidate as a scheduled loop producing new revisions with provenance",
+      "phase": "P3",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-13-1",
+        "SEAM-03-3"
+      ],
+      "acceptance_criteria": [
+        "SEAM-13 AC (consolidate)"
+      ],
+      "owners": [
+        "crates/context-engine",
+        "apps/rapid/src/interactive.rs",
+        "crates/scheduler"
+      ],
+      "implementation": [
+        "A PromptCron-backed loop folds context.compacted summaries into topic notes as new revisions; sources are never destroyed; the run is visible in /jobs."
+      ],
+      "validation": [
+        "Consolidation produces a new revision, sources intact; the job appears in /jobs."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-14-1",
+      "title": "Passive update notice: opt-in, TTY-only, throttled, budgeted, receipted",
+      "phase": "P3",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-02-2"
+      ],
+      "acceptance_criteria": [
+        "SEAM-14 AC"
+      ],
+      "owners": [
+        "apps/rapid/src/update_serve.rs",
+        "apps/rapid/src/user_config.rs",
+        "apps/rapid/src/interactive.rs"
+      ],
+      "implementation": [
+        "Decision D-3 recorded (recommendation: [update] url, no built-in default); [update] check = true; skipped in CI, non-TTY and headless; at most once per 24 h with a 3 s timeout; state file under RAPIDLM_HOME; one line at exit; egress through the proxy with a receipt."
+      ],
+      "validation": [
+        "Throttling, CI skip, no hang without network (closed port), receipt recorded."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "SEAM-15-1",
+      "title": "Agent dashboard as a daemon-hosted projection",
+      "phase": "P3",
+      "status": "pending",
+      "depends_on": [
+        "SEAM-03-5",
+        "SEAM-04-3"
+      ],
+      "acceptance_criteria": [
+        "SEAM-15 AC"
+      ],
+      "owners": [
+        "apps/rapid/src/daemon_serve.rs",
+        "crates/tui"
+      ],
+      "implementation": [
+        "A cross-session overview (sessions, forks, loops, pinned agents, last-turn summary, new-agent action) reduced from ledger events by the daemon; nothing stored separately."
+      ],
+      "validation": [
+        "Every row is derivable from the ledger; killing and restarting the daemon reproduces the dashboard byte-for-byte."
+      ],
+      "evidence": []
+    }
+  ],
+  "phase_notes": [
+    {
+      "phase": "P0",
+      "date": "2026-09-20",
+      "note": "Phase 0 complete: baseline audit with fifteen item rechecks (eleven 'today' corrections, none widening the program), ADRs 0022\u20130024, this worklist, the SEAMS section of the development ledger. Three decisions recorded (D-1 signature primitive, D-2 worktree location, D-3 update URL); only SEAM-06-1 is blocked on one of them.",
+      "evidence": "docs/goals/seams-phase0-baseline-2026-09-20.md"
+    }
+  ]
+}

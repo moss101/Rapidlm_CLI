@@ -452,3 +452,28 @@ Update rows only after observing evidence. `NOT_STARTED → IN_PROGRESS → BLOC
 | P13-GATE | P13 | VERIFIED | implementer | 2026-08-26 | 2026-08-26 |  | Machine-derived 25 entries all VERIFIED. Toolchains pinned; CI/test/bench/replay gates present; NEW `rapid release-manifest` (digests+rollback) probed live twice consistently; V2->V3 migration + compat fixtures proven by migrations/sdk tests; operator/reference docs present; traceability audit executed; suites green (rapid 60, kernel 163 with pre-existing IPC flake attributed, others green), cargo check --workspace exit 0. Environmental: no cross-platform OS runners, remote mac/iOS lanes, or live signing HSM — shipped as scripts/seams. P4-032 PARTIALLY_SATISFIED/DEFERRED and P4-GATE BLOCKED preserved; no GA waiver. P14 not entered |
 | ROADMAP-TERMINUS | — | N/A | implementer | 2026-08-26 | 2026-08-26 |  | Non-task bookkeeping: no P14 tasks exist. Machine-derived proof: manifest contains zero P14-* ids and its terminal entry is P13-GATE; docs/tasks.md has no P14 headings. Documented roadmap ends at P13-GATE (VERIFIED). No P14/P15 manifest entries added |
 
+
+## SEAMS-RAPIDLM-01 — Extension seams, background work, agent control and operability
+
+Governing document: `docs/goals/seams-governing-principles.md`. Worklist: `docs/goals/seams-implementation-tasks.json` (the authoritative per-task status and evidence; this table carries the item-level rows). Phase 0 audit: `docs/goals/seams-phase0-baseline-2026-09-20.md`. Rows follow the same rule as above: a row advances only on observed evidence named in a delivery record.
+
+| Task | Phase | Status | Owner/Agent | Started | Completed | Commit/PR | Evidence | Notes |
+|---|---|---|---|---|---|---|---|---|
+| SEAM-00-1 | P0 | VERIFIED | planner+context-scout | 2026-09-20 | 2026-09-20 |  | `docs/goals/seams-phase0-baseline-2026-09-20.md` — fifteen item rechecks with file:line, eleven "today" corrections, cross-cutting seams table, three recorded decisions | none widens the program |
+| SEAM-00-2 | P0 | VERIFIED | planner | 2026-09-20 | 2026-09-20 |  | ADR 0022 (hook result v2), ADR 0023 (inbox edges), ADR 0024 (plan proposals) | each extends an existing primitive; none adds an engine |
+| SEAM-00-3 | P0 | VERIFIED | planner | 2026-09-20 | 2026-09-20 |  | `docs/goals/seams-implementation-tasks.json` (53 tasks); governing document §4 "today" paragraphs corrected with pointers to the audit | commit names the audit |
+| SEAM-01 | P1 | NOT_STARTED |  |  |  |  |  | hook decision contract v2 — 7 tasks |
+| SEAM-02 | P1 | NOT_STARTED |  |  |  |  |  | provider onboarding and resilience — 6 tasks |
+| SEAM-03 | P1 | NOT_STARTED |  |  |  |  |  | background work — 5 tasks; `/jobs` rows verified ledger-derived |
+| SEAM-04 | P1 | NOT_STARTED |  |  |  |  |  | subagent control — 5 tasks |
+| SEAM-05 | P1 | NOT_STARTED |  |  |  |  |  | plan mode — 3 tasks; read-only floor already in the lattice |
+| SEAM-06 | P2 | BLOCKED (SEAM-06-1 only) |  |  |  |  | audit §5 D-1 | signature primitive decision; SEAM-06-2..5 are ready |
+| SEAM-07 | P2 | NOT_STARTED |  |  |  |  |  | usage/du/status line/exporter — 4 tasks; cost must reach the ledger first |
+| SEAM-08 | P2 | NOT_STARTED |  |  |  |  | audit §5 D-2 recorded, not blocking | worktree lifecycle — 2 tasks |
+| SEAM-09 | P2 | NOT_STARTED |  |  |  |  |  | permission UX — 4 tasks |
+| SEAM-10 | P3 | NOT_STARTED |  |  |  |  |  | agent-mode flags and envelope — 1 task |
+| SEAM-11 | P3 | NOT_STARTED |  |  |  |  |  | elicitation and web search — 2 tasks |
+| SEAM-12 | P3 | NOT_STARTED |  |  |  |  |  | session ergonomics — 2 tasks |
+| SEAM-13 | P3 | NOT_STARTED |  |  |  |  |  | memory consolidation — 2 tasks; no file watcher exists |
+| SEAM-14 | P3 | NOT_STARTED |  |  |  |  | audit §5 D-3 recorded, not blocking | update notice — 1 task |
+| SEAM-15 | P3 | NOT_STARTED |  |  |  |  |  | dashboard — 1 task; deferred behind SEAM-03/04 |
