@@ -1496,6 +1496,12 @@ pub struct WorkspaceTools {
     /// ACP/SDK session); headless exec stays `None`, which keeps `Ask`
     /// decisions on their fail-closed typed denial.
     approval_sink: Option<Arc<dyn crate::approvals::ApprovalSink>>,
+    /// The sink a hook's `ask` reaches when no general approval surface is
+    /// installed — headless `rapid exec` with a recording (ADR 0022 §3): the
+    /// wait is recorded exactly as the TUI records it and the run exits
+    /// `NeedsApproval`, while a *permission* `Ask` keeps today's typed
+    /// denial. `approval_sink`, when present, serves hook asks too.
+    hook_ask_sink: Option<Arc<dyn crate::approvals::ApprovalSink>>,
     mcp: Arc<Mutex<Vec<McpConnection>>>,
     mcp_surface: Arc<Mutex<Vec<(String, String, mcp::transport::McpToolDescriptor)>>>,
     /// Resource ceiling (Modbit `WRK-017`'s concurrency axis) bounding the
@@ -1599,6 +1605,7 @@ impl WorkspaceTools {
             shadow_diagnostics: None,
             ask_stdin: None,
             approval_sink: None,
+            hook_ask_sink: None,
             mcp: Arc::new(Mutex::new(Vec::new())),
             mcp_surface: Arc::new(Mutex::new(Vec::new())),
             subagent_spawns: Arc::new(AtomicU64::new(0)),
@@ -1849,6 +1856,12 @@ impl WorkspaceTools {
     /// `Ask` keeps its typed denial.
     pub fn set_approval_source(&mut self, sink: Arc<dyn crate::approvals::ApprovalSink>) {
         self.approval_sink = Some(sink);
+    }
+
+    /// Attach the sink a hook's `ask` reaches on a surface with no general
+    /// approval source (headless exec). See the field's doc.
+    pub fn set_hook_ask_source(&mut self, sink: Arc<dyn crate::approvals::ApprovalSink>) {
+        self.hook_ask_sink = Some(sink);
     }
 
     /// Read-only driver for subagent explore/plan scopes: write-classified
@@ -2399,19 +2412,44 @@ impl WorkspaceTools {
                         )))),
                     });
                 }
-                // A hook `ask` becomes a human decision on the approval
-                // surface in the next slice (ADR 0022 §3). Until then it is
-                // the one thing S2 permits for an unanswerable question:
-                // a denial that says so, never an implicit allow.
+                // A hook `ask` is the existing approval wait (ADR 0022 §3):
+                // the request names the hook and its reason, is journaled
+                // before the turn pauses, and the human's decision resumes
+                // the turn exactly as a lattice `Ask` does. On that resume
+                // (`preapproved`) the ask is answered — the hooks ran again
+                // and may still deny, but they cannot re-ask the question
+                // the human just answered. Where no surface can take the
+                // question, the call is denied and says so — never an
+                // implicit allow (S2).
                 crate::hooks::PreHookOutcome::Ask { hook, reason } => {
-                    return Ok(ToolStepResult::Denied {
-                        call_id: call.call_id().to_owned(),
-                        detail: Some(self.redact_output(bounded_detail(&format!(
-                            "{} held by {hook} hook: {reason} (a hook's ask cannot reach an \
-                             approval surface in this build, so the call is denied)",
-                            call.tool()
-                        )))),
-                    });
+                    if !preapproved {
+                        let sink = self.approval_sink.as_ref().or(self.hook_ask_sink.as_ref());
+                        if let Some(sink) = sink {
+                            let request = crate::approvals::build_hook_ask_request(
+                                call.tool(),
+                                call.call_id(),
+                                call.arguments(),
+                                &self.root,
+                                &hook,
+                                &reason,
+                            );
+                            if let Ok(_token) = sink.request(&request) {
+                                return Ok(ToolStepResult::ApprovalRequired {
+                                    call_id: call.call_id().to_owned(),
+                                });
+                            }
+                        }
+                        // The outcome leads, so a long reason cut at the
+                        // detail bound never reads as pending.
+                        return Ok(ToolStepResult::Denied {
+                            call_id: call.call_id().to_owned(),
+                            detail: Some(self.redact_output(bounded_detail(&format!(
+                                "{} denied: {hook} hook asked for approval and no approval \
+                                 surface can take the question here; {reason}",
+                                call.tool()
+                            )))),
+                        });
+                    }
                 }
                 crate::hooks::PreHookOutcome::Allowed => {}
             }
@@ -6652,6 +6690,14 @@ impl ExecTools {
         }
     }
 
+    /// Attach the hook-ask sink (no-op on the no-op surface). See
+    /// [`WorkspaceTools::set_hook_ask_source`].
+    pub fn set_hook_ask_source(&mut self, sink: Arc<dyn crate::approvals::ApprovalSink>) {
+        if let Self::Workspace(tools) = self {
+            tools.set_hook_ask_source(sink);
+        }
+    }
+
     /// Attach the durable-evidence invalidation hook (no-op on the no-op
     /// surface — an untrusted project refuses every write long before any
     /// invalidation could matter).
@@ -8455,29 +8501,53 @@ mod tests {
         assert_eq!(records[0].2.decision, protocol::HookDecision::Defer);
     }
 
-    #[test]
-    fn a_hook_ask_is_a_stated_denial_until_it_can_reach_an_approval_surface() {
-        // ADR 0022 §3 lands the approval mapping in the next slice; until
-        // then an `ask` is never an implicit allow (S2) and says why.
-        let root = TempRoot::new("hook-v2-ask");
-        let sink = Arc::new(RecordingHookEvents::default());
-        let mut tools = permissive_workspace(&root.0);
-        tools.set_hook_events(sink.clone());
-        tools.set_hooks(crate::hooks::HooksConfig {
+    /// Captures every approval request a driver raises and hands back a
+    /// token, like the ledger sink does once the request is journaled.
+    #[derive(Default)]
+    struct RecordingApprovalSink {
+        requests: Mutex<Vec<crate::approvals::ApprovalRequest>>,
+    }
+
+    impl crate::approvals::ApprovalSink for RecordingApprovalSink {
+        fn request(&self, request: &crate::approvals::ApprovalRequest) -> Result<String, String> {
+            let mut requests = self.requests.lock().unwrap_or_else(|p| p.into_inner());
+            requests.push(request.clone());
+            Ok(format!("wait-{}", requests.len()))
+        }
+    }
+
+    fn ask_hooks(root: &Path) -> crate::hooks::HooksConfig {
+        crate::hooks::HooksConfig {
             pre_tool_use: vec![hook_printing(
-                &root.0,
+                root,
                 "ask.sh",
                 r#"{"decision":"ask","reason":"a reviewer must see this"}"#,
             )],
             ..Default::default()
-        });
+        }
+    }
+
+    #[test]
+    fn a_hook_ask_with_no_approval_surface_is_a_stated_denial() {
+        // S2: where no surface can take the question, the call is denied
+        // and the model is told why — never an implicit allow. The outcome
+        // leads the text, so a long reason cut at the detail bound never
+        // reads as pending.
+        let root = TempRoot::new("hook-ask-no-surface");
+        let sink = Arc::new(RecordingHookEvents::default());
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_hook_events(sink.clone());
+        tools.set_hooks(ask_hooks(&root.0));
         match run_one(&mut tools, &write_call("c1", "d.txt")) {
             ToolStepResult::Denied { detail, .. } => {
                 let detail = detail.unwrap_or_default();
                 assert!(
-                    detail.contains("held by pre_tool_use[0] hook: a reviewer must see this"),
+                    detail.starts_with(
+                        "workspace_write denied: pre_tool_use[0] hook asked for approval and no approval surface"
+                    ),
                     "{detail}"
                 );
+                assert!(detail.contains("a reviewer must see this"), "{detail}");
             }
             other => panic!("an unroutable ask must deny, got {other:?}"),
         }
@@ -8485,6 +8555,171 @@ mod tests {
         let records = sink.records.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].2.decision, protocol::HookDecision::Ask);
+    }
+
+    #[test]
+    fn a_hook_ask_with_an_approval_surface_pauses_the_call_and_the_approved_resume_runs_it_once() {
+        // SEAM-01 AC-02/AC-03 at the driver: the ask becomes the existing
+        // approval wait (the request names the hook first and as its
+        // source, and carries the call's own action/scope/diff), the call
+        // does not run; the approved resume runs it without re-asking the
+        // question the human just answered — the hook still runs and still
+        // says `ask`, and that ask is recorded as answered rather than
+        // raised again.
+        let root = TempRoot::new("hook-ask-surface");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        let decisions = Arc::new(RecordingHookEvents::default());
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_approval_source(approvals.clone());
+        tools.set_hook_events(decisions.clone());
+        tools.set_hooks(ask_hooks(&root.0));
+        let call = write_call("c1", "e.txt");
+        let cancel = CancellationToken::new();
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::ApprovalRequired { call_id } => assert_eq!(call_id, "c1"),
+            other => panic!("a routable ask must pause the call, got {other:?}"),
+        }
+        assert!(
+            !root.0.join("e.txt").exists(),
+            "a paused write must not land"
+        );
+        {
+            let requests = approvals.requests.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            assert_eq!(request.tool, WORKSPACE_WRITE_TOOL);
+            assert_eq!(request.call_id, "c1");
+            assert_eq!(request.source.as_deref(), Some("hook:pre_tool_use[0]"));
+            assert!(
+                request
+                    .summary
+                    .starts_with("pre_tool_use[0] hook asks: a reviewer must see this — "),
+                "{}",
+                request.summary
+            );
+            assert!(
+                request.summary.contains("e.txt"),
+                "the call's own summary follows: {}",
+                request.summary
+            );
+            assert_eq!(request.scope, vec!["e.txt".to_owned()]);
+            assert!(
+                request.diff.contains("hi"),
+                "the write's diff travels: {}",
+                request.diff
+            );
+        }
+        // The human approved: the resume runs the call exactly once.
+        match tools
+            .execute_preapproved(&validated, &cancel)
+            .expect("resume")
+        {
+            ToolStepResult::Succeeded { .. } => {}
+            other => panic!("the approved resume must run the call, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read_to_string(root.0.join("e.txt")).expect("written"),
+            "hi"
+        );
+        assert_eq!(
+            approvals
+                .requests
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len(),
+            1,
+            "the answered question is not asked again"
+        );
+        // Both hook runs were recorded as `ask`: the hook did ask twice; the
+        // second was answered by the approval.
+        let records = decisions.records.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            records
+                .iter()
+                .map(|(_, _, r)| r.decision)
+                .collect::<Vec<_>>(),
+            vec![protocol::HookDecision::Ask, protocol::HookDecision::Ask]
+        );
+    }
+
+    #[test]
+    fn a_hook_deny_still_denies_an_approved_resume() {
+        // Approval answers the hook's question; it does not override a
+        // hook that denies (policy only narrows, S5) — on resume the hooks
+        // run again and a deny is still a deny.
+        let root = TempRoot::new("hook-deny-on-resume");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_approval_source(approvals.clone());
+        // First run asks; the "same" project then tightens its hook to deny.
+        tools.set_hooks(ask_hooks(&root.0));
+        let call = write_call("c1", "f.txt");
+        let cancel = CancellationToken::new();
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        assert!(matches!(
+            tools.execute(&validated, &cancel).expect("execute"),
+            ToolStepResult::ApprovalRequired { .. }
+        ));
+        tools.set_hooks(crate::hooks::HooksConfig {
+            pre_tool_use: vec![hook_printing(
+                &root.0,
+                "deny.sh",
+                r#"{"decision":"deny","reason":"policy changed"}"#,
+            )],
+            ..Default::default()
+        });
+        match tools
+            .execute_preapproved(&validated, &cancel)
+            .expect("resume")
+        {
+            ToolStepResult::Denied { detail, .. } => {
+                assert!(detail.unwrap_or_default().contains("policy changed"));
+            }
+            other => panic!("a denying hook must still deny on resume, got {other:?}"),
+        }
+        assert!(!root.0.join("f.txt").exists());
+    }
+
+    #[test]
+    fn the_hook_ask_sink_serves_hook_asks_only_and_a_permission_ask_keeps_its_denial() {
+        // Headless exec installs only the hook-ask sink: a hook's ask pauses
+        // the call (recorded for a later decision), while a *permission*
+        // `Ask` from the lattice keeps today's typed denial (S11) — the
+        // sink does not widen what headless exec waits on.
+        let root = TempRoot::new("hook-ask-sink-only");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        // Default mode: file edits ask.
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default);
+        let mut tools = WorkspaceTools::open_with_permissions(&root.0, lattice).expect("tools");
+        tools.set_hook_ask_source(approvals.clone());
+        // No hooks: the lattice's Ask is a typed denial, nothing recorded.
+        match run_one(&mut tools, &write_call("c1", "g.txt")) {
+            ToolStepResult::Denied { detail, .. } => {
+                assert!(detail.unwrap_or_default().contains("permissions.allow"));
+            }
+            other => panic!("a permission ask stays a denial on this surface, got {other:?}"),
+        }
+        assert!(
+            approvals
+                .requests
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty()
+        );
+        // A hook's ask on a call the lattice allows (a read) pauses.
+        tools.set_hooks(ask_hooks(&root.0));
+        fs::write(root.0.join("r.txt"), "x").expect("seed");
+        match run_one(
+            &mut tools,
+            &make_call("c2", REPO_READ_TOOL, r#"{"path":"r.txt"}"#),
+        ) {
+            ToolStepResult::ApprovalRequired { call_id } => assert_eq!(call_id, "c2"),
+            other => panic!("a hook ask reaches the hook-ask sink, got {other:?}"),
+        }
+        let requests = approvals.requests.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].source.as_deref(), Some("hook:pre_tool_use[0]"));
     }
 
     #[test]

@@ -397,6 +397,145 @@ fn ask_with_a_sink_suspends_records_and_resumes_the_exact_call() {
     assert!(!seen[0].iter().any(|kind| kind == "approval_required"));
 }
 
+/// A hook's `ask` rides the same wait (ADR 0022 §3): with the lattice
+/// permissive, a v2 hook that asks suspends the turn, records the pending
+/// approval naming the hook as its source, and writes nothing; a restarted
+/// process sees the approval, approves it, and the preapproved resume runs
+/// the call exactly once even though the hook asks again.
+#[test]
+fn a_hook_ask_with_a_sink_suspends_records_its_source_and_a_restart_resumes_the_call_once() {
+    let project = project("hook-ask");
+    let (client, session) = open_session(&project.root);
+    let hook = project.root.join("ask.sh");
+    std::fs::write(
+        &hook,
+        "echo '{\"schema\":\"rapidlm.hook_result\",\"version\":2,\"decision\":\"ask\",\"reason\":\"notes need a reviewer\"}'\nexit 0\n",
+    )
+    .expect("hook script");
+    let hooks = rapid::hooks::HooksConfig {
+        pre_tool_use: vec![format!("sh {}", test_fixtures::slash_path(&hook))],
+        ..Default::default()
+    };
+    let permissive = || {
+        rapid::permissions::PermissionLattice::new(
+            rapid::permissions::PermissionMode::BypassPermissions,
+        )
+    };
+
+    let mut model = ScriptedModel::new(vec![
+        ScriptedModel::propose(
+            "c1",
+            "workspace_write",
+            r#"{"path":"notes/plan.txt","content":"the plan"}"#,
+        ),
+        ScriptedModel::terminal("unreachable — the turn must stop first"),
+    ]);
+    let mut tools = TestTools::open(&project.root, permissive()).with_sink(
+        client.clone(),
+        session,
+        &project.root,
+    );
+    tools.inner.set_hooks(hooks.clone());
+    let cancel = agent_runtime::CancellationToken::new();
+    let result = run_turn(
+        TurnSpec::new(
+            TurnId::new(),
+            session,
+            AgentId::new(),
+            budget(),
+            &mut model,
+            &mut tools,
+            &mut Vec::new(),
+        ),
+        &cancel,
+    )
+    .expect("turn runs");
+    assert_eq!(result.reason(), Some(TurnStopReason::ApprovalRequired));
+    assert_eq!(result.suspension().expect("suspends").call_id(), "c1");
+    assert!(!project.root.join("notes/plan.txt").exists());
+
+    // The pending approval names the hook — as its source and first in the
+    // summary — and still carries the call's own action, scope and diff.
+    let pendings = call(client.pending_approvals(session)).expect("pendings");
+    assert_eq!(pendings.len(), 1);
+    let payload = pendings[0].payload();
+    assert_eq!(payload.tool, "workspace_write");
+    assert_eq!(payload.source.as_deref(), Some("hook:pre_tool_use[0]"));
+    assert!(
+        payload
+            .summary
+            .starts_with("pre_tool_use[0] hook asks: notes need a reviewer — "),
+        "{}",
+        payload.summary
+    );
+    assert!(
+        payload.summary.contains("notes/plan.txt"),
+        "{}",
+        payload.summary
+    );
+    assert_eq!(payload.scope, vec!["notes/plan.txt".to_owned()]);
+    assert!(payload.diff.contains("the plan"));
+
+    // A restarted process (a fresh client over the same ledger) sees it and
+    // decides; the source survived the round trip through the ledger.
+    let reopened = InProcessKernelClient::open(ledger_path(&project.root)).expect("reopens");
+    let pendings = call(reopened.pending_approvals(session)).expect("pendings");
+    assert_eq!(pendings.len(), 1);
+    assert_eq!(
+        pendings[0].payload().source.as_deref(),
+        Some("hook:pre_tool_use[0]")
+    );
+    let token = pendings[0].payload().id.clone();
+    call(
+        reopened.approve(
+            ResolveApproval::new(
+                session,
+                pendings[0].seq(),
+                ApprovalDecision::Approved,
+                actor(),
+                TraceId::new(),
+            )
+            .with_wait_token(&token),
+        ),
+    )
+    .expect("resolves");
+
+    // The preapproved resume runs the call once, with the same asking hook
+    // still configured: the answered ask is not raised again, and the sink
+    // (installed again, as the resuming surface would) receives nothing.
+    let proposed = ProposedToolCall::replay(
+        "c1",
+        "workspace_write",
+        r#"{"path":"notes/plan.txt","content":"the plan"}"#,
+    );
+    let mut fresh_tools = TestTools::open(&project.root, permissive()).with_sink(
+        reopened.clone(),
+        session,
+        &project.root,
+    );
+    fresh_tools.inner.set_hooks(hooks);
+    let validated =
+        agent_runtime::ToolDriver::validate(&mut fresh_tools, &proposed, &cancel).expect("valid");
+    let executed = fresh_tools
+        .inner
+        .execute_preapproved(&validated, &cancel)
+        .expect("executes");
+    assert!(matches!(
+        executed,
+        agent_runtime::ToolStepResult::Succeeded { .. }
+    ));
+    assert_eq!(
+        std::fs::read_to_string(project.root.join("notes/plan.txt")).expect("written"),
+        "the plan"
+    );
+    assert!(
+        call(reopened.pending_approvals(session))
+            .expect("pendings")
+            .is_empty(),
+        "the answered ask must not be asked again"
+    );
+}
+
 /// A denial feeds the paused turn a typed denial, so the model sees the
 /// refusal rather than the turn simply vanishing; nothing is written.
 #[test]
@@ -632,6 +771,7 @@ fn a_clarification_is_pending_until_answered_then_continues() {
             summary: "Which flavor?".to_owned(),
             scope: Vec::new(),
             diff: String::new(),
+            source: None,
         })
         .expect("records");
     let suspended = rapid::approvals::SuspendedTurn {

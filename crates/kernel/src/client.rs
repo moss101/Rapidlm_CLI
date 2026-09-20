@@ -560,6 +560,7 @@ pub struct RecordApproval {
     scope: Vec<String>,
     diff: String,
     detail: String,
+    source: Option<String>,
 }
 
 impl RecordApproval {
@@ -586,6 +587,7 @@ impl RecordApproval {
             scope: Vec::new(),
             diff: String::new(),
             detail: String::new(),
+            source: None,
         }
     }
 
@@ -605,6 +607,18 @@ impl RecordApproval {
 
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = bounded_payload_str(&detail.into(), MAX_APPROVAL_DETAIL_BYTES);
+        self
+    }
+
+    /// Who raised the ask when it was not the permission lattice — a hook
+    /// (`hook:pre_tool_use[0]`), a plan proposal, an elicitation. Absent for
+    /// a lattice `Ask`, which is what every request was before the field
+    /// existed; bounded like the summary.
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(bounded_payload_str(
+            &source.into(),
+            MAX_APPROVAL_SUMMARY_BYTES,
+        ));
         self
     }
 
@@ -672,6 +686,11 @@ pub struct ApprovalRequestedPayload {
     /// own serialized resume state.
     #[serde(default)]
     pub detail: String,
+    /// Who raised the ask when it was not the permission lattice (a hook,
+    /// a plan, an elicitation). Absent on every request recorded before the
+    /// field existed and on a lattice `Ask` today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Wire payload of `approval.resolved`.
@@ -1233,6 +1252,7 @@ impl InProcessKernelClient {
             scope: req.scope.clone(),
             diff: req.diff.clone(),
             detail: req.detail.clone(),
+            source: req.source.clone(),
         };
         if let Err(err) = self.ledger.append(
             req.session_id,

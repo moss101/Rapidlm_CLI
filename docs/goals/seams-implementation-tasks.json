@@ -159,7 +159,7 @@
       "id": "SEAM-01-2",
       "title": "Hook `ask` through the approval wait; headless recording sink and NeedsApproval",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-01-1"
       ],
@@ -181,7 +181,14 @@
       "validation": [
         "TUI resolves a hook ask through /approvals; headless exits 10 with the wait recorded; a process restart during the ask resumes waiting with the call not re-run (ledger shows one tool.started at most)."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goal-delivery-2026-09-20.md \u00a7 SEAM-01-2 \u2014 criterion table",
+        "apps/rapid/src/exec_tools.rs \u2014 tests a_hook_ask_with_no_approval_surface_is_a_stated_denial, a_hook_ask_with_an_approval_surface_pauses_the_call_and_the_approved_resume_runs_it_once, a_hook_deny_still_denies_an_approved_resume, the_hook_ask_sink_serves_hook_asks_only_and_a_permission_ask_keeps_its_denial",
+        "apps/rapid/src/interactive.rs \u2014 test a_hook_ask_pauses_an_interactive_turn_on_the_approval_surface_and_approval_continues_it (TUI projection + continuation)",
+        "apps/rapid/tests/approvals_flow.rs \u2014 a_hook_ask_with_a_sink_suspends_records_its_source_and_a_restart_resumes_the_call_once",
+        "apps/rapid/tests/hooks_cli.rs \u2014 a_hook_ask_parks_a_headless_run_with_the_needs_approval_exit_code_and_writes_nothing (exit 10), a_hook_deny_is_a_model_visible_denial_and_the_run_completes",
+        "revert cycles: sink lookup forced None \u2192 pause tests fail; preapproved exemption removed \u2192 resume tests fail"
+      ]
     },
     {
       "id": "SEAM-01-3",
@@ -1434,6 +1441,12 @@
       "phase": "P1",
       "date": "2026-09-20",
       "note": "SEAM-01-1 landed: protocol::hooks::HookResult (rapidlm.hook_result v2) with fixture; the hook runner separates stdout (result) from stderr (detail); allow/deny/defer applied at the one dispatch site, every v2 decision recorded as hook.decided (rapidlm.hook.decision/v1) through a HookEvents sink attached with the other ledger sinks and propagated to subagent children; `ask` is an explicit, recorded denial until SEAM-01-2 routes it onto the approval wait. v1 hooks are byte-identical and record nothing.",
+      "evidence": "docs/goal-delivery-2026-09-20.md"
+    },
+    {
+      "phase": "P1",
+      "date": "2026-09-21",
+      "note": "SEAM-01-2 landed: a hook `ask` is the existing approval wait (ApprovalRequest/approval.requested gain an additive `source`), the approved resume runs the call once without re-asking, a hook deny still denies on resume; headless exec installs a hook-only ledger sink, records the suspension like the TUI and exits NeedsApproval (10) naming `rapid resume` as the next command, while a permission Ask keeps its typed denial.",
       "evidence": "docs/goal-delivery-2026-09-20.md"
     }
   ]

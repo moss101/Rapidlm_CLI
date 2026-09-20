@@ -4290,6 +4290,21 @@ run without --continue to start one"
         Some(recording) => match recording.start_turn(&turn_text) {
             Ok(turn_id) => {
                 attach_ledger_sinks(&mut tools, &recording.client, session_id, &recording.actor);
+                // A hook's `ask` has a durable place to go on a recorded run
+                // (ADR 0022 §3): the same ledger sink the TUI installs for
+                // every `Ask`, here for hook asks only — a permission `Ask`
+                // keeps its typed denial on this surface (S11). The run then
+                // ends `NeedsApproval` and names the surface that resolves it.
+                if let Some((root, _)) = workspace.as_ref() {
+                    tools.set_hook_ask_source(std::sync::Arc::new(
+                        crate::approvals::LedgerApprovalSink::new(
+                            recording.client.clone(),
+                            session_id,
+                            recording.actor.clone(),
+                            root.clone(),
+                        ),
+                    ));
+                }
                 Some(turn_id)
             }
             Err(reason) => {
@@ -4390,6 +4405,15 @@ run without --continue to start one"
         )
     };
     if let (Some(recording), Some(turn_id)) = (&recording, recorded_turn) {
+        // A paused turn's exact mid-state goes into the ledger before its
+        // terminal event, as the TUI records it, so `rapid resume` (or an
+        // ACP client) can offer the same decision and run the call once.
+        if let Ok(outcome) = &run_result
+            && let Some(suspension) = &outcome.suspension
+            && outcome.stop_reason == Some(agent_runtime::TurnStopReason::ApprovalRequired)
+        {
+            recording.record_suspension(&turn_text, suspension);
+        }
         recording.finish_turn(turn_id, &run_result, history_through);
     }
     if let (Ok(outcome), Some(goal_path), Some(goal_id)) = (&run_result, &goal_path, goal_id) {
@@ -4519,6 +4543,26 @@ run without --continue to start one"
                     crate::exec_diag::stderr_line(&line);
                     (Some(text), JsonlExitCode::Success, outcome.cost_usd_micros)
                 }
+            }
+            Ok(outcome)
+                if outcome.stop_reason == Some(agent_runtime::TurnStopReason::ApprovalRequired) =>
+            {
+                // A hook asked for a human (the only way a headless turn
+                // pauses here — a permission `Ask` is denied on this
+                // surface): nothing is wrong, the turn is durably parked
+                // with the call not run, and the next command resolves it.
+                let what = outcome
+                    .suspension
+                    .as_ref()
+                    .map(|suspension| suspension.call_id().to_owned())
+                    .unwrap_or_default();
+                crate::exec_diag::stderr_line(&format!(
+                    "needs approval: a hook asked for a human decision on call {what}; the turn \
+                     is parked in session {session_id}. Resolve it with `rapid resume \
+                     {session_id}` and `/approvals approve <n>` (or deny), which continues \
+                     the turn."
+                ));
+                (None, JsonlExitCode::NeedsApproval, outcome.cost_usd_micros)
             }
             Ok(outcome) if context_required_question(&outcome).is_some() => {
                 // Checked before `describe_turn_failure`'s generic "(failing
@@ -7671,6 +7715,42 @@ impl ExecRecording {
         }
     }
 
+    /// Persist a paused turn's resumable state under the approval the pause
+    /// recorded — the same `tool.approval_required` record the TUI writes
+    /// (`execute_interactive_turn`), so a resume on any surface replays it.
+    /// A suspension with no recorded approval (the sink refused) is left
+    /// alone: the call was denied, not parked.
+    fn record_suspension(&self, task: &str, suspension: &agent_runtime::TurnSuspension) {
+        let Some(token) = crate::approvals::pending_token_for_call(
+            &self.client,
+            self.session_id,
+            suspension.call_id(),
+        ) else {
+            return;
+        };
+        let suspended = crate::approvals::SuspendedTurn {
+            task: task.to_owned(),
+            call_id: suspension.call_id().to_owned(),
+            reason: suspension.reason().as_str().to_owned(),
+            omitted_earlier_steps: suspension.omitted_earlier_steps(),
+            history: crate::approvals::SuspendedHistory::from_agent(suspension.history()),
+        };
+        let tool = crate::approvals::requested_payload(&self.client, self.session_id, &token)
+            .map(|payload| payload.tool)
+            .unwrap_or_default();
+        if let Err(reason) = crate::approvals::record_suspension(
+            &self.client,
+            self.session_id,
+            &self.actor,
+            &token,
+            suspension.call_id(),
+            &tool,
+            &suspended,
+        ) {
+            eprintln!("warning: the paused turn's resumable state was not recorded: {reason}");
+        }
+    }
+
     fn finish_turn<E: std::fmt::Display>(
         &self,
         turn_id: protocol::TurnId,
@@ -9627,6 +9707,17 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     );
     // Same session-scoped job table the production path uses.
     tools.share_job_table(jobs);
+    // The same durable approval sink production installs: without it a
+    // scripted turn turned every `Ask` — a hook's included — into the
+    // headless denial, and no interactive approval flow could be exercised.
+    tools.set_approval_source(std::sync::Arc::new(
+        crate::approvals::LedgerApprovalSink::new(
+            client.clone(),
+            session_id,
+            actor.clone(),
+            root.to_path_buf(),
+        ),
+    ));
     if let Some(runner) = &shared.scripted_subagents {
         tools.set_subagent_runner(std::sync::Arc::clone(runner));
     }
@@ -9744,6 +9835,7 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
                     summary: question,
                     scope: Vec::new(),
                     diff: String::new(),
+                    source: None,
                 };
                 if let Ok(recorded) = crate::approvals::ApprovalSink::request(&sink, &request) {
                     token = Some(recorded);
@@ -15176,6 +15268,153 @@ question the panel answers"
             decided_seq < denied_seq,
             "{:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_hook_ask_pauses_an_interactive_turn_on_the_approval_surface_and_approval_continues_it() {
+        // SEAM-01 AC-03 on the TUI: a v2 hook's `ask` becomes a pending
+        // approval the panel projects (naming the hook), the write does not
+        // land, and approving it runs the continuation — the call executes
+        // once, the turn completes on the recorded history.
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let hook = root.join("ask.sh");
+        fs::write(
+            &hook,
+            "echo '{\"decision\":\"ask\",\"reason\":\"notes need a reviewer\"}'\nexit 0\n",
+        )
+        .expect("hook script");
+        fs::write(
+            root.join(PROJECT_MARKER).join("settings.json"),
+            serde_json::json!({
+                "hooks": { "pre_tool_use": [format!("sh {}", test_fixtures::slash_path(&hook))] }
+            })
+            .to_string(),
+        )
+        .expect("settings");
+
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "write notes.txt",
+            ScriptedModel::write_then_answer("notes.txt", "the notes", "done"),
+        );
+        assert!(
+            !root.join("notes.txt").exists(),
+            "the asked call must not run"
+        );
+        let approvals = session.state().approvals();
+        assert_eq!(
+            approvals.len(),
+            1,
+            "{approvals:?}\n{:?}",
+            session.transcript()
+        );
+        let (key, projection) = approvals.iter().next().expect("one pending approval");
+        assert_eq!(projection.state(), tui::state::ApprovalLifecycle::Requested);
+        assert_eq!(
+            projection.tool(),
+            Some(crate::exec_tools::WORKSPACE_WRITE_TOOL)
+        );
+        assert!(
+            projection
+                .summary()
+                .is_some_and(|s| s.starts_with("pre_tool_use[0] hook asks: notes need a reviewer")),
+            "{projection:?}"
+        );
+        let token = key.to_string();
+
+        // Approve, as `/approvals approve 1` does, then run the continuation
+        // through the test seam with a scripted model.
+        let cancel = CancellationToken::new();
+        let pendings = block_on(
+            session.client.pending_approvals(session.session_id),
+            &cancel,
+        )
+        .expect("pendings");
+        assert_eq!(pendings.len(), 1);
+        assert_eq!(pendings[0].payload().id, token);
+        assert_eq!(
+            pendings[0].payload().source.as_deref(),
+            Some("hook:pre_tool_use[0]")
+        );
+        let call_id = pendings[0].payload().call_id.clone();
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        block_on(
+            session.client.approve(
+                kernel::ResolveApproval::new(
+                    session.session_id,
+                    tip,
+                    kernel::ApprovalDecision::Approved,
+                    session.actor.clone(),
+                    TraceId::new(),
+                )
+                .with_wait_token(&token),
+            ),
+            &cancel,
+        )
+        .expect("approve");
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        let handle = block_on(
+            session.client.submit_turn(SubmitTurn::new(
+                session.session_id,
+                tip,
+                session.actor.clone(),
+                TraceId::new(),
+                "",
+            )),
+            &cancel,
+        )
+        .expect("continuation submitted");
+        let outcome = run_continuation_turn_inner_with_backing(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &session.root,
+            true,
+            &agent_runtime::CancellationToken::new(),
+            &session.jobs,
+            &session.shared,
+            token,
+            call_id,
+            ContinuationDecision::Execute,
+            ScriptedModel::terminal("written"),
+            (
+                crate::user_config::DEFAULT_CONTEXT_WINDOW,
+                crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS,
+            ),
+        );
+        session
+            .client
+            .finish_turn(kernel::FinishTurn::new(
+                session.session_id,
+                handle.turn_id(),
+                session.actor.clone(),
+                TraceId::new(),
+                outcome.clone(),
+            ))
+            .expect("finish");
+        assert!(
+            matches!(outcome, kernel::TurnOutcome::Completed { .. }),
+            "the approved continuation completes: {outcome:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("notes.txt")).expect("the approved write landed"),
+            "the notes"
+        );
+        assert!(
+            block_on(
+                session.client.pending_approvals(session.session_id),
+                &cancel
+            )
+            .expect("pendings")
+            .is_empty(),
+            "the answered ask is not asked again by the continuation's own hook run"
         );
     }
 

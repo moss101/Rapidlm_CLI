@@ -43,6 +43,10 @@ pub struct ApprovalRequest {
     pub summary: String,
     pub scope: Vec<String>,
     pub diff: String,
+    /// Who raised the ask when it was not the permission lattice — a hook
+    /// (`hook:pre_tool_use[0]`), later a plan or an elicitation (ADR 0022
+    /// §3). `None` for a lattice `Ask`.
+    pub source: Option<String>,
 }
 
 /// Records a pending approval durably. Returns the wait token the request was
@@ -374,7 +378,26 @@ pub fn build_request(tool: &str, call_id: &str, arguments: &str, root: &Path) ->
         summary,
         scope,
         diff,
+        source: None,
     }
+}
+
+/// The [`ApprovalRequest`] a hook's `ask` raises for a call: the same
+/// action, scope and diff a lattice `Ask` would show, with the hook named
+/// first in the summary and as the request's `source`, so the human sees
+/// who asked and why before what the call would do.
+pub fn build_hook_ask_request(
+    tool: &str,
+    call_id: &str,
+    arguments: &str,
+    root: &Path,
+    hook: &str,
+    reason: &str,
+) -> ApprovalRequest {
+    let mut request = build_request(tool, call_id, arguments, root);
+    request.summary = format!("{hook} hook asks: {reason} — {}", request.summary);
+    request.source = Some(format!("hook:{hook}"));
+    request
 }
 
 /// The sink the interactive surface installs on `ExecTools`: every pending
@@ -415,12 +438,19 @@ impl LedgerApprovalSink {
     }
 }
 
+fn with_source(record: kernel::RecordApproval, source: Option<&str>) -> kernel::RecordApproval {
+    match source {
+        Some(source) => record.with_source(source),
+        None => record,
+    }
+}
+
 impl ApprovalSink for LedgerApprovalSink {
     fn request(&self, request: &ApprovalRequest) -> Result<String, String> {
         let token = new_wait_token();
         let expected_seq = self.tip()?;
         client_call(
-            self.client.record_approval(
+            self.client.record_approval(with_source(
                 kernel::RecordApproval::new(
                     self.session_id,
                     expected_seq,
@@ -433,7 +463,8 @@ impl ApprovalSink for LedgerApprovalSink {
                 )
                 .with_scope(request.scope.clone())
                 .with_diff(request.diff.clone()),
-            ),
+                request.source.as_deref(),
+            )),
         )?;
         Ok(token)
     }

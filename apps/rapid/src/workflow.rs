@@ -1089,6 +1089,7 @@ pub fn record_human_wait(
         summary,
         scope: step.watch.clone(),
         diff: String::new(),
+        source: None,
     };
     ApprovalSink::request(&sink, &request)
 }
