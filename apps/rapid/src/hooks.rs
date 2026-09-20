@@ -168,6 +168,9 @@ pub struct PreHookReport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HookRun {
     ok: bool,
+    /// The hook was killed at the timeout. Whatever it printed is at best
+    /// partial: never a decision, still a diagnostic.
+    timed_out: bool,
     stdout: Vec<u8>,
     stderr: String,
 }
@@ -176,6 +179,7 @@ impl HookRun {
     fn failed(reason: String) -> Self {
         Self {
             ok: false,
+            timed_out: false,
             stdout: Vec::new(),
             stderr: reason,
         }
@@ -315,6 +319,7 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> HookRun 
         cleanup();
         HookRun {
             ok,
+            timed_out: false,
             stdout,
             stderr: truncate(&stderr, MAX_HOOK_STDERR_BYTES),
         }
@@ -338,10 +343,8 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> HookRun 
         }
     }
     let mut run = collect(false);
-    // A timed-out hook's stdout is not a decision: whatever it printed
-    // before the kill is at best partial.
-    run.stdout.clear();
-    if run.stderr.is_empty() {
+    run.timed_out = true;
+    if run.stderr.is_empty() && run.stdout.is_empty() {
         run.stderr = "hook timed out".to_owned();
     }
     run
@@ -389,19 +392,33 @@ pub fn run_pre_tool_stage(
         let name = hook_name(STAGE, index);
         let run = run_hook_once(command, &input, timeout);
         if !run.ok {
-            // Fail-closed whatever stdout says; a v2 `deny` printed beside
-            // the non-zero exit still lends its reason and is recorded.
+            // Fail-closed whatever stdout says. A v2 result printed beside
+            // the non-zero exit is still a decision the hook made, so it is
+            // recorded — and a `deny` lends its reason — but only the exit
+            // code decides the outcome, and it says deny. A timed-out hook
+            // printed nothing that counts as a decision; its stdout is a
+            // diagnostic like its stderr.
+            let result = if run.timed_out {
+                None
+            } else {
+                HookResult::from_stdout(&run.stdout).ok().flatten()
+            };
             let mut reason = None;
-            if let Ok(Some(result)) = HookResult::from_stdout(&run.stdout)
-                && result.decision == HookDecision::Deny
-            {
-                reason = result.reason.clone().filter(|r| !r.is_empty());
+            if let Some(result) = result {
+                if result.decision == HookDecision::Deny {
+                    reason = result.reason.clone().filter(|r| !r.is_empty());
+                } else {
+                    reason = Some(format!(
+                        "hook exited non-zero (its result said {}; the exit code decides)",
+                        result.decision
+                    ));
+                }
                 decisions.push(HookDecisionRecord {
                     hook: name.clone(),
                     event: STAGE,
                     command_digest: command_digest(command),
-                    decision: HookDecision::Deny,
-                    reason: result.reason,
+                    decision: result.decision,
+                    reason: result.reason.filter(|r| !r.is_empty()),
                     grant_attempted: result.grant_attempted,
                 });
             }
@@ -410,6 +427,8 @@ pub fn run_pre_tool_stage(
                 if detail.is_empty() {
                     // A silent failure still denies with a static reason.
                     "hook exited non-zero".to_owned()
+                } else if run.timed_out {
+                    format!("hook timed out: {detail}")
                 } else {
                     detail
                 }
@@ -438,7 +457,7 @@ pub fn run_pre_tool_stage(
             event: STAGE,
             command_digest: command_digest(command),
             decision: result.decision,
-            reason: result.reason.clone(),
+            reason: result.reason.clone().filter(|r| !r.is_empty()),
             grant_attempted: result.grant_attempted,
         });
         match result.decision {
@@ -1012,30 +1031,88 @@ exit 0"#,
         assert_eq!(report.decisions.len(), 1);
         assert_eq!(report.decisions[0].decision, HookDecision::Deny);
         // Exit code still rules: `allow` printed by a failing hook denies
-        // (fail-closed), with the static v1 reason, and records nothing.
+        // (fail-closed) with a reason that says so — not the echoed JSON,
+        // which would read as an allow — and the decision is still recorded.
         let allow = result_script(&dir, "allow1.sh", r#"{"decision":"allow"}"#, 1);
         let report = run_pre_tool_stage(&[allow], "repo_read", "{}", HOOK_TIMEOUT);
-        match &report.outcome {
-            PreHookOutcome::Denied { reason } => {
-                assert_eq!(reason.trim(), r#"{"decision":"allow"}"#, "{reason}");
+        assert_eq!(
+            report.outcome,
+            PreHookOutcome::Denied {
+                reason: "hook exited non-zero (its result said allow; the exit code decides)"
+                    .to_owned()
             }
-            other => panic!("a failing hook must deny whatever it printed, got {other:?}"),
-        }
-        assert!(report.decisions.is_empty());
+        );
+        assert_eq!(report.decisions.len(), 1);
+        assert_eq!(report.decisions[0].decision, HookDecision::Allow);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_timed_out_hooks_partial_stdout_is_not_a_decision() {
         let dir = temp("v2-timeout");
-        // Prints an allow, then hangs: what it printed is not a decision,
-        // the timeout is.
-        let hang = script(&dir, "hang.sh", "echo '{\"decision\":\"allow\"}'\nsleep 30");
+        // Prints a deny with a distinctive reason, then hangs. If the
+        // timed-out run's stdout were parsed, that deny would be recorded
+        // and its reason would surface; instead the timeout is the reason
+        // and nothing is recorded — what a killed hook printed is a
+        // diagnostic, never a decision.
+        let hang = script(
+            &dir,
+            "hang.sh",
+            "echo '{\"decision\":\"deny\",\"reason\":\"partial-verdict\"}'\nsleep 30",
+        );
         let report = run_pre_tool_stage(&[hang], "repo_read", "{}", Duration::from_millis(250));
         match &report.outcome {
-            PreHookOutcome::Denied { reason } => assert!(reason.contains("timed out"), "{reason}"),
+            PreHookOutcome::Denied { reason } => {
+                assert!(reason.starts_with("hook timed out"), "{reason}");
+                // The stdout diagnostic still reaches the detail.
+                assert!(reason.contains("partial-verdict"), "{reason}");
+            }
             other => panic!("a hung hook must deny, got {other:?}"),
         }
+        assert!(report.decisions.is_empty(), "{:?}", report.decisions);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_malformed_result_denies_and_a_chatty_v1_hook_of_any_size_allows() {
+        let dir = temp("v2-malformed");
+        // A deny whose reason broke the JSON: denied, naming the hook — not
+        // silently read as a v1 hook that allowed.
+        let broken = script(
+            &dir,
+            "broken.sh",
+            "echo '{\"decision\":\"deny\",\"reason\":\"a \"quoted\" word\"}'\nexit 0",
+        );
+        let report = run_pre_tool_stage(&[broken], "repo_read", "{}", HOOK_TIMEOUT);
+        match &report.outcome {
+            PreHookOutcome::Denied { reason } => {
+                assert!(
+                    reason.starts_with("pre_tool_use[0] hook printed an unreadable result"),
+                    "{reason}"
+                );
+                assert!(reason.contains("not exactly one JSON object"), "{reason}");
+            }
+            other => panic!("a malformed result must deny, got {other:?}"),
+        }
+        // A result followed by a log line is malformed too.
+        let trailing = script(
+            &dir,
+            "trailing.sh",
+            "echo '{\"decision\":\"deny\"}'\necho checked 3 files\nexit 0",
+        );
+        assert!(matches!(
+            run_pre_tool_stage(&[trailing], "repo_read", "{}", HOOK_TIMEOUT).outcome,
+            PreHookOutcome::Denied { .. }
+        ));
+        // A v1 hook that prints far more than the result ceiling and exits
+        // zero is still allowed: the ceiling is for results, not for text.
+        let chatty = script(
+            &dir,
+            "chatty.sh",
+            "i=0\nwhile [ $i -lt 1200 ]; do echo 'lint: file ok ...................................................'; i=$((i+1)); done\nexit 0",
+        );
+        let report = run_pre_tool_stage(&[chatty], "repo_read", "{}", HOOK_TIMEOUT);
+        assert_eq!(report.outcome, PreHookOutcome::Allowed);
         assert!(report.decisions.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -136,6 +136,11 @@ pub enum HookResultError {
     WrongType { field: &'static str },
     /// `updated_input` serializes past [`MAX_HOOK_UPDATED_INPUT_BYTES`].
     UpdatedInputTooLarge { bytes: usize },
+    /// stdout began like a result (`{`) and was not exactly one JSON object:
+    /// invalid JSON, invalid UTF-8, or text after the object. A hook that
+    /// meant to decide and could not be understood is not allowed to have
+    /// allowed.
+    Malformed,
 }
 
 impl fmt::Display for HookResultError {
@@ -167,6 +172,9 @@ impl fmt::Display for HookResultError {
                 f,
                 "hook result updated_input is {bytes} bytes; the ceiling is {MAX_HOOK_UPDATED_INPUT_BYTES}"
             ),
+            Self::Malformed => {
+                f.write_str("hook stdout begins like a result but is not exactly one JSON object")
+            }
         }
     }
 }
@@ -186,33 +194,53 @@ impl HookResult {
         }
     }
 
-    /// Read a hook's stdout. `Ok(None)` means "no structured result — v1
-    /// semantics": empty output, non-JSON text, or a JSON value that is not
-    /// an object carrying `schema` or `decision`. `Err` means the output
-    /// declared itself a hook result and could not be read as one.
+    /// Read a hook's stdout.
+    ///
+    /// `Ok(None)` means "no structured result — v1 semantics": empty output,
+    /// or text whose first non-blank byte is not `{` (whatever its size —
+    /// a chatty v1 hook is still a v1 hook), or a JSON object that is some
+    /// other program's (neither a `decision` key nor
+    /// `"schema": "rapidlm.hook_result"`).
+    ///
+    /// Once stdout begins with `{` it is read as a result and must be
+    /// exactly one JSON object within [`MAX_HOOK_RESULT_BYTES`]: invalid
+    /// JSON, invalid UTF-8, trailing text or a second value is
+    /// [`HookResultError::Malformed`]; an unknown decision, schema or
+    /// version is its own error. `Err` is what the caller denies on — a
+    /// hook that meant to decide and could not be understood cannot be
+    /// assumed to have allowed (ADR 0022 §2).
     pub fn from_stdout(stdout: &[u8]) -> Result<Option<Self>, HookResultError> {
+        let first = stdout
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .map(|index| stdout[index]);
+        if first != Some(b'{') {
+            return Ok(None);
+        }
         if stdout.len() > MAX_HOOK_RESULT_BYTES {
             return Err(HookResultError::TooLarge {
                 bytes: stdout.len(),
             });
         }
-        let text = match std::str::from_utf8(stdout) {
-            Ok(text) => text.trim(),
-            Err(_) => return Ok(None),
-        };
-        if !text.starts_with('{') {
-            return Ok(None);
-        }
-        let Ok(value) = serde_json::from_str::<Value>(text) else {
-            return Ok(None);
-        };
+        let text = std::str::from_utf8(stdout)
+            .map_err(|_| HookResultError::Malformed)?
+            .trim();
+        let value: Value = serde_json::from_str(text).map_err(|_| HookResultError::Malformed)?;
         let Value::Object(object) = value else {
-            return Ok(None);
+            return Err(HookResultError::Malformed);
         };
-        if !object.contains_key("schema") && !object.contains_key("decision") {
+        if !Self::is_marked(&object) {
             return Ok(None);
         }
         Self::from_object(&object).map(Some)
+    }
+
+    /// Whether an object declares itself a hook result: a `decision` key, or
+    /// `schema` equal to [`HOOK_RESULT_SCHEMA`]. Some other program's JSON
+    /// with an unrelated `schema` key is not a result.
+    fn is_marked(object: &Map<String, Value>) -> bool {
+        object.contains_key("decision")
+            || object.get("schema").and_then(Value::as_str) == Some(HOOK_RESULT_SCHEMA)
     }
 
     /// Read an object that is known to be a hook result.
@@ -361,11 +389,59 @@ mod tests {
         assert_eq!(HookResult::from_stdout(b""), Ok(None));
         assert_eq!(HookResult::from_stdout(b"   \n"), Ok(None));
         assert_eq!(HookResult::from_stdout(b"checked ok"), Ok(None));
-        assert_eq!(HookResult::from_stdout(b"{not json"), Ok(None));
         assert_eq!(HookResult::from_stdout(b"[1,2]"), Ok(None));
-        // An object with neither marker key is some other program's JSON.
+        // Non-JSON text is v1 whatever it contains and however long it is:
+        // a chatty hook that prints 70 KiB of lint output is still a v1 hook.
+        assert_eq!(HookResult::from_stdout(&[0xff, b'x']), Ok(None));
+        let chatty = vec![b'x'; MAX_HOOK_RESULT_BYTES + 1];
+        assert_eq!(HookResult::from_stdout(&chatty), Ok(None));
+        // An object with neither marker is some other program's JSON — a
+        // `schema` key alone (another tool's `--json`) is not a marker.
         assert_eq!(HookResult::from_stdout(br#"{"ok":true}"#), Ok(None));
-        assert_eq!(HookResult::from_stdout(&[0xff, b'{']), Ok(None));
+        assert_eq!(
+            HookResult::from_stdout(br#"{"schema":"other.tool/v1","ok":true}"#),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn stdout_that_begins_like_a_result_and_is_not_one_object_is_malformed() {
+        // A deny whose reason broke the JSON must not become an allow.
+        assert_eq!(
+            HookResult::from_stdout(br#"{"decision":"deny","reason":"a "quoted" word"}"#),
+            Err(HookResultError::Malformed)
+        );
+        assert_eq!(
+            HookResult::from_stdout(b"{not json"),
+            Err(HookResultError::Malformed)
+        );
+        // A result followed by a diagnostic line, or by a second result.
+        assert_eq!(
+            HookResult::from_stdout(b"{\"decision\":\"deny\"}\nchecked 3 files"),
+            Err(HookResultError::Malformed)
+        );
+        assert_eq!(
+            HookResult::from_stdout(b"{\"decision\":\"allow\"}\n{\"decision\":\"deny\"}"),
+            Err(HookResultError::Malformed)
+        );
+        // Invalid UTF-8 inside what began as a result.
+        assert_eq!(
+            HookResult::from_stdout(b"{\"decision\":\"deny\",\"reason\":\"\xff\"}"),
+            Err(HookResultError::Malformed)
+        );
+        // Leading whitespace before the brace is still a result.
+        let spaced = HookResult::from_stdout(b"  \n {\"decision\":\"defer\"}\n")
+            .expect("parses")
+            .expect("result");
+        assert_eq!(spaced.decision, HookDecision::Defer);
+        // The size ceiling applies to results, not to v1 text.
+        let mut huge = br#"{"decision":"allow","pad":""#.to_vec();
+        huge.extend(std::iter::repeat_n(b'p', MAX_HOOK_RESULT_BYTES));
+        huge.extend_from_slice(b"\"}");
+        assert!(matches!(
+            HookResult::from_stdout(&huge),
+            Err(HookResultError::TooLarge { .. })
+        ));
     }
 
     #[test]
@@ -464,11 +540,6 @@ mod tests {
         assert!(matches!(
             HookResult::from_stdout(huge.as_bytes()),
             Err(HookResultError::UpdatedInputTooLarge { .. })
-        ));
-        let oversized = vec![b' '; MAX_HOOK_RESULT_BYTES + 1];
-        assert!(matches!(
-            HookResult::from_stdout(&oversized),
-            Err(HookResultError::TooLarge { .. })
         ));
     }
 

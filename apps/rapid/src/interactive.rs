@@ -9843,14 +9843,19 @@ struct LedgerHookEvents {
 
 impl crate::exec_tools::HookEvents for LedgerHookEvents {
     fn decided(&self, tool: &str, call_id: &str, record: &crate::hooks::HookDecisionRecord) {
-        let reason_digest = record.reason.as_deref().map(|reason| {
-            use sha2::Digest;
-            let digest = sha2::Sha256::digest(reason.as_bytes());
-            digest
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        });
+        // An empty reason is no reason: `null`, not the digest of "".
+        let reason_digest = record
+            .reason
+            .as_deref()
+            .filter(|reason| !reason.is_empty())
+            .map(|reason| {
+                use sha2::Digest;
+                let digest = sha2::Sha256::digest(reason.as_bytes());
+                digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            });
         let _ = self.client.append_turn_progress(
             self.session_id,
             &self.actor,
@@ -15078,7 +15083,6 @@ question the panel answers"
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_v2_hook_decision_reaches_the_ledger_as_hook_decided() {
         // SEAM-01 AC-02, at the surface a real turn uses: a hook that prints
@@ -15089,9 +15093,23 @@ question the panel answers"
         let env = TempEnv::create();
         let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
         fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        // The hook is a script run through `sh`, so the same settings line
+        // works under `sh -c` and `cmd /C` (the quoting lives inside a file
+        // `sh` parses on every host).
+        let hook = root.join("deny.sh");
+        fs::write(
+            &hook,
+            "echo '{\"schema\":\"rapidlm.hook_result\",\"version\":2,\"decision\":\"deny\",\"reason\":\"notes are generated nightly\"}'\nexit 0\n",
+        )
+        .expect("hook script");
         fs::write(
             root.join(PROJECT_MARKER).join("settings.json"),
-            r#"{"hooks":{"pre_tool_use":["echo '{\"schema\":\"rapidlm.hook_result\",\"version\":2,\"decision\":\"deny\",\"reason\":\"notes are generated nightly\"}'"]}}"#,
+            serde_json::json!({
+                "hooks": {
+                    "pre_tool_use": [format!("sh {}", test_fixtures::slash_path(&hook))]
+                }
+            })
+            .to_string(),
         )
         .expect("settings");
 
