@@ -194,7 +194,7 @@
       "id": "SEAM-01-3",
       "title": "Rewrites: validated updated_input, journaled digests, transcript marker",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-01-1"
       ],
@@ -213,7 +213,14 @@
       "validation": [
         "A schema-failing rewrite is denied naming the hook; a valid rewrite runs the rewritten call and the ledger carries both digests; the marker is present; revert cycle on each."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goal-delivery-2026-09-20.md \u00a7 SEAM-01-3 \u2014 criterion table",
+        "apps/rapid/src/hooks.rs \u2014 HookRewrite in PreHookReport; test the_last_rewrite_wins_a_deny_discards_them_and_an_ask_keeps_one",
+        "apps/rapid/src/exec_tools.rs \u2014 apply_hook_rewrite, arguments_parse, HookRewriteRecord; tests a_valid_rewrite_runs_the_rewritten_call_journals_both_inputs_and_marks_the_result, a_rewrite_that_fails_the_tools_arguments_is_denied_naming_the_hook, a_rewrite_cannot_widen_what_policy_allows, a_hook_ask_with_a_rewrite_shows_the_human_the_rewritten_call",
+        "apps/rapid/src/interactive.rs \u2014 LedgerHookEvents::rewritten (hook.input_rewritten); test a_hook_rewrite_reaches_the_ledger_with_both_inputs_and_marks_the_transcript",
+        "crates/tui \u2014 ToolActivityStatus::Rewritten projected from hook.input_rewritten",
+        "revert cycle: rewrite ignored at dispatch \u2192 five rewrite tests fail"
+      ]
     },
     {
       "id": "SEAM-01-4",
@@ -1447,6 +1454,12 @@
       "phase": "P1",
       "date": "2026-09-21",
       "note": "SEAM-01-2 landed: a hook `ask` is the existing approval wait (ApprovalRequest/approval.requested gain an additive `source`), the approved resume runs the call once without re-asking, a hook deny still denies on resume; headless exec installs a hook-only ledger sink, records the suspension like the TUI and exits NeedsApproval (10) naming `rapid resume` as the next command, while a permission Ask keeps its typed denial.",
+      "evidence": "docs/goal-delivery-2026-09-20.md"
+    },
+    {
+      "phase": "P1",
+      "date": "2026-09-21",
+      "note": "SEAM-01-3 landed: a hook's updated_input replaces the call once it passes ProposedToolCall bounds, the tool's own argument parser and the permission lattice (evaluated on the rewritten call \u2014 a rewrite cannot widen policy); hook.input_rewritten carries both inputs and digests before anything runs; the model's result and the TUI transcript both carry a one-line marker; the last rewriting hook wins, a deny discards, an ask shows the human the rewritten call.",
       "evidence": "docs/goal-delivery-2026-09-20.md"
     }
   ]

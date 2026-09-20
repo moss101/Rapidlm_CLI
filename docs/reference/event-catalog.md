@@ -12,7 +12,7 @@ Durable families and examples:
 - computer: `observation.captured`, `computer.action.*`, `control.transferred`;
 - evidence: `evidence.recorded|invalidated`, `verification.*`;
 - handoff/remote: `handoff.*`, `worker.*`;
-- extension: `hook.decided` (a v2 hook decision — `rapidlm.hook.decision/v1`: hook, stage, decision, reason digest, tool, call; ADR 0022), `plugin.*`, `mcp.*`, `acp.*`;
+- extension: `hook.decided` (a v2 hook decision — `rapidlm.hook.decision/v1`: hook, stage, decision, reason digest, tool, call), `hook.input_rewritten` (a hook replaced a call's arguments — `rapidlm.hook.rewrite/v1`: hook, tool, call, both inputs and their digests; ADR 0022), `plugin.*`, `mcp.*`, `acp.*`;
 - eval/release: `eval.*`, `experiment.*`, `release.*`.
 
 Token streaming deltas need not be durable events unless export/replay policy requires them.

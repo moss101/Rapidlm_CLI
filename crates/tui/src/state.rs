@@ -430,6 +430,11 @@ pub enum ToolActivityStatus {
     Denied,
     ApprovalRequired,
     ContextRequired,
+    /// A hook replaced the call's arguments before it ran
+    /// (`hook.input_rewritten`): the one-line transcript marker a rewrite
+    /// must leave, so a call that did not run as the model proposed it says
+    /// so where the user reads the turn.
+    Rewritten,
 }
 
 /// Job row keyed by [`JobId`].
@@ -827,6 +832,22 @@ fn apply_kernel(
         }
         EventKind::ToolDenied => {
             push_tool_activity(&mut state, event, ToolActivityStatus::Denied)?;
+        }
+        EventKind::HookInputRewritten => {
+            // The record names the hook under `hook`; the transcript line
+            // reads "✎ <tool>: rewritten by <hook> hook".
+            if let Some(tool) = optional_display(event, event.payload(), "tool")? {
+                let detail = optional_display(event, event.payload(), "hook")?
+                    .map(|hook| format!("rewritten by {hook} hook"));
+                push_transcript(
+                    &mut state,
+                    TranscriptEntry::ToolActivity {
+                        tool,
+                        status: ToolActivityStatus::Rewritten,
+                        detail,
+                    },
+                );
+            }
         }
         EventKind::TurnCompleted => {
             if let Some(text) = optional_display(event, event.payload(), "text")? {

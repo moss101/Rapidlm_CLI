@@ -9934,6 +9934,31 @@ struct LedgerHookEvents {
 }
 
 impl crate::exec_tools::HookEvents for LedgerHookEvents {
+    /// `hook.input_rewritten` (`rapidlm.hook.rewrite/v1`): both inputs and
+    /// their digests, so a reader can see exactly what the model proposed
+    /// and what ran — the inputs are tool arguments the ledger already
+    /// carries in `tool.requested`, not a new class of secret-bearing text.
+    fn rewritten(&self, tool: &str, call_id: &str, record: &crate::exec_tools::HookRewriteRecord) {
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::HookInputRewritten,
+            serde_json::json!({
+                "record": "rapidlm.hook.rewrite/v1",
+                "hook": record.hook,
+                "event": "pre_tool_use",
+                "command_digest": record.command_digest,
+                "tool": tool,
+                "call_id": call_id,
+                "before_digest": record.before_digest,
+                "after_digest": record.after_digest,
+                "before": record.before,
+                "after": record.after,
+            }),
+        );
+    }
+
     fn decided(&self, tool: &str, call_id: &str, record: &crate::hooks::HookDecisionRecord) {
         // An empty reason is no reason: `null`, not the digest of "".
         let reason_digest = record
@@ -15269,6 +15294,114 @@ question the panel answers"
             "{:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn a_hook_rewrite_reaches_the_ledger_with_both_inputs_and_marks_the_transcript() {
+        // SEAM-01 AC-04 at the surface a real turn uses: the rewritten call
+        // runs, `hook.input_rewritten` carries both inputs and their digests
+        // before the tool completes, and the transcript entry for the call
+        // carries the one-line marker.
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let hook = root.join("rewrite.sh");
+        fs::write(
+            &hook,
+            "echo '{\"decision\":\"allow\",\"updated_input\":{\"path\":\"docs/notes.txt\",\"content\":\"the notes\"}}'\nexit 0\n",
+        )
+        .expect("hook script");
+        fs::write(
+            root.join(PROJECT_MARKER).join("settings.json"),
+            serde_json::json!({
+                "hooks": { "pre_tool_use": [format!("sh {}", test_fixtures::slash_path(&hook))] }
+            })
+            .to_string(),
+        )
+        .expect("settings");
+
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "write notes.txt",
+            ScriptedModel::write_then_answer("notes.txt", "the notes", "done"),
+        );
+        assert!(
+            !root.join("notes.txt").exists(),
+            "the proposed path must not be written"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("docs/notes.txt")).expect("the rewritten path is written"),
+            "the notes"
+        );
+        // The transcript carries the marker as its own line, projected from
+        // the ledger record (a completed tool's summary is not shown there).
+        let transcript = session.transcript();
+        let rewritten_at = transcript
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    TranscriptEntry::ToolActivity {
+                        tool,
+                        status: ToolActivityStatus::Rewritten,
+                        detail: Some(detail),
+                    } if tool == crate::exec_tools::WORKSPACE_WRITE_TOOL
+                        && detail == "rewritten by pre_tool_use[0] hook"
+                )
+            })
+            .unwrap_or_else(|| panic!("a rewrite marker line: {transcript:?}"));
+        let completed_at = transcript
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    TranscriptEntry::ToolActivity {
+                        status: ToolActivityStatus::Completed,
+                        ..
+                    }
+                )
+            })
+            .expect("the call completed");
+        assert!(
+            rewritten_at < completed_at,
+            "the marker precedes the completion: {transcript:?}"
+        );
+
+        let events = session
+            .client
+            .export_events(session.session_id, &CancellationToken::new())
+            .expect("export");
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        let rewritten = events
+            .iter()
+            .position(|e| e.kind == event_ledger::event::EventKind::HookInputRewritten.as_str())
+            .unwrap_or_else(|| panic!("hook.input_rewritten recorded: {kinds:?}"));
+        let completed = events
+            .iter()
+            .position(|e| e.kind == event_ledger::event::EventKind::ToolCompleted.as_str())
+            .expect("tool.completed");
+        assert!(
+            rewritten < completed,
+            "the rewrite is recorded before the call completes: {kinds:?}"
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(&events[rewritten].payload_json).expect("payload json");
+        assert_eq!(payload["record"], "rapidlm.hook.rewrite/v1");
+        assert_eq!(payload["hook"], "pre_tool_use[0]");
+        assert_eq!(payload["tool"], crate::exec_tools::WORKSPACE_WRITE_TOOL);
+        assert!(
+            payload["before"]
+                .as_str()
+                .is_some_and(|b| b.contains("\"notes.txt\""))
+        );
+        assert!(
+            payload["after"]
+                .as_str()
+                .is_some_and(|a| a.contains("docs/notes.txt"))
+        );
+        assert_eq!(payload["before_digest"].as_str().map(str::len), Some(64));
+        assert_eq!(payload["after_digest"].as_str().map(str::len), Some(64));
+        assert_ne!(payload["before_digest"], payload["after_digest"]);
     }
 
     #[test]

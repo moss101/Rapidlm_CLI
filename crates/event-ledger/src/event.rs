@@ -273,6 +273,7 @@ define_event_kinds! {
     GraphProposalRejected = "graph.proposal_rejected" => Graph,
     GraphNodeStateChanged = "graph.node_state_changed" => Graph,
     HookDecided = "hook.decided" => Hook,
+    HookInputRewritten = "hook.input_rewritten" => Hook,
 }
 
 impl<P> EventEnvelope<P> {

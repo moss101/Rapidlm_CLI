@@ -462,7 +462,7 @@ Governing document: `docs/goals/seams-governing-principles.md`. Worklist: `docs/
 | SEAM-00-1 | P0 | VERIFIED | planner+context-scout | 2026-09-20 | 2026-09-20 |  | `docs/goals/seams-phase0-baseline-2026-09-20.md` — fifteen item rechecks with file:line, eleven "today" corrections, cross-cutting seams table, three recorded decisions | none widens the program |
 | SEAM-00-2 | P0 | VERIFIED | planner | 2026-09-20 | 2026-09-20 |  | ADR 0022 (hook result v2), ADR 0023 (inbox edges), ADR 0024 (plan proposals) | each extends an existing primitive; none adds an engine |
 | SEAM-00-3 | P0 | VERIFIED | planner | 2026-09-20 | 2026-09-20 |  | `docs/goals/seams-implementation-tasks.json` (53 tasks); governing document §4 "today" paragraphs corrected with pointers to the audit | commit names the audit |
-| SEAM-01 | P1 | IN_PROGRESS | coder | 2026-09-20 |  |  | SEAM-01-1, SEAM-01-2: `docs/goal-delivery-2026-09-20.md` (protocol `HookResult` v2 + fixture; separated streams; allow/deny/defer + `hook.decided`; `ask` on the approval wait, headless `NeedsApproval`) | hook decision contract v2 — 2 of 7 tasks landed |
+| SEAM-01 | P1 | IN_PROGRESS | coder | 2026-09-20 |  |  | SEAM-01-1..3: `docs/goal-delivery-2026-09-20.md` (protocol `HookResult` v2 + fixture; separated streams; allow/deny/defer + `hook.decided`; `ask` on the approval wait, headless `NeedsApproval`; validated rewrites with `hook.input_rewritten` + transcript marker) | hook decision contract v2 — 3 of 7 tasks landed |
 | SEAM-02 | P1 | NOT_STARTED |  |  |  |  |  | provider onboarding and resilience — 6 tasks |
 | SEAM-03 | P1 | NOT_STARTED |  |  |  |  |  | background work — 5 tasks; `/jobs` rows verified ledger-derived |
 | SEAM-04 | P1 | NOT_STARTED |  |  |  |  |  | subagent control — 5 tasks |

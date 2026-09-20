@@ -172,6 +172,7 @@ pub fn render_block_parts(entry: &crate::state::TranscriptEntry) -> (RenderBlock
                 ToolActivityStatus::Denied => "⛔",
                 ToolActivityStatus::ApprovalRequired => "⏸",
                 ToolActivityStatus::ContextRequired => "❓",
+                ToolActivityStatus::Rewritten => "✎",
             };
             // A denial used to render as `⛔ workspace_write` alone, so the
             // user was told a call was refused but never why or what to do —

@@ -155,11 +155,26 @@ pub struct HookDecisionRecord {
 }
 
 /// A pre-tool stage's outcome together with every v2 decision made on the
-/// way to it, for the caller to record.
+/// way to it, for the caller to record, and the input rewrite that survived
+/// the stage (ADR 0022 §5): the last rewriting hook wins, a denial discards
+/// every rewrite, and an `ask` keeps the rewrite so the human is shown the
+/// call that would actually run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreHookReport {
     pub outcome: PreHookOutcome,
     pub decisions: Vec<HookDecisionRecord>,
+    pub rewrite: Option<HookRewrite>,
+}
+
+/// An `updated_input` a hook returned: the hook that returned it and the
+/// object that replaces the call's arguments. Validation against the tool's
+/// own argument parser is the caller's (the stage does not know the tools).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HookRewrite {
+    /// `pre_tool_use[<index>]`.
+    pub hook: String,
+    pub command_digest: String,
+    pub input: serde_json::Map<String, serde_json::Value>,
 }
 
 /// What one hook run produced: whether it exited zero, its stdout (the
@@ -388,6 +403,7 @@ pub fn run_pre_tool_stage(
     let input = format!(r#"{{"tool":"{tool}","arguments":{arguments}}}"#);
     let mut decisions = Vec::new();
     let mut ask: Option<(String, String)> = None;
+    let mut rewrite: Option<HookRewrite> = None;
     for (index, command) in hooks.iter().enumerate() {
         let name = hook_name(STAGE, index);
         let run = run_hook_once(command, &input, timeout);
@@ -433,11 +449,13 @@ pub fn run_pre_tool_stage(
                     detail
                 }
             });
+            // A denial discards every rewrite: nothing runs.
             return PreHookReport {
                 outcome: PreHookOutcome::Denied {
                     reason: truncate(reason.as_bytes(), MAX_HOOK_STDERR_BYTES),
                 },
                 decisions,
+                rewrite: None,
             };
         }
         let result = match HookResult::from_stdout(&run.stdout) {
@@ -449,6 +467,7 @@ pub fn run_pre_tool_stage(
                         reason: unreadable_result_reason(&name, &err),
                     },
                     decisions,
+                    rewrite: None,
                 };
             }
         };
@@ -460,6 +479,15 @@ pub fn run_pre_tool_stage(
             reason: result.reason.clone().filter(|r| !r.is_empty()),
             grant_attempted: result.grant_attempted,
         });
+        // The last rewriting hook wins (a later hook that rewrites nothing
+        // leaves an earlier rewrite standing); a `deny` below discards it.
+        if let Some(input) = result.updated_input.clone() {
+            rewrite = Some(HookRewrite {
+                hook: name.clone(),
+                command_digest: command_digest(command),
+                input,
+            });
+        }
         match result.decision {
             HookDecision::Allow | HookDecision::Defer => {}
             HookDecision::Deny => {
@@ -470,6 +498,7 @@ pub fn run_pre_tool_stage(
                 return PreHookReport {
                     outcome: PreHookOutcome::Denied { reason },
                     decisions,
+                    rewrite: None,
                 };
             }
             HookDecision::Ask => {
@@ -487,7 +516,11 @@ pub fn run_pre_tool_stage(
         Some((hook, reason)) => PreHookOutcome::Ask { hook, reason },
         None => PreHookOutcome::Allowed,
     };
-    PreHookReport { outcome, decisions }
+    PreHookReport {
+        outcome,
+        decisions,
+        rewrite,
+    }
 }
 
 /// The denial reason for a hook whose stdout declared itself a result this
@@ -1125,6 +1158,58 @@ exit 0"#,
         let out = output.find("out-line").expect("stdout recorded");
         let err = output.find("err-line").expect("stderr recorded");
         assert!(out < err, "{output}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_last_rewrite_wins_a_deny_discards_them_and_an_ask_keeps_one() {
+        let dir = temp("v2-rewrite");
+        let first = result_script(
+            &dir,
+            "first.sh",
+            r#"{"decision":"allow","updated_input":{"path":"first.txt","content":"a"}}"#,
+            0,
+        );
+        let second = result_script(
+            &dir,
+            "second.sh",
+            r#"{"decision":"defer","updated_input":{"path":"second.txt","content":"b"}}"#,
+            0,
+        );
+        let plain_allow = result_script(&dir, "plain.sh", r#"{"decision":"allow"}"#, 0);
+        let deny = result_script(&dir, "deny.sh", r#"{"decision":"deny","reason":"no"}"#, 0);
+        let ask = result_script(
+            &dir,
+            "ask.sh",
+            r#"{"decision":"ask","reason":"look","updated_input":{"path":"asked.txt","content":"c"}}"#,
+            0,
+        );
+        // Two rewriters, then a hook that rewrites nothing: the second
+        // rewrite stands (the last *rewriting* hook wins).
+        let report = run_pre_tool_stage(
+            &[first.clone(), second.clone(), plain_allow],
+            "workspace_write",
+            r#"{"path":"orig.txt","content":"x"}"#,
+            HOOK_TIMEOUT,
+        );
+        assert_eq!(report.outcome, PreHookOutcome::Allowed);
+        let rewrite = report.rewrite.expect("a rewrite survives");
+        assert_eq!(rewrite.hook, "pre_tool_use[1]");
+        assert_eq!(rewrite.command_digest, command_digest(&second));
+        assert_eq!(rewrite.input["path"], "second.txt");
+        // A denial discards every rewrite.
+        let report = run_pre_tool_stage(
+            &[first.clone(), deny],
+            "workspace_write",
+            "{}",
+            HOOK_TIMEOUT,
+        );
+        assert!(matches!(report.outcome, PreHookOutcome::Denied { .. }));
+        assert_eq!(report.rewrite, None);
+        // An ask keeps the rewrite: the human is shown what would run.
+        let report = run_pre_tool_stage(&[first, ask], "workspace_write", "{}", HOOK_TIMEOUT);
+        assert!(matches!(report.outcome, PreHookOutcome::Ask { .. }));
+        assert_eq!(report.rewrite.expect("kept").input["path"], "asked.txt");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
