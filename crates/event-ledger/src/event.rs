@@ -121,6 +121,7 @@ pub enum EventFamily {
     Computer,
     Orchestration,
     Graph,
+    Hook,
 }
 
 /// Parse failure for an unregistered event kind string.
@@ -271,6 +272,7 @@ define_event_kinds! {
     GraphRevisionCommitted = "graph.revision_committed" => Graph,
     GraphProposalRejected = "graph.proposal_rejected" => Graph,
     GraphNodeStateChanged = "graph.node_state_changed" => Graph,
+    HookDecided = "hook.decided" => Hook,
 }
 
 impl<P> EventEnvelope<P> {
@@ -1291,6 +1293,7 @@ mod tests {
                 Self::Computer => "computer",
                 Self::Orchestration => "orchestration",
                 Self::Graph => "graph",
+                Self::Hook => "hook",
             })
         }
     }

@@ -122,7 +122,7 @@
       "id": "SEAM-01-1",
       "title": "Hook result v2: protocol type, fixture, separated streams, allow/deny/defer",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-00-3"
       ],
@@ -144,7 +144,15 @@
       "validation": [
         "Every existing hook test passes unchanged; a v1 exit-code hook behaves identically (before/after transcript comparison); allow/deny/defer each have a dispatch + ledger test; malformed JSON denies; Windows runs the same tests under cmd /C."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goal-delivery-2026-09-20.md \u00a7 SEAM-01-1 \u2014 criterion table",
+        "crates/protocol/src/hooks.rs (HookResult v2 parser; tests plain_text_and_empty_stdout_are_v1, the_four_decisions_and_the_legacy_block_token_parse, a_declared_schema_and_version_must_be_the_known_ones, optional_fields_are_typed_and_bounded, a_truncated_reason_stays_on_a_character_boundary, grant_shaped_keys_are_observed_not_honoured, serialized_form_round_trips_and_carries_schema_and_version)",
+        "crates/protocol/tests/fixtures/hooks/v2/hook_result.json \u2014 hook_result_v2_fixture_matches_wire_contract",
+        "apps/rapid/src/hooks.rs \u2014 run_pre_tool_stage; tests a_v2_deny_result_denies_with_its_reason_and_is_recorded, v2_allow_and_defer_continue_to_the_next_hook_and_are_recorded, a_v2_ask_is_reported_unless_a_later_hook_denies, an_unreadable_v2_result_denies_naming_the_hook, plain_stdout_text_keeps_v1_semantics_and_records_nothing, a_v2_deny_beside_a_nonzero_exit_lends_its_reason_and_a_v2_allow_does_not_rescue_it, a_timed_out_hooks_partial_stdout_is_not_a_decision, post_hooks_record_both_streams_stdout_first",
+        "apps/rapid/src/exec_tools.rs \u2014 HookEvents sink; tests v2_hook_decisions_are_applied_on_dispatch_and_recorded_for_the_ledger, a_deferring_hook_leaves_the_decision_to_the_permission_flow, a_hook_ask_is_a_stated_denial_until_it_can_reach_an_approval_surface, a_v1_hook_records_no_decision",
+        "apps/rapid/src/interactive.rs \u2014 LedgerHookEvents (hook.decided); test a_v2_hook_decision_reaches_the_ledger_as_hook_decided",
+        "revert cycle: parsing disabled \u2192 nine v2 tests fail, every v1 test passes"
+      ]
     },
     {
       "id": "SEAM-01-2",
@@ -1420,6 +1428,12 @@
       "date": "2026-09-20",
       "note": "Phase 0 complete: baseline audit with fifteen item rechecks (eleven 'today' corrections, none widening the program), ADRs 0022\u20130024, this worklist, the SEAMS section of the development ledger. Three decisions recorded (D-1 signature primitive, D-2 worktree location, D-3 update URL); only SEAM-06-1 is blocked on one of them.",
       "evidence": "docs/goals/seams-phase0-baseline-2026-09-20.md"
+    },
+    {
+      "phase": "P1",
+      "date": "2026-09-20",
+      "note": "SEAM-01-1 landed: protocol::hooks::HookResult (rapidlm.hook_result v2) with fixture; the hook runner separates stdout (result) from stderr (detail); allow/deny/defer applied at the one dispatch site, every v2 decision recorded as hook.decided (rapidlm.hook.decision/v1) through a HookEvents sink attached with the other ledger sinks and propagated to subagent children; `ask` is an explicit, recorded denial until SEAM-01-2 routes it onto the approval wait. v1 hooks are byte-identical and record nothing.",
+      "evidence": "docs/goal-delivery-2026-09-20.md"
     }
   ]
 }

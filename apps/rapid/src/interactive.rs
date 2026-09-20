@@ -2702,6 +2702,7 @@ fn configure_trusted_model_tools(
             job_events: tools.job_events(),
             workspace_changes: tools.workspace_changes(),
             hooks,
+            hook_events: tools.hook_events(),
             shadow_diagnostics,
             trace_calls,
             turn_ceilings,
@@ -2864,6 +2865,11 @@ struct LiveSubagentRunner {
     /// own tool calls also gates its subagents' — without this, delegating
     /// a call to a subagent silently bypassed every hook.
     hooks: crate::hooks::HooksConfig,
+    /// The parent's hook-decision sink, propagated with the hooks themselves:
+    /// a child's hook decisions are this turn's decisions, and a ledger that
+    /// recorded only the parent's would be a half-truth about what the
+    /// hooks decided.
+    hook_events: Option<std::sync::Arc<dyn crate::exec_tools::HookEvents>>,
     /// The parent's configured shadow-diagnostics command, if any, cloned
     /// into every child so a subagent's writes are verified against the
     /// same quality gate as the parent's own instead of silently skipping
@@ -2993,6 +2999,9 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // subagent_stop) must apply to a subagent's own tool calls too, or
         // delegation becomes a way to route around them entirely.
         tools.set_hooks(self.hooks.clone());
+        if let Some(events) = self.hook_events.clone() {
+            tools.set_hook_events(events);
+        }
         // Same reasoning for the shadow-diagnostics quality gate: a
         // subagent's writes should be verified the same way the parent's
         // own would be.
@@ -9810,6 +9819,56 @@ fn attach_ledger_sinks(
         session_id,
         actor: actor.clone(),
     }));
+    tools.set_hook_events(std::sync::Arc::new(LedgerHookEvents {
+        client: client.clone(),
+        session_id,
+        actor: actor.clone(),
+    }));
+}
+
+/// A v2 hook's decision as a `hook.decided` ledger event
+/// (`rapidlm.hook.decision/v1`; ADR 0022 §9): which hook, which stage, what
+/// it decided about which call, with the reason's digest rather than its
+/// text — the text reached the model as the denial detail or stays with the
+/// hook; the ledger needs to say *that* a hook decided and *what*, not to
+/// carry a second copy of a possibly secret-bearing message.
+///
+/// Owns its handles for the same reason [`LedgerJobEvents`] does. A failed
+/// append is dropped: the decision has already been applied to the call.
+struct LedgerHookEvents {
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: ActorRef,
+}
+
+impl crate::exec_tools::HookEvents for LedgerHookEvents {
+    fn decided(&self, tool: &str, call_id: &str, record: &crate::hooks::HookDecisionRecord) {
+        let reason_digest = record.reason.as_deref().map(|reason| {
+            use sha2::Digest;
+            let digest = sha2::Sha256::digest(reason.as_bytes());
+            digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        });
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::HookDecided,
+            serde_json::json!({
+                "record": "rapidlm.hook.decision/v1",
+                "hook": record.hook,
+                "event": record.event,
+                "command_digest": record.command_digest,
+                "decision": record.decision.as_str(),
+                "reason_digest": reason_digest,
+                "grant_attempted": record.grant_attempted,
+                "tool": tool,
+                "call_id": call_id,
+            }),
+        );
+    }
 }
 
 /// Compiled-context usage, appended on the same terms as a background job's
@@ -15016,6 +15075,89 @@ question the panel answers"
             seen.iter()
                 .any(|(l, t)| l.starts_with("retrieved:") && t.contains("LRUCache")),
             "{locators:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_v2_hook_decision_reaches_the_ledger_as_hook_decided() {
+        // SEAM-01 AC-02, at the surface a real turn uses: a hook that prints
+        // a `rapidlm.hook_result` deny is applied (no write, the reason in
+        // the transcript) and recorded as `hook.decided` with the hook's
+        // name, the decision, the tool and the call — the reason travels as
+        // a digest, not as text.
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        fs::write(
+            root.join(PROJECT_MARKER).join("settings.json"),
+            r#"{"hooks":{"pre_tool_use":["echo '{\"schema\":\"rapidlm.hook_result\",\"version\":2,\"decision\":\"deny\",\"reason\":\"notes are generated nightly\"}'"]}}"#,
+        )
+        .expect("settings");
+
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "write notes.txt",
+            ScriptedModel::write_then_answer("notes.txt", "eviction notes", "done"),
+        );
+
+        assert!(!root.join("notes.txt").exists(), "the v2 deny must hold");
+        assert!(
+            session.transcript().iter().any(|entry| matches!(
+                entry,
+                TranscriptEntry::ToolActivity {
+                    tool,
+                    status: ToolActivityStatus::Denied,
+                    detail: Some(detail),
+                } if tool == crate::exec_tools::WORKSPACE_WRITE_TOOL
+                    && detail.contains("notes are generated nightly")
+            )),
+            "{:?}",
+            session.transcript()
+        );
+
+        let events = session
+            .client
+            .export_events(session.session_id, &CancellationToken::new())
+            .expect("export");
+        let decided: Vec<serde_json::Value> = events
+            .iter()
+            .filter(|event| event.kind == event_ledger::event::EventKind::HookDecided.as_str())
+            .map(|event| serde_json::from_str(&event.payload_json).expect("payload json"))
+            .collect();
+        assert_eq!(
+            decided.len(),
+            1,
+            "exactly one decision was made: {decided:?}"
+        );
+        let payload = &decided[0];
+        assert_eq!(payload["record"], "rapidlm.hook.decision/v1");
+        assert_eq!(payload["hook"], "pre_tool_use[0]");
+        assert_eq!(payload["event"], "pre_tool_use");
+        assert_eq!(payload["decision"], "deny");
+        assert_eq!(payload["tool"], crate::exec_tools::WORKSPACE_WRITE_TOOL);
+        assert!(payload["call_id"].as_str().is_some_and(|id| !id.is_empty()));
+        assert_eq!(payload["grant_attempted"], false);
+        assert_eq!(payload["command_digest"].as_str().map(str::len), Some(12));
+        let digest = payload["reason_digest"].as_str().expect("digest");
+        assert_eq!(digest.len(), 64);
+        assert!(
+            !digest.contains("generated"),
+            "the reason text must not be in the ledger"
+        );
+        // The decision came before the denial it explains.
+        let decided_seq = events
+            .iter()
+            .position(|e| e.kind == event_ledger::event::EventKind::HookDecided.as_str())
+            .expect("decided");
+        let denied_seq = events
+            .iter()
+            .position(|e| e.kind == event_ledger::event::EventKind::ToolDenied.as_str())
+            .expect("denied");
+        assert!(
+            decided_seq < denied_seq,
+            "{:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
         );
     }
 

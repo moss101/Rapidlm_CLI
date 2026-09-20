@@ -1,17 +1,23 @@
-//! Project-settings hooks (Claude hook parity, headless scope).
+//! Project-settings hooks (headless scope).
 //!
-//! `pre_tool_use` commands run before a matched tool executes: a non-zero
-//! exit DENIES the call with the hook's stderr as the model-visible detail.
-//! `post_tool_use` commands run after execution and their output is recorded
-//! on the result. Hook commands are project settings (trusted-project gate),
-//! receive the tool call as JSON on stdin, and are bounded by a timeout — a
-//! hung hook denies rather than hangs the turn.
+//! `pre_tool_use` commands run before a matched tool executes. A hook that
+//! prints nothing structured keeps the v1 contract: a non-zero exit DENIES
+//! the call with the hook's stderr as the model-visible detail. A hook that
+//! prints a [`protocol::HookResult`] (`rapidlm.hook_result` v2) on stdout
+//! decides in words — `allow`, `deny`, `ask`, `defer` — and each such
+//! decision is recorded as a [`HookDecisionRecord`] for the ledger (ADR
+//! 0022). `post_tool_use` commands run after execution and their output is
+//! recorded on the result. Hook commands are project settings
+//! (trusted-project gate), receive the tool call as JSON on stdin, and are
+//! bounded by a timeout — a hung hook denies rather than hangs the turn.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Default per-hook wall-clock budget (Claude: 5 s default).
+use protocol::{HookDecision, HookResult, HookResultError, MAX_HOOK_RESULT_BYTES};
+
+/// Default per-hook wall-clock budget.
 pub const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum hooks per stage.
 pub const MAX_HOOKS_PER_STAGE: usize = 8;
@@ -118,10 +124,101 @@ impl HooksConfig {
 /// Outcome of a pre-tool-use hook stage.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PreHookOutcome {
-    /// Every hook allowed the call.
+    /// Every hook allowed (or deferred on) the call.
     Allowed,
-    /// A hook denied the call; carries its bounded stderr.
+    /// A hook denied the call; carries its bounded reason (a v2 `reason`,
+    /// or the v1 stderr).
     Denied { reason: String },
+    /// A v2 hook asked for a human decision and no hook denied. `hook`
+    /// names the asking hook (`pre_tool_use[<index>]`).
+    Ask { hook: String, reason: String },
+}
+
+/// One v2 decision a hook made, in the shape the ledger records
+/// (`hook.decided`, `rapidlm.hook.decision/v1`). v1 hooks — exit code only,
+/// nothing structured on stdout — produce no record, so a project whose
+/// hooks never print a result has a ledger identical to before.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HookDecisionRecord {
+    /// `pre_tool_use[<index>]` — the stage and the hook's position in it.
+    pub hook: String,
+    /// The stage that ran (`pre_tool_use`).
+    pub event: &'static str,
+    /// First twelve hex digits of the SHA-256 of the hook command line, so
+    /// a reader can tell which command a position referred to after the
+    /// settings file changed.
+    pub command_digest: String,
+    pub decision: HookDecision,
+    pub reason: Option<String>,
+    /// The result carried a grant-shaped key (ignored; recorded).
+    pub grant_attempted: bool,
+}
+
+/// A pre-tool stage's outcome together with every v2 decision made on the
+/// way to it, for the caller to record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreHookReport {
+    pub outcome: PreHookOutcome,
+    pub decisions: Vec<HookDecisionRecord>,
+}
+
+/// What one hook run produced: whether it exited zero, its stdout (the
+/// result channel, bounded by [`MAX_HOOK_RESULT_BYTES`]) and its stderr
+/// (the detail channel, bounded by [`MAX_HOOK_STDERR_BYTES`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HookRun {
+    ok: bool,
+    stdout: Vec<u8>,
+    stderr: String,
+}
+
+impl HookRun {
+    fn failed(reason: String) -> Self {
+        Self {
+            ok: false,
+            stdout: Vec::new(),
+            stderr: reason,
+        }
+    }
+
+    /// The v1 detail: stderr, or stdout when the hook wrote its reason there
+    /// (both streams used to land in one capture, so a hook that spoke on
+    /// stdout keeps being heard).
+    fn detail(&self) -> String {
+        if !self.stderr.is_empty() {
+            return self.stderr.clone();
+        }
+        truncate(&self.stdout, MAX_HOOK_STDERR_BYTES)
+    }
+
+    /// Both streams as one bounded text, stdout first — the shape the
+    /// notification and post-tool stages have always recorded.
+    fn combined(&self) -> String {
+        let mut text = truncate(&self.stdout, MAX_HOOK_STDERR_BYTES);
+        if !self.stderr.is_empty() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&self.stderr);
+        }
+        truncate(text.as_bytes(), MAX_HOOK_STDERR_BYTES)
+    }
+}
+
+/// `pre_tool_use[<index>]`.
+fn hook_name(stage: &str, index: usize) -> String {
+    format!("{stage}[{index}]")
+}
+
+/// First twelve hex digits of the SHA-256 of the hook command line.
+fn command_digest(command: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(command.as_bytes());
+    let mut hex = String::with_capacity(12);
+    for byte in &digest[..6] {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
 }
 
 /// The shell a hook line runs under, with the environment cleared down to
@@ -148,45 +245,50 @@ fn hook_shell(command: &str) -> Command {
     builder
 }
 
-/// Run one hook command with `input_json` on stdin; returns
-/// `(exit_ok, stderr)`. A missing/failed spawn counts as failed with a
-/// static reason (never a panic).
-fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> (bool, String) {
-    // Output goes to a temp file rather than our pipes: a hook that
+/// Run one hook command with `input_json` on stdin. A missing/failed spawn
+/// counts as failed with a static reason (never a panic).
+fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> HookRun {
+    // Output goes to temp files rather than our pipes: a hook that
     // backgrounds its own children (`sleep 30 &`) would otherwise hold the
-    // pipe write-end open past the kill, blocking EOF collection.
+    // pipe write-end open past the kill, blocking EOF collection. Two files,
+    // because stdout is the result channel and stderr the detail channel
+    // (a v2 result printed beside a warning must still parse).
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let output_path = std::env::temp_dir().join(format!(
-        "rapidlm-hook-out-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-    ));
-    let output_file = match std::fs::File::create(&output_path) {
-        Ok(file) => file,
-        Err(err) => return (false, format!("hook output file failed: {err}")),
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let stdout_path =
+        std::env::temp_dir().join(format!("rapidlm-hook-out-{}-{seq}", std::process::id()));
+    let stderr_path =
+        std::env::temp_dir().join(format!("rapidlm-hook-err-{}-{seq}", std::process::id()));
+    let cleanup = || {
+        let _ = std::fs::remove_file(&stdout_path);
+        let _ = std::fs::remove_file(&stderr_path);
     };
-    let stdout_file = match output_file.try_clone() {
+    let stdout_file = match std::fs::File::create(&stdout_path) {
+        Ok(file) => file,
+        Err(err) => return HookRun::failed(format!("hook output file failed: {err}")),
+    };
+    let stderr_file = match std::fs::File::create(&stderr_path) {
         Ok(file) => file,
         Err(err) => {
-            let _ = std::fs::remove_file(&output_path);
-            return (false, format!("hook output file failed: {err}"));
+            cleanup();
+            return HookRun::failed(format!("hook output file failed: {err}"));
         }
     };
     // The stdio wiring is the contract — input JSON on stdin, everything the
-    // hook prints into the file — and is the same on every platform. Only
+    // hook prints into the files — and is the same on every platform. Only
     // the shell differs. (The Windows arm used to spawn bare: no stdin, so
     // the hook never received its payload, and no redirection, so its
     // output went to the TUI's own terminal and the file read back empty.)
     let spawn = hook_shell(command)
         .stdin(Stdio::piped())
         .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(output_file))
+        .stderr(Stdio::from(stderr_file))
         .spawn();
     let mut child = match spawn {
         Ok(child) => child,
         Err(err) => {
-            let _ = std::fs::remove_file(&output_path);
-            return (false, format!("hook spawn failed: {err}"));
+            cleanup();
+            return HookRun::failed(format!("hook spawn failed: {err}"));
         }
     };
     // Write stdin on its own thread rather than blocking here: `write_all`
@@ -207,16 +309,20 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> (bool, S
             let _ = stdin.flush();
         });
     }
+    let collect = |ok: bool| {
+        let stdout = crate::exec_tools::read_capped_bytes(&stdout_path, MAX_HOOK_RESULT_BYTES + 1);
+        let stderr = crate::exec_tools::read_capped_bytes(&stderr_path, MAX_HOOK_STDERR_BYTES);
+        cleanup();
+        HookRun {
+            ok,
+            stdout,
+            stderr: truncate(&stderr, MAX_HOOK_STDERR_BYTES),
+        }
+    };
     let started = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                let output =
-                    crate::exec_tools::read_capped_bytes(&output_path, MAX_HOOK_STDERR_BYTES);
-                let _ = std::fs::remove_file(&output_path);
-                let text = truncate(&output, MAX_HOOK_STDERR_BYTES);
-                return (status.success(), text);
-            }
+            Ok(Some(status)) => return collect(status.success()),
             Ok(None) => {
                 if started.elapsed() > timeout {
                     let _ = child.kill();
@@ -226,49 +332,152 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> (bool, S
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(err) => {
-                let _ = std::fs::remove_file(&output_path);
-                return (false, format!("hook wait failed: {err}"));
+                cleanup();
+                return HookRun::failed(format!("hook wait failed: {err}"));
             }
         }
     }
-    let output = crate::exec_tools::read_capped_bytes(&output_path, MAX_HOOK_STDERR_BYTES);
-    let _ = std::fs::remove_file(&output_path);
-    let text = truncate(&output, MAX_HOOK_STDERR_BYTES);
-    if !text.is_empty() {
-        (false, text)
-    } else {
-        (false, "hook timed out".to_owned())
+    let mut run = collect(false);
+    // A timed-out hook's stdout is not a decision: whatever it printed
+    // before the kill is at best partial.
+    run.stdout.clear();
+    if run.stderr.is_empty() {
+        run.stderr = "hook timed out".to_owned();
     }
+    run
 }
 
 /// Run every `pre_tool_use` hook for one tool call. Input JSON:
 /// `{"tool": name, "arguments": <raw arguments value>}`. The first denial
-/// wins.
+/// wins. Kept for callers that only need the outcome; the stage's decision
+/// records are in [`run_pre_tool_stage`].
 pub fn run_pre_tool_hooks(
     hooks: &[String],
     tool: &str,
     arguments: &str,
     timeout: Duration,
 ) -> PreHookOutcome {
+    run_pre_tool_stage(hooks, tool, arguments, timeout).outcome
+}
+
+/// Run every `pre_tool_use` hook for one tool call and report every v2
+/// decision made on the way (ADR 0022 §1–4).
+///
+/// Per hook, in declaration order:
+/// - a non-zero exit, a crash or a timeout **denies** with the hook's stderr
+///   (v1 contract, unchanged), whatever its stdout says;
+/// - stdout with no structured result is v1: exit zero allows;
+/// - a v2 `deny` denies with its `reason`; a v2 result the binary cannot read
+///   (unknown decision, wrong schema, newer version) denies naming the hook —
+///   a hook speaking an unknown contract cannot be assumed to have allowed;
+/// - `allow` and `defer` continue to the next hook (`defer` states no
+///   opinion: the normal permission flow decides);
+/// - `ask` is remembered and reported only if no later hook denies.
+///
+/// A denial ends the stage: later hooks do not run (they never did).
+pub fn run_pre_tool_stage(
+    hooks: &[String],
+    tool: &str,
+    arguments: &str,
+    timeout: Duration,
+) -> PreHookReport {
+    const STAGE: &str = "pre_tool_use";
     let input = format!(r#"{{"tool":"{tool}","arguments":{arguments}}}"#);
-    for command in hooks {
-        // Bounded stderr collection: the hook runs to completion (or timeout)
-        // with stderr redirected to a temp buffer via the shell wrapper.
-        let (ok, stderr) = run_hook_once(command, &input, timeout);
-        if !ok {
-            let reason = if stderr.is_empty() {
-                // Re-run capturing stderr through the wrapper is already done;
-                // a silent failure still denies with a static reason.
-                "hook exited non-zero".to_owned()
-            } else {
-                stderr
-            };
-            return PreHookOutcome::Denied {
-                reason: truncate(reason.as_bytes(), MAX_HOOK_STDERR_BYTES),
+    let mut decisions = Vec::new();
+    let mut ask: Option<(String, String)> = None;
+    for (index, command) in hooks.iter().enumerate() {
+        let name = hook_name(STAGE, index);
+        let run = run_hook_once(command, &input, timeout);
+        if !run.ok {
+            // Fail-closed whatever stdout says; a v2 `deny` printed beside
+            // the non-zero exit still lends its reason and is recorded.
+            let mut reason = None;
+            if let Ok(Some(result)) = HookResult::from_stdout(&run.stdout)
+                && result.decision == HookDecision::Deny
+            {
+                reason = result.reason.clone().filter(|r| !r.is_empty());
+                decisions.push(HookDecisionRecord {
+                    hook: name.clone(),
+                    event: STAGE,
+                    command_digest: command_digest(command),
+                    decision: HookDecision::Deny,
+                    reason: result.reason,
+                    grant_attempted: result.grant_attempted,
+                });
+            }
+            let reason = reason.unwrap_or_else(|| {
+                let detail = run.detail();
+                if detail.is_empty() {
+                    // A silent failure still denies with a static reason.
+                    "hook exited non-zero".to_owned()
+                } else {
+                    detail
+                }
+            });
+            return PreHookReport {
+                outcome: PreHookOutcome::Denied {
+                    reason: truncate(reason.as_bytes(), MAX_HOOK_STDERR_BYTES),
+                },
+                decisions,
             };
         }
+        let result = match HookResult::from_stdout(&run.stdout) {
+            Ok(None) => continue,
+            Ok(Some(result)) => result,
+            Err(err) => {
+                return PreHookReport {
+                    outcome: PreHookOutcome::Denied {
+                        reason: unreadable_result_reason(&name, &err),
+                    },
+                    decisions,
+                };
+            }
+        };
+        decisions.push(HookDecisionRecord {
+            hook: name.clone(),
+            event: STAGE,
+            command_digest: command_digest(command),
+            decision: result.decision,
+            reason: result.reason.clone(),
+            grant_attempted: result.grant_attempted,
+        });
+        match result.decision {
+            HookDecision::Allow | HookDecision::Defer => {}
+            HookDecision::Deny => {
+                let reason = result
+                    .reason
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or_else(|| format!("denied by {name} hook"));
+                return PreHookReport {
+                    outcome: PreHookOutcome::Denied { reason },
+                    decisions,
+                };
+            }
+            HookDecision::Ask => {
+                if ask.is_none() {
+                    let reason = result
+                        .reason
+                        .filter(|r| !r.is_empty())
+                        .unwrap_or_else(|| format!("{name} hook asked for approval"));
+                    ask = Some((name, reason));
+                }
+            }
+        }
     }
-    PreHookOutcome::Allowed
+    let outcome = match ask {
+        Some((hook, reason)) => PreHookOutcome::Ask { hook, reason },
+        None => PreHookOutcome::Allowed,
+    };
+    PreHookReport { outcome, decisions }
+}
+
+/// The denial reason for a hook whose stdout declared itself a result this
+/// binary cannot read.
+fn unreadable_result_reason(hook: &str, err: &HookResultError) -> String {
+    truncate(
+        format!("{hook} hook printed an unreadable result ({err}); the call is denied").as_bytes(),
+        MAX_HOOK_STDERR_BYTES,
+    )
 }
 
 /// Run every `post_tool_use` hook; returns their combined output (bounded).
@@ -285,7 +494,7 @@ pub fn run_post_tool_hooks(
     let input = serde_json::json!({ "tool": tool, "summary": summary }).to_string();
     let mut combined = String::new();
     for command in hooks {
-        let (_, output) = run_hook_once(command, &input, timeout);
+        let output = run_hook_once(command, &input, timeout).combined();
         if !output.is_empty() && combined.len() < MAX_HOOK_STDERR_BYTES {
             if !combined.is_empty() {
                 combined.push_str("; ");
@@ -293,7 +502,6 @@ pub fn run_post_tool_hooks(
             combined.push_str(&output);
         }
     }
-    let _ = MAX_HOOK_STDERR_BYTES;
     combined
 }
 
@@ -325,7 +533,7 @@ pub fn run_notify_hooks(
     let input = serde_json::Value::Object(input).to_string();
     let mut combined = String::new();
     for command in hooks {
-        let (_, output) = run_hook_once(command, &input, timeout);
+        let output = run_hook_once(command, &input, timeout).combined();
         if !output.is_empty() && combined.len() < MAX_HOOK_STDERR_BYTES {
             if !combined.is_empty() {
                 combined.push_str("; ");
@@ -405,7 +613,7 @@ exit 0"#,
             PreHookOutcome::Denied { reason } => {
                 assert!(reason.contains("shell is not allowed"), "{reason}");
             }
-            PreHookOutcome::Allowed => panic!("denial expected"),
+            other => panic!("denial expected, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -440,7 +648,7 @@ exit 0"#,
             PreHookOutcome::Denied { reason } => {
                 assert!(reason.contains("timed out"), "{reason}");
             }
-            PreHookOutcome::Allowed => panic!("hung hook must deny"),
+            other => panic!("hung hook must deny, got {other:?}"),
         }
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -535,7 +743,7 @@ exit 0"#,
             PreHookOutcome::Denied { reason } => {
                 assert!(reason.contains("timed out"), "{reason}");
             }
-            PreHookOutcome::Allowed => panic!("hung hook must deny"),
+            other => panic!("hung hook must deny, got {other:?}"),
         }
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -598,6 +806,248 @@ exit 0"#,
         let value: serde_json::Value = serde_json::from_str(&captured).expect("json");
         assert_eq!(value["event"], "subagent_start");
         assert_eq!(value["agent_type"], "explore");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hook script whose stdout is exactly `json` (single-quoted for `sh`,
+    /// so the braces and double quotes survive) and whose exit code is
+    /// `exit_code`.
+    fn result_script(dir: &std::path::Path, name: &str, json: &str, exit_code: u8) -> String {
+        script(dir, name, &format!("echo '{json}'\nexit {exit_code}"))
+    }
+
+    fn temp(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("hook-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    #[test]
+    fn a_v2_deny_result_denies_with_its_reason_and_is_recorded() {
+        let dir = temp("v2-deny");
+        let deny = result_script(
+            &dir,
+            "deny.sh",
+            r#"{"schema":"rapidlm.hook_result","version":2,"decision":"deny","reason":"writes to docs/ are reviewed"}"#,
+            0,
+        );
+        let report = run_pre_tool_stage(
+            std::slice::from_ref(&deny),
+            "workspace_write",
+            "{}",
+            HOOK_TIMEOUT,
+        );
+        assert_eq!(
+            report.outcome,
+            PreHookOutcome::Denied {
+                reason: "writes to docs/ are reviewed".to_owned()
+            }
+        );
+        assert_eq!(report.decisions.len(), 1);
+        let record = &report.decisions[0];
+        assert_eq!(record.hook, "pre_tool_use[0]");
+        assert_eq!(record.event, "pre_tool_use");
+        assert_eq!(record.decision, HookDecision::Deny);
+        assert_eq!(
+            record.reason.as_deref(),
+            Some("writes to docs/ are reviewed")
+        );
+        assert_eq!(record.command_digest, command_digest(&deny));
+        assert_eq!(record.command_digest.len(), 12);
+        assert!(!record.grant_attempted);
+        // The thin wrapper agrees with the stage.
+        assert_eq!(
+            run_pre_tool_hooks(&[deny], "workspace_write", "{}", HOOK_TIMEOUT),
+            report.outcome
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_allow_and_defer_continue_to_the_next_hook_and_are_recorded() {
+        let dir = temp("v2-allow-defer");
+        let allow = result_script(&dir, "allow.sh", r#"{"decision":"allow"}"#, 0);
+        let defer = result_script(
+            &dir,
+            "defer.sh",
+            r#"{"decision":"defer","reason":"not my call","Capabilities":["fs.write"]}"#,
+            0,
+        );
+        let report = run_pre_tool_stage(&[allow, defer], "repo_read", "{}", HOOK_TIMEOUT);
+        assert_eq!(report.outcome, PreHookOutcome::Allowed);
+        let decisions: Vec<(String, HookDecision, bool)> = report
+            .decisions
+            .iter()
+            .map(|d| (d.hook.clone(), d.decision, d.grant_attempted))
+            .collect();
+        assert_eq!(
+            decisions,
+            vec![
+                ("pre_tool_use[0]".to_owned(), HookDecision::Allow, false),
+                ("pre_tool_use[1]".to_owned(), HookDecision::Defer, true),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_v2_ask_is_reported_unless_a_later_hook_denies() {
+        let dir = temp("v2-ask");
+        let ask = result_script(
+            &dir,
+            "ask.sh",
+            r#"{"decision":"ask","reason":"a human should look at this"}"#,
+            0,
+        );
+        let deny = result_script(&dir, "deny.sh", r#"{"decision":"deny","reason":"no"}"#, 0);
+        let alone =
+            run_pre_tool_stage(std::slice::from_ref(&ask), "shell_exec", "{}", HOOK_TIMEOUT);
+        assert_eq!(
+            alone.outcome,
+            PreHookOutcome::Ask {
+                hook: "pre_tool_use[0]".to_owned(),
+                reason: "a human should look at this".to_owned()
+            }
+        );
+        assert_eq!(alone.decisions.len(), 1);
+        assert_eq!(alone.decisions[0].decision, HookDecision::Ask);
+        // A later denial wins over an earlier ask; both are recorded.
+        let denied = run_pre_tool_stage(&[ask, deny], "shell_exec", "{}", HOOK_TIMEOUT);
+        assert_eq!(
+            denied.outcome,
+            PreHookOutcome::Denied {
+                reason: "no".to_owned()
+            }
+        );
+        assert_eq!(
+            denied
+                .decisions
+                .iter()
+                .map(|d| d.decision)
+                .collect::<Vec<_>>(),
+            vec![HookDecision::Ask, HookDecision::Deny]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_v2_result_denies_naming_the_hook() {
+        let dir = temp("v2-unreadable");
+        let unknown = result_script(&dir, "maybe.sh", r#"{"decision":"maybe"}"#, 0);
+        let future = result_script(
+            &dir,
+            "v9.sh",
+            r#"{"schema":"rapidlm.hook_result","version":9,"decision":"allow"}"#,
+            0,
+        );
+        for (hook, expected) in [
+            (unknown, "is not one of allow, deny, ask, defer"),
+            (future, "version 9 is not supported"),
+        ] {
+            let report = run_pre_tool_stage(&[hook], "repo_read", "{}", HOOK_TIMEOUT);
+            match &report.outcome {
+                PreHookOutcome::Denied { reason } => {
+                    assert!(
+                        reason.starts_with("pre_tool_use[0] hook printed an unreadable result"),
+                        "{reason}"
+                    );
+                    assert!(reason.contains(expected), "{reason}");
+                }
+                other => panic!("an unreadable result must deny, got {other:?}"),
+            }
+            // Nothing readable was decided, so nothing is recorded.
+            assert!(report.decisions.is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_stdout_text_keeps_v1_semantics_and_records_nothing() {
+        let dir = temp("v1-text");
+        // A v1 hook that chats on stdout and exits zero: allowed, silent.
+        let chatty = script(&dir, "chatty.sh", "echo checking the call\nexit 0");
+        let report = run_pre_tool_stage(&[chatty], "repo_read", "{}", HOOK_TIMEOUT);
+        assert_eq!(report.outcome, PreHookOutcome::Allowed);
+        assert!(report.decisions.is_empty());
+        // A v1 hook that prints its reason on stdout (not stderr) and exits
+        // non-zero: the reason is still the detail, as it was when both
+        // streams shared one capture.
+        let stdout_deny = script(&dir, "stdout-deny.sh", "echo not here\nexit 3");
+        let report = run_pre_tool_stage(&[stdout_deny], "repo_read", "{}", HOOK_TIMEOUT);
+        assert_eq!(
+            report.outcome,
+            PreHookOutcome::Denied {
+                reason: "not here\n".to_owned()
+            }
+        );
+        assert!(report.decisions.is_empty());
+        // stderr wins over stdout as the v1 detail when both are written.
+        let both = script(&dir, "both.sh", "echo progress\necho refused >&2\nexit 1");
+        let report = run_pre_tool_stage(&[both], "repo_read", "{}", HOOK_TIMEOUT);
+        assert_eq!(
+            report.outcome,
+            PreHookOutcome::Denied {
+                reason: "refused\n".to_owned()
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_v2_deny_beside_a_nonzero_exit_lends_its_reason_and_a_v2_allow_does_not_rescue_it() {
+        let dir = temp("v2-nonzero");
+        let deny = result_script(
+            &dir,
+            "deny1.sh",
+            r#"{"decision":"deny","reason":"typed refusal"}"#,
+            1,
+        );
+        let report = run_pre_tool_stage(&[deny], "repo_read", "{}", HOOK_TIMEOUT);
+        assert_eq!(
+            report.outcome,
+            PreHookOutcome::Denied {
+                reason: "typed refusal".to_owned()
+            }
+        );
+        assert_eq!(report.decisions.len(), 1);
+        assert_eq!(report.decisions[0].decision, HookDecision::Deny);
+        // Exit code still rules: `allow` printed by a failing hook denies
+        // (fail-closed), with the static v1 reason, and records nothing.
+        let allow = result_script(&dir, "allow1.sh", r#"{"decision":"allow"}"#, 1);
+        let report = run_pre_tool_stage(&[allow], "repo_read", "{}", HOOK_TIMEOUT);
+        match &report.outcome {
+            PreHookOutcome::Denied { reason } => {
+                assert_eq!(reason.trim(), r#"{"decision":"allow"}"#, "{reason}");
+            }
+            other => panic!("a failing hook must deny whatever it printed, got {other:?}"),
+        }
+        assert!(report.decisions.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_timed_out_hooks_partial_stdout_is_not_a_decision() {
+        let dir = temp("v2-timeout");
+        // Prints an allow, then hangs: what it printed is not a decision,
+        // the timeout is.
+        let hang = script(&dir, "hang.sh", "echo '{\"decision\":\"allow\"}'\nsleep 30");
+        let report = run_pre_tool_stage(&[hang], "repo_read", "{}", Duration::from_millis(250));
+        match &report.outcome {
+            PreHookOutcome::Denied { reason } => assert!(reason.contains("timed out"), "{reason}"),
+            other => panic!("a hung hook must deny, got {other:?}"),
+        }
+        assert!(report.decisions.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn post_hooks_record_both_streams_stdout_first() {
+        let dir = temp("post-both");
+        let both = script(&dir, "both.sh", "echo out-line\necho err-line >&2");
+        let output = run_post_tool_hooks(&[both], "repo_read", "s", HOOK_TIMEOUT);
+        let out = output.find("out-line").expect("stdout recorded");
+        let err = output.find("err-line").expect("stderr recorded");
+        assert!(out < err, "{output}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

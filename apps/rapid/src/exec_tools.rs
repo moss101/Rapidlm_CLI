@@ -350,6 +350,16 @@ pub(crate) trait AgentEvents: Send + Sync {
     fn finished(&self, agent: protocol::AgentId, end: SubagentEnd, detail: Option<&str>);
 }
 
+/// Where a turn reports the decisions its v2 hooks made (`hook.decided`).
+/// v1 hooks — exit code only — produce none, so a project whose hooks never
+/// print a result has a ledger identical to before. `None` outside a kernel
+/// session. An observer on the hook stage, not a second way of running one.
+pub(crate) trait HookEvents: Send + Sync {
+    /// One hook decided about one call. A dropped record must not disturb
+    /// the call itself; the decision has already been applied.
+    fn decided(&self, tool: &str, call_id: &str, record: &crate::hooks::HookDecisionRecord);
+}
+
 /// The registration and record of one running child, released exactly once
 /// on every path out of `task_spawn` — the ordinary return, and a panic in
 /// the runner that `batch_dispatch` turns into a failed call: without this
@@ -1461,6 +1471,8 @@ pub struct WorkspaceTools {
     subagent_registry: SubagentRegistry,
     /// See [`AgentEvents`]. `None` outside a kernel session.
     agent_events: Option<Arc<dyn AgentEvents>>,
+    /// See [`HookEvents`]. `None` outside a kernel session.
+    hook_events: Option<Arc<dyn HookEvents>>,
     /// The session's worktree-isolation manager (`agent_views.rs`): a
     /// write-capable `task_spawn` child gets its own git worktree view and
     /// runs rooted there. `None` refuses write delegation fail-closed.
@@ -1575,6 +1587,7 @@ impl WorkspaceTools {
             subagents: None,
             subagent_registry: SubagentRegistry::default(),
             agent_events: None,
+            hook_events: None,
             agent_views: None,
             subagent_auto_integrate: false,
             sandbox_confinement_required: std::env::var("RAPIDLM_SANDBOX_REQUIRED")
@@ -1966,6 +1979,18 @@ impl WorkspaceTools {
         self.agent_events = Some(events);
     }
 
+    /// Report this surface's hook decisions to `events`. See [`HookEvents`].
+    pub(crate) fn set_hook_events(&mut self, events: Arc<dyn HookEvents>) {
+        self.hook_events = Some(events);
+    }
+
+    /// The sink this surface reports hook decisions to, for propagating to
+    /// a subagent child alongside the hooks themselves — a child's hook
+    /// decisions are this turn's decisions.
+    pub(crate) fn hook_events(&self) -> Option<Arc<dyn HookEvents>> {
+        self.hook_events.clone()
+    }
+
     /// Attach the worktree-isolation manager a spawned write-capable child
     /// runs under. See [`crate::agent_views::AgentViewManager`].
     pub fn set_agent_views(&mut self, views: Arc<crate::agent_views::AgentViewManager>) {
@@ -2349,18 +2374,41 @@ impl WorkspaceTools {
             });
         }
         // Pre-tool-use hooks: the first denial wins and is model-visible.
+        // Every v2 decision is recorded before the outcome is applied, so
+        // the ledger says what each hook decided even when a later hook's
+        // denial is what the model sees.
         if !self.hooks.pre_tool_use.is_empty() {
-            match crate::hooks::run_pre_tool_hooks(
+            let report = crate::hooks::run_pre_tool_stage(
                 &self.hooks.pre_tool_use,
                 call.tool(),
                 call.arguments(),
                 crate::hooks::HOOK_TIMEOUT,
-            ) {
+            );
+            if let Some(events) = self.hook_events.as_ref() {
+                for record in &report.decisions {
+                    events.decided(call.tool(), call.call_id(), record);
+                }
+            }
+            match report.outcome {
                 crate::hooks::PreHookOutcome::Denied { reason } => {
                     return Ok(ToolStepResult::Denied {
                         call_id: call.call_id().to_owned(),
                         detail: Some(self.redact_output(bounded_detail(&format!(
                             "{} blocked by pre_tool_use hook: {reason}",
+                            call.tool()
+                        )))),
+                    });
+                }
+                // A hook `ask` becomes a human decision on the approval
+                // surface in the next slice (ADR 0022 §3). Until then it is
+                // the one thing S2 permits for an unanswerable question:
+                // a denial that says so, never an implicit allow.
+                crate::hooks::PreHookOutcome::Ask { hook, reason } => {
+                    return Ok(ToolStepResult::Denied {
+                        call_id: call.call_id().to_owned(),
+                        detail: Some(self.redact_output(bounded_detail(&format!(
+                            "{} held by {hook} hook: {reason} (a hook's ask cannot reach an \
+                             approval surface in this build, so the call is denied)",
                             call.tool()
                         )))),
                     });
@@ -6643,6 +6691,23 @@ impl ExecTools {
         }
     }
 
+    /// Report hook decisions to `events` (no-op on the no-op surface). See
+    /// [`HookEvents`].
+    pub(crate) fn set_hook_events(&mut self, events: Arc<dyn HookEvents>) {
+        if let Self::Workspace(tools) = self {
+            tools.set_hook_events(events);
+        }
+    }
+
+    /// The hook-decision sink, for propagating to a subagent child (`None`
+    /// on the no-op surface).
+    pub(crate) fn hook_events(&self) -> Option<Arc<dyn HookEvents>> {
+        match self {
+            Self::Workspace(tools) => tools.hook_events(),
+            _ => None,
+        }
+    }
+
     /// Run subagents in the session's registry (no-op on the no-op
     /// surface). See [`SubagentRegistry`].
     pub(crate) fn share_subagents(&mut self, session: &SubagentRegistry) {
@@ -8203,6 +8268,250 @@ mod tests {
             }
             other => panic!("expected write success, got {other:?}"),
         }
+    }
+
+    /// Captures every `hook.decided` record the driver reports, in order.
+    #[derive(Default)]
+    struct RecordingHookEvents {
+        records: Mutex<Vec<(String, String, crate::hooks::HookDecisionRecord)>>,
+    }
+
+    impl HookEvents for RecordingHookEvents {
+        fn decided(&self, tool: &str, call_id: &str, record: &crate::hooks::HookDecisionRecord) {
+            self.records
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((tool.to_owned(), call_id.to_owned(), record.clone()));
+        }
+    }
+
+    /// A hook line running a script that prints `stdout` and exits zero —
+    /// through `sh` so the same fixture runs under `cmd /C` on Windows.
+    fn hook_printing(root: &Path, name: &str, stdout: &str) -> String {
+        let path = root.join(name);
+        fs::write(&path, format!("echo '{stdout}'\nexit 0")).expect("write hook");
+        format!("sh {}", test_fixtures::slash_path(&path))
+    }
+
+    fn write_call(id: &str, path: &str) -> ProposedToolCall {
+        make_call(
+            id,
+            WORKSPACE_WRITE_TOOL,
+            &format!(r#"{{"path":"{path}","content":"hi"}}"#),
+        )
+    }
+
+    fn run_one(tools: &mut WorkspaceTools, call: &ProposedToolCall) -> ToolStepResult {
+        let cancel = CancellationToken::new();
+        let validated = tools.validate(call, &cancel).expect("validate");
+        tools.execute(&validated, &cancel).expect("execute")
+    }
+
+    #[test]
+    fn v2_hook_decisions_are_applied_on_dispatch_and_recorded_for_the_ledger() {
+        // SEAM-01 AC-02: allow, deny and defer each change dispatch as
+        // documented, and each leaves exactly one decision record naming
+        // the hook, the tool and the call.
+        let root = TempRoot::new("hook-v2-dispatch");
+        let sink = Arc::new(RecordingHookEvents::default());
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_hook_events(sink.clone());
+
+        // deny: the call does not run, the model sees the reason, one record.
+        tools.set_hooks(crate::hooks::HooksConfig {
+            pre_tool_use: vec![hook_printing(
+                &root.0,
+                "deny.sh",
+                r#"{"schema":"rapidlm.hook_result","version":2,"decision":"deny","reason":"docs are generated"}"#,
+            )],
+            ..Default::default()
+        });
+        match run_one(&mut tools, &write_call("c-deny", "a.txt")) {
+            ToolStepResult::Denied { detail, .. } => {
+                let detail = detail.unwrap_or_default();
+                assert!(
+                    detail.contains("blocked by pre_tool_use hook: docs are generated"),
+                    "{detail}"
+                );
+            }
+            other => panic!("a v2 deny must deny the call, got {other:?}"),
+        }
+        assert!(
+            !root.0.join("a.txt").exists(),
+            "a denied write must not land"
+        );
+
+        // allow: the call runs; one record.
+        tools.set_hooks(crate::hooks::HooksConfig {
+            pre_tool_use: vec![hook_printing(
+                &root.0,
+                "allow.sh",
+                r#"{"decision":"allow"}"#,
+            )],
+            ..Default::default()
+        });
+        assert!(matches!(
+            run_one(&mut tools, &write_call("c-allow", "b.txt")),
+            ToolStepResult::Succeeded { .. }
+        ));
+        assert!(root.0.join("b.txt").exists());
+
+        // defer: the call runs when the permission flow allows it; one record.
+        tools.set_hooks(crate::hooks::HooksConfig {
+            pre_tool_use: vec![hook_printing(
+                &root.0,
+                "defer.sh",
+                r#"{"decision":"defer"}"#,
+            )],
+            ..Default::default()
+        });
+        assert!(matches!(
+            run_one(&mut tools, &write_call("c-defer", "c.txt")),
+            ToolStepResult::Succeeded { .. }
+        ));
+
+        let records = sink.records.lock().unwrap_or_else(|p| p.into_inner());
+        let summary: Vec<(String, String, String, protocol::HookDecision)> = records
+            .iter()
+            .map(|(tool, call, r)| (tool.clone(), call.clone(), r.hook.clone(), r.decision))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    "workspace_write".to_owned(),
+                    "c-deny".to_owned(),
+                    "pre_tool_use[0]".to_owned(),
+                    protocol::HookDecision::Deny
+                ),
+                (
+                    "workspace_write".to_owned(),
+                    "c-allow".to_owned(),
+                    "pre_tool_use[0]".to_owned(),
+                    protocol::HookDecision::Allow
+                ),
+                (
+                    "workspace_write".to_owned(),
+                    "c-defer".to_owned(),
+                    "pre_tool_use[0]".to_owned(),
+                    protocol::HookDecision::Defer
+                ),
+            ]
+        );
+        assert_eq!(records[0].2.reason.as_deref(), Some("docs are generated"));
+    }
+
+    #[test]
+    fn a_deferring_hook_leaves_the_decision_to_the_permission_flow() {
+        // `defer` states no opinion: the permission lattice's decision
+        // stands. The lattice runs *before* the hook stage (a call the policy
+        // denies never reaches a hook — today's order, kept), so with a deny
+        // rule on the tool the call is denied by the rule and no hook is
+        // consulted; with a permissive lattice a deferring hook lets the
+        // call run (`v2_hook_decisions_are_applied_on_dispatch_and_recorded_
+        // for_the_ledger`).
+        let root = TempRoot::new("hook-v2-defer-rule");
+        let sink = Arc::new(RecordingHookEvents::default());
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::BypassPermissions)
+            .with_rules(vec![ToolRule {
+                effect: RuleEffect::Deny,
+                pattern: ToolPattern::parse("workspace_write(secret*)").expect("rule"),
+            }]);
+        let mut tools = WorkspaceTools::open_with_permissions(&root.0, lattice).expect("tools");
+        tools.set_hook_events(sink.clone());
+        tools.set_hooks(crate::hooks::HooksConfig {
+            pre_tool_use: vec![hook_printing(
+                &root.0,
+                "defer.sh",
+                r#"{"decision":"defer"}"#,
+            )],
+            ..Default::default()
+        });
+        match run_one(&mut tools, &write_call("c1", "secret.txt")) {
+            ToolStepResult::Denied { detail, .. } => {
+                let detail = detail.unwrap_or_default();
+                assert!(detail.contains("deny rule"), "{detail}");
+                assert!(
+                    !detail.contains("hook"),
+                    "the rule decided, not the hook: {detail}"
+                );
+            }
+            other => panic!("the deny rule must decide, got {other:?}"),
+        }
+        assert!(
+            sink.records
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "a call the lattice denies never reaches the hook stage"
+        );
+        // The same hook, a path the rule does not cover: defer → the call runs.
+        assert!(matches!(
+            run_one(&mut tools, &write_call("c2", "open.txt")),
+            ToolStepResult::Succeeded { .. }
+        ));
+        let records = sink.records.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].2.decision, protocol::HookDecision::Defer);
+    }
+
+    #[test]
+    fn a_hook_ask_is_a_stated_denial_until_it_can_reach_an_approval_surface() {
+        // ADR 0022 §3 lands the approval mapping in the next slice; until
+        // then an `ask` is never an implicit allow (S2) and says why.
+        let root = TempRoot::new("hook-v2-ask");
+        let sink = Arc::new(RecordingHookEvents::default());
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_hook_events(sink.clone());
+        tools.set_hooks(crate::hooks::HooksConfig {
+            pre_tool_use: vec![hook_printing(
+                &root.0,
+                "ask.sh",
+                r#"{"decision":"ask","reason":"a reviewer must see this"}"#,
+            )],
+            ..Default::default()
+        });
+        match run_one(&mut tools, &write_call("c1", "d.txt")) {
+            ToolStepResult::Denied { detail, .. } => {
+                let detail = detail.unwrap_or_default();
+                assert!(
+                    detail.contains("held by pre_tool_use[0] hook: a reviewer must see this"),
+                    "{detail}"
+                );
+            }
+            other => panic!("an unroutable ask must deny, got {other:?}"),
+        }
+        assert!(!root.0.join("d.txt").exists());
+        let records = sink.records.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].2.decision, protocol::HookDecision::Ask);
+    }
+
+    #[test]
+    fn a_v1_hook_records_no_decision() {
+        // SEAM-01 AC-01: a project whose hooks print nothing structured has a
+        // ledger identical to before — the sink is never called.
+        let root = TempRoot::new("hook-v1-silent");
+        let sink = Arc::new(RecordingHookEvents::default());
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_hook_events(sink.clone());
+        tools.set_hooks(crate::hooks::HooksConfig {
+            pre_tool_use: vec![
+                hook_printing(&root.0, "ok.sh", "checked"),
+                hook_printing(&root.0, "quiet.sh", ""),
+            ],
+            ..Default::default()
+        });
+        assert!(matches!(
+            run_one(&mut tools, &write_call("c1", "e.txt")),
+            ToolStepResult::Succeeded { .. }
+        ));
+        assert!(
+            sink.records
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]

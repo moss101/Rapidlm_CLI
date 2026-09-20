@@ -14,7 +14,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use protocol::{ApiError, ArtifactId, ArtifactRef, ErrorCode, RedactionClass, SessionId, TraceId};
+use protocol::{
+    ApiError, ArtifactId, ArtifactRef, ErrorCode, HookDecision, HookResult, RedactionClass,
+    SessionId, TraceId,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -267,6 +270,29 @@ fn golden_artifact_ref() -> ArtifactRef {
     )
 }
 
+/// A hook result exercising every optional field, so the fixture pins the
+/// whole v2 shape (ADR 0022 §1) and not just a bare decision.
+fn golden_hook_result() -> HookResult {
+    let mut input = serde_json::Map::new();
+    input.insert(
+        "path".to_owned(),
+        serde_json::Value::String("docs/notes.md".to_owned()),
+    );
+    let mut specific = serde_json::Map::new();
+    specific.insert(
+        "ticket".to_owned(),
+        serde_json::Value::String("OPS-12".to_owned()),
+    );
+    HookResult {
+        decision: HookDecision::Ask,
+        reason: Some("writes under docs/ need a reviewer".to_owned()),
+        updated_input: Some(input),
+        additional_context: Some("the docs directory is generated nightly".to_owned()),
+        hook_specific: Some(specific),
+        grant_attempted: false,
+    }
+}
+
 fn assert_roundtrip<T>(relative_path: &str, value: &T)
 where
     T: Serialize + DeserializeOwned + PartialEq + fmt::Debug,
@@ -295,6 +321,11 @@ fn id_error_and_artifact_fixtures_match_wire_contract() {
     assert_roundtrip("id/v1/session_id.json", &golden_session_id());
     assert_roundtrip("error/v1/api_error.json", &golden_api_error());
     assert_roundtrip("artifact/v1/artifact_ref.json", &golden_artifact_ref());
+}
+
+#[test]
+fn hook_result_v2_fixture_matches_wire_contract() {
+    assert_roundtrip("hooks/v2/hook_result.json", &golden_hook_result());
 }
 
 #[test]

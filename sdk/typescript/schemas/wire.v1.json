@@ -244,7 +244,8 @@
     { "kind": "graph.created", "family": "graph" },
     { "kind": "graph.revision_committed", "family": "graph" },
     { "kind": "graph.proposal_rejected", "family": "graph" },
-    { "kind": "graph.node_state_changed", "family": "graph" }
+    { "kind": "graph.node_state_changed", "family": "graph" },
+    { "kind": "hook.decided", "family": "hook" }
   ],
   "tools": [
     { "name": "repo.search", "description": "hybrid/lexical/structural search" },

@@ -3,6 +3,7 @@
 pub mod artifact;
 pub mod config;
 pub mod error;
+pub mod hooks;
 pub mod host_env;
 pub mod host_path;
 pub mod id;
@@ -29,6 +30,11 @@ pub use error::{
     API_ERROR_SCHEMA, ApiError, ApiErrorBuildError, ErrorCode, ErrorCodeParseError, ErrorDetails,
     ErrorDetailsError, MAX_DETAIL_FIELDS, MAX_DETAIL_KEY_BYTES, MAX_DETAIL_VALUE_BYTES,
     MAX_MESSAGE_BYTES, RapidErrorClass, UNKNOWN_INTERNAL_MESSAGE,
+};
+pub use hooks::{
+    HOOK_RESULT_SCHEMA, HOOK_RESULT_VERSION, HookDecision, HookResult, HookResultError,
+    MAX_HOOK_CONTEXT_BYTES, MAX_HOOK_REASON_BYTES, MAX_HOOK_RESULT_BYTES,
+    MAX_HOOK_UPDATED_INPUT_BYTES,
 };
 pub use id::{
     AgentId, CandidateId, ContextItemId, ControlLeaseId, EventId, EvidenceId, GoalId, GraphId,

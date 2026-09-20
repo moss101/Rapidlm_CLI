@@ -1,0 +1,13 @@
+{
+  "schema": "rapidlm.hook_result",
+  "version": 2,
+  "decision": "ask",
+  "reason": "writes under docs/ need a reviewer",
+  "updated_input": {
+    "path": "docs/notes.md"
+  },
+  "additional_context": "the docs directory is generated nightly",
+  "hook_specific": {
+    "ticket": "OPS-12"
+  }
+}
