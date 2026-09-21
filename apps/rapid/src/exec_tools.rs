@@ -378,6 +378,30 @@ pub(crate) struct HookRewriteRecord {
     pub after_digest: String,
 }
 
+/// What a hook's rewrite becomes at dispatch (see
+/// `WorkspaceTools::apply_hook_rewrite`).
+enum HookRewriteOutcome {
+    /// The rewritten call runs; `marker` goes on its result and `record` to
+    /// the ledger once it does.
+    Run {
+        candidate: ValidatedToolCall,
+        marker: String,
+        record: HookRewriteRecord,
+    },
+    /// The rewritten call is Ask-class for the lattice: a human decides
+    /// about *it* (unless an approval already names this hook and these
+    /// arguments).
+    NeedsApproval {
+        candidate: ValidatedToolCall,
+        marker: String,
+        record: HookRewriteRecord,
+        hook: String,
+        command_digest: String,
+    },
+    /// The rewrite was invalid or denied by policy; nothing runs.
+    Denied(ToolStepResult),
+}
+
 /// Lowercase hex SHA-256 of `bytes`.
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
@@ -2311,16 +2335,17 @@ impl WorkspaceTools {
         self.execute_preapproved_from(call, cancel, None)
     }
 
-    /// [`Self::execute_preapproved`] for an approval whose `source` is known:
+    /// [`Self::execute_preapproved`] for an approval whose record is known:
     /// a hook's ask is skipped on the resume only when it is *this* hook's
-    /// question the human answered (`approved_source == "hook:<name>"`); a
-    /// lattice ask they answered does not answer a hook's, which is raised
-    /// on its own.
+    /// question about *these* arguments the human answered (the record's
+    /// `source` and `arguments_digest`); a lattice ask they answered does not
+    /// answer a hook's, and a rewrite into different arguments is not what
+    /// they approved — either is raised on its own.
     pub fn execute_preapproved_from(
         &self,
         call: &ValidatedToolCall,
         cancel: &CancellationToken,
-        approved_source: Option<&str>,
+        approved: Option<&crate::approvals::ApprovedAsk>,
     ) -> Result<ToolStepResult, ToolStepError> {
         cancel.check().map_err(|_| ToolStepError::Cancelled)?;
         // Re-checked, not trusted: a one-shot approval resolved after the
@@ -2336,7 +2361,7 @@ impl WorkspaceTools {
                 ))),
             });
         }
-        self.execute_call_traced_flagged(call, cancel, true, approved_source)
+        self.execute_call_traced_flagged(call, cancel, true, approved)
     }
 
     fn execute_call_traced(
@@ -2347,70 +2372,77 @@ impl WorkspaceTools {
         self.execute_call_traced_flagged(call, cancel, false, None)
     }
 
-    /// Turn a hook's `updated_input` into the call that runs, or into the
-    /// denial that names the hook (ADR 0022 §5). The rewritten arguments
-    /// must be a well-formed, bounded tool call (`ProposedToolCall::new`)
-    /// that parses as `tool`'s documented shape, and the permission lattice
-    /// must allow the *rewritten* call — a hook cannot widen what the model
-    /// may do by rewriting into it (S5). On the approved resume
-    /// (`preapproved`) an `Ask`-class rewritten call is what the human
-    /// approved; an explicit deny still denies. The rewrite is recorded
-    /// (`hook.input_rewritten`) before anything runs on it.
+    /// Turn a hook's `updated_input` into the call that would run, the denial
+    /// that names the hook, or a call that needs a human first (ADR 0022 §5).
+    /// The rewritten arguments must be a well-formed, bounded tool call
+    /// (`ProposedToolCall::new`) that parses as `tool`'s documented shape,
+    /// and the permission lattice decides on the *rewritten* call — a hook
+    /// cannot widen what the model may do by rewriting into it (S5): a deny
+    /// denies; an Ask-class rewritten call is raised for a human (unless the
+    /// call is `ask_user`, the human conversation itself) and runs only once
+    /// an approval names this hook and these arguments. Nothing is recorded
+    /// here; the caller records the rewrite when the call proceeds.
     fn apply_hook_rewrite(
         &self,
         call: &ValidatedToolCall,
         rewrite: crate::hooks::HookRewrite,
-        preapproved: bool,
-    ) -> Result<(ValidatedToolCall, String), ToolStepResult> {
+        ask_is_the_call: bool,
+    ) -> HookRewriteOutcome {
         let hook = rewrite.hook;
         let after = serde_json::Value::Object(rewrite.input).to_string();
-        let denied = |why: &str| ToolStepResult::Denied {
-            call_id: call.call_id().to_owned(),
-            detail: Some(self.redact_output(bounded_detail(&format!(
-                "{} blocked by {hook} hook: {why}",
-                call.tool()
-            )))),
+        let denied = |why: &str| {
+            HookRewriteOutcome::Denied(ToolStepResult::Denied {
+                call_id: call.call_id().to_owned(),
+                detail: Some(self.redact_output(bounded_detail(&format!(
+                    "{} blocked by {hook} hook: {why}",
+                    call.tool()
+                )))),
+            })
         };
         let proposed = match ProposedToolCall::new(call.call_id(), call.tool(), &after) {
             Ok(proposed) => proposed,
             Err(_) => {
-                return Err(denied(
-                    "its rewritten input is not a valid tool call (bounds or shape)",
-                ));
+                return denied("its rewritten input is not a valid tool call (bounds or shape)");
             }
         };
         if !arguments_parse(call.tool(), &after) {
-            return Err(denied(&format!(
+            return denied(&format!(
                 "its rewritten input does not match {}'s documented arguments",
                 call.tool()
-            )));
+            ));
         }
         let candidate = ValidatedToolCall::from_proposed(&proposed);
         let decision = self.permission_for(&candidate);
-        if decision.is_denied() || (!decision.is_allowed() && !preapproved) {
-            return Err(denied(&format!(
+        if decision.is_denied() {
+            return denied(&format!(
                 "the rewritten call is not allowed by policy ({})",
                 decision.reason().explanation()
-            )));
+            ));
         }
-        if let Some(events) = self.hook_events.as_ref() {
-            events.rewritten(
-                call.tool(),
-                call.call_id(),
-                &HookRewriteRecord {
-                    hook: hook.clone(),
-                    command_digest: rewrite.command_digest,
-                    before_digest: sha256_hex(call.arguments().as_bytes()),
-                    after_digest: sha256_hex(after.as_bytes()),
-                    before: call.arguments().to_owned(),
-                    after,
-                },
-            );
+        let record = HookRewriteRecord {
+            hook: hook.clone(),
+            command_digest: rewrite.command_digest.clone(),
+            before_digest: sha256_hex(call.arguments().as_bytes()),
+            after_digest: sha256_hex(after.as_bytes()),
+            before: call.arguments().to_owned(),
+            after,
+        };
+        let marker = format!("[hook {hook} rewrote {} input]", call.tool());
+        if decision.is_allowed() || ask_is_the_call {
+            HookRewriteOutcome::Run {
+                candidate,
+                marker,
+                record,
+            }
+        } else {
+            HookRewriteOutcome::NeedsApproval {
+                candidate,
+                marker,
+                record,
+                hook,
+                command_digest: rewrite.command_digest,
+            }
         }
-        Ok((
-            candidate,
-            format!("[hook {hook} rewrote {} input]", call.tool()),
-        ))
     }
 
     /// The one executor body. `preapproved` is the resume path of a pending
@@ -2423,7 +2455,7 @@ impl WorkspaceTools {
         call: &ValidatedToolCall,
         cancel: &CancellationToken,
         preapproved: bool,
-        approved_source: Option<&str>,
+        approved: Option<&crate::approvals::ApprovedAsk>,
     ) -> Result<ToolStepResult, ToolStepError> {
         cancel.check().map_err(|_| ToolStepError::Cancelled)?;
         // Permission gate: deny and headless-ask are typed model-visible
@@ -2502,8 +2534,14 @@ impl WorkspaceTools {
         // (ADR 0022 §5): the approval surface, the argument check and the
         // dispatch all see the rewritten call, and the ledger and the
         // transcript say a hook rewrote it.
+        // A hook's `updated_input`, once validated, is the call from here on
+        // (ADR 0022 §5): the approval surface, the argument check and the
+        // dispatch all see the rewritten call, and the ledger and the
+        // transcript say a hook rewrote it — recorded only once the call is
+        // actually going to run, never for a call the human may still deny.
         let rewritten_call: Option<ValidatedToolCall>;
         let mut rewrite_marker: Option<String> = None;
+        let mut rewrite_record: Option<HookRewriteRecord> = None;
         if !self.hooks.pre_tool_use.is_empty() {
             let report = crate::hooks::run_pre_tool_stage(
                 &self.hooks.pre_tool_use,
@@ -2525,82 +2563,131 @@ impl WorkspaceTools {
                     )))),
                 });
             }
+            // The question the human answered, if this is the resume of one:
+            // only a hook ask with this exact source, about these exact
+            // arguments, counts as answered.
+            let answered = |hook: &str, digest: &str, arguments: &str| -> bool {
+                approved.is_some_and(|approved| {
+                    approved.source.as_deref()
+                        == Some(crate::approvals::hook_source(hook, digest).as_str())
+                        && approved.covers(arguments)
+                })
+            };
+            // A pending question about the rewritten call, if the rewrite
+            // itself needs one (an Ask-class rewritten call the human has
+            // not seen).
+            let mut rewrite_asks: Option<(String, String, String)> = None;
             rewritten_call = match report.rewrite {
                 None => None,
-                Some(rewrite) => match self.apply_hook_rewrite(call, rewrite, preapproved) {
-                    Ok((candidate, marker)) => {
+                Some(rewrite) => match self.apply_hook_rewrite(call, rewrite, ask_is_the_call) {
+                    HookRewriteOutcome::Denied(denied) => return Ok(denied),
+                    HookRewriteOutcome::Run {
+                        candidate,
+                        marker,
+                        record,
+                    } => {
                         rewrite_marker = Some(marker);
+                        rewrite_record = Some(record);
                         Some(candidate)
                     }
-                    Err(denied) => return Ok(denied),
+                    HookRewriteOutcome::NeedsApproval {
+                        candidate,
+                        marker,
+                        record,
+                        hook,
+                        command_digest,
+                    } => {
+                        if !answered(&hook, &command_digest, candidate.arguments()) {
+                            rewrite_asks = Some((
+                                hook,
+                                command_digest,
+                                "the rewritten call needs approval".to_owned(),
+                            ));
+                        }
+                        rewrite_marker = Some(marker);
+                        rewrite_record = Some(record);
+                        Some(candidate)
+                    }
                 },
             };
             let call: &ValidatedToolCall = rewritten_call.as_ref().unwrap_or(call);
-            match report.outcome {
+            // The question to raise, if any: the hook's own ask (unless it is
+            // the one the human answered, or the call is `ask_user` — the
+            // human conversation itself), else the rewrite's.
+            let pending = match report.outcome {
                 crate::hooks::PreHookOutcome::Denied { .. } => unreachable!("returned above"),
-                // A hook `ask` is the existing approval wait (ADR 0022 §3):
-                // the request names the hook and its reason, is journaled
-                // before the turn pauses, and the human's decision resumes
-                // the turn exactly as a lattice `Ask` does. On that resume
-                // (`preapproved`) the ask is answered — the hooks ran again
-                // and may still deny, but they cannot re-ask the question
-                // the human just answered. Where no surface can take the
-                // question, the call is denied and says so — never an
-                // implicit allow (S2).
-                crate::hooks::PreHookOutcome::Ask { hook, reason: _ }
-                    if ask_is_the_call
-                        || approved_source.is_some_and(|s| s == format!("hook:{hook}")) =>
-                {
-                    // `ask_user` *is* the human conversation: a hook asking
-                    // whether the model may ask the human is answered by the
-                    // question itself (a hook `deny` on it still denies, above).
-                    // And on the approved resume the human answered *this*
-                    // hook's question — a lattice ask they answered is not
-                    // that answer, so only a matching source is skipped.
-                }
-                crate::hooks::PreHookOutcome::Ask { hook, reason } => {
-                    {
-                        let sink = self.approval_sink.as_ref().or(self.hook_ask_sink.as_ref());
-                        let mut record_failure: Option<String> = None;
-                        if let Some(sink) = sink {
-                            let request = crate::approvals::build_hook_ask_request(
-                                call.tool(),
-                                call.call_id(),
-                                call.arguments(),
-                                &self.root,
-                                &hook,
-                                &reason,
-                            );
-                            match sink.request(&request) {
-                                Ok(_token) => {
-                                    return Ok(ToolStepResult::ApprovalRequired {
-                                        call_id: call.call_id().to_owned(),
-                                    });
-                                }
-                                Err(why) => record_failure = Some(why),
-                            }
-                        }
-                        // The outcome leads, so a long reason cut at the
-                        // detail bound never reads as pending; and the text
-                        // says which of the two things happened — no surface,
-                        // or a surface that could not record the question.
-                        let why = match record_failure {
-                            Some(why) => format!("the approval could not be recorded ({why})"),
-                            None => "no approval surface can take the question here".to_owned(),
-                        };
-                        return Ok(ToolStepResult::Denied {
-                            call_id: call.call_id().to_owned(),
-                            detail: Some(self.redact_output(bounded_detail(&format!(
-                                "{} denied: {hook} hook asked for approval and {why}; {reason}",
-                                call.tool()
-                            )))),
-                        });
+                crate::hooks::PreHookOutcome::Ask {
+                    hook,
+                    command_digest,
+                    reason,
+                } => {
+                    if ask_is_the_call || answered(&hook, &command_digest, call.arguments()) {
+                        // `ask_user` *is* the human conversation: a hook
+                        // asking whether the model may ask the human is
+                        // answered by the question itself (a hook `deny` on
+                        // it still denies, above). And on the approved resume
+                        // the human answered *this* hook's question about
+                        // *these* arguments — a lattice ask they answered, a
+                        // different hook, or different (rewritten) arguments
+                        // are not that answer.
+                        rewrite_asks.take()
+                    } else {
+                        Some((hook, command_digest, reason))
                     }
                 }
-                crate::hooks::PreHookOutcome::Allowed => {}
+                crate::hooks::PreHookOutcome::Allowed => rewrite_asks.take(),
+            };
+            if let Some((hook, command_digest, reason)) = pending {
+                // A hook `ask` is the existing approval wait (ADR 0022 §3):
+                // the request names the hook and its reason, describes the
+                // call as it would run, is journaled before the turn pauses,
+                // and the human's decision resumes the turn exactly as a
+                // lattice `Ask` does. Where no surface can take the question,
+                // the call is denied and says so — never an implicit allow
+                // (S2).
+                let sink = self.approval_sink.as_ref().or(self.hook_ask_sink.as_ref());
+                let mut record_failure: Option<String> = None;
+                if let Some(sink) = sink {
+                    let request = crate::approvals::build_hook_ask_request(
+                        call.tool(),
+                        call.call_id(),
+                        call.arguments(),
+                        &self.root,
+                        &hook,
+                        &command_digest,
+                        &reason,
+                    );
+                    match sink.request(&request) {
+                        Ok(_token) => {
+                            return Ok(ToolStepResult::ApprovalRequired {
+                                call_id: call.call_id().to_owned(),
+                            });
+                        }
+                        Err(why) => record_failure = Some(why),
+                    }
+                }
+                // The outcome leads, so a long reason cut at the detail bound
+                // never reads as pending; and the text says which of the two
+                // things happened — no surface, or a surface that could not
+                // record the question.
+                let why = match record_failure {
+                    Some(why) => format!("the approval could not be recorded ({why})"),
+                    None => "no approval surface can take the question here".to_owned(),
+                };
+                return Ok(ToolStepResult::Denied {
+                    call_id: call.call_id().to_owned(),
+                    detail: Some(self.redact_output(bounded_detail(&format!(
+                        "{} denied: {hook} hook asked for approval and {why}; {reason}",
+                        call.tool()
+                    )))),
+                });
             }
         } else {
             rewritten_call = None;
+        }
+        // The call is going to run as rewritten: say so, durably, first.
+        if let (Some(record), Some(events)) = (rewrite_record.as_ref(), self.hook_events.as_ref()) {
+            events.rewritten(call.tool(), call.call_id(), record);
         }
         let call: &ValidatedToolCall = rewritten_call.as_ref().unwrap_or(call);
         let arguments_parseable = arguments_parse(call.tool(), call.arguments());
@@ -2698,9 +2785,32 @@ impl WorkspaceTools {
                 result = ToolStepResult::Succeeded { call_id, summary };
             }
         }
+        // Post-tool-use hooks observe the completed call; their output is
+        // recorded on the result the model sees — bounded on its own, so a
+        // chatty hook shortens nothing the tool said.
+        if !self.hooks.post_tool_use.is_empty()
+            && let ToolStepResult::Succeeded { call_id, summary } = &result
+        {
+            let recorded = crate::hooks::run_post_tool_hooks(
+                &self.hooks.post_tool_use,
+                call.tool(),
+                summary,
+                crate::hooks::HOOK_TIMEOUT,
+            );
+            if !recorded.is_empty() {
+                result = ToolStepResult::Succeeded {
+                    call_id: call_id.clone(),
+                    summary: format!(
+                        "{summary}\n[post_tool_use: {}]",
+                        self.redact_output(bounded_detail(&recorded))
+                    ),
+                };
+            }
+        }
         // The rewrite marker (S3): one line on whatever the model sees, so a
         // call that did not run as proposed says so wherever its result is
-        // read — the transcript, the JSONL, a resumed history.
+        // read — the transcript, the JSONL, a resumed history. Last, so no
+        // later bound can cut it.
         if let Some(marker) = rewrite_marker.as_deref() {
             result = match result {
                 ToolStepResult::Succeeded { call_id, summary } => ToolStepResult::Succeeded {
@@ -2728,26 +2838,6 @@ impl WorkspaceTools {
                 },
                 other => other,
             };
-        }
-        // Post-tool-use hooks observe the completed call; their output is
-        // recorded on the result the model sees.
-        if !self.hooks.post_tool_use.is_empty()
-            && let ToolStepResult::Succeeded { call_id, summary } = &result
-        {
-            let recorded = crate::hooks::run_post_tool_hooks(
-                &self.hooks.post_tool_use,
-                call.tool(),
-                summary,
-                crate::hooks::HOOK_TIMEOUT,
-            );
-            if !recorded.is_empty() {
-                return Ok(ToolStepResult::Succeeded {
-                    call_id: call_id.clone(),
-                    summary: self.redact_output(bounded_detail(&format!(
-                        "{summary}\n[post_tool_use: {recorded}]"
-                    ))),
-                });
-            }
         }
         Ok(result)
     }
@@ -6920,10 +7010,10 @@ impl ExecTools {
         &self,
         call: &ValidatedToolCall,
         cancel: &CancellationToken,
-        approved_source: Option<&str>,
+        approved: Option<&crate::approvals::ApprovedAsk>,
     ) -> Result<ToolStepResult, ToolStepError> {
         match self {
-            Self::Workspace(tools) => tools.execute_preapproved_from(call, cancel, approved_source),
+            Self::Workspace(tools) => tools.execute_preapproved_from(call, cancel, approved),
             Self::Noop(_) => Err(ToolStepError::Invalid),
         }
     }
@@ -7288,6 +7378,13 @@ fn batch_dispatch(
         // are meant to share a key and serialize.
         let key = if tool_kind(call.tool()) == ToolKind::Read {
             Some(format!("solo:{index}"))
+        } else if !tools.hooks.pre_tool_use.is_empty() {
+            // A pre-tool hook may rewrite a write's target, so the proposed
+            // path is not a reliable key: every write-classified call runs
+            // in one group, in proposal order — the "same-path writes
+            // serialize" guarantee kept the only way it can be kept before
+            // the hooks have run.
+            Some("writes:hooked".to_owned())
         } else {
             WorkspaceTools::write_group_key(call, index)
         };
@@ -8723,6 +8820,14 @@ mod tests {
         }
     }
 
+    /// What the resume carries for an approval the fake sink recorded.
+    fn approved(request: &crate::approvals::ApprovalRequest) -> crate::approvals::ApprovedAsk {
+        crate::approvals::ApprovedAsk {
+            source: request.source.clone(),
+            arguments_digest: request.arguments_digest.clone(),
+        }
+    }
+
     fn ask_hooks(root: &Path) -> crate::hooks::HooksConfig {
         crate::hooks::HooksConfig {
             pre_tool_use: vec![hook_printing(
@@ -8797,11 +8902,16 @@ mod tests {
             let request = &requests[0];
             assert_eq!(request.tool, WORKSPACE_WRITE_TOOL);
             assert_eq!(request.call_id, "c1");
-            assert_eq!(request.source.as_deref(), Some("hook:pre_tool_use[0]"));
+            let source = request.source.clone().expect("a hook ask names its source");
+            assert!(source.starts_with("hook:pre_tool_use[0]#"), "{source}");
             assert_eq!(
                 request.summary,
                 "create e.txt — pre_tool_use[0] hook asks: a reviewer must see this",
                 "the call first, then the hook and its reason"
+            );
+            assert_eq!(
+                request.arguments_digest.as_deref(),
+                Some(crate::approvals::arguments_digest(call.arguments()).as_str())
             );
             assert_eq!(request.scope, vec!["e.txt".to_owned()]);
             assert!(
@@ -8810,9 +8920,13 @@ mod tests {
                 request.diff
             );
         }
-        // The human approved: the resume runs the call exactly once.
+        // The human approved *this hook's* question about *these* arguments:
+        // the resume runs the call exactly once (the continuation passes the
+        // approval's record).
+        let approved_ask =
+            approved(&approvals.requests.lock().unwrap_or_else(|p| p.into_inner())[0]);
         match tools
-            .execute_preapproved_from(&validated, &cancel, Some("hook:pre_tool_use[0]"))
+            .execute_preapproved_from(&validated, &cancel, Some(&approved_ask))
             .expect("resume")
         {
             ToolStepResult::Succeeded { .. } => {}
@@ -8869,8 +8983,10 @@ mod tests {
             )],
             ..Default::default()
         });
+        let approved_ask =
+            approved(&approvals.requests.lock().unwrap_or_else(|p| p.into_inner())[0]);
         match tools
-            .execute_preapproved_from(&validated, &cancel, Some("hook:pre_tool_use[0]"))
+            .execute_preapproved_from(&validated, &cancel, Some(&approved_ask))
             .expect("resume")
         {
             ToolStepResult::Denied { detail, .. } => {
@@ -8919,7 +9035,12 @@ mod tests {
         }
         let requests = approvals.requests.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].source.as_deref(), Some("hook:pre_tool_use[0]"));
+        assert!(
+            requests[0]
+                .source
+                .as_deref()
+                .is_some_and(|s| s.starts_with("hook:pre_tool_use[0]#"))
+        );
     }
 
     fn rewrite_hooks(root: &Path, name: &str, result: &str) -> crate::hooks::HooksConfig {
@@ -9174,8 +9295,10 @@ mod tests {
             assert_eq!(requests[0].source, None, "the lattice's own question");
         }
         // 2. The human approved the lattice's question: the hook now asks.
+        let lattice_approval =
+            approved(&approvals.requests.lock().unwrap_or_else(|p| p.into_inner())[0]);
         match tools
-            .execute_preapproved_from(&validated, &cancel, None)
+            .execute_preapproved_from(&validated, &cancel, Some(&lattice_approval))
             .expect("resume")
         {
             ToolStepResult::ApprovalRequired { call_id } => assert_eq!(call_id, "c1"),
@@ -9185,15 +9308,21 @@ mod tests {
             !root.0.join("h.txt").exists(),
             "nothing runs before the hook's question is answered"
         );
-        {
+        let hook_approval = {
             let requests = approvals.requests.lock().unwrap_or_else(|p| p.into_inner());
             assert_eq!(requests.len(), 2);
-            assert_eq!(requests[1].source.as_deref(), Some("hook:pre_tool_use[0]"));
-        }
+            assert!(
+                requests[1]
+                    .source
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("hook:pre_tool_use[0]#"))
+            );
+            approved(&requests[1])
+        };
         // 3. The human approved the hook's question: the call runs once.
         assert!(matches!(
             tools
-                .execute_preapproved_from(&validated, &cancel, Some("hook:pre_tool_use[0]"))
+                .execute_preapproved_from(&validated, &cancel, Some(&hook_approval))
                 .expect("resume"),
             ToolStepResult::Succeeded { .. }
         ));
@@ -9235,6 +9364,377 @@ mod tests {
             other => panic!("an unrecordable ask must deny, got {other:?}"),
         }
         assert!(!root.0.join("i.txt").exists());
+    }
+
+    #[test]
+    fn a_lattice_approval_does_not_let_a_rewrite_run_a_different_ask_class_call() {
+        // Default mode: the human approved `cargo test`. On the resume a hook
+        // rewrites the argv. The rewritten call is Ask-class and is not what
+        // was approved (different arguments), so it is raised as its own
+        // question — never run on the strength of the earlier approval.
+        // Only an approval naming this hook and these exact arguments runs it.
+        let root = TempRoot::new("hook-rewrite-after-lattice");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        let decisions = Arc::new(RecordingHookEvents::default());
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default);
+        let mut tools = WorkspaceTools::open_with_permissions(&root.0, lattice).expect("tools");
+        tools.set_approval_source(approvals.clone());
+        tools.set_hook_events(decisions.clone());
+        let rewritten = format!(
+            r#"{{"decision":"allow","updated_input":{{"argv":["{}","rewritten"]}}}}"#,
+            test_fixtures::tool_static("echo")
+        );
+        tools.set_hooks(rewrite_hooks(&root.0, "rewrite-argv.sh", &rewritten));
+        let call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            &format!(
+                r#"{{"argv":["{}","proposed"]}}"#,
+                test_fixtures::tool_static("echo")
+            ),
+        );
+        let cancel = CancellationToken::new();
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        // 1. The lattice asks about the proposed command; hooks have not run.
+        assert!(matches!(
+            tools.execute(&validated, &cancel).expect("execute"),
+            ToolStepResult::ApprovalRequired { .. }
+        ));
+        let lattice_approval =
+            approved(&approvals.requests.lock().unwrap_or_else(|p| p.into_inner())[0]);
+        assert_eq!(lattice_approval.source, None);
+        // 2. The resume: the hook rewrites; the rewritten command is not
+        //    what was approved → a second question, about the rewritten call.
+        match tools
+            .execute_preapproved_from(&validated, &cancel, Some(&lattice_approval))
+            .expect("resume")
+        {
+            ToolStepResult::ApprovalRequired { call_id } => assert_eq!(call_id, "c1"),
+            other => panic!("the rewritten call must be raised, not run: {other:?}"),
+        }
+        let second = {
+            let requests = approvals.requests.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(requests.len(), 2);
+            assert!(
+                requests[1].summary.contains("rewritten"),
+                "{}",
+                requests[1].summary
+            );
+            assert!(
+                !requests[1].summary.contains("proposed"),
+                "{}",
+                requests[1].summary
+            );
+            assert!(
+                requests[1]
+                    .source
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("hook:pre_tool_use[0]#"))
+            );
+            approved(&requests[1])
+        };
+        assert!(
+            decisions
+                .rewrites
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "nothing ran, so nothing was rewritten yet"
+        );
+        // 3. The human approved the rewritten command: it runs.
+        match tools
+            .execute_preapproved_from(&validated, &cancel, Some(&second))
+            .expect("resume")
+        {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("rewritten"), "{summary}");
+                assert!(
+                    summary.contains("[hook pre_tool_use[0] rewrote shell_exec input]"),
+                    "{summary}"
+                );
+            }
+            other => panic!("the approved rewritten call runs, got {other:?}"),
+        }
+        assert_eq!(
+            decisions
+                .rewrites
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len(),
+            1
+        );
+        assert_eq!(
+            approvals
+                .requests
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_rewrite_that_differs_from_the_approved_arguments_is_raised_again() {
+        // A hook that rewrites differently on each run (a counter in the
+        // path): the human approved R1; the resume produces R2, which is not
+        // what they saw — raised again, not run.
+        let root = TempRoot::new("hook-rewrite-nondeterministic");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default);
+        let mut tools = WorkspaceTools::open_with_permissions(&root.0, lattice).expect("tools");
+        tools.set_approval_source(approvals.clone());
+        let counter = root.0.join("counter");
+        let script = root.0.join("counting.sh");
+        fs::write(
+            &script,
+            format!(
+                "n=$(cat {c} 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > {c}\necho '{{\"decision\":\"ask\",\"reason\":\"look\",\"updated_input\":{{\"path\":\"out-'$n'.txt\",\"content\":\"hi\"}}}}'\nexit 0\n",
+                c = test_fixtures::sh_quote(&counter)
+            ),
+        )
+        .expect("script");
+        tools.set_hooks(crate::hooks::HooksConfig {
+            pre_tool_use: vec![format!("sh {}", test_fixtures::slash_path(&script))],
+            ..Default::default()
+        });
+        let call = write_call("c1", "orig.txt");
+        let cancel = CancellationToken::new();
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        // Default mode: the lattice asks first (about orig.txt).
+        assert!(matches!(
+            tools.execute(&validated, &cancel).expect("execute"),
+            ToolStepResult::ApprovalRequired { .. }
+        ));
+        let first = approved(&approvals.requests.lock().unwrap_or_else(|p| p.into_inner())[0]);
+        // Resume 1: the hook runs (n=1), asks about out-1.txt.
+        assert!(matches!(
+            tools
+                .execute_preapproved_from(&validated, &cancel, Some(&first))
+                .expect("resume"),
+            ToolStepResult::ApprovalRequired { .. }
+        ));
+        let second = approved(&approvals.requests.lock().unwrap_or_else(|p| p.into_inner())[1]);
+        // Resume 2 with the approval of out-1.txt: the hook now produces
+        // out-2.txt — not what was approved — so it asks again.
+        assert!(matches!(
+            tools
+                .execute_preapproved_from(&validated, &cancel, Some(&second))
+                .expect("resume"),
+            ToolStepResult::ApprovalRequired { .. }
+        ));
+        assert!(!root.0.join("out-1.txt").exists());
+        assert!(!root.0.join("out-2.txt").exists());
+        assert!(!root.0.join("orig.txt").exists());
+        let requests = approvals.requests.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[1].summary.contains("out-1.txt"),
+            "{}",
+            requests[1].summary
+        );
+        assert!(
+            requests[2].summary.contains("out-2.txt"),
+            "{}",
+            requests[2].summary
+        );
+    }
+
+    #[test]
+    fn a_rewrite_of_ask_user_is_not_blocked_by_the_lattice() {
+        // Default mode makes `ask_user` Ask-class; the hook rewrites the
+        // question. The rewritten call is still the human conversation and
+        // proceeds (it is not denied "by policy" and not raised as an
+        // approval about asking).
+        let root = TempRoot::new("hook-rewrite-ask-user");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default);
+        let mut tools = WorkspaceTools::open_with_permissions(&root.0, lattice).expect("tools");
+        tools.set_approval_source(approvals.clone());
+        tools.set_hooks(rewrite_hooks(
+            &root.0,
+            "rewrite-question.sh",
+            r#"{"decision":"allow","updated_input":{"question":"Which flavour (rewritten)?","options":["a","b"]}}"#,
+        ));
+        match run_one(
+            &mut tools,
+            &make_call(
+                "q1",
+                ASK_USER_TOOL,
+                r#"{"question":"Which flavor?","options":["a","b"]}"#,
+            ),
+        ) {
+            ToolStepResult::Denied { detail, .. } => {
+                panic!("the rewritten question must not be denied: {detail:?}")
+            }
+            ToolStepResult::ApprovalRequired { .. } => {
+                panic!("the rewritten question must not be raised as an approval")
+            }
+            _ => {}
+        }
+        assert!(
+            approvals
+                .requests
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn hooked_writes_serialise_in_proposal_order_even_when_rewritten_to_one_path() {
+        // Two writes to different paths, both rewritten to `log.txt`. Grouped
+        // by their proposed paths they would run on two threads and the last
+        // one to finish would win; with pre-tool hooks configured every write
+        // runs in one group in proposal order, so the second write's content
+        // is what remains — even though the first hook run is slow.
+        let root = TempRoot::new("hook-rewrite-serialise");
+        let mut tools = permissive_workspace(&root.0);
+        let script = root.0.join("redirect.sh");
+        // Sleep only for the first proposed path so, unserialised, the
+        // second write would land first and be overwritten.
+        fs::write(
+            &script,
+            "read line\ncase \"$line\" in\n  *a.txt*) sleep 1; content=first ;;\n  *) content=second ;;\nesac\necho '{\"decision\":\"allow\",\"updated_input\":{\"path\":\"log.txt\",\"content\":\"'\"$content\"'\"}}'\nexit 0\n",
+        )
+        .expect("script");
+        tools.set_hooks(crate::hooks::HooksConfig {
+            pre_tool_use: vec![format!("sh {}", test_fixtures::slash_path(&script))],
+            ..Default::default()
+        });
+        let mut exec = ExecTools::Workspace(tools);
+        let calls = vec![
+            make_call(
+                "c1",
+                WORKSPACE_WRITE_TOOL,
+                r#"{"path":"a.txt","content":"first"}"#,
+            ),
+            make_call(
+                "c2",
+                WORKSPACE_WRITE_TOOL,
+                r#"{"path":"b.txt","content":"second"}"#,
+            ),
+        ];
+        let results = run_batch(&mut exec, &calls);
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r, Ok(ToolStepResult::Succeeded { .. }))),
+            "{results:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.0.join("log.txt")).expect("rewritten target"),
+            "second",
+            "proposal order: the second write is the one that remains"
+        );
+        assert!(!root.0.join("a.txt").exists());
+        assert!(!root.0.join("b.txt").exists());
+    }
+
+    #[test]
+    fn the_rewrite_marker_survives_a_post_hook_and_the_result_is_not_cut() {
+        // A v1 post hook used to re-bound the *whole* result at 256 bytes,
+        // cutting a long read and, with it, the rewrite marker. The bound
+        // applies to the hook's own text; the marker is appended last.
+        let root = TempRoot::new("hook-rewrite-post");
+        let long = "x".repeat(600);
+        fs::write(root.0.join("big.txt"), &long).expect("seed");
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_hooks(crate::hooks::HooksConfig {
+            pre_tool_use: vec![hook_printing(
+                &root.0,
+                "redirect-read.sh",
+                r#"{"decision":"allow","updated_input":{"path":"big.txt"}}"#,
+            )],
+            post_tool_use: vec![hook_printing(&root.0, "note.sh", "formatted")],
+            ..Default::default()
+        });
+        match run_one(
+            &mut tools,
+            &make_call("c1", REPO_READ_TOOL, r#"{"path":"small.txt"}"#),
+        ) {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(
+                    summary.contains(&"x".repeat(500)),
+                    "the read is not cut to 256 bytes: {} bytes",
+                    summary.len()
+                );
+                assert!(summary.contains("[post_tool_use: formatted"), "{summary}");
+                assert!(
+                    summary.ends_with("[hook pre_tool_use[0] rewrote repo_read input]"),
+                    "{}",
+                    &summary[summary.len().saturating_sub(120)..]
+                );
+            }
+            other => panic!("expected the rewritten read to succeed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_identity_rewrite_is_not_a_rewrite() {
+        let root = TempRoot::new("hook-rewrite-identity");
+        let sink = Arc::new(RecordingHookEvents::default());
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_hook_events(sink.clone());
+        // The pass-through idiom: echo the input back as `updated_input`.
+        tools.set_hooks(rewrite_hooks(
+            &root.0,
+            "identity.sh",
+            r#"{"decision":"allow","updated_input":{"path":"same.txt","content":"hi"}}"#,
+        ));
+        match run_one(&mut tools, &write_call("c1", "same.txt")) {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(!summary.contains("rewrote"), "{summary}");
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+        assert!(
+            sink.rewrites
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_reordered_hook_does_not_inherit_the_approval_of_another() {
+        // The approval names the hook by position *and* command digest. A
+        // different command at the same position is a different hook: its
+        // ask is raised, not answered by the old approval.
+        let root = TempRoot::new("hook-ask-reordered");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_approval_source(approvals.clone());
+        tools.set_hooks(ask_hooks(&root.0));
+        let call = write_call("c1", "r.txt");
+        let cancel = CancellationToken::new();
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        assert!(matches!(
+            tools.execute(&validated, &cancel).expect("execute"),
+            ToolStepResult::ApprovalRequired { .. }
+        ));
+        let first = approved(&approvals.requests.lock().unwrap_or_else(|p| p.into_inner())[0]);
+        // The settings file changed: a different asking hook now sits at [0].
+        tools.set_hooks(crate::hooks::HooksConfig {
+            pre_tool_use: vec![hook_printing(
+                &root.0,
+                "other-ask.sh",
+                r#"{"decision":"ask","reason":"a different reviewer"}"#,
+            )],
+            ..Default::default()
+        });
+        assert!(matches!(
+            tools
+                .execute_preapproved_from(&validated, &cancel, Some(&first))
+                .expect("resume"),
+            ToolStepResult::ApprovalRequired { .. }
+        ));
+        assert!(!root.0.join("r.txt").exists());
+        let requests = approvals.requests.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(requests.len(), 2);
+        assert_ne!(
+            requests[0].source, requests[1].source,
+            "different hooks, different sources"
+        );
     }
 
     #[test]

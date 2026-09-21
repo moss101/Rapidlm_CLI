@@ -130,8 +130,14 @@ pub enum PreHookOutcome {
     /// or the v1 stderr).
     Denied { reason: String },
     /// A v2 hook asked for a human decision and no hook denied. `hook`
-    /// names the asking hook (`pre_tool_use[<index>]`).
-    Ask { hook: String, reason: String },
+    /// names the asking hook (`pre_tool_use[<index>]`); `command_digest`
+    /// identifies its command line, so an approval answers this hook and
+    /// not whichever hook later sits at its position.
+    Ask {
+        hook: String,
+        command_digest: String,
+        reason: String,
+    },
 }
 
 /// One v2 decision a hook made, in the shape the ledger records
@@ -400,12 +406,19 @@ pub fn run_pre_tool_stage(
     timeout: Duration,
 ) -> PreHookReport {
     const STAGE: &str = "pre_tool_use";
-    let input = format!(r#"{{"tool":"{tool}","arguments":{arguments}}}"#);
     let mut decisions = Vec::new();
-    let mut ask: Option<(String, String)> = None;
+    let mut ask: Option<(String, String, String)> = None;
     let mut rewrite: Option<HookRewrite> = None;
     for (index, command) in hooks.iter().enumerate() {
         let name = hook_name(STAGE, index);
+        // Each hook sees the call as it currently stands: an earlier hook's
+        // rewrite is what a later hook evaluates (and may ask about), not
+        // the model's original the later hook would otherwise judge blind.
+        let current_arguments = match &rewrite {
+            Some(rewrite) => serde_json::Value::Object(rewrite.input.clone()).to_string(),
+            None => arguments.to_owned(),
+        };
+        let input = format!(r#"{{"tool":"{tool}","arguments":{current_arguments}}}"#);
         let run = run_hook_once(command, &input, timeout);
         if !run.ok {
             // Fail-closed whatever stdout says. A v2 result printed beside
@@ -482,11 +495,19 @@ pub fn run_pre_tool_stage(
         // The last rewriting hook wins (a later hook that rewrites nothing
         // leaves an earlier rewrite standing); a `deny` below discards it.
         if let Some(input) = result.updated_input.clone() {
-            rewrite = Some(HookRewrite {
-                hook: name.clone(),
-                command_digest: command_digest(command),
-                input,
-            });
+            // An `updated_input` equal to what the hook was shown (the
+            // pass-through idiom) is not a rewrite: nothing to journal or
+            // mark.
+            let unchanged = serde_json::from_str::<serde_json::Value>(&current_arguments)
+                .ok()
+                .is_some_and(|shown| shown == serde_json::Value::Object(input.clone()));
+            if !unchanged {
+                rewrite = Some(HookRewrite {
+                    hook: name.clone(),
+                    command_digest: command_digest(command),
+                    input,
+                });
+            }
         }
         match result.decision {
             HookDecision::Allow | HookDecision::Defer => {}
@@ -507,13 +528,17 @@ pub fn run_pre_tool_stage(
                         .reason
                         .filter(|r| !r.is_empty())
                         .unwrap_or_else(|| format!("{name} hook asked for approval"));
-                    ask = Some((name, reason));
+                    ask = Some((name, command_digest(command), reason));
                 }
             }
         }
     }
     let outcome = match ask {
-        Some((hook, reason)) => PreHookOutcome::Ask { hook, reason },
+        Some((hook, command_digest, reason)) => PreHookOutcome::Ask {
+            hook,
+            command_digest,
+            reason,
+        },
         None => PreHookOutcome::Allowed,
     };
     PreHookReport {
@@ -958,6 +983,7 @@ exit 0"#,
             alone.outcome,
             PreHookOutcome::Ask {
                 hook: "pre_tool_use[0]".to_owned(),
+                command_digest: command_digest(&ask),
                 reason: "a human should look at this".to_owned()
             }
         );
@@ -1210,6 +1236,66 @@ exit 0"#,
         let report = run_pre_tool_stage(&[first, ask], "workspace_write", "{}", HOOK_TIMEOUT);
         assert!(matches!(report.outcome, PreHookOutcome::Ask { .. }));
         assert_eq!(report.rewrite.expect("kept").input["path"], "asked.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_later_hook_sees_the_earlier_hooks_rewrite() {
+        let dir = temp("v2-chain");
+        let capture = dir.join("seen.json");
+        let first = result_script(
+            &dir,
+            "first.sh",
+            r#"{"decision":"allow","updated_input":{"path":"redirected.txt","content":"a"}}"#,
+            0,
+        );
+        // The second hook records what it was shown and allows.
+        let second = script(
+            &dir,
+            "second.sh",
+            &format!(
+                "cat > {}\necho '{{\"decision\":\"allow\"}}'\nexit 0",
+                test_fixtures::sh_quote(&capture)
+            ),
+        );
+        let report = run_pre_tool_stage(
+            &[first, second],
+            "workspace_write",
+            r#"{"path":"orig.txt","content":"a"}"#,
+            HOOK_TIMEOUT,
+        );
+        assert_eq!(report.outcome, PreHookOutcome::Allowed);
+        let seen: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(capture).expect("captured"))
+                .expect("json");
+        assert_eq!(seen["arguments"]["path"], "redirected.txt", "{seen}");
+        assert_eq!(
+            report.rewrite.expect("kept").input["path"],
+            "redirected.txt"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_updated_input_equal_to_the_shown_input_is_not_a_rewrite() {
+        let dir = temp("v2-identity");
+        let same = result_script(
+            &dir,
+            "same.sh",
+            r#"{"decision":"allow","updated_input":{"path":"a.txt","content":"x"}}"#,
+            0,
+        );
+        let report = run_pre_tool_stage(
+            std::slice::from_ref(&same),
+            "workspace_write",
+            r#"{"content":"x","path":"a.txt"}"#,
+            HOOK_TIMEOUT,
+        );
+        assert_eq!(report.outcome, PreHookOutcome::Allowed);
+        assert_eq!(
+            report.rewrite, None,
+            "same object (key order aside) is no rewrite"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

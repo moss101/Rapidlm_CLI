@@ -561,6 +561,7 @@ pub struct RecordApproval {
     diff: String,
     detail: String,
     source: Option<String>,
+    arguments_digest: Option<String>,
 }
 
 impl RecordApproval {
@@ -588,6 +589,7 @@ impl RecordApproval {
             diff: String::new(),
             detail: String::new(),
             source: None,
+            arguments_digest: None,
         }
     }
 
@@ -619,6 +621,14 @@ impl RecordApproval {
             &source.into(),
             MAX_APPROVAL_SUMMARY_BYTES,
         ));
+        self
+    }
+
+    /// SHA-256 (lowercase hex) of the exact arguments the human is shown, so
+    /// the resume can prove the call it runs is the call that was approved
+    /// and not a later rewrite of it.
+    pub fn with_arguments_digest(mut self, digest: impl Into<String>) -> Self {
+        self.arguments_digest = Some(bounded_payload_str(&digest.into(), 64));
         self
     }
 
@@ -691,6 +701,11 @@ pub struct ApprovalRequestedPayload {
     /// field existed and on a lattice `Ask` today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// SHA-256 of the arguments the human was shown (`approval.requested`
+    /// carries the summary and diff, not the raw arguments); the resume
+    /// refuses to treat a call with different arguments as approved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments_digest: Option<String>,
 }
 
 /// Wire payload of `approval.resolved`.
@@ -1253,6 +1268,7 @@ impl InProcessKernelClient {
             diff: req.diff.clone(),
             detail: req.detail.clone(),
             source: req.source.clone(),
+            arguments_digest: req.arguments_digest.clone(),
         };
         if let Err(err) = self.ledger.append(
             req.session_id,

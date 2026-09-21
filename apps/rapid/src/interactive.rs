@@ -9197,17 +9197,15 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
                     recorded.tool.clone(),
                     recorded.arguments.clone(),
                 );
-                // Who the human answered: a hook's own ask is skipped on the
-                // resume only when it was that hook's question.
-                let approved_source =
-                    crate::approvals::recorded_request(client, session_id, &token)
-                        .and_then(|payload| payload.source);
+                // What the human answered: a hook's own ask is skipped on the
+                // resume only when it was that hook's question about these
+                // arguments.
+                let approved = crate::approvals::recorded_request(client, session_id, &token)
+                    .map(|payload| crate::approvals::ApprovedAsk::from_payload(&payload));
                 match agent_runtime::ToolDriver::validate(&mut tools, &proposed, cancel) {
-                    Ok(validated) => tools.execute_preapproved_from(
-                        &validated,
-                        cancel,
-                        approved_source.as_deref(),
-                    ),
+                    Ok(validated) => {
+                        tools.execute_preapproved_from(&validated, cancel, approved.as_ref())
+                    }
                     Err(err) => Err(err),
                 }
             }
@@ -9938,6 +9936,7 @@ fn record_outcome_suspension(
                 scope: Vec::new(),
                 diff: String::new(),
                 source: None,
+                arguments_digest: None,
             };
             if let Ok(recorded) = crate::approvals::ApprovalSink::request(&sink, &request) {
                 token = Some(recorded);
@@ -10024,8 +10023,10 @@ struct LedgerHookEvents {
 impl crate::exec_tools::HookEvents for LedgerHookEvents {
     /// `hook.input_rewritten` (`rapidlm.hook.rewrite/v1`): both inputs and
     /// their digests, so a reader can see exactly what the model proposed
-    /// and what ran — the inputs are tool arguments the ledger already
-    /// carries in `tool.requested`, not a new class of secret-bearing text.
+    /// and what ran. The inputs are tool arguments — the same class of text
+    /// `approval.requested` already carries as a diff under the same
+    /// `Project` redaction class; `tool.requested` itself carries only the
+    /// call id and tool name, so this record is where the arguments live.
     fn rewritten(&self, tool: &str, call_id: &str, record: &crate::exec_tools::HookRewriteRecord) {
         let _ = self.client.append_turn_progress(
             self.session_id,
@@ -15669,9 +15670,12 @@ question the panel answers"
             second[0].payload().call_id.clone(),
         );
         assert_eq!(call2, "c2");
-        assert_eq!(
-            second[0].payload().source.as_deref(),
-            Some("hook:pre_tool_use[0]")
+        assert!(
+            second[0]
+                .payload()
+                .source
+                .as_deref()
+                .is_some_and(|s| s.starts_with("hook:pre_tool_use[0]#"))
         );
         // The continuation recorded its own suspension: the resume can load it.
         assert!(
@@ -15744,7 +15748,7 @@ question the panel answers"
         let outputs = command_outputs(loop_state.ui);
         assert!(
             outputs.iter().any(|line| line
-                .contains("`remember` is not offered for a hook's ask (hook:pre_tool_use[0])")),
+                .contains("`remember` is not offered for a hook's ask (hook:pre_tool_use[0]#")),
             "{outputs:?}"
         );
         // Nothing was approved or persisted.
@@ -15825,9 +15829,12 @@ question the panel answers"
         .expect("pendings");
         assert_eq!(pendings.len(), 1);
         assert_eq!(pendings[0].payload().id, token);
-        assert_eq!(
-            pendings[0].payload().source.as_deref(),
-            Some("hook:pre_tool_use[0]")
+        assert!(
+            pendings[0]
+                .payload()
+                .source
+                .as_deref()
+                .is_some_and(|s| s.starts_with("hook:pre_tool_use[0]#"))
         );
         let call_id = pendings[0].payload().call_id.clone();
         let tip = block_on(session.client.get_session(session.session_id), &cancel)

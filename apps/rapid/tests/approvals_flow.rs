@@ -460,7 +460,12 @@ fn a_hook_ask_with_a_sink_suspends_records_its_source_and_a_restart_resumes_the_
     assert_eq!(pendings.len(), 1);
     let payload = pendings[0].payload();
     assert_eq!(payload.tool, "workspace_write");
-    assert_eq!(payload.source.as_deref(), Some("hook:pre_tool_use[0]"));
+    assert!(
+        payload
+            .source
+            .as_deref()
+            .is_some_and(|s| s.starts_with("hook:pre_tool_use[0]#"))
+    );
     // The call comes first — a human approving must see what runs — then
     // the hook and its reason.
     assert_eq!(
@@ -475,9 +480,12 @@ fn a_hook_ask_with_a_sink_suspends_records_its_source_and_a_restart_resumes_the_
     let reopened = InProcessKernelClient::open(ledger_path(&project.root)).expect("reopens");
     let pendings = call(reopened.pending_approvals(session)).expect("pendings");
     assert_eq!(pendings.len(), 1);
-    assert_eq!(
-        pendings[0].payload().source.as_deref(),
-        Some("hook:pre_tool_use[0]")
+    assert!(
+        pendings[0]
+            .payload()
+            .source
+            .as_deref()
+            .is_some_and(|s| s.starts_with("hook:pre_tool_use[0]#"))
     );
     let token = pendings[0].payload().id.clone();
     call(
@@ -512,13 +520,20 @@ fn a_hook_ask_with_a_sink_suspends_records_its_source_and_a_restart_resumes_the_
         agent_runtime::ToolDriver::validate(&mut fresh_tools, &proposed, &cancel).expect("valid");
     // The resuming surface passes the approval's recorded source, so the
     // hook's (identical) ask is the one the human answered.
-    let approved_source = rapid::approvals::recorded_request(&reopened, session, &token)
-        .and_then(|payload| payload.source)
-        .expect("the resolved approval's record still names its source");
-    assert_eq!(approved_source, "hook:pre_tool_use[0]");
+    let approved = rapid::approvals::recorded_request(&reopened, session, &token)
+        .map(|payload| rapid::approvals::ApprovedAsk::from_payload(&payload))
+        .expect("the resolved approval's record is still readable");
+    assert!(
+        approved
+            .source
+            .as_deref()
+            .is_some_and(|s| s.starts_with("hook:pre_tool_use[0]#")),
+        "{approved:?}"
+    );
+    assert!(approved.covers(proposed.arguments()));
     let executed = fresh_tools
         .inner
-        .execute_preapproved_from(&validated, &cancel, Some(&approved_source))
+        .execute_preapproved_from(&validated, &cancel, Some(&approved))
         .expect("executes");
     assert!(matches!(
         executed,
@@ -536,24 +551,32 @@ fn a_hook_ask_with_a_sink_suspends_records_its_source_and_a_restart_resumes_the_
     );
 }
 
-/// Two asks recorded concurrently — a tool batch runs its calls on threads —
-/// both land: the sink re-reads the session tip on a sequence conflict
-/// rather than telling the loser there is no approval surface.
+/// Asks recorded concurrently through *independent* sinks — the interactive
+/// turn's sink and the one a continuation's suspension record creates, or two
+/// surfaces on one session — all land: each sink serialises its own requests,
+/// and across sinks the retry re-reads the session tip on a sequence conflict
+/// rather than telling the loser there is no approval surface. (Two sinks, so
+/// the conflicts are real: one shared sink would serialise everything and the
+/// retry would never run.)
 #[test]
 fn concurrent_approval_requests_both_land_despite_sequence_conflicts() {
     let project = project("concurrent-asks");
     let (client, session) = open_session(&project.root);
-    let sink = Arc::new(rapid::approvals::LedgerApprovalSink::new(
-        client.clone(),
-        session,
-        actor(),
-        project.root.clone(),
-    ));
+    let sinks: Vec<Arc<rapid::approvals::LedgerApprovalSink>> = (0..2)
+        .map(|_| {
+            Arc::new(rapid::approvals::LedgerApprovalSink::new(
+                client.clone(),
+                session,
+                actor(),
+                project.root.clone(),
+            ))
+        })
+        .collect();
     let rounds = 12;
     let mut handles = Vec::new();
     for round in 0..rounds {
         for side in 0..2 {
-            let sink = Arc::clone(&sink);
+            let sink = Arc::clone(&sinks[side]);
             handles.push(std::thread::spawn(move || {
                 sink.request(&rapid::approvals::ApprovalRequest {
                     tool: "repo_read".to_owned(),
@@ -561,7 +584,8 @@ fn concurrent_approval_requests_both_land_despite_sequence_conflicts() {
                     summary: format!("read file {round}-{side}"),
                     scope: Vec::new(),
                     diff: String::new(),
-                    source: Some("hook:pre_tool_use[0]".to_owned()),
+                    source: Some("hook:pre_tool_use[0]#0123456789ab".to_owned()),
+                    arguments_digest: None,
                 })
             }));
         }
@@ -580,7 +604,7 @@ fn concurrent_approval_requests_both_land_despite_sequence_conflicts() {
     assert!(
         pendings
             .iter()
-            .all(|p| p.payload().source.as_deref() == Some("hook:pre_tool_use[0]"))
+            .all(|p| p.payload().source.as_deref() == Some("hook:pre_tool_use[0]#0123456789ab"))
     );
 }
 
@@ -820,6 +844,7 @@ fn a_clarification_is_pending_until_answered_then_continues() {
             scope: Vec::new(),
             diff: String::new(),
             source: None,
+            arguments_digest: None,
         })
         .expect("records");
     let suspended = rapid::approvals::SuspendedTurn {

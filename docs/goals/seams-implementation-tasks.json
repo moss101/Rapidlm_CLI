@@ -220,7 +220,8 @@
         "apps/rapid/src/exec_tools.rs \u2014 apply_hook_rewrite, arguments_parse, HookRewriteRecord; tests a_valid_rewrite_runs_the_rewritten_call_journals_both_inputs_and_marks_the_result, a_rewrite_that_fails_the_tools_arguments_is_denied_naming_the_hook, a_rewrite_cannot_widen_what_policy_allows, a_hook_ask_with_a_rewrite_shows_the_human_the_rewritten_call",
         "apps/rapid/src/interactive.rs \u2014 LedgerHookEvents::rewritten (hook.input_rewritten); test a_hook_rewrite_reaches_the_ledger_with_both_inputs_and_marks_the_transcript",
         "crates/tui \u2014 ToolActivityStatus::Rewritten projected from hook.input_rewritten",
-        "revert cycle: rewrite ignored at dispatch \u2192 five rewrite tests fail"
+        "revert cycle: rewrite ignored at dispatch \u2192 five rewrite tests fail",
+        "follow-up fix after the 9253341/9ee5f45 self-review: approvals carry arguments_digest and a digest-qualified hook source; an Ask-class rewritten call is raised, not run on an earlier approval; ask_user exempt in the rewrite check; hooked writes serialise; post-hook bound only its own text and the marker is last; rewrite recorded only on dispatch; chained hook input; identity rewrites ignored \u2014 docs/goal-delivery-2026-09-20.md \u00a7 Self-review of 9253341 + 9ee5f45"
       ]
     },
     {

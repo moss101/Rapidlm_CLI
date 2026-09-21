@@ -44,9 +44,46 @@ pub struct ApprovalRequest {
     pub scope: Vec<String>,
     pub diff: String,
     /// Who raised the ask when it was not the permission lattice — a hook
-    /// (`hook:pre_tool_use[0]`), later a plan or an elicitation (ADR 0022
-    /// §3). `None` for a lattice `Ask`.
+    /// (`hook:pre_tool_use[0]#<command digest>`), later a plan or an
+    /// elicitation (ADR 0022 §3). `None` for a lattice `Ask`.
     pub source: Option<String>,
+    /// SHA-256 of the arguments this request describes — what the human is
+    /// approving. The resume runs a call only when its arguments match.
+    pub arguments_digest: Option<String>,
+}
+
+/// Lowercase hex SHA-256 of `arguments` — the digest approvals and hook
+/// records use for tool arguments.
+pub fn arguments_digest(arguments: &str) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(arguments.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// What the human approved, read back from the resolved `approval.requested`
+/// record for the resume: who asked and the digest of the arguments shown.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ApprovedAsk {
+    pub source: Option<String>,
+    pub arguments_digest: Option<String>,
+}
+
+impl ApprovedAsk {
+    pub fn from_payload(payload: &ApprovalRequestedPayload) -> Self {
+        Self {
+            source: payload.source.clone(),
+            arguments_digest: payload.arguments_digest.clone(),
+        }
+    }
+
+    /// Whether `arguments` are the arguments the human was shown. A record
+    /// without a digest (written before the field existed) matches nothing —
+    /// fail closed: the call is asked about again rather than assumed.
+    pub fn covers(&self, arguments: &str) -> bool {
+        self.arguments_digest.as_deref() == Some(arguments_digest(arguments).as_str())
+    }
 }
 
 /// Records a pending approval durably. Returns the wait token the request was
@@ -398,6 +435,7 @@ pub fn build_request(tool: &str, call_id: &str, arguments: &str, root: &Path) ->
         scope,
         diff,
         source: None,
+        arguments_digest: Some(arguments_digest(arguments)),
     }
 }
 
@@ -419,6 +457,7 @@ pub fn build_hook_ask_request(
     arguments: &str,
     root: &Path,
     hook: &str,
+    command_digest: &str,
     reason: &str,
 ) -> ApprovalRequest {
     let mut request = build_request(tool, call_id, arguments, root);
@@ -432,8 +471,15 @@ pub fn build_hook_ask_request(
         reason.push('…');
     }
     request.summary = format!("{} — {hook} hook asks: {reason}", request.summary);
-    request.source = Some(format!("hook:{hook}"));
+    request.source = Some(hook_source(hook, command_digest));
     request
+}
+
+/// The `source` a hook's ask carries: the hook's position *and* the digest
+/// of its command line, so an approval answers the hook that asked — not
+/// whichever hook sits at that position after the settings file changed.
+pub fn hook_source(hook: &str, command_digest: &str) -> String {
+    format!("hook:{hook}#{command_digest}")
 }
 
 /// The sink the interactive surface installs on `ExecTools`: every pending
@@ -482,9 +528,17 @@ impl LedgerApprovalSink {
     }
 }
 
-fn with_source(record: kernel::RecordApproval, source: Option<&str>) -> kernel::RecordApproval {
-    match source {
+fn with_source(
+    record: kernel::RecordApproval,
+    source: Option<&str>,
+    arguments_digest: Option<&str>,
+) -> kernel::RecordApproval {
+    let record = match source {
         Some(source) => record.with_source(source),
+        None => record,
+    };
+    match arguments_digest {
+        Some(digest) => record.with_arguments_digest(digest),
         None => record,
     }
 }
@@ -492,8 +546,11 @@ fn with_source(record: kernel::RecordApproval, source: Option<&str>) -> kernel::
 /// How many times a request re-reads the session tip after another writer
 /// advanced it. A tool batch runs its calls on threads, so two hook asks
 /// (or an ask beside a job's progress event) can both read the same tip;
-/// the loser must not be told there is no approval surface.
-const REQUEST_SEQUENCE_RETRIES: usize = 8;
+/// the loser must not be told there is no approval surface. Generous: a
+/// writer can lose every race to a neighbour that keeps appending (a second
+/// sink's whole batch, a job spooling output), and each retry is one cheap
+/// local read.
+const REQUEST_SEQUENCE_RETRIES: usize = 64;
 
 impl ApprovalSink for LedgerApprovalSink {
     fn request(&self, request: &ApprovalRequest) -> Result<String, String> {
@@ -523,6 +580,7 @@ impl ApprovalSink for LedgerApprovalSink {
                     .with_scope(request.scope.clone())
                     .with_diff(request.diff.clone()),
                     request.source.as_deref(),
+                    request.arguments_digest.as_deref(),
                 )),
             )?;
             match outcome {
@@ -732,9 +790,17 @@ mod tests {
             r#"{"argv":["rm","-rf","build"]}"#,
             &root,
             "pre_tool_use[0]",
+            "0123456789ab",
             &long,
         );
-        assert_eq!(request.source.as_deref(), Some("hook:pre_tool_use[0]"));
+        assert_eq!(
+            request.source.as_deref(),
+            Some("hook:pre_tool_use[0]#0123456789ab")
+        );
+        assert_eq!(
+            request.arguments_digest.as_deref(),
+            Some(arguments_digest(r#"{"argv":["rm","-rf","build"]}"#).as_str())
+        );
         assert!(
             request.summary.starts_with("run: rm -rf build"),
             "{}",
@@ -759,6 +825,7 @@ mod tests {
             r#"{"path":"a.txt"}"#,
             &root,
             "pre_tool_use[1]",
+            "abcdef012345",
             "look",
         );
         assert!(
