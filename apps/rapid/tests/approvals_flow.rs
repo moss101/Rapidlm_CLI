@@ -454,24 +454,18 @@ fn a_hook_ask_with_a_sink_suspends_records_its_source_and_a_restart_resumes_the_
     assert_eq!(result.suspension().expect("suspends").call_id(), "c1");
     assert!(!project.root.join("notes/plan.txt").exists());
 
-    // The pending approval names the hook — as its source and first in the
-    // summary — and still carries the call's own action, scope and diff.
+    // The pending approval names the hook as its source and in the summary,
+    // after the call's own action; scope and diff are the call's.
     let pendings = call(client.pending_approvals(session)).expect("pendings");
     assert_eq!(pendings.len(), 1);
     let payload = pendings[0].payload();
     assert_eq!(payload.tool, "workspace_write");
     assert_eq!(payload.source.as_deref(), Some("hook:pre_tool_use[0]"));
-    assert!(
-        payload
-            .summary
-            .starts_with("pre_tool_use[0] hook asks: notes need a reviewer — "),
-        "{}",
-        payload.summary
-    );
-    assert!(
-        payload.summary.contains("notes/plan.txt"),
-        "{}",
-        payload.summary
+    // The call comes first — a human approving must see what runs — then
+    // the hook and its reason.
+    assert_eq!(
+        payload.summary,
+        "create notes/plan.txt — pre_tool_use[0] hook asks: notes need a reviewer"
     );
     assert_eq!(payload.scope, vec!["notes/plan.txt".to_owned()]);
     assert!(payload.diff.contains("the plan"));
@@ -516,9 +510,15 @@ fn a_hook_ask_with_a_sink_suspends_records_its_source_and_a_restart_resumes_the_
     fresh_tools.inner.set_hooks(hooks);
     let validated =
         agent_runtime::ToolDriver::validate(&mut fresh_tools, &proposed, &cancel).expect("valid");
+    // The resuming surface passes the approval's recorded source, so the
+    // hook's (identical) ask is the one the human answered.
+    let approved_source = rapid::approvals::recorded_request(&reopened, session, &token)
+        .and_then(|payload| payload.source)
+        .expect("the resolved approval's record still names its source");
+    assert_eq!(approved_source, "hook:pre_tool_use[0]");
     let executed = fresh_tools
         .inner
-        .execute_preapproved(&validated, &cancel)
+        .execute_preapproved_from(&validated, &cancel, Some(&approved_source))
         .expect("executes");
     assert!(matches!(
         executed,
@@ -533,6 +533,54 @@ fn a_hook_ask_with_a_sink_suspends_records_its_source_and_a_restart_resumes_the_
             .expect("pendings")
             .is_empty(),
         "the answered ask must not be asked again"
+    );
+}
+
+/// Two asks recorded concurrently — a tool batch runs its calls on threads —
+/// both land: the sink re-reads the session tip on a sequence conflict
+/// rather than telling the loser there is no approval surface.
+#[test]
+fn concurrent_approval_requests_both_land_despite_sequence_conflicts() {
+    let project = project("concurrent-asks");
+    let (client, session) = open_session(&project.root);
+    let sink = Arc::new(rapid::approvals::LedgerApprovalSink::new(
+        client.clone(),
+        session,
+        actor(),
+        project.root.clone(),
+    ));
+    let rounds = 12;
+    let mut handles = Vec::new();
+    for round in 0..rounds {
+        for side in 0..2 {
+            let sink = Arc::clone(&sink);
+            handles.push(std::thread::spawn(move || {
+                sink.request(&rapid::approvals::ApprovalRequest {
+                    tool: "repo_read".to_owned(),
+                    call_id: format!("c{round}-{side}"),
+                    summary: format!("read file {round}-{side}"),
+                    scope: Vec::new(),
+                    diff: String::new(),
+                    source: Some("hook:pre_tool_use[0]".to_owned()),
+                })
+            }));
+        }
+    }
+    let outcomes: Vec<Result<String, String>> = handles
+        .into_iter()
+        .map(|h| h.join().expect("thread"))
+        .collect();
+    let failures: Vec<&String> = outcomes.iter().filter_map(|o| o.as_ref().err()).collect();
+    assert!(
+        failures.is_empty(),
+        "every request must be recorded: {failures:?}"
+    );
+    let pendings = call(client.pending_approvals(session)).expect("pendings");
+    assert_eq!(pendings.len(), rounds * 2);
+    assert!(
+        pendings
+            .iter()
+            .all(|p| p.payload().source.as_deref() == Some("hook:pre_tool_use[0]"))
     );
 }
 

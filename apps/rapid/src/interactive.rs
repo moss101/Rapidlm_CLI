@@ -4295,7 +4295,11 @@ run without --continue to start one"
                 // every `Ask`, here for hook asks only — a permission `Ask`
                 // keeps its typed denial on this surface (S11). The run then
                 // ends `NeedsApproval` and names the surface that resolves it.
-                if let Some((root, _)) = workspace.as_ref() {
+                // Not under a forced mode: `rapid cron` fires prompts as
+                // unattended Plan-mode turns, and a parked turn nobody will
+                // resume is worse than the stated denial it gets without a
+                // sink.
+                if let (Some((root, _)), None) = (workspace.as_ref(), forced_mode) {
                     tools.set_hook_ask_source(std::sync::Arc::new(
                         crate::approvals::LedgerApprovalSink::new(
                             recording.client.clone(),
@@ -6187,6 +6191,22 @@ denied\n",
                         "/approvals: `remember` is not offered for shell_exec — a remembered shell grant from one command would match that command with anything appended. Pre-approve a scoped pattern instead: `rapid permissions allow 'shell_exec(git *)'`"
                             .to_owned(),
                     );
+                    return Ok(());
+                }
+                if remember
+                    && item
+                        .payload()
+                        .source
+                        .as_deref()
+                        .is_some_and(|source| source.starts_with("hook:"))
+                {
+                    // A persisted grant is a *permission* grant; a hook is not
+                    // the lattice and will ask again. Saying "remembered" here
+                    // would be untrue.
+                    self.append_command_error(format!(
+                        "/approvals: `remember` is not offered for a hook's ask ({}) — a persisted grant answers the permission lattice, and the hook would ask again next time; approve once, or change the hook",
+                        item.payload().source.as_deref().unwrap_or_default()
+                    ));
                     return Ok(());
                 }
                 if remember && let Some(pattern) = remembered_pattern(item.payload()) {
@@ -9177,12 +9197,56 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
                     recorded.tool.clone(),
                     recorded.arguments.clone(),
                 );
+                // Who the human answered: a hook's own ask is skipped on the
+                // resume only when it was that hook's question.
+                let approved_source =
+                    crate::approvals::recorded_request(client, session_id, &token)
+                        .and_then(|payload| payload.source);
                 match agent_runtime::ToolDriver::validate(&mut tools, &proposed, cancel) {
-                    Ok(validated) => tools.execute_preapproved(&validated, cancel),
+                    Ok(validated) => tools.execute_preapproved_from(
+                        &validated,
+                        cancel,
+                        approved_source.as_deref(),
+                    ),
                     Err(err) => Err(err),
                 }
             }
         };
+        // The resumed call raised a question of its own (a hook's ask after
+        // a lattice approval): the turn pauses again on the same recorded
+        // history, under the new approval — not a failure fed to the model.
+        if let Ok(agent_runtime::ToolStepResult::ApprovalRequired { call_id: paused }) = &outcome {
+            match crate::approvals::pending_token_for_call(client, session_id, paused.as_str()) {
+                Some(new_token) => {
+                    let tool = crate::approvals::requested_payload(client, session_id, &new_token)
+                        .map(|payload| payload.tool)
+                        .unwrap_or_default();
+                    if let Err(reason) = crate::approvals::record_suspension(
+                        client,
+                        session_id,
+                        actor,
+                        &new_token,
+                        paused.as_str(),
+                        &tool,
+                        &suspended,
+                    ) {
+                        notify(
+                            &shared.notices,
+                            &format!(
+                                "the paused turn's resumable state was not recorded: {reason}"
+                            ),
+                        );
+                    }
+                    return kernel::TurnOutcome::Waiting;
+                }
+                None => {
+                    return kernel::TurnOutcome::Failed {
+                        reason: "the resumed call asked for approval but no approval was recorded"
+                            .to_owned(),
+                    };
+                }
+            }
+        }
         let result = match outcome {
             Ok(result) => result,
             Err(agent_runtime::ToolStepError::Cancelled) => {
@@ -9267,6 +9331,9 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
         resolved,
     );
     if let Ok(outcome) = &run_result {
+        // A continuation can pause again (the next call a hook asks about):
+        // its suspension is recorded like the first turn's.
+        record_outcome_suspension(client, session_id, actor, root, &suspended.task, outcome);
         record_turn_context(client, session_id, actor, outcome, history_through);
     }
     kernel_turn_outcome(&run_result)
@@ -9806,67 +9873,7 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
         None,
     );
     if let Ok(outcome) = &run_result {
-        // Persist the suspension before the turn's terminal event: a resume
-        // (this process or a restarted one) replays it from the ledger.
-        if let Some(suspension) = &outcome.suspension {
-            let mut token =
-                crate::approvals::pending_token_for_call(client, session_id, suspension.call_id());
-            // A clarification (the model's own `ask_user`) suspends without a
-            // permission `Ask`, so no approval was pre-recorded: record the
-            // question as a pending approval now so the same durable wait —
-            // listing, resolution, restart survival — serves both flows.
-            if token.is_none()
-                && suspension.reason() == agent_runtime::TurnStopReason::ContextRequired
-            {
-                let question = outcome
-                    .failure_detail
-                    .as_ref()
-                    .map(|detail| detail.error().to_owned())
-                    .unwrap_or_else(|| "the model asked a question".to_owned());
-                let sink = crate::approvals::LedgerApprovalSink::new(
-                    client.clone(),
-                    session_id,
-                    actor.clone(),
-                    root.to_path_buf(),
-                );
-                let request = crate::approvals::ApprovalRequest {
-                    tool: "ask_user".to_owned(),
-                    call_id: suspension.call_id().to_owned(),
-                    summary: question,
-                    scope: Vec::new(),
-                    diff: String::new(),
-                    source: None,
-                };
-                if let Ok(recorded) = crate::approvals::ApprovalSink::request(&sink, &request) {
-                    token = Some(recorded);
-                }
-            }
-            if let Some(token) = token {
-                let suspended = crate::approvals::SuspendedTurn {
-                    task: text.to_owned(),
-                    call_id: suspension.call_id().to_owned(),
-                    reason: suspension.reason().as_str().to_owned(),
-                    omitted_earlier_steps: suspension.omitted_earlier_steps(),
-                    history: crate::approvals::SuspendedHistory::from_agent(suspension.history()),
-                };
-                let tool = crate::approvals::requested_payload(client, session_id, &token)
-                    .map(|payload| payload.tool)
-                    .unwrap_or_default();
-                // No in-thread notice channel reaches this body (`shared`
-                // is the loop's); a failed record leaves the approval
-                // pending but unresumable, and the resume path's own
-                // "could not be loaded" failure is the visible feedback.
-                let _ = crate::approvals::record_suspension(
-                    client,
-                    session_id,
-                    actor,
-                    &token,
-                    suspension.call_id(),
-                    &tool,
-                    &suspended,
-                );
-            }
-        }
+        record_outcome_suspension(client, session_id, actor, root, text, outcome);
         record_turn_context(client, session_id, actor, outcome, history_through);
     }
     if let (Ok(outcome), Some(goal_id)) = (&run_result, goal_id) {
@@ -9881,6 +9888,87 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
     }
 
     kernel_turn_outcome(&run_result)
+}
+
+/// Persist a paused turn's exact mid-state under the approval the pause
+/// recorded, before the turn's terminal event, so a resume — this process, a
+/// restarted one, a headless run's `rapid resume` — replays it from the
+/// ledger. A clarification (the model's own `ask_user`) suspends without a
+/// pre-recorded approval, so its question is recorded as one here.
+///
+/// One function for every turn that can pause: the first turn
+/// (`execute_interactive_turn`) and a continuation (`continuation_turn_inner`)
+/// — a continuation used to record nothing, so the *second* ask of a turn
+/// (a hook asking on every write, the canonical use) left an approval that
+/// resolved into "resumable state could not be loaded".
+fn record_outcome_suspension(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    text: &str,
+    outcome: &crate::host::ExecOutcome,
+) {
+    // Persist the suspension before the turn's terminal event: a resume
+    // (this process or a restarted one) replays it from the ledger.
+    if let Some(suspension) = &outcome.suspension {
+        let mut token =
+            crate::approvals::pending_token_for_call(client, session_id, suspension.call_id());
+        // A clarification (the model's own `ask_user`) suspends without a
+        // permission `Ask`, so no approval was pre-recorded: record the
+        // question as a pending approval now so the same durable wait —
+        // listing, resolution, restart survival — serves both flows.
+        if token.is_none() && suspension.reason() == agent_runtime::TurnStopReason::ContextRequired
+        {
+            let question = outcome
+                .failure_detail
+                .as_ref()
+                .map(|detail| detail.error().to_owned())
+                .unwrap_or_else(|| "the model asked a question".to_owned());
+            let sink = crate::approvals::LedgerApprovalSink::new(
+                client.clone(),
+                session_id,
+                actor.clone(),
+                root.to_path_buf(),
+            );
+            let request = crate::approvals::ApprovalRequest {
+                tool: "ask_user".to_owned(),
+                call_id: suspension.call_id().to_owned(),
+                summary: question,
+                scope: Vec::new(),
+                diff: String::new(),
+                source: None,
+            };
+            if let Ok(recorded) = crate::approvals::ApprovalSink::request(&sink, &request) {
+                token = Some(recorded);
+            }
+        }
+        if let Some(token) = token {
+            let suspended = crate::approvals::SuspendedTurn {
+                task: text.to_owned(),
+                call_id: suspension.call_id().to_owned(),
+                reason: suspension.reason().as_str().to_owned(),
+                omitted_earlier_steps: suspension.omitted_earlier_steps(),
+                history: crate::approvals::SuspendedHistory::from_agent(suspension.history()),
+            };
+            let tool = crate::approvals::requested_payload(client, session_id, &token)
+                .map(|payload| payload.tool)
+                .unwrap_or_default();
+            // No in-thread notice channel reaches this body (`shared`
+            // is the loop's); a failed record leaves the approval
+            // pending but unresumable, and the resume path's own
+            // "could not be loaded" failure is the visible feedback.
+            let _ = crate::approvals::record_suspension(
+                client,
+                session_id,
+                actor,
+                &token,
+                suspension.call_id(),
+                &tool,
+                &suspended,
+            );
+        }
+    }
 }
 
 /// Attach the ledger-backed observers a recorded session needs, so that
@@ -15404,6 +15492,275 @@ question the panel answers"
         assert_ne!(payload["before_digest"], payload["after_digest"]);
     }
 
+    /// A scripted model whose continuation proposes a second write and then
+    /// answers — the shape of "a hook asks on every write" across a turn.
+    fn second_write_then_answer(path: &str, content: &str, answer: &str) -> ScriptedModel {
+        let call = ProposedToolCall::new(
+            "c2",
+            crate::exec_tools::WORKSPACE_WRITE_TOOL,
+            serde_json::to_string(&serde_json::json!({ "path": path, "content": content }))
+                .expect("encode write args"),
+        )
+        .expect("call");
+        ScriptedModel {
+            outputs: VecDeque::from(vec![
+                Ok(ModelStepOutput::ToolCalls {
+                    calls: vec![call],
+                    tokens: 1,
+                    cost_usd_micros: None,
+                }),
+                Ok(ModelStepOutput::Terminal {
+                    text: answer.to_owned(),
+                    tokens: 1,
+                    cost_usd_micros: None,
+                }),
+            ]),
+            ..ScriptedModel::terminal(answer)
+        }
+    }
+
+    fn approve_and_continue(
+        session: &ScriptedSession,
+        token: &str,
+        call_id: &str,
+        backing: ScriptedModel,
+    ) -> kernel::TurnOutcome {
+        let cancel = CancellationToken::new();
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        block_on(
+            session.client.approve(
+                kernel::ResolveApproval::new(
+                    session.session_id,
+                    tip,
+                    kernel::ApprovalDecision::Approved,
+                    session.actor.clone(),
+                    TraceId::new(),
+                )
+                .with_wait_token(token),
+            ),
+            &cancel,
+        )
+        .expect("approve");
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        let handle = block_on(
+            session.client.submit_turn(SubmitTurn::new(
+                session.session_id,
+                tip,
+                session.actor.clone(),
+                TraceId::new(),
+                "",
+            )),
+            &cancel,
+        )
+        .expect("continuation submitted");
+        let outcome = run_continuation_turn_inner_with_backing(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &session.root,
+            true,
+            &agent_runtime::CancellationToken::new(),
+            &session.jobs,
+            &session.shared,
+            token.to_owned(),
+            call_id.to_owned(),
+            ContinuationDecision::Execute,
+            backing,
+            (
+                crate::user_config::DEFAULT_CONTEXT_WINDOW,
+                crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS,
+            ),
+        );
+        session
+            .client
+            .finish_turn(kernel::FinishTurn::new(
+                session.session_id,
+                handle.turn_id(),
+                session.actor.clone(),
+                TraceId::new(),
+                outcome.clone(),
+            ))
+            .expect("finish");
+        outcome
+    }
+
+    #[test]
+    fn a_continuation_that_pauses_again_records_its_own_suspension_and_resumes() {
+        // "A hook asks on every write" across one turn: the first ask is
+        // approved, the continuation writes file 1, proposes file 2, the
+        // hook asks again — and that second pause must be as resumable as
+        // the first (it used to leave an approval whose resume failed with
+        // "resumable state could not be loaded").
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let hook = root.join("ask.sh");
+        fs::write(
+            &hook,
+            "echo '{\"decision\":\"ask\",\"reason\":\"every write is reviewed\"}'\nexit 0\n",
+        )
+        .expect("hook script");
+        fs::write(
+            root.join(PROJECT_MARKER).join("settings.json"),
+            serde_json::json!({
+                "hooks": { "pre_tool_use": [format!("sh {}", test_fixtures::slash_path(&hook))] }
+            })
+            .to_string(),
+        )
+        .expect("settings");
+        let mut session = ScriptedSession::create(&env);
+        // The continuation resolves the real lattice (the first turn's seam
+        // forces a permissive one); the session override keeps the lattice
+        // out of the way so the second pause is the hook's.
+        *session
+            .shared
+            .permission_mode_override
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) =
+            Some(crate::permissions::PermissionMode::BypassPermissions);
+        session.run_turn(
+            "write two files",
+            ScriptedModel::write_then_answer("one.txt", "1", "unreachable"),
+        );
+        let cancel = CancellationToken::new();
+        let first = block_on(
+            session.client.pending_approvals(session.session_id),
+            &cancel,
+        )
+        .expect("pendings");
+        assert_eq!(first.len(), 1);
+        let (token1, call1) = (
+            first[0].payload().id.clone(),
+            first[0].payload().call_id.clone(),
+        );
+
+        // Approve #1: the continuation writes one.txt, then pauses on two.txt.
+        let outcome = approve_and_continue(
+            &session,
+            &token1,
+            &call1,
+            second_write_then_answer("two.txt", "2", "both written"),
+        );
+        assert_eq!(
+            outcome,
+            kernel::TurnOutcome::Waiting,
+            "the second ask pauses the continuation"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("one.txt")).expect("first write landed"),
+            "1"
+        );
+        assert!(
+            !root.join("two.txt").exists(),
+            "the second write waits for its answer"
+        );
+        let second = block_on(
+            session.client.pending_approvals(session.session_id),
+            &cancel,
+        )
+        .expect("pendings");
+        assert_eq!(second.len(), 1, "{second:?}");
+        let (token2, call2) = (
+            second[0].payload().id.clone(),
+            second[0].payload().call_id.clone(),
+        );
+        assert_eq!(call2, "c2");
+        assert_eq!(
+            second[0].payload().source.as_deref(),
+            Some("hook:pre_tool_use[0]")
+        );
+        // The continuation recorded its own suspension: the resume can load it.
+        assert!(
+            crate::approvals::recorded_suspension(&session.client, session.session_id, &token2)
+                .is_some(),
+            "the second pause must be resumable"
+        );
+
+        // Approve #2: the second continuation writes two.txt and completes.
+        let outcome = approve_and_continue(
+            &session,
+            &token2,
+            &call2,
+            ScriptedModel::terminal("both written"),
+        );
+        assert!(
+            matches!(outcome, kernel::TurnOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("two.txt")).expect("second write landed"),
+            "2"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("one.txt")).expect("first intact"),
+            "1"
+        );
+        assert!(
+            block_on(
+                session.client.pending_approvals(session.session_id),
+                &cancel
+            )
+            .expect("pendings")
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn remember_is_refused_for_a_hooks_ask() {
+        // A persisted grant answers the permission lattice; a hook is not the
+        // lattice and asks again — so "remembered" would be untrue.
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let hook = root.join("ask.sh");
+        fs::write(
+            &hook,
+            "echo '{\"decision\":\"ask\",\"reason\":\"look\"}'\nexit 0\n",
+        )
+        .expect("hook");
+        fs::write(
+            root.join(PROJECT_MARKER).join("settings.json"),
+            serde_json::json!({
+                "hooks": { "pre_tool_use": [format!("sh {}", test_fixtures::slash_path(&hook))] }
+            })
+            .to_string(),
+        )
+        .expect("settings");
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "write notes.txt",
+            ScriptedModel::write_then_answer("notes.txt", "n", "done"),
+        );
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        loop_state.drain().expect("drain");
+        loop_state
+            .dispatch_slash("/approvals approve 1 remember")
+            .expect("dispatch");
+        let outputs = command_outputs(loop_state.ui);
+        assert!(
+            outputs.iter().any(|line| line
+                .contains("`remember` is not offered for a hook's ask (hook:pre_tool_use[0])")),
+            "{outputs:?}"
+        );
+        // Nothing was approved or persisted.
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            block_on(
+                session.client.pending_approvals(session.session_id),
+                &cancel
+            )
+            .expect("pendings")
+            .len(),
+            1
+        );
+        assert!(!root.join("notes.txt").exists());
+    }
+
     #[test]
     fn a_hook_ask_pauses_an_interactive_turn_on_the_approval_surface_and_approval_continues_it() {
         // SEAM-01 AC-03 on the TUI: a v2 hook's `ask` becomes a pending
@@ -15453,7 +15810,7 @@ question the panel answers"
         assert!(
             projection
                 .summary()
-                .is_some_and(|s| s.starts_with("pre_tool_use[0] hook asks: notes need a reviewer")),
+                .is_some_and(|s| s.ends_with(" — pre_tool_use[0] hook asks: notes need a reviewer")),
             "{projection:?}"
         );
         let token = key.to_string();

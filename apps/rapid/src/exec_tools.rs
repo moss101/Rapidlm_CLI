@@ -2308,6 +2308,20 @@ impl WorkspaceTools {
         call: &ValidatedToolCall,
         cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
+        self.execute_preapproved_from(call, cancel, None)
+    }
+
+    /// [`Self::execute_preapproved`] for an approval whose `source` is known:
+    /// a hook's ask is skipped on the resume only when it is *this* hook's
+    /// question the human answered (`approved_source == "hook:<name>"`); a
+    /// lattice ask they answered does not answer a hook's, which is raised
+    /// on its own.
+    pub fn execute_preapproved_from(
+        &self,
+        call: &ValidatedToolCall,
+        cancel: &CancellationToken,
+        approved_source: Option<&str>,
+    ) -> Result<ToolStepResult, ToolStepError> {
         cancel.check().map_err(|_| ToolStepError::Cancelled)?;
         // Re-checked, not trusted: a one-shot approval resolved after the
         // project's managed policy changed must still fail closed.
@@ -2322,7 +2336,7 @@ impl WorkspaceTools {
                 ))),
             });
         }
-        self.execute_call_traced_flagged(call, cancel, true)
+        self.execute_call_traced_flagged(call, cancel, true, approved_source)
     }
 
     fn execute_call_traced(
@@ -2330,7 +2344,7 @@ impl WorkspaceTools {
         call: &ValidatedToolCall,
         cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
-        self.execute_call_traced_flagged(call, cancel, false)
+        self.execute_call_traced_flagged(call, cancel, false, None)
     }
 
     /// Turn a hook's `updated_input` into the call that runs, or into the
@@ -2409,6 +2423,7 @@ impl WorkspaceTools {
         call: &ValidatedToolCall,
         cancel: &CancellationToken,
         preapproved: bool,
+        approved_source: Option<&str>,
     ) -> Result<ToolStepResult, ToolStepError> {
         cancel.check().map_err(|_| ToolStepError::Cancelled)?;
         // Permission gate: deny and headless-ask are typed model-visible
@@ -2532,9 +2547,21 @@ impl WorkspaceTools {
                 // the human just answered. Where no surface can take the
                 // question, the call is denied and says so — never an
                 // implicit allow (S2).
+                crate::hooks::PreHookOutcome::Ask { hook, reason: _ }
+                    if ask_is_the_call
+                        || approved_source.is_some_and(|s| s == format!("hook:{hook}")) =>
+                {
+                    // `ask_user` *is* the human conversation: a hook asking
+                    // whether the model may ask the human is answered by the
+                    // question itself (a hook `deny` on it still denies, above).
+                    // And on the approved resume the human answered *this*
+                    // hook's question — a lattice ask they answered is not
+                    // that answer, so only a matching source is skipped.
+                }
                 crate::hooks::PreHookOutcome::Ask { hook, reason } => {
-                    if !preapproved {
+                    {
                         let sink = self.approval_sink.as_ref().or(self.hook_ask_sink.as_ref());
+                        let mut record_failure: Option<String> = None;
                         if let Some(sink) = sink {
                             let request = crate::approvals::build_hook_ask_request(
                                 call.tool(),
@@ -2544,19 +2571,27 @@ impl WorkspaceTools {
                                 &hook,
                                 &reason,
                             );
-                            if let Ok(_token) = sink.request(&request) {
-                                return Ok(ToolStepResult::ApprovalRequired {
-                                    call_id: call.call_id().to_owned(),
-                                });
+                            match sink.request(&request) {
+                                Ok(_token) => {
+                                    return Ok(ToolStepResult::ApprovalRequired {
+                                        call_id: call.call_id().to_owned(),
+                                    });
+                                }
+                                Err(why) => record_failure = Some(why),
                             }
                         }
                         // The outcome leads, so a long reason cut at the
-                        // detail bound never reads as pending.
+                        // detail bound never reads as pending; and the text
+                        // says which of the two things happened — no surface,
+                        // or a surface that could not record the question.
+                        let why = match record_failure {
+                            Some(why) => format!("the approval could not be recorded ({why})"),
+                            None => "no approval surface can take the question here".to_owned(),
+                        };
                         return Ok(ToolStepResult::Denied {
                             call_id: call.call_id().to_owned(),
                             detail: Some(self.redact_output(bounded_detail(&format!(
-                                "{} denied: {hook} hook asked for approval and no approval \
-                                 surface can take the question here; {reason}",
+                                "{} denied: {hook} hook asked for approval and {why}; {reason}",
                                 call.tool()
                             )))),
                         });
@@ -6880,6 +6915,19 @@ impl ExecTools {
         }
     }
 
+    /// See [`WorkspaceTools::execute_preapproved_from`].
+    pub fn execute_preapproved_from(
+        &self,
+        call: &ValidatedToolCall,
+        cancel: &CancellationToken,
+        approved_source: Option<&str>,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        match self {
+            Self::Workspace(tools) => tools.execute_preapproved_from(call, cancel, approved_source),
+            Self::Noop(_) => Err(ToolStepError::Invalid),
+        }
+    }
+
     /// Report subagents to `events` (no-op on the no-op surface). See
     /// [`AgentEvents`].
     pub(crate) fn set_agent_events(&mut self, events: Arc<dyn AgentEvents>) {
@@ -8750,17 +8798,10 @@ mod tests {
             assert_eq!(request.tool, WORKSPACE_WRITE_TOOL);
             assert_eq!(request.call_id, "c1");
             assert_eq!(request.source.as_deref(), Some("hook:pre_tool_use[0]"));
-            assert!(
-                request
-                    .summary
-                    .starts_with("pre_tool_use[0] hook asks: a reviewer must see this — "),
-                "{}",
-                request.summary
-            );
-            assert!(
-                request.summary.contains("e.txt"),
-                "the call's own summary follows: {}",
-                request.summary
+            assert_eq!(
+                request.summary,
+                "create e.txt — pre_tool_use[0] hook asks: a reviewer must see this",
+                "the call first, then the hook and its reason"
             );
             assert_eq!(request.scope, vec!["e.txt".to_owned()]);
             assert!(
@@ -8771,7 +8812,7 @@ mod tests {
         }
         // The human approved: the resume runs the call exactly once.
         match tools
-            .execute_preapproved(&validated, &cancel)
+            .execute_preapproved_from(&validated, &cancel, Some("hook:pre_tool_use[0]"))
             .expect("resume")
         {
             ToolStepResult::Succeeded { .. } => {}
@@ -8829,7 +8870,7 @@ mod tests {
             ..Default::default()
         });
         match tools
-            .execute_preapproved(&validated, &cancel)
+            .execute_preapproved_from(&validated, &cancel, Some("hook:pre_tool_use[0]"))
             .expect("resume")
         {
             ToolStepResult::Denied { detail, .. } => {
@@ -9055,6 +9096,145 @@ mod tests {
             "the human is shown what would run: {}",
             requests[0].summary
         );
+    }
+
+    #[test]
+    fn a_hook_ask_on_ask_user_is_answered_by_the_question_itself() {
+        // `ask_user` is the model talking to the human; a hook asking whether
+        // it may is answered by the question. Neither a pause (which would
+        // swallow the clarification on approve) nor a denial — the call
+        // proceeds to the tool. A hook `deny` on it still denies.
+        let root = TempRoot::new("hook-ask-ask-user");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_approval_source(approvals.clone());
+        tools.set_hooks(ask_hooks(&root.0));
+        let call = make_call(
+            "q1",
+            ASK_USER_TOOL,
+            r#"{"question":"Which flavor?","options":["a","b"]}"#,
+        );
+        match run_one(&mut tools, &call) {
+            ToolStepResult::ApprovalRequired { .. } => {
+                panic!("a hook ask on ask_user must not pause the question")
+            }
+            ToolStepResult::Denied { detail, .. } => {
+                panic!("a hook ask on ask_user must not deny it: {detail:?}")
+            }
+            _ => {}
+        }
+        assert!(
+            approvals
+                .requests
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty()
+        );
+        tools.set_hooks(crate::hooks::HooksConfig {
+            pre_tool_use: vec![hook_printing(
+                &root.0,
+                "deny.sh",
+                r#"{"decision":"deny","reason":"no questions today"}"#,
+            )],
+            ..Default::default()
+        });
+        assert!(matches!(
+            run_one(
+                &mut tools,
+                &make_call("q2", ASK_USER_TOOL, r#"{"question":"Again?"}"#)
+            ),
+            ToolStepResult::Denied { .. }
+        ));
+    }
+
+    #[test]
+    fn a_lattice_approval_does_not_answer_a_hooks_ask_which_is_raised_on_the_resume() {
+        // Default mode: the lattice asks about a write before the hooks run.
+        // The human's answer to the *lattice* question is not an answer to
+        // the hook's: on the resume the hook's ask is raised as its own
+        // approval (source `hook:…`), and only an approval carrying that
+        // source lets the call run.
+        let root = TempRoot::new("hook-ask-after-lattice");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default);
+        let mut tools = WorkspaceTools::open_with_permissions(&root.0, lattice).expect("tools");
+        tools.set_approval_source(approvals.clone());
+        tools.set_hooks(ask_hooks(&root.0));
+        let call = write_call("c1", "h.txt");
+        let cancel = CancellationToken::new();
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        // 1. The lattice asks; the hook has not run yet.
+        assert!(matches!(
+            tools.execute(&validated, &cancel).expect("execute"),
+            ToolStepResult::ApprovalRequired { .. }
+        ));
+        {
+            let requests = approvals.requests.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].source, None, "the lattice's own question");
+        }
+        // 2. The human approved the lattice's question: the hook now asks.
+        match tools
+            .execute_preapproved_from(&validated, &cancel, None)
+            .expect("resume")
+        {
+            ToolStepResult::ApprovalRequired { call_id } => assert_eq!(call_id, "c1"),
+            other => panic!("the hook's own ask must be raised, got {other:?}"),
+        }
+        assert!(
+            !root.0.join("h.txt").exists(),
+            "nothing runs before the hook's question is answered"
+        );
+        {
+            let requests = approvals.requests.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[1].source.as_deref(), Some("hook:pre_tool_use[0]"));
+        }
+        // 3. The human approved the hook's question: the call runs once.
+        assert!(matches!(
+            tools
+                .execute_preapproved_from(&validated, &cancel, Some("hook:pre_tool_use[0]"))
+                .expect("resume"),
+            ToolStepResult::Succeeded { .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(root.0.join("h.txt")).expect("written"),
+            "hi"
+        );
+        assert_eq!(
+            approvals
+                .requests
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn an_approval_that_cannot_be_recorded_denies_and_says_so() {
+        struct FailingSink;
+        impl crate::approvals::ApprovalSink for FailingSink {
+            fn request(&self, _: &crate::approvals::ApprovalRequest) -> Result<String, String> {
+                Err("ledger closed".to_owned())
+            }
+        }
+        let root = TempRoot::new("hook-ask-sink-fails");
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_approval_source(Arc::new(FailingSink));
+        tools.set_hooks(ask_hooks(&root.0));
+        match run_one(&mut tools, &write_call("c1", "i.txt")) {
+            ToolStepResult::Denied { detail, .. } => {
+                let detail = detail.unwrap_or_default();
+                assert!(
+                    detail.contains("the approval could not be recorded (ledger closed)"),
+                    "{detail}"
+                );
+                assert!(!detail.contains("no approval surface"), "{detail}");
+            }
+            other => panic!("an unrecordable ask must deny, got {other:?}"),
+        }
+        assert!(!root.0.join("i.txt").exists());
     }
 
     #[test]

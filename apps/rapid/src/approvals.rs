@@ -313,7 +313,26 @@ pub fn describe_call(tool: &str, arguments: &str, root: &Path) -> (String, Vec<S
             (summary, vec![path], diff)
         }
         "shell_exec" => {
-            let command = arg("command").unwrap_or_else(|| "(no command)".to_owned());
+            // The tool's arguments are `argv` (a JSON array); the summary
+            // used to read a `command` string the tool never had, so every
+            // shell approval said "run: (no command)" — a human approving a
+            // command they could not see. The joined argv is the command.
+            let command = parsed
+                .as_ref()
+                .and_then(|value| value.get("argv"))
+                .and_then(|value| value.as_array())
+                .map(|argv| {
+                    argv.iter()
+                        .map(|item| match item {
+                            serde_json::Value::String(text) => text.clone(),
+                            other => other.to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .filter(|command| !command.is_empty())
+                .or_else(|| arg("command"))
+                .unwrap_or_else(|| "(no command)".to_owned());
             let cwd = arg("cwd").unwrap_or_else(|| ".".to_owned());
             (format!("run: {command}"), vec![cwd], String::new())
         }
@@ -382,10 +401,18 @@ pub fn build_request(tool: &str, call_id: &str, arguments: &str, root: &Path) ->
     }
 }
 
+/// Bound on the hook reason carried into an approval summary: the summary
+/// itself is bounded at [`kernel::MAX_APPROVAL_SUMMARY_BYTES`] (512) and a
+/// hook reason may be 2 KiB, so the reason is cut first — the call's own
+/// description (for `shell_exec`, the only place the command appears) must
+/// never be what the bound removes.
+pub const MAX_HOOK_ASK_REASON_BYTES: usize = 192;
+
 /// The [`ApprovalRequest`] a hook's `ask` raises for a call: the same
-/// action, scope and diff a lattice `Ask` would show, with the hook named
-/// first in the summary and as the request's `source`, so the human sees
-/// who asked and why before what the call would do.
+/// action, scope and diff a lattice `Ask` would show, then the hook and its
+/// (bounded) reason, with the hook as the request's `source`. The call comes
+/// first because a human approving a command must see the command — a long
+/// reason is cut, the action never is.
 pub fn build_hook_ask_request(
     tool: &str,
     call_id: &str,
@@ -395,7 +422,16 @@ pub fn build_hook_ask_request(
     reason: &str,
 ) -> ApprovalRequest {
     let mut request = build_request(tool, call_id, arguments, root);
-    request.summary = format!("{hook} hook asks: {reason} — {}", request.summary);
+    let mut reason = reason.trim().to_owned();
+    if reason.len() > MAX_HOOK_ASK_REASON_BYTES {
+        let mut end = MAX_HOOK_ASK_REASON_BYTES;
+        while end > 0 && !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        reason.truncate(end);
+        reason.push('…');
+    }
+    request.summary = format!("{} — {hook} hook asks: {reason}", request.summary);
     request.source = Some(format!("hook:{hook}"));
     request
 }
@@ -412,6 +448,13 @@ pub struct LedgerApprovalSink {
     /// scoping; the journal itself keys off the ledger client.
     #[allow(dead_code)]
     root: PathBuf,
+    /// One request at a time through this sink: a tool batch runs its calls
+    /// on threads, and two asks reading the same session tip would race on
+    /// `expected_seq` — the loser was told there was no approval surface.
+    /// Serialising the sink's own requests removes the common race; the
+    /// bounded retry below covers another writer's append landing between
+    /// the tip read and ours.
+    requests: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 impl LedgerApprovalSink {
@@ -426,6 +469,7 @@ impl LedgerApprovalSink {
             session_id,
             actor,
             root,
+            requests: std::sync::Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -445,28 +489,66 @@ fn with_source(record: kernel::RecordApproval, source: Option<&str>) -> kernel::
     }
 }
 
+/// How many times a request re-reads the session tip after another writer
+/// advanced it. A tool batch runs its calls on threads, so two hook asks
+/// (or an ask beside a job's progress event) can both read the same tip;
+/// the loser must not be told there is no approval surface.
+const REQUEST_SEQUENCE_RETRIES: usize = 8;
+
 impl ApprovalSink for LedgerApprovalSink {
     fn request(&self, request: &ApprovalRequest) -> Result<String, String> {
-        let token = new_wait_token();
-        let expected_seq = self.tip()?;
-        client_call(
-            self.client.record_approval(with_source(
-                kernel::RecordApproval::new(
-                    self.session_id,
-                    expected_seq,
-                    self.actor.clone(),
-                    protocol::TraceId::new(),
-                    token.clone(),
-                    request.call_id.clone(),
-                    request.tool.clone(),
-                    request.summary.clone(),
-                )
-                .with_scope(request.scope.clone())
-                .with_diff(request.diff.clone()),
-                request.source.as_deref(),
-            )),
-        )?;
-        Ok(token)
+        let _one_at_a_time = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut attempt = 0;
+        loop {
+            // A fresh token per attempt: the kernel releases a failed
+            // attempt's wait row as `Expired` but keeps it, so the same token
+            // would collide on the retry.
+            let token = new_wait_token();
+            let expected_seq = self.tip()?;
+            let outcome = poll_once(
+                self.client.record_approval(with_source(
+                    kernel::RecordApproval::new(
+                        self.session_id,
+                        expected_seq,
+                        self.actor.clone(),
+                        protocol::TraceId::new(),
+                        token.clone(),
+                        request.call_id.clone(),
+                        request.tool.clone(),
+                        request.summary.clone(),
+                    )
+                    .with_scope(request.scope.clone())
+                    .with_diff(request.diff.clone()),
+                    request.source.as_deref(),
+                )),
+            )?;
+            match outcome {
+                Ok(()) => return Ok(token),
+                Err(err)
+                    if err.code() == protocol::ErrorCode::SessionConflict
+                        && attempt < REQUEST_SEQUENCE_RETRIES =>
+                {
+                    attempt += 1;
+                }
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+    }
+}
+
+/// Poll one kernel call once, keeping its typed error (unlike
+/// [`client_call`], which stringifies it) so the caller can tell a sequence
+/// conflict — retryable — from every other failure.
+fn poll_once<T, E>(future: impl Future<Output = Result<T, E>>) -> Result<Result<T, E>, String> {
+    let mut future = std::pin::pin!(future);
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    match future.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(result) => Ok(result),
+        std::task::Poll::Pending => Err("kernel did not answer immediately".to_owned()),
     }
 }
 
@@ -592,4 +674,99 @@ pub fn requested_payload(
         .into_iter()
         .find(|pending| pending.payload().id == token)
         .map(|pending| pending.payload().clone())
+}
+
+/// The `approval.requested` payload recorded under `token`, pending or
+/// already resolved — what a continuation needs after the human decided
+/// (the pending set no longer holds it): who raised the ask (`source`) and
+/// about what.
+pub fn recorded_request(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    token: &str,
+) -> Option<ApprovalRequestedPayload> {
+    let events = client
+        .export_events(session_id, &kernel::CancellationToken::new())
+        .ok()?;
+    events
+        .iter()
+        .filter(|event| event.kind == event_ledger::event::EventKind::ApprovalRequested.as_str())
+        .filter_map(|event| {
+            serde_json::from_str::<ApprovalRequestedPayload>(&event.payload_json).ok()
+        })
+        .find(|payload| payload.id == token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_shell_approval_summary_shows_the_argv_command() {
+        // The tool's arguments are `argv`; the summary must show them (it
+        // used to read a `command` field the tool never sends).
+        let root = std::env::temp_dir();
+        let (summary, scope, diff) = describe_call(
+            "shell_exec",
+            r#"{"argv":["git","status","--short"],"cwd":"."}"#,
+            &root,
+        );
+        assert_eq!(summary, "run: git status --short");
+        assert_eq!(scope, vec![".".to_owned()]);
+        assert!(diff.is_empty());
+        let (summary, _, _) = describe_call("shell_exec", r#"{"argv":[]}"#, &root);
+        assert_eq!(summary, "run: (no command)");
+    }
+
+    #[test]
+    fn a_hook_ask_request_shows_the_call_first_and_bounds_the_reason() {
+        // The summary is bounded at 512 bytes by the kernel; a hook reason
+        // may be 2 KiB. The call's own description — for shell_exec the only
+        // place the command appears — comes first and is never what the
+        // bound removes; the reason is cut with an ellipsis.
+        let root = std::env::temp_dir();
+        let long = "why ".repeat(300);
+        let request = build_hook_ask_request(
+            "shell_exec",
+            "c1",
+            r#"{"argv":["rm","-rf","build"]}"#,
+            &root,
+            "pre_tool_use[0]",
+            &long,
+        );
+        assert_eq!(request.source.as_deref(), Some("hook:pre_tool_use[0]"));
+        assert!(
+            request.summary.starts_with("run: rm -rf build"),
+            "{}",
+            request.summary
+        );
+        let asks = request
+            .summary
+            .find(" — pre_tool_use[0] hook asks: ")
+            .expect("the hook follows the call");
+        let reason = &request.summary[asks + " — pre_tool_use[0] hook asks: ".len()..];
+        assert!(reason.ends_with('…'), "{reason}");
+        assert!(reason.len() <= MAX_HOOK_ASK_REASON_BYTES + '…'.len_utf8());
+        assert!(
+            request.summary.len() <= kernel::MAX_APPROVAL_SUMMARY_BYTES,
+            "{} bytes",
+            request.summary.len()
+        );
+        // A short reason is carried whole.
+        let short = build_hook_ask_request(
+            "repo_read",
+            "c2",
+            r#"{"path":"a.txt"}"#,
+            &root,
+            "pre_tool_use[1]",
+            "look",
+        );
+        assert!(
+            short
+                .summary
+                .ends_with(" — pre_tool_use[1] hook asks: look"),
+            "{}",
+            short.summary
+        );
+    }
 }

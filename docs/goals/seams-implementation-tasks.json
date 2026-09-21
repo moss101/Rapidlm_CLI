@@ -187,7 +187,8 @@
         "apps/rapid/src/interactive.rs \u2014 test a_hook_ask_pauses_an_interactive_turn_on_the_approval_surface_and_approval_continues_it (TUI projection + continuation)",
         "apps/rapid/tests/approvals_flow.rs \u2014 a_hook_ask_with_a_sink_suspends_records_its_source_and_a_restart_resumes_the_call_once",
         "apps/rapid/tests/hooks_cli.rs \u2014 a_hook_ask_parks_a_headless_run_with_the_needs_approval_exit_code_and_writes_nothing (exit 10), a_hook_deny_is_a_model_visible_denial_and_the_run_completes",
-        "revert cycles: sink lookup forced None \u2192 pause tests fail; preapproved exemption removed \u2192 resume tests fail"
+        "revert cycles: sink lookup forced None \u2192 pause tests fail; preapproved exemption removed \u2192 resume tests fail",
+        "follow-up fix after the 4b76689 self-review: ask_user exempt from hook asks, serialised + retried approval recording, call-first bounded summary (and the shell summary reads argv), continuations record their own suspension, source-matched resume, remember refused for hook asks, no hook-ask sink under a forced mode, docs corrected \u2014 docs/goal-delivery-2026-09-20.md \u00a7 Self-review of 4b76689"
       ]
     },
     {
@@ -1235,7 +1236,8 @@
         "apps/rapid/src/p9_commands.rs"
       ],
       "implementation": [
-        "--output json|text, --quiet, --non-interactive, --dry-run, --yes, --no-color, --timeout with RAPIDLM_* mirrors parsed before dispatch; non-TTY stdout defaults to JSON where a JSON form exists; protocol::cli::CliError {code, message, hint} with fixture rendered as {\"error\":{\u2026}} on stderr in JSON mode; every InteractiveError gains a hint naming the next command; session.created gains origin = headless|interactive; sessions list --origin."
+        "--output json|text, --quiet, --non-interactive, --dry-run, --yes, --no-color, --timeout with RAPIDLM_* mirrors parsed before dispatch; non-TTY stdout defaults to JSON where a JSON form exists; protocol::cli::CliError {code, message, hint} with fixture rendered as {\"error\":{\u2026}} on stderr in JSON mode; every InteractiveError gains a hint naming the next command; session.created gains origin = headless|interactive; sessions list --origin.",
+        "Candidate recorded by SEAM-01-2: a headless `rapid approvals list|approve|deny <session> <n>` so a parked exec turn can be resolved without the TUI (today: `rapid resume <session>` then /approvals)."
       ],
       "validation": [
         "Table-driven test over every subcommand; envelope fixture; exit codes unchanged (pinned); sessions list --origin filters."

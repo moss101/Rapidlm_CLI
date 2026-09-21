@@ -246,9 +246,9 @@ fn a_hook_ask_parks_a_headless_run_with_the_needs_approval_exit_code_and_writes_
     assert_eq!(requested.1["tool"], "workspace_write");
     assert_eq!(requested.1["source"], "hook:pre_tool_use[0]");
     assert!(
-        requested.1["summary"]
-            .as_str()
-            .is_some_and(|s| s.starts_with("pre_tool_use[0] hook asks: a reviewer must see writes")),
+        requested.1["summary"].as_str().is_some_and(
+            |s| s.ends_with(" — pre_tool_use[0] hook asks: a reviewer must see writes")
+        ),
         "{}",
         requested.1
     );

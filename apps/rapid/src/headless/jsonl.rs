@@ -503,7 +503,7 @@ impl JsonlExitCode {
         ),
         (
             Self::NeedsApproval,
-            "a workflow run paused for a human decision; resume with --resume",
+            "paused for a human decision: a workflow run (`rapid run --resume <id>` continues it) or an exec turn a hook asked about (`rapid resume <session>`, then /approvals)",
         ),
         (
             Self::Interrupted,
