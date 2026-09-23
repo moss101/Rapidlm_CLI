@@ -575,8 +575,8 @@ fn concurrent_approval_requests_both_land_despite_sequence_conflicts() {
     let rounds = 12;
     let mut handles = Vec::new();
     for round in 0..rounds {
-        for side in 0..2 {
-            let sink = Arc::clone(&sinks[side]);
+        for (side, sink) in sinks.iter().enumerate() {
+            let sink = Arc::clone(sink);
             handles.push(std::thread::spawn(move || {
                 sink.request(&rapid::approvals::ApprovalRequest {
                     tool: "repo_read".to_owned(),
