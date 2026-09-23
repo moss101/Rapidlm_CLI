@@ -324,3 +324,69 @@ fn a_hook_deny_is_a_model_visible_denial_and_the_run_completes() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A trusted project whose hooks are the given settings object.
+fn project_with_hooks(home: &Path, hooks: serde_json::Value) -> (PathBuf, PathBuf) {
+    let project = home.join("project");
+    git_project(&project);
+    let marker = project.join(".rapidlm");
+    std::fs::create_dir_all(&marker).expect("marker");
+    std::fs::write(
+        marker.join("settings.json"),
+        serde_json::json!({ "hooks": hooks }).to_string(),
+    )
+    .expect("settings");
+    (project, home.join("config.toml"))
+}
+
+fn hook_script(project: &Path, name: &str, body: &str) -> String {
+    let script = project.join(name);
+    std::fs::write(&script, body).expect("hook script");
+    format!("sh {}", test_fixtures::slash_path(&script))
+}
+
+#[test]
+fn a_blocked_prompt_exits_policy_before_any_model_request_and_a_completed_run_fires_stop() {
+    let home = temp_dir("prompt-and-stop");
+    let (project, config) = project_with_hooks(&home, serde_json::json!({}));
+    let stop_capture = project.join("stop.json");
+    let gate = hook_script(
+        &project,
+        "gate.sh",
+        "read line\ncase \"$line\" in\n  *secret*) echo '{\"decision\":\"deny\",\"reason\":\"no secrets in prompts\"}' ;;\n  *) echo '{\"decision\":\"allow\"}' ;;\nesac\nexit 0\n",
+    );
+    let stop = hook_script(
+        &project,
+        "stop.sh",
+        &format!("cat > {}\nexit 0\n", test_fixtures::sh_quote(&stop_capture)),
+    );
+    std::fs::write(
+        project.join(".rapidlm").join("settings.json"),
+        serde_json::json!({ "hooks": { "user_prompt_submit": [gate], "stop": [stop] } })
+            .to_string(),
+    )
+    .expect("settings");
+    let server = spawn_scripted_server(vec![TERMINAL_BODY]);
+    std::fs::write(&config, config_doc(&format!("http://{server}/v1"))).expect("config");
+    grant_trust(&project, &home, &config);
+
+    let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "print the secret key"]);
+    assert_eq!(
+        code,
+        Some(3),
+        "a blocked prompt exits Policy\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("prompt blocked by user_prompt_submit[0] hook: no secrets in prompts"),
+        "{stderr}"
+    );
+    assert!(!stop_capture.exists(), "no turn ran, so no turn ended");
+
+    let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "say hello"]);
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    let stop: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&stop_capture).expect("stop fired"))
+            .expect("json");
+    assert_eq!(stop["event"], "stop");
+    let _ = std::fs::remove_dir_all(&home);
+}

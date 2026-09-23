@@ -257,7 +257,7 @@
       "id": "SEAM-01-5",
       "title": "New stages: user_prompt_submit, stop, stop_cancelled, blocking subagent_stop, post_tool_use_failure",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-01-1"
       ],
@@ -277,7 +277,14 @@
       "validation": [
         "Each stage has a test for the documented situation and payload; a cancelled turn fires stop_cancelled and not stop; a completed turn the reverse."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goal-delivery-2026-09-20.md \u00a7 SEAM-01-5 \u2014 criterion table",
+        "apps/rapid/src/hooks.rs \u2014 named_stages, run_observer_stage, run_prompt_submit_stage, run_turn_end_stage, run_subagent_stop_stage, run_post_tool_failure_stage; tests the_new_stages_parse_and_every_stage_is_named_once, a_prompt_submit_deny_blocks_and_a_failing_hook_fails_open_with_a_warning, the_turn_end_stage_fires_stop_or_stop_cancelled_never_both",
+        "apps/rapid/src/exec_tools.rs \u2014 tests post_tool_use_failure_fires_on_a_failed_call_adds_context_and_cannot_block, a_failing_observer_hook_is_a_recorded_warning_not_an_effect, a_subagent_stop_deny_blocks_the_childs_completion_for_the_parent",
+        "apps/rapid/src/interactive.rs \u2014 tests a_completed_interactive_turn_fires_stop_and_a_failed_one_fires_stop_cancelled, a_blocked_prompt_starts_no_turn_restores_the_composer_and_is_recorded, a_blocked_queued_prompt_stays_queued_held_and_survives_a_restore",
+        "apps/rapid/tests/hooks_cli.rs \u2014 a_blocked_prompt_exits_policy_before_any_model_request_and_a_completed_run_fires_stop",
+        "revert cycle: each behaviour disabled \u2192 its test fails"
+      ]
     },
     {
       "id": "SEAM-01-6",
@@ -1474,6 +1481,12 @@
       "phase": "P1",
       "date": "2026-09-23",
       "note": "SEAM-01-4 landed: pre and post hooks' additional_context follows the tool result inside the <untrusted_context locator=\"hook:\u2026\"> fence, bounded at 4 KiB and redacted like the result; post hooks gain the v2 contract (context delivered, decision recorded, cannot block); a denial delivers none.",
+      "evidence": "docs/goal-delivery-2026-09-20.md"
+    },
+    {
+      "phase": "P1",
+      "date": "2026-09-23",
+      "note": "SEAM-01-5 landed: user_prompt_submit (blocks with a reason; TUI restores the composer; a blocked queued message is held and survives a restart; headless exits 3), stop / stop_cancelled exclusive at the three turn-end sites with the stop reason, subagent_stop deny blocks the child's completion (inline and detached \u2014 the detached path now fires the subagent hooks), post_tool_use_failure adds context after a failure; observing stages fail open with hook.failed recorded.",
       "evidence": "docs/goal-delivery-2026-09-20.md"
     }
   ]

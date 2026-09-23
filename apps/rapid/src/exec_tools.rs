@@ -363,6 +363,11 @@ pub(crate) trait HookEvents: Send + Sync {
     /// (`hook.input_rewritten`, ADR 0022 §5): both inputs and their digests,
     /// recorded before the rewritten call runs.
     fn rewritten(&self, tool: &str, call_id: &str, record: &HookRewriteRecord);
+
+    /// A hook in a fail-open stage failed and was ignored (`hook.failed`) —
+    /// the recorded warning ADR 0022 §7 requires. `tool`/`call_id` are empty
+    /// for stages that are not about a tool call.
+    fn failed(&self, tool: &str, call_id: &str, failure: &crate::hooks::HookFailure);
 }
 
 /// What the ledger records about an input rewrite: the hook, the call, and
@@ -2804,6 +2809,9 @@ impl WorkspaceTools {
                 for record in &report.decisions {
                     events.decided(call.tool(), call.call_id(), record);
                 }
+                for failure in &report.failures {
+                    events.failed(call.tool(), call.call_id(), failure);
+                }
             }
             hook_context.extend(report.context);
             if !report.output.is_empty() {
@@ -2813,6 +2821,43 @@ impl WorkspaceTools {
                         "{summary}\n[post_tool_use: {}]",
                         self.redact_output(bounded_detail(&report.output))
                     ),
+                };
+            }
+        }
+        // `post_tool_use_failure` (ADR 0022 §7): a failed call's hooks may add
+        // context after the failure; they cannot block — the call already
+        // failed — and a hook of theirs that fails is a recorded warning.
+        if !self.hooks.post_tool_use_failure.is_empty()
+            && let ToolStepResult::Failed {
+                call_id,
+                handled,
+                detail,
+            } = &result
+        {
+            let error = detail.clone().unwrap_or_default();
+            let report = crate::hooks::run_post_tool_failure_stage(
+                &self.hooks.post_tool_use_failure,
+                call.tool(),
+                &error,
+                crate::hooks::HOOK_TIMEOUT,
+            );
+            if let Some(events) = self.hook_events.as_ref() {
+                for record in &report.decisions {
+                    events.decided(call.tool(), call.call_id(), record);
+                }
+                for failure in &report.failures {
+                    events.failed(call.tool(), call.call_id(), failure);
+                }
+            }
+            hook_context.extend(report.context);
+            if !report.output.is_empty() {
+                result = ToolStepResult::Failed {
+                    call_id: call_id.clone(),
+                    handled: *handled,
+                    detail: Some(format!(
+                        "{error}\n[post_tool_use_failure: {}]",
+                        self.redact_output(bounded_detail(&report.output))
+                    )),
                 };
             }
         }
@@ -4309,17 +4354,24 @@ read with job_output, in this turn or a later one — the job is stopped when th
             Err(reason) => (SubagentEnd::Failed, Some(reason.as_str())),
         };
         lifecycle.end(end, detail);
-        if !self.hooks.subagent_stop.is_empty() {
-            let (status, ok) = match &outcome {
-                Ok(report) => (report.status.clone(), true),
-                Err(_) => ("failed".to_owned(), false),
-            };
-            let _ = crate::hooks::run_notify_hooks(
-                &self.hooks.subagent_stop,
-                "subagent_stop",
-                serde_json::json!({"agent_type": args.agent_type, "status": status, "ok": ok}),
-                crate::hooks::HOOK_TIMEOUT,
-            );
+        // `subagent_stop` (ADR 0022 §7): a v2 `deny` blocks the child's
+        // completion — the parent is told so, naming the hook, instead of
+        // receiving the report as a result it may act on.
+        if let Some((hook, reason)) = subagent_stop_block(
+            &self.hooks,
+            self.hook_events.as_deref(),
+            call.call_id(),
+            &args.agent_type,
+            &outcome,
+        ) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(self.redact_output(bounded_detail(&format!(
+                    "subagent ({}) completion blocked by {hook} hook: {reason}",
+                    args.agent_type
+                )))),
+            });
         }
         match &outcome {
             Ok(_) => {
@@ -4393,6 +4445,20 @@ read with job_output, in this turn or a later one — the job is stopped when th
                 });
             }
         };
+        // The detached path fires the subagent hooks the inline path fires:
+        // it used to fire neither, so a policy hook on `subagent_stop` never
+        // saw a background child finish.
+        if !self.hooks.subagent_start.is_empty() {
+            let _ = crate::hooks::run_notify_hooks(
+                &self.hooks.subagent_start,
+                "subagent_start",
+                serde_json::json!({"agent_type": args.agent_type}),
+                crate::hooks::HOOK_TIMEOUT,
+            );
+        }
+        let stop_hooks = self.hooks.clone();
+        let hook_events = self.hook_events.clone();
+        let spawn_call_id = call.call_id().to_owned();
         let agent_id = protocol::AgentId::new();
         let child_cancel = CancellationToken::new();
         let prompt = args.prompt.clone();
@@ -4468,18 +4534,33 @@ read with job_output, in this turn or a later one — the job is stopped when th
             };
             lifecycle.end(end, detail);
             registry.release_detached();
+            let blocked = subagent_stop_block(
+                &stop_hooks,
+                hook_events.as_deref(),
+                &spawn_call_id,
+                &agent_type,
+                &outcome,
+            );
             // Spool the report BEFORE marking the job terminal, so a
             // completion notification never shows an empty output page.
             if let Ok(mut buffer) = shared.output.lock() {
-                let rendered = render_subagent_report(&agent_type, &outcome);
+                let rendered = match &blocked {
+                    Some((hook, reason)) => format!(
+                        "subagent ({agent_type}) completion blocked by {hook} hook: {reason}"
+                    ),
+                    None => render_subagent_report(&agent_type, &outcome),
+                };
                 buffer.extend_from_slice(rendered.as_bytes());
             }
             if let Ok(mut state) = shared.state.lock() {
-                *state = match &outcome {
-                    Ok(report) if report.status == "succeeded" => JobState::Completed(0),
-                    Ok(report) if report.status == "cancelled" => JobState::Cancelled,
-                    Ok(report) => JobState::Failed(format!("status {}", report.status)),
-                    Err(reason) => JobState::Failed(reason.clone()),
+                *state = match (&blocked, &outcome) {
+                    (Some((hook, _)), _) => {
+                        JobState::Failed(format!("completion blocked by {hook} hook"))
+                    }
+                    (None, Ok(report)) if report.status == "succeeded" => JobState::Completed(0),
+                    (None, Ok(report)) if report.status == "cancelled" => JobState::Cancelled,
+                    (None, Ok(report)) => JobState::Failed(format!("status {}", report.status)),
+                    (None, Err(reason)) => JobState::Failed(reason.clone()),
                 };
             }
             // The worker's exit: stop the watchdog and wait for it. Reaching
@@ -7401,6 +7482,41 @@ impl ToolDriver for WorkspaceTools {
     }
 }
 
+/// Run the `subagent_stop` stage for a finished child and record what its
+/// hooks decided (and which failed). `Some((hook, reason))` when a hook's
+/// v2 `deny` blocks the child's completion.
+fn subagent_stop_block(
+    hooks: &crate::hooks::HooksConfig,
+    events: Option<&dyn HookEvents>,
+    call_id: &str,
+    agent_type: &str,
+    outcome: &Result<SubagentReport, String>,
+) -> Option<(String, String)> {
+    if hooks.subagent_stop.is_empty() {
+        return None;
+    }
+    let (status, ok) = match outcome {
+        Ok(report) => (report.status.clone(), true),
+        Err(_) => ("failed".to_owned(), false),
+    };
+    let report = crate::hooks::run_subagent_stop_stage(
+        &hooks.subagent_stop,
+        agent_type,
+        &status,
+        ok,
+        crate::hooks::HOOK_TIMEOUT,
+    );
+    if let Some(events) = events {
+        for record in &report.decisions {
+            events.decided(TASK_SPAWN_TOOL, call_id, record);
+        }
+        for failure in &report.failures {
+            events.failed(TASK_SPAWN_TOOL, call_id, failure);
+        }
+    }
+    report.first_deny()
+}
+
 /// Threaded batch dispatch over the workspace driver: read-classified calls
 /// run individually and concurrently, write-classified calls group by target
 /// key (all `shell_exec` together, file writes per relative path) so
@@ -8660,6 +8776,7 @@ mod tests {
     struct RecordingHookEvents {
         records: Mutex<Vec<(String, String, crate::hooks::HookDecisionRecord)>>,
         rewrites: Mutex<Vec<(String, String, HookRewriteRecord)>>,
+        failures: Mutex<Vec<(String, String, crate::hooks::HookFailure)>>,
     }
 
     impl HookEvents for RecordingHookEvents {
@@ -8675,6 +8792,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .push((tool.to_owned(), call_id.to_owned(), record.clone()));
+        }
+
+        fn failed(&self, tool: &str, call_id: &str, failure: &crate::hooks::HookFailure) {
+            self.failures
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((tool.to_owned(), call_id.to_owned(), failure.clone()));
         }
     }
 
@@ -9872,6 +9996,164 @@ mod tests {
             }
             other => panic!("expected a denial, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn post_tool_use_failure_fires_on_a_failed_call_adds_context_and_cannot_block() {
+        let root = TempRoot::new("hook-failure-stage");
+        let sink = Arc::new(RecordingHookEvents::default());
+        let capture = root.0.join("failure.json");
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_hook_events(sink.clone());
+        let script = root.0.join("on-failure.sh");
+        fs::write(
+            &script,
+            format!(
+                "cat > {}\necho '{{\"decision\":\"deny\",\"reason\":\"too late\",\"additional_context\":\"the file lives under docs/\"}}'\nexit 0\n",
+                test_fixtures::sh_quote(&capture)
+            ),
+        )
+        .expect("script");
+        tools.set_hooks(crate::hooks::HooksConfig {
+            post_tool_use_failure: vec![format!("sh {}", test_fixtures::slash_path(&script))],
+            ..Default::default()
+        });
+        // A read of a missing file fails at dispatch.
+        match run_one(
+            &mut tools,
+            &make_call("c1", REPO_READ_TOOL, r#"{"path":"missing.txt"}"#),
+        ) {
+            ToolStepResult::Failed { detail, .. } => {
+                let detail = detail.unwrap_or_default();
+                assert!(
+                    detail
+                        .contains("<untrusted_context locator=\"hook:post_tool_use_failure[0]\">"),
+                    "{detail}"
+                );
+                assert!(detail.contains("the file lives under docs/"), "{detail}");
+            }
+            other => panic!("the call stays failed — the hook cannot change that: {other:?}"),
+        }
+        let seen: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&capture).expect("fired")).expect("json");
+        assert_eq!(seen["event"], "post_tool_use_failure");
+        assert_eq!(seen["tool"], REPO_READ_TOOL);
+        assert!(seen["error"].as_str().is_some_and(|e| !e.is_empty()));
+        let decisions = sink.records.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].2.event, "post_tool_use_failure");
+        drop(decisions);
+        // A successful call does not fire it.
+        fs::remove_file(&capture).expect("reset");
+        fs::write(root.0.join("present.txt"), "x").expect("seed");
+        assert!(matches!(
+            run_one(
+                &mut tools,
+                &make_call("c2", REPO_READ_TOOL, r#"{"path":"present.txt"}"#)
+            ),
+            ToolStepResult::Succeeded { .. }
+        ));
+        assert!(!capture.exists(), "no failure, no failure hook");
+    }
+
+    #[test]
+    fn a_failing_observer_hook_is_a_recorded_warning_not_an_effect() {
+        let root = TempRoot::new("hook-observer-fails");
+        let sink = Arc::new(RecordingHookEvents::default());
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_hook_events(sink.clone());
+        let crash = root.0.join("crash.sh");
+        fs::write(&crash, "echo broken >&2\nexit 4\n").expect("script");
+        tools.set_hooks(crate::hooks::HooksConfig {
+            post_tool_use: vec![format!("sh {}", test_fixtures::slash_path(&crash))],
+            ..Default::default()
+        });
+        assert!(matches!(
+            run_one(&mut tools, &write_call("c1", "a.txt")),
+            ToolStepResult::Succeeded { .. }
+        ));
+        let failures = sink.failures.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].2.hook, "post_tool_use[0]");
+        assert_eq!(failures[0].2.event, "post_tool_use");
+        assert!(failures[0].2.detail.contains("broken"));
+    }
+
+    #[test]
+    fn a_subagent_stop_deny_blocks_the_childs_completion_for_the_parent() {
+        struct DoneRunner;
+        impl crate::exec_tools::SubagentRunner for DoneRunner {
+            fn run(
+                &self,
+                _agent: protocol::AgentId,
+                _prompt: &str,
+                _agent_type: &str,
+                _write_scope: Option<&str>,
+                _cancel: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                Ok(SubagentReport {
+                    summary: "the child's summary".to_owned(),
+                    status: "succeeded".to_owned(),
+                    tool_calls: 1,
+                    tokens: 1,
+                    cost_usd_micros: None,
+                    stop_reason: None,
+                    claims: Vec::new(),
+                    blockers: Vec::new(),
+                    open_questions: Vec::new(),
+                    patch_summary: None,
+                    artifacts: Vec::new(),
+                })
+            }
+        }
+        let root = TempRoot::new("hook-subagent-stop");
+        let sink = Arc::new(RecordingHookEvents::default());
+        let capture = root.0.join("stop.json");
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_hook_events(sink.clone());
+        tools.set_subagent_runner(Arc::new(DoneRunner));
+        let script = root.0.join("stop.sh");
+        fs::write(
+            &script,
+            format!(
+                "cat > {}\necho '{{\"decision\":\"deny\",\"reason\":\"no tests were run\"}}'\nexit 0\n",
+                test_fixtures::sh_quote(&capture)
+            ),
+        )
+        .expect("script");
+        tools.set_hooks(crate::hooks::HooksConfig {
+            subagent_stop: vec![format!("sh {}", test_fixtures::slash_path(&script))],
+            ..Default::default()
+        });
+        match run_one(
+            &mut tools,
+            &make_call(
+                "s1",
+                TASK_SPAWN_TOOL,
+                r#"{"prompt":"do it","type":"explore"}"#,
+            ),
+        ) {
+            ToolStepResult::Failed { detail, .. } => {
+                let detail = detail.unwrap_or_default();
+                assert!(
+                    detail
+                        .contains("completion blocked by subagent_stop[0] hook: no tests were run"),
+                    "{detail}"
+                );
+                assert!(!detail.contains("the child's summary"), "{detail}");
+            }
+            other => panic!("a subagent_stop deny must block the completion, got {other:?}"),
+        }
+        let seen: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&capture).expect("fired")).expect("json");
+        assert_eq!(seen["event"], "subagent_stop");
+        assert_eq!(seen["status"], "succeeded");
+        assert_eq!(seen["ok"], true);
+        let decisions = sink.records.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].0, TASK_SPAWN_TOOL);
+        assert_eq!(decisions[0].1, "s1");
+        assert_eq!(decisions[0].2.decision, protocol::HookDecision::Deny);
     }
 
     #[test]

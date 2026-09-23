@@ -4286,6 +4286,35 @@ run without --continue to start one"
     // interactive turn's does — that is what carries the prompt into the
     // ledger — and the tools get the same ledger-backed observers, so what
     // this run writes and runs reaches `/diff` and `/jobs` on resume.
+    // `user_prompt_submit` (ADR 0022 §7): before the turn starts, the
+    // project's hooks may block the prompt with a reason. Blocked: nothing
+    // is submitted, the decision is recorded, the run exits `Policy` (3).
+    // A hook that fails lets the prompt through with a warning.
+    {
+        let hooks = tools.hooks_config();
+        if !hooks.user_prompt_submit.is_empty() {
+            let report = crate::hooks::run_prompt_submit_stage(
+                &hooks.user_prompt_submit,
+                &turn_text,
+                crate::hooks::HOOK_TIMEOUT,
+            );
+            let sink = recording
+                .as_ref()
+                .map(|r| LedgerHookEvents::new(&r.client, r.session_id, &r.actor));
+            record_hook_report(
+                sink.as_ref()
+                    .map(|s| s as &dyn crate::exec_tools::HookEvents),
+                "",
+                "",
+                &report,
+                &mut |line| eprintln!("{line}"),
+            );
+            if let Some((hook, reason)) = report.first_deny() {
+                eprintln!("prompt blocked by {hook} hook: {reason}");
+                return Ok(JsonlExitCode::Policy.as_i32());
+            }
+        }
+    }
     let recorded_turn = match &recording {
         Some(recording) => match recording.start_turn(&turn_text) {
             Ok(turn_id) => {
@@ -4355,6 +4384,8 @@ run without --continue to start one"
         .map(|(root, _)| root.join(PROJECT_MARKER).join(GOAL_FILE));
     let goal_id = goal_path.as_deref().and_then(active_goal_id);
     let turn_started = Instant::now();
+    // Captured before the tools may move into a structured-output wrapper.
+    let turn_end_hooks = tools.hooks_config();
     let run_result = if let Some(schema_path) = parsed.json_schema.as_ref() {
         let schema_text = match std::fs::read_to_string(schema_path) {
             Ok(text) => text,
@@ -4408,6 +4439,18 @@ run without --continue to start one"
             diag,
         )
     };
+    {
+        let sink = recording
+            .as_ref()
+            .map(|r| LedgerHookEvents::new(&r.client, r.session_id, &r.actor));
+        fire_turn_end_hooks(
+            &turn_end_hooks,
+            &run_result,
+            sink.as_ref()
+                .map(|s| s as &dyn crate::exec_tools::HookEvents),
+            &mut |line| eprintln!("{line}"),
+        );
+    }
     if let (Some(recording), Some(turn_id)) = (&recording, recorded_turn) {
         // A paused turn's exact mid-state goes into the ledger before its
         // terminal event, as the TUI records it, so `rapid resume` (or an
@@ -4965,6 +5008,11 @@ fn run_started_session(
 struct QueuedMessage {
     id: String,
     text: String,
+    /// Why a `user_prompt_submit` hook blocked this message when it came up
+    /// to run. A held message stays queued — in order, ahead of later ones —
+    /// until `/queue edit` or `/queue run` retries it or `/queue cancel`
+    /// drops it; it is never silently discarded.
+    held: Option<String>,
 }
 
 struct SessionLoop<'a> {
@@ -5322,6 +5370,7 @@ impl SessionLoop<'_> {
         self.message_queue.push(QueuedMessage {
             id: id.clone(),
             text: bounded.clone(),
+            held: None,
         });
         self.append_command_output(format!(
             "queued as {id} (position {} of {}): {}\n\
@@ -5344,9 +5393,58 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
         if !crate::approvals::pending_approvals(self.client, self.session_id).is_empty() {
             return Ok(());
         }
+        // A held head holds the queue: later messages do not jump ahead of a
+        // blocked one, and the hook is not re-run every tick.
+        if self.message_queue[0].held.is_some() {
+            return Ok(());
+        }
+        let text = self.message_queue[0].text.clone();
+        if let Some((hook, reason)) = self.prompt_block(&text) {
+            let id = self.message_queue[0].id.clone();
+            self.message_queue[0].held = Some(format!("{hook}: {reason}"));
+            let _ = self.client.append_turn_progress(
+                self.session_id,
+                self.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::MessageState,
+                serde_json::json!({ "id": id, "state": "held", "reason": format!("{hook}: {reason}") }),
+            );
+            self.append_command_error(format!(
+                "queued message {id} held: blocked by {hook} hook: {reason}\n\
+/queue edit {id} <text> or /queue run {id} retries it; /queue cancel {id} drops it."
+            ));
+            return Ok(());
+        }
         let next = self.message_queue.remove(0);
         self.mark_message(&next.id, "submitted");
-        self.submit_turn(&next.text)
+        self.start_submitted_turn(&next.text)
+    }
+
+    /// Run the project's `user_prompt_submit` hooks for `text` (trusted
+    /// projects only; hooks are project settings) and record what they
+    /// decided. `Some((hook, reason))` when a hook blocked the prompt.
+    fn prompt_block(&mut self, text: &str) -> Option<(String, String)> {
+        if !self.trusted {
+            return None;
+        }
+        let hooks = load_project_integrations(self.root).hooks;
+        if hooks.user_prompt_submit.is_empty() {
+            return None;
+        }
+        let report = crate::hooks::run_prompt_submit_stage(
+            &hooks.user_prompt_submit,
+            text,
+            crate::hooks::HOOK_TIMEOUT,
+        );
+        let sink = LedgerHookEvents::new(self.client, self.session_id, self.actor);
+        let mut warnings = Vec::new();
+        record_hook_report(Some(&sink), "", "", &report, &mut |line| {
+            warnings.push(line.to_owned())
+        });
+        for line in warnings {
+            self.append_command_error(line);
+        }
+        report.first_deny()
     }
 
     /// Record a queue-state transition (`submitted`/`cancelled`) durably.
@@ -5364,7 +5462,8 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
     /// every `message.queued` whose latest `message.state` still says
     /// `queued` is offered again, unchanged.
     fn restore_queued_messages(&mut self) {
-        let mut latest: Vec<(String, String, String)> = Vec::new(); // (id, text, state)
+        // (id, text, state, held reason)
+        let mut latest: Vec<(String, String, String, Option<String>)> = Vec::new();
         for seq in 1..=self.session_tip().unwrap_or(0) {
             let Ok(event) = self.client.read_event(self.session_id, seq) else {
                 continue;
@@ -5377,7 +5476,7 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
                         payload.get("text").and_then(serde_json::Value::as_str),
                     ) {
                         latest.retain(|entry| entry.0 != id);
-                        latest.push((id.to_owned(), text.to_owned(), "queued".to_owned()));
+                        latest.push((id.to_owned(), text.to_owned(), "queued".to_owned(), None));
                     }
                 }
                 event_ledger::event::EventKind::MessageState => {
@@ -5388,16 +5487,24 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
                     ) && let Some(entry) = latest.iter_mut().find(|entry| entry.0 == id)
                     {
                         entry.2 = state.to_owned();
+                        entry.3 = payload
+                            .get("reason")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned);
                     }
                 }
                 _ => {}
             }
         }
-        for (id, text, state) in latest {
-            if state == "queued" {
+        for (id, text, state, reason) in latest {
+            // A held message is still queued: the hold is carried over, not
+            // dropped by a restart.
+            if state == "queued" || state == "held" {
+                let held = (state == "held").then(|| reason.unwrap_or_default());
                 self.message_queue.push(QueuedMessage {
                     id: id.clone(),
                     text: text.clone(),
+                    held,
                 });
                 self.append_command_output(format!(
                     "restored queued message {id} from a previous run: {}\n\
@@ -5663,12 +5770,21 @@ workspace was never touched by it"
             } else {
                 let mut lines = vec![format!("{} queued message(s):", self.message_queue.len())];
                 for (index, message) in self.message_queue.iter().enumerate() {
-                    lines.push(format!(
-                        "{}. [{}] {}",
-                        index + 1,
-                        message.id,
-                        first_line(&message.text)
-                    ));
+                    lines.push(match &message.held {
+                        Some(why) => format!(
+                            "{}. [{}] (held — {}) {}",
+                            index + 1,
+                            message.id,
+                            first_line(why),
+                            first_line(&message.text)
+                        ),
+                        None => format!(
+                            "{}. [{}] {}",
+                            index + 1,
+                            message.id,
+                            first_line(&message.text)
+                        ),
+                    });
                 }
                 lines.push(
                     "/queue cancel <id|n> | /queue edit <id|n> <text> | /queue run <id|n>"
@@ -5716,6 +5832,9 @@ workspace was never touched by it"
                 }
                 let message = &mut self.message_queue[index];
                 message.text = kernel::bounded_turn_text(&new_text);
+                // Edited text is a new prompt: the hold is lifted and the
+                // hooks judge it again when it comes up.
+                message.held = None;
                 let id = message.id.clone();
                 let text = message.text.clone();
                 // Re-record durably: the newest `message.queued` for an id is
@@ -5737,9 +5856,20 @@ workspace was never touched by it"
                     );
                     return Ok(());
                 }
+                // `/queue run` retries a held message too: the hooks run
+                // again, and a message they still block stays queued, held.
+                let text = self.message_queue[index].text.clone();
+                if let Some((hook, reason)) = self.prompt_block(&text) {
+                    let id = self.message_queue[index].id.clone();
+                    self.message_queue[index].held = Some(format!("{hook}: {reason}"));
+                    self.append_command_error(format!(
+                        "queued message {id} still held: blocked by {hook} hook: {reason}"
+                    ));
+                    return Ok(());
+                }
                 let message = self.message_queue.remove(index);
                 self.mark_message(&message.id, "submitted");
-                self.submit_turn(&message.text)
+                self.start_submitted_turn(&message.text)
             }
             other => {
                 self.append_command_error(format!(
@@ -7315,10 +7445,32 @@ the full history, where `/diff` lists every file it wrote\n"
         // would only bounce off `SessionConflict`. The message is never
         // silently dropped: it is queued — durably — and runs after the
         // in-flight turn settles (`/queue` lists, cancels, edits, or runs
-        // it early).
+        // it early). Its `user_prompt_submit` hooks run when it comes up.
         if self.model_busy() {
             self.queue_message(text)?;
             return self.drain();
+        }
+        // `user_prompt_submit` (ADR 0022 §7): a blocked prompt starts no
+        // turn; the reason is shown and the text goes back into the
+        // composer so the user can revise it.
+        if !text.trim().is_empty()
+            && let Some((hook, reason)) = self.prompt_block(text)
+        {
+            self.append_command_error(format!("prompt blocked by {hook} hook: {reason}"));
+            *self.ui = reduce(
+                self.ui.clone(),
+                &UiEvent::Local(LocalUiEvent::SetComposerText(text.to_owned())),
+            );
+            return self.drain();
+        }
+        self.start_submitted_turn(text)
+    }
+
+    /// Start a turn for `text` whose `user_prompt_submit` hooks already
+    /// passed (the rest of [`Self::submit_turn`]).
+    fn start_submitted_turn(&mut self, text: &str) -> Result<(), InteractiveError> {
+        if self.ui.actions_blocked() {
+            return Ok(());
         }
         // The kernel's own tip, not the projection's seq. The projection
         // lags the ledger by the live-tail poll interval (see
@@ -9334,6 +9486,13 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
         record_outcome_suspension(client, session_id, actor, root, &suspended.task, outcome);
         record_turn_context(client, session_id, actor, outcome, history_through);
     }
+    // The continuation is the rest of the turn: its end is the turn's end.
+    fire_turn_end_hooks(
+        &tools.hooks_config(),
+        &run_result,
+        Some(&LedgerHookEvents::new(client, session_id, actor)),
+        &mut |_| {},
+    );
     kernel_turn_outcome(&run_result)
 }
 
@@ -9860,6 +10019,7 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
     let goal_path = root.join(PROJECT_MARKER).join(GOAL_FILE);
     let goal_id = active_goal_id(&goal_path);
     let started = Instant::now();
+    let turn_end_hooks = tools.hooks_config();
     let run_result = crate::host::run_live_exec(
         preserved,
         backing,
@@ -9874,6 +10034,14 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
         record_outcome_suspension(client, session_id, actor, root, text, outcome);
         record_turn_context(client, session_id, actor, outcome, history_through);
     }
+    // The ledger's `hook.failed` is the warning here: a TUI turn thread has
+    // no terminal line to write to.
+    fire_turn_end_hooks(
+        &turn_end_hooks,
+        &run_result,
+        Some(&LedgerHookEvents::new(client, session_id, actor)),
+        &mut |_| {},
+    );
     if let (Ok(outcome), Some(goal_id)) = (&run_result, goal_id) {
         let active_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         accrue_turn_usage(
@@ -9967,6 +10135,81 @@ fn record_outcome_suspension(
                 &suspended,
             );
         }
+    }
+}
+
+/// How a turn ended, for the exclusive `stop` / `stop_cancelled` hook
+/// choice: a turn that succeeded completed; anything else — interrupted,
+/// paused for approval, out of budget, a failed step, an error before an
+/// outcome — ended without completing, and carries the stop reason's token.
+fn turn_end_of<E>(run_result: &Result<crate::host::ExecOutcome, E>) -> crate::hooks::TurnEnd {
+    match run_result {
+        Ok(outcome) if outcome.result.status() == AgentTerminalStatus::Succeeded => {
+            crate::hooks::TurnEnd::Completed
+        }
+        Ok(outcome) => crate::hooks::TurnEnd::Cancelled {
+            reason: outcome
+                .stop_reason
+                .map(|reason| reason.as_str().to_owned())
+                .unwrap_or_else(|| "failed".to_owned()),
+        },
+        Err(_) => crate::hooks::TurnEnd::Cancelled {
+            reason: "error".to_owned(),
+        },
+    }
+}
+
+/// Run the turn-end stage (`stop` or `stop_cancelled`, never both) for a
+/// finished turn and record what its hooks decided and which of them failed.
+/// Observes; never gates. `warn` receives a line per failed hook (headless:
+/// stderr) — the ledger records each as `hook.failed` too.
+fn fire_turn_end_hooks<E>(
+    hooks: &crate::hooks::HooksConfig,
+    run_result: &Result<crate::host::ExecOutcome, E>,
+    sink: Option<&dyn crate::exec_tools::HookEvents>,
+    warn: &mut dyn FnMut(&str),
+) {
+    if hooks.stop.is_empty() && hooks.stop_cancelled.is_empty() {
+        return;
+    }
+    let (tool_calls, tokens) = match run_result {
+        Ok(outcome) => (outcome.tool_calls, outcome.tokens),
+        Err(_) => (0, 0),
+    };
+    let report = crate::hooks::run_turn_end_stage(
+        hooks,
+        &turn_end_of(run_result),
+        tool_calls,
+        tokens,
+        crate::hooks::HOOK_TIMEOUT,
+    );
+    record_hook_report(sink, "", "", &report, warn);
+}
+
+/// Record a fail-open stage's decisions (`hook.decided`) and failures
+/// (`hook.failed`, plus a warning line) through `sink`, when there is one.
+pub(crate) fn record_hook_report(
+    sink: Option<&dyn crate::exec_tools::HookEvents>,
+    tool: &str,
+    call_id: &str,
+    report: &crate::hooks::PostHookReport,
+    warn: &mut dyn FnMut(&str),
+) {
+    for failure in &report.failures {
+        warn(&format!(
+            "warning: {} hook failed and was ignored: {}",
+            failure.hook,
+            first_line(&failure.detail)
+        ));
+    }
+    let Some(sink) = sink else {
+        return;
+    };
+    for record in &report.decisions {
+        sink.decided(tool, call_id, record);
+    }
+    for failure in &report.failures {
+        sink.failed(tool, call_id, failure);
     }
 }
 
@@ -10075,10 +10318,54 @@ impl crate::exec_tools::HookEvents for LedgerHookEvents {
                 "decision": record.decision.as_str(),
                 "reason_digest": reason_digest,
                 "grant_attempted": record.grant_attempted,
-                "tool": tool,
-                "call_id": call_id,
+                // Stages that are not about a tool call (a prompt, a turn's
+                // end) record no tool and no call.
+                "tool": (!tool.is_empty()).then_some(tool),
+                "call_id": (!call_id.is_empty()).then_some(call_id),
             }),
         );
+    }
+
+    /// `hook.failed` (`rapidlm.hook.failure/v1`): a hook in a fail-open stage
+    /// failed and was ignored — the "recorded warning" (ADR 0022 §7). The
+    /// detail travels as a digest, like a decision's reason.
+    fn failed(&self, tool: &str, call_id: &str, failure: &crate::hooks::HookFailure) {
+        let detail_digest = {
+            use sha2::Digest;
+            sha2::Sha256::digest(failure.detail.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::HookFailed,
+            serde_json::json!({
+                "record": "rapidlm.hook.failure/v1",
+                "hook": failure.hook,
+                "event": failure.event,
+                "command_digest": failure.command_digest,
+                "detail_digest": detail_digest,
+                "tool": (!tool.is_empty()).then_some(tool),
+                "call_id": (!call_id.is_empty()).then_some(call_id),
+            }),
+        );
+    }
+}
+
+impl LedgerHookEvents {
+    fn new(
+        client: &InProcessKernelClient,
+        session_id: protocol::SessionId,
+        actor: &ActorRef,
+    ) -> Self {
+        Self {
+            client: client.clone(),
+            session_id,
+            actor: actor.clone(),
+        }
     }
 }
 
@@ -15763,6 +16050,212 @@ question the panel answers"
             1
         );
         assert!(!root.join("notes.txt").exists());
+    }
+
+    fn settings_with_hooks(root: &Path, hooks: serde_json::Value) {
+        fs::write(
+            root.join(PROJECT_MARKER).join("settings.json"),
+            serde_json::json!({ "hooks": hooks }).to_string(),
+        )
+        .expect("settings");
+    }
+
+    /// A hook line running a script that appends its stdin to `capture` and
+    /// prints `stdout` — through `sh` so it runs under `cmd /C` too.
+    fn capturing_hook(root: &Path, name: &str, capture: &Path, stdout: &str) -> String {
+        let script = root.join(name);
+        fs::write(
+            &script,
+            format!(
+                "cat >> {}\necho >> {}\necho '{stdout}'\nexit 0\n",
+                test_fixtures::sh_quote(capture),
+                test_fixtures::sh_quote(capture)
+            ),
+        )
+        .expect("hook script");
+        format!("sh {}", test_fixtures::slash_path(&script))
+    }
+
+    #[test]
+    fn a_completed_interactive_turn_fires_stop_and_a_failed_one_fires_stop_cancelled() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let stop_capture = root.join("stop.jsonl");
+        let cancelled_capture = root.join("cancelled.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [capturing_hook(&root, "stop.sh", &stop_capture, "")],
+                "stop_cancelled": [capturing_hook(&root, "cancelled.sh", &cancelled_capture, "")],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("hello", ScriptedModel::terminal("hi"));
+        let stop = fs::read_to_string(&stop_capture).expect("stop fired for the completed turn");
+        assert!(stop.contains("\"event\":\"stop\""), "{stop}");
+        assert!(
+            !cancelled_capture.exists(),
+            "stop_cancelled must not fire for a completed turn"
+        );
+
+        session.run_turn(
+            "fail please",
+            ScriptedModel {
+                outputs: VecDeque::from(vec![Err(ModelStepError::Failed)]),
+                ..ScriptedModel::terminal("unused")
+            },
+        );
+        let cancelled = fs::read_to_string(&cancelled_capture)
+            .expect("stop_cancelled fired for the failed turn");
+        assert!(
+            cancelled.contains("\"event\":\"stop_cancelled\""),
+            "{cancelled}"
+        );
+        assert!(
+            cancelled.contains("\"reason\":\"model_failed\""),
+            "{cancelled}"
+        );
+        assert_eq!(
+            fs::read_to_string(&stop_capture)
+                .expect("stop")
+                .lines()
+                .filter(|l| !l.is_empty())
+                .count(),
+            1,
+            "stop fired once — for the first turn only"
+        );
+    }
+
+    #[test]
+    fn a_blocked_prompt_starts_no_turn_restores_the_composer_and_is_recorded() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let capture = root.join("prompts.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "user_prompt_submit": [capturing_hook(
+                    &root,
+                    "gate.sh",
+                    &capture,
+                    r#"{"decision":"deny","reason":"prompts must name a ticket"}"#,
+                )],
+            }),
+        );
+        let session = ScriptedSession::create(&env);
+        let turns_before = block_on(
+            session.client.get_session(session.session_id),
+            &CancellationToken::new(),
+        )
+        .expect("session")
+        .seq();
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, vec![ScriptedModel::terminal("unused")]);
+        loop_state
+            .submit_turn("refactor the parser")
+            .expect("submit");
+        let outputs = command_outputs(loop_state.ui);
+        assert!(
+            outputs.iter().any(|line| line.contains(
+                "prompt blocked by user_prompt_submit[0] hook: prompts must name a ticket"
+            )),
+            "{outputs:?}"
+        );
+        assert_eq!(
+            loop_state.ui.composer().text(),
+            "refactor the parser",
+            "the text comes back"
+        );
+        assert!(
+            !loop_state
+                .turn_in_flight
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(
+            fs::read_to_string(&capture)
+                .expect("hook ran")
+                .contains("refactor the parser")
+        );
+        let events = session
+            .client
+            .export_events(session.session_id, &CancellationToken::new())
+            .expect("export");
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.kind == event_ledger::event::EventKind::TurnStarted.as_str()),
+            "no turn started"
+        );
+        let decided = events
+            .iter()
+            .filter(|e| e.kind == event_ledger::event::EventKind::HookDecided.as_str())
+            .map(|e| serde_json::from_str::<serde_json::Value>(&e.payload_json).expect("json"))
+            .collect::<Vec<_>>();
+        assert_eq!(decided.len(), 1, "{decided:?}");
+        assert_eq!(decided[0]["event"], "user_prompt_submit");
+        assert_eq!(decided[0]["decision"], "deny");
+        assert!(decided[0]["tool"].is_null());
+        assert!(events.len() as u64 > turns_before);
+    }
+
+    #[test]
+    fn a_blocked_queued_prompt_stays_queued_held_and_survives_a_restore() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let capture = root.join("prompts.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "user_prompt_submit": [capturing_hook(
+                    &root,
+                    "gate.sh",
+                    &capture,
+                    r#"{"decision":"deny","reason":"not now"}"#,
+                )],
+            }),
+        );
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, vec![ScriptedModel::terminal("unused")]);
+        loop_state.queue_message("queued follow-up").expect("queue");
+        loop_state.queue_message("second follow-up").expect("queue");
+        loop_state.dequeue_if_ready().expect("dequeue");
+        assert_eq!(loop_state.message_queue.len(), 2, "nothing dropped");
+        assert_eq!(
+            loop_state.message_queue[0].held.as_deref(),
+            Some("user_prompt_submit[0]: not now")
+        );
+        assert!(loop_state.message_queue[1].held.is_none());
+        // The held head holds the queue and is not re-judged every tick.
+        loop_state.dequeue_if_ready().expect("dequeue");
+        loop_state.dequeue_if_ready().expect("dequeue");
+        let runs = fs::read_to_string(&capture)
+            .expect("hook ran")
+            .matches("queued follow-up")
+            .count();
+        assert_eq!(runs, 1, "the hook ran once for the held message");
+        assert_eq!(loop_state.message_queue.len(), 2);
+        assert!(
+            !loop_state
+                .turn_in_flight
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        // A restart restores the message as held, in order.
+        drop(loop_state);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut restored = locals.session_loop(&session, vec![ScriptedModel::terminal("unused")]);
+        restored.message_queue.clear();
+        restored.restore_queued_messages();
+        assert_eq!(restored.message_queue.len(), 2);
+        assert_eq!(restored.message_queue[0].text, "queued follow-up");
+        assert_eq!(
+            restored.message_queue[0].held.as_deref(),
+            Some("user_prompt_submit[0]: not now")
+        );
+        assert!(restored.message_queue[1].held.is_none());
     }
 
     #[test]

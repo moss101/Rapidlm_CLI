@@ -49,7 +49,25 @@ pub struct HooksConfig {
     /// Fires after a `/compact` recorded its summary, with the turns folded
     /// and the summary's size. Notification-style, same as `pre_compact`.
     pub post_compact: Vec<String>,
+    /// Fires when a prompt is submitted, before a turn starts (headless
+    /// `rapid exec`, the TUI composer, a queued message). A v2 `deny`
+    /// blocks the prompt with its reason; a queued prompt that is blocked
+    /// stays queued, held (ADR 0022 §7).
+    pub user_prompt_submit: Vec<String>,
+    /// Fires when a turn completes. Exclusive with `stop_cancelled`: one
+    /// turn-end site chooses which. Observes; never gates.
+    pub stop: Vec<String>,
+    /// Fires *instead of* `stop` when a turn ends without completing —
+    /// interrupted, paused for approval, out of budget, a failed model or
+    /// tool step — with the reason. Observes; never gates.
+    pub stop_cancelled: Vec<String>,
+    /// Fires when a tool call failed (a dispatch failure or an MCP error
+    /// result). May add context after the failure; cannot block.
+    pub post_tool_use_failure: Vec<String>,
 }
+
+/// Number of hook stages [`HooksConfig`] carries.
+pub const HOOK_STAGE_COUNT: usize = 12;
 
 impl HooksConfig {
     /// Parse the `hooks` object from a settings document value.
@@ -65,6 +83,10 @@ impl HooksConfig {
             ("subagent_stop", &mut config.subagent_stop),
             ("pre_compact", &mut config.pre_compact),
             ("post_compact", &mut config.post_compact),
+            ("user_prompt_submit", &mut config.user_prompt_submit),
+            ("stop", &mut config.stop),
+            ("stop_cancelled", &mut config.stop_cancelled),
+            ("post_tool_use_failure", &mut config.post_tool_use_failure),
         ] {
             let Some(entries) = object.get(key).and_then(serde_json::Value::as_array) else {
                 continue;
@@ -89,7 +111,7 @@ impl HooksConfig {
     /// walks, so a stage added to the struct cannot be left out of either
     /// (which is how `pre_compact`/`post_compact` parsed and then vanished
     /// in the project-settings merge).
-    pub fn stages_mut(&mut self) -> [&mut Vec<String>; 8] {
+    pub fn stages_mut(&mut self) -> [&mut Vec<String>; HOOK_STAGE_COUNT] {
         [
             &mut self.pre_tool_use,
             &mut self.post_tool_use,
@@ -99,6 +121,30 @@ impl HooksConfig {
             &mut self.subagent_stop,
             &mut self.pre_compact,
             &mut self.post_compact,
+            &mut self.user_prompt_submit,
+            &mut self.stop,
+            &mut self.stop_cancelled,
+            &mut self.post_tool_use_failure,
+        ]
+    }
+
+    /// Every stage with its settings key, in declaration order — what a
+    /// reader (`rapid doctor`, a managed gate) walks, so a new stage cannot
+    /// be listed in one place and forgotten in another.
+    pub fn named_stages(&self) -> [(&'static str, &Vec<String>); HOOK_STAGE_COUNT] {
+        [
+            ("pre_tool_use", &self.pre_tool_use),
+            ("post_tool_use", &self.post_tool_use),
+            ("session_start", &self.session_start),
+            ("session_end", &self.session_end),
+            ("subagent_start", &self.subagent_start),
+            ("subagent_stop", &self.subagent_stop),
+            ("pre_compact", &self.pre_compact),
+            ("post_compact", &self.post_compact),
+            ("user_prompt_submit", &self.user_prompt_submit),
+            ("stop", &self.stop),
+            ("stop_cancelled", &self.stop_cancelled),
+            ("post_tool_use_failure", &self.post_tool_use_failure),
         ]
     }
 
@@ -110,14 +156,9 @@ impl HooksConfig {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pre_tool_use.is_empty()
-            && self.post_tool_use.is_empty()
-            && self.session_start.is_empty()
-            && self.session_end.is_empty()
-            && self.subagent_start.is_empty()
-            && self.subagent_stop.is_empty()
-            && self.pre_compact.is_empty()
-            && self.post_compact.is_empty()
+        self.named_stages()
+            .iter()
+            .all(|(_, commands)| commands.is_empty())
     }
 }
 
@@ -205,9 +246,54 @@ impl HookContext {
 pub struct PostHookReport {
     pub output: String,
     pub context: Vec<HookContext>,
-    /// v2 decisions post hooks made; a post hook cannot block, so a `deny`
-    /// here is recorded and has no effect on the completed call.
+    /// v2 decisions the stage's hooks made. Whether a `deny` has an effect is
+    /// the stage's own rule: none for `post_tool_use`, `post_tool_use_failure`,
+    /// `stop` and `stop_cancelled`; a block for `user_prompt_submit` and
+    /// `subagent_stop`.
     pub decisions: Vec<HookDecisionRecord>,
+    /// Hooks that failed (non-zero exit, crash, timeout, unreadable result):
+    /// these stages fail open, so each is a recorded warning (`hook.failed`),
+    /// never an effect.
+    pub failures: Vec<HookFailure>,
+}
+
+impl PostHookReport {
+    /// The first `deny` the stage's hooks returned, as `(hook, reason)`.
+    pub fn first_deny(&self) -> Option<(String, String)> {
+        self.decisions
+            .iter()
+            .find(|decision| decision.decision == HookDecision::Deny)
+            .map(|decision| {
+                let reason = decision
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| format!("denied by {} hook", decision.hook));
+                (decision.hook.clone(), reason)
+            })
+    }
+}
+
+/// A hook in a fail-open stage that did not produce a usable result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HookFailure {
+    /// `<stage>[<index>]`.
+    pub hook: String,
+    pub event: &'static str,
+    pub command_digest: String,
+    /// Bounded: what went wrong (the hook's stderr, "hook timed out", the
+    /// parse error).
+    pub detail: String,
+}
+
+/// How a turn ended, for the exclusive `stop` / `stop_cancelled` choice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TurnEnd {
+    Completed,
+    /// Ended without completing; `reason` is a stable token
+    /// (`interrupted`, `approval_required`, `budget_exhausted`, …).
+    Cancelled {
+        reason: String,
+    },
 }
 
 /// An `updated_input` a hook returned: the hook that returned it and the
@@ -634,25 +720,139 @@ pub fn run_post_tool_stage(
     summary: &str,
     timeout: Duration,
 ) -> PostHookReport {
-    const STAGE: &str = "post_tool_use";
     // Proper JSON serialization: a hand-rolled `"{escaped}"` format only
     // escaped `\` and `"`, so a summary containing a raw newline (e.g.
     // `execute_shell`'s `"exit {code}\n{output}"`) produced invalid JSON.
     // `serde_json` escapes every control character RFC 8259 requires.
     let input = serde_json::json!({ "tool": tool, "summary": summary }).to_string();
+    run_observer_stage("post_tool_use", hooks, &input, timeout)
+}
+
+/// Run every `post_tool_use_failure` hook for a failed call. Input JSON:
+/// `{"event":"post_tool_use_failure","tool":name,"error":<the failure the
+/// model will see>}`. May add context after the failure; cannot block.
+pub fn run_post_tool_failure_stage(
+    hooks: &[String],
+    tool: &str,
+    error: &str,
+    timeout: Duration,
+) -> PostHookReport {
+    let input = serde_json::json!({
+        "event": "post_tool_use_failure",
+        "tool": tool,
+        "error": error,
+    })
+    .to_string();
+    run_observer_stage("post_tool_use_failure", hooks, &input, timeout)
+}
+
+/// Run every `user_prompt_submit` hook for a prompt about to start a turn.
+/// Input JSON: `{"event":"user_prompt_submit","prompt":text}`. A v2 `deny`
+/// blocks the prompt ([`PostHookReport::first_deny`]); `allow`/`defer`
+/// let it through; `ask` has no one to ask — the prompt's author is the
+/// human — and is recorded without effect. A hook that fails lets the prompt
+/// through with a recorded warning (fail open, like every non-tool stage).
+pub fn run_prompt_submit_stage(
+    hooks: &[String],
+    prompt: &str,
+    timeout: Duration,
+) -> PostHookReport {
+    let input = serde_json::json!({ "event": "user_prompt_submit", "prompt": prompt }).to_string();
+    run_observer_stage("user_prompt_submit", hooks, &input, timeout)
+}
+
+/// Run the one turn-end stage `end` selects — `stop` for a completed turn,
+/// `stop_cancelled` otherwise, never both. Input JSON:
+/// `{"event":"stop"|"stop_cancelled","reason"?:…,"tool_calls":n,"tokens":n}`.
+/// Observes; never gates.
+pub fn run_turn_end_stage(
+    hooks: &HooksConfig,
+    end: &TurnEnd,
+    tool_calls: u32,
+    tokens: u64,
+    timeout: Duration,
+) -> PostHookReport {
+    let (stage, commands, input) = match end {
+        TurnEnd::Completed => (
+            "stop",
+            &hooks.stop,
+            serde_json::json!({
+                "event": "stop",
+                "tool_calls": tool_calls,
+                "tokens": tokens,
+            }),
+        ),
+        TurnEnd::Cancelled { reason } => (
+            "stop_cancelled",
+            &hooks.stop_cancelled,
+            serde_json::json!({
+                "event": "stop_cancelled",
+                "reason": reason,
+                "tool_calls": tool_calls,
+                "tokens": tokens,
+            }),
+        ),
+    };
+    run_observer_stage(stage, commands, &input.to_string(), timeout)
+}
+
+/// Run every `subagent_stop` hook for a finished `task_spawn` child. Input
+/// JSON: `{"event":"subagent_stop","agent_type":…,"status":…,"ok":bool}`.
+/// A v2 `deny` blocks the child's completion: the parent receives a failure
+/// naming the hook instead of the child's report
+/// ([`PostHookReport::first_deny`]).
+pub fn run_subagent_stop_stage(
+    hooks: &[String],
+    agent_type: &str,
+    status: &str,
+    ok: bool,
+    timeout: Duration,
+) -> PostHookReport {
+    let input = serde_json::json!({
+        "event": "subagent_stop",
+        "agent_type": agent_type,
+        "status": status,
+        "ok": ok,
+    })
+    .to_string();
+    run_observer_stage("subagent_stop", hooks, &input, timeout)
+}
+
+/// The fail-open stage runner every observing stage shares: each hook gets
+/// `input` on stdin; a v2 result (from a hook that exited zero and was not
+/// killed) contributes its context and decision; plain text is the v1
+/// output; a hook that failed or printed an unreadable result is a
+/// [`HookFailure`] — a recorded warning, never an effect.
+fn run_observer_stage(
+    stage: &'static str,
+    hooks: &[String],
+    input: &str,
+    timeout: Duration,
+) -> PostHookReport {
     let mut report = PostHookReport::default();
     for (index, command) in hooks.iter().enumerate() {
-        let run = run_hook_once(command, &input, timeout);
-        // A v2 result is read only from a hook that exited zero and was not
-        // killed; anything else is the v1 text it always was.
-        let result = if run.ok && !run.timed_out {
-            HookResult::from_stdout(&run.stdout).ok().flatten()
-        } else {
-            None
-        };
-        match result {
-            Some(result) => {
-                let name = hook_name(STAGE, index);
+        let name = hook_name(stage, index);
+        let run = run_hook_once(command, input, timeout);
+        if !run.ok {
+            let detail = run.detail();
+            let detail = if detail.is_empty() {
+                "hook exited non-zero".to_owned()
+            } else {
+                detail
+            };
+            report.failures.push(HookFailure {
+                hook: name,
+                event: stage,
+                command_digest: command_digest(command),
+                detail: truncate(detail.as_bytes(), MAX_HOOK_STDERR_BYTES),
+            });
+            // A failing hook's text is still what it printed: recorded like
+            // any v1 output, as it always was for `post_tool_use`.
+            append_output(&mut report.output, &run.combined());
+            continue;
+        }
+        match HookResult::from_stdout(&run.stdout) {
+            Ok(Some(result)) => {
                 if let Some(text) = result
                     .additional_context
                     .filter(|text| !text.trim().is_empty())
@@ -664,25 +864,39 @@ pub fn run_post_tool_stage(
                 }
                 report.decisions.push(HookDecisionRecord {
                     hook: name,
-                    event: STAGE,
+                    event: stage,
                     command_digest: command_digest(command),
                     decision: result.decision,
                     reason: result.reason.filter(|r| !r.is_empty()),
                     grant_attempted: result.grant_attempted,
                 });
             }
-            None => {
-                let output = run.combined();
-                if !output.is_empty() && report.output.len() < MAX_HOOK_STDERR_BYTES {
-                    if !report.output.is_empty() {
-                        report.output.push_str("; ");
-                    }
-                    report.output.push_str(&output);
-                }
+            Ok(None) => append_output(&mut report.output, &run.combined()),
+            Err(err) => {
+                report.failures.push(HookFailure {
+                    hook: name,
+                    event: stage,
+                    command_digest: command_digest(command),
+                    detail: truncate(
+                        format!("unreadable result ({err})").as_bytes(),
+                        MAX_HOOK_STDERR_BYTES,
+                    ),
+                });
+                // What it printed is still recorded, as v1 recorded it.
+                append_output(&mut report.output, &run.combined());
             }
         }
     }
     report
+}
+
+fn append_output(combined: &mut String, output: &str) {
+    if !output.is_empty() && combined.len() < MAX_HOOK_STDERR_BYTES {
+        if !combined.is_empty() {
+            combined.push_str("; ");
+        }
+        combined.push_str(output);
+    }
 }
 
 /// Run every hook for a notification-style event (`session_start`,
@@ -1455,6 +1669,134 @@ exit 0"#,
         assert_eq!(post.decisions[0].event, "post_tool_use");
         assert_eq!(post.decisions[0].decision, HookDecision::Deny);
         // The v1 wrapper still returns only the text.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_new_stages_parse_and_every_stage_is_named_once() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"hooks": {"user_prompt_submit": ["a"], "stop": ["b"], "stop_cancelled": ["c"], "post_tool_use_failure": ["d"]}}"#,
+        )
+        .expect("json");
+        let hooks = HooksConfig::parse(&value).expect("hooks");
+        assert_eq!(hooks.user_prompt_submit, vec!["a".to_owned()]);
+        assert_eq!(hooks.stop, vec!["b".to_owned()]);
+        assert_eq!(hooks.stop_cancelled, vec!["c".to_owned()]);
+        assert_eq!(hooks.post_tool_use_failure, vec!["d".to_owned()]);
+        assert!(!hooks.is_empty());
+        // One list, no duplicates, every stage: a stage added to the struct
+        // but not to `named_stages` would drop out of doctor and the gates.
+        let mut every = HooksConfig::default();
+        for stage in every.stages_mut() {
+            stage.push("x".to_owned());
+        }
+        let names: Vec<&str> = every.named_stages().iter().map(|(n, _)| *n).collect();
+        let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+        assert_eq!(unique.len(), HOOK_STAGE_COUNT, "{names:?}");
+        assert!(every.named_stages().iter().all(|(_, c)| c.len() == 1));
+        // A settings key for every named stage round-trips through parse.
+        let doc = serde_json::json!({
+            "hooks": names.iter().map(|n| (n.to_string(), serde_json::json!(["y"]))).collect::<serde_json::Map<_, _>>()
+        });
+        let parsed = HooksConfig::parse(&doc).expect("hooks");
+        assert!(
+            parsed
+                .named_stages()
+                .iter()
+                .all(|(_, c)| **c == vec!["y".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_prompt_submit_deny_blocks_and_a_failing_hook_fails_open_with_a_warning() {
+        let dir = temp("prompt-submit");
+        let capture = dir.join("prompt.json");
+        let deny = script(
+            &dir,
+            "deny.sh",
+            &format!(
+                "cat > {}\necho '{{\"decision\":\"deny\",\"reason\":\"no secrets in prompts\"}}'\nexit 0",
+                test_fixtures::sh_quote(&capture)
+            ),
+        );
+        let report =
+            run_prompt_submit_stage(std::slice::from_ref(&deny), "fix the bug", HOOK_TIMEOUT);
+        assert_eq!(
+            report.first_deny(),
+            Some((
+                "user_prompt_submit[0]".to_owned(),
+                "no secrets in prompts".to_owned()
+            ))
+        );
+        let seen: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&capture).expect("captured"))
+                .expect("json");
+        assert_eq!(seen["event"], "user_prompt_submit");
+        assert_eq!(seen["prompt"], "fix the bug");
+        // A crashing hook lets the prompt through and is a recorded failure.
+        let crash = script(&dir, "crash.sh", "echo boom >&2\nexit 9");
+        let report = run_prompt_submit_stage(&[crash], "fix the bug", HOOK_TIMEOUT);
+        assert_eq!(report.first_deny(), None);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].hook, "user_prompt_submit[0]");
+        assert!(report.failures[0].detail.contains("boom"));
+        // `ask` has no one to ask: recorded, no block.
+        let ask = result_script(&dir, "ask.sh", r#"{"decision":"ask"}"#, 0);
+        let report = run_prompt_submit_stage(&[ask], "x", HOOK_TIMEOUT);
+        assert_eq!(report.first_deny(), None);
+        assert_eq!(report.decisions[0].decision, HookDecision::Ask);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_turn_end_stage_fires_stop_or_stop_cancelled_never_both() {
+        let dir = temp("turn-end");
+        let stop_capture = dir.join("stop.json");
+        let cancelled_capture = dir.join("cancelled.json");
+        let hooks = HooksConfig {
+            stop: vec![script(
+                &dir,
+                "stop.sh",
+                &format!("cat > {}", test_fixtures::sh_quote(&stop_capture)),
+            )],
+            stop_cancelled: vec![script(
+                &dir,
+                "cancelled.sh",
+                &format!("cat > {}", test_fixtures::sh_quote(&cancelled_capture)),
+            )],
+            ..Default::default()
+        };
+        run_turn_end_stage(&hooks, &TurnEnd::Completed, 3, 42, HOOK_TIMEOUT);
+        let stop: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&stop_capture).expect("stop fired"))
+                .expect("json");
+        assert_eq!(stop["event"], "stop");
+        assert_eq!(stop["tool_calls"], 3);
+        assert_eq!(stop["tokens"], 42);
+        assert!(
+            !cancelled_capture.exists(),
+            "stop_cancelled must not fire for a completed turn"
+        );
+        std::fs::remove_file(&stop_capture).expect("reset");
+        run_turn_end_stage(
+            &hooks,
+            &TurnEnd::Cancelled {
+                reason: "budget_exhausted".to_owned(),
+            },
+            1,
+            7,
+            HOOK_TIMEOUT,
+        );
+        let cancelled: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&cancelled_capture).expect("stop_cancelled fired"),
+        )
+        .expect("json");
+        assert_eq!(cancelled["event"], "stop_cancelled");
+        assert_eq!(cancelled["reason"], "budget_exhausted");
+        assert!(
+            !stop_capture.exists(),
+            "stop must not fire when stop_cancelled does"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -246,7 +246,8 @@
     { "kind": "graph.proposal_rejected", "family": "graph" },
     { "kind": "graph.node_state_changed", "family": "graph" },
     { "kind": "hook.decided", "family": "hook" },
-    { "kind": "hook.input_rewritten", "family": "hook" }
+    { "kind": "hook.input_rewritten", "family": "hook" },
+    { "kind": "hook.failed", "family": "hook" }
   ],
   "tools": [
     { "name": "repo.search", "description": "hybrid/lexical/structural search" },

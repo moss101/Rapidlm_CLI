@@ -946,14 +946,10 @@ fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegratio
     if hooks.is_empty() {
         return DoctorCheck::skipped("hooks", "no hooks configured in project settings");
     }
-    let stages: [(&str, &Vec<String>); 6] = [
-        ("pre_tool_use", &hooks.pre_tool_use),
-        ("post_tool_use", &hooks.post_tool_use),
-        ("session_start", &hooks.session_start),
-        ("session_end", &hooks.session_end),
-        ("subagent_start", &hooks.subagent_start),
-        ("subagent_stop", &hooks.subagent_stop),
-    ];
+    // Every stage the config carries — the list used to name six of them,
+    // so a `pre_compact`/`post_compact` hook (and every stage added since)
+    // was never counted or path-checked here.
+    let stages = hooks.named_stages();
     let mut total = 0usize;
     let mut unresolved = Vec::new();
     for (stage, commands) in stages {
