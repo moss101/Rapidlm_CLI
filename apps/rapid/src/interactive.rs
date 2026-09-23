@@ -10279,6 +10279,7 @@ impl crate::exec_tools::HookEvents for LedgerHookEvents {
             serde_json::json!({
                 "record": "rapidlm.hook.rewrite/v1",
                 "hook": record.hook,
+                "contributors": record.contributors,
                 "event": "pre_tool_use",
                 "command_digest": record.command_digest,
                 "tool": tool,
@@ -15764,6 +15765,10 @@ question the panel answers"
             serde_json::from_str(&events[rewritten].payload_json).expect("payload json");
         assert_eq!(payload["record"], "rapidlm.hook.rewrite/v1");
         assert_eq!(payload["hook"], "pre_tool_use[0]");
+        assert_eq!(
+            payload["contributors"],
+            serde_json::json!(["pre_tool_use[0]"])
+        );
         assert_eq!(payload["tool"], crate::exec_tools::WORKSPACE_WRITE_TOOL);
         assert!(
             payload["before"]

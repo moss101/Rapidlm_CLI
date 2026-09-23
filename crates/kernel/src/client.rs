@@ -613,7 +613,8 @@ impl RecordApproval {
     }
 
     /// Who raised the ask when it was not the permission lattice — a hook
-    /// (`hook:pre_tool_use[0]`), a plan proposal, an elicitation. Absent for
+    /// (`hook:pre_tool_use[0]#<12-hex command digest>`), a plan proposal, an
+    /// elicitation. Absent for
     /// a lattice `Ask`, which is what every request was before the field
     /// existed; bounded like the summary.
     pub fn with_source(mut self, source: impl Into<String>) -> Self {

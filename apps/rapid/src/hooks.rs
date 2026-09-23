@@ -233,10 +233,7 @@ impl HookContext {
     /// boundary is structural and source-independent: instructions inside
     /// are data.
     pub fn fenced(&self) -> String {
-        format!(
-            "<untrusted_context locator=\"hook:{}\">\n{}\n</untrusted_context>",
-            self.hook, self.text
-        )
+        crate::model::fence_untrusted(&format!("hook:{}", self.hook), &self.text)
     }
 }
 
@@ -301,10 +298,13 @@ pub enum TurnEnd {
 /// own argument parser is the caller's (the stage does not know the tools).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HookRewrite {
-    /// `pre_tool_use[<index>]`.
+    /// `pre_tool_use[<index>]` — the last hook that rewrote.
     pub hook: String,
     pub command_digest: String,
     pub input: serde_json::Map<String, serde_json::Value>,
+    /// Every hook whose rewrite shaped `input`, in order (each saw the call
+    /// as the hooks before it left it).
+    pub contributors: Vec<String>,
 }
 
 /// What one hook run produced: whether it exited zero, its stdout (the
@@ -639,10 +639,16 @@ pub fn run_pre_tool_stage(
                 .ok()
                 .is_some_and(|shown| shown == serde_json::Value::Object(input.clone()));
             if !unchanged {
+                let mut contributors = rewrite
+                    .take()
+                    .map(|earlier| earlier.contributors)
+                    .unwrap_or_default();
+                contributors.push(name.clone());
                 rewrite = Some(HookRewrite {
                     hook: name.clone(),
                     command_digest: command_digest(command),
                     input,
+                    contributors,
                 });
             }
         }
@@ -679,6 +685,11 @@ pub fn run_pre_tool_stage(
         },
         None => PreHookOutcome::Allowed,
     };
+    // A chain of rewrites that ends where it started is no rewrite.
+    let original = serde_json::from_str::<serde_json::Value>(arguments).ok();
+    let rewrite = rewrite.filter(|rewrite| {
+        original.as_ref() != Some(&serde_json::Value::Object(rewrite.input.clone()))
+    });
     PreHookReport {
         outcome,
         decisions,
@@ -1797,6 +1808,48 @@ exit 0"#,
             !stop_capture.exists(),
             "stop must not fire when stop_cancelled does"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_chained_rewrite_credits_every_contributor_and_a_round_trip_is_no_rewrite() {
+        let dir = temp("v2-contributors");
+        // hook0 changes the path; hook1 (seeing hook0's call) changes the content.
+        let path = script(
+            &dir,
+            "path.sh",
+            "echo '{\"decision\":\"allow\",\"updated_input\":{\"path\":\"b.txt\",\"content\":\"x\"}}'",
+        );
+        let content = script(
+            &dir,
+            "content.sh",
+            "echo '{\"decision\":\"allow\",\"updated_input\":{\"path\":\"b.txt\",\"content\":\"y\"}}'",
+        );
+        let report = run_pre_tool_stage(
+            &[path.clone(), content],
+            "workspace_write",
+            r#"{"path":"a.txt","content":"x"}"#,
+            HOOK_TIMEOUT,
+        );
+        let rewrite = report.rewrite.expect("rewritten");
+        assert_eq!(rewrite.hook, "pre_tool_use[1]");
+        assert_eq!(
+            rewrite.contributors,
+            vec!["pre_tool_use[0]".to_owned(), "pre_tool_use[1]".to_owned()]
+        );
+        // hook1 puts it back exactly as the model proposed: no rewrite at all.
+        let back = script(
+            &dir,
+            "back.sh",
+            "echo '{\"decision\":\"allow\",\"updated_input\":{\"path\":\"a.txt\",\"content\":\"x\"}}'",
+        );
+        let report = run_pre_tool_stage(
+            &[path, back],
+            "workspace_write",
+            r#"{"path":"a.txt","content":"x"}"#,
+            HOOK_TIMEOUT,
+        );
+        assert_eq!(report.rewrite, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
