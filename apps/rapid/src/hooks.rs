@@ -170,6 +170,44 @@ pub struct PreHookReport {
     pub outcome: PreHookOutcome,
     pub decisions: Vec<HookDecisionRecord>,
     pub rewrite: Option<HookRewrite>,
+    /// Every `additional_context` the stage's hooks returned, in hook order
+    /// (ADR 0022 §6). Delivered after the tool result, fenced as untrusted;
+    /// a denial delivers none — there is no result to follow.
+    pub context: Vec<HookContext>,
+}
+
+/// An `additional_context` a hook returned: bounded at parse
+/// ([`protocol::MAX_HOOK_CONTEXT_BYTES`]), delivered to the model only inside
+/// the untrusted-content fence, naming the hook.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HookContext {
+    /// `<stage>[<index>]`.
+    pub hook: String,
+    pub text: String,
+}
+
+impl HookContext {
+    /// The fenced block the model sees — the same fence retrieved untrusted
+    /// context already uses (`<untrusted_context locator="…">`), so the
+    /// boundary is structural and source-independent: instructions inside
+    /// are data.
+    pub fn fenced(&self) -> String {
+        format!(
+            "<untrusted_context locator=\"hook:{}\">\n{}\n</untrusted_context>",
+            self.hook, self.text
+        )
+    }
+}
+
+/// A post-tool stage's report: the v1 text (every plain line the hooks
+/// printed, as before) and the v2 context and decisions.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct PostHookReport {
+    pub output: String,
+    pub context: Vec<HookContext>,
+    /// v2 decisions post hooks made; a post hook cannot block, so a `deny`
+    /// here is recorded and has no effect on the completed call.
+    pub decisions: Vec<HookDecisionRecord>,
 }
 
 /// An `updated_input` a hook returned: the hook that returned it and the
@@ -409,6 +447,7 @@ pub fn run_pre_tool_stage(
     let mut decisions = Vec::new();
     let mut ask: Option<(String, String, String)> = None;
     let mut rewrite: Option<HookRewrite> = None;
+    let mut context: Vec<HookContext> = Vec::new();
     for (index, command) in hooks.iter().enumerate() {
         let name = hook_name(STAGE, index);
         // Each hook sees the call as it currently stands: an earlier hook's
@@ -469,6 +508,7 @@ pub fn run_pre_tool_stage(
                 },
                 decisions,
                 rewrite: None,
+                context: Vec::new(),
             };
         }
         let result = match HookResult::from_stdout(&run.stdout) {
@@ -481,6 +521,7 @@ pub fn run_pre_tool_stage(
                     },
                     decisions,
                     rewrite: None,
+                    context: Vec::new(),
                 };
             }
         };
@@ -492,6 +533,16 @@ pub fn run_pre_tool_stage(
             reason: result.reason.clone().filter(|r| !r.is_empty()),
             grant_attempted: result.grant_attempted,
         });
+        if let Some(text) = result
+            .additional_context
+            .clone()
+            .filter(|text| !text.trim().is_empty())
+        {
+            context.push(HookContext {
+                hook: name.clone(),
+                text,
+            });
+        }
         // The last rewriting hook wins (a later hook that rewrites nothing
         // leaves an earlier rewrite standing); a `deny` below discards it.
         if let Some(input) = result.updated_input.clone() {
@@ -520,6 +571,7 @@ pub fn run_pre_tool_stage(
                     outcome: PreHookOutcome::Denied { reason },
                     decisions,
                     rewrite: None,
+                    context: Vec::new(),
                 };
             }
             HookDecision::Ask => {
@@ -545,6 +597,7 @@ pub fn run_pre_tool_stage(
         outcome,
         decisions,
         rewrite,
+        context,
     }
 }
 
@@ -557,29 +610,79 @@ fn unreadable_result_reason(hook: &str, err: &HookResultError) -> String {
     )
 }
 
-/// Run every `post_tool_use` hook; returns their combined output (bounded).
+/// Run every `post_tool_use` hook; returns their combined v1 output
+/// (bounded). Kept for callers that only need the text; the v2 context and
+/// decisions are in [`run_post_tool_stage`].
 pub fn run_post_tool_hooks(
     hooks: &[String],
     tool: &str,
     summary: &str,
     timeout: Duration,
 ) -> String {
+    run_post_tool_stage(hooks, tool, summary, timeout).output
+}
+
+/// Run every `post_tool_use` hook for a completed call. Input JSON:
+/// `{"tool": name, "summary": <the result the model will see>}`. A hook
+/// that prints plain text has it recorded on the result as before (v1); a
+/// hook that prints a v2 result has its `additional_context` delivered
+/// fenced and its decision recorded — a post hook observes, it cannot block
+/// (ADR 0022 §6–7).
+pub fn run_post_tool_stage(
+    hooks: &[String],
+    tool: &str,
+    summary: &str,
+    timeout: Duration,
+) -> PostHookReport {
+    const STAGE: &str = "post_tool_use";
     // Proper JSON serialization: a hand-rolled `"{escaped}"` format only
     // escaped `\` and `"`, so a summary containing a raw newline (e.g.
     // `execute_shell`'s `"exit {code}\n{output}"`) produced invalid JSON.
     // `serde_json` escapes every control character RFC 8259 requires.
     let input = serde_json::json!({ "tool": tool, "summary": summary }).to_string();
-    let mut combined = String::new();
-    for command in hooks {
-        let output = run_hook_once(command, &input, timeout).combined();
-        if !output.is_empty() && combined.len() < MAX_HOOK_STDERR_BYTES {
-            if !combined.is_empty() {
-                combined.push_str("; ");
+    let mut report = PostHookReport::default();
+    for (index, command) in hooks.iter().enumerate() {
+        let run = run_hook_once(command, &input, timeout);
+        // A v2 result is read only from a hook that exited zero and was not
+        // killed; anything else is the v1 text it always was.
+        let result = if run.ok && !run.timed_out {
+            HookResult::from_stdout(&run.stdout).ok().flatten()
+        } else {
+            None
+        };
+        match result {
+            Some(result) => {
+                let name = hook_name(STAGE, index);
+                if let Some(text) = result
+                    .additional_context
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    report.context.push(HookContext {
+                        hook: name.clone(),
+                        text,
+                    });
+                }
+                report.decisions.push(HookDecisionRecord {
+                    hook: name,
+                    event: STAGE,
+                    command_digest: command_digest(command),
+                    decision: result.decision,
+                    reason: result.reason.filter(|r| !r.is_empty()),
+                    grant_attempted: result.grant_attempted,
+                });
             }
-            combined.push_str(&output);
+            None => {
+                let output = run.combined();
+                if !output.is_empty() && report.output.len() < MAX_HOOK_STDERR_BYTES {
+                    if !report.output.is_empty() {
+                        report.output.push_str("; ");
+                    }
+                    report.output.push_str(&output);
+                }
+            }
         }
     }
-    combined
+    report
 }
 
 /// Run every hook for a notification-style event (`session_start`,
@@ -1296,6 +1399,62 @@ exit 0"#,
             report.rewrite, None,
             "same object (key order aside) is no rewrite"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn additional_context_is_collected_from_pre_and_post_hooks_and_fenced() {
+        let dir = temp("v2-context");
+        let pre = result_script(
+            &dir,
+            "pre.sh",
+            r#"{"decision":"allow","additional_context":"the docs are generated nightly"}"#,
+            0,
+        );
+        let blank = result_script(
+            &dir,
+            "blank.sh",
+            r#"{"decision":"defer","additional_context":"   "}"#,
+            0,
+        );
+        let report = run_pre_tool_stage(&[pre, blank], "repo_read", "{}", HOOK_TIMEOUT);
+        assert_eq!(report.outcome, PreHookOutcome::Allowed);
+        assert_eq!(report.context.len(), 1, "blank context is not delivered");
+        assert_eq!(report.context[0].hook, "pre_tool_use[0]");
+        assert_eq!(
+            report.context[0].fenced(),
+            "<untrusted_context locator=\"hook:pre_tool_use[0]\">\nthe docs are generated nightly\n</untrusted_context>"
+        );
+        // A deny delivers none, even from an earlier hook.
+        let deny = result_script(&dir, "deny.sh", r#"{"decision":"deny","reason":"no"}"#, 0);
+        let pre2 = result_script(
+            &dir,
+            "pre2.sh",
+            r#"{"decision":"allow","additional_context":"c"}"#,
+            0,
+        );
+        let denied = run_pre_tool_stage(&[pre2, deny], "repo_read", "{}", HOOK_TIMEOUT);
+        assert!(matches!(denied.outcome, PreHookOutcome::Denied { .. }));
+        assert!(denied.context.is_empty());
+        // Post hooks: a v2 result's context is delivered, its decision
+        // recorded (and ignored — a post hook cannot block); plain text is
+        // the v1 output it always was.
+        let post_v2 = result_script(
+            &dir,
+            "post.sh",
+            r#"{"decision":"deny","reason":"too late","additional_context":"lint: 2 warnings"}"#,
+            0,
+        );
+        let post_v1 = script(&dir, "note.sh", "echo post-ran-ok");
+        let post = run_post_tool_stage(&[post_v2, post_v1], "repo_read", "s", HOOK_TIMEOUT);
+        assert_eq!(post.output, "post-ran-ok\n");
+        assert_eq!(post.context.len(), 1);
+        assert_eq!(post.context[0].hook, "post_tool_use[0]");
+        assert_eq!(post.context[0].text, "lint: 2 warnings");
+        assert_eq!(post.decisions.len(), 1);
+        assert_eq!(post.decisions[0].event, "post_tool_use");
+        assert_eq!(post.decisions[0].decision, HookDecision::Deny);
+        // The v1 wrapper still returns only the text.
         let _ = std::fs::remove_dir_all(&dir);
     }
 

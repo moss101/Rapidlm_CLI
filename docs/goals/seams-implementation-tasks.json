@@ -228,7 +228,7 @@
       "id": "SEAM-01-4",
       "title": "additional_context delivered after the result, fenced and bounded",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-01-1"
       ],
@@ -246,7 +246,12 @@
       "validation": [
         "Context appears after the result, fenced, naming the hook, cut at the bound; instructions inside are not acted on (a scripted-model test)."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goal-delivery-2026-09-20.md \u00a7 SEAM-01-4 \u2014 criterion table",
+        "apps/rapid/src/hooks.rs \u2014 HookContext, run_post_tool_stage; test additional_context_is_collected_from_pre_and_post_hooks_and_fenced",
+        "apps/rapid/src/exec_tools.rs \u2014 with_hook_context; test additional_context_follows_the_result_fenced_bounded_and_redacted",
+        "revert cycle: context dropped at dispatch \u2192 the dispatch test fails"
+      ]
     },
     {
       "id": "SEAM-01-5",
@@ -1463,6 +1468,12 @@
       "phase": "P1",
       "date": "2026-09-21",
       "note": "SEAM-01-3 landed: a hook's updated_input replaces the call once it passes ProposedToolCall bounds, the tool's own argument parser and the permission lattice (evaluated on the rewritten call \u2014 a rewrite cannot widen policy); hook.input_rewritten carries both inputs and digests before anything runs; the model's result and the TUI transcript both carry a one-line marker; the last rewriting hook wins, a deny discards, an ask shows the human the rewritten call.",
+      "evidence": "docs/goal-delivery-2026-09-20.md"
+    },
+    {
+      "phase": "P1",
+      "date": "2026-09-23",
+      "note": "SEAM-01-4 landed: pre and post hooks' additional_context follows the tool result inside the <untrusted_context locator=\"hook:\u2026\"> fence, bounded at 4 KiB and redacted like the result; post hooks gain the v2 contract (context delivered, decision recorded, cannot block); a denial delivers none.",
       "evidence": "docs/goal-delivery-2026-09-20.md"
     }
   ]
