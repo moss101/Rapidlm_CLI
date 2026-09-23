@@ -336,7 +336,9 @@
       "validation": [
         "pnpm generate:check green; a test executes every command line in hooks.md against --help."
       ],
-      "evidence": []
+      "evidence": [
+        "rule 2.4 part done early (overdue since SEAM-01-1): peer-product names removed from the comments, a test name and fixture model ids of every file SEAM-01 touched (exec_tools.rs, interactive.rs, model.rs, headless/jsonl.rs); the compat settings path stays, spelled once in PROJECT_SETTINGS_FILES \u2014 docs/goal-delivery-2026-09-20.md \u00a7 Rule 2.4"
+      ]
     },
     {
       "id": "SEAM-02-1",

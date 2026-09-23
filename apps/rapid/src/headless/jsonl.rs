@@ -733,8 +733,8 @@ mod tests {
             session_id(),
             1,
             TIME,
-            "openai/gpt-5",
-            "anthropic/claude",
+            "provider-a/model-a",
+            "provider-b/model-b",
             "fallback_to",
             None,
             None,
@@ -743,7 +743,7 @@ mod tests {
         assert_eq!(
             encode(&record),
             format!(
-                r#"{{"schema":1,"type":"router.decision","session_id":"{SESSION_ID}","seq":1,"time":"{TIME}","data":{{"policy_version":null,"reason":"fallback_to","requested_model":"openai/gpt-5","resolved_model":"anthropic/claude","spent_usd_micros":null}}}}"#
+                r#"{{"schema":1,"type":"router.decision","session_id":"{SESSION_ID}","seq":1,"time":"{TIME}","data":{{"policy_version":null,"reason":"fallback_to","requested_model":"provider-a/model-a","resolved_model":"provider-b/model-b","spent_usd_micros":null}}}}"#
             )
         );
     }
@@ -754,8 +754,8 @@ mod tests {
             session_id(),
             1,
             TIME,
-            "openai/gpt-5",
-            "anthropic/claude",
+            "provider-a/model-a",
+            "provider-b/model-b",
             "fallback_to",
             Some(4_200),
             None,
@@ -764,7 +764,7 @@ mod tests {
         assert_eq!(
             encode(&record),
             format!(
-                r#"{{"schema":1,"type":"router.decision","session_id":"{SESSION_ID}","seq":1,"time":"{TIME}","data":{{"policy_version":null,"reason":"fallback_to","requested_model":"openai/gpt-5","resolved_model":"anthropic/claude","spent_usd_micros":4200}}}}"#
+                r#"{{"schema":1,"type":"router.decision","session_id":"{SESSION_ID}","seq":1,"time":"{TIME}","data":{{"policy_version":null,"reason":"fallback_to","requested_model":"provider-a/model-a","resolved_model":"provider-b/model-b","spent_usd_micros":4200}}}}"#
             )
         );
     }
@@ -775,8 +775,8 @@ mod tests {
             session_id(),
             1,
             TIME,
-            "openai/gpt-5",
-            "anthropic/claude",
+            "provider-a/model-a",
+            "provider-b/model-b",
             "fallback_to",
             None,
             Some("abcd1234abcd1234"),
@@ -785,7 +785,7 @@ mod tests {
         assert_eq!(
             encode(&record),
             format!(
-                r#"{{"schema":1,"type":"router.decision","session_id":"{SESSION_ID}","seq":1,"time":"{TIME}","data":{{"policy_version":"abcd1234abcd1234","reason":"fallback_to","requested_model":"openai/gpt-5","resolved_model":"anthropic/claude","spent_usd_micros":null}}}}"#
+                r#"{{"schema":1,"type":"router.decision","session_id":"{SESSION_ID}","seq":1,"time":"{TIME}","data":{{"policy_version":"abcd1234abcd1234","reason":"fallback_to","requested_model":"provider-a/model-a","resolved_model":"provider-b/model-b","spent_usd_micros":null}}}}"#
             )
         );
     }

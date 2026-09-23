@@ -41,11 +41,11 @@ pub const REPO_SEARCH_TOOL: &str = "repo_search";
 pub const WORKSPACE_PATCH_TOOL: &str = "workspace_patch";
 /// Tool name for supervised command execution (gateway name `shell_exec`).
 pub const SHELL_EXEC_TOOL: &str = "shell_exec";
-/// Tool name for file-pattern search (Claude `Glob` parity).
+/// Tool name for file-pattern search.
 pub const REPO_GLOB_TOOL: &str = "repo_glob";
-/// Tool name for the model-callable task list (Claude `TodoWrite` parity).
+/// Tool name for the model-callable task list.
 pub const TODO_WRITE_TOOL: &str = "todo_write";
-/// Hard cap on `repo_glob` results (Claude truncates Glob at 100 files).
+/// Hard cap on `repo_glob` results (100 files, the common peer-tool cap).
 pub const MAX_GLOB_RESULTS: usize = 100;
 /// Hard cap on one task-list entry.
 pub const MAX_TODO_CONTENT_BYTES: usize = 512;
@@ -62,18 +62,18 @@ pub const MAX_TODO_REF_ID_BYTES: usize = 128;
 pub const MAX_TODO_DEPENDS_ON: usize = 16;
 /// Hard cap on `evidence_ids` entries per task.
 pub const MAX_TODO_EVIDENCE_IDS: usize = 16;
-/// Tool name for entering plan mode (Claude `EnterPlanMode` parity).
+/// Tool name for entering plan mode.
 pub const PLAN_ENTER_TOOL: &str = "plan_enter";
-/// Tool name for exiting plan mode with the written plan (Claude `ExitPlanMode`).
+/// Tool name for exiting plan mode with the written plan.
 pub const PLAN_EXIT_TOOL: &str = "plan_exit";
-/// Tool name for spawning a subagent (Claude `Agent`/`Task` parity).
+/// Tool name for spawning a subagent.
 pub const TASK_SPAWN_TOOL: &str = "task_spawn";
-/// Tool name for background job status (Claude `TaskOutput`/`TaskStop` parity).
+/// Tool name for background job status.
 pub const JOB_STATUS_TOOL: &str = "job_status";
 /// Tool name for reading background job output.
 pub const JOB_OUTPUT_TOOL: &str = "job_output";
 /// Workspace-relative path of the plan file (the only writable file in plan
-/// mode — Claude's plan-file carve-out).
+/// mode — the plan-file carve-out).
 pub const PLAN_PATH: &str = ".rapidlm/plan.md";
 /// Maximum live background jobs per run.
 pub const MAX_BACKGROUND_JOBS: usize = 16;
@@ -115,9 +115,9 @@ pub const MAX_PLAN_BYTES: usize = 16 * 1024;
 pub const MAX_MCP_TOOL_SURFACE_BYTES: usize = 20 * 1024;
 /// Adopted subagent types (the names both reference CLIs standardized on).
 pub const AGENT_TYPES: &[&str] = &["general-purpose", "explore", "plan"];
-/// Tool name for fetching a web page (Claude `WebFetch` parity).
+/// Tool name for fetching a web page.
 pub const WEB_FETCH_TOOL: &str = "web_fetch";
-/// Tool name for asking the user a question (Claude `AskUserQuestion` parity).
+/// Tool name for asking the user a question.
 pub const ASK_USER_TOOL: &str = "ask_user";
 /// Timeout for the ask_user stdin read.
 pub const ASK_USER_TIMEOUT: Duration = Duration::from_secs(300);
@@ -2270,7 +2270,7 @@ impl WorkspaceTools {
     /// Permission decision for one validated call. Total: every call of a
     /// known tool gets a decision. While plan mode is active the decision is
     /// additionally gated: only read-only calls and writes to the plan file
-    /// pass (Claude's plan-file carve-out).
+    /// pass (the plan-file carve-out).
     fn permission_for(&self, call: &ValidatedToolCall) -> Decision {
         let subject = Self::rule_subject(call.tool(), call.arguments()).unwrap_or_default();
         let decision = self
@@ -3735,7 +3735,7 @@ read with job_output, in this turn or a later one — the job is stopped when th
     }
 
     /// `repo_glob`: file-pattern search over workspace paths with `**` /
-    /// `*` / `?` semantics (Claude `Glob` parity), capped results.
+    /// `*` / `?` semantics, capped results.
     fn execute_repo_glob(
         &self,
         call: &ValidatedToolCall,
@@ -3772,7 +3772,7 @@ read with job_output, in this turn or a later one — the job is stopped when th
         })
     }
 
-    /// `todo_write`: merge-by-id model task list (Claude `TodoWrite` parity),
+    /// `todo_write`: merge-by-id model task list,
     /// persisted to `.rapidlm/todos.json` so the list survives across turns.
     fn execute_todo_write(
         &self,
@@ -3971,7 +3971,7 @@ read with job_output, in this turn or a later one — the job is stopped when th
     }
 
     /// `plan_enter`: activate read-only enforcement with the plan-file
-    /// carve-out (Claude `EnterPlanMode` parity).
+    /// carve-out.
     fn execute_plan_enter(
         &self,
         call: &ValidatedToolCall,
@@ -3986,8 +3986,8 @@ read with job_output, in this turn or a later one — the job is stopped when th
         })
     }
 
-    /// `plan_exit`: present the written plan and leave plan mode (Claude
-    /// `ExitPlanMode` parity — the plan is read from disk, not from memory).
+    /// `plan_exit`: present the written plan and leave plan mode (the plan
+    /// is read from disk, not from memory).
     fn execute_plan_exit(
         &self,
         call: &ValidatedToolCall,
@@ -5972,8 +5972,8 @@ fn parse_patch_args(raw: &str) -> Result<PatchArgs, ToolStepError> {
     })
 }
 
-/// Parse bounded `{"pattern", "head_limit"?}` glob arguments (Claude `Glob`:
-/// head_limit capped at 100; `**` crosses directories, `*` stays in one).
+/// Parse bounded `{"pattern", "head_limit"?}` glob arguments (head_limit
+/// capped at 100; `**` crosses directories, `*` stays in one).
 fn parse_repo_glob_args(raw: &str) -> Result<RepoGlobArgs, ToolStepError> {
     const ALLOWED: &[&str] = &["pattern", "head_limit"];
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
@@ -6233,7 +6233,7 @@ fn parse_ask_user_args(raw: &str) -> Result<(String, Vec<String>), ToolStepError
     Ok((question.to_owned(), parsed))
 }
 
-/// One configured stdio MCP server (Claude `mcpServers` schema subset).
+/// One configured stdio MCP server (the common `mcpServers` schema subset).
 ///
 /// Built only by [`crate::mcp_config`], which owns every validation rule and
 /// bound: by the time one of these exists its name is already known to be a
@@ -14519,8 +14519,8 @@ mod tests {
     fn every_tool_name_is_provider_portable() {
         // Providers disagree on tool-name alphabets: api.b.ai (and some other
         // OpenAI-compatible servers) enforce `^[a-zA-Z0-9_-]+$` and reject
-        // dots, while OpenRouter tolerates them. Adopt the reference-CLI
-        // practice (Claude Code, Grok Build): tool names use only
+        // dots, while OpenRouter tolerates them. Adopt the common peer-tool
+        // practice: tool names use only
         // [a-zA-Z0-9_-], so one surface works with every provider.
         let portable = |name: &str| {
             !name.is_empty()

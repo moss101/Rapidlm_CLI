@@ -1800,8 +1800,9 @@ grammar for: run `rapid mcp add <name> --command <program>` (see `rapid mcp --he
         // reports it is unavailable rather than acting. Wiring this one
         // would make it the first approval-classified action in the binary
         // that silently mutates the filesystem, and it edits
-        // `.claude/settings.json`, a file another tool owns, from a
-        // two-word slash command with no confirmation.
+        // the compat settings file (`PROJECT_SETTINGS_FILES[1]`), which
+        // another tool owns, from a two-word slash command with no
+        // confirmation.
         KernelAction::RemoveMcp { .. } => {
             "removing a server is approval-gated and this build has no approval broker: run \
 `rapid mcp remove <name>`, which is an explicit, argv-only command"
@@ -1826,8 +1827,8 @@ are supported, and they have no auth step"
     format!("not available: {reason}")
 }
 
-/// stderr guidance for the typed no-config fallback (mirrors the Grok Build
-/// onboarding: a small user TOML selects provider, model, and credential).
+/// stderr guidance for the typed no-config fallback (a small user TOML
+/// selects provider, model, and credential).
 pub(crate) const NOT_CONFIGURED_HINT: &str = "no model configured: add a [models] default and a [model.<id>] \
 table (provider, model, base_url) to ~/.rapidlm/config.toml or point RAPIDLM_CONFIG at one; \
 see docs/reference/model-configuration.md";
@@ -2144,7 +2145,8 @@ fn exec_turn_exit_code(
 /// Env var overriding the permission mode for one exec run.
 const PERMISSION_MODE_ENV: &str = "RAPIDLM_PERMISSION_MODE";
 /// Project settings documents consulted for the permission lattice, in
-/// precedence order (RapidLM's own first, then the Claude-compat path).
+/// precedence order (RapidLM's own first, then the compat path another
+/// tool owns — read for compatibility, never written by default).
 pub(crate) const PROJECT_SETTINGS_FILES: [&str; 2] =
     [".rapidlm/settings.json", ".claude/settings.json"];
 /// Persisted per-project allow grants consulted before any ask.
@@ -2161,13 +2163,13 @@ pub(crate) const PERMISSIONS_STORE_NAME: &str = "project-permissions.json";
 const MAX_WIRED_RULES: usize = crate::permissions::MAX_RULES * PROJECT_SETTINGS_FILES.len();
 
 /// Resolve the permission lattice for one exec run: mode precedence is env >
-/// project settings > Claude-compat `defaultMode` > `default`; rules merge
+/// project settings > compat-path `defaultMode` > `default`; rules merge
 /// from every settings document that exists (deny rules always apply). A
 /// corrupt settings document refuses the run typed rather than silently
 /// dropping its deny rules; a corrupt grants file simply yields no grants
 /// (fail-closed in the permissive direction).
 /// Resolve the permission mode for one exec run: env override > project
-/// settings > Claude-compat `defaultMode` > `default`.
+/// settings > compat-path `defaultMode` > `default`.
 fn exec_permission_mode() -> Result<crate::permissions::PermissionMode, String> {
     use crate::permissions::{PermissionMode, parse_settings};
     if let Ok(raw) = std::env::var(PERMISSION_MODE_ENV)
@@ -2509,8 +2511,8 @@ pub(crate) fn project_marker_dir_in(cwd: &Path) -> PathBuf {
 
 /// Trusted-project config merged from every file in `PROJECT_SETTINGS_FILES`
 /// — the `web_fetch` allowlist, hooks, shadow-diagnostics config, and MCP
-/// servers a `.rapidlm/settings.json` *or* `.claude/settings.json`-only
-/// project can configure, in one place instead of duplicated at both call
+/// servers a project can configure in either settings file (its own or the
+/// compat path), in one place instead of duplicated at both call
 /// sites (the real `exec_turn` path and this struct's own unit test).
 pub(crate) struct ProjectIntegrations {
     fetch_allowlist: Vec<String>,
@@ -3199,7 +3201,7 @@ the child's changes are held in its isolated worktree at {} and were NOT applied
     }
 }
 
-/// Discover project instructions (AGENTS.md convention + `.claude`/`.cursor`
+/// Discover project instructions (AGENTS.md convention + the peer-tool
 /// compat paths) for the exec run, root-first and bounded. Failures are
 /// advisory here (the turn continues without rules) but are reported.
 fn exec_discover_rules(cwd: &Path, root: &Path) -> Option<String> {
@@ -3930,7 +3932,7 @@ fn build_live_context(
 }
 
 /// Build the live-context host around the prompt and run one agent turn through
-/// the recovery-capable executor. The backing model is resolved Grok-style:
+/// the recovery-capable executor. The backing model is resolved in layers:
 /// `RAPIDLM_CONFIG`/`RAPIDLM_MODEL` env overrides, then the user config file,
 /// then the typed unconfigured fallback (a model step stays a typed provider
 /// failure — never a synthetic completion). Workspace file tools are granted
@@ -3938,7 +3940,7 @@ fn build_live_context(
 /// fail-closed refusal. `--verbose` opts into bounded step diagnostics.
 ///
 /// `forced_mode` overrides every other permission-mode source unconditionally
-/// (env, project settings, Claude-compat `defaultMode`) — used by `rapid
+/// (env, project settings, compat-path `defaultMode`) — used by `rapid
 /// cron`'s propose-only execution to guarantee `Plan` mode regardless of the
 /// ambient environment. `None` (the interactive `rapid exec` CLI entry) keeps
 /// the existing precedence untouched.
@@ -11946,7 +11948,7 @@ default = "main"
 
 [model.main]
 provider = "anthropic"
-model = "claude-sonnet-5"
+model = "main-model"
 base_url = "https://api.anthropic.com"
 
 [model.cheap]
@@ -12317,29 +12319,35 @@ approval gap has been closed and this characterization test should be rewritten:
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The compat settings path, spelled once in `PROJECT_SETTINGS_FILES`.
+    fn compat_settings() -> &'static str {
+        PROJECT_SETTINGS_FILES[1]
+    }
+
     #[test]
-    fn project_integrations_merge_across_rapidlm_and_claude_settings() {
+    fn project_integrations_merge_across_rapidlm_and_compat_settings() {
         let dir = std::env::temp_dir().join(format!(
             "project-integrations-{}-{}",
             std::process::id(),
             TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(dir.join(".rapidlm")).expect("rapidlm dir");
-        std::fs::create_dir_all(dir.join(".claude")).expect("claude dir");
+        std::fs::create_dir_all(dir.join(compat_settings()).parent().expect("compat dir"))
+            .expect("compat dir");
         std::fs::write(
             dir.join(".rapidlm/settings.json"),
             r#"{"fetch_allowlist": ["example.com"], "hooks": {"session_start": ["a"]}}"#,
         )
         .expect("rapidlm settings");
         std::fs::write(
-            dir.join(".claude/settings.json"),
+            dir.join(compat_settings()),
             r#"{"fetch_allowlist": ["other.example"], "hooks": {"session_start": ["b"]}}"#,
         )
-        .expect("claude settings");
+        .expect("compat settings");
 
         let integrations = load_project_integrations(&dir);
-        // List-shaped config merges across both files: a `.claude/
-        // settings.json`-only project (the compat case this exists for)
+        // List-shaped config merges across both files: a compat-path-only
+        // project (the compat case this exists for)
         // gets the same treatment as a `.rapidlm/settings.json`-only one,
         // and a project with both gets contributions from both.
         assert_eq!(
@@ -12362,7 +12370,8 @@ approval gap has been closed and this characterization test should be rewritten:
             TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(dir.join(".rapidlm")).expect("rapidlm dir");
-        std::fs::create_dir_all(dir.join(".claude")).expect("claude dir");
+        std::fs::create_dir_all(dir.join(compat_settings()).parent().expect("compat dir"))
+            .expect("compat dir");
         // MAX_HOOKS_PER_STAGE commands in each file: each file's own parse
         // stays under the per-file cap, but the merge across two files
         // would exceed it without the post-merge truncate.
@@ -12371,7 +12380,7 @@ approval gap has been closed and this characterization test should be rewritten:
             .collect();
         let settings = serde_json::json!({"hooks": {"session_start": full_stage}}).to_string();
         std::fs::write(dir.join(".rapidlm/settings.json"), &settings).expect("rapidlm settings");
-        std::fs::write(dir.join(".claude/settings.json"), &settings).expect("claude settings");
+        std::fs::write(dir.join(compat_settings()), &settings).expect("compat settings");
 
         let integrations = load_project_integrations(&dir);
         assert_eq!(
@@ -12396,19 +12405,20 @@ approval gap has been closed and this characterization test should be rewritten:
             TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(dir.join(".rapidlm")).expect("rapidlm dir");
-        std::fs::create_dir_all(dir.join(".claude")).expect("claude dir");
+        std::fs::create_dir_all(dir.join(compat_settings()).parent().expect("compat dir"))
+            .expect("compat dir");
         std::fs::write(
             dir.join(".rapidlm/settings.json"),
             r#"{"mcpServers": {"shared": {"command": "native"}, "only-native": {"command": "a"}}}"#,
         )
         .expect("rapidlm settings");
         std::fs::write(
-            dir.join(".claude/settings.json"),
+            dir.join(compat_settings()),
             r#"{"mcpServers": {"shared": {"command": "compat"},
                                 "only-compat": {"command": "b"},
                                 "broken": {"url": "https://example.com"}}}"#,
         )
-        .expect("claude settings");
+        .expect("compat settings");
 
         let integrations = load_project_integrations(&dir);
         let names: Vec<String> = integrations
@@ -15365,7 +15375,7 @@ that is no longer there"
             reasoning_effort: None,
         };
         let mut entries = std::collections::BTreeMap::new();
-        entries.insert("big".to_owned(), entry("claude-opus-5", Some(200_000)));
+        entries.insert("big".to_owned(), entry("big-model", Some(200_000)));
         entries.insert("backup".to_owned(), entry("gpt-5", None));
         let config = UserConfig {
             models: ModelsSection {
@@ -19883,8 +19893,9 @@ api_key = "k"
         // approval-gated and this build has no approval broker. Wiring it
         // would have made it the first approval-classified action in the
         // binary that silently mutates the filesystem, and it deletes from
-        // `.claude/settings.json`, a file another tool owns, from a two-word
-        // slash command with no confirmation.
+        // the compat settings file (`PROJECT_SETTINGS_FILES[1]`), which
+        // another tool owns, from a two-word slash command with no
+        // confirmation.
         let _lock = lock_terminal();
         let env = TempEnv::create();
         fs::create_dir_all(env.project.join(PROJECT_MARKER)).expect("marker");

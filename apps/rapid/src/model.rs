@@ -1,7 +1,7 @@
 //! Composition bridge: user model config → llm-router adapter → `LiveModelCall`.
 //!
 //! The exec command's typed fallback ([`UnconfiguredModel`]) is replaced by a
-//! [`ConfiguredModel`] when the Grok-style user config resolves a model. The
+//! [`ConfiguredModel`] when the layered user config resolves a model. The
 //! bridge owns:
 //!
 //!   - credential seeding: the resolved key is placed in an in-process
