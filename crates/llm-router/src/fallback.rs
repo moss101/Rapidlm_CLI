@@ -246,6 +246,9 @@ pub fn classify_failure(trigger: &FallbackTrigger) -> FailureClass {
             ProviderError::Cancelled => FailureClass::Cancelled,
             ProviderError::AuthFailed => FailureClass::Auth,
             ProviderError::QuotaExceeded => FailureClass::Quota,
+            // Credentials again, though not the provider's: an explicit
+            // alternate (another path) or a stop, never a retry.
+            ProviderError::ProxyRefused => FailureClass::Auth,
             ProviderError::RateLimited { retry_after_ms } => FailureClass::RateLimited {
                 retry_after_ms: *retry_after_ms,
             },

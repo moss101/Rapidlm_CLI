@@ -538,9 +538,8 @@ pub(crate) fn connect_tunnel(
     match status {
         200..=299 => Ok(()),
         // The proxy refused its own credentials: asking again sends the same
-        // ones (and can lock a directory account). An authentication failure
-        // is the class nothing retries.
-        407 => Err(ProviderError::AuthFailed),
+        // ones (and can lock a directory account). Never retried.
+        407 => Err(ProviderError::ProxyRefused),
         _ => Err(ProviderError::Connection),
     }
 }
@@ -799,7 +798,7 @@ mod tests {
             );
             assert_eq!(result.is_ok(), ok, "{answer}");
             if answer.contains(" 407 ") {
-                assert_eq!(result, Err(ProviderError::AuthFailed), "not retried");
+                assert_eq!(result, Err(ProviderError::ProxyRefused), "not retried");
             }
         }
     }

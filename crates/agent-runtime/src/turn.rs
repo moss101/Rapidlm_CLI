@@ -304,6 +304,9 @@ pub enum FailureCause {
     Rejected,
     /// The account has no quota or credit left (HTTP 402); never retried.
     Quota,
+    /// A proxy on the path refused its own credentials (HTTP 407); never
+    /// retried — asking again sends the same ones.
+    ProxyAuth,
     /// Temporary provider-side condition; the step layer retries within bounds.
     Transient { retry_after_ms: Option<u64> },
     /// Cause not provider-classified (internal or unclassified stream failure).
@@ -317,6 +320,7 @@ impl FailureCause {
             Self::Connection => "connection",
             Self::Rejected => "provider rejection",
             Self::Quota => "exhausted provider quota",
+            Self::ProxyAuth => "proxy authentication",
             Self::Transient { .. } => "transient provider condition",
             Self::Unspecified => "unspecified failure",
         }
@@ -329,6 +333,7 @@ impl FailureCause {
             Self::Connection => "check network reachability and the configured base_url",
             Self::Rejected => "check the model id and request shape",
             Self::Quota => "check the provider account's quota or billing",
+            Self::ProxyAuth => "check the user and password in the proxy variable",
             Self::Transient { .. } => "bounded retries were exhausted; try again later",
             Self::Unspecified => "no provider-classified detail is available",
         }

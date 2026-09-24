@@ -1270,6 +1270,8 @@ pub enum ProbeFailure {
     /// Not sent: rapid does not dial this address (an unspecified,
     /// link-local or metadata address).
     Refused,
+    /// The proxy the request goes through refused its own credentials.
+    ProxyAuth,
     /// It answered, but not as this dialect's server would, or refused the
     /// request itself (unknown model, malformed body).
     Invalid,
@@ -1285,7 +1287,7 @@ impl ProbeFailure {
             | Self::Auth
             | Self::AuthNoKey => 11,
             Self::Quota => 12,
-            Self::Network | Self::Refused => 13,
+            Self::Network | Self::Refused | Self::ProxyAuth => 13,
             Self::Server => 14,
             Self::Invalid => 15,
         }
@@ -1300,7 +1302,7 @@ impl ProbeFailure {
             | Self::Auth
             | Self::AuthNoKey => "auth",
             Self::Quota => "quota",
-            Self::Network | Self::Refused => "network",
+            Self::Network | Self::Refused | Self::ProxyAuth => "network",
             Self::Server => "server",
             Self::Invalid => "invalid",
         }
@@ -1344,6 +1346,9 @@ billing and limits, then run rapid setup again"
 rapid setup again"
             ),
             Self::Server => format!("{endpoint} failed on its side — run rapid setup again later"),
+            Self::ProxyAuth => "the proxy on the way refused its credentials — check the user and \
+password in the proxy variable (https_proxy or http_proxy), then run rapid setup again"
+                .to_owned(),
             Self::Refused => format!(
                 "rapid does not dial {endpoint} (an unspecified, broadcast, multicast, link-local \
 or metadata address), so no request was made — check --base-url, then run rapid setup again"
@@ -1363,6 +1368,7 @@ pub fn classify(err: &llm_router::provider::ProviderError) -> ProbeFailure {
     match err {
         E::AuthFailed => ProbeFailure::Auth,
         E::QuotaExceeded | E::RateLimited { .. } => ProbeFailure::Quota,
+        E::ProxyRefused => ProbeFailure::ProxyAuth,
         E::Connection | E::Cancelled => ProbeFailure::Network,
         E::Transient => ProbeFailure::Server,
         // Raised before anything is sent (the address guards).
@@ -3323,6 +3329,8 @@ own_knob = 2
         let home = Home::new("verify-local");
         // A name that resolves to an address rapid does not dial is refused
         // by the transport's guard before anything is sent.
+        let proxy = classify(&llm_router::provider::ProviderError::ProxyRefused);
+        assert_eq!((proxy.exit_code(), proxy.class()), (13, "network"));
         let failure = classify(&llm_router::provider::ProviderError::InvalidRequest);
         assert_eq!(failure, ProbeFailure::Refused);
         assert_eq!((failure.exit_code(), failure.class()), (13, "network"));
@@ -3336,6 +3344,11 @@ own_knob = 2
             "T",
         )
         .expect("plan");
+        assert!(
+            proxy.hint(&plan).contains("proxy variable"),
+            "{}",
+            proxy.hint(&plan)
+        );
         assert!(
             failure
                 .hint(&plan)

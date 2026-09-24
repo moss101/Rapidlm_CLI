@@ -1284,9 +1284,8 @@ fn classify_http_error(response: &ProviderHttpResponse) -> Result<(), ProviderEr
             Err(ProviderError::ContextTooLarge)
         }
         // Only a proxy asks for its own credentials: asking again sends the
-        // same ones (and can lock a directory account). An authentication
-        // failure is the class nothing retries.
-        407 => Err(ProviderError::AuthFailed),
+        // same ones (and can lock a directory account). Never retried.
+        407 => Err(ProviderError::ProxyRefused),
         408 | 409 | 425 | 500 | 502 | 503 | 504 => Err(ProviderError::Transient),
         // A redirect is never followed, and asking again is redirected again.
         300..=499 => Err(ProviderError::Permanent),
@@ -4516,8 +4515,9 @@ mod tests {
         let response = ProviderHttpResponse::new(407, Vec::new(), Vec::new()).expect("response");
         assert_eq!(
             classify_http_error(&response),
-            Err(ProviderError::AuthFailed)
+            Err(ProviderError::ProxyRefused)
         );
+        assert!(!ProviderError::ProxyRefused.is_retryable());
     }
 
     #[test]

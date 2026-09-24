@@ -183,6 +183,11 @@ pub enum ProviderError {
     /// left. Distinct from [`ProviderError::RateLimited`] — waiting does not
     /// help — so it is never retried.
     QuotaExceeded,
+    /// A proxy on the path refused its own credentials (HTTP 407): asking
+    /// again sends the same ones (and can lock a directory account), so it is
+    /// never retried. Distinct from [`ProviderError::AuthFailed`]: the
+    /// provider's key is not what was refused.
+    ProxyRefused,
     BoundExceeded,
     UnknownVariant,
 }
@@ -521,9 +526,11 @@ impl ProviderError {
             Self::ContextTooLarge => Some(ErrorCode::ProviderContextTooLarge),
             // No public code of its own (adding one is a wire change): the
             // one `Permanent` uses, with its own message below.
-            Self::Transient | Self::Permanent | Self::Connection | Self::QuotaExceeded => {
-                Some(ErrorCode::InternalUnexpected)
-            }
+            Self::Transient
+            | Self::Permanent
+            | Self::Connection
+            | Self::QuotaExceeded
+            | Self::ProxyRefused => Some(ErrorCode::InternalUnexpected),
         }
     }
 
@@ -544,6 +551,7 @@ impl ProviderError {
             Self::ContextTooLarge => "Provider context window exceeded",
             Self::Connection => "Provider connection failed",
             Self::QuotaExceeded => "Provider quota exhausted",
+            Self::ProxyRefused => "Proxy refused its credentials",
             Self::InvalidRequest => return None,
             Self::Transient | Self::Permanent | Self::BoundExceeded | Self::UnknownVariant => {
                 UNKNOWN_INTERNAL_MESSAGE
@@ -566,6 +574,7 @@ impl ProviderError {
             Self::Connection => "connection",
             Self::Permanent => "permanent",
             Self::QuotaExceeded => "quota_exceeded",
+            Self::ProxyRefused => "proxy_refused",
             Self::BoundExceeded => "bound_exceeded",
             Self::UnknownVariant => "unknown_variant",
         }
@@ -584,6 +593,7 @@ impl fmt::Display for ProviderError {
             Self::Connection => "provider connection failed",
             Self::Permanent => "provider reported a permanent failure",
             Self::QuotaExceeded => "provider quota exhausted (payment required)",
+            Self::ProxyRefused => "a proxy refused its credentials (proxy authentication required)",
             Self::BoundExceeded => "provider object exceeds a documented bound",
             Self::UnknownVariant => "unknown provider schema variant",
         })
@@ -2518,6 +2528,7 @@ fn parse_error_kind(kind: &str) -> Result<ProviderError, ProviderError> {
         "connection" => Ok(ProviderError::Connection),
         "permanent" => Ok(ProviderError::Permanent),
         "quota_exceeded" => Ok(ProviderError::QuotaExceeded),
+        "proxy_refused" => Ok(ProviderError::ProxyRefused),
         "bound_exceeded" => Ok(ProviderError::BoundExceeded),
         "unknown_variant" => Ok(ProviderError::UnknownVariant),
         _ => Err(ProviderError::UnknownVariant),
@@ -2868,6 +2879,21 @@ mod tests {
         assert_eq!(
             ToolName::parse("read/file"),
             Err(ProviderError::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn a_proxy_refusal_round_trips_and_is_never_retried() {
+        assert_eq!(
+            parse_error_kind(ProviderError::ProxyRefused.as_kind_str()),
+            Ok(ProviderError::ProxyRefused)
+        );
+        assert!(!ProviderError::ProxyRefused.is_retryable());
+        assert_eq!(
+            crate::fallback::classify_failure(&crate::fallback::FallbackTrigger::Provider(
+                ProviderError::ProxyRefused
+            )),
+            crate::fallback::FailureClass::Auth
         );
     }
 }

@@ -832,6 +832,9 @@ fn map_provider_error(err: ProviderError) -> ModelStepError {
         ProviderError::QuotaExceeded => ModelStepError::ProviderFailed {
             cause: FailureCause::Quota,
         },
+        ProviderError::ProxyRefused => ModelStepError::ProviderFailed {
+            cause: FailureCause::ProxyAuth,
+        },
         ProviderError::Connection => ModelStepError::ProviderFailed {
             cause: FailureCause::Connection,
         },
@@ -1230,6 +1233,13 @@ mod tests {
     fn provider_error_mapping_keeps_distinct_cause_classes() {
         // Auth vs connection vs rejection vs transient must stay distinguishable:
         // the CLI formats each into its own operator-actionable message.
+        assert_eq!(
+            map_provider_error(ProviderError::ProxyRefused),
+            ModelStepError::ProviderFailed {
+                cause: FailureCause::ProxyAuth
+            },
+            "a proxy's refusal is its own cause, never the provider key's"
+        );
         assert_eq!(
             map_provider_error(ProviderError::AuthFailed),
             ModelStepError::ProviderFailed {

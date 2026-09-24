@@ -553,8 +553,8 @@ fn classify_http_error(
             Err(ProviderError::ContextTooLarge)
         }
         // Only a proxy asks for its own credentials: asking again sends the
-        // same ones. An authentication failure is the class nothing retries.
-        407 => Err(ProviderError::AuthFailed),
+        // same ones. Never retried.
+        407 => Err(ProviderError::ProxyRefused),
         408 | 409 | 425 | 500 | 502 | 503 | 504 | 529 => Err(ProviderError::Transient),
         // A redirect is never followed, and asking again is redirected again.
         300..=499 => Err(ProviderError::Permanent),
@@ -1946,7 +1946,7 @@ mod tests {
         .expect("response");
         assert_eq!(
             classify_http_error(&proxy_auth),
-            Err(ProviderError::AuthFailed),
+            Err(ProviderError::ProxyRefused),
             "a proxy refusing its own credentials is not retried"
         );
         assert_eq!(
