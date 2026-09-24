@@ -823,6 +823,12 @@ impl<C: KernelClient> V1Adapter<C> {
         Ok(())
     }
 
+    /// Whether `initialize` has completed (and the adapter is not cancelled):
+    /// a composition root that answers a request itself checks this first.
+    pub fn is_ready(&self) -> bool {
+        self.require_ready().is_ok()
+    }
+
     fn require_ready(&self) -> Result<(), V1Error> {
         self.check_cancel()?;
         if self.initialized {

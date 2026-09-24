@@ -6755,12 +6755,16 @@ denied\n",
                 return Ok(());
             }
         };
+        // Started while a turn holds the slot: that turn's end is inspected
+        // like an iteration's — interrupted or failed stops the goal, as it
+        // would have stopped the loop — before the first iteration starts.
+        let busy_since = self.model_busy().then(|| self.ui.transcript().len());
         self.autonomous = Some(AutonomousGoalState {
             goal_id,
             agent_id: protocol::AgentId::new(),
             _lease: lease,
             loop_detector: MessageLoopDetector::new(),
-            transcript_len_before_iteration: None,
+            transcript_len_before_iteration: busy_since,
         });
         self.append_command_output("autonomous goal execution started".to_owned());
         self.continue_or_stop_autonomous_goal()
@@ -6870,7 +6874,11 @@ denied\n",
         // lease — an error that ends the session — or race the compaction.
         // The loop's next pass (`step_autonomous_goal`) starts the iteration
         // once the slot is free.
-        if self.model_busy() {
+        if self.model_busy()
+            || !crate::approvals::pending_approvals(self.client, self.session_id).is_empty()
+        {
+            // An approval the user has not answered holds the session too:
+            // a goal turn started over it would lock `/approvals` out.
             return Ok(());
         }
         let goal_id = auto.goal_id;
@@ -7949,10 +7957,17 @@ impl ExecRecording {
     /// `finish_turn` needs.
     fn start_turn(&self, text: &str) -> Result<protocol::TurnId, String> {
         let cancel = CancellationToken::new();
+        // The session's own tip, not the seq captured when the recording
+        // began: the `user_prompt_submit` gate records its decisions through
+        // this same session before the turn starts, and a submit at the
+        // older seq conflicted with them — the run then went unrecorded.
+        let tip = block_on(self.client.get_session(self.session_id), &cancel)
+            .map(|snapshot| snapshot.seq())
+            .unwrap_or(self.seq);
         let handle = block_on(
             self.client.submit_turn(SubmitTurn::new(
                 self.session_id,
-                self.seq,
+                tip,
                 self.actor.clone(),
                 TraceId::new(),
                 text,
@@ -10369,6 +10384,22 @@ pub(crate) fn prompt_submit_block(
     text: &str,
     warn: &mut dyn FnMut(&str),
 ) -> Option<(String, String)> {
+    let report = prompt_submit_decision(root, trusted, text)?;
+    record_prompt_submit(client, session_id, actor, &report, warn);
+    report.first_deny()
+}
+
+/// Run the `user_prompt_submit` stage without recording anything: `None`
+/// when no hook runs (untrusted, blank prompt, no hooks). A caller that
+/// submits at a client-supplied `expected_seq` records the report only after
+/// the turn is accepted ([`record_prompt_submit`]) — recorded first, the
+/// hooks' own events would move the session past that seq and the submit
+/// would conflict with them.
+pub(crate) fn prompt_submit_decision(
+    root: &Path,
+    trusted: bool,
+    text: &str,
+) -> Option<crate::hooks::PostHookReport> {
     if !trusted || text.trim().is_empty() {
         return None;
     }
@@ -10376,14 +10407,23 @@ pub(crate) fn prompt_submit_block(
     if hooks.user_prompt_submit.is_empty() {
         return None;
     }
-    let report = crate::hooks::run_prompt_submit_stage(
+    Some(crate::hooks::run_prompt_submit_stage(
         &hooks.user_prompt_submit,
         text,
         crate::hooks::HOOK_TIMEOUT,
-    );
+    ))
+}
+
+/// Record what the `user_prompt_submit` hooks decided and which failed.
+pub(crate) fn record_prompt_submit(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    report: &crate::hooks::PostHookReport,
+    warn: &mut dyn FnMut(&str),
+) {
     let sink = LedgerHookEvents::new(client, session_id, actor);
-    record_hook_report(Some(&sink), "", "", &report, warn);
-    report.first_deny()
+    record_hook_report(Some(&sink), "", "", report, warn);
 }
 
 /// Record a fail-open stage's decisions (`hook.decided`) and failures
@@ -16742,6 +16782,142 @@ question the panel answers"
     }
 
     #[test]
+    fn a_goal_waits_for_a_pending_approval_and_stops_when_the_turn_it_waited_behind_fails() {
+        use crate::approvals::ApprovalSink as _;
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let _goal = session.create_active_goal();
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(vec![ScriptedModel::terminal("done")]);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            std::sync::Arc::clone(&turn_in_flight),
+            backings,
+        );
+        // A pending approval holds the session: no iteration starts over it.
+        let sink = crate::approvals::LedgerApprovalSink::new(
+            session.client.clone(),
+            session.session_id,
+            session.actor.clone(),
+            session.root.clone(),
+        );
+        sink.request(&crate::approvals::ApprovalRequest {
+            tool: crate::exec_tools::WORKSPACE_WRITE_TOOL.to_owned(),
+            call_id: "c1".to_owned(),
+            summary: "create a.txt".to_owned(),
+            scope: Vec::new(),
+            diff: String::new(),
+            source: None,
+            arguments_digest: None,
+        })
+        .expect("pending approval");
+        loop_state.start_autonomous_goal().expect("start");
+        assert!(
+            loop_state
+                .autonomous
+                .as_ref()
+                .is_some_and(|auto| auto.transcript_len_before_iteration.is_none()),
+            "no iteration over a pending approval"
+        );
+        loop_state.stop_autonomous_goal("test");
+
+        // Started while a turn runs; that turn fails: the goal stops rather
+        // than starting over it.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let _goal = session.create_active_goal();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let tip = snapshot.seq();
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(vec![ScriptedModel::terminal("never")]);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            std::sync::Arc::clone(&turn_in_flight),
+            backings,
+        );
+        loop_state
+            .start_autonomous_goal()
+            .expect("start while busy");
+        let handle = block_on(
+            session.client.submit_turn(SubmitTurn::new(
+                session.session_id,
+                tip,
+                session.actor.clone(),
+                TraceId::new(),
+                "the turn that was running".to_owned(),
+            )),
+            &cancel,
+        )
+        .expect("occupying turn");
+        let _ = session.client.finish_turn(kernel::FinishTurn::new(
+            session.session_id,
+            handle.turn_id(),
+            session.actor.clone(),
+            TraceId::new(),
+            kernel::TurnOutcome::Failed {
+                reason: "it failed".to_owned(),
+            },
+        ));
+        turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+        drive_autonomous_goal(&mut loop_state);
+        assert!(
+            loop_state.autonomous.is_none(),
+            "the goal stops when the turn it waited behind failed"
+        );
+        let transcript = format!("{:?}", loop_state.ui.transcript());
+        assert!(
+            transcript.contains("the last autonomous turn failed"),
+            "stopped because of that turn: {transcript}"
+        );
+        assert!(
+            !loop_state
+                .ui
+                .transcript()
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::Assistant { .. })),
+            "no iteration ran over it"
+        );
+    }
+
+    #[test]
     fn a_goal_run_while_the_model_slot_is_busy_waits_instead_of_starting_a_second_turn() {
         // `/goal run` typed while a turn runs: starting one now would bounce
         // off the kernel's lease (an error that ends the session) or race a
@@ -16784,10 +16960,11 @@ question the panel answers"
             "the goal is still being driven"
         );
         assert!(
-            loop_state
-                .autonomous
-                .as_ref()
-                .is_some_and(|auto| auto.transcript_len_before_iteration.is_none()),
+            !loop_state
+                .ui
+                .transcript()
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::Assistant { .. })),
             "no iteration started while the slot was busy"
         );
         turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);

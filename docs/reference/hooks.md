@@ -185,7 +185,9 @@ context.
   `rapid exec` prints the reason and exits `3` before any model request. An
   ACP or `rapid daemon` prompt that is blocked is refused before it becomes
   a turn — the client gets the reason (ACP: stop reason `refusal`; the
-  daemon: an error) and the prompt never enters the conversation history.
+  daemon: an error, and the decision is recorded on the session, so re-read
+  it before the next submit) and the prompt never enters the conversation
+  history.
 - `subagent_stop`: a `deny` replaces the child's report with
   `subagent (<type>) completion blocked by subagent_stop[<n>] hook: <reason>`,
   followed by what became of the child's changes. The hook decides before
@@ -193,7 +195,8 @@ context.
   not blocked is applied (automatically under `rapid exec`; held for
   `/agents integrate` in the TUI). A blocked or unfinished child's changes
   are held for review in the TUI and discarded under `rapid exec`; a failed
-  child's are discarded. `/agents` shows a blocked child as failed.
+  or cancelled child's are discarded. `/agents` shows a blocked child as
+  failed.
 
 ## Records
 

@@ -405,6 +405,10 @@ fn a_blocked_prompt_exits_policy_before_any_model_request_and_a_completed_run_fi
     let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "say hello"]);
     assert_eq!(code, Some(0), "{stdout}\n{stderr}");
     assert!(
+        !stderr.contains("not being recorded"),
+        "the gate's decision does not stale the recorded session: {stderr}"
+    );
+    assert!(
         posts.load(std::sync::atomic::Ordering::SeqCst) > 0,
         "the allowed prompt did"
     );

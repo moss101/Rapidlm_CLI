@@ -341,17 +341,25 @@ impl Connection {
                     .to_owned();
                 // `user_prompt_submit` (ADR 0022 §7) decides before the kernel
                 // records a turn: a blocked prompt never becomes one, so its
-                // text never enters the history a later turn replays.
-                if let Some((hook, reason)) = crate::interactive::prompt_submit_block(
-                    &self.client,
-                    session,
-                    &self.actor,
-                    &self.root,
-                    self.trusted,
-                    &text,
-                    &mut |_| {},
-                ) {
-                    return Err(format!("prompt blocked by {hook} hook: {reason}"));
+                // text never enters the history a later turn replays. The
+                // hooks' records land after the turn is accepted — first, they
+                // would move the session past the client's `expected_seq`.
+                let gate =
+                    crate::interactive::prompt_submit_decision(&self.root, self.trusted, &text);
+                if let Some(report) = &gate
+                    && let Some((hook, reason)) = report.first_deny()
+                {
+                    crate::interactive::record_prompt_submit(
+                        &self.client,
+                        session,
+                        &self.actor,
+                        report,
+                        &mut |_| {},
+                    );
+                    return Err(format!(
+                        "prompt blocked by {hook} hook: {reason} (recorded on the session; \
+re-read it before the next submit)"
+                    ));
                 }
                 let handle = crate::approvals::client_call(self.client.submit_turn(
                     kernel::SubmitTurn::new(
@@ -363,6 +371,15 @@ impl Connection {
                     ),
                 ))
                 .map_err(|err| err.to_string())?;
+                if let Some(report) = &gate {
+                    crate::interactive::record_prompt_submit(
+                        &self.client,
+                        session,
+                        &self.actor,
+                        report,
+                        &mut |_| {},
+                    );
+                }
                 // Execute the turn with the production assembly; progress
                 // streams to any events.subscribe consumer.
                 let kernel_cancel = self.client.turn_cancel_token(session).unwrap_or_else(|| {
@@ -719,6 +736,48 @@ mod tests {
             "no turn: {kinds:?}"
         );
         assert!(kinds.contains(&EventKind::HookDecided), "{kinds:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_allowed_prompt_submits_at_the_clients_seq_and_the_decision_lands_after_the_turn() {
+        // A hook printing a v2 result records a decision; recorded before the
+        // submit it moved the session past the client's `expected_seq` and
+        // every submit in the project conflicted.
+        let root = project_with_gate("daemon-allow", r#"{"decision":"allow"}"#);
+        let (client, actor) = client_in(&root);
+        let connection = Connection {
+            client: client.clone(),
+            actor,
+            root: root.clone(),
+            trusted: true,
+            daemon_token: None,
+            mode_override: Default::default(),
+        };
+        let snapshot = connection
+            .rpc("sessions.create", &serde_json::json!({}))
+            .expect("session");
+        let session = snapshot["id"].as_str().expect("id").to_owned();
+        connection
+            .rpc(
+                "turns.submit",
+                &serde_json::json!({
+                    "session_id": session,
+                    "expected_seq": snapshot["seq"],
+                    "prompt": "say hello",
+                }),
+            )
+            .expect("an allowed prompt is submitted at the client's seq");
+        let kinds = event_kinds(&client, session.parse().expect("session id"));
+        let started = kinds
+            .iter()
+            .position(|kind| *kind == EventKind::TurnStarted)
+            .expect("turn.started");
+        let decided = kinds
+            .iter()
+            .position(|kind| *kind == EventKind::HookDecided)
+            .expect("hook.decided");
+        assert!(started < decided, "{kinds:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

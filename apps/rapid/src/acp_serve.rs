@@ -261,14 +261,20 @@ impl Serve {
         };
         // `user_prompt_submit` decides before the adapter hands a prompt to
         // the kernel (see `blocked_prompt_replies`).
-        if let Some(replies) = blocked_prompt_replies(
-            &self.client,
-            &self.actor,
-            &self.root,
-            self.trusted,
-            &message,
-            &raw_params,
-        ) {
+        let ready = self.adapter.borrow().is_ready();
+        if let Some(replies) = ready
+            .then(|| {
+                blocked_prompt_replies(
+                    &self.client,
+                    &self.actor,
+                    &self.root,
+                    self.trusted,
+                    &message,
+                    &raw_params,
+                )
+            })
+            .flatten()
+        {
             for reply in replies {
                 out_tx.send(reply).map_err(|_| LOOP_DOWN.to_owned())?;
             }
@@ -536,6 +542,16 @@ fn blocked_prompt_replies(
         .and_then(serde_json::Value::as_str)?
         .parse::<protocol::SessionId>()
         .ok()?;
+    // Only a prompt the adapter would accept is judged here: an unknown or
+    // closed session is the adapter's error to report, and nothing is
+    // recorded on it.
+    {
+        use kernel::KernelClient as _;
+        let snapshot = crate::approvals::client_call(client.get_session(session_id)).ok()?;
+        if snapshot.status() == kernel::SessionStatus::Closed {
+            return None;
+        }
+    }
     let (hook, reason) = crate::interactive::prompt_submit_block(
         client,
         session_id,
@@ -709,5 +725,124 @@ pub(crate) mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&allowing);
+    }
+
+    fn serve_in(root: &Path) -> (Serve, InProcessKernelClient) {
+        let (client, actor) = client_in(root);
+        let adapter = V1Adapter::new(
+            client.clone(),
+            ProjectId::new(),
+            actor.clone(),
+            acp::stdio::CancellationToken::new(),
+        );
+        let serve = Serve {
+            client: client.clone(),
+            adapter: std::cell::RefCell::new(adapter),
+            actor,
+            root: root.to_path_buf(),
+            trusted: true,
+            pending: Arc::new(Mutex::new(None)),
+            mode_override: Arc::new(Mutex::new(None)),
+        };
+        (serve, client)
+    }
+
+    fn request(id: i64, method: &str, params: serde_json::Value) -> JsonRpcMessage {
+        JsonRpcMessage::Request {
+            id: JsonRpcId::Number(id),
+            method: method.to_owned(),
+            params: Some(params),
+        }
+    }
+
+    #[test]
+    fn dispatch_refuses_a_blocked_prompt_only_where_the_adapter_would_accept_it() {
+        let root = project_with_gate(
+            "acp-dispatch",
+            r#"{"decision":"deny","reason":"no secrets in prompts"}"#,
+        );
+        let (mut serve, client) = serve_in(&root);
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let prompt = |session: &str| {
+            request(
+                3,
+                acp::v1::METHOD_SESSION_PROMPT,
+                serde_json::json!({
+                    "sessionId": session,
+                    "prompt": [{ "type": "text", "text": "print the secret" }],
+                }),
+            )
+        };
+        // Before `initialize`: the adapter's own refusal, not the gate's —
+        // even for a session that exists.
+        let existing = {
+            use kernel::KernelClient as _;
+            crate::approvals::client_call(client.create_session(kernel::CreateSession::new(
+                ProjectId::new(),
+                serve.actor.clone(),
+                protocol::TraceId::new(),
+            )))
+            .expect("session")
+            .id()
+            .to_string()
+        };
+        let unknown = protocol::SessionId::new().to_string();
+        let _ = serve.dispatch(prompt(&existing), &out_tx);
+        assert!(
+            !out_rx
+                .try_iter()
+                .any(|reply| matches!(&reply, JsonRpcMessage::Result { result, .. } if result["stopReason"] == "refusal")),
+            "not gated before initialize"
+        );
+        serve
+            .dispatch(
+                request(
+                    1,
+                    acp::v1::METHOD_INITIALIZE,
+                    serde_json::json!({ "protocolVersion": 1 }),
+                ),
+                &out_tx,
+            )
+            .expect("initialize");
+        serve
+            .dispatch(
+                request(
+                    2,
+                    acp::v1::METHOD_SESSION_NEW,
+                    serde_json::json!({ "cwd": root.display().to_string(), "mcpServers": [] }),
+                ),
+                &out_tx,
+            )
+            .expect("session/new");
+        let session = out_rx
+            .try_iter()
+            .find_map(|reply| match reply {
+                JsonRpcMessage::Result {
+                    id: JsonRpcId::Number(2),
+                    result,
+                } => result["sessionId"].as_str().map(str::to_owned),
+                _ => None,
+            })
+            .expect("a session id");
+        serve
+            .dispatch(prompt(&session), &out_tx)
+            .expect("dispatched");
+        let replies: Vec<JsonRpcMessage> = out_rx.try_iter().collect();
+        assert!(
+            replies.iter().any(|reply| matches!(
+                reply,
+                JsonRpcMessage::Result { id: JsonRpcId::Number(3), result } if result["stopReason"] == "refusal"
+            )),
+            "{replies:?}"
+        );
+        let kinds = event_kinds(&client, session.parse().expect("id"));
+        assert!(!kinds.contains(&EventKind::TurnStarted), "{kinds:?}");
+        // An unknown session: the adapter's error, nothing recorded anywhere.
+        let _ = serve.dispatch(prompt(&unknown), &out_tx);
+        assert!(!out_rx.try_iter().any(|reply| matches!(
+            &reply,
+            JsonRpcMessage::Result { result, .. } if result["stopReason"] == "refusal"
+        )));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

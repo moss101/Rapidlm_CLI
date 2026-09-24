@@ -1460,10 +1460,19 @@ pub enum ChildEnd {
 impl ChildEnd {
     fn of(blocked: bool, outcome: &Result<SubagentReport, String>) -> Self {
         match (blocked, outcome) {
-            (true, _) => Self::Blocked,
-            (false, Ok(report)) if report.status == "succeeded" => Self::Completed,
+            // A failed child is discarded whatever a hook said of it.
+            (_, Err(_)) => Self::Failed,
+            (true, Ok(_)) => Self::Blocked,
+            // The runner's "effectively successful" child — tool calls, then
+            // an empty final message — kept its work; it is completed here too.
+            (false, Ok(report))
+                if report.status == "succeeded"
+                    || (report.stop_reason.as_deref() == Some("empty_response")
+                        && report.tool_calls > 0) =>
+            {
+                Self::Completed
+            }
             (false, Ok(_)) => Self::Incomplete,
-            (false, Err(_)) => Self::Failed,
         }
     }
 }
@@ -10285,6 +10294,50 @@ mod tests {
         assert_eq!(decisions[0].0, TASK_SPAWN_TOOL);
         assert_eq!(decisions[0].1, "s1");
         assert_eq!(decisions[0].2.decision, protocol::HookDecision::Deny);
+    }
+
+    #[test]
+    fn child_end_counts_an_effective_success_and_a_failure_outranks_a_block() {
+        let report = |status: &str, stop: Option<&str>, tool_calls: u32| SubagentReport {
+            summary: String::new(),
+            status: status.to_owned(),
+            tool_calls,
+            tokens: 0,
+            cost_usd_micros: None,
+            stop_reason: stop.map(str::to_owned),
+            claims: Vec::new(),
+            blockers: Vec::new(),
+            open_questions: Vec::new(),
+            patch_summary: None,
+            artifacts: Vec::new(),
+        };
+        // The runner keeps an "effectively successful" child's work — tool
+        // calls, then an empty final message — so it is completed.
+        assert_eq!(
+            ChildEnd::of(false, &Ok(report("failed", Some("empty_response"), 2))),
+            ChildEnd::Completed
+        );
+        assert_eq!(
+            ChildEnd::of(false, &Ok(report("failed", Some("empty_response"), 0))),
+            ChildEnd::Incomplete
+        );
+        assert_eq!(
+            ChildEnd::of(false, &Ok(report("succeeded", None, 0))),
+            ChildEnd::Completed
+        );
+        assert_eq!(
+            ChildEnd::of(false, &Ok(report("cancelled", None, 1))),
+            ChildEnd::Incomplete
+        );
+        // A failed child is discarded whatever a hook said of it.
+        assert_eq!(
+            ChildEnd::of(true, &Err("boom".to_owned())),
+            ChildEnd::Failed
+        );
+        assert_eq!(
+            ChildEnd::of(true, &Ok(report("succeeded", None, 1))),
+            ChildEnd::Blocked
+        );
     }
 
     #[test]
