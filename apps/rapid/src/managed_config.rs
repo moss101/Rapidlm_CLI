@@ -919,7 +919,11 @@ pub fn resolve_gated(
         let mut gated_config = config.clone();
         gated_config.models.default = Some(locked.to_string());
         let locked_active = resolve_active(&effective_env, &gated_config)?;
-        if locked_active.profile_id != active_profile_id(env, config)? {
+        // What the shell alone would pick decides only whether the lock is
+        // reported: an override naming a missing profile is overruled by
+        // the lock like any other, not a reason to fail the run.
+        if active_profile_id(env, config).ok().as_deref() != Some(locked_active.profile_id.as_str())
+        {
             reports.push(GateReportEntry {
                 field_id: "models.default".to_string(),
                 origin: ConfigOrigin::Managed,
@@ -1340,6 +1344,11 @@ base_url = "http://gateway.internal:8080"
         let gated = resolve_gated(&env, &config, Some(&policy)).expect("gated");
         assert_eq!(gated.active.profile_id, "cloud");
         assert_eq!(gated.default_origin, ConfigOrigin::Managed);
+        assert!(gated.reports.iter().any(|r| r.field_id == "models.default"));
+        // An override naming a missing profile is overruled too, not fatal.
+        let env = vec![(DEFAULT_MODEL_ENV.to_string(), "nope".to_string())];
+        let gated = resolve_gated(&env, &config, Some(&policy)).expect("the lock decides");
+        assert_eq!(gated.active.profile_id, "cloud");
         assert!(gated.reports.iter().any(|r| r.field_id == "models.default"));
         // An already-compliant selection (user default == lock) reports no
         // override — the layer that decided is still the managed lock, but

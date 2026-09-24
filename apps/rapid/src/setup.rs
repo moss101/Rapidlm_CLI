@@ -222,7 +222,9 @@ the user config (RAPIDLM_CONFIG, else RAPIDLM_HOME/config.toml, else
   --profile <id>      the [model.<id>] name to write (default: the preset id, or \"default\")
   --model <id>        the model identifier to request (default: the preset's)
   --base-url <url>    the endpoint (http:// or https:// origin); without --preset the
-                      endpoint is taken to speak the openai-compatible dialect
+                      endpoint is taken to speak the openai-compatible dialect; a
+                      preset's key variable goes only to the preset's own host
+                      (--key-env names one for another)
   --key-env <VAR>     the key is read from this environment variable at request time;
                       the config names the variable, never the value
   --key-stdin         read the key from stdin and keep it in the OS keychain; the
@@ -528,6 +530,11 @@ pub fn resolve_choice(
             alias: keychain_alias(&profile),
         },
         KeyFlag::Unspecified => match chosen {
+            // A preset's key goes only to the preset's own endpoint: with a
+            // `--base-url` on another origin the profile keeps what it
+            // already names for that endpoint (the custom-endpoint rule),
+            // never the provider's key variable.
+            Some(preset) if !same_origin(preset.base_url, &base_url) => Credential::Unchanged,
             Some(Preset {
                 key_env: Some(var), ..
             }) => Credential::Env {
@@ -773,6 +780,19 @@ pub fn plan(
                 }
             }
         };
+        if let (
+            Credential::Unchanged,
+            None,
+            Some(Preset {
+                key_env: Some(var), ..
+            }),
+        ) = (&choice.credential, &kept_credential, choice.preset)
+        {
+            notes.push(format!(
+                "{var} is sent only to the preset's own endpoint; --key-env {var} sends it to \
+this --base-url"
+            ));
+        }
         // Credential keys other than the chosen one would shadow it (an
         // inline `api_key` wins over everything) or contradict it.
         if keep != Some("*") {
@@ -857,11 +877,10 @@ untouched: {err}",
     // Keys of this profile a run would not read (a newer key than this
     // build's reader knows) are named, not silently written.
     let profile_prefix = format!("model.{}.", choice.profile);
-    for key in parsed
-        .unknown_keys
-        .iter()
-        .filter(|key| key.starts_with(&profile_prefix))
-    {
+    for key in parsed.unknown_keys.iter().filter(|key| {
+        key.strip_prefix(&profile_prefix)
+            .is_some_and(|rest| !rest.contains('.'))
+    }) {
         notes.push(format!(
             "a run would ignore {key}: this build does not read it"
         ));
@@ -1490,7 +1509,9 @@ were changed; --dry-run prints what would be written\n",
 /// the file a first setup creates.
 fn follow_symlinks(link: &Path) -> Result<PathBuf, String> {
     let mut current = link.to_path_buf();
-    for _ in 0..40 {
+    // Up to 40 links are followed; the 41st read says whether that was the
+    // file or yet another link.
+    for _ in 0..=40 {
         match std::fs::read_link(&current) {
             Ok(target) => {
                 current = if target.is_absolute() {
@@ -1714,6 +1735,8 @@ mod tests {
                 "openai",
                 "--base-url",
                 &url,
+                "--key-env",
+                "OPENAI_API_KEY",
                 "--dry-run",
                 "--non-interactive",
                 "--output",
@@ -2560,6 +2583,135 @@ gw = { provider = \"openai-compatible\", model = \"m\", base_url = \"http://10.0
             "{:?}",
             plan.notes
         );
+    }
+
+    #[test]
+    fn a_presets_key_goes_only_to_the_presets_own_endpoint() {
+        let proxy = [
+            "--preset",
+            "openai",
+            "--base-url",
+            "http://10.0.0.9:8000/v1",
+        ];
+        let fresh = plan(
+            choice_for(&proxy),
+            Path::new("c.toml"),
+            None,
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert_eq!(fresh.choice.credential, Credential::Unchanged);
+        let parsed = parse_config_document(&fresh.document, "c").expect("parses");
+        assert!(parsed.models.entries["openai"].env_key.is_empty());
+        assert!(
+            fresh
+                .notes
+                .iter()
+                .any(|note| note.contains("--key-env OPENAI_API_KEY")),
+            "{:?}",
+            fresh.notes
+        );
+        // The profile's key was for the preset's host: removed, not sent.
+        let existing = "\
+[model.openai]
+provider = \"openai-compatible\"
+model = \"gpt-5\"
+base_url = \"https://api.openai.com/v1\"
+env_key = \"OPENAI_API_KEY\"
+";
+        let moved = plan(
+            choice_for(&proxy),
+            Path::new("c.toml"),
+            Some(existing),
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert_eq!(moved.unset, vec!["model.openai.env_key".to_owned()]);
+        // The preset's own origin, another path: its key variable as before;
+        // and a key variable named on the command line goes where it is told.
+        assert_eq!(
+            choice_for(&[
+                "--preset",
+                "openai",
+                "--base-url",
+                "https://api.openai.com/v2"
+            ])
+            .credential,
+            Credential::Env {
+                var: "OPENAI_API_KEY".to_owned()
+            }
+        );
+        let mut explicit = proxy.to_vec();
+        explicit.extend(["--key-env", "OPENAI_API_KEY"]);
+        assert_eq!(
+            choice_for(&explicit).credential,
+            Credential::Env {
+                var: "OPENAI_API_KEY".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn only_this_profiles_unknown_keys_are_named() {
+        let existing = "\
+[model.\"default.x\"]
+provider = \"openai-compatible\"
+model = \"m\"
+base_url = \"http://10.0.0.5:9000/v1\"
+future_knob = 1
+";
+        let plan = plan(
+            choice_for(&["--base-url", "http://10.0.0.5:9000/v1", "--model", "m"]),
+            Path::new("c.toml"),
+            Some(existing),
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert!(
+            !plan.notes.iter().any(|note| note.contains("future_knob")),
+            "another profile's key is not this one's: {:?}",
+            plan.notes
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_chain_of_forty_links_is_followed_and_forty_one_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapid-setup-links-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let target = dir.join("config.toml");
+        let mut previous = target.clone();
+        for hop in 1..=41 {
+            let link = dir.join(format!("link{hop}"));
+            std::os::unix::fs::symlink(&previous, &link).expect("symlink");
+            previous = link;
+        }
+        assert_eq!(
+            follow_symlinks(&dir.join("link40")).expect("forty links"),
+            target
+        );
+        assert!(
+            follow_symlinks(&dir.join("link41"))
+                .expect_err("forty-one")
+                .contains("symlink loop")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
