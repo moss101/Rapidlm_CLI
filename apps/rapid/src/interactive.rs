@@ -9101,6 +9101,8 @@ fn run_interactive_turn_inner(
 /// assembly the TUI's `spawn_interactive_turn` uses (hooks, MCP, retrieval,
 /// approval sink, ledger sinks), minus the session loop's UI plumbing — the
 /// serve loop watches the ledger for progress and the terminal event.
+/// `running` is cleared as the thread ends — after the turn-end hooks and
+/// `finish_turn` — so a serve can wait for its turns before it exits.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_acp_turn(
     client: InProcessKernelClient,
@@ -9112,7 +9114,9 @@ pub(crate) fn spawn_acp_turn(
     text: String,
     kernel_cancel: kernel::CancelToken,
     mode_override: std::sync::Arc<std::sync::Mutex<Option<crate::permissions::PermissionMode>>>,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
+    running.store(true, std::sync::atomic::Ordering::SeqCst);
     std::thread::spawn(move || {
         // A fresh SessionShared per turn (ACP prompts have no conversation
         // state here) except the mode override, which is the serve's own
@@ -9148,13 +9152,15 @@ pub(crate) fn spawn_acp_turn(
             TraceId::new(),
             outcome,
         ));
+        running.store(false, std::sync::atomic::Ordering::SeqCst);
     });
 }
 
 /// The serve-side half of the durable approval flow (shared with the TUI's
 /// `/approvals`): record the decision durably, then submit and spawn the
 /// continuation turn that replays the suspension. Used by `rapid acp` so an
-/// editor's permission decision resumes the exact turn.
+/// editor's permission decision resumes the exact turn. `running` is set
+/// only when a continuation thread is spawned, and cleared as it ends.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn acp_resolve_and_continue(
     client: &InProcessKernelClient,
@@ -9165,6 +9171,7 @@ pub(crate) fn acp_resolve_and_continue(
     token: &str,
     call_id: &str,
     approve: bool,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), String> {
     let tip = block_on_session_tip(client, session_id)?;
     let decision = if approve {
@@ -9190,6 +9197,7 @@ pub(crate) fn acp_resolve_and_continue(
         kernel::SubmitTurn::new(session_id, expected_seq, actor.clone(), TraceId::new(), ""),
     )?;
     if let Some(turn_cancel) = client.turn_cancel_token(session_id) {
+        running.store(true, std::sync::atomic::Ordering::SeqCst);
         spawn_continuation_turn(
             client.clone(),
             session_id,
@@ -9198,7 +9206,7 @@ pub(crate) fn acp_resolve_and_continue(
             root.to_path_buf(),
             trusted,
             turn_cancel,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            running,
             crate::exec_tools::JobRegistry::default(),
             SessionShared::default(),
             token.to_owned(),
@@ -10248,14 +10256,19 @@ fn record_outcome_suspension(
     // Persist the suspension before the turn's terminal event: a resume
     // (this process or a restarted one) replays it from the ledger.
     if let Some(suspension) = &outcome.suspension {
-        let mut token =
-            crate::approvals::pending_token_for_call(client, session_id, suspension.call_id());
         // A clarification (the model's own `ask_user`) suspends without a
-        // permission `Ask`, so no approval was pre-recorded: record the
-        // question as a pending approval now so the same durable wait —
-        // listing, resolution, restart survival — serves both flows.
-        if token.is_none() && suspension.reason() == agent_runtime::TurnStopReason::ContextRequired
-        {
+        // permission `Ask`, so no approval was pre-recorded — and a pending
+        // one for its call id belongs to another turn (call ids repeat
+        // across turns), so it is never looked up: the question is recorded
+        // as a pending approval now, so the same durable wait — listing,
+        // resolution, restart survival — serves both flows.
+        let clarification = suspension.reason() == agent_runtime::TurnStopReason::ContextRequired;
+        let mut token = if clarification {
+            None
+        } else {
+            crate::approvals::pending_token_for_call(client, session_id, suspension.call_id())
+        };
+        if clarification {
             let question = outcome
                 .failure_detail
                 .as_ref()
@@ -22290,6 +22303,59 @@ pre-approve it with `rapid permissions allow <tool>`";
             "{painted}"
         );
         assert!(painted.contains("turn failed"), "{painted}");
+    }
+
+    #[test]
+    fn a_clarification_is_its_own_wait_never_another_turn_s_pending_approval() {
+        use kernel::KernelClient as _;
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        // An earlier turn's approval for the same call id, left pending (its
+        // prompt was cancelled): call ids repeat across turns.
+        let tip = crate::approvals::client_call(session.client.get_session(session.session_id))
+            .expect("session")
+            .seq();
+        crate::approvals::client_call(session.client.record_approval(kernel::RecordApproval::new(
+            session.session_id,
+            tip,
+            session.actor.clone(),
+            TraceId::new(),
+            "token-earlier-write",
+            "c1",
+            "workspace_write",
+            "write a file",
+        )))
+        .expect("record");
+        session.run_turn(
+            "deploy the app",
+            ScriptedModel::asks_for_context(
+                "Which environment: staging or production?",
+                &["staging", "production"],
+            ),
+        );
+        let pending = crate::approvals::pending_approvals(&session.client, session.session_id);
+        let question = pending
+            .iter()
+            .find(|pending| pending.payload().tool == "ask_user")
+            .unwrap_or_else(|| panic!("the question is its own pending approval: {pending:?}"));
+        assert!(
+            crate::approvals::recorded_suspension(
+                &session.client,
+                session.session_id,
+                &question.payload().id
+            )
+            .is_some(),
+            "the clarification's suspension is filed under its own question"
+        );
+        assert!(
+            crate::approvals::recorded_suspension(
+                &session.client,
+                session.session_id,
+                "token-earlier-write"
+            )
+            .is_none(),
+            "and never under the earlier turn's write"
+        );
     }
 
     #[test]

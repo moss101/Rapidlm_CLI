@@ -396,6 +396,8 @@ re-read it before the next submit)"
                     text,
                     kernel_cancel,
                     self.mode_override.clone(),
+                    // The daemon does not wait on its turn threads.
+                    std::sync::Arc::default(),
                 );
                 turn_handle_json(&handle)
             }
@@ -446,6 +448,7 @@ re-read it before the next submit)"
                         &token,
                         &call_id,
                         decision == kernel::ApprovalDecision::Approved,
+                        std::sync::Arc::default(),
                     );
                 }
                 Ok(serde_json::json!({}))

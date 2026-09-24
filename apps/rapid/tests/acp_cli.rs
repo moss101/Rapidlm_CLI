@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -58,6 +58,27 @@ fn write_calls(calls: &[(&str, &str)]) -> String {
     json!({
         "choices": [{
             "message": { "role": "assistant", "content": null, "tool_calls": tool_calls },
+            "finish_reason": "tool_calls",
+        }],
+        "usage": { "prompt_tokens": 3, "completion_tokens": 5 },
+    })
+    .to_string()
+}
+
+/// A non-streaming chat completion proposing one call of `tool`.
+#[cfg(unix)]
+fn tool_call(id: &str, tool: &str, arguments: Value) -> String {
+    json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": tool, "arguments": arguments.to_string() },
+                }],
+            },
             "finish_reason": "tool_calls",
         }],
         "usage": { "prompt_tokens": 3, "completion_tokens": 5 },
@@ -775,13 +796,14 @@ fn a_prompt_straight_after_a_cancel_is_accepted() {
 #[test]
 fn a_call_id_reused_after_a_cancelled_approval_is_asked_again() {
     // The second prompt's model proposes a call under the same id as the
-    // first prompt's, whose approval the cancel left pending.
-    static SECOND_PROMPT_STEPS: AtomicUsize = AtomicUsize::new(0);
+    // first prompt's, whose approval the cancel left pending. Its
+    // continuation is the request that already carries that call.
     fn model(request: &str) -> String {
         if request.contains("PROMPT-TWO") {
-            match SECOND_PROMPT_STEPS.fetch_add(1, Ordering::SeqCst) {
-                0 => write_call("call_1", "second.txt"),
-                _ => answer("second done"),
+            if request.contains("second.txt") {
+                answer("second done")
+            } else {
+                write_call("call_1", "second.txt")
             }
         } else {
             one_write(request)
@@ -822,4 +844,57 @@ fn a_call_id_reused_after_a_cancelled_approval_is_asked_again() {
         "{second:#?}\nstderr: {stderr}"
     );
     assert_eq!(editor.finish(), Some(0), "stderr: {stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_disconnect_while_a_command_runs_stops_it_before_the_serve_exits() {
+    // A duration no other process uses, so the command is found by argv.
+    const LINE: &str = "sleep 37.25";
+    fn model(request: &str) -> String {
+        match tool_results(request) {
+            0 => tool_call(
+                "call_1",
+                "shell_exec",
+                json!({ "argv": ["sleep", "37.25"] }),
+            ),
+            _ => answer("done"),
+        }
+    }
+    fn running() -> bool {
+        Command::new("pgrep")
+            .args(["-f", LINE])
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+    let home = temp_dir("disconnect-while-command-runs");
+    let (project, config) = trusted_project(&home.0, model);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+    // The command runs without asking.
+    editor.request(
+        3,
+        "session/set_mode",
+        json!({ "sessionId": session, "mode": "bypassPermissions" }),
+    );
+    let set = editor.until_result(3);
+    assert!(set.get("result").is_some(), "{set}");
+    editor.start_prompt(4, &session, "run it");
+    let deadline = Instant::now() + DEADLINE;
+    while !running() {
+        assert!(
+            Instant::now() < deadline,
+            "the command never started; stderr: {}",
+            editor.stderr_text()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let stderr = editor.stderr_text();
+    let code = editor.finish();
+    let orphaned = running();
+    if orphaned {
+        let _ = Command::new("pkill").args(["-f", LINE]).status();
+    }
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(!orphaned, "the interrupted command outlived the serve");
 }
