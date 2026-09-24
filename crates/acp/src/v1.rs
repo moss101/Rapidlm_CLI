@@ -620,8 +620,9 @@ impl<C: KernelClient> V1Adapter<C> {
             .map_err(map_kernel_err)?;
         // A prompt's updates are its own turn's. The turn was submitted
         // against `snapshot.seq()` (its `turn.started` is the next event), so
-        // the drain starts there: anything earlier belongs to earlier turns,
-        // which their own prompts already streamed, and is never replayed.
+        // the drain starts there: anything earlier is not this prompt's to
+        // report — earlier prompts streamed their own turns, and a turn run
+        // from another surface is that surface's — and is never replayed.
         self.cursors.insert(session_id, snapshot.seq());
         let events = self.drain_updates(session_id).await?;
         Ok((prompt_turn(handle), events))

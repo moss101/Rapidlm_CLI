@@ -279,16 +279,26 @@ impl Serve {
                 }
             }
         }
-        // The editor is gone (or the protocol failed): a prompt waiting on
-        // an approval would wait forever and hold the writer open, so every
-        // in-flight prompt is cancelled. Its approval stays pending.
-        for flag in self
-            .cancels
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
-        {
-            flag.store(true, Ordering::SeqCst);
+        // The editor is gone (or the protocol failed): no turn keeps running
+        // for no one, and no prompt waits forever holding the writer open.
+        // Every in-flight prompt is cancelled — flagged, which ends one paused
+        // on an approval (the approval stays pending), and its session
+        // interrupted, which ends a live turn.
+        let in_flight: Vec<protocol::SessionId> = {
+            let cancels = self.cancels.lock().unwrap_or_else(PoisonError::into_inner);
+            for flag in cancels.values() {
+                flag.store(true, Ordering::SeqCst);
+            }
+            cancels.keys().copied().collect()
+        };
+        for session_id in in_flight {
+            use kernel::KernelClient as _;
+            let _ = block_adapter(self.client.interrupt(kernel::Interrupt::new(
+                session_id,
+                kernel::InterruptReason::ClientRequested,
+                self.actor.clone(),
+                protocol::TraceId::new(),
+            )));
         }
         drop(out_tx);
         let _ = writer_handle.join();
@@ -314,7 +324,11 @@ impl Serve {
         // approval its turn has finished as far as the kernel knows, so it
         // would accept a second one — whose turn the first prompt's stream
         // would then report as its own. Refused before anything is
-        // recorded for it.
+        // recorded for it. A cancelled prompt no longer counts: it ends
+        // before reading past its own turn (the flag is checked before any
+        // further read while it waits, and a live turn's interruption
+        // precedes the next turn in the ledger), so the editor may prompt
+        // again straight after `session/cancel`.
         if let JsonRpcMessage::Request { id, method, .. } = &message
             && method == acp::v1::METHOD_SESSION_PROMPT
             && let Some(session_id) = session_id_of(&raw_params)
@@ -322,7 +336,8 @@ impl Serve {
                 .cancels
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .contains_key(&session_id)
+                .get(&session_id)
+                .is_some_and(|cancelled| !cancelled.load(Ordering::SeqCst))
         {
             let refused = JsonRpcMessage::Error {
                 id: id.clone(),
@@ -668,7 +683,9 @@ the approval stays pending"
         match stream.try_recv() {
             Ok(Some(event)) => {
                 if event.kind() == event_ledger::event::EventKind::TurnStarted {
-                    // A continuation: the previous turn's asks are settled.
+                    // A continuation: the previous turn's asks are no longer
+                    // this prompt's to surface (any it never surfaced stay
+                    // pending in the ledger).
                     asked.clear();
                     suspended = None;
                 }
@@ -678,10 +695,23 @@ the approval stays pending"
                 // The turn paused: surface the approval it suspended on and
                 // wait. Not the end of the prompt — the continuation the
                 // answer resumes is.
-                if is_approval_pause(&event)
-                    && let Some(token) = suspended.take()
-                    && let Some(position) = asked.iter().position(|ask| ask.token == token)
-                {
+                if is_approval_pause(&event) {
+                    if routes.is_cancelled() {
+                        // Cancelled before the pause was read: nothing to ask.
+                        return finish_prompt(routes, &out_tx, request_id, StopReason::Cancelled);
+                    }
+                    let found = suspended
+                        .take()
+                        .and_then(|token| asked.iter().position(|ask| ask.token == token));
+                    let Some(position) = found else {
+                        // Nothing this prompt can resume: no one cancelled,
+                        // so the prompt is not `cancelled`.
+                        eprintln!(
+                            "rapid acp: the turn paused on an approval this prompt did not \
+see; it stays pending"
+                        );
+                        return finish_prompt(routes, &out_tx, request_id, StopReason::Refusal);
+                    };
                     let ask = asked.swap_remove(position);
                     asked.clear();
                     // The route exists before the request is written, under

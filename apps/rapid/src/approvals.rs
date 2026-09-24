@@ -682,9 +682,12 @@ pub fn recorded_suspension(
     serde_json::from_str(&detail).ok()
 }
 
-/// The wait token of the unresolved `approval.requested` recorded for
-/// `call_id` — the linkage between a turn's suspension (which knows the
-/// call) and the durable wait row (which knows the token).
+/// The wait token of the newest unresolved `approval.requested` recorded
+/// for `call_id` — the linkage between a turn's suspension (which knows the
+/// call) and the durable wait row (which knows the token). Newest, because
+/// call ids repeat across turns: an older approval for the same id (left
+/// pending when its prompt was cancelled) belongs to another turn, and a
+/// suspension recorded under its token would resume the wrong wait.
 pub fn pending_token_for_call(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
@@ -692,6 +695,7 @@ pub fn pending_token_for_call(
 ) -> Option<String> {
     pending_approvals(client, session_id)
         .into_iter()
+        .rev()
         .find(|pending| pending.payload().call_id == call_id)
         .map(|pending| pending.payload().id.clone())
 }
@@ -758,6 +762,54 @@ pub fn recorded_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_call_id_s_token_is_its_newest_pending_approval() {
+        let path = std::env::temp_dir().join(format!(
+            "rapidlm-approvals-newest-{}-{}.sqlite",
+            std::process::id(),
+            new_wait_token()
+        ));
+        let client = InProcessKernelClient::open(&path).expect("ledger");
+        let actor = ActorRef::new(
+            event_ledger::event::ActorKind::Human,
+            &protocol::EventId::new().to_string(),
+        )
+        .expect("actor");
+        let session = client_call(client.create_session(kernel::CreateSession::new(
+            protocol::ProjectId::new(),
+            actor.clone(),
+            protocol::TraceId::new(),
+        )))
+        .expect("session")
+        .id();
+        // Two turns proposed a call with the same id; the first one's
+        // approval was left pending (its prompt was cancelled).
+        for token in ["token-older", "token-newer"] {
+            let tip = client_call(client.get_session(session)).expect("tip").seq();
+            client_call(client.record_approval(kernel::RecordApproval::new(
+                session,
+                tip,
+                actor.clone(),
+                protocol::TraceId::new(),
+                token,
+                "call_1",
+                "workspace_write",
+                "write a file",
+            )))
+            .expect("record");
+        }
+        assert_eq!(
+            pending_token_for_call(&client, session, "call_1").as_deref(),
+            Some("token-newer")
+        );
+        assert_eq!(pending_token_for_call(&client, session, "call_2"), None);
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let mut file = path.clone().into_os_string();
+            file.push(suffix);
+            let _ = std::fs::remove_file(file);
+        }
+    }
 
     #[test]
     fn a_shell_approval_summary_shows_the_argv_command() {

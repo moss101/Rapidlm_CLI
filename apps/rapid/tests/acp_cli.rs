@@ -11,6 +11,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -668,6 +669,157 @@ fn the_next_prompt_streams_only_its_own_turn() {
     assert_eq!(
         second.last().expect("response")["result"]["stopReason"],
         "end_turn"
+    );
+    assert_eq!(editor.finish(), Some(0), "stderr: {stderr}");
+}
+
+/// The `reason` of every `turn.interrupted` in `events`, in order.
+fn interruptions(events: &[(String, Value)]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|(kind, _)| kind == "turn.interrupted")
+        .map(|(_, payload)| payload["reason"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+#[test]
+fn a_disconnect_while_the_turn_runs_interrupts_it() {
+    // The model takes its time; the editor leaves while it thinks. Left
+    // running, the turn would go on to propose a write and ask.
+    static THINKING: AtomicBool = AtomicBool::new(false);
+    fn model(request: &str) -> String {
+        match tool_results(request) {
+            0 => {
+                THINKING.store(true, Ordering::SeqCst);
+                thread::sleep(Duration::from_secs(2));
+                write_call("call_1", "first.txt")
+            }
+            _ => answer("done"),
+        }
+    }
+    let home = temp_dir("disconnect-while-running");
+    let (project, config) = trusted_project(&home.0, model);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+
+    editor.start_prompt(3, &session, "write it");
+    let deadline = Instant::now() + DEADLINE;
+    while !THINKING.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the model was never asked");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let stderr = editor.stderr_text();
+    assert_eq!(editor.finish(), Some(0), "stderr: {stderr}");
+    let events = ledger(&project, &home.0, &config, &session);
+    assert_eq!(
+        interruptions(&events),
+        ["client_requested"],
+        "interrupted at the disconnect: {events:#?}"
+    );
+    assert_eq!(count_kind(&events, "approval.requested"), 0, "{events:#?}");
+}
+
+#[test]
+fn a_prompt_straight_after_a_cancel_is_accepted() {
+    fn model(request: &str) -> String {
+        if request.contains("PROMPT-TWO") {
+            answer("second")
+        } else {
+            one_write(request)
+        }
+    }
+    let home = temp_dir("prompt-after-cancel");
+    let (project, config) = trusted_project(&home.0, model);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+
+    editor.start_prompt(3, &session, "write it");
+    let permission = editor.until_permission();
+    // Cancel and prompt again at once, without waiting for the cancelled
+    // prompt's response; then answer its request as the protocol asks.
+    editor.send(json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": { "sessionId": session },
+    }));
+    editor.start_prompt(4, &session, "PROMPT-TWO instead");
+    editor.answer_permission(
+        &permission,
+        json!({ "outcome": { "outcome": "cancelled" } }),
+    );
+    let deadline = Instant::now() + DEADLINE;
+    let (mut first, mut second) = (None, None);
+    while first.is_none() || second.is_none() {
+        let frame = editor
+            .next(deadline)
+            .unwrap_or_else(|| panic!("a prompt never answered; stderr: {}", editor.stderr_text()));
+        if frame.get("method").is_none() && frame["id"] == 3 {
+            first = Some(frame);
+        } else if frame.get("method").is_none() && frame["id"] == 4 {
+            second = Some(frame);
+        }
+    }
+    let stderr = editor.stderr_text();
+    let (first, second) = (first.expect("3"), second.expect("4"));
+    assert_eq!(
+        first["result"]["stopReason"], "cancelled",
+        "{first}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        second["result"]["stopReason"], "end_turn",
+        "{second}\nstderr: {stderr}"
+    );
+    assert_eq!(editor.finish(), Some(0), "stderr: {stderr}");
+}
+
+#[test]
+fn a_call_id_reused_after_a_cancelled_approval_is_asked_again() {
+    // The second prompt's model proposes a call under the same id as the
+    // first prompt's, whose approval the cancel left pending.
+    static SECOND_PROMPT_STEPS: AtomicUsize = AtomicUsize::new(0);
+    fn model(request: &str) -> String {
+        if request.contains("PROMPT-TWO") {
+            match SECOND_PROMPT_STEPS.fetch_add(1, Ordering::SeqCst) {
+                0 => write_call("call_1", "second.txt"),
+                _ => answer("second done"),
+            }
+        } else {
+            one_write(request)
+        }
+    }
+    let home = temp_dir("reused-call-id");
+    let (project, config) = trusted_project(&home.0, model);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+
+    editor.start_prompt(3, &session, "write it");
+    let permission = editor.until_permission();
+    editor.send(json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": { "sessionId": session },
+    }));
+    editor.answer_permission(
+        &permission,
+        json!({ "outcome": { "outcome": "cancelled" } }),
+    );
+    let first = editor.play(3);
+    assert_eq!(
+        first.last().expect("response")["result"]["stopReason"],
+        "cancelled"
+    );
+
+    let second = editor.prompt(4, &session, "PROMPT-TWO write again");
+    let stderr = editor.stderr_text();
+    assert_eq!(
+        permission_requests(&second),
+        1,
+        "the reused call's own approval is asked: {second:#?}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        second.last().expect("response")["result"]["stopReason"],
+        "end_turn",
+        "{second:#?}\nstderr: {stderr}"
     );
     assert_eq!(editor.finish(), Some(0), "stderr: {stderr}");
 }
