@@ -70,8 +70,13 @@ pub enum AttemptProgress {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum FailureClass {
     Transient,
-    RateLimited { retry_after_ms: Option<u64> },
+    RateLimited {
+        retry_after_ms: Option<u64>,
+    },
     Auth,
+    /// The account has no quota left: not retried on this model, like
+    /// [`FailureClass::Auth`], and reported as what it is.
+    Quota,
     Config,
     Safety,
     ContextTooLarge,
@@ -91,6 +96,7 @@ pub enum FallbackTrigger {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum StopReason {
     AuthFailure,
+    QuotaExhausted,
     ConfigFailure,
     SafetyFailure,
     ContextTooLarge,
@@ -199,6 +205,7 @@ impl FailureClass {
             Self::Transient => "transient",
             Self::RateLimited { .. } => "rate_limited",
             Self::Auth => "auth",
+            Self::Quota => "quota",
             Self::Config => "config",
             Self::Safety => "safety",
             Self::ContextTooLarge => "context_too_large",
@@ -238,6 +245,7 @@ pub fn classify_failure(trigger: &FallbackTrigger) -> FailureClass {
         FallbackTrigger::Provider(error) => match error {
             ProviderError::Cancelled => FailureClass::Cancelled,
             ProviderError::AuthFailed => FailureClass::Auth,
+            ProviderError::QuotaExceeded => FailureClass::Quota,
             ProviderError::RateLimited { retry_after_ms } => FailureClass::RateLimited {
                 retry_after_ms: *retry_after_ms,
             },
@@ -255,6 +263,7 @@ impl StopReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AuthFailure => "auth_failure",
+            Self::QuotaExhausted => "quota_exhausted",
             Self::ConfigFailure => "config_failure",
             Self::SafetyFailure => "safety_failure",
             Self::ContextTooLarge => "context_too_large",
@@ -621,7 +630,10 @@ impl FallbackController {
             FailureClass::Permanent => {
                 return Ok(stop(current, StopReason::PermanentFailure));
             }
-            FailureClass::Auth | FailureClass::Config | FailureClass::Safety => {
+            FailureClass::Auth
+            | FailureClass::Quota
+            | FailureClass::Config
+            | FailureClass::Safety => {
                 return Ok(self.explicit_or_stop(current, failure));
             }
             FailureClass::Transient | FailureClass::RateLimited { .. } => {}
@@ -696,6 +708,7 @@ fn stop(model: ModelRef, reason: StopReason) -> FallbackAction {
 fn stop_reason_for(failure: FailureClass) -> StopReason {
     match failure {
         FailureClass::Auth => StopReason::AuthFailure,
+        FailureClass::Quota => StopReason::QuotaExhausted,
         FailureClass::Config => StopReason::ConfigFailure,
         FailureClass::Safety => StopReason::SafetyFailure,
         FailureClass::ContextTooLarge => StopReason::ContextTooLarge,
@@ -1184,11 +1197,30 @@ mod tests {
     }
 
     #[test]
+    fn an_exhausted_quota_is_its_own_class_and_stop_reason() {
+        let trigger = FallbackTrigger::Provider(ProviderError::QuotaExceeded);
+        assert_eq!(classify_failure(&trigger), FailureClass::Quota);
+        assert_eq!(FailureClass::Quota.as_str(), "quota");
+        let decision = ranked_decision();
+        let controller = controller_from(&decision, FallbackPolicy::standard());
+        let plan = controller
+            .plan(&trigger, AttemptProgress::PreResponse, &live())
+            .expect("plan");
+        assert!(
+            !plan.is_safe_retry(),
+            "a quota is never retried on the same model"
+        );
+        assert_eq!(plan.stop_reason(), Some(StopReason::QuotaExhausted));
+        assert_eq!(StopReason::QuotaExhausted.as_str(), "quota_exhausted");
+    }
+
+    #[test]
     fn auth_config_safety_stop_without_explicit_alternate() {
         let decision = ranked_decision();
         let mut controller = controller_from(&decision, FallbackPolicy::standard());
         for trigger in [
             auth(),
+            FallbackTrigger::Provider(ProviderError::QuotaExceeded),
             FallbackTrigger::Config,
             FallbackTrigger::Safety,
             FallbackTrigger::Provider(ProviderError::InvalidRequest),
@@ -1200,7 +1232,10 @@ mod tests {
             assert!(matches!(
                 plan.stop_reason(),
                 Some(
-                    StopReason::AuthFailure | StopReason::ConfigFailure | StopReason::SafetyFailure
+                    StopReason::AuthFailure
+                        | StopReason::QuotaExhausted
+                        | StopReason::ConfigFailure
+                        | StopReason::SafetyFailure
                 )
             ));
         }

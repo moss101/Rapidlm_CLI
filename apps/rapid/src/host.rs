@@ -959,6 +959,7 @@ fn cause_tag(cause: FailureCause) -> &'static str {
         FailureCause::Auth => "auth",
         FailureCause::Connection => "connection",
         FailureCause::Rejected => "rejected",
+        FailureCause::Quota => "quota",
         FailureCause::Transient { .. } => "transient",
         FailureCause::Unspecified => "unspecified",
         // Future causes stay typed failures and classify as unspecified.
@@ -1548,6 +1549,7 @@ fn to_fallback_trigger(err: &ModelStepError) -> FallbackTrigger {
         ModelStepError::Failed => ProviderError::Permanent,
         ModelStepError::ProviderFailed { cause } => match cause {
             FailureCause::Auth => ProviderError::AuthFailed,
+            FailureCause::Quota => ProviderError::QuotaExceeded,
             FailureCause::Connection => ProviderError::Connection,
             FailureCause::Rejected => ProviderError::InvalidRequest,
             FailureCause::Transient {
@@ -4287,6 +4289,38 @@ mod tests {
             1,
             "auth failures are actionable, never auto-retried"
         );
+    }
+
+    #[test]
+    fn an_exhausted_quota_is_not_retried() {
+        // A 402 is not a capacity blip: retrying burns the backoff budget
+        // against the same wall. It fails once, with its own cause.
+        let request = AgentExecutionRequest::new(spec(), SessionId::new());
+        let mut events = Vec::new();
+        let backing = ScriptedBacking::new(vec![
+            Err(ModelStepError::ProviderFailed {
+                cause: FailureCause::Quota,
+            }),
+            Ok(ModelStepOutput::Terminal {
+                text: "never reached".to_owned(),
+                tokens: 1,
+                cost_usd_micros: None,
+            }),
+        ]);
+        let witness = backing.clone();
+        let outcome = run_live_exec(
+            preserved(),
+            backing,
+            &request,
+            &mut CountingTools { executed: 0 },
+            &mut events,
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+        )
+        .expect("execute");
+        assert_eq!(outcome.failure_cause, Some(FailureCause::Quota));
+        assert_eq!(witness.saw_blocks.borrow().len(), 1);
     }
 
     #[test]

@@ -179,6 +179,10 @@ pub enum ProviderError {
     /// which is a provider-reported retryable condition on a working wire.
     Connection,
     Permanent,
+    /// The account cannot pay for the request (HTTP 402): no quota or credit
+    /// left. Distinct from [`ProviderError::RateLimited`] — waiting does not
+    /// help — so it is never retried.
+    QuotaExceeded,
     BoundExceeded,
     UnknownVariant,
 }
@@ -515,7 +519,9 @@ impl ProviderError {
             Self::AuthFailed => Some(ErrorCode::ProviderAuthFailed),
             Self::RateLimited { .. } => Some(ErrorCode::ProviderRateLimited),
             Self::ContextTooLarge => Some(ErrorCode::ProviderContextTooLarge),
-            Self::Transient | Self::Permanent | Self::Connection => {
+            // No public code of its own (adding one is a wire change): the
+            // one `Permanent` uses, with its own message below.
+            Self::Transient | Self::Permanent | Self::Connection | Self::QuotaExceeded => {
                 Some(ErrorCode::InternalUnexpected)
             }
         }
@@ -537,6 +543,7 @@ impl ProviderError {
             Self::RateLimited { .. } => "Provider rate limited",
             Self::ContextTooLarge => "Provider context window exceeded",
             Self::Connection => "Provider connection failed",
+            Self::QuotaExceeded => "Provider quota exhausted",
             Self::InvalidRequest => return None,
             Self::Transient | Self::Permanent | Self::BoundExceeded | Self::UnknownVariant => {
                 UNKNOWN_INTERNAL_MESSAGE
@@ -558,6 +565,7 @@ impl ProviderError {
             Self::Transient => "transient",
             Self::Connection => "connection",
             Self::Permanent => "permanent",
+            Self::QuotaExceeded => "quota_exceeded",
             Self::BoundExceeded => "bound_exceeded",
             Self::UnknownVariant => "unknown_variant",
         }
@@ -575,6 +583,7 @@ impl fmt::Display for ProviderError {
             Self::Transient => "provider reported a transient failure",
             Self::Connection => "provider connection failed",
             Self::Permanent => "provider reported a permanent failure",
+            Self::QuotaExceeded => "provider quota exhausted (payment required)",
             Self::BoundExceeded => "provider object exceeds a documented bound",
             Self::UnknownVariant => "unknown provider schema variant",
         })
@@ -2508,6 +2517,7 @@ fn parse_error_kind(kind: &str) -> Result<ProviderError, ProviderError> {
         "transient" => Ok(ProviderError::Transient),
         "connection" => Ok(ProviderError::Connection),
         "permanent" => Ok(ProviderError::Permanent),
+        "quota_exceeded" => Ok(ProviderError::QuotaExceeded),
         "bound_exceeded" => Ok(ProviderError::BoundExceeded),
         "unknown_variant" => Ok(ProviderError::UnknownVariant),
         _ => Err(ProviderError::UnknownVariant),

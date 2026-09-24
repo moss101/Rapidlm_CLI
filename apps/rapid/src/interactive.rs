@@ -689,7 +689,7 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
     Subcommand {
         name: "setup",
         operands: "[--preset <id>] [--model <id>] [--base-url <url>] [--key-env <VAR> | --key-stdin] [--dry-run]",
-        summary: "write a model configuration (dry run today)",
+        summary: "plan and verify a model configuration",
         own_help: true,
         handler: SubcommandHandler::P9(crate::p9_commands::run_setup),
     },

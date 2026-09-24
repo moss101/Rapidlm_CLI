@@ -242,6 +242,12 @@ Exit codes:
   0   done (or the dry-run plan was printed)
   1   the existing config could not be read or does not parse
   2   usage error
+  11  verification: the key was refused, or its variable is not set
+  12  verification: no quota or credit left, or rate-limited
+  13  verification: the endpoint could not be reached
+  14  verification: the endpoint failed on its side
+  15  verification: the endpoint answered, but not usably
+A failed verification changes no file.
 "
     )
 }
@@ -1163,6 +1169,8 @@ pub fn render_json(plan: &SetupPlan, dry_run: bool) -> serde_json::Value {
 pub struct SetupEnv {
     pub env: Vec<(String, String)>,
     pub stdin_is_tty: bool,
+    /// Reads the key `--key-stdin` names (stdin in production).
+    pub read_key: fn() -> std::io::Result<String>,
 }
 
 impl SetupEnv {
@@ -1171,8 +1179,151 @@ impl SetupEnv {
         Self {
             env: std::env::vars().collect(),
             stdin_is_tty: std::io::stdin().is_terminal(),
+            read_key: read_stdin_key,
         }
     }
+}
+
+/// At most this much is read as a key from stdin.
+const MAX_STDIN_KEY_BYTES: u64 = 8 * 1024;
+
+/// The key `--key-stdin` supplies: stdin to its end, bounded, trimmed.
+pub fn read_stdin_key() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut key = String::new();
+    std::io::stdin()
+        .lock()
+        .take(MAX_STDIN_KEY_BYTES)
+        .read_to_string(&mut key)?;
+    Ok(key.trim().to_owned())
+}
+
+/// Why the verification request failed. Each class is its own exit code and
+/// hint, and every one is reported with "no files were changed".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProbeFailure {
+    /// The key's environment variable is not set: nothing was sent.
+    NoKey { var: String },
+    /// The endpoint refused the key (401/403).
+    Auth,
+    /// No quota or credit left, or rate-limited (402/429).
+    Quota,
+    /// The endpoint could not be reached (DNS, connect, TLS, timeout).
+    Network,
+    /// The endpoint failed on its side (5xx).
+    Server,
+    /// It answered, but not as this dialect's server would, or refused the
+    /// request itself (unknown model, malformed body).
+    Invalid,
+}
+
+impl ProbeFailure {
+    pub const fn exit_code(&self) -> i32 {
+        match self {
+            Self::NoKey { .. } | Self::Auth => 11,
+            Self::Quota => 12,
+            Self::Network => 13,
+            Self::Server => 14,
+            Self::Invalid => 15,
+        }
+    }
+
+    pub const fn class(&self) -> &'static str {
+        match self {
+            Self::NoKey { .. } | Self::Auth => "auth",
+            Self::Quota => "quota",
+            Self::Network => "network",
+            Self::Server => "server",
+            Self::Invalid => "invalid",
+        }
+    }
+
+    /// The next step, naming the command. Never a credential or a response.
+    pub fn hint(&self, plan: &SetupPlan) -> String {
+        let endpoint = origin_of(&plan.choice.base_url)
+            .map(|(scheme, host, port)| format!("{scheme}://{host}:{port}"))
+            .unwrap_or_else(|| "the endpoint".to_owned());
+        match self {
+            Self::NoKey { var } => format!(
+                "${var} is not set, so no request was made — export it, then run rapid setup again"
+            ),
+            Self::Auth => format!(
+                "{endpoint} refused the key — check it, or give another with rapid setup \
+--key-env <VAR> or --key-stdin"
+            ),
+            Self::Quota => format!(
+                "{endpoint} reports no quota or credit left, or a rate limit — check the account's \
+billing and limits, then run rapid setup again"
+            ),
+            Self::Network => {
+                format!("{endpoint} could not be reached — check --base-url and the network")
+            }
+            Self::Server => format!("{endpoint} failed on its side — run rapid setup again later"),
+            Self::Invalid => format!(
+                "{endpoint} answered, but not as a {} server would, or refused the request — check \
+--base-url and --model",
+                plan.choice.dialect.as_str()
+            ),
+        }
+    }
+}
+
+/// The failure class of a provider error.
+pub fn classify(err: &llm_router::provider::ProviderError) -> ProbeFailure {
+    use llm_router::provider::ProviderError as E;
+    match err {
+        E::AuthFailed => ProbeFailure::Auth,
+        E::QuotaExceeded | E::RateLimited { .. } => ProbeFailure::Quota,
+        E::Connection | E::Cancelled => ProbeFailure::Network,
+        E::Transient => ProbeFailure::Server,
+        E::ContextTooLarge
+        | E::InvalidRequest
+        | E::Permanent
+        | E::BoundExceeded
+        | E::UnknownVariant => ProbeFailure::Invalid,
+    }
+}
+
+/// The live verification (SEAM-02): one request of at most
+/// [`VERIFY_MAX_OUTPUT_TOKENS`] through the model client a run would build
+/// for the planned profile — the config as the plan leaves it, the key as
+/// the plan names it (`stdin_key` for `--key-stdin`). Nothing is written.
+pub fn verify(
+    plan: &SetupPlan,
+    env: &[(String, String)],
+    stdin_key: Option<&str>,
+    cancel: &llm_router::provider::CancellationToken,
+) -> Result<(), ProbeFailure> {
+    if let Credential::Env { var } = &plan.choice.credential
+        && env_value(env, var).is_none_or(str::is_empty)
+    {
+        return Err(ProbeFailure::NoKey { var: var.clone() });
+    }
+    let parsed = parse_config_document(&plan.document, "the planned config")
+        .map_err(|_| ProbeFailure::Invalid)?;
+    // The planned profile, whatever this shell's RAPIDLM_MODEL names.
+    let mut probe_env: Vec<(String, String)> = env
+        .iter()
+        .filter(|(key, _)| key != crate::user_config::DEFAULT_MODEL_ENV)
+        .cloned()
+        .collect();
+    probe_env.push((
+        crate::user_config::DEFAULT_MODEL_ENV.to_owned(),
+        plan.choice.profile.clone(),
+    ));
+    let mut active = crate::user_config::resolve_active(&probe_env, &parsed)
+        .map_err(|_| ProbeFailure::Invalid)?;
+    if let Credential::Keychain { .. } = &plan.choice.credential {
+        active.credential = crate::user_config::ResolvedCredential {
+            plaintext: stdin_key.map(str::to_owned),
+            source: crate::user_config::CredentialSource::InlineApiKey,
+        };
+    }
+    active.entry.max_tokens = Some(VERIFY_MAX_OUTPUT_TOKENS);
+    let store = auth::InMemoryCredentialStore::new();
+    let model =
+        crate::model::ConfiguredModel::build(&active, &store).map_err(|_| ProbeFailure::Invalid)?;
+    model.probe(cancel).map_err(|err| classify(&err))
 }
 
 /// What a run printed and how it exited.
@@ -1257,11 +1408,69 @@ pub fn run(args: &[String], env: &SetupEnv, prompter: &mut dyn Prompter) -> Setu
     };
     plan.via_symlink = link;
     if !parsed.dry_run {
+        let stdin_key = match (&plan.choice.credential, parsed.no_verify) {
+            (Credential::Keychain { .. }, false) => match (env.read_key)() {
+                Ok(key) if !key.trim().is_empty() => Some(key.trim().to_owned()),
+                _ => {
+                    return usage_error(
+                        "rapid setup: --key-stdin read no key from stdin".to_owned(),
+                    );
+                }
+            },
+            _ => None,
+        };
+        if !parsed.no_verify {
+            let cancel = llm_router::provider::CancellationToken::new();
+            if let Err(failure) = verify(&plan, &env.env, stdin_key.as_deref(), &cancel) {
+                let hint = failure.hint(&plan);
+                let stdout = match parsed.output {
+                    OutputFormat::Json => format!(
+                        "{}\n",
+                        serde_json::json!({
+                            "schema": "rapidlm.setup_outcome/v1",
+                            "verified": false,
+                            "class": failure.class(),
+                            "hint": hint,
+                            "written": false,
+                        })
+                    ),
+                    OutputFormat::Text => String::new(),
+                };
+                return SetupOutcome {
+                    stdout,
+                    stderr: format!(
+                        "rapid setup: verification failed ({}): {hint}\nno files were changed\n",
+                        failure.class()
+                    ),
+                    exit: failure.exit_code(),
+                };
+            }
+        }
+        // Writing is SEAM-02-3: until then a verified plan still writes
+        // nothing, and says so.
+        let verified = !parsed.no_verify;
+        let stdout = match parsed.output {
+            OutputFormat::Json => format!(
+                "{}\n",
+                serde_json::json!({
+                    "schema": "rapidlm.setup_outcome/v1",
+                    "verified": verified,
+                    "written": false,
+                })
+            ),
+            OutputFormat::Text => String::new(),
+        };
         return SetupOutcome {
-            stdout: String::new(),
-            stderr: "rapid setup: writing a configuration comes with live verification, which \
-this build does not have yet; --dry-run prints what would be written\n"
-                .to_owned(),
+            stdout,
+            stderr: format!(
+                "rapid setup: {}writing the configuration is not in this build yet — no files \
+were changed; --dry-run prints what would be written\n",
+                if verified {
+                    format!("{} answered; ", plan.choice.base_url)
+                } else {
+                    String::new()
+                }
+            ),
             exit: 2,
         };
     }
@@ -1396,6 +1605,7 @@ mod tests {
                     ),
                 ],
                 stdin_is_tty: false,
+                read_key: || Ok("sk-test-from-stdin".to_owned()),
             }
         }
 
@@ -1876,26 +2086,6 @@ api_key = \"inline-secret\"
         assert!(config_target(&[]).is_err());
     }
 
-    #[test]
-    fn a_run_without_dry_run_is_refused_until_verification_exists() {
-        let home = Home::new("no-dry-run");
-        let before = home.snapshot();
-        let outcome = run(
-            &args(&["--preset", "ollama", "--non-interactive"]),
-            &home.env(),
-            &mut Scripted(Vec::new()),
-        );
-        assert_eq!(outcome.exit, 2);
-        assert!(
-            outcome
-                .stderr
-                .contains("--dry-run prints what would be written"),
-            "{}",
-            outcome.stderr
-        );
-        assert_eq!(home.snapshot(), before);
-    }
-
     fn choice_for(list: &[&str]) -> Choice {
         resolve_choice(
             &parse_args(&args(list)).expect("args"),
@@ -2134,6 +2324,7 @@ gw = { provider = \"openai-compatible\", model = \"m\", base_url = \"http://10.0
         let env = SetupEnv {
             env: vec![(CONFIG_PATH_ENV.to_owned(), home.0.display().to_string())],
             stdin_is_tty: false,
+            read_key: || Ok(String::new()),
         };
         let outcome = run(
             &args(&["--preset", "ollama", "--dry-run"]),
@@ -2391,6 +2582,185 @@ gw = { provider = \"openai-compatible\", model = \"m\", base_url = \"http://10.0
         assert_eq!(
             plan["files"][0]["via_symlink"],
             home.config().display().to_string()
+        );
+    }
+
+    /// A loopback endpoint answering every request with `status` and `body`;
+    /// returns its `/v1` base URL and the requests it received.
+    fn endpoint(
+        status: u16,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while let Ok(read) = stream.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                log.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(String::from_utf8_lossy(&buf).to_string());
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (url, seen)
+    }
+
+    const GOOD_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#;
+
+    fn verify_run(home: &Home, url: &str, extra: &[&str]) -> SetupOutcome {
+        let mut list = vec!["--base-url", url, "--model", "m", "--non-interactive"];
+        list.extend_from_slice(extra);
+        let mut env = home.env();
+        env.env
+            .push(("TEST_KEY".to_owned(), "sk-test-env".to_owned()));
+        run(&args(&list), &env, &mut Scripted(Vec::new()))
+    }
+
+    #[test]
+    fn each_verification_failure_has_its_own_exit_code_and_changes_no_file() {
+        // SEAM-02 AC-02 (and the validation list): 401 → auth, 402/429 →
+        // quota, refused → network, 500 → server, garbage → invalid; the
+        // home is byte-identical after each, and every message says no files
+        // were changed.
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+            drop(listener);
+            url
+        };
+        let cases: Vec<(String, i32, &str)> = vec![
+            (
+                endpoint(401, r#"{"error":{"message":"bad key"}}"#).0,
+                11,
+                "auth",
+            ),
+            (
+                endpoint(402, r#"{"error":{"message":"no credit"}}"#).0,
+                12,
+                "quota",
+            ),
+            (
+                endpoint(429, r#"{"error":{"message":"slow down"}}"#).0,
+                12,
+                "quota",
+            ),
+            (refused, 13, "network"),
+            (
+                endpoint(500, r#"{"error":{"message":"oops"}}"#).0,
+                14,
+                "server",
+            ),
+            (endpoint(200, "definitely not json").0, 15, "invalid"),
+        ];
+        for (url, code, class) in cases {
+            let home = Home::new("verify-fail");
+            let before = home.snapshot();
+            let outcome = verify_run(&home, &url, &["--key-env", "TEST_KEY"]);
+            assert_eq!(outcome.exit, code, "{class}: {}", outcome.stderr);
+            assert!(
+                outcome
+                    .stderr
+                    .contains(&format!("verification failed ({class})")),
+                "{}",
+                outcome.stderr
+            );
+            assert!(
+                outcome.stderr.contains("no files were changed"),
+                "{}",
+                outcome.stderr
+            );
+            assert!(
+                !outcome.stderr.contains("sk-test-env"),
+                "the key is never printed"
+            );
+            assert_eq!(home.snapshot(), before, "{class}: nothing written");
+        }
+    }
+
+    #[test]
+    fn a_verified_plan_sent_one_bounded_request_with_the_named_key() {
+        let home = Home::new("verify-ok");
+        let (url, seen) = endpoint(200, GOOD_BODY);
+        let before = home.snapshot();
+        let outcome = verify_run(&home, &url, &["--key-env", "TEST_KEY", "--output", "json"]);
+        assert_eq!(outcome.exit, 2, "writing is SEAM-02-3: {}", outcome.stderr);
+        assert!(outcome.stderr.contains("answered"), "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("no files were changed"),
+            "{}",
+            outcome.stderr
+        );
+        let json: serde_json::Value = serde_json::from_str(&outcome.stdout).expect("json");
+        assert_eq!(json["verified"], true);
+        assert_eq!(json["written"], false);
+        assert_eq!(home.snapshot(), before);
+        let requests = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(requests.len(), 1, "exactly one request");
+        assert!(
+            requests[0].contains("Bearer sk-test-env"),
+            "the named key was sent"
+        );
+        assert!(requests[0].contains("\"max_tokens\":16"), "{}", requests[0]);
+        // --key-stdin: the key read from stdin is the one sent.
+        let (url, seen) = endpoint(200, GOOD_BODY);
+        let outcome = verify_run(&home, &url, &["--key-stdin"]);
+        assert_eq!(outcome.exit, 2, "{}", outcome.stderr);
+        let requests = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert!(
+            requests[0].contains("Bearer sk-test-from-stdin"),
+            "{}",
+            requests[0]
+        );
+    }
+
+    #[test]
+    fn an_unset_key_variable_sends_nothing() {
+        let home = Home::new("verify-nokey");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+        let outcome = verify_run(&home, &url, &["--key-env", "NOT_SET_ANYWHERE"]);
+        assert_eq!(outcome.exit, 11);
+        assert!(
+            outcome.stderr.contains("$NOT_SET_ANYWHERE is not set"),
+            "{}",
+            outcome.stderr
+        );
+        assert!(outcome.stderr.contains("no files were changed"));
+        assert!(
+            matches!(listener.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock)
         );
     }
 }

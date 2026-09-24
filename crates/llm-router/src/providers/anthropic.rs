@@ -543,6 +543,7 @@ fn classify_http_error(
     let parsed = parse_json_object(response.body());
     match response.status() {
         401 | 403 => Err(ProviderError::AuthFailed),
+        402 => Err(ProviderError::QuotaExceeded),
         429 => Err(ProviderError::RateLimited {
             retry_after_ms: response
                 .header("retry-after")
@@ -1675,6 +1676,24 @@ mod tests {
         assert_ne!(err, ProviderError::Transient);
         assert!(!err.is_retryable());
         assert_no_canary("forbidden", &format!("{err}"));
+    }
+
+    #[test]
+    fn payment_required_is_an_exhausted_quota_never_retried() {
+        let store = store_with_canary();
+        let transport = ScriptedTransport::new(
+            402,
+            format!(
+                r#"{{"type":"error","error":{{"type":"billing_error","message":"{CANARY}"}}}}"#
+            ),
+        );
+        let err = block_on(
+            adapter(&store, transport, caps(false, false)).invoke(request(false, false), live()),
+        )
+        .expect_err("payment required");
+        assert_eq!(err, ProviderError::QuotaExceeded);
+        assert!(!err.is_retryable());
+        assert_no_canary("quota", &format!("{err}"));
     }
 
     #[test]

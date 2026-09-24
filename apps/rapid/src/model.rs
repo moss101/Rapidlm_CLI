@@ -412,6 +412,38 @@ impl LiveModelCall for ConfiguredModel<'_> {
     }
 }
 
+impl ConfiguredModel<'_> {
+    /// One minimal request through this model's own adapter and transport —
+    /// the SEAM-02 live verification (`rapid setup`, `rapid doctor --live`).
+    /// The output ceiling is the entry's `max_tokens`, which the caller sets
+    /// (≤16). `Ok` when a well-formed response came back. The provider's own
+    /// error class is returned, not the step layer's folded cause, so a 429
+    /// and a 5xx, or a 402 and a 400, stay distinguishable.
+    pub fn probe(
+        &self,
+        cancel: &llm_router::provider::CancellationToken,
+    ) -> Result<(), ProviderError> {
+        let packet = context_engine::compile::compile(
+            &context_engine::compile::CompileContext::new(1024, 64).user(
+                context_engine::compile::CompileInput::new(
+                    "setup-verification",
+                    "Reply with the single word: ok",
+                ),
+            ),
+        )
+        .map_err(|_| ProviderError::InvalidRequest)?;
+        let request = build_request(self, packet.blocks(), &ModelStepInput::without_tools(1))
+            .map_err(|_| ProviderError::InvalidRequest)?;
+        let stream = match &self.backend {
+            Backend::OpenAi(adapter) => adapter.invoke_sync(request, cancel),
+            Backend::Anthropic(adapter) => adapter.invoke_sync(request, cancel),
+        }?;
+        fold_stream(&stream, 0)
+            .map(|_| ())
+            .map_err(|_| ProviderError::UnknownVariant)
+    }
+}
+
 /// Bridges the turn's cancellation into a provider request: a watcher thread
 /// cancels the router token the moment the turn token fires. Detached — it
 /// exits within one poll interval of the step returning, and touching
@@ -776,6 +808,9 @@ fn map_provider_error(err: ProviderError) -> ModelStepError {
         }
         ProviderError::AuthFailed => ModelStepError::ProviderFailed {
             cause: FailureCause::Auth,
+        },
+        ProviderError::QuotaExceeded => ModelStepError::ProviderFailed {
+            cause: FailureCause::Quota,
         },
         ProviderError::Connection => ModelStepError::ProviderFailed {
             cause: FailureCause::Connection,

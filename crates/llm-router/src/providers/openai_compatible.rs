@@ -1166,6 +1166,7 @@ fn classify_http_error(response: &ProviderHttpResponse) -> Result<(), ProviderEr
     let parsed = parse_json_object(&response.body);
     match response.status {
         401 | 403 => Err(ProviderError::AuthFailed),
+        402 => Err(ProviderError::QuotaExceeded),
         429 => Err(ProviderError::RateLimited {
             retry_after_ms: response
                 .header("retry-after")
@@ -3199,6 +3200,31 @@ mod tests {
         assert_eq!(usage.input_tokens(), Some(5));
         assert_eq!(usage.output_tokens(), Some(1));
         assert_eq!(usage.cost(), UsageCost::Unknown);
+    }
+
+    #[test]
+    fn payment_required_is_an_exhausted_quota_never_retried() {
+        let store = store_with_canary();
+        let quota = FixtureServer::spawn(FixtureScript {
+            status: 402,
+            body: format!(
+                r#"{{"error":{{"message":"insufficient credit {CANARY}","type":"insufficient_quota"}}}}"#
+            ),
+            extra_headers: vec![],
+        });
+        let err = block_on(
+            adapter(
+                &store,
+                &quota.base_url(),
+                OpenAiApiStyle::ChatCompletions,
+                caps(false, false),
+            )
+            .invoke(request(false, false), live()),
+        )
+        .expect_err("payment required");
+        assert_eq!(err, ProviderError::QuotaExceeded);
+        assert!(!err.is_retryable(), "waiting does not refill a quota");
+        assert_no_canary("quota", &format!("{err:?}{err}"));
     }
 
     #[test]
