@@ -218,7 +218,7 @@ impl FailureClass {
         matches!(self, Self::Transient | Self::RateLimited { .. })
     }
 
-    /// Auth/config/safety stop unless policy names an explicit alternate.
+    /// Auth/quota/config/safety stop unless policy names an explicit alternate.
     pub const fn requires_explicit_alternate(self) -> bool {
         matches!(self, Self::Auth | Self::Quota | Self::Config | Self::Safety)
     }

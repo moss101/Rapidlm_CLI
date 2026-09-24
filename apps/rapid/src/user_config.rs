@@ -1,6 +1,4 @@
-//! Grok Build–style layered model configuration for the `rapid` CLI.
-//!
-//! Mirrors the Grok Build user-config surface with RapidLM names:
+//! Layered model configuration for the `rapid` CLI:
 //!
 //!   - File: `RAPIDLM_CONFIG` (explicit path, must exist) else the first
 //!     existing home candidate `RAPIDLM_HOME/config.toml`,
@@ -26,9 +24,9 @@ use std::path::{Path, PathBuf};
 
 use llm_router::{PhaseRoute, ReasoningEffort, parse_purpose_name, purpose_name};
 
-/// Env var holding an explicit config file path (Grok: `GROK_CONFIG`).
+/// Env var holding an explicit config file path.
 pub const CONFIG_PATH_ENV: &str = "RAPIDLM_CONFIG";
-/// Env var overriding `[models].default` (Grok: model override flags/envs).
+/// Env var overriding `[models].default`.
 pub const DEFAULT_MODEL_ENV: &str = "RAPIDLM_MODEL";
 /// Home-root override consumed verbatim (same semantics as `resolve_user_home`).
 pub const RAPIDLM_HOME_ENV: &str = "RAPIDLM_HOME";
@@ -113,9 +111,9 @@ pub struct ModelEntry {
     /// Provider origin (http for local servers, https for TLS-verified
     /// remotes; e.g. `http://127.0.0.1:11434/v1`).
     pub base_url: String,
-    /// Optional display name (Grok: `name`).
+    /// Optional display name.
     pub name: Option<String>,
-    /// Inline credential; wins over `env_key` (Grok precedence).
+    /// Inline credential; wins over `env_key`.
     pub api_key: Option<String>,
     /// Env var names tried in order; first set, non-empty value wins.
     pub env_key: Vec<String>,
@@ -661,7 +659,7 @@ fn expect_non_empty_str<'a>(value: &'a toml::Value, key: &str) -> Result<&'a str
     Ok(raw)
 }
 
-/// Apply the Grok precedence: `RAPIDLM_MODEL` > `[models].default`, then
+/// Apply the precedence `RAPIDLM_MODEL` > `[models].default`, then
 /// resolve the entry and its credential (`api_key` > first non-empty
 /// `env_key` > keyless).
 pub fn resolve_active(
@@ -778,6 +776,18 @@ pub fn resolve_purpose_model(
     purpose: llm_router::provider::ModelPurpose,
 ) -> Result<ActiveModel, UserConfigError> {
     let active = resolve_active(env, config)?;
+    resolve_purpose_model_for(active, env, config, purpose)
+}
+
+/// [`resolve_purpose_model`] for a primary already resolved — the gated one
+/// a run uses (a managed lock may have overruled the shell's override, which
+/// must not be re-read here).
+pub fn resolve_purpose_model_for(
+    active: ActiveModel,
+    env: &[(String, String)],
+    config: &UserConfig,
+    purpose: llm_router::provider::ModelPurpose,
+) -> Result<ActiveModel, UserConfigError> {
     let routed = active.phase_route.route(purpose).as_str();
     if routed == active.profile_id {
         return Ok(active);
@@ -800,7 +810,7 @@ pub fn resolve_purpose_model(
     })
 }
 
-/// Grok credential precedence: inline `api_key`, then the first set,
+/// Credential precedence: inline `api_key`, then the first set,
 /// non-empty `env_key` entry, then keyless.
 pub fn resolve_credential(entry: &ModelEntry, env: &[(String, String)]) -> ResolvedCredential {
     if let Some(api_key) = &entry.api_key {
@@ -885,7 +895,13 @@ pub fn select_active_model_with_override(
     // RAPIDLM_MODEL out of the env the resolver sees and set the cloned
     // config's default, so `[phases]` routes and warnings stay consistent.
     let mut effective_env: Vec<(String, String)> = env.to_vec();
-    if let Some(id) = override_id {
+    let policy = crate::managed_config::load_policy(env)?;
+    // Under a managed lock the override is overruled whatever it names — a
+    // profile removed since `/model select` included, like `RAPIDLM_MODEL`.
+    let locked = policy
+        .as_ref()
+        .is_some_and(|policy| policy.locked_default().is_some());
+    if let Some(id) = override_id.filter(|_| !locked) {
         if !config.model_ids().contains(&id.to_owned()) {
             return Err(crate::managed_config::GatedConfigError::Config(
                 UserConfigError::UnknownDefaultModel {
@@ -902,7 +918,6 @@ pub fn select_active_model_with_override(
         .iter()
         .map(|key| format!("unknown config key '{key}'"))
         .collect::<Vec<_>>();
-    let policy = crate::managed_config::load_policy(env)?;
     let gated = crate::managed_config::resolve_gated(&effective_env, &config, policy.as_ref())?;
     for report in &gated.reports {
         warnings.push(format!("managed gate: {report}"));
@@ -953,7 +968,7 @@ context_window = 65536
 
 [model.cloud]
 provider = "anthropic"
-model = "claude-3-5-sonnet"
+model = "remote-large"
 base_url = "http://gateway.internal:8080"
 api_key = "inline-secret"
 "#;
@@ -1010,7 +1025,7 @@ reasoning_effort = "high"
 
 [model.cloud]
 provider = "anthropic"
-model = "claude-3-5-sonnet"
+model = "remote-large"
 base_url = "http://gateway.internal:8080"
 api_key = "inline-secret"
 "#;
@@ -1123,7 +1138,7 @@ base_url = "http://127.0.0.1:11434/v1"
 
 [model.cloud]
 provider = "anthropic"
-model = "claude-3-5-sonnet"
+model = "remote-large"
 base_url = "http://gateway.internal:8080"
 api_key = "inline-secret"
 
@@ -1176,7 +1191,7 @@ base_url = "http://127.0.0.1:11434/v1"
 
 [model.cloud]
 provider = "anthropic"
-model = "claude-3-5-sonnet"
+model = "remote-large"
 base_url = "http://gateway.internal:8080"
 api_key = "inline-secret"
 "#;
@@ -1222,7 +1237,7 @@ base_url = "http://127.0.0.1:11434/v1"
 
 [model.cloud]
 provider = "anthropic"
-model = "claude-3-5-sonnet"
+model = "remote-large"
 base_url = "http://gateway.internal:8080"
 api_key = "inline-secret"
 "#;
@@ -1564,5 +1579,47 @@ mod capability_override_tests {
         )
         .unwrap();
         assert!(parse_model_entry("m", &broken, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn under_a_lock_a_stale_session_override_is_overruled_not_fatal() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-stale-override-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let config = dir.join("config.toml");
+        std::fs::write(
+            &config,
+            "[models]\ndefault = \"corp\"\n\n[model.corp]\nprovider = \"openai-compatible\"\nmodel = \"m\"\nbase_url = \"http://127.0.0.1:11434/v1\"\n",
+        )
+        .expect("config");
+        let policy = dir.join("policy.toml");
+        std::fs::write(
+            &policy,
+            format!(
+                "schema = \"{}\"\n[policy]\nlocked_default = \"corp\"\n",
+                crate::managed_config::MANAGED_SCHEMA
+            ),
+        )
+        .expect("policy");
+        let env = vec![(CONFIG_PATH_ENV.to_owned(), config.display().to_string())];
+        // Without a lock, a removed profile is the error it always was.
+        assert!(select_active_model_with_override(&env, Some("removed")).is_err());
+        let mut locked = env.clone();
+        locked.push((
+            crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+            policy.display().to_string(),
+        ));
+        match select_active_model_with_override(&locked, Some("removed")).expect("the lock decides")
+        {
+            ModelSelection::Configured { active, .. } => assert_eq!(active.profile_id, "corp"),
+            other => panic!("configured, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

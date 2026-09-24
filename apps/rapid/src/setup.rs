@@ -169,7 +169,8 @@ pub fn preset(id: &str) -> Option<&'static Preset> {
 /// Where the key comes from, as the user asked.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum KeyFlag {
-    /// Neither `--key-env` nor `--key-stdin`: the preset's convention.
+    /// Neither `--key-env` nor `--key-stdin`: a preset's key variable on
+    /// the preset's own origin, otherwise whatever the profile names.
     #[default]
     Unspecified,
     Env(String),
@@ -223,8 +224,8 @@ the user config (RAPIDLM_CONFIG, else RAPIDLM_HOME/config.toml, else
   --model <id>        the model identifier to request (default: the preset's)
   --base-url <url>    the endpoint (http:// or https:// origin); without --preset the
                       endpoint is taken to speak the openai-compatible dialect; a
-                      preset's key variable goes only to the preset's own host
-                      (--key-env names one for another)
+                      preset's key variable goes only to the preset's own origin
+                      (scheme, host and port; --key-env names one for another)
   --key-env <VAR>     the key is read from this environment variable at request time;
                       the config names the variable, never the value
   --key-stdin         read the key from stdin and keep it in the OS keychain; the
@@ -463,8 +464,12 @@ pub enum Credential {
     Keychain { alias: String },
     /// No key: the endpoint is called without credentials.
     None,
-    /// Whatever credential the profile already names is kept (a custom
-    /// endpoint with no key flag: setup does not guess, and does not strip).
+    /// The profile keeps the credential it names — but only for the origin
+    /// it was set up for; on another origin it is removed (a custom endpoint,
+    /// or a preset's `--base-url` on another origin, with no key flag: setup
+    /// does not guess, and never sends a key for one host to another). A
+    /// keyless preset on its own origin is `None` instead: its server takes
+    /// no key.
     Unchanged,
 }
 
@@ -697,6 +702,7 @@ pub fn plan(
     let mut unset = Vec::new();
     let mut notes = Vec::new();
     let kept: Vec<String>;
+    let profile_keys: Vec<String>;
     let mut kept_credential = None;
     let mut changed = existing.is_none();
     {
@@ -804,6 +810,7 @@ this --base-url"
                 }
             }
         }
+        profile_keys = profile.iter().map(|(key, _)| key.to_owned()).collect();
         let written: Vec<&str> = ["provider", "model", "base_url"]
             .into_iter()
             .chain(credential_keys)
@@ -855,6 +862,20 @@ untouched: {err}",
                 config_path.display()
             )
         })?;
+    // Under a lock the gate above judged the locked profile: the one this
+    // writes must pass the allowlist too — any run that selects it would
+    // refuse it.
+    if let Some(allowed) = policy.and_then(crate::managed_config::ManagedPolicy::allowed_providers)
+        && !allowed.iter().any(|name| name == choice.dialect.as_str())
+    {
+        return Err(format!(
+            "rapid setup: the managed policy allows only the providers {} and a run would refuse \
+{}, so {} is left untouched",
+            allowed.join(", "),
+            choice.dialect.as_str(),
+            config_path.display()
+        ));
+    }
     let effective = if resolution.active.profile_id != choice.profile {
         // A managed locked default.
         Some((
@@ -878,10 +899,13 @@ untouched: {err}",
     // Keys of this profile a run would not read (a newer key than this
     // build's reader knows) are named, not silently written.
     let profile_prefix = format!("model.{}.", choice.profile);
-    for key in parsed.unknown_keys.iter().filter(|key| {
-        key.strip_prefix(&profile_prefix)
-            .is_some_and(|rest| !rest.contains('.'))
-    }) {
+    // Exactly this profile's own keys: a quoted id with a dot is another
+    // profile, a quoted key with a dot is this one's.
+    for key in profile_keys
+        .iter()
+        .map(|key| format!("{profile_prefix}{key}"))
+        .filter(|key| parsed.unknown_keys.contains(key))
+    {
         notes.push(format!(
             "a run would ignore {key}: this build does not read it"
         ));
@@ -1224,9 +1248,13 @@ pub fn read_stdin_key() -> std::io::Result<String> {
 pub enum ProbeFailure {
     /// The key's environment variable is not set: nothing was sent.
     NoKey { var: String },
-    /// The profile names its key where this build does not read it (the
-    /// `keychain` alias until the reader learns it): nothing was sent.
+    /// The endpoint refused a keyless request, and the profile names its key
+    /// where this build does not read it (the `keychain` alias until the
+    /// reader learns it).
     KeyNotRead { key: String },
+    /// The endpoint refused a keyless request, and the variable the profile
+    /// names for its key is not set.
+    KeptKeyUnset { var: String },
     /// The key has characters no HTTP header can carry: nothing was sent.
     UnusableKey,
     /// The endpoint refused the key (401/403).
@@ -1253,6 +1281,7 @@ impl ProbeFailure {
         match self {
             Self::NoKey { .. }
             | Self::KeyNotRead { .. }
+            | Self::KeptKeyUnset { .. }
             | Self::UnusableKey
             | Self::Auth
             | Self::AuthNoKey { .. } => 11,
@@ -1267,6 +1296,7 @@ impl ProbeFailure {
         match self {
             Self::NoKey { .. }
             | Self::KeyNotRead { .. }
+            | Self::KeptKeyUnset { .. }
             | Self::UnusableKey
             | Self::Auth
             | Self::AuthNoKey { .. } => "auth",
@@ -1287,11 +1317,16 @@ impl ProbeFailure {
                 "${var} is not set, so no request was made — export it, then run rapid setup again"
             ),
             Self::KeyNotRead { key } => format!(
-                "the profile names its key in {key}, which this build does not read, so no \
-request was made — give the key with rapid setup --key-env <VAR>"
+                "{endpoint} requires a key, and the profile names it in {key}, which this build \
+does not read — give the key with rapid setup --key-env <VAR>"
             ),
-            Self::UnusableKey => "the key has characters no HTTP header can carry (a line break \
-from a file?), so no request was made — check it, then run rapid setup again"
+            Self::KeptKeyUnset { var } => format!(
+                "{endpoint} requires a key, and ${var}, which the profile names for it, is not \
+set — export it, then run rapid setup again"
+            ),
+            Self::UnusableKey => "the key cannot be sent: it has characters no HTTP header can \
+carry (a line break from a file?) or is too long, so no request was made — check it, then run \
+rapid setup again"
                 .to_owned(),
             Self::Auth => format!(
                 "{endpoint} refused the key — check it, or give another with rapid setup \
@@ -1312,8 +1347,8 @@ rapid setup again"
             ),
             Self::Server => format!("{endpoint} failed on its side — run rapid setup again later"),
             Self::Refused => format!(
-                "rapid does not dial {endpoint} (an unspecified, link-local or metadata address), \
-so no request was made — check --base-url, then run rapid setup again"
+                "rapid does not dial {endpoint} (an unspecified, broadcast, multicast, link-local \
+or metadata address), so no request was made — check --base-url, then run rapid setup again"
             ),
             Self::Invalid => format!(
                 "{endpoint} answered, but not as a {} server would, or refused the request — check \
@@ -1376,28 +1411,20 @@ pub fn verify(
             source: crate::user_config::CredentialSource::InlineApiKey,
         };
     }
-    // A kept credential a run would not send — its variable unset, or held
-    // where this build does not read it: probing without it would blame the
-    // endpoint's refusal on a key that never left.
-    if active.credential.plaintext.is_none() {
-        if let Some(kept) = plan
-            .kept_credential
-            .as_deref()
-            .filter(|key| key.ends_with(".keychain"))
-        {
-            return Err(ProbeFailure::KeyNotRead {
-                key: kept.to_owned(),
-            });
-        }
-        if let Some(var) = active.entry.env_key.first() {
-            return Err(ProbeFailure::NoKey { var: var.clone() });
-        }
-    }
     // The request a run would make: the managed effort floor applies.
     let mut active = crate::managed_config::apply_to_fallback_candidate(active, policy)
         .map_err(|_| ProbeFailure::Invalid)?;
     active.entry.max_tokens = Some(VERIFY_MAX_OUTPUT_TOKENS);
+    // Keyless as a run would be (a local server needs no key, whatever its
+    // profile names); only a refusal of that keyless request says why no key
+    // was sent.
     let sends_key = active.credential.plaintext.is_some();
+    let kept_keychain = plan
+        .kept_credential
+        .as_deref()
+        .filter(|key| key.ends_with(".keychain"))
+        .map(str::to_owned);
+    let unset_var = active.entry.env_key.first().cloned();
     let store = auth::InMemoryCredentialStore::new();
     let model = crate::model::ConfiguredModel::build(&active, &store).map_err(|err| match err {
         crate::model::ModelConfigError::Credential { .. } => ProbeFailure::UnusableKey,
@@ -1405,12 +1432,19 @@ pub fn verify(
         _ => ProbeFailure::Invalid,
     })?;
     model.probe(cancel).map_err(|err| match classify(&err) {
-        ProbeFailure::Auth if !sends_key => ProbeFailure::AuthNoKey {
-            var: plan
-                .choice
-                .preset
-                .and_then(|preset| preset.key_env)
-                .map(str::to_owned),
+        ProbeFailure::Auth if !sends_key => match (kept_keychain, unset_var) {
+            (Some(key), _) => ProbeFailure::KeyNotRead { key },
+            (None, Some(var)) => ProbeFailure::KeptKeyUnset { var },
+            // The preset's variable is named only for its own origin: on
+            // another, its key is deliberately kept off this host.
+            (None, None) => ProbeFailure::AuthNoKey {
+                var: plan
+                    .choice
+                    .preset
+                    .filter(|preset| same_origin(preset.base_url, &plan.choice.base_url))
+                    .and_then(|preset| preset.key_env)
+                    .map(str::to_owned),
+            },
         },
         failure => failure,
     })
@@ -1443,7 +1477,8 @@ pub fn run(args: &[String], env: &SetupEnv, prompter: &mut dyn Prompter) -> Setu
         Err(message) => return usage_error(message),
     };
     // A key typed at a terminal would echo and stay in its scrollback.
-    if parsed.key == KeyFlag::Stdin && env.stdin_is_tty && !parsed.dry_run {
+    // (`--no-verify` reads no key until the key is stored — SEAM-02-3.)
+    if parsed.key == KeyFlag::Stdin && env.stdin_is_tty && !parsed.dry_run && !parsed.no_verify {
         return usage_error(
             "rapid setup: --key-stdin reads the key from a pipe, and stdin is a terminal (the key \
 would echo) — pipe it in: printf '%s' \"$KEY\" | rapid setup --key-stdin ...; no files were \
@@ -1474,7 +1509,7 @@ changed"
         .is_ok_and(|meta| meta.file_type().is_symlink())
         .then(|| config_path.clone());
     let config_path = match &link {
-        Some(link) => match follow_symlinks(link) {
+        Some(link) => match resolve_symlinks(link) {
             Ok(target) => target,
             Err(message) => return failed(message),
         },
@@ -1621,7 +1656,24 @@ fn follow_symlinks(link: &Path) -> Result<PathBuf, String> {
             Err(_) => return Ok(current),
         }
     }
-    Err(format!("rapid setup: {} is a symlink loop", link.display()))
+    Err(format!(
+        "rapid setup: {} is a symlink loop, or a chain of more than 40 links",
+        link.display()
+    ))
+}
+
+/// [`follow_symlinks`], checked against the OS: a chain longer than the
+/// platform follows (32 links on some) is refused rather than planned, so
+/// the target always agrees with the file a run's reader opens.
+fn resolve_symlinks(link: &Path) -> Result<PathBuf, String> {
+    let target = follow_symlinks(link)?;
+    if target.exists() && std::fs::metadata(link).is_err() {
+        return Err(format!(
+            "rapid setup: {} is a chain of more symbolic links than this system follows",
+            link.display()
+        ));
+    }
+    Ok(target)
 }
 
 /// The config's current content: `None` when there is no file. Bounded like
@@ -2569,6 +2621,70 @@ base_url = \"http://127.0.0.1:11434/v1\"
     }
 
     #[test]
+    fn under_a_lock_this_shells_missing_override_is_overruled_not_a_failure() {
+        let existing = "\
+[models]
+default = \"corp\"
+
+[model.corp]
+provider = \"openai-compatible\"
+model = \"m\"
+base_url = \"http://10.0.0.5:9000/v1\"
+";
+        let policy = crate::managed_config::ManagedPolicy::parse(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\nlocked_default = \"corp\"\n",
+        )
+        .expect("policy");
+        let env = vec![(
+            crate::user_config::DEFAULT_MODEL_ENV.to_owned(),
+            "nope".to_owned(),
+        )];
+        let plan = super::plan(
+            choice_for(&[
+                "--base-url",
+                "http://10.0.0.6:9000/v1",
+                "--model",
+                "m",
+                "--profile",
+                "x",
+            ]),
+            Path::new("c.toml"),
+            Some(existing),
+            &env,
+            Some(&policy),
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert_eq!(plan.effective, Some(("corp".to_owned(), "managed")));
+        assert!(
+            !plan.notes.iter().any(|note| note.contains("would fail")),
+            "{:?}",
+            plan.notes
+        );
+        // The profile this writes is judged by the allowlist too, though the
+        // lock picks another.
+        let allowlisted = crate::managed_config::ManagedPolicy::parse(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\nlocked_default = \"corp\"\nallowed_providers = [\"openai-compatible\"]\n",
+        )
+        .expect("policy");
+        let err = super::plan(
+            choice_for(&["--preset", "anthropic", "--profile", "x"]),
+            Path::new("c.toml"),
+            Some(existing),
+            &env,
+            Some(&allowlisted),
+            true,
+            "T",
+        )
+        .expect_err("refused");
+        assert!(
+            err.contains("allows only the providers openai-compatible"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn an_inline_table_keeps_its_comments_and_an_identical_run_is_unchanged() {
         let existing = "\
 # which profile runs
@@ -2728,6 +2844,58 @@ env_key = \"OPENAI_API_KEY\"
         )
         .expect("plan");
         assert_eq!(moved.unset, vec!["model.openai.env_key".to_owned()]);
+        assert!(
+            moved
+                .notes
+                .iter()
+                .any(|note| note.contains("--key-env OPENAI_API_KEY")),
+            "{:?}",
+            moved.notes
+        );
+        // A credential already set up for the proxy's own origin is kept,
+        // and there is nothing to say about the preset's variable.
+        let for_the_proxy = existing
+            .replace("https://api.openai.com/v1", "http://10.0.0.9:8000/v1")
+            .replace("OPENAI_API_KEY", "PROXY_KEY");
+        let kept = plan(
+            choice_for(&proxy),
+            Path::new("c.toml"),
+            Some(&for_the_proxy),
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert_eq!(
+            kept.kept_credential.as_deref(),
+            Some("model.openai.env_key")
+        );
+        assert!(kept.unset.is_empty(), "{:?}", kept.unset);
+        assert!(
+            !kept
+                .notes
+                .iter()
+                .any(|note| note.contains("OPENAI_API_KEY")),
+            "{:?}",
+            kept.notes
+        );
+        // A keyless preset: on its own origin its server takes no key; on
+        // another it keeps what the profile names for that origin.
+        assert_eq!(
+            choice_for(&["--preset", "ollama"]).credential,
+            Credential::None
+        );
+        assert_eq!(
+            choice_for(&[
+                "--preset",
+                "ollama",
+                "--base-url",
+                "http://gpu.example.test:11434/v1"
+            ])
+            .credential,
+            Credential::Unchanged
+        );
         // The preset's own origin, another path: its key variable as before;
         // and a key variable named on the command line goes where it is told.
         assert_eq!(
@@ -2760,6 +2928,13 @@ provider = \"openai-compatible\"
 model = \"m\"
 base_url = \"http://10.0.0.5:9000/v1\"
 future_knob = 1
+
+[model.default]
+provider = \"openai-compatible\"
+model = \"m\"
+base_url = \"http://10.0.0.5:9000/v1\"
+own_knob = 2
+\"dotted.knob\" = 3
 ";
         let plan = plan(
             choice_for(&["--base-url", "http://10.0.0.5:9000/v1", "--model", "m"]),
@@ -2776,6 +2951,13 @@ future_knob = 1
             "another profile's key is not this one's: {:?}",
             plan.notes
         );
+        for own in ["model.default.own_knob", "model.default.dotted.knob"] {
+            assert!(
+                plan.notes.iter().any(|note| note.contains(own)),
+                "{own}: {:?}",
+                plan.notes
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -2806,6 +2988,17 @@ future_knob = 1
                 .expect_err("forty-one")
                 .contains("symlink loop")
         );
+        // With the file there, the chain is planned exactly when the system
+        // itself follows it (some stop at 32 links).
+        std::fs::write(&target, "").expect("target");
+        for hops in [1, 32, 33, 40] {
+            let link = dir.join(format!("link{hops}"));
+            assert_eq!(
+                resolve_symlinks(&link).is_ok(),
+                std::fs::metadata(&link).is_ok(),
+                "{hops} links"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2982,14 +3175,7 @@ future_knob = 1
 
     #[test]
     fn a_key_the_probe_would_not_send_is_named_instead_of_blamed_on_the_endpoint() {
-        // A kept variable that is unset, a kept keychain alias this build
-        // does not read: nothing is sent, and the message says why.
-        for (key_line, expected) in [
-            ("env_key = \"GW_KEY\"", "$GW_KEY is not set"),
-            ("keychain = \"rapidlm.default\"", "does not read"),
-        ] {
-            let (url, seen) = endpoint(200, GOOD_BODY);
-            let home = Home::new("verify-kept");
+        let config_with = |home: &Home, url: &str, key_line: &str| {
             std::fs::create_dir_all(home.config().parent().expect("dir")).expect("dir");
             std::fs::write(
                 home.config(),
@@ -2998,21 +3184,48 @@ future_knob = 1
                 ),
             )
             .expect("config");
+        };
+        // A kept variable that is unset: the probe goes keyless, as a run
+        // would — a local server that needs no key verifies.
+        let (url, seen) = endpoint(200, GOOD_BODY);
+        let home = Home::new("verify-kept-keyless");
+        config_with(&home, &url, "env_key = \"LOCAL_KEY\"");
+        let outcome = verify_run(&home, &url, &[]);
+        assert_eq!(
+            outcome.exit, 2,
+            "verified, not yet written: {}",
+            outcome.stderr
+        );
+        assert_eq!(seen.lock().expect("seen").len(), 1, "one keyless request");
+        // Refused without a key: the message names why no key was sent.
+        for (key_line, expected) in [
+            (
+                "env_key = \"GW_KEY\"",
+                "$GW_KEY, which the profile names for it, is not set",
+            ),
+            (
+                "keychain = \"rapidlm.default\"",
+                "which this build does not read",
+            ),
+        ] {
+            let (url, _) = endpoint(401, r#"{"error":{"message":"missing key"}}"#);
+            let home = Home::new("verify-kept");
+            config_with(&home, &url, key_line);
             let outcome = verify_run(&home, &url, &[]);
             assert_eq!(outcome.exit, 11, "{key_line}: {}", outcome.stderr);
             assert!(outcome.stderr.contains(expected), "{}", outcome.stderr);
-            assert!(seen.lock().expect("seen").is_empty(), "nothing was sent");
         }
-        // No key at all, and the endpoint wants one: said so, naming the
-        // preset's variable, with the plan's note on the key.
+        // No key at all, and the endpoint wants one: said so — without
+        // steering the preset's key to a host it is deliberately kept off —
+        // and the plan's note on the key is shown.
         let (url, _) = endpoint(401, r#"{"error":{"message":"missing key"}}"#);
         let home = Home::new("verify-keyless");
         let outcome = verify_run(&home, &url, &["--preset", "openai"]);
         assert_eq!(outcome.exit, 11, "{}", outcome.stderr);
         assert!(
-            outcome
-                .stderr
-                .contains("requires a key and none was sent — give one with rapid setup --key-env OPENAI_API_KEY"),
+            outcome.stderr.contains(
+                "requires a key and none was sent — give one with rapid setup --key-env <VAR>"
+            ),
             "{}",
             outcome.stderr
         );
@@ -3098,13 +3311,25 @@ future_knob = 1
             "{}",
             outcome.stderr
         );
-        // A dry run reads no key, so it may run on a terminal.
+        // A dry run, or one that does not verify, reads no key (yet), so it
+        // may run on a terminal.
         let dry = run(
             &args(&["--preset", "openai", "--key-stdin", "--dry-run"]),
             &env,
             &mut Scripted(Vec::new()),
         );
         assert_eq!(dry.exit, 0, "{}", dry.stderr);
+        let unverified = run(
+            &args(&["--preset", "openai", "--key-stdin", "--no-verify"]),
+            &env,
+            &mut Scripted(Vec::new()),
+        );
+        assert_eq!(unverified.exit, 2, "{}", unverified.stderr);
+        assert!(
+            unverified.stderr.contains("not in this build yet"),
+            "{}",
+            unverified.stderr
+        );
     }
 
     #[test]

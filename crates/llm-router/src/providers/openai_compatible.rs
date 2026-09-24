@@ -865,7 +865,8 @@ impl OpenAiCompatibleEndpoint {
     /// accepts it for every model); compatible servers read `max_tokens`.
     fn is_first_party(&self) -> bool {
         parse_http_url(&self.base_url).is_ok_and(|url| {
-            url.scheme == UrlScheme::Https && url.host.trim_end_matches('.') == "api.openai.com"
+            url.scheme == UrlScheme::Https
+                && (url.host == "api.openai.com" || url.host.ends_with(".api.openai.com"))
         })
     }
 }
@@ -1369,7 +1370,11 @@ fn map_in_stream_error(value: &Value) -> Result<Vec<ModelStreamEvent>, ProviderE
     }
     let error = value.get("error").unwrap_or(value);
     // Some servers put the HTTP status in `code` as a number.
-    match error.get("code").and_then(Value::as_u64) {
+    let numeric = error.get("code").and_then(|code| {
+        code.as_u64()
+            .or_else(|| code.as_str().and_then(|text| text.trim().parse().ok()))
+    });
+    match numeric {
         Some(401 | 403) => return Err(ProviderError::AuthFailed),
         Some(402) => return Err(ProviderError::QuotaExceeded),
         Some(429) => {
@@ -1377,7 +1382,7 @@ fn map_in_stream_error(value: &Value) -> Result<Vec<ModelStreamEvent>, ProviderE
                 retry_after_ms: None,
             });
         }
-        Some(500..=599) => return Err(ProviderError::Transient),
+        Some(408 | 409 | 425 | 500..=599) => return Err(ProviderError::Transient),
         _ => {}
     }
     let code = error.get("code").and_then(Value::as_str).unwrap_or("");
@@ -1496,6 +1501,15 @@ fn ingest_responses_event(
     cancel: &CancellationToken,
 ) -> Result<(), ProviderError> {
     cancel.check()?;
+    // An untyped object is read as a whole response (the non-streaming
+    // body) only when it carries one: `{}` is not a completion.
+    if value.get("type").is_none()
+        && ["output", "status", "response", "usage"]
+            .iter()
+            .all(|field| value.get(field).is_none())
+    {
+        return Ok(());
+    }
     let event_type = value
         .get("type")
         .and_then(Value::as_str)
@@ -1622,7 +1636,9 @@ fn ingest_non_stream_completion(
 }
 
 fn normalize_openai_usage(value: &Value) -> Result<NormalizedUsage, ProviderError> {
-    let object = value.as_object().ok_or(ProviderError::InvalidRequest)?;
+    // A malformed reply is the provider's failure: `InvalidRequest` is kept
+    // for what is refused before anything is sent.
+    let object = value.as_object().ok_or(ProviderError::Permanent)?;
     let input = first_u64(object, &["input_tokens", "prompt_tokens"])?;
     let output = first_u64(object, &["output_tokens", "completion_tokens"])?;
     let cached = object
@@ -1688,11 +1704,8 @@ fn first_u64(object: &Map<String, Value>, keys: &[&str]) -> Result<Option<u64>, 
 fn json_u64(value: &Value) -> Result<Option<u64>, ProviderError> {
     match value {
         Value::Null => Ok(None),
-        Value::Number(number) => number
-            .as_u64()
-            .ok_or(ProviderError::InvalidRequest)
-            .map(Some),
-        _ => Err(ProviderError::InvalidRequest),
+        Value::Number(number) => number.as_u64().ok_or(ProviderError::Permanent).map(Some),
+        _ => Err(ProviderError::Permanent),
     }
 }
 
@@ -4096,14 +4109,13 @@ mod tests {
     #[test]
     fn the_first_party_endpoint_reads_the_output_bound_as_max_completion_tokens() {
         let bounded = request(false, false);
-        let first_party = OpenAiCompatibleEndpoint::new(
-            "https://api.openai.com/v1",
-            OpenAiApiStyle::ChatCompletions,
-        )
-        .expect("endpoint");
-        let payload = encode_for_endpoint(&bounded, &first_party, &live()).expect("encode");
-        assert_eq!(payload["max_completion_tokens"], 256);
-        assert!(payload.get("max_tokens").is_none(), "{payload}");
+        for first in ["https://api.openai.com/v1", "https://eu.api.openai.com/v1"] {
+            let first_party = OpenAiCompatibleEndpoint::new(first, OpenAiApiStyle::ChatCompletions)
+                .expect("endpoint");
+            let payload = encode_for_endpoint(&bounded, &first_party, &live()).expect("encode");
+            assert_eq!(payload["max_completion_tokens"], 256, "{first}");
+            assert!(payload.get("max_tokens").is_none(), "{payload}");
+        }
         for other in ["http://127.0.0.1:11434/v1", "https://gw.example.test/v1"] {
             let endpoint = OpenAiCompatibleEndpoint::new(other, OpenAiApiStyle::ChatCompletions)
                 .expect("endpoint");
@@ -4119,7 +4131,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exhausted_quota_reported_as_429_and_a_redirect_are_not_retried() {
+    fn an_exhausted_quota_reported_as_429_is_not_a_rate_limit_and_a_redirect_is_permanent() {
         let response = |status: u16, body: &str| {
             ProviderHttpResponse::new(status, Vec::new(), body.as_bytes().to_vec())
                 .expect("response")
@@ -4168,6 +4180,16 @@ mod tests {
                 ProviderError::QuotaExceeded,
             ),
             (
+                r#"{"error":{"code":408,"message":"x"}}"#,
+                ProviderError::Transient,
+            ),
+            (
+                r#"{"error":{"code":"429","message":"x"}}"#,
+                ProviderError::RateLimited {
+                    retry_after_ms: None,
+                },
+            ),
+            (
                 r#"{"error":{"type":"invalid_request_error"}}"#,
                 ProviderError::Permanent,
             ),
@@ -4192,6 +4214,26 @@ mod tests {
                 "{body:?}"
             );
         }
+        for body in ["{}", "data: {}\n\ndata: [DONE]\n\n"] {
+            assert_eq!(
+                parse_provider_stream(OpenAiApiStyle::Responses, body.as_bytes(), &live())
+                    .expect_err(body),
+                ProviderError::Permanent,
+                "responses {body:?}"
+            );
+        }
+        // A malformed usage object is the provider's failure, not a request
+        // refused before sending.
+        let bad_usage = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3.5}}"#;
+        assert_eq!(
+            parse_provider_stream(
+                OpenAiApiStyle::ChatCompletions,
+                bad_usage.as_bytes(),
+                &live()
+            )
+            .expect_err("bad usage"),
+            ProviderError::Permanent
+        );
         // An empty answer the server finished is still an answer.
         let finished = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n";
         assert!(

@@ -702,6 +702,11 @@ fn parse_anthropic_stream(
     } else if finish.is_none() && !saw_terminal {
         return Err(ProviderError::Permanent);
     }
+    // No content, no usage, no stop reason: the body carried no message at
+    // all (`{}`) — not an empty answer.
+    if events.is_empty() && finish.is_none() {
+        return Err(ProviderError::Permanent);
+    }
 
     let finish = finish.unwrap_or_else(|| infer_finish(&events));
     push_event(&mut events, ModelStreamEvent::Completed { finish, usage })?;
@@ -916,14 +921,17 @@ fn ingest_non_stream_message(
             }
         }
     }
-    if finish.is_none() {
+    // Inferred only for a body that is a message: `{}` carries none.
+    if finish.is_none() && content.is_some() {
         *finish = Some(infer_finish(events));
     }
     Ok(())
 }
 
 fn normalize_anthropic_usage(value: &Value) -> Result<NormalizedUsage, ProviderError> {
-    let object = value.as_object().ok_or(ProviderError::InvalidRequest)?;
+    // A malformed reply is the provider's failure: `InvalidRequest` is kept
+    // for what is refused before anything is sent.
+    let object = value.as_object().ok_or(ProviderError::Permanent)?;
     let raw_input = first_u64(object, &["input_tokens"])?;
     let output = first_u64(object, &["output_tokens"])?;
     let cache_read = first_u64(object, &["cache_read_input_tokens"])?;
@@ -995,11 +1003,8 @@ fn first_u64(object: &Map<String, Value>, keys: &[&str]) -> Result<Option<u64>, 
 fn json_u64(value: &Value) -> Result<Option<u64>, ProviderError> {
     match value {
         Value::Null => Ok(None),
-        Value::Number(number) => number
-            .as_u64()
-            .ok_or(ProviderError::InvalidRequest)
-            .map(Some),
-        _ => Err(ProviderError::InvalidRequest),
+        Value::Number(number) => number.as_u64().ok_or(ProviderError::Permanent).map(Some),
+        _ => Err(ProviderError::Permanent),
     }
 }
 
@@ -1896,7 +1901,11 @@ mod tests {
     }
 
     #[test]
-    fn a_redirect_is_not_retried() {
+    fn a_redirect_is_permanent_at_the_adapter_and_an_empty_body_is_not_a_message() {
+        assert_eq!(
+            parse_anthropic_stream(b"{}", &CancellationToken::new()).expect_err("empty"),
+            ProviderError::Permanent
+        );
         for status in [301, 308] {
             let response = crate::providers::openai_compatible::ProviderHttpResponse::new(
                 status,

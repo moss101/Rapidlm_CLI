@@ -3468,7 +3468,10 @@ pub(crate) fn resolve_model_plan_with_override(
                     .override_for(llm_router::provider::ModelPurpose::Compact)
                     .is_some_and(|profile| profile.as_str() != primary.profile_id);
                 if routed_elsewhere {
-                    match crate::user_config::resolve_purpose_model(
+                    // Against the primary as gated: a lock may have overruled
+                    // the shell's override, which is not read again here.
+                    match crate::user_config::resolve_purpose_model_for(
+                        primary.clone(),
                         process_env,
                         &config,
                         llm_router::provider::ModelPurpose::Compact,
@@ -12339,6 +12342,40 @@ compact = "cheap"
             warnings
                 .iter()
                 .any(|w| w.contains("phases.compact") && w.contains("allowlist")),
+            "{warnings:?}"
+        );
+
+        // A managed lock over a shell override naming a missing profile:
+        // the lock decides the primary, and the compaction route still
+        // resolves against it.
+        std::fs::write(
+            &policy_path,
+            format!(
+                "schema = \"{}\"\n[policy]\nlocked_default = \"main\"\n",
+                crate::managed_config::MANAGED_SCHEMA
+            ),
+        )
+        .expect("write policy");
+        let mut locked_env = gated_env.clone();
+        locked_env.push((
+            crate::user_config::DEFAULT_MODEL_ENV.to_owned(),
+            "nope".to_owned(),
+        ));
+        let mut warnings = Vec::new();
+        let plan = resolve_model_plan(
+            &locked_env,
+            agent_runtime::reminders::ReminderFloor::Baseline,
+            &mut |line| warnings.push(line.to_owned()),
+        )
+        .expect("the lock decides");
+        assert_eq!(plan.models[0].profile_id, "main");
+        assert_eq!(
+            plan.compact.as_ref().map(|m| m.profile_id.as_str()),
+            Some("cheap"),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("not resolved")),
             "{warnings:?}"
         );
 
