@@ -244,9 +244,10 @@ Exit codes:
   0   done (or the dry-run plan was printed)
   1   the existing config could not be read or does not parse
   2   usage error
-  11  verification: the key was refused, or its variable is not set
+  11  verification: the key was refused or required, or it could not be sent
+      (its variable is not set, or it is held where this build does not read it)
   12  verification: no quota or credit left, or rate-limited
-  13  verification: the endpoint could not be reached
+  13  verification: the endpoint could not be reached, or rapid does not dial it
   14  verification: the endpoint failed on its side
   15  verification: the endpoint answered, but not usably
 A failed verification changes no file.
@@ -1223,14 +1224,25 @@ pub fn read_stdin_key() -> std::io::Result<String> {
 pub enum ProbeFailure {
     /// The key's environment variable is not set: nothing was sent.
     NoKey { var: String },
+    /// The profile names its key where this build does not read it (the
+    /// `keychain` alias until the reader learns it): nothing was sent.
+    KeyNotRead { key: String },
+    /// The key has characters no HTTP header can carry: nothing was sent.
+    UnusableKey,
     /// The endpoint refused the key (401/403).
     Auth,
+    /// The endpoint requires a key, and none was sent (401/403 to a request
+    /// without one). `var`: the preset's key variable, if any.
+    AuthNoKey { var: Option<String> },
     /// No quota or credit left, or rate-limited (402/429).
     Quota,
     /// The endpoint could not be reached (DNS, connect, TLS, timeout).
     Network,
     /// The endpoint failed on its side (5xx).
     Server,
+    /// Not sent: rapid does not dial this address (an unspecified,
+    /// link-local or metadata address).
+    Refused,
     /// It answered, but not as this dialect's server would, or refused the
     /// request itself (unknown model, malformed body).
     Invalid,
@@ -1239,9 +1251,13 @@ pub enum ProbeFailure {
 impl ProbeFailure {
     pub const fn exit_code(&self) -> i32 {
         match self {
-            Self::NoKey { .. } | Self::Auth => 11,
+            Self::NoKey { .. }
+            | Self::KeyNotRead { .. }
+            | Self::UnusableKey
+            | Self::Auth
+            | Self::AuthNoKey { .. } => 11,
             Self::Quota => 12,
-            Self::Network => 13,
+            Self::Network | Self::Refused => 13,
             Self::Server => 14,
             Self::Invalid => 15,
         }
@@ -1249,9 +1265,13 @@ impl ProbeFailure {
 
     pub const fn class(&self) -> &'static str {
         match self {
-            Self::NoKey { .. } | Self::Auth => "auth",
+            Self::NoKey { .. }
+            | Self::KeyNotRead { .. }
+            | Self::UnusableKey
+            | Self::Auth
+            | Self::AuthNoKey { .. } => "auth",
             Self::Quota => "quota",
-            Self::Network => "network",
+            Self::Network | Self::Refused => "network",
             Self::Server => "server",
             Self::Invalid => "invalid",
         }
@@ -1266,21 +1286,38 @@ impl ProbeFailure {
             Self::NoKey { var } => format!(
                 "${var} is not set, so no request was made — export it, then run rapid setup again"
             ),
+            Self::KeyNotRead { key } => format!(
+                "the profile names its key in {key}, which this build does not read, so no \
+request was made — give the key with rapid setup --key-env <VAR>"
+            ),
+            Self::UnusableKey => "the key has characters no HTTP header can carry (a line break \
+from a file?), so no request was made — check it, then run rapid setup again"
+                .to_owned(),
             Self::Auth => format!(
                 "{endpoint} refused the key — check it, or give another with rapid setup \
 --key-env <VAR> or --key-stdin"
+            ),
+            Self::AuthNoKey { var } => format!(
+                "{endpoint} requires a key and none was sent — give one with rapid setup \
+--key-env {} or --key-stdin",
+                var.as_deref().unwrap_or("<VAR>")
             ),
             Self::Quota => format!(
                 "{endpoint} reports no quota or credit left, or a rate limit — check the account's \
 billing and limits, then run rapid setup again"
             ),
-            Self::Network => {
-                format!("{endpoint} could not be reached — check --base-url and the network")
-            }
+            Self::Network => format!(
+                "{endpoint} could not be reached — check --base-url and the network, then run \
+rapid setup again"
+            ),
             Self::Server => format!("{endpoint} failed on its side — run rapid setup again later"),
+            Self::Refused => format!(
+                "rapid does not dial {endpoint} (an unspecified, link-local or metadata address), \
+so no request was made — check --base-url, then run rapid setup again"
+            ),
             Self::Invalid => format!(
                 "{endpoint} answered, but not as a {} server would, or refused the request — check \
---base-url and --model",
+--base-url and --model, then run rapid setup again",
                 plan.choice.dialect.as_str()
             ),
         }
@@ -1295,11 +1332,11 @@ pub fn classify(err: &llm_router::provider::ProviderError) -> ProbeFailure {
         E::QuotaExceeded | E::RateLimited { .. } => ProbeFailure::Quota,
         E::Connection | E::Cancelled => ProbeFailure::Network,
         E::Transient => ProbeFailure::Server,
-        E::ContextTooLarge
-        | E::InvalidRequest
-        | E::Permanent
-        | E::BoundExceeded
-        | E::UnknownVariant => ProbeFailure::Invalid,
+        // Raised before anything is sent (the address guards).
+        E::InvalidRequest => ProbeFailure::Refused,
+        E::ContextTooLarge | E::Permanent | E::BoundExceeded | E::UnknownVariant => {
+            ProbeFailure::Invalid
+        }
     }
 }
 
@@ -1311,6 +1348,7 @@ pub fn verify(
     plan: &SetupPlan,
     env: &[(String, String)],
     stdin_key: Option<&str>,
+    policy: Option<&crate::managed_config::ManagedPolicy>,
     cancel: &llm_router::provider::CancellationToken,
 ) -> Result<(), ProbeFailure> {
     if let Credential::Env { var } = &plan.choice.credential
@@ -1338,11 +1376,44 @@ pub fn verify(
             source: crate::user_config::CredentialSource::InlineApiKey,
         };
     }
+    // A kept credential a run would not send — its variable unset, or held
+    // where this build does not read it: probing without it would blame the
+    // endpoint's refusal on a key that never left.
+    if active.credential.plaintext.is_none() {
+        if let Some(kept) = plan
+            .kept_credential
+            .as_deref()
+            .filter(|key| key.ends_with(".keychain"))
+        {
+            return Err(ProbeFailure::KeyNotRead {
+                key: kept.to_owned(),
+            });
+        }
+        if let Some(var) = active.entry.env_key.first() {
+            return Err(ProbeFailure::NoKey { var: var.clone() });
+        }
+    }
+    // The request a run would make: the managed effort floor applies.
+    let mut active = crate::managed_config::apply_to_fallback_candidate(active, policy)
+        .map_err(|_| ProbeFailure::Invalid)?;
     active.entry.max_tokens = Some(VERIFY_MAX_OUTPUT_TOKENS);
+    let sends_key = active.credential.plaintext.is_some();
     let store = auth::InMemoryCredentialStore::new();
-    let model =
-        crate::model::ConfiguredModel::build(&active, &store).map_err(|_| ProbeFailure::Invalid)?;
-    model.probe(cancel).map_err(|err| classify(&err))
+    let model = crate::model::ConfiguredModel::build(&active, &store).map_err(|err| match err {
+        crate::model::ModelConfigError::Credential { .. } => ProbeFailure::UnusableKey,
+        crate::model::ModelConfigError::BaseUrl { .. } => ProbeFailure::Refused,
+        _ => ProbeFailure::Invalid,
+    })?;
+    model.probe(cancel).map_err(|err| match classify(&err) {
+        ProbeFailure::Auth if !sends_key => ProbeFailure::AuthNoKey {
+            var: plan
+                .choice
+                .preset
+                .and_then(|preset| preset.key_env)
+                .map(str::to_owned),
+        },
+        failure => failure,
+    })
 }
 
 /// What a run printed and how it exited.
@@ -1371,6 +1442,15 @@ pub fn run(args: &[String], env: &SetupEnv, prompter: &mut dyn Prompter) -> Setu
         Ok(parsed) => parsed,
         Err(message) => return usage_error(message),
     };
+    // A key typed at a terminal would echo and stay in its scrollback.
+    if parsed.key == KeyFlag::Stdin && env.stdin_is_tty && !parsed.dry_run {
+        return usage_error(
+            "rapid setup: --key-stdin reads the key from a pipe, and stdin is a terminal (the key \
+would echo) — pipe it in: printf '%s' \"$KEY\" | rapid setup --key-stdin ...; no files were \
+changed"
+                .to_owned(),
+        );
+    }
     // Stdin carries the key under --key-stdin, so it cannot also answer
     // questions.
     let interactive = env.stdin_is_tty && !parsed.non_interactive && parsed.key != KeyFlag::Stdin;
@@ -1432,15 +1512,29 @@ pub fn run(args: &[String], env: &SetupEnv, prompter: &mut dyn Prompter) -> Setu
                 Ok(key) if !key.trim().is_empty() => Some(key.trim().to_owned()),
                 _ => {
                     return usage_error(
-                        "rapid setup: --key-stdin read no key from stdin".to_owned(),
+                        "rapid setup: --key-stdin read no key from stdin; no files were changed"
+                            .to_owned(),
                     );
                 }
             },
             _ => None,
         };
+        // What the plan says about the key and the profile — a dry run
+        // prints it with the plan.
+        let notes: String = plan
+            .notes
+            .iter()
+            .map(|note| format!("note: {note}\n"))
+            .collect();
         if !parsed.no_verify {
             let cancel = llm_router::provider::CancellationToken::new();
-            if let Err(failure) = verify(&plan, &env.env, stdin_key.as_deref(), &cancel) {
+            if let Err(failure) = verify(
+                &plan,
+                &env.env,
+                stdin_key.as_deref(),
+                policy.as_ref(),
+                &cancel,
+            ) {
                 let hint = failure.hint(&plan);
                 let stdout = match parsed.output {
                     OutputFormat::Json => format!(
@@ -1458,7 +1552,8 @@ pub fn run(args: &[String], env: &SetupEnv, prompter: &mut dyn Prompter) -> Setu
                 return SetupOutcome {
                     stdout,
                     stderr: format!(
-                        "rapid setup: verification failed ({}): {hint}\nno files were changed\n",
+                        "{notes}rapid setup: verification failed ({}): {hint}\nno files were \
+changed\n",
                         failure.class()
                     ),
                     exit: failure.exit_code(),
@@ -1482,8 +1577,8 @@ pub fn run(args: &[String], env: &SetupEnv, prompter: &mut dyn Prompter) -> Setu
         return SetupOutcome {
             stdout,
             stderr: format!(
-                "rapid setup: {}writing the configuration is not in this build yet — no files \
-were changed; --dry-run prints what would be written\n",
+                "{notes}rapid setup: {}writing the configuration is not in this build yet — no \
+files were changed; --dry-run prints what would be written\n",
                 if verified {
                     format!("{} answered; ", plan.choice.base_url)
                 } else {
@@ -2819,6 +2914,11 @@ future_knob = 1
                 "auth",
             ),
             (
+                endpoint(403, r#"{"error":{"message":"forbidden"}}"#).0,
+                11,
+                "auth",
+            ),
+            (
                 endpoint(402, r#"{"error":{"message":"no credit"}}"#).0,
                 12,
                 "quota",
@@ -2859,6 +2959,215 @@ future_knob = 1
             );
             assert_eq!(home.snapshot(), before, "{class}: nothing written");
         }
+    }
+
+    #[test]
+    fn a_failed_verification_in_json_names_its_class_and_hint_and_writes_nothing() {
+        let home = Home::new("verify-json");
+        let (url, _) = endpoint(401, r#"{"error":{"message":"bad key"}}"#);
+        let outcome = verify_run(&home, &url, &["--key-env", "TEST_KEY", "--output", "json"]);
+        assert_eq!(outcome.exit, 11, "{}", outcome.stderr);
+        let value: serde_json::Value = serde_json::from_str(&outcome.stdout).expect("json");
+        assert_eq!(value["schema"], "rapidlm.setup_outcome/v1");
+        assert_eq!(value["verified"], false);
+        assert_eq!(value["class"], "auth");
+        assert_eq!(value["written"], false);
+        assert!(
+            value["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("rapid setup")),
+            "the hint names the next command: {value}"
+        );
+    }
+
+    #[test]
+    fn a_key_the_probe_would_not_send_is_named_instead_of_blamed_on_the_endpoint() {
+        // A kept variable that is unset, a kept keychain alias this build
+        // does not read: nothing is sent, and the message says why.
+        for (key_line, expected) in [
+            ("env_key = \"GW_KEY\"", "$GW_KEY is not set"),
+            ("keychain = \"rapidlm.default\"", "does not read"),
+        ] {
+            let (url, seen) = endpoint(200, GOOD_BODY);
+            let home = Home::new("verify-kept");
+            std::fs::create_dir_all(home.config().parent().expect("dir")).expect("dir");
+            std::fs::write(
+                home.config(),
+                format!(
+                    "[models]\ndefault = \"default\"\n\n[model.default]\nprovider = \"openai-compatible\"\nmodel = \"m\"\nbase_url = \"{url}\"\n{key_line}\n"
+                ),
+            )
+            .expect("config");
+            let outcome = verify_run(&home, &url, &[]);
+            assert_eq!(outcome.exit, 11, "{key_line}: {}", outcome.stderr);
+            assert!(outcome.stderr.contains(expected), "{}", outcome.stderr);
+            assert!(seen.lock().expect("seen").is_empty(), "nothing was sent");
+        }
+        // No key at all, and the endpoint wants one: said so, naming the
+        // preset's variable, with the plan's note on the key.
+        let (url, _) = endpoint(401, r#"{"error":{"message":"missing key"}}"#);
+        let home = Home::new("verify-keyless");
+        let outcome = verify_run(&home, &url, &["--preset", "openai"]);
+        assert_eq!(outcome.exit, 11, "{}", outcome.stderr);
+        assert!(
+            outcome
+                .stderr
+                .contains("requires a key and none was sent — give one with rapid setup --key-env OPENAI_API_KEY"),
+            "{}",
+            outcome.stderr
+        );
+        assert!(
+            outcome
+                .stderr
+                .contains("note: OPENAI_API_KEY is sent only to the preset's own endpoint"),
+            "a real run shows the plan's notes too: {}",
+            outcome.stderr
+        );
+    }
+
+    #[test]
+    fn what_is_refused_before_sending_is_not_reported_as_an_answer() {
+        let home = Home::new("verify-local");
+        // A name that resolves to an address rapid does not dial is refused
+        // by the transport's guard before anything is sent.
+        let failure = classify(&llm_router::provider::ProviderError::InvalidRequest);
+        assert_eq!(failure, ProbeFailure::Refused);
+        assert_eq!((failure.exit_code(), failure.class()), (13, "network"));
+        let plan = plan(
+            choice_for(&["--base-url", "http://gw.example.test/v1", "--model", "m"]),
+            Path::new("c.toml"),
+            None,
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert!(
+            failure
+                .hint(&plan)
+                .contains("rapid does not dial http://gw.example.test:80"),
+            "{}",
+            failure.hint(&plan)
+        );
+        // A key no header can carry.
+        let (url, seen) = endpoint(200, GOOD_BODY);
+        let mut env = home.env();
+        env.env.push((
+            "TWO_LINES".to_owned(),
+            "sk-part-one\nsk-part-two".to_owned(),
+        ));
+        let outcome = run(
+            &args(&[
+                "--base-url",
+                &url,
+                "--model",
+                "m",
+                "--non-interactive",
+                "--key-env",
+                "TWO_LINES",
+            ]),
+            &env,
+            &mut Scripted(Vec::new()),
+        );
+        assert_eq!(outcome.exit, 11, "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("no HTTP header can carry"),
+            "{}",
+            outcome.stderr
+        );
+        assert!(!outcome.stderr.contains("sk-part"), "never printed");
+        assert!(seen.lock().expect("seen").is_empty(), "nothing was sent");
+    }
+
+    #[test]
+    fn a_key_on_a_terminal_is_refused_before_anything_is_read() {
+        let home = Home::new("stdin-tty");
+        let mut env = home.env();
+        env.stdin_is_tty = true;
+        env.read_key = || panic!("a terminal key is never read");
+        let outcome = run(
+            &args(&["--preset", "openai", "--key-stdin"]),
+            &env,
+            &mut Scripted(Vec::new()),
+        );
+        assert_eq!(outcome.exit, 2, "{}", outcome.stderr);
+        assert!(outcome.stderr.contains("pipe it in"), "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("no files were changed"),
+            "{}",
+            outcome.stderr
+        );
+        // A dry run reads no key, so it may run on a terminal.
+        let dry = run(
+            &args(&["--preset", "openai", "--key-stdin", "--dry-run"]),
+            &env,
+            &mut Scripted(Vec::new()),
+        );
+        assert_eq!(dry.exit, 0, "{}", dry.stderr);
+    }
+
+    #[test]
+    fn the_probe_carries_the_managed_effort_floor_a_run_would() {
+        let home = Home::new("verify-floor");
+        let policy = home.0.join("policy.toml");
+        std::fs::write(
+            &policy,
+            format!(
+                "schema = \"{}\"\n[policy]\nmin_reasoning_effort = \"high\"\n",
+                crate::managed_config::MANAGED_SCHEMA
+            ),
+        )
+        .expect("policy");
+        let (url, seen) = endpoint(200, GOOD_BODY);
+        let mut env = home.env();
+        env.env
+            .push(("TEST_KEY".to_owned(), "sk-test-env".to_owned()));
+        env.env.push((
+            crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+            policy.display().to_string(),
+        ));
+        let outcome = run(
+            &args(&[
+                "--base-url",
+                &url,
+                "--model",
+                "m",
+                "--non-interactive",
+                "--key-env",
+                "TEST_KEY",
+            ]),
+            &env,
+            &mut Scripted(Vec::new()),
+        );
+        assert_eq!(
+            outcome.exit, 2,
+            "verified, not yet written: {}",
+            outcome.stderr
+        );
+        let requests = seen.lock().expect("seen").clone();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].contains(r#""reasoning_effort":"high""#),
+            "{}",
+            requests[0]
+        );
+    }
+
+    #[test]
+    fn no_verify_sends_nothing_and_says_nothing_was_written() {
+        let home = Home::new("no-verify");
+        let (url, seen) = endpoint(200, GOOD_BODY);
+        let before = home.snapshot();
+        let outcome = verify_run(&home, &url, &["--key-env", "TEST_KEY", "--no-verify"]);
+        assert_eq!(outcome.exit, 2, "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("no files were changed"),
+            "{}",
+            outcome.stderr
+        );
+        assert!(seen.lock().expect("seen").is_empty(), "no request");
+        assert_eq!(home.snapshot(), before);
     }
 
     #[test]

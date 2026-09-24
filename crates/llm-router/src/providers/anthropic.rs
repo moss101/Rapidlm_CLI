@@ -553,7 +553,8 @@ fn classify_http_error(
             Err(ProviderError::ContextTooLarge)
         }
         408 | 409 | 425 | 500 | 502 | 503 | 504 | 529 => Err(ProviderError::Transient),
-        400..=499 => Err(ProviderError::Permanent),
+        // A redirect is never followed, and asking again is redirected again.
+        300..=499 => Err(ProviderError::Permanent),
         _ => Err(ProviderError::Transient),
     }
 }
@@ -1892,5 +1893,22 @@ mod tests {
             .expect("resolve");
         assert_eq!(resolved.byte_len(), CANARY.len());
         assert_no_canary("resolved", &format!("{resolved:?}"));
+    }
+
+    #[test]
+    fn a_redirect_is_not_retried() {
+        for status in [301, 308] {
+            let response = crate::providers::openai_compatible::ProviderHttpResponse::new(
+                status,
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("response");
+            assert_eq!(
+                classify_http_error(&response),
+                Err(ProviderError::Permanent),
+                "{status}"
+            );
+        }
     }
 }

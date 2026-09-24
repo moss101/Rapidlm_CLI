@@ -758,7 +758,7 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
             self.config.profile(),
             cancel,
         )?;
-        let body = encode_provider_payload(&req, self.config.endpoint.style, cancel)?;
+        let body = encode_for_endpoint(&req, &self.config.endpoint, cancel)?;
         let encoded = serde_json::to_vec(&body).map_err(|_| ProviderError::InvalidRequest)?;
         if encoded.len() > MAX_HTTP_REQUEST_BYTES {
             return Err(ProviderError::BoundExceeded);
@@ -809,7 +809,7 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
             self.config.profile(),
             cancel,
         )?;
-        let body = encode_provider_payload(&req, self.config.endpoint.style, cancel)?;
+        let body = encode_for_endpoint(&req, &self.config.endpoint, cancel)?;
         let encoded = serde_json::to_vec(&body).map_err(|_| ProviderError::InvalidRequest)?;
         if encoded.len() > MAX_HTTP_REQUEST_BYTES {
             return Err(ProviderError::BoundExceeded);
@@ -857,6 +857,35 @@ impl<T: HttpTransport> ProviderAdapter for OpenAiCompatibleAdapter<'_, T> {
         let result = self.invoke_sync(req, &cancel);
         async move { result }
     }
+}
+
+impl OpenAiCompatibleEndpoint {
+    /// Whether this is the dialect's first-party API, which requires the
+    /// output bound as `max_completion_tokens` for its reasoning models (and
+    /// accepts it for every model); compatible servers read `max_tokens`.
+    fn is_first_party(&self) -> bool {
+        parse_http_url(&self.base_url).is_ok_and(|url| {
+            url.scheme == UrlScheme::Https && url.host.trim_end_matches('.') == "api.openai.com"
+        })
+    }
+}
+
+/// [`encode_provider_payload`] for `endpoint`: the chat dialect's output
+/// bound under the field that endpoint reads.
+fn encode_for_endpoint(
+    req: &CanonicalModelRequest,
+    endpoint: &OpenAiCompatibleEndpoint,
+    cancel: &CancellationToken,
+) -> Result<Value, ProviderError> {
+    let mut payload = encode_provider_payload(req, endpoint.style, cancel)?;
+    if endpoint.style == OpenAiApiStyle::ChatCompletions
+        && endpoint.is_first_party()
+        && let Some(map) = payload.as_object_mut()
+        && let Some(bound) = map.remove("max_tokens")
+    {
+        map.insert("max_completion_tokens".to_owned(), bound);
+    }
+    Ok(payload)
 }
 
 /// Convert a canonical request to the provider JSON object (no secrets).
@@ -1172,6 +1201,11 @@ fn classify_http_error(response: &ProviderHttpResponse) -> Result<(), ProviderEr
     match response.status {
         401 | 403 => Err(ProviderError::AuthFailed),
         402 => Err(ProviderError::QuotaExceeded),
+        // An exhausted quota is often reported as a 429: waiting does not
+        // refill it, so it is not a rate limit to retry.
+        429 if parsed.as_ref().is_some_and(json_is_quota_exhausted) => {
+            Err(ProviderError::QuotaExceeded)
+        }
         429 => Err(ProviderError::RateLimited {
             retry_after_ms: response
                 .header("retry-after")
@@ -1181,7 +1215,8 @@ fn classify_http_error(response: &ProviderHttpResponse) -> Result<(), ProviderEr
             Err(ProviderError::ContextTooLarge)
         }
         408 | 409 | 425 | 500 | 502 | 503 | 504 => Err(ProviderError::Transient),
-        400..=499 => Err(ProviderError::Permanent),
+        // A redirect is never followed, and asking again is redirected again.
+        300..=499 => Err(ProviderError::Permanent),
         _ => Err(ProviderError::Transient),
     }
 }
@@ -1190,6 +1225,17 @@ fn parse_json_object(body: &[u8]) -> Option<Value> {
     let text = std::str::from_utf8(body).ok()?;
     let value: Value = serde_json::from_str(text).ok()?;
     value.is_object().then_some(value)
+}
+
+/// The error an exhausted quota or credit balance reports (`code` or `type`).
+fn json_is_quota_exhausted(value: &Value) -> bool {
+    let error = value.get("error").unwrap_or(value);
+    ["code", "type"].into_iter().any(|field| {
+        error
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.eq_ignore_ascii_case("insufficient_quota"))
+    })
 }
 
 fn json_is_context_too_large(value: &Value) -> bool {
@@ -1291,6 +1337,11 @@ fn parse_provider_stream(
         // Mid-stream events without a terminal marker are a truncated prefix.
         return Err(ProviderError::Permanent);
     }
+    // No choice, no usage, no finish: the body carried no completion at all
+    // (`{}`, or `data: {}` then `[DONE]`) — not an empty answer.
+    if events.is_empty() && finish.is_none() {
+        return Err(ProviderError::Permanent);
+    }
 
     let finish = finish.unwrap_or({
         if events.iter().any(|event| {
@@ -1313,7 +1364,22 @@ fn map_in_stream_error(value: &Value) -> Result<Vec<ModelStreamEvent>, ProviderE
     if json_is_context_too_large(value) {
         return Err(ProviderError::ContextTooLarge);
     }
+    if json_is_quota_exhausted(value) {
+        return Err(ProviderError::QuotaExceeded);
+    }
     let error = value.get("error").unwrap_or(value);
+    // Some servers put the HTTP status in `code` as a number.
+    match error.get("code").and_then(Value::as_u64) {
+        Some(401 | 403) => return Err(ProviderError::AuthFailed),
+        Some(402) => return Err(ProviderError::QuotaExceeded),
+        Some(429) => {
+            return Err(ProviderError::RateLimited {
+                retry_after_ms: None,
+            });
+        }
+        Some(500..=599) => return Err(ProviderError::Transient),
+        _ => {}
+    }
     let code = error.get("code").and_then(Value::as_str).unwrap_or("");
     let kind = error.get("type").and_then(Value::as_str).unwrap_or("");
     let joined = format!("{code} {kind}").to_ascii_lowercase();
@@ -1324,6 +1390,9 @@ fn map_in_stream_error(value: &Value) -> Result<Vec<ModelStreamEvent>, ProviderE
         return Err(ProviderError::RateLimited {
             retry_after_ms: None,
         });
+    }
+    if joined.contains("server_error") || joined.contains("overloaded") {
+        return Err(ProviderError::Transient);
     }
     Err(ProviderError::Permanent)
 }
@@ -4021,6 +4090,117 @@ mod tests {
                 Some(("127.0.0.1".to_owned(), proxy.port())),
                 vec![proxy],
             )]
+        );
+    }
+
+    #[test]
+    fn the_first_party_endpoint_reads_the_output_bound_as_max_completion_tokens() {
+        let bounded = request(false, false);
+        let first_party = OpenAiCompatibleEndpoint::new(
+            "https://api.openai.com/v1",
+            OpenAiApiStyle::ChatCompletions,
+        )
+        .expect("endpoint");
+        let payload = encode_for_endpoint(&bounded, &first_party, &live()).expect("encode");
+        assert_eq!(payload["max_completion_tokens"], 256);
+        assert!(payload.get("max_tokens").is_none(), "{payload}");
+        for other in ["http://127.0.0.1:11434/v1", "https://gw.example.test/v1"] {
+            let endpoint = OpenAiCompatibleEndpoint::new(other, OpenAiApiStyle::ChatCompletions)
+                .expect("endpoint");
+            let payload = encode_for_endpoint(&bounded, &endpoint, &live()).expect("encode");
+            assert_eq!(payload["max_tokens"], 256, "{other}");
+            assert!(payload.get("max_completion_tokens").is_none(), "{other}");
+        }
+        let responses =
+            OpenAiCompatibleEndpoint::new("https://api.openai.com/v1", OpenAiApiStyle::Responses)
+                .expect("endpoint");
+        let payload = encode_for_endpoint(&bounded, &responses, &live()).expect("encode");
+        assert_eq!(payload["max_output_tokens"], 256);
+    }
+
+    #[test]
+    fn an_exhausted_quota_reported_as_429_and_a_redirect_are_not_retried() {
+        let response = |status: u16, body: &str| {
+            ProviderHttpResponse::new(status, Vec::new(), body.as_bytes().to_vec())
+                .expect("response")
+        };
+        assert_eq!(
+            classify_http_error(&response(
+                429,
+                r#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}"#,
+            )),
+            Err(ProviderError::QuotaExceeded)
+        );
+        assert!(matches!(
+            classify_http_error(&response(429, r#"{"error":{"type":"rate_limit_error"}}"#)),
+            Err(ProviderError::RateLimited { .. })
+        ));
+        for status in [301, 302, 307, 308] {
+            assert_eq!(
+                classify_http_error(&response(status, "")),
+                Err(ProviderError::Permanent),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_stream_errors_name_quota_server_and_numeric_codes() {
+        let cases = [
+            (
+                r#"{"error":{"type":"insufficient_quota"}}"#,
+                ProviderError::QuotaExceeded,
+            ),
+            (
+                r#"{"error":{"type":"server_error","message":"x"}}"#,
+                ProviderError::Transient,
+            ),
+            (
+                r#"{"error":{"code":503,"message":"x"}}"#,
+                ProviderError::Transient,
+            ),
+            (
+                r#"{"error":{"code":401,"message":"x"}}"#,
+                ProviderError::AuthFailed,
+            ),
+            (
+                r#"{"error":{"code":402,"message":"x"}}"#,
+                ProviderError::QuotaExceeded,
+            ),
+            (
+                r#"{"error":{"type":"invalid_request_error"}}"#,
+                ProviderError::Permanent,
+            ),
+        ];
+        for (body, expected) in cases {
+            let value: Value = serde_json::from_str(body).expect("json");
+            assert_eq!(
+                map_in_stream_error(&value).expect_err(body),
+                expected,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_with_no_completion_in_it_is_not_an_empty_answer() {
+        for body in ["{}", "data: {}\n\ndata: [DONE]\n\n"] {
+            assert_eq!(
+                parse_provider_stream(OpenAiApiStyle::ChatCompletions, body.as_bytes(), &live())
+                    .expect_err(body),
+                ProviderError::Permanent,
+                "{body:?}"
+            );
+        }
+        // An empty answer the server finished is still an answer.
+        let finished = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n";
+        assert!(
+            parse_provider_stream(
+                OpenAiApiStyle::ChatCompletions,
+                finished.as_bytes(),
+                &live()
+            )
+            .is_ok()
         );
     }
 }

@@ -220,7 +220,7 @@ impl FailureClass {
 
     /// Auth/config/safety stop unless policy names an explicit alternate.
     pub const fn requires_explicit_alternate(self) -> bool {
-        matches!(self, Self::Auth | Self::Config | Self::Safety)
+        matches!(self, Self::Auth | Self::Quota | Self::Config | Self::Safety)
     }
 
     pub const fn retry_after_ms(self) -> Option<u64> {
@@ -1201,6 +1201,7 @@ mod tests {
         let trigger = FallbackTrigger::Provider(ProviderError::QuotaExceeded);
         assert_eq!(classify_failure(&trigger), FailureClass::Quota);
         assert_eq!(FailureClass::Quota.as_str(), "quota");
+        assert!(FailureClass::Quota.requires_explicit_alternate());
         let decision = ranked_decision();
         let controller = controller_from(&decision, FallbackPolicy::standard());
         let plan = controller
