@@ -1247,7 +1247,7 @@ api_key = "inline-secret"
     fn parse_rejects_unknown_provider_and_bad_scalars() {
         let doc = r#"
 [model.a]
-provider = "vllm-ish"
+provider = "some-other-dialect"
 model = "m"
 base_url = "http://127.0.0.1:1"
 "#;

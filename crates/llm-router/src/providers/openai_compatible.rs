@@ -947,6 +947,16 @@ fn encode_for_endpoint(
     Ok(payload)
 }
 
+/// A reply's own malformation is the provider's failure (`Permanent`):
+/// `InvalidRequest` is kept for what is refused before anything is sent.
+/// Other errors (`BoundExceeded` for an over-long id) pass through.
+pub(crate) fn reply_error(err: ProviderError) -> ProviderError {
+    match err {
+        ProviderError::InvalidRequest => ProviderError::Permanent,
+        other => other,
+    }
+}
+
 /// Convert a canonical request to the provider JSON object (no secrets).
 pub fn encode_provider_payload(
     req: &CanonicalModelRequest,
@@ -1505,32 +1515,32 @@ fn ingest_chat_tool_deltas(
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
         {
-            let call_id = ToolCallId::parse(id).map_err(|_| ProviderError::Permanent)?;
+            let call_id = ToolCallId::parse(id).map_err(reply_error)?;
             let name = call
                 .get("function")
                 .and_then(|function| function.get("name"))
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
-                .map(ToolName::parse)
-                .transpose()
-                .map_err(|_| ProviderError::Permanent)?
                 .or_else(|| {
                     call.get("name")
                         .and_then(Value::as_str)
                         .filter(|name| !name.is_empty())
-                        .map(ToolName::parse)
-                        .transpose()
-                        .ok()
-                        .flatten()
-                });
-            if let Some(name) = name {
-                push_event(
+                })
+                .map(ToolName::parse)
+                .transpose()
+                .map_err(reply_error)?;
+            match name {
+                Some(name) => push_event(
                     events,
                     ModelStreamEvent::ToolCallStart {
                         call_id: call_id.clone(),
                         name,
                     },
-                )?;
+                )?,
+                // An id repeated on a later delta of a started call is fine;
+                // a new call without a name could never be run.
+                None if !tool_ids.contains_key(&index) => return Err(ProviderError::Permanent),
+                None => {}
             }
             tool_ids.insert(index, call_id);
         }
@@ -1655,8 +1665,8 @@ fn ingest_responses_item(
         .get("name")
         .and_then(Value::as_str)
         .ok_or(ProviderError::Permanent)?;
-    let parsed_id = ToolCallId::parse(call_id).map_err(|_| ProviderError::Permanent)?;
-    let parsed_name = ToolName::parse(name).map_err(|_| ProviderError::Permanent)?;
+    let parsed_id = ToolCallId::parse(call_id).map_err(reply_error)?;
+    let parsed_name = ToolName::parse(name).map_err(reply_error)?;
     if let Some(item_id) = item.get("id").and_then(Value::as_str) {
         tools.insert(item_id.to_owned(), parsed_id.clone());
     }
@@ -4308,6 +4318,39 @@ mod tests {
             .expect_err("bad tool name"),
             ProviderError::Permanent
         );
+        // Tool calls a reply spells wrong: the provider's failure, and an
+        // over-long id stays a bound, not a rejection.
+        let stream = |call: &str| {
+            format!(
+                "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{call}]}}}}]}}\n\ndata: [DONE]\n\n"
+            )
+        };
+        let long_id = "c".repeat(129);
+        for (call, expected) in [
+            (
+                r#"{"index":0,"id":"c\u0001","type":"function","function":{"name":"x","arguments":""}}"#.to_owned(),
+                ProviderError::Permanent,
+            ),
+            (
+                r#"{"index":0,"id":"c1","type":"function","function":{"arguments":"{}"}}"#.to_owned(),
+                ProviderError::Permanent,
+            ),
+            (
+                r#"{"index":0,"id":"c1","name":"get weather","arguments":"{}"}"#.to_owned(),
+                ProviderError::Permanent,
+            ),
+            (
+                format!(r#"{{"index":0,"id":"{long_id}","type":"function","function":{{"name":"x","arguments":""}}}}"#),
+                ProviderError::BoundExceeded,
+            ),
+        ] {
+            assert_eq!(
+                parse_provider_stream(OpenAiApiStyle::ChatCompletions, stream(&call).as_bytes(), &live())
+                    .expect_err(&call),
+                expected,
+                "{call}"
+            );
+        }
         // An empty answer the server finished is still an answer.
         let finished = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n";
         assert!(

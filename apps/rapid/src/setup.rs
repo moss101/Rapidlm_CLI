@@ -1433,8 +1433,6 @@ pub fn verify(
         ProbeFailure::Auth if !sends_key => match (kept_keychain, unset_var) {
             (Some(key), _) => ProbeFailure::KeyNotRead { key },
             (None, Some(var)) => ProbeFailure::KeptKeyUnset { var },
-            // The preset's variable is named only for its own origin: on
-            // another, its key is deliberately kept off this host.
             // A preset on its own origin always sends its variable (or stops
             // before sending); here the key is deliberately not the preset's.
             (None, None) => ProbeFailure::AuthNoKey,
@@ -1662,15 +1660,17 @@ fn resolve_symlinks(link: &Path) -> Result<PathBuf, String> {
     let target = follow_symlinks(link)?;
     // Refused unless the OS follows the link too: resolved, or ends at a
     // file not created yet (the target itself missing).
-    let followed = match std::fs::metadata(link) {
-        Ok(_) => true,
-        Err(err) => err.kind() == std::io::ErrorKind::NotFound && !target.exists(),
-    };
-    if !followed {
-        return Err(format!(
-            "rapid setup: {} is a chain of more symbolic links than this system follows",
-            link.display()
-        ));
+    match std::fs::metadata(link) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && !target.exists() => {}
+        // The OS's own reason ("too many levels of symbolic links", a
+        // permission, …) — not a guess at one.
+        Err(err) => {
+            return Err(format!(
+                "rapid setup: {} cannot be followed: {err}",
+                link.display()
+            ));
+        }
     }
     Ok(target)
 }
@@ -2994,32 +2994,30 @@ own_knob = 2
                 .expect_err("forty-one")
                 .contains("symlink loop")
         );
-        // A chain this system will not follow is refused, whether or not its
-        // file exists yet; this one follows 32 links.
-        #[cfg(target_os = "macos")]
+        // A chain the system will not follow is refused, whether or not its
+        // file exists yet. Each hop goes through a directory link, so the
+        // system pays two links per hop: 21 hops are 42 for it (more than any
+        // system follows), 21 for the count by hand.
+        std::os::unix::fs::symlink(&dir, dir.join("alias")).expect("alias");
+        let mut previous = dir.join("alias").join("config.toml");
+        for hop in 1..=21 {
+            let link = dir.join(format!("deep{hop}"));
+            std::os::unix::fs::symlink(&previous, &link).expect("symlink");
+            previous = dir.join("alias").join(format!("deep{hop}"));
+        }
         for exists in [false, true] {
             if exists {
                 std::fs::write(&target, "").expect("target");
             }
-            assert_eq!(
-                resolve_symlinks(&dir.join("link32")).expect("32 links"),
-                target,
+            assert!(
+                resolve_symlinks(&dir.join("deep21"))
+                    .expect_err("more than the system follows")
+                    .contains("cannot be followed"),
                 "exists={exists}"
             );
             assert!(
-                resolve_symlinks(&dir.join("link33"))
-                    .expect_err("33 links")
-                    .contains("more symbolic links than this system follows"),
+                resolve_symlinks(&dir.join("deep3")).is_ok(),
                 "exists={exists}"
-            );
-        }
-        // Where the system follows 40, all 40 are planned.
-        #[cfg(target_os = "linux")]
-        {
-            std::fs::write(&target, "").expect("target");
-            assert_eq!(
-                resolve_symlinks(&dir.join("link40")).expect("40 links"),
-                target
             );
         }
         let _ = std::fs::remove_dir_all(&dir);

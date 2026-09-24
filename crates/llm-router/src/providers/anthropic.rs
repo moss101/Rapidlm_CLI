@@ -806,8 +806,10 @@ fn ingest_content_block_start(
             .get("name")
             .and_then(Value::as_str)
             .ok_or(ProviderError::Permanent)?;
-        let parsed_id = ToolCallId::parse(call_id).map_err(|_| ProviderError::Permanent)?;
-        let parsed_name = ToolName::parse(name).map_err(|_| ProviderError::Permanent)?;
+        let parsed_id =
+            ToolCallId::parse(call_id).map_err(crate::providers::openai_compatible::reply_error)?;
+        let parsed_name =
+            ToolName::parse(name).map_err(crate::providers::openai_compatible::reply_error)?;
         tool_ids.insert(index, parsed_id.clone());
         push_event(
             events,
@@ -898,13 +900,14 @@ fn ingest_non_stream_message(
                         .get("name")
                         .and_then(Value::as_str)
                         .ok_or(ProviderError::Permanent)?;
-                    let parsed_id =
-                        ToolCallId::parse(call_id).map_err(|_| ProviderError::Permanent)?;
+                    let parsed_id = ToolCallId::parse(call_id)
+                        .map_err(crate::providers::openai_compatible::reply_error)?;
                     push_event(
                         events,
                         ModelStreamEvent::ToolCallStart {
                             call_id: parsed_id.clone(),
-                            name: ToolName::parse(name).map_err(|_| ProviderError::Permanent)?,
+                            name: ToolName::parse(name)
+                                .map_err(crate::providers::openai_compatible::reply_error)?,
                         },
                     )?;
                     if let Some(input) = block.get("input") {
@@ -1916,6 +1919,16 @@ mod tests {
         );
         assert_eq!(
             parse_anthropic_stream(b"data: {}\n\ndata: [DONE]\n\n", &cancel).expect_err("empty"),
+            ProviderError::Permanent
+        );
+        let streamed_bad_id = b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t\\u0001\",\"name\":\"x\",\"input\":{}}}\n\n";
+        assert_eq!(
+            parse_anthropic_stream(streamed_bad_id, &cancel).expect_err("bad streamed id"),
+            ProviderError::Permanent
+        );
+        let bad_id = br#"{"content":[{"type":"tool_use","id":"t\u0001","name":"x","input":{}}],"stop_reason":"tool_use"}"#;
+        assert_eq!(
+            parse_anthropic_stream(bad_id, &cancel).expect_err("bad id"),
             ProviderError::Permanent
         );
     }

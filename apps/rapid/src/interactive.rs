@@ -5604,34 +5604,48 @@ It will run after the current turn; /queue cancels or edits it.",
         }
     }
 
-    /// The mid-session model switching backend, shared by `/model select`
-    /// and `KernelAction::SelectModel`: validate the id against the session's
-    /// own config catalog, then record the override for every later turn.
-    /// The NEXT turn runs on it; the current turn is unaffected.
-    /// The environment `/model` resolves configuration in: the session's own
-    /// home, with `RAPIDLM_CONFIG` and the managed policy (if the process
-    /// names them) still in force, exactly like turn-side resolution. Read
-    /// one variable at a time, so an unrelated non-Unicode variable cannot
-    /// panic the session.
-    fn model_env(&self) -> Vec<(String, String)> {
-        let mut model_env: Vec<(String, String)> =
-            vec![("HOME".to_owned(), self.user_home.display().to_string())];
+    /// The environment `/model` resolves configuration in: the session's
+    /// RapidLM home (`RAPIDLM_HOME`, whose `config.toml` a turn reads by
+    /// default), with `RAPIDLM_CONFIG` and the managed policy (if the process
+    /// names them) still in force. A variable set but not valid Unicode is an
+    /// error — a policy path must never silently read as "no policy".
+    fn model_env(&self) -> Result<Vec<(String, String)>, String> {
+        let mut model_env: Vec<(String, String)> = vec![(
+            crate::user_config::RAPIDLM_HOME_ENV.to_owned(),
+            self.user_home.display().to_string(),
+        )];
         for key in [
             crate::user_config::CONFIG_PATH_ENV,
             crate::managed_config::MANAGED_CONFIG_ENV,
         ] {
-            if let Some(value) = std::env::var_os(key).and_then(|value| value.into_string().ok()) {
+            if let Some(value) = std::env::var_os(key) {
+                let value = value
+                    .into_string()
+                    .map_err(|_| format!("/model: {key} is set but not valid Unicode"))?;
                 model_env.push((key.to_owned(), value));
             }
         }
-        model_env
+        Ok(model_env)
     }
 
+    /// The mid-session model switching backend, shared by `/model select`
+    /// and `KernelAction::SelectModel`: validate the id against the session's
+    /// own config catalog, then record the override for every later turn.
+    /// The NEXT turn runs on it; the current turn is unaffected.
     fn select_model(
         &mut self,
         model_env: &[(String, String)],
         id: &str,
     ) -> Result<(), InteractiveError> {
+        // A typo is a typo, lock or no lock.
+        let defined = crate::user_config::list_configured_models(model_env);
+        if !defined.is_empty() && !defined.iter().any(|defined| defined == id) {
+            self.append_command_error(format!(
+                "/model select: there is no [model.{id}] table (defined: {}; run /model to list)",
+                defined.join(", ")
+            ));
+            return Ok(());
+        }
         match crate::user_config::select_active_model_with_override(model_env, Some(id)) {
             Ok(crate::user_config::ModelSelection::Configured { active, .. })
                 if active.profile_id != id =>
@@ -5674,10 +5688,13 @@ running on it",
     /// so the composer can show the choices.
     fn run_model_command(&mut self, rest: &str) -> Result<(), InteractiveError> {
         let args = rest.trim();
-        // Config resolution for this command uses the session's own home —
-        // the same catalog every turn reads — with RAPIDLM_CONFIG (if the
-        // process set one) still winning, exactly like turn-side resolution.
-        let model_env = self.model_env();
+        let model_env = match self.model_env() {
+            Ok(model_env) => model_env,
+            Err(message) => {
+                self.append_command_error(message);
+                return Ok(());
+            }
+        };
         if args.is_empty() || args == "list" {
             let models = crate::user_config::list_configured_models(&model_env);
             let override_active = self
@@ -5705,6 +5722,12 @@ running on it",
                 lines.push(format!("session override: {active}"));
             } else {
                 lines.push("using the configured default".to_owned());
+            }
+            // A managed lock decides whatever the session asks.
+            if let Ok(Some(policy)) = crate::managed_config::load_policy(&model_env)
+                && let Some(locked) = policy.locked_default()
+            {
+                lines.push(format!("the managed policy locks the model to {locked}"));
             }
             lines.push(
                 "/model select <id> switches for the rest of the session; /model clear returns to the default"
@@ -7096,6 +7119,7 @@ session, then /goal run",
         sync_memory_index(&mut fresh, self.root);
         *self.stream = stream;
         *self.ui = fresh;
+        self.renderer.repaint_transcript();
         self.session_id = target;
         Ok(())
     }
@@ -7438,10 +7462,10 @@ session, then /goal run",
                 self.append_command_error(text);
                 return self.drain();
             }
-            KernelAction::SelectModel { name } => {
-                let model_env = self.model_env();
-                self.select_model(&model_env, &name)?;
-            }
+            KernelAction::SelectModel { name } => match self.model_env() {
+                Ok(model_env) => self.select_model(&model_env, &name)?,
+                Err(message) => self.append_command_error(message),
+            },
             KernelAction::CompactSession => self.compact_session()?,
             KernelAction::RunGoal => self.start_autonomous_goal()?,
             KernelAction::StopGoal => {
@@ -11405,7 +11429,12 @@ fn policy_mode_for(mode: crate::permissions::PermissionMode) -> tui::PolicyMode 
 struct TuiRenderer {
     transcript: tui::Transcript,
     viewport: tui::TranscriptViewport,
-    rendered_entries: usize,
+    /// The transcript position (`AppState::transcript_end`) painted up to;
+    /// `None` to paint the whole transcript on the next frame (the first
+    /// one, or after a session switch). A position, not a length: the
+    /// transcript's bound drops the oldest entries, and a length stops
+    /// moving at the cap.
+    rendered_mark: Option<u64>,
     sink: RenderSink,
     /// Session-level facts the status line shows that `AppState` does not
     /// carry: which model this session resolved, and how the permission mode
@@ -11423,7 +11452,7 @@ impl TuiRenderer {
         Self {
             transcript: tui::Transcript::new(),
             viewport: tui::TranscriptViewport::new(80, 24),
-            rendered_entries: 0,
+            rendered_mark: None,
             chrome: tui::StatusChrome::default(),
             sink: if capture {
                 RenderSink::Captured(Vec::new())
@@ -11443,12 +11472,31 @@ impl TuiRenderer {
     }
 
     fn sync_transcript(&mut self, ui: &AppState) {
-        let entries = ui.transcript();
-        let start = self.rendered_entries.min(entries.len());
-        for entry in &entries[start..] {
-            self.transcript.push_entry(entry);
+        match self
+            .rendered_mark
+            .and_then(|mark| ui.transcript_since(mark))
+        {
+            Some(entries) => {
+                for entry in entries {
+                    self.transcript.push_entry(entry);
+                }
+            }
+            // First frame, a switched session, or entries the bound dropped
+            // before they were painted: paint what the projection holds.
+            None => {
+                self.transcript = tui::Transcript::new();
+                for entry in ui.transcript() {
+                    self.transcript.push_entry(entry);
+                }
+            }
         }
-        self.rendered_entries = entries.len();
+        self.rendered_mark = Some(ui.transcript_end());
+    }
+
+    /// Paint the whole transcript again on the next frame: the projection
+    /// was replaced (another session), so no position in it carries over.
+    fn repaint_transcript(&mut self) {
+        self.rendered_mark = None;
     }
 
     /// Scroll one page toward earlier transcript output. Landing back on
@@ -17157,6 +17205,104 @@ question the panel answers"
             transcript.contains("the last autonomous turn failed"),
             "the failure was seen at the bound: {transcript:.2000}"
         );
+        assert!(
+            !loop_state
+                .ui
+                .transcript()
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::Assistant { .. })),
+            "no iteration ran over it"
+        );
+    }
+
+    #[test]
+    fn the_renderer_paints_what_arrives_after_the_transcript_bound() {
+        let mut ui = AppState::new();
+        for n in 0..tui::state::MAX_TRANSCRIPT_ENTRIES {
+            ui = reduce(
+                ui,
+                &UiEvent::Local(tui::state::LocalUiEvent::AppendCommandOutput(format!(
+                    "earlier {n}"
+                ))),
+            );
+        }
+        let mut renderer = TuiRenderer::new(true);
+        renderer.sync_transcript(&ui);
+        let painted = renderer.transcript.len();
+        ui = reduce(
+            ui,
+            &UiEvent::Local(tui::state::LocalUiEvent::AppendCommandOutput(
+                "after the bound".to_owned(),
+            )),
+        );
+        renderer.sync_transcript(&ui);
+        assert_eq!(
+            renderer.transcript.len(),
+            painted + 1,
+            "one more block painted"
+        );
+        // A switched session is painted afresh.
+        let other = reduce(
+            AppState::new(),
+            &UiEvent::Local(tui::state::LocalUiEvent::AppendCommandOutput(
+                "another session".to_owned(),
+            )),
+        );
+        renderer.repaint_transcript();
+        renderer.sync_transcript(&other);
+        assert_eq!(renderer.transcript.len(), 1);
+    }
+
+    #[test]
+    fn a_goal_whose_unread_entries_the_bound_dropped_stops_and_says_so() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let _goal = session.create_active_goal();
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(vec![ScriptedModel::terminal("never")]);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            std::sync::Arc::clone(&turn_in_flight),
+            backings,
+        );
+        loop_state
+            .start_autonomous_goal()
+            .expect("start while busy");
+        for n in 0..=tui::state::MAX_TRANSCRIPT_ENTRIES {
+            *loop_state.ui = reduce(
+                loop_state.ui.clone(),
+                &UiEvent::Local(tui::state::LocalUiEvent::AppendCommandOutput(format!(
+                    "flood {n}"
+                ))),
+            );
+        }
+        turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+        loop_state.step_autonomous_goal().expect("step");
+        assert!(loop_state.autonomous.is_none(), "stopped");
+        assert!(
+            format!("{:?}", loop_state.ui.transcript()).contains("dropped entries"),
+            "says why"
+        );
     }
 
     #[test]
@@ -20817,6 +20963,13 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             transcript.contains("the managed policy locks the model to corp"),
             "{transcript}"
         );
+        // A typo is said as a typo, lock or no lock.
+        loop_state.select_model(&model_env, "nope").expect("select");
+        let transcript = format!("{:?}", loop_state.ui.transcript());
+        assert!(
+            transcript.contains("there is no [model.nope] table"),
+            "{transcript}"
+        );
         assert!(
             loop_state
                 .shared
@@ -20832,7 +20985,8 @@ cancelled and not turned into a turn interrupt:\n{painted}"
     fn model_select_switches_lists_and_clears_through_the_session() {
         let _lock = lock_terminal();
         let env = TempEnv::create();
-        let config_dir = env.user_home.join(".rapidlm");
+        // The RapidLM home's own config.toml: what a turn reads by default.
+        let config_dir = env.user_home.clone();
         fs::create_dir_all(&config_dir).expect("config dir");
         fs::write(
             config_dir.join("config.toml"),
@@ -20918,7 +21072,8 @@ api_key = "k"
         // cell, next turn runs on it, unknown ids leave it standing.
         let _lock = lock_terminal();
         let env = TempEnv::create();
-        let config_dir = env.user_home.join(".rapidlm");
+        // The RapidLM home's own config.toml: what a turn reads by default.
+        let config_dir = env.user_home.clone();
         fs::create_dir_all(&config_dir).expect("config dir");
         fs::write(
             config_dir.join("config.toml"),
@@ -22865,15 +23020,16 @@ pre-approve it with `rapid permissions allow <tool>`";
         // re-enables follow) survives being driven through this renderer
         // rather than being reimplemented here.
         let mut renderer = TuiRenderer::new(true);
+        // Through the projection, as every painted entry arrives.
+        let mut state = AppState::new();
         for i in 0..40 {
-            renderer
-                .transcript
-                .push_entry(&tui::state::TranscriptEntry::Assistant {
-                    text: format!("line {i}"),
-                });
+            state = reduce(
+                state,
+                &UiEvent::Local(LocalUiEvent::AppendCommandOutput(format!("line {i}"))),
+            );
         }
         let state = reduce(
-            AppState::new(),
+            state,
             &UiEvent::Local(LocalUiEvent::SetViewport {
                 width: 80,
                 height: 8,

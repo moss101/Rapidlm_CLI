@@ -4539,11 +4539,11 @@ read with job_output, in this turn or a later one — the job is stopped when th
             Err(reason) => Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
-                detail: Some(bounded_detail(&format!(
-                    "subagent ({}) failed: {reason}{}",
-                    args.agent_type,
-                    note.as_deref().unwrap_or_default()
-                ))),
+                detail: Some(detail_keeping_note(
+                    &format!("subagent ({}) failed: ", args.agent_type),
+                    reason,
+                    note.as_deref(),
+                )),
             }),
         }
     }
@@ -7649,7 +7649,16 @@ fn blocked_completion_detail(
     reason: &str,
     note: Option<&str>,
 ) -> String {
-    let head = format!("subagent ({agent_type}) completion blocked by {hook} hook: ");
+    detail_keeping_note(
+        &format!("subagent ({agent_type}) completion blocked by {hook} hook: "),
+        reason,
+        note,
+    )
+}
+
+/// `head`, `reason`, `note` within the result bound — the reason cut first,
+/// so the note (what became of the child's changes) always survives.
+fn detail_keeping_note(head: &str, reason: &str, note: Option<&str>) -> String {
     let note = note.unwrap_or_default();
     let room = MAX_RESULT_DETAIL_BYTES.saturating_sub(head.len() + note.len());
     let reason = if reason.len() <= room {
@@ -10341,6 +10350,29 @@ mod tests {
     }
 
     #[test]
+    fn a_moot_block_names_how_the_child_ended_and_a_long_reason_keeps_the_note() {
+        let blocked = ("subagent_stop[0]".to_owned(), "no".to_owned());
+        let note = |end| moot_block_note(Some(&blocked), end, Some(" [discarded]".to_owned()));
+        assert_eq!(
+            note(ChildEnd::Cancelled).as_deref(),
+            Some(
+                " (the subagent_stop[0] hook's block is moot: the child was cancelled) [discarded]"
+            )
+        );
+        assert_eq!(
+            note(ChildEnd::Failed).as_deref(),
+            Some(" (the subagent_stop[0] hook's block is moot: the child failed) [discarded]")
+        );
+        assert_eq!(note(ChildEnd::Blocked).as_deref(), Some(" [discarded]"));
+        let detail = detail_keeping_note("head: ", &"x".repeat(1000), Some(" [discarded]"));
+        assert!(
+            detail.ends_with("...  [discarded]") || detail.ends_with("... [discarded]"),
+            "{detail}"
+        );
+        assert!(detail.len() <= MAX_RESULT_DETAIL_BYTES);
+    }
+
+    #[test]
     fn child_end_counts_an_effective_success_and_a_failure_outranks_a_block() {
         let report = |status: &str, stop: Option<&str>, tool_calls: u32| SubagentReport {
             summary: String::new(),
@@ -10428,7 +10460,12 @@ mod tests {
                 _cancel: &CancellationToken,
             ) -> Result<SubagentReport, String> {
                 if self.1 {
-                    return Err("the child's model step failed".to_owned());
+                    // Long enough that only a note-keeping bound keeps the
+                    // note at the end of the parent's result.
+                    return Err(format!(
+                        "the child's model step failed: {}",
+                        "the provider kept refusing the request; ".repeat(8)
+                    ));
                 }
                 Ok(SubagentReport {
                     summary: "done".to_owned(),
