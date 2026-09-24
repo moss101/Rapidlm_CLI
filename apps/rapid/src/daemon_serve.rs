@@ -287,6 +287,61 @@ impl Connection {
         hello.get("id").cloned()
     }
 
+    /// `turns.submit` up to the accepted turn: the `user_prompt_submit` gate
+    /// (ADR 0022 §7), then the kernel submit at the client's `expected_seq`.
+    /// The gate runs, and records, only on a session that can take a turn —
+    /// an unknown or closed one is the kernel's error to report. A deny
+    /// records and refuses: the prompt never becomes a turn, so its text never
+    /// enters the history a later turn replays. Otherwise the decisions are
+    /// recorded after the submit — first, they would move the session past
+    /// `expected_seq` — and whether or not the submit was accepted: the hooks
+    /// ran either way.
+    fn submit_prompt(
+        &self,
+        session: SessionId,
+        expected_seq: u64,
+        text: &str,
+        trace: protocol::TraceId,
+    ) -> Result<kernel::TurnHandle, String> {
+        use kernel::KernelClient as _;
+        let snapshot = crate::approvals::client_call(self.client.get_session(session))
+            .map_err(|err| err.to_string())?;
+        let gate = (snapshot.status() != kernel::SessionStatus::Closed)
+            .then(|| crate::interactive::prompt_submit_decision(&self.root, self.trusted, text))
+            .flatten();
+        let record = |report: &crate::hooks::PostHookReport| {
+            crate::interactive::record_prompt_submit(
+                &self.client,
+                session,
+                &self.actor,
+                report,
+                &mut |_| {},
+            );
+        };
+        if let Some(report) = &gate
+            && let Some((hook, reason)) = report.first_deny()
+        {
+            record(report);
+            return Err(format!(
+                "prompt blocked by {hook} hook: {reason} (the decision is recorded on the \
+session, which moved: refresh the session before the next submit)"
+            ));
+        }
+        let submitted =
+            crate::approvals::client_call(self.client.submit_turn(kernel::SubmitTurn::new(
+                session,
+                expected_seq,
+                self.actor.clone(),
+                trace,
+                text.to_owned(),
+            )))
+            .map_err(|err| err.to_string());
+        if let Some(report) = &gate {
+            record(report);
+        }
+        submitted
+    }
+
     fn rpc(&self, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
         use kernel::KernelClient as _;
         match method {
@@ -339,47 +394,8 @@ impl Connection {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
-                // `user_prompt_submit` (ADR 0022 §7) decides before the kernel
-                // records a turn: a blocked prompt never becomes one, so its
-                // text never enters the history a later turn replays. The
-                // hooks' records land after the turn is accepted — first, they
-                // would move the session past the client's `expected_seq`.
-                let gate =
-                    crate::interactive::prompt_submit_decision(&self.root, self.trusted, &text);
-                if let Some(report) = &gate
-                    && let Some((hook, reason)) = report.first_deny()
-                {
-                    crate::interactive::record_prompt_submit(
-                        &self.client,
-                        session,
-                        &self.actor,
-                        report,
-                        &mut |_| {},
-                    );
-                    return Err(format!(
-                        "prompt blocked by {hook} hook: {reason} (recorded on the session; \
-re-read it before the next submit)"
-                    ));
-                }
-                let handle = crate::approvals::client_call(self.client.submit_turn(
-                    kernel::SubmitTurn::new(
-                        session,
-                        expected_seq,
-                        self.actor.clone(),
-                        trace_id_of(params),
-                        text.clone(),
-                    ),
-                ))
-                .map_err(|err| err.to_string())?;
-                if let Some(report) = &gate {
-                    crate::interactive::record_prompt_submit(
-                        &self.client,
-                        session,
-                        &self.actor,
-                        report,
-                        &mut |_| {},
-                    );
-                }
+                let handle =
+                    self.submit_prompt(session, expected_seq, &text, trace_id_of(params))?;
                 // Execute the turn with the production assembly; progress
                 // streams to any events.subscribe consumer.
                 let kernel_cancel = self.client.turn_cancel_token(session).unwrap_or_else(|| {
@@ -758,17 +774,61 @@ mod tests {
             .rpc("sessions.create", &serde_json::json!({}))
             .expect("session");
         let session = snapshot["id"].as_str().expect("id").to_owned();
-        connection
-            .rpc(
-                "turns.submit",
-                &serde_json::json!({
-                    "session_id": session,
-                    "expected_seq": snapshot["seq"],
-                    "prompt": "say hello",
-                }),
+        // `submit_prompt`, not the whole `turns.submit`: that would spawn the
+        // turn, which resolves a model from the real environment.
+        let session_id: SessionId = session.parse().expect("session id");
+        let handle = connection
+            .submit_prompt(
+                session_id,
+                snapshot["seq"].as_u64().expect("seq"),
+                "say hello",
+                protocol::TraceId::new(),
             )
             .expect("an allowed prompt is submitted at the client's seq");
-        let kinds = event_kinds(&client, session.parse().expect("session id"));
+        let _ = client.finish_turn(kernel::FinishTurn::new(
+            session_id,
+            handle.turn_id(),
+            connection.actor.clone(),
+            protocol::TraceId::new(),
+            kernel::TurnOutcome::Completed { text: None },
+        ));
+        // A stale seq: the kernel refuses the submit, and what the hooks
+        // decided is recorded all the same — they ran.
+        assert!(
+            connection
+                .submit_prompt(
+                    session_id,
+                    snapshot["seq"].as_u64().expect("seq"),
+                    "say hello again",
+                    protocol::TraceId::new(),
+                )
+                .is_err(),
+            "a stale seq conflicts"
+        );
+        assert_eq!(
+            event_kinds(&client, session_id)
+                .iter()
+                .filter(|kind| **kind == EventKind::HookDecided)
+                .count(),
+            2
+        );
+        // An unknown session: the kernel's error, and no hook runs for it.
+        let runs = root.join("runs");
+        std::fs::write(
+            root.join("gate.sh"),
+            format!(
+                "echo run >> {}\necho '{{\"decision\":\"allow\"}}'\nexit 0\n",
+                test_fixtures::sh_quote(&runs)
+            ),
+        )
+        .expect("counting hook");
+        assert!(
+            connection
+                .submit_prompt(protocol::SessionId::new(), 0, "x", protocol::TraceId::new())
+                .is_err()
+        );
+        assert!(!runs.exists(), "no hook ran for an unknown session");
+        let kinds = event_kinds(&client, session_id);
         let started = kinds
             .iter()
             .position(|kind| *kind == EventKind::TurnStarted)

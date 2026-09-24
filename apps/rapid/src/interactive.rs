@@ -4317,34 +4317,46 @@ run without --continue to start one"
     // project's hooks may block the prompt with a reason. Blocked: nothing
     // is submitted, the decision is recorded, the run exits `Policy` (3).
     // A hook that fails lets the prompt through with a warning.
-    {
+    // The hooks decide before the turn is submitted; what they decided is
+    // recorded after it is accepted — recorded first, it would move the
+    // session past the seq the run submits at (and a concurrent writer's turn
+    // must still conflict rather than be silently skipped over).
+    let gate_report = {
         let hooks = tools.hooks_config();
-        if !hooks.user_prompt_submit.is_empty() {
-            let report = crate::hooks::run_prompt_submit_stage(
+        (!hooks.user_prompt_submit.is_empty()).then(|| {
+            crate::hooks::run_prompt_submit_stage(
                 &hooks.user_prompt_submit,
                 &turn_text,
                 crate::hooks::HOOK_TIMEOUT,
-            );
-            let sink = recording
-                .as_ref()
-                .map(|r| LedgerHookEvents::new(&r.client, r.session_id, &r.actor));
-            record_hook_report(
-                sink.as_ref()
-                    .map(|s| s as &dyn crate::exec_tools::HookEvents),
-                "",
-                "",
-                &report,
-                &mut |line| eprintln!("{line}"),
-            );
-            if let Some((hook, reason)) = report.first_deny() {
-                eprintln!("prompt blocked by {hook} hook: {reason}");
-                return Ok(JsonlExitCode::Policy.as_i32());
-            }
-        }
+            )
+        })
+    };
+    let record_gate = |report: &crate::hooks::PostHookReport| {
+        let sink = recording
+            .as_ref()
+            .map(|r| LedgerHookEvents::new(&r.client, r.session_id, &r.actor));
+        record_hook_report(
+            sink.as_ref()
+                .map(|s| s as &dyn crate::exec_tools::HookEvents),
+            "",
+            "",
+            report,
+            &mut |line| eprintln!("{line}"),
+        );
+    };
+    if let Some(report) = &gate_report
+        && let Some((hook, reason)) = report.first_deny()
+    {
+        record_gate(report);
+        eprintln!("prompt blocked by {hook} hook: {reason}");
+        return Ok(JsonlExitCode::Policy.as_i32());
     }
     let recorded_turn = match &recording {
         Some(recording) => match recording.start_turn(&turn_text) {
             Ok(turn_id) => {
+                if let Some(report) = &gate_report {
+                    record_gate(report);
+                }
                 attach_ledger_sinks(&mut tools, &recording.client, session_id, &recording.actor);
                 // A hook's `ask` has a durable place to go on a recorded run
                 // (ADR 0022 §3): the same ledger sink the TUI installs for
@@ -4369,10 +4381,18 @@ run without --continue to start one"
             }
             Err(reason) => {
                 eprintln!("warning: this run is not being recorded: {reason}");
+                if let Some(report) = &gate_report {
+                    record_gate(report);
+                }
                 None
             }
         },
-        None => None,
+        None => {
+            if let Some(report) = &gate_report {
+                record_gate(report);
+            }
+            None
+        }
     };
     let mut sink = RecordedEvents {
         events: &mut events,
@@ -6797,7 +6817,7 @@ denied\n",
         if self.autonomous.is_none() {
             return Ok(());
         }
-        if self.model_busy() {
+        if self.model_busy() || !self.ui_caught_up() {
             return Ok(());
         }
         let started_at = self
@@ -6849,6 +6869,13 @@ denied\n",
                 self.stop_autonomous_goal("the model repeated itself with no progress");
                 return Ok(());
             }
+            // The range is inspected once: when the loop then waits (for an
+            // approval), the next pass must not observe the same entries —
+            // the loop detector would count one finished turn as a loop.
+            let inspected = self.ui.transcript().len();
+            if let Some(auto) = &mut self.autonomous {
+                auto.transcript_len_before_iteration = Some(inspected);
+            }
         }
         self.continue_or_stop_autonomous_goal()
     }
@@ -6875,7 +6902,12 @@ denied\n",
         // The loop's next pass (`step_autonomous_goal`) starts the iteration
         // once the slot is free.
         if self.model_busy()
-            || !crate::approvals::pending_approvals(self.client, self.session_id).is_empty()
+            || !self.ui_caught_up()
+            || self
+                .ui
+                .approvals()
+                .values()
+                .any(|approval| approval.state() == tui::state::ApprovalLifecycle::Requested)
         {
             // An approval the user has not answered holds the session too:
             // a goal turn started over it would lock `/approvals` out.
@@ -7677,6 +7709,20 @@ the full history, where `/diff` lists every file it wrote\n"
             || self.compaction.is_some()
     }
 
+    /// Whether the projection holds every event the ledger does. The live
+    /// tail delivers an event a poll interval after it lands, so just after
+    /// a turn ends — or pauses on an approval — the ledger can be ahead of
+    /// `self.ui`: the goal loop deciding then would miss the turn's end or
+    /// the approval it raised, and submit its next turn at a stale seq.
+    fn ui_caught_up(&self) -> bool {
+        let Ok(snapshot) = block_on(self.client.get_session(self.session_id), self.cancel) else {
+            return false;
+        };
+        self.ui
+            .snapshot()
+            .is_some_and(|current| current.seq() >= snapshot.seq())
+    }
+
     /// `/compact`: fold the session's earlier turns into a model-written
     /// summary, recorded as `context.compacted` so every later turn — in
     /// this process, in a `rapid exec --continue`, in a resumed session —
@@ -7957,17 +8003,14 @@ impl ExecRecording {
     /// `finish_turn` needs.
     fn start_turn(&self, text: &str) -> Result<protocol::TurnId, String> {
         let cancel = CancellationToken::new();
-        // The session's own tip, not the seq captured when the recording
-        // began: the `user_prompt_submit` gate records its decisions through
-        // this same session before the turn starts, and a submit at the
-        // older seq conflicted with them — the run then went unrecorded.
-        let tip = block_on(self.client.get_session(self.session_id), &cancel)
-            .map(|snapshot| snapshot.seq())
-            .unwrap_or(self.seq);
+        // At the seq the run read the session at: a turn another writer
+        // recorded since (the history this run carries does not include it)
+        // conflicts, rather than being silently skipped over. The prompt
+        // gate's own records are appended after this submit.
         let handle = block_on(
             self.client.submit_turn(SubmitTurn::new(
                 self.session_id,
-                tip,
+                self.seq,
                 self.actor.clone(),
                 TraceId::new(),
                 text,
@@ -10370,11 +10413,12 @@ fn fire_turn_end_hooks<E>(
 /// turn — trusted projects only; hooks are project settings — and record what
 /// they decided. `Some((hook, reason))` when a hook blocked the prompt. Every
 /// surface that starts a turn from a human prompt asks this first, before the
-/// kernel records a turn: the TUI composer, queue and goal loop, ACP's
-/// `session/prompt` (`acp_serve`), the daemon's `turns.submit`, and headless
-/// `rapid exec` (its own copy, which exits `Policy`). A blocked prompt must
-/// never become a turn: a failed turn's prompt is part of the history the
-/// next turn replays to the model.
+/// kernel records a turn: the TUI composer, queue and goal loop, and ACP's
+/// `session/prompt` (`acp_serve`). The daemon's `turns.submit` and headless
+/// `rapid exec` submit at a seq the client read, so they decide with
+/// [`prompt_submit_decision`] and record after the submit. A blocked prompt
+/// must never become a turn: a failed turn's prompt is part of the history
+/// the next turn replays to the model.
 pub(crate) fn prompt_submit_block(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
@@ -10412,6 +10456,17 @@ pub(crate) fn prompt_submit_decision(
         text,
         crate::hooks::HOOK_TIMEOUT,
     ))
+}
+
+/// Whether a `user_prompt_submit` hook would run for a prompt here (a
+/// trusted project with hooks on that stage) — checked before any work is
+/// done to judge one.
+pub(crate) fn prompt_submit_configured(root: &Path, trusted: bool) -> bool {
+    trusted
+        && !load_project_integrations(root)
+            .hooks
+            .user_prompt_submit
+            .is_empty()
 }
 
 /// Record what the `user_prompt_submit` hooks decided and which failed.
@@ -13962,6 +14017,19 @@ alignment below it: {line:?}",
     /// scripted-turn tests: iterations run on their own real (if fast,
     /// scripted) background thread, so the driving loop must actually wait
     /// in real wall-clock time between checks, not just retry instantly.
+    /// Drains until the projection holds the ledger's tip (the live tail
+    /// delivers on its own worker thread), so a following step decides.
+    fn drain_until_caught_up(loop_state: &mut SessionLoop) {
+        for _ in 0..1500 {
+            loop_state.drain().expect("drain");
+            if loop_state.ui_caught_up() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("the projection never caught up with the ledger");
+    }
+
     fn drive_autonomous_goal(loop_state: &mut SessionLoop) {
         for _ in 0..300 {
             // `ScriptedSession::run_turn`'s own comment documents the exact
@@ -16831,7 +16899,18 @@ question the panel answers"
             arguments_digest: None,
         })
         .expect("pending approval");
+        // Not drained yet: the ledger is ahead of the projection, and the
+        // loop decides nothing over events it has not seen.
         loop_state.start_autonomous_goal().expect("start");
+        assert!(
+            loop_state
+                .autonomous
+                .as_ref()
+                .is_some_and(|auto| auto.transcript_len_before_iteration.is_none()),
+            "no iteration before the projection caught up"
+        );
+        drain_until_caught_up(&mut loop_state);
+        loop_state.step_autonomous_goal().expect("step");
         assert!(
             loop_state
                 .autonomous
@@ -16918,6 +16997,98 @@ question the panel answers"
     }
 
     #[test]
+    fn a_goal_waiting_on_an_approval_does_not_count_one_finished_turn_as_a_loop() {
+        // Busy start, a pending approval, and the occupying turn completes:
+        // the loop waits for the approval, and its passes must not observe
+        // that turn's answer again and again (the loop detector would stop
+        // the goal as "repeated itself").
+        use crate::approvals::ApprovalSink as _;
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let _goal = session.create_active_goal();
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(vec![ScriptedModel::terminal("never")]);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            std::sync::Arc::clone(&turn_in_flight),
+            backings,
+        );
+        loop_state
+            .start_autonomous_goal()
+            .expect("start while busy");
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        let handle = block_on(
+            session.client.submit_turn(SubmitTurn::new(
+                session.session_id,
+                tip,
+                session.actor.clone(),
+                TraceId::new(),
+                "the turn that was running".to_owned(),
+            )),
+            &cancel,
+        )
+        .expect("occupying turn");
+        let _ = session.client.finish_turn(kernel::FinishTurn::new(
+            session.session_id,
+            handle.turn_id(),
+            session.actor.clone(),
+            TraceId::new(),
+            kernel::TurnOutcome::Completed {
+                text: Some("the same answer".to_owned()),
+            },
+        ));
+        crate::approvals::LedgerApprovalSink::new(
+            session.client.clone(),
+            session.session_id,
+            session.actor.clone(),
+            session.root.clone(),
+        )
+        .request(&crate::approvals::ApprovalRequest {
+            tool: crate::exec_tools::WORKSPACE_WRITE_TOOL.to_owned(),
+            call_id: "c1".to_owned(),
+            summary: "create a.txt".to_owned(),
+            scope: Vec::new(),
+            diff: String::new(),
+            source: None,
+            arguments_digest: None,
+        })
+        .expect("pending approval");
+        turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..10 {
+            drain_until_caught_up(&mut loop_state);
+            loop_state.step_autonomous_goal().expect("step");
+        }
+        assert!(
+            loop_state.autonomous.is_some(),
+            "still waiting for the approval, not stopped: {:?}",
+            loop_state.ui.transcript()
+        );
+        loop_state.stop_autonomous_goal("test");
+    }
+
+    #[test]
     fn a_goal_run_while_the_model_slot_is_busy_waits_instead_of_starting_a_second_turn() {
         // `/goal run` typed while a turn runs: starting one now would bounce
         // off the kernel's lease (an error that ends the session) or race a
@@ -16952,6 +17123,7 @@ question the panel answers"
             std::sync::Arc::clone(&turn_in_flight),
             backings,
         );
+        let before = loop_state.ui.transcript().len();
         loop_state
             .start_autonomous_goal()
             .expect("start while busy");
@@ -16959,12 +17131,15 @@ question the panel answers"
             loop_state.autonomous.is_some(),
             "the goal is still being driven"
         );
-        assert!(
-            !loop_state
-                .ui
-                .transcript()
-                .iter()
-                .any(|entry| matches!(entry, TranscriptEntry::Assistant { .. })),
+        // The inspection point is the transcript as it was when the goal
+        // started (the busy turn's end is inspected); an iteration would have
+        // set it past the "started" line.
+        assert_eq!(
+            loop_state
+                .autonomous
+                .as_ref()
+                .and_then(|auto| auto.transcript_len_before_iteration),
+            Some(before),
             "no iteration started while the slot was busy"
         );
         turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);

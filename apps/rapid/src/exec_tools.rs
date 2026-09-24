@@ -1472,7 +1472,21 @@ impl ChildEnd {
             {
                 Self::Completed
             }
+            // A cancelled child's changes are discarded: the user stopped it.
+            (false, Ok(report)) if report.status == "cancelled" => Self::Failed,
             (false, Ok(_)) => Self::Incomplete,
+        }
+    }
+
+    /// The lifecycle end `/agents` records for this child: what `settle`
+    /// did with its work, so a merged child is never shown as failed.
+    fn lifecycle(self, outcome: &Result<SubagentReport, String>) -> (SubagentEnd, Option<&str>) {
+        match (self, outcome) {
+            (Self::Blocked, _) => (SubagentEnd::Failed, Some("completion blocked by a hook")),
+            (Self::Completed, _) => (SubagentEnd::Succeeded, None),
+            (_, Ok(report)) if report.status == "cancelled" => (SubagentEnd::Cancelled, None),
+            (_, Ok(report)) => (SubagentEnd::Failed, Some(report.status.as_str())),
+            (_, Err(reason)) => (SubagentEnd::Failed, Some(reason.as_str())),
         }
     }
 }
@@ -4448,14 +4462,9 @@ read with job_output, in this turn or a later one — the job is stopped when th
             &args.agent_type,
             &outcome,
         );
-        let note = runner.settle(agent_id, ChildEnd::of(blocked.is_some(), &outcome));
-        let (end, detail) = match (&blocked, &outcome) {
-            (Some(_), _) => (SubagentEnd::Failed, Some("completion blocked by a hook")),
-            (None, Ok(report)) if report.status == "cancelled" => (SubagentEnd::Cancelled, None),
-            (None, Ok(report)) if report.status == "succeeded" => (SubagentEnd::Succeeded, None),
-            (None, Ok(report)) => (SubagentEnd::Failed, Some(report.status.as_str())),
-            (None, Err(reason)) => (SubagentEnd::Failed, Some(reason.as_str())),
-        };
+        let child_end = ChildEnd::of(blocked.is_some(), &outcome);
+        let note = runner.settle(agent_id, child_end);
+        let (end, detail) = child_end.lifecycle(&outcome);
         lifecycle.end(end, detail);
         if let Some((hook, reason)) = blocked {
             return Ok(ToolStepResult::Failed {
@@ -4635,18 +4644,9 @@ read with job_output, in this turn or a later one — the job is stopped when th
                 &agent_type,
                 &outcome,
             );
-            let note = runner.settle(agent_id, ChildEnd::of(blocked.is_some(), &outcome));
-            let (end, detail) = match (&blocked, &outcome) {
-                (Some(_), _) => (SubagentEnd::Failed, Some("completion blocked by a hook")),
-                (None, Ok(report)) if report.status == "cancelled" => {
-                    (SubagentEnd::Cancelled, None)
-                }
-                (None, Ok(report)) if report.status == "succeeded" => {
-                    (SubagentEnd::Succeeded, None)
-                }
-                (None, Ok(report)) => (SubagentEnd::Failed, Some(report.status.as_str())),
-                (None, Err(reason)) => (SubagentEnd::Failed, Some(reason.as_str())),
-            };
+            let child_end = ChildEnd::of(blocked.is_some(), &outcome);
+            let note = runner.settle(agent_id, child_end);
+            let (end, detail) = child_end.lifecycle(&outcome);
             lifecycle.end(end, detail);
             registry.release_detached();
             // Spool the report BEFORE marking the job terminal, so a
@@ -4670,7 +4670,7 @@ read with job_output, in this turn or a later one — the job is stopped when th
                     (Some((hook, _)), _) => {
                         JobState::Failed(format!("completion blocked by {hook} hook"))
                     }
-                    (None, Ok(report)) if report.status == "succeeded" => JobState::Completed(0),
+                    (None, _) if child_end == ChildEnd::Completed => JobState::Completed(0),
                     (None, Ok(report)) if report.status == "cancelled" => JobState::Cancelled,
                     (None, Ok(report)) => JobState::Failed(format!("status {}", report.status)),
                     (None, Err(reason)) => JobState::Failed(reason.clone()),
@@ -10325,8 +10325,21 @@ mod tests {
             ChildEnd::of(false, &Ok(report("succeeded", None, 0))),
             ChildEnd::Completed
         );
+        // A cancelled child's changes are discarded; `/agents` shows it cancelled.
+        let cancelled = Ok(report("cancelled", None, 1));
+        assert_eq!(ChildEnd::of(false, &cancelled), ChildEnd::Failed);
         assert_eq!(
-            ChildEnd::of(false, &Ok(report("cancelled", None, 1))),
+            ChildEnd::Failed.lifecycle(&cancelled).0,
+            SubagentEnd::Cancelled
+        );
+        // A merged "effective success" is recorded as a success, not a failure.
+        let effective = Ok(report("failed", Some("empty_response"), 2));
+        assert_eq!(
+            ChildEnd::of(false, &effective).lifecycle(&effective),
+            (SubagentEnd::Succeeded, None)
+        );
+        assert_eq!(
+            ChildEnd::of(false, &Ok(report("failed", Some("budget_exhausted"), 1))),
             ChildEnd::Incomplete
         );
         // A failed child is discarded whatever a hook said of it.

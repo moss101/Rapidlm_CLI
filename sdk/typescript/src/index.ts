@@ -16,6 +16,7 @@ export type {
   ForkRequest,
   InterruptRequest,
   RapidClientConnectOptions,
+  RefreshRequest,
   RunRequest,
   SubscribeRequest,
   TurnHandle,

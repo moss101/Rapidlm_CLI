@@ -595,6 +595,22 @@ impl<C: KernelClient> V1Adapter<C> {
         })
     }
 
+    /// Check a `session/prompt` request as [`Self::session_prompt`] would —
+    /// ready, well-formed, a known and open session — without submitting it:
+    /// the session it names. A composition root judges a prompt itself only
+    /// when this is `Ok`; otherwise the adapter's own error stands.
+    pub async fn validate_prompt_request(&self, params: Value) -> Result<SessionId, V1Error> {
+        self.require_ready()?;
+        let parsed: PromptParams = parse_params(params)?;
+        validate_prompt(&parsed.prompt)?;
+        let session_id = parse_session_id(&parsed.session_id)?;
+        let snapshot = self.load_kernel_session(session_id).await?;
+        if snapshot.status() == SessionStatus::Closed {
+            return Err(V1Error::SessionClosed);
+        }
+        Ok(session_id)
+    }
+
     pub async fn session_prompt(
         &mut self,
         params: Value,
