@@ -1101,6 +1101,11 @@ pub fn encode_permission_request(
 /// `{"outcome":{"outcome":"cancelled"}}`. An option id the request never
 /// offered, or any other shape, is `InvalidParams`.
 pub fn decode_permission_response(result: Value) -> Result<PermissionAnswer, V1Error> {
+    // serde would also read the struct, or the tagged outcome, from an
+    // array; the protocol's answer is an object holding an object.
+    if !result.get("outcome").is_some_and(Value::is_object) {
+        return Err(V1Error::InvalidParams);
+    }
     parse_params::<PermissionResponseWire>(result)?
         .outcome
         .answer()
@@ -1687,18 +1692,23 @@ mod tests {
             selected("allow-everything"),
             Err(V1Error::InvalidParams)
         ));
-        // The outcome not nested under `outcome` is no answer at all.
-        for flat in [
+        // The outcome not nested under `outcome` is no answer at all; nor
+        // is an array in place of either object, though serde would read
+        // a struct or a tagged enum from one.
+        for other in [
             serde_json::json!({"outcome": "selected", "optionId": "allow-once"}),
             serde_json::json!({"outcome": "cancelled"}),
             serde_json::json!({}),
+            serde_json::json!({"outcome": ["selected", "allow-once"]}),
+            serde_json::json!({"outcome": ["cancelled"]}),
+            serde_json::json!([{"outcome": "selected", "optionId": "allow-once"}]),
         ] {
             assert!(
                 matches!(
-                    decode_permission_response(flat.clone()),
+                    decode_permission_response(other.clone()),
                     Err(V1Error::InvalidParams)
                 ),
-                "{flat}"
+                "{other}"
             );
         }
     }

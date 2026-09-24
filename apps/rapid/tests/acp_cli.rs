@@ -663,22 +663,38 @@ fn a_cancelled_answer_is_a_cancel_not_a_denial() {
 
 #[test]
 fn an_answer_outside_the_protocol_s_shape_decides_nothing() {
-    // `outcome` not nested: an "allow once" only in appearance.
-    let run = answer_one_write(
-        "flat-answer",
-        json!({ "outcome": "selected", "optionId": "allow-once" }),
-    );
-    let (frames, stderr, events) = (&run.frames, &run.stderr, &run.events);
-    assert_eq!(
-        frames.last().expect("response")["result"]["stopReason"],
-        "refusal",
-        "{frames:#?}\nstderr: {stderr}"
-    );
-    assert!(stderr.contains("not an offered option"), "stderr: {stderr}");
-    assert_eq!(run.exit, Some(0), "stderr: {stderr}");
-    assert_eq!(count_kind(events, "approval.resolved"), 0, "{events:#?}");
-    assert_eq!(count_kind(events, "turn.started"), 1, "{events:#?}");
-    assert_eq!(run.written, None);
+    // An "allow once" only in appearance: `outcome` not nested, or an
+    // array where the protocol has an object.
+    for (name, answer) in [
+        (
+            "flat-answer",
+            json!({ "outcome": "selected", "optionId": "allow-once" }),
+        ),
+        (
+            "array-answer",
+            json!({ "outcome": ["selected", "allow-once"] }),
+        ),
+    ] {
+        let run = answer_one_write(name, answer);
+        let (frames, stderr, events) = (&run.frames, &run.stderr, &run.events);
+        assert_eq!(
+            frames.last().expect("response")["result"]["stopReason"],
+            "refusal",
+            "{name}: {frames:#?}\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("not an offered option"),
+            "{name}: stderr: {stderr}"
+        );
+        assert_eq!(run.exit, Some(0), "{name}: stderr: {stderr}");
+        assert_eq!(
+            count_kind(events, "approval.resolved"),
+            0,
+            "{name}: {events:#?}"
+        );
+        assert_eq!(count_kind(events, "turn.started"), 1, "{name}: {events:#?}");
+        assert_eq!(run.written, None, "{name}");
+    }
 }
 
 #[test]
