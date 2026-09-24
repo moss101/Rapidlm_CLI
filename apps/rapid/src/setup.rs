@@ -41,8 +41,6 @@ pub const VERIFY_MAX_OUTPUT_TOKENS: u32 = 16;
 /// The mode the config file is written with: it may name a keychain alias or
 /// an environment variable, and it is the user's alone.
 pub const CONFIG_FILE_MODE: u32 = 0o600;
-const MAX_PROFILE_ID_BYTES: usize = 64;
-const MAX_MODEL_ID_BYTES: usize = 256;
 const MAX_ENV_NAME_BYTES: usize = 128;
 
 /// One provider preset — an endpoint, the wire dialect it speaks, a model to
@@ -256,7 +254,7 @@ pub fn parse_args(args: &[String]) -> Result<SetupArgs, String> {
     while index < args.len() {
         let raw = args[index].as_str();
         let (flag, inline) = match raw.split_once('=') {
-            Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
+            Some((flag, value)) if flag.starts_with('-') => (flag, Some(value)),
             _ => (raw, None),
         };
         if is_key_bearing_flag(flag) {
@@ -274,10 +272,17 @@ the process list and the shell history; use --key-env <VAR> or --key-stdin"
             "--key-stdin" | "--dry-run" | "--non-interactive" | "--no-verify"
         );
         if !takes_value && !is_switch {
-            return Err(if flag.starts_with('-') {
+            // Nothing the user typed is echoed unless it is plainly an
+            // option name: a key pasted in the wrong place must not land in
+            // a terminal log.
+            return Err(if !flag.starts_with('-') {
+                "rapid setup: unexpected argument — setup takes only --options (a key is never \
+given on the command line)"
+                    .to_owned()
+            } else if looks_like_an_option_name(flag) {
                 format!("rapid setup: unknown option {flag}")
             } else {
-                format!("rapid setup: unexpected argument '{raw}'")
+                "rapid setup: unknown option".to_owned()
             });
         }
         if seen.contains(&flag) {
@@ -333,7 +338,7 @@ the process list and the shell history; use --key-env <VAR> or --key-stdin"
         && preset(id).is_none()
     {
         return Err(format!(
-            "rapid setup: unknown preset '{id}' (one of: {})",
+            "rapid setup: unknown preset (one of: {})",
             preset_ids()
         ));
     }
@@ -348,6 +353,15 @@ fn preset_ids() -> String {
         .join(", ")
 }
 
+/// `-x` / `--word-word`: short enough and plain enough to be a typo, not a key.
+fn looks_like_an_option_name(flag: &str) -> bool {
+    let name = flag.trim_start_matches('-');
+    (1..=2).contains(&(flag.len() - name.len()))
+        && (1..=24).contains(&name.len())
+        && name.starts_with(|ch: char| ch.is_ascii_lowercase())
+        && name.chars().all(|ch| ch.is_ascii_lowercase() || ch == '-')
+}
+
 /// A flag whose value would be a secret: refused by name, with the reason.
 fn is_key_bearing_flag(flag: &str) -> bool {
     matches!(
@@ -356,63 +370,59 @@ fn is_key_bearing_flag(flag: &str) -> bool {
     )
 }
 
+/// The run-time profile alphabet (`llm_router::ProfileId`): a profile setup
+/// accepts is one every later run accepts.
 fn validate_profile_id(raw: &str) -> Result<String, String> {
-    if raw.is_empty()
-        || raw.len() > MAX_PROFILE_ID_BYTES
-        || !raw
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
-    {
-        return Err(format!(
-            "rapid setup: --profile must be 1–{MAX_PROFILE_ID_BYTES} letters, digits, '-' or '_'"
-        ));
-    }
-    Ok(raw.to_owned())
+    llm_router::credentials::ProfileId::parse(raw)
+        .map(|_| raw.to_owned())
+        .map_err(|_| {
+            "rapid setup: --profile must start with a lower-case letter and use only a-z, 0-9 \
+and single '-' (not at the end)"
+                .to_owned()
+        })
 }
 
+/// The model client's own identifier rule (`llm_router::provider::ModelId`).
 fn validate_model_id(raw: &str) -> Result<String, String> {
-    if raw.is_empty()
-        || raw.len() > MAX_MODEL_ID_BYTES
-        || raw
-            .chars()
-            .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '"')
-    {
-        return Err(format!(
-            "rapid setup: --model must be 1–{MAX_MODEL_ID_BYTES} bytes with no spaces, quotes \
-or control characters"
-        ));
-    }
-    Ok(raw.to_owned())
+    llm_router::provider::ModelId::parse(raw)
+        .map(|_| raw.to_owned())
+        .map_err(|_| {
+            "rapid setup: --model must be ASCII letters, digits and '-_./:', starting with a \
+letter or digit"
+                .to_owned()
+        })
 }
 
+/// The conventional environment-variable form, upper case: a key pasted
+/// here (they carry lower case, '-' or both) is refused, and never echoed.
 fn validate_env_name(raw: &str) -> Result<String, String> {
     let mut chars = raw.chars();
     let valid_start = chars
         .next()
-        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_');
+        .is_some_and(|ch| ch.is_ascii_uppercase() || ch == '_');
     if !valid_start
         || raw.len() > MAX_ENV_NAME_BYTES
-        || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        || !chars.all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
     {
         return Err(
-            "rapid setup: --key-env takes an environment variable name (letters, digits, '_'), \
-not a key"
+            "rapid setup: --key-env takes the NAME of an environment variable (upper-case \
+letters, digits, '_'), never a key"
                 .to_owned(),
         );
     }
     Ok(raw.to_owned())
 }
 
-/// The same validation the model client applies to `base_url`, so a URL
-/// setup accepts is one a turn can use.
+/// The model client's own `base_url` validation, so a URL setup accepts is
+/// one a turn can use. The value is stored as given (without a trailing
+/// `/`), and a rejected one is never echoed — it may carry a credential.
 fn validate_base_url(raw: &str) -> Result<String, String> {
     OpenAiCompatibleEndpoint::new(raw, OpenAiApiStyle::ChatCompletions)
-        .map(|endpoint| endpoint.base_url().to_owned())
+        .map(|_| raw.trim_end_matches('/').to_owned())
         .map_err(|_| {
-            format!(
-                "rapid setup: --base-url '{raw}' is not usable: expected an http:// or https:// \
-origin without userinfo or metadata hosts"
-            )
+            "rapid setup: --base-url is not usable: expected an http:// or https:// origin \
+without userinfo or metadata hosts"
+                .to_owned()
         })
 }
 
@@ -446,6 +456,9 @@ pub enum Credential {
     Keychain { alias: String },
     /// No key: the endpoint is called without credentials.
     None,
+    /// Whatever credential the profile already names is kept (a custom
+    /// endpoint with no key flag: setup does not guess, and does not strip).
+    Unchanged,
 }
 
 /// A fully resolved choice.
@@ -510,11 +523,14 @@ pub fn resolve_choice(
         KeyFlag::Stdin => Credential::Keychain {
             alias: keychain_alias(&profile),
         },
-        KeyFlag::Unspecified => match chosen.and_then(|preset| preset.key_env) {
-            Some(var) => Credential::Env {
-                var: var.to_owned(),
+        KeyFlag::Unspecified => match chosen {
+            Some(Preset {
+                key_env: Some(var), ..
+            }) => Credential::Env {
+                var: (*var).to_owned(),
             },
-            None => Credential::None,
+            Some(_) => Credential::None,
+            None => Credential::Unchanged,
         },
     };
     Ok(Choice {
@@ -553,12 +569,7 @@ fn ask_preset(prompter: &mut dyn Prompter) -> Result<&'static Preset, String> {
         .and_then(|number| number.checked_sub(1))
         .and_then(|index| PRESETS.get(index))
         .or_else(|| preset(&answer))
-        .ok_or_else(|| {
-            format!(
-                "rapid setup: unknown preset '{answer}' (one of: {})",
-                preset_ids()
-            )
-        })
+        .ok_or_else(|| format!("rapid setup: unknown preset (one of: {})", preset_ids()))
 }
 
 fn ask(prompter: &mut dyn Prompter, question: &str, default: &str) -> Result<String, String> {
@@ -627,9 +638,20 @@ pub struct SetupPlan {
     pub set: Vec<(String, String)>,
     /// Dotted keys removed (a credential key that would shadow the chosen one).
     pub unset: Vec<String>,
+    /// Keys of the profile setup leaves as they are (`max_tokens`, …).
+    pub kept: Vec<String>,
+    /// For `Credential::Unchanged`: the credential key the profile keeps.
+    pub kept_credential: Option<String>,
     /// Whether the credential's environment variable is set right now (for
     /// `Credential::Env`): the plan says so, never what it holds.
     pub env_key_present: Option<bool>,
+    /// When a run would use another profile than the one written — the
+    /// `RAPIDLM_MODEL` override or a managed locked default — which one and
+    /// the layer that decides it.
+    pub effective: Option<(String, &'static str)>,
+    /// The symlink the config path is reached through, when it is one: the
+    /// file behind it is the one written.
+    pub via_symlink: Option<PathBuf>,
     pub verify: bool,
     /// The file's content after the run.
     pub document: String,
@@ -642,6 +664,7 @@ pub fn plan(
     config_path: &Path,
     existing: Option<&str>,
     env: &[(String, String)],
+    policy: Option<&crate::managed_config::ManagedPolicy>,
     verify: bool,
     now_compact: &str,
 ) -> Result<SetupPlan, String> {
@@ -657,54 +680,114 @@ pub fn plan(
     };
     let mut set = Vec::new();
     let mut unset = Vec::new();
+    let kept: Vec<String>;
+    let mut kept_credential = None;
+    let mut changed = existing.is_none();
     {
-        let models = table_at(doc.as_table_mut(), "models", config_path, false)?;
-        set_value(models, "default", &choice.profile, "models", &mut set);
+        let models = table_at(
+            doc.as_table_mut(),
+            "models",
+            config_path,
+            false,
+            &mut changed,
+        )?;
+        changed |= set_value(models, "default", &choice.profile, "models", &mut set);
     }
     {
-        let model = table_at(doc.as_table_mut(), "model", config_path, true)?;
-        let profile = table_at(model, &choice.profile, config_path, false)?;
+        let model = table_at(doc.as_table_mut(), "model", config_path, true, &mut changed)?;
+        let profile = table_at(model, &choice.profile, config_path, false, &mut changed)?;
         let prefix = format!("model.{}", choice.profile);
-        set_value(
+        changed |= set_value(
             profile,
             "provider",
             choice.dialect.as_str(),
             &prefix,
             &mut set,
         );
-        set_value(profile, "model", &choice.model, &prefix, &mut set);
-        set_value(profile, "base_url", &choice.base_url, &prefix, &mut set);
+        changed |= set_value(profile, "model", &choice.model, &prefix, &mut set);
+        changed |= set_value(profile, "base_url", &choice.base_url, &prefix, &mut set);
+        let credential_keys = ["api_key", "env_key", "keychain"];
         let keep = match &choice.credential {
             Credential::Env { var } => {
-                set_value(profile, "env_key", var, &prefix, &mut set);
+                changed |= set_value(profile, "env_key", var, &prefix, &mut set);
                 Some("env_key")
             }
             Credential::Keychain { alias } => {
-                set_value(profile, "keychain", alias, &prefix, &mut set);
+                changed |= set_value(profile, "keychain", alias, &prefix, &mut set);
                 Some("keychain")
             }
             Credential::None => None,
+            Credential::Unchanged => {
+                // The resolver's own precedence: an inline key wins, then
+                // the variable, then the keychain.
+                kept_credential = credential_keys
+                    .iter()
+                    .find(|key| profile.contains_key(key))
+                    .map(|key| format!("{prefix}.{key}"));
+                Some("*")
+            }
         };
         // Credential keys other than the chosen one would shadow it (an
         // inline `api_key` wins over everything) or contradict it.
-        for key in ["api_key", "env_key", "keychain"] {
-            if Some(key) != keep && profile.remove(key).is_some() {
-                unset.push(format!("{prefix}.{key}"));
+        if keep != Some("*") {
+            for key in credential_keys {
+                if Some(key) != keep && profile.remove(key).is_some() {
+                    unset.push(format!("{prefix}.{key}"));
+                    changed = true;
+                }
             }
         }
+        let written: Vec<&str> = ["provider", "model", "base_url"]
+            .into_iter()
+            .chain(credential_keys)
+            .collect();
+        kept = profile
+            .iter()
+            .map(|(key, _)| key.to_owned())
+            .filter(|key| !written.contains(&key.as_str()))
+            .map(|key| format!("{prefix}.{key}"))
+            .collect();
     }
-    let document = doc.to_string();
-    // What a turn will read must parse: setup never leaves a config the
-    // reader rejects.
-    parse_config_document(&document, &config_path.display().to_string()).map_err(|err| {
+    // Nothing changed: the file stays byte for byte as it is — CRLF line
+    // endings, a byte-order mark and a missing final newline included, which
+    // re-serialising would otherwise normalise into an "update".
+    let document = match existing {
+        Some(previous) if !changed => previous.to_owned(),
+        _ => with_original_line_endings(existing, doc.to_string()),
+    };
+    if document.len() > crate::user_config::MAX_USER_CONFIG_BYTES {
+        return Err(format!(
+            "rapid setup: {} would exceed {} bytes, the most a run reads; it is left untouched",
+            config_path.display(),
+            crate::user_config::MAX_USER_CONFIG_BYTES
+        ));
+    }
+    // What a turn will read must parse — and resolve, through the same
+    // managed gates a run applies: setup never leaves a config a run
+    // refuses (a provider outside a managed allowlist, say).
+    let parsed =
+        parse_config_document(&document, &config_path.display().to_string()).map_err(|err| {
+            format!(
+                "rapid setup: {} would not parse after the change and is left untouched: {err}",
+                config_path.display()
+            )
+        })?;
+    let resolution = crate::managed_config::resolve_gated(env, &parsed, policy).map_err(|err| {
         format!(
-            "rapid setup: {} would not parse after the change and is left untouched: {err}",
+            "rapid setup: a run would refuse the configuration this writes, so {} is left \
+untouched: {err}",
             config_path.display()
         )
     })?;
+    let effective = (resolution.active.profile_id != choice.profile).then(|| {
+        (
+            resolution.active.profile_id.clone(),
+            resolution.default_origin.as_str(),
+        )
+    });
     let action = match existing {
         None => FileAction::Create,
-        Some(previous) if previous == document => FileAction::Unchanged,
+        Some(_) if !changed => FileAction::Unchanged,
         Some(_) => FileAction::Update,
     };
     let backup = (action == FileAction::Update).then(|| {
@@ -725,24 +808,53 @@ pub fn plan(
         backup,
         set,
         unset,
+        kept,
+        kept_credential,
         env_key_present,
+        effective,
+        via_symlink: None,
         verify,
         document,
     })
 }
 
-/// The table at `key` in `parent`, created when absent; an existing
-/// non-table value there is an error naming it.
+/// A re-serialised document in the original's line-ending convention: CRLF
+/// kept when the original used it, and its byte-order mark.
+fn with_original_line_endings(original: Option<&str>, rendered: String) -> String {
+    let Some(original) = original else {
+        return rendered;
+    };
+    let mut out = if original.contains("\r\n") {
+        rendered.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        rendered
+    };
+    if original.starts_with('\u{feff}') && !out.starts_with('\u{feff}') {
+        out.insert(0, '\u{feff}');
+    }
+    out
+}
+
+/// The table at `key` in `parent`, created when absent (an inline table
+/// there is turned into a standard one — same keys, same values); any other
+/// value there is an error naming it. `changed` records a creation or a
+/// conversion.
 fn table_at<'a>(
     parent: &'a mut toml_edit::Table,
     key: &str,
     config_path: &Path,
     implicit: bool,
+    changed: &mut bool,
 ) -> Result<&'a mut toml_edit::Table, String> {
     if !parent.contains_key(key) {
         let mut table = toml_edit::Table::new();
         table.set_implicit(implicit);
         parent.insert(key, toml_edit::Item::Table(table));
+        *changed = true;
+    } else if let Some(inline) = parent.get(key).and_then(toml_edit::Item::as_inline_table) {
+        let table = inline.clone().into_table();
+        parent.insert(key, toml_edit::Item::Table(table));
+        *changed = true;
     }
     parent
         .get_mut(key)
@@ -755,20 +867,35 @@ fn table_at<'a>(
         })
 }
 
-/// Set `table[key] = value` (a string), keeping the entry's decoration when
-/// it already holds that value, and record the change.
+/// Set `table[key] = value` (a string) and record it. An existing entry is
+/// replaced in place: the comment lines above the key and the comment after
+/// the value survive. `true` when the file changes.
 fn set_value(
     table: &mut toml_edit::Table,
     key: &str,
     value: &str,
     prefix: &str,
     set: &mut Vec<(String, String)>,
-) {
-    let current = table.get(key).and_then(toml_edit::Item::as_str);
-    if current != Some(value) {
-        table.insert(key, toml_edit::value(value));
-    }
+) -> bool {
     set.push((format!("{prefix}.{key}"), value.to_owned()));
+    match table.get_mut(key) {
+        Some(item) if item.as_str() == Some(value) => false,
+        Some(item) => {
+            match item.as_value_mut() {
+                Some(existing) => {
+                    let decor = existing.decor().clone();
+                    *existing = toml_edit::Value::from(value);
+                    *existing.decor_mut() = decor;
+                }
+                None => *item = toml_edit::value(value),
+            }
+            true
+        }
+        None => {
+            table.insert(key, toml_edit::value(value));
+            true
+        }
+    }
 }
 
 /// The plan as the text a person reads.
@@ -777,7 +904,14 @@ pub fn render_text(plan: &SetupPlan, dry_run: bool) -> String {
     if dry_run {
         out.push_str("rapid setup — dry run: nothing was written and no request was made\n");
     }
-    let path = plan.config_path.display();
+    let path = match &plan.via_symlink {
+        Some(link) => format!(
+            "{} (through {})",
+            plan.config_path.display(),
+            link.display()
+        ),
+        None => plan.config_path.display().to_string(),
+    };
     match plan.action {
         FileAction::Unchanged => out.push_str(&format!(
             "  config   {path}  unchanged — it already holds this profile\n"
@@ -800,6 +934,9 @@ pub fn render_text(plan: &SetupPlan, dry_run: bool) -> String {
     for key in &plan.unset {
         out.push_str(&format!("  unset    {key}\n"));
     }
+    if !plan.kept.is_empty() {
+        out.push_str(&format!("  kept     {}\n", plan.kept.join(", ")));
+    }
     out.push_str(&match &plan.choice.credential {
         Credential::Env { var } => format!(
             "  key      ${var} at request time ({}) — the config names the variable, never the value\n",
@@ -815,7 +952,22 @@ pub fn render_text(plan: &SetupPlan, dry_run: bool) -> String {
         Credential::None => {
             "  key      none — the endpoint is called without credentials\n".to_owned()
         }
+        Credential::Unchanged => match &plan.kept_credential {
+            Some(key) => format!("  key      {key} is kept as it is\n"),
+            None => {
+                "  key      none — the endpoint is called without credentials (--key-env or \
+--key-stdin adds one)\n"
+                    .to_owned()
+            }
+        },
     });
+    if let Some((profile, origin)) = &plan.effective {
+        out.push_str(&format!(
+            "  note     runs will use profile '{profile}' (decided by the {origin} layer), not \
+'{}'\n",
+            plan.choice.profile
+        ));
+    }
     out.push_str(&if plan.verify {
         format!(
             "  verify   one request of at most {VERIFY_MAX_OUTPUT_TOKENS} output tokens to {} before anything is written\n",
@@ -844,6 +996,10 @@ pub fn render_json(plan: &SetupPlan, dry_run: bool) -> serde_json::Value {
             "alias": alias,
         }),
         Credential::None => serde_json::json!({ "source": "none" }),
+        Credential::Unchanged => serde_json::json!({
+            "source": "unchanged",
+            "key": plan.kept_credential,
+        }),
     };
     serde_json::json!({
         "schema": "rapidlm.setup_plan/v1",
@@ -852,6 +1008,7 @@ pub fn render_json(plan: &SetupPlan, dry_run: bool) -> serde_json::Value {
         "preset": plan.choice.preset.map(|preset| preset.id),
         "files": [{
             "path": plan.config_path.display().to_string(),
+            "via_symlink": plan.via_symlink.as_ref().map(|link| link.display().to_string()),
             "action": plan.action.as_str(),
             "mode": format!("{:o}", CONFIG_FILE_MODE),
             "backup": plan.backup.as_ref().map(|path| path.display().to_string()),
@@ -862,7 +1019,10 @@ pub fn render_json(plan: &SetupPlan, dry_run: bool) -> serde_json::Value {
             .map(|(key, value)| serde_json::json!({ "key": key, "value": value }))
             .collect::<Vec<_>>(),
         "unset": plan.unset,
+        "kept": plan.kept,
         "credential": credential,
+        "effective_profile": plan.effective.as_ref().map(|(profile, _)| profile),
+        "effective_origin": plan.effective.as_ref().map(|(_, origin)| origin),
         "verify": {
             "planned": plan.verify,
             "endpoint": plan.choice.base_url,
@@ -927,38 +1087,55 @@ pub fn run(args: &[String], env: &SetupEnv, prompter: &mut dyn Prompter) -> Setu
         Ok(path) => path,
         Err(message) => return usage_error(message),
     };
-    let existing = match std::fs::read_to_string(&config_path) {
-        Ok(text) => Some(text),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+    let failed = |message: String| SetupOutcome {
+        stdout: String::new(),
+        stderr: format!("{message}\n"),
+        exit: 1,
+    };
+    // A symlinked config is edited where it points: the reader follows the
+    // link, and replacing the link itself would detach it.
+    let link = config_path
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+        .then(|| config_path.clone());
+    let config_path = match &link {
+        Some(link) => match std::fs::canonicalize(link) {
+            Ok(target) => target,
+            Err(err) => {
+                return failed(format!(
+                    "rapid setup: {} is a symlink that does not resolve: {err}",
+                    link.display()
+                ));
+            }
+        },
+        None => config_path,
+    };
+    let existing = match read_existing(&config_path) {
+        Ok(existing) => existing,
+        Err(message) => return failed(message),
+    };
+    let policy = match crate::managed_config::load_policy(&env.env) {
+        Ok(policy) => policy,
         Err(err) => {
-            return SetupOutcome {
-                stdout: String::new(),
-                stderr: format!(
-                    "rapid setup: {} could not be read: {err}\n",
-                    config_path.display()
-                ),
-                exit: 1,
-            };
+            return failed(format!(
+                "rapid setup: the managed policy could not be loaded, so nothing is planned: {err}"
+            ));
         }
     };
     let now = compact_utc_now();
-    let plan = match plan(
+    let mut plan = match plan(
         choice,
         &config_path,
         existing.as_deref(),
         &env.env,
+        policy.as_ref(),
         !parsed.no_verify,
         &now,
     ) {
         Ok(plan) => plan,
-        Err(message) => {
-            return SetupOutcome {
-                stdout: String::new(),
-                stderr: format!("{message}\n"),
-                exit: 1,
-            };
-        }
+        Err(message) => return failed(message),
     };
+    plan.via_symlink = link;
     if !parsed.dry_run {
         return SetupOutcome {
             stdout: String::new(),
@@ -979,17 +1156,56 @@ this build does not have yet; --dry-run prints what would be written\n"
     }
 }
 
-/// `20260924T051500Z`: UTC now, compact, for a backup file's name.
+/// The config's current content: `None` when there is no file. Bounded like
+/// the reader's own read, and only a regular file (a device or a pipe named
+/// by `RAPIDLM_CONFIG` would block, or swallow a `--key-stdin` key).
+fn read_existing(path: &Path) -> Result<Option<String>, String> {
+    match path.metadata() {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "rapid setup: {} could not be read: {err}",
+                path.display()
+            ));
+        }
+        Ok(meta) if !meta.is_file() => {
+            return Err(format!(
+                "rapid setup: {} is not a regular file",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+    }
+    let bytes =
+        crate::exec_tools::read_file_bounded(path, crate::user_config::MAX_USER_CONFIG_BYTES)
+            .map_err(|err| match err {
+                crate::exec_tools::BoundedReadError::TooLarge => format!(
+                    "rapid setup: {} exceeds {} bytes, the most a run reads",
+                    path.display(),
+                    crate::user_config::MAX_USER_CONFIG_BYTES
+                ),
+                crate::exec_tools::BoundedReadError::Io(err) => {
+                    format!("rapid setup: {} could not be read: {err}", path.display())
+                }
+            })?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| format!("rapid setup: {} is not UTF-8", path.display()))
+}
+
+/// `20260924T051500.123Z`: UTC now, compact, to the millisecond, for a
+/// backup file's name (two runs in one second get two names).
 fn compact_utc_now() -> String {
     let now = time::OffsetDateTime::now_utc();
     format!(
-        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        "{:04}{:02}{:02}T{:02}{:02}{:02}.{:03}Z",
         now.year(),
         u8::from(now.month()),
         now.day(),
         now.hour(),
         now.minute(),
-        now.second()
+        now.second(),
+        now.millisecond()
     )
 }
 
@@ -1116,7 +1332,7 @@ mod tests {
                 &mut Scripted(Vec::new()),
             )
             .expect("resolves");
-            let plan = plan(choice, Path::new("config.toml"), None, &[], true, "T")
+            let plan = plan(choice, Path::new("config.toml"), None, &[], None, true, "T")
                 .expect("plans a config the reader accepts");
             let config = parse_config_document(&plan.document, "config.toml").expect("parses");
             let entry = config.models.entries.get(preset.id).expect("the profile");
@@ -1265,7 +1481,8 @@ api_key = \"inline-secret\"
             &mut Scripted(Vec::new()),
         )
         .expect("choice");
-        let plan = plan(choice, &home.config(), Some(existing), &[], true, "T").expect("plan");
+        let plan =
+            plan(choice, &home.config(), Some(existing), &[], None, true, "T").expect("plan");
         assert!(
             plan.document.contains("# my models"),
             "comments kept:\n{}",
@@ -1290,8 +1507,16 @@ api_key = \"inline-secret\"
             &mut Scripted(Vec::new()),
         )
         .expect("choice");
-        let second =
-            super::plan(again, &home.config(), Some(&plan.document), &[], true, "T").expect("plan");
+        let second = super::plan(
+            again,
+            &home.config(),
+            Some(&plan.document),
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
         assert_eq!(second.action, FileAction::Unchanged);
         assert_eq!(second.backup, None);
     }
@@ -1324,21 +1549,43 @@ api_key = \"inline-secret\"
             assert!(err.contains("visible in the process list"), "{flag}: {err}");
             assert!(!err.contains("sk-123"), "the value is not echoed: {err}");
         }
-        let err = parse_args(&args(&["--key-env", "sk-live-abc123"]));
-        assert!(err.is_err(), "a key is not an environment variable name");
+        for key in [
+            "sk-live-abc123",
+            "gsk_0123456789abcdefABCDEF",
+            "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6",
+        ] {
+            let err = parse_args(&args(&["--key-env", key])).expect_err("refused");
+            assert!(!err.contains(key), "a key is never echoed: {err}");
+        }
+        // Rejected values anywhere are never echoed: they may be keys.
+        for list in [
+            vec!["sk-live-abc123"],
+            vec!["-k=sk-live-abc123"],
+            vec!["--sk-live-abc123"],
+            vec!["--base-url", "https://user:sk-live-abc123@gw.example/v1"],
+            vec!["--preset", "sk-live-abc123"],
+        ] {
+            let err = parse_args(&args(&list)).expect_err("refused");
+            assert!(!err.contains("sk-live-abc123"), "{list:?} echoed: {err}");
+        }
     }
 
     #[test]
     fn the_argument_surface_is_closed_and_consistent() {
         for (list, needle) in [
             (vec!["--preset"], "needs a value"),
-            (vec!["--preset", "nope"], "unknown preset 'nope'"),
+            (vec!["--preset", "nope"], "unknown preset (one of"),
             (vec!["--bogus"], "unknown option --bogus"),
-            (vec!["stray"], "unexpected argument 'stray'"),
+            (
+                vec!["stray"],
+                "unexpected argument — setup takes only --options",
+            ),
             (vec!["--dry-run", "--dry-run"], "given twice"),
             (vec!["--key-env", "A", "--key-stdin"], "alternatives"),
             (vec!["--output", "yaml"], "text or json"),
-            (vec!["--profile", "has space"], "--profile must be"),
+            (vec!["--profile", "has space"], "--profile must start with"),
+            (vec!["--profile", "my_openai"], "--profile must start with"),
+            (vec!["--model", "-x"], "--model must be"),
             (
                 vec!["--base-url", "http://user:pw@example.com"],
                 "not usable",
@@ -1446,7 +1693,7 @@ api_key = \"inline-secret\"
                 alias: "rapidlm-model-gw".to_owned()
             }
         );
-        let plan = plan(choice, Path::new("c.toml"), None, &[], false, "T").expect("plan");
+        let plan = plan(choice, Path::new("c.toml"), None, &[], None, false, "T").expect("plan");
         let text = render_text(&plan, true);
         assert!(text.contains("OS keychain as 'rapidlm-model-gw'"), "{text}");
         assert!(text.contains("verify   skipped (--no-verify)"), "{text}");
@@ -1504,5 +1751,259 @@ api_key = \"inline-secret\"
             outcome.stderr
         );
         assert_eq!(home.snapshot(), before);
+    }
+
+    fn choice_for(list: &[&str]) -> Choice {
+        resolve_choice(
+            &parse_args(&args(list)).expect("args"),
+            false,
+            &mut Scripted(Vec::new()),
+        )
+        .expect("choice")
+    }
+
+    #[test]
+    fn help_names_every_flag_and_every_preset() {
+        let outcome = run(
+            &args(&["--help"]),
+            &Home::new("help").env(),
+            &mut Scripted(Vec::new()),
+        );
+        assert_eq!(outcome.exit, 0);
+        for needle in [
+            "--preset",
+            "--profile",
+            "--model",
+            "--base-url",
+            "--key-env",
+            "--key-stdin",
+            "--dry-run",
+            "--non-interactive",
+            "--output",
+            "--no-verify",
+        ] {
+            assert!(outcome.stdout.contains(needle), "{needle}");
+        }
+        for preset in PRESETS {
+            assert!(outcome.stdout.contains(preset.id), "{}", preset.id);
+        }
+    }
+
+    #[test]
+    fn comments_on_a_changed_key_survive_and_an_unchanged_file_is_left_byte_for_byte() {
+        let existing = "\
+[models]
+# keep local on the laptop
+default = \"local\"  # the usual one
+
+[model.local]
+provider = \"openai-compatible\"
+model = \"llama3.2\"
+base_url = \"http://127.0.0.1:11434/v1\"
+";
+        let plan = plan(
+            choice_for(&["--preset", "openai"]),
+            Path::new("c.toml"),
+            Some(existing),
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert!(
+            plan.document
+                .contains("# keep local on the laptop\ndefault = \"openai\""),
+            "{}",
+            plan.document
+        );
+        assert!(
+            plan.document.contains("# the usual one"),
+            "{}",
+            plan.document
+        );
+        // A file already holding exactly this profile, in CRLF with a BOM and
+        // no final newline: `unchanged`, byte for byte, no backup.
+        let written = plan.document.replace('\n', "\r\n");
+        let odd = format!("\u{feff}{}", written.trim_end_matches("\r\n"));
+        let again = super::plan(
+            choice_for(&["--preset", "openai"]),
+            Path::new("c.toml"),
+            Some(&odd),
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert_eq!(again.action, FileAction::Unchanged);
+        assert_eq!(again.document, odd);
+        assert_eq!(again.backup, None);
+        // A change to such a file keeps its CRLF line endings and its BOM.
+        let changed = super::plan(
+            choice_for(&["--preset", "openai", "--model", "gpt-5-mini"]),
+            Path::new("c.toml"),
+            Some(&odd),
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert_eq!(changed.action, FileAction::Update);
+        assert!(changed.document.starts_with('\u{feff}'));
+        assert!(
+            !changed.document.replace("\r\n", "").contains('\n'),
+            "only CRLF line endings"
+        );
+    }
+
+    #[test]
+    fn the_plan_says_when_a_run_would_use_another_profile_and_refuses_what_a_run_refuses() {
+        // RAPIDLM_MODEL overrides `[models] default`: the plan says so.
+        let existing = "\
+[model.local]
+provider = \"openai-compatible\"
+model = \"llama3.2\"
+base_url = \"http://127.0.0.1:11434/v1\"
+";
+        let env = vec![(
+            crate::user_config::DEFAULT_MODEL_ENV.to_owned(),
+            "local".to_owned(),
+        )];
+        let plan = plan(
+            choice_for(&["--preset", "openai"]),
+            Path::new("c.toml"),
+            Some(existing),
+            &env,
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert_eq!(plan.effective, Some(("local".to_owned(), "env")));
+        assert!(render_text(&plan, true).contains("runs will use profile 'local'"));
+        assert_eq!(render_json(&plan, true)["effective_profile"], "local");
+        // A managed allowlist that refuses the dialect: nothing is planned.
+        let policy = crate::managed_config::ManagedPolicy::parse(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\nallowed_providers = [\"openai-compatible\"]\n",
+        )
+        .expect("policy");
+        let err = super::plan(
+            choice_for(&["--preset", "anthropic"]),
+            Path::new("c.toml"),
+            None,
+            &[],
+            Some(&policy),
+            true,
+            "T",
+        )
+        .expect_err("a run would refuse it");
+        assert!(err.contains("a run would refuse"), "{err}");
+    }
+
+    #[test]
+    fn an_inline_table_config_is_edited_and_a_custom_endpoint_keeps_its_credential() {
+        let existing = "\
+models = { default = \"gw\" }
+
+[model]
+gw = { provider = \"openai-compatible\", model = \"m\", base_url = \"http://10.0.0.5:9000/v1\", env_key = \"GW_KEY\", max_tokens = 1024 }
+";
+        let plan = plan(
+            choice_for(&[
+                "--base-url",
+                "http://10.0.0.6:9000/v1",
+                "--model",
+                "m2",
+                "--profile",
+                "gw",
+            ]),
+            Path::new("c.toml"),
+            Some(existing),
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("an inline table is not refused");
+        let parsed = parse_config_document(&plan.document, "c").expect("parses");
+        let entry = parsed.models.entries.get("gw").expect("profile");
+        assert_eq!(entry.model, "m2");
+        assert_eq!(entry.base_url, "http://10.0.0.6:9000/v1");
+        assert_eq!(
+            entry.env_key,
+            vec!["GW_KEY".to_owned()],
+            "the credential is kept, not stripped"
+        );
+        assert!(plan.unset.is_empty(), "{:?}", plan.unset);
+        assert_eq!(plan.kept, vec!["model.gw.max_tokens".to_owned()]);
+        assert_eq!(plan.kept_credential.as_deref(), Some("model.gw.env_key"));
+        let text = render_text(&plan, true);
+        assert!(text.contains("model.gw.env_key is kept as it is"), "{text}");
+        assert!(text.contains("kept     model.gw.max_tokens"), "{text}");
+    }
+
+    #[test]
+    fn the_target_agrees_with_the_reader_once_the_file_exists() {
+        let home = Home::new("reader");
+        let env: Vec<(String, String)> = vec![
+            (
+                RAPIDLM_HOME_ENV.to_owned(),
+                home.0.join("rh").display().to_string(),
+            ),
+            (HOME_ENV.to_owned(), home.0.display().to_string()),
+        ];
+        let target = config_target(&env).expect("target");
+        std::fs::create_dir_all(target.parent().expect("dir")).expect("dir");
+        std::fs::write(&target, "").expect("file");
+        match crate::user_config::resolve_config_source(&env) {
+            crate::user_config::ConfigSource::HomeFallback(read) => assert_eq!(read, target),
+            other => panic!("the reader looks elsewhere: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_is_planned_where_it_points() {
+        let home = Home::new("symlink");
+        let real = home.0.join("real.toml");
+        std::fs::write(&real, "").expect("real");
+        std::fs::create_dir_all(home.0.join(".rapidlm")).expect("dir");
+        std::os::unix::fs::symlink(&real, home.config()).expect("link");
+        let outcome = run(
+            &args(&["--preset", "ollama", "--dry-run", "--output", "json"]),
+            &home.env(),
+            &mut Scripted(Vec::new()),
+        );
+        assert_eq!(outcome.exit, 0, "{}", outcome.stderr);
+        let plan: serde_json::Value = serde_json::from_str(&outcome.stdout).expect("json");
+        let canonical = std::fs::canonicalize(&real).expect("canonical");
+        assert_eq!(plan["files"][0]["path"], canonical.display().to_string());
+        assert_eq!(
+            plan["files"][0]["via_symlink"],
+            home.config().display().to_string()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_path_that_is_not_a_regular_file_is_refused() {
+        let home = Home::new("fifo");
+        let env = SetupEnv {
+            env: vec![(CONFIG_PATH_ENV.to_owned(), home.0.display().to_string())],
+            stdin_is_tty: false,
+        };
+        let outcome = run(
+            &args(&["--preset", "ollama", "--dry-run"]),
+            &env,
+            &mut Scripted(Vec::new()),
+        );
+        assert_eq!(outcome.exit, 1);
+        assert!(
+            outcome.stderr.contains("not a regular file"),
+            "{}",
+            outcome.stderr
+        );
     }
 }
