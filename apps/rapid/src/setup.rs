@@ -316,10 +316,8 @@ given on the command line)"
                 parsed.output = match value.as_str() {
                     "json" => OutputFormat::Json,
                     "text" => OutputFormat::Text,
-                    other => {
-                        return Err(format!(
-                            "rapid setup: --output takes text or json, not '{other}'"
-                        ));
+                    _ => {
+                        return Err("rapid setup: --output takes text or json".to_owned());
                     }
                 }
             }
@@ -638,6 +636,9 @@ pub struct SetupPlan {
     pub set: Vec<(String, String)>,
     /// Dotted keys removed (a credential key that would shadow the chosen one).
     pub unset: Vec<String>,
+    /// Things the user should know before the file is written (a removed
+    /// credential, an override from this shell, a key a run would ignore).
+    pub notes: Vec<String>,
     /// Keys of the profile setup leaves as they are (`max_tokens`, …).
     pub kept: Vec<String>,
     /// For `Credential::Unchanged`: the credential key the profile keeps.
@@ -680,23 +681,44 @@ pub fn plan(
     };
     let mut set = Vec::new();
     let mut unset = Vec::new();
+    let mut notes = Vec::new();
     let kept: Vec<String>;
     let mut kept_credential = None;
     let mut changed = existing.is_none();
     {
-        let models = table_at(
+        let (models, _) = table_at(
             doc.as_table_mut(),
             "models",
-            config_path,
             false,
+            false,
+            config_path,
             &mut changed,
         )?;
         changed |= set_value(models, "default", &choice.profile, "models", &mut set);
     }
     {
-        let model = table_at(doc.as_table_mut(), "model", config_path, true, &mut changed)?;
-        let profile = table_at(model, &choice.profile, config_path, false, &mut changed)?;
+        let (model, model_inline) = table_at(
+            doc.as_table_mut(),
+            "model",
+            false,
+            true,
+            config_path,
+            &mut changed,
+        )?;
+        let (profile, _) = table_at(
+            model,
+            &choice.profile,
+            model_inline,
+            false,
+            config_path,
+            &mut changed,
+        )?;
         let prefix = format!("model.{}", choice.profile);
+        // The endpoint the profile's existing credential was set up for.
+        let previous_base_url = profile
+            .get("base_url")
+            .and_then(toml_edit::Item::as_str)
+            .map(str::to_owned);
         changed |= set_value(
             profile,
             "provider",
@@ -720,11 +742,29 @@ pub fn plan(
             Credential::Unchanged => {
                 // The resolver's own precedence: an inline key wins, then
                 // the variable, then the keychain.
-                kept_credential = credential_keys
+                let existing_key = credential_keys
                     .iter()
                     .find(|key| profile.contains_key(key))
                     .map(|key| format!("{prefix}.{key}"));
-                Some("*")
+                // A kept credential goes only to the endpoint it was set up
+                // for: a key for one host is never sent to another.
+                let same_origin = previous_base_url
+                    .as_deref()
+                    .is_some_and(|previous| same_origin(previous, &choice.base_url));
+                match existing_key {
+                    Some(_) if !same_origin => {
+                        notes.push(
+                            "the profile's key was set up for another endpoint and is removed; \
+--key-env or --key-stdin adds one for this one"
+                                .to_owned(),
+                        );
+                        None
+                    }
+                    key => {
+                        kept_credential = key;
+                        Some("*")
+                    }
+                }
             }
         };
         // Credential keys other than the chosen one would shadow it (an
@@ -763,8 +803,11 @@ pub fn plan(
         ));
     }
     // What a turn will read must parse — and resolve, through the same
-    // managed gates a run applies: setup never leaves a config a run
-    // refuses (a provider outside a managed allowlist, say).
+    // managed gates a run applies, as the file decides it: setup never
+    // leaves a config a run refuses (a provider outside a managed
+    // allowlist, say). `RAPIDLM_MODEL` is set aside for this: it is this
+    // shell's choice, not the file's, and must neither refuse a good plan nor
+    // let a bad one through.
     let parsed =
         parse_config_document(&document, &config_path.display().to_string()).map_err(|err| {
             format!(
@@ -772,19 +815,51 @@ pub fn plan(
                 config_path.display()
             )
         })?;
-    let resolution = crate::managed_config::resolve_gated(env, &parsed, policy).map_err(|err| {
-        format!(
-            "rapid setup: a run would refuse the configuration this writes, so {} is left \
+    let file_env: Vec<(String, String)> = env
+        .iter()
+        .filter(|(key, _)| key != crate::user_config::DEFAULT_MODEL_ENV)
+        .cloned()
+        .collect();
+    let resolution =
+        crate::managed_config::resolve_gated(&file_env, &parsed, policy).map_err(|err| {
+            format!(
+                "rapid setup: a run would refuse the configuration this writes, so {} is left \
 untouched: {err}",
-            config_path.display()
-        )
-    })?;
-    let effective = (resolution.active.profile_id != choice.profile).then(|| {
-        (
+                config_path.display()
+            )
+        })?;
+    let effective = if resolution.active.profile_id != choice.profile {
+        // A managed locked default.
+        Some((
             resolution.active.profile_id.clone(),
             resolution.default_origin.as_str(),
-        )
-    });
+        ))
+    } else {
+        match crate::managed_config::resolve_gated(env, &parsed, policy) {
+            Ok(real) if real.active.profile_id != choice.profile => {
+                Some((real.active.profile_id, real.default_origin.as_str()))
+            }
+            Ok(_) => None,
+            Err(err) => {
+                notes.push(format!(
+                    "with this shell's RAPIDLM_MODEL a run would fail: {err}"
+                ));
+                None
+            }
+        }
+    };
+    // Keys of this profile a run would not read (a newer key than this
+    // build's reader knows) are named, not silently written.
+    let profile_prefix = format!("model.{}.", choice.profile);
+    for key in parsed
+        .unknown_keys
+        .iter()
+        .filter(|key| key.starts_with(&profile_prefix))
+    {
+        notes.push(format!(
+            "a run would ignore {key}: this build does not read it"
+        ));
+    }
     let action = match existing {
         None => FileAction::Create,
         Some(_) if !changed => FileAction::Unchanged,
@@ -808,6 +883,7 @@ untouched: {err}",
         backup,
         set,
         unset,
+        notes,
         kept,
         kept_credential,
         env_key_present,
@@ -824,7 +900,9 @@ fn with_original_line_endings(original: Option<&str>, rendered: String) -> Strin
     let Some(original) = original else {
         return rendered;
     };
-    let mut out = if original.contains("\r\n") {
+    let crlf = original.matches("\r\n").count();
+    let lines = original.matches('\n').count();
+    let mut out = if crlf * 2 > lines {
         rendered.replace("\r\n", "\n").replace('\n', "\r\n")
     } else {
         rendered
@@ -835,50 +913,53 @@ fn with_original_line_endings(original: Option<&str>, rendered: String) -> Strin
     out
 }
 
-/// The table at `key` in `parent`, created when absent (an inline table
-/// there is turned into a standard one — same keys, same values); any other
-/// value there is an error naming it. `changed` records a creation or a
-/// conversion.
+/// The table at `key` in `parent` — a standard or an inline table, edited in
+/// place either way (converting an inline table would drop its comments) —
+/// created when absent, inline inside an inline parent. Any other value
+/// there is an error naming it. Returns whether it is inline; `changed`
+/// records a creation.
 fn table_at<'a>(
-    parent: &'a mut toml_edit::Table,
+    parent: &'a mut dyn toml_edit::TableLike,
     key: &str,
-    config_path: &Path,
+    parent_inline: bool,
     implicit: bool,
+    config_path: &Path,
     changed: &mut bool,
-) -> Result<&'a mut toml_edit::Table, String> {
+) -> Result<(&'a mut dyn toml_edit::TableLike, bool), String> {
     if !parent.contains_key(key) {
-        let mut table = toml_edit::Table::new();
-        table.set_implicit(implicit);
-        parent.insert(key, toml_edit::Item::Table(table));
-        *changed = true;
-    } else if let Some(inline) = parent.get(key).and_then(toml_edit::Item::as_inline_table) {
-        let table = inline.clone().into_table();
-        parent.insert(key, toml_edit::Item::Table(table));
+        let item = if parent_inline {
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(toml_edit::InlineTable::new()))
+        } else {
+            let mut table = toml_edit::Table::new();
+            table.set_implicit(implicit);
+            toml_edit::Item::Table(table)
+        };
+        parent.insert(key, item);
         *changed = true;
     }
-    parent
-        .get_mut(key)
-        .and_then(toml_edit::Item::as_table_mut)
-        .ok_or_else(|| {
-            format!(
-                "rapid setup: `{key}` in {} is not a table; fix it by hand",
-                config_path.display()
-            )
-        })
+    let not_a_table = || {
+        format!(
+            "rapid setup: `{key}` in {} is not a table; fix it by hand",
+            config_path.display()
+        )
+    };
+    let item = parent.get_mut(key).ok_or_else(not_a_table)?;
+    let inline = item.is_inline_table();
+    let table = item.as_table_like_mut().ok_or_else(not_a_table)?;
+    Ok((table, inline))
 }
 
 /// Set `table[key] = value` (a string) and record it. An existing entry is
 /// replaced in place: the comment lines above the key and the comment after
 /// the value survive. `true` when the file changes.
 fn set_value(
-    table: &mut toml_edit::Table,
+    table: &mut dyn toml_edit::TableLike,
     key: &str,
     value: &str,
     prefix: &str,
     set: &mut Vec<(String, String)>,
 ) -> bool {
-    set.push((format!("{prefix}.{key}"), value.to_owned()));
-    match table.get_mut(key) {
+    let changed = match table.get_mut(key) {
         Some(item) if item.as_str() == Some(value) => false,
         Some(item) => {
             match item.as_value_mut() {
@@ -895,7 +976,47 @@ fn set_value(
             table.insert(key, toml_edit::value(value));
             true
         }
+    };
+    // Only what changes is listed: the plan names exactly what it writes.
+    if changed {
+        set.push((format!("{prefix}.{key}"), value.to_owned()));
     }
+    changed
+}
+
+/// Whether two URLs name the same origin (scheme, host, port — default
+/// ports filled in, case-insensitive host).
+fn same_origin(left: &str, right: &str) -> bool {
+    match (origin_of(left), origin_of(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn origin_of(url: &str) -> Option<(String, String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit('@').next()?;
+    let default_port = match scheme.as_str() {
+        "https" => 443,
+        "http" => 80,
+        _ => return None,
+    };
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, after) = bracketed.split_once(']')?;
+        let port = match after.strip_prefix(':') {
+            Some(port) => port.parse().ok()?,
+            None => default_port,
+        };
+        (host.to_owned(), port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host.to_owned(), port.parse().ok()?),
+            None => (authority.to_owned(), default_port),
+        }
+    };
+    Some((scheme, host.to_ascii_lowercase(), port))
 }
 
 /// The plan as the text a person reads.
@@ -936,6 +1057,9 @@ pub fn render_text(plan: &SetupPlan, dry_run: bool) -> String {
     }
     if !plan.kept.is_empty() {
         out.push_str(&format!("  kept     {}\n", plan.kept.join(", ")));
+    }
+    for note in &plan.notes {
+        out.push_str(&format!("  note     {note}\n"));
     }
     out.push_str(&match &plan.choice.credential {
         Credential::Env { var } => format!(
@@ -996,10 +1120,10 @@ pub fn render_json(plan: &SetupPlan, dry_run: bool) -> serde_json::Value {
             "alias": alias,
         }),
         Credential::None => serde_json::json!({ "source": "none" }),
-        Credential::Unchanged => serde_json::json!({
-            "source": "unchanged",
-            "key": plan.kept_credential,
-        }),
+        Credential::Unchanged => match &plan.kept_credential {
+            Some(key) => serde_json::json!({ "source": "unchanged", "key": key }),
+            None => serde_json::json!({ "source": "none" }),
+        },
     };
     serde_json::json!({
         "schema": "rapidlm.setup_plan/v1",
@@ -1020,6 +1144,7 @@ pub fn render_json(plan: &SetupPlan, dry_run: bool) -> serde_json::Value {
             .collect::<Vec<_>>(),
         "unset": plan.unset,
         "kept": plan.kept,
+        "notes": plan.notes,
         "credential": credential,
         "effective_profile": plan.effective.as_ref().map(|(profile, _)| profile),
         "effective_origin": plan.effective.as_ref().map(|(_, origin)| origin),
@@ -1099,14 +1224,9 @@ pub fn run(args: &[String], env: &SetupEnv, prompter: &mut dyn Prompter) -> Setu
         .is_ok_and(|meta| meta.file_type().is_symlink())
         .then(|| config_path.clone());
     let config_path = match &link {
-        Some(link) => match std::fs::canonicalize(link) {
+        Some(link) => match follow_symlinks(link) {
             Ok(target) => target,
-            Err(err) => {
-                return failed(format!(
-                    "rapid setup: {} is a symlink that does not resolve: {err}",
-                    link.display()
-                ));
-            }
+            Err(message) => return failed(message),
         },
         None => config_path,
     };
@@ -1154,6 +1274,29 @@ this build does not have yet; --dry-run prints what would be written\n"
         stderr: String::new(),
         exit: 0,
     }
+}
+
+/// The file a symlink chain ends at — followed by hand, not canonicalised:
+/// a link a dotfile manager made before its target exists points at exactly
+/// the file a first setup creates.
+fn follow_symlinks(link: &Path) -> Result<PathBuf, String> {
+    let mut current = link.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::read_link(&current) {
+            Ok(target) => {
+                current = if target.is_absolute() {
+                    target
+                } else {
+                    current
+                        .parent()
+                        .map_or_else(|| target.clone(), |dir| dir.join(&target))
+                };
+            }
+            // Not a link (or not there yet): this is the file.
+            Err(_) => return Ok(current),
+        }
+    }
+    Err(format!("rapid setup: {} is a symlink loop", link.display()))
 }
 
 /// The config's current content: `None` when there is no file. Bounded like
@@ -1913,7 +2056,7 @@ gw = { provider = \"openai-compatible\", model = \"m\", base_url = \"http://10.0
         let plan = plan(
             choice_for(&[
                 "--base-url",
-                "http://10.0.0.6:9000/v1",
+                "http://10.0.0.5:9000/v2",
                 "--model",
                 "m2",
                 "--profile",
@@ -1930,7 +2073,7 @@ gw = { provider = \"openai-compatible\", model = \"m\", base_url = \"http://10.0
         let parsed = parse_config_document(&plan.document, "c").expect("parses");
         let entry = parsed.models.entries.get("gw").expect("profile");
         assert_eq!(entry.model, "m2");
-        assert_eq!(entry.base_url, "http://10.0.0.6:9000/v1");
+        assert_eq!(entry.base_url, "http://10.0.0.5:9000/v2");
         assert_eq!(
             entry.env_key,
             vec!["GW_KEY".to_owned()],
@@ -1978,15 +2121,13 @@ gw = { provider = \"openai-compatible\", model = \"m\", base_url = \"http://10.0
         );
         assert_eq!(outcome.exit, 0, "{}", outcome.stderr);
         let plan: serde_json::Value = serde_json::from_str(&outcome.stdout).expect("json");
-        let canonical = std::fs::canonicalize(&real).expect("canonical");
-        assert_eq!(plan["files"][0]["path"], canonical.display().to_string());
+        assert_eq!(plan["files"][0]["path"], real.display().to_string());
         assert_eq!(
             plan["files"][0]["via_symlink"],
             home.config().display().to_string()
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_config_path_that_is_not_a_regular_file_is_refused() {
         let home = Home::new("fifo");
@@ -2004,6 +2145,252 @@ gw = { provider = \"openai-compatible\", model = \"m\", base_url = \"http://10.0
             outcome.stderr.contains("not a regular file"),
             "{}",
             outcome.stderr
+        );
+    }
+
+    #[test]
+    fn a_kept_credential_goes_only_to_the_endpoint_it_was_set_up_for() {
+        let existing = "\
+[models]
+default = \"default\"
+
+[model.default]
+provider = \"openai-compatible\"
+model = \"m\"
+base_url = \"https://gw-a.corp.example/v1\"
+env_key = \"CORP_KEY\"
+";
+        // Another host, no key flag: the old key is removed, not sent there.
+        let moved = plan(
+            choice_for(&["--base-url", "http://10.0.0.9:8000/v1", "--model", "qwen3"]),
+            Path::new("c.toml"),
+            Some(existing),
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert_eq!(moved.unset, vec!["model.default.env_key".to_owned()]);
+        assert!(
+            moved
+                .notes
+                .iter()
+                .any(|note| note.contains("another endpoint")),
+            "{:?}",
+            moved.notes
+        );
+        let parsed = parse_config_document(&moved.document, "c").expect("parses");
+        assert!(parsed.models.entries["default"].env_key.is_empty());
+        // The same origin (another path, the default port spelled out): kept.
+        let same = plan(
+            choice_for(&[
+                "--base-url",
+                "https://GW-A.corp.example:443/v2",
+                "--model",
+                "m",
+            ]),
+            Path::new("c.toml"),
+            Some(existing),
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert!(same.unset.is_empty(), "{:?}", same.unset);
+        assert_eq!(
+            same.kept_credential.as_deref(),
+            Some("model.default.env_key")
+        );
+        assert!(same_origin("http://[::1]:8080/v1", "http://[::1]:8080/x"));
+        assert!(!same_origin("http://[::1]:8080/v1", "http://[::1]:8081/v1"));
+    }
+
+    #[test]
+    fn this_shells_model_override_is_a_note_and_the_allowlist_judges_the_written_profile() {
+        // RAPIDLM_MODEL naming a profile that does not exist: the plan still
+        // stands, and says a run in this shell would fail.
+        let env = vec![(
+            crate::user_config::DEFAULT_MODEL_ENV.to_owned(),
+            "work".to_owned(),
+        )];
+        let plan = plan(
+            choice_for(&["--preset", "openai"]),
+            Path::new("c.toml"),
+            None,
+            &env,
+            None,
+            true,
+            "T",
+        )
+        .expect("a good plan is not refused");
+        assert!(
+            plan.notes.iter().any(|note| note.contains("RAPIDLM_MODEL")),
+            "{:?}",
+            plan.notes
+        );
+        // The allowlist judges the profile the file sets, not the one this
+        // shell's RAPIDLM_MODEL happens to name.
+        let existing = "\
+[model.local]
+provider = \"openai-compatible\"
+model = \"llama3.2\"
+base_url = \"http://127.0.0.1:11434/v1\"
+";
+        let policy = crate::managed_config::ManagedPolicy::parse(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\nallowed_providers = [\"openai-compatible\"]\n",
+        )
+        .expect("policy");
+        let env = vec![(
+            crate::user_config::DEFAULT_MODEL_ENV.to_owned(),
+            "local".to_owned(),
+        )];
+        let err = super::plan(
+            choice_for(&["--preset", "anthropic"]),
+            Path::new("c.toml"),
+            Some(existing),
+            &env,
+            Some(&policy),
+            true,
+            "T",
+        )
+        .expect_err("the written profile is refused");
+        assert!(err.contains("a run would refuse"), "{err}");
+    }
+
+    #[test]
+    fn an_inline_table_keeps_its_comments_and_an_identical_run_is_unchanged() {
+        let existing = "\
+# which profile runs
+models = { default = \"gw\" }  # set by hand
+
+[model]
+gw = { provider = \"openai-compatible\", model = \"m\", base_url = \"http://10.0.0.5:9000/v1\", env_key = \"GW_KEY\" }
+";
+        let plan = plan(
+            choice_for(&[
+                "--base-url",
+                "http://10.0.0.5:9000/v1",
+                "--model",
+                "m",
+                "--profile",
+                "gw",
+                "--key-env",
+                "GW_KEY",
+            ]),
+            Path::new("c.toml"),
+            Some(existing),
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert_eq!(plan.action, FileAction::Unchanged, "{}", plan.document);
+        assert!(plan.set.is_empty(), "nothing is written: {:?}", plan.set);
+        let changed = super::plan(
+            choice_for(&[
+                "--base-url",
+                "http://10.0.0.5:9000/v1",
+                "--model",
+                "m2",
+                "--profile",
+                "gw",
+            ]),
+            Path::new("c.toml"),
+            Some(existing),
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert!(
+            changed.document.contains("# which profile runs"),
+            "{}",
+            changed.document
+        );
+        assert!(
+            changed.document.contains("# set by hand"),
+            "{}",
+            changed.document
+        );
+        assert_eq!(
+            changed.set,
+            vec![("model.gw.model".to_owned(), "m2".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_lf_file_with_one_crlf_line_stays_lf_and_output_never_echoes() {
+        let existing = "[models]\ndefault = \"local\"\r\n\n[model.local]\nprovider = \"openai-compatible\"\nmodel = \"llama3.2\"\nbase_url = \"http://127.0.0.1:11434/v1\"\n";
+        let plan = plan(
+            choice_for(&["--preset", "openai"]),
+            Path::new("c.toml"),
+            Some(existing),
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert!(
+            plan.document.matches("\r\n").count() <= 1,
+            "{:?}",
+            plan.document
+        );
+        let err = parse_args(&args(&["--output", "sk-live-abc123"])).expect_err("refused");
+        assert!(!err.contains("sk-live-abc123"), "{err}");
+    }
+
+    #[test]
+    fn a_key_a_run_would_not_read_is_named_in_the_plan() {
+        let plan = plan(
+            choice_for(&[
+                "--base-url",
+                "http://10.0.0.5:9000/v1",
+                "--model",
+                "m",
+                "--key-stdin",
+            ]),
+            Path::new("c.toml"),
+            None,
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.contains("model.default.keychain")),
+            "{:?}",
+            plan.notes
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_file_not_created_yet_plans_a_create_there() {
+        let home = Home::new("dangling");
+        let real = home.0.join("dotfiles").join("rapidlm.toml");
+        std::fs::create_dir_all(real.parent().expect("dir")).expect("dir");
+        std::fs::create_dir_all(home.0.join(".rapidlm")).expect("dir");
+        std::os::unix::fs::symlink(&real, home.config()).expect("link");
+        let outcome = run(
+            &args(&["--preset", "ollama", "--dry-run", "--output", "json"]),
+            &home.env(),
+            &mut Scripted(Vec::new()),
+        );
+        assert_eq!(outcome.exit, 0, "{}", outcome.stderr);
+        let plan: serde_json::Value = serde_json::from_str(&outcome.stdout).expect("json");
+        assert_eq!(plan["files"][0]["path"], real.display().to_string());
+        assert_eq!(plan["files"][0]["action"], "create");
+        assert_eq!(
+            plan["files"][0]["via_symlink"],
+            home.config().display().to_string()
         );
     }
 }
