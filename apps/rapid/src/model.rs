@@ -174,6 +174,16 @@ impl<'store> ConfiguredModel<'store> {
         active: &ActiveModel,
         store: &'store InMemoryCredentialStore,
     ) -> Result<Self, ModelConfigError> {
+        Self::build_with_gate(active, store, None)
+    }
+
+    /// [`Self::build`] whose every connection `gate` must permit first
+    /// (S10: the setup probe dials only on an egress lease).
+    pub fn build_with_gate(
+        active: &ActiveModel,
+        store: &'store InMemoryCredentialStore,
+        gate: Option<std::sync::Arc<dyn llm_router::providers::dial::DialGate>>,
+    ) -> Result<Self, ModelConfigError> {
         let provider = ProviderId::parse(active.entry.provider.as_str()).map_err(|_| {
             ModelConfigError::Capability {
                 reason: "provider kind does not map to a router provider id".to_owned(),
@@ -235,9 +245,9 @@ impl<'store> ConfiguredModel<'store> {
                         reason: "key contains control characters or exceeds the size bound"
                             .to_owned(),
                     })?;
-                Box::new(Http1Transport::new(bearer))
+                Box::new(gated(Http1Transport::new(bearer), gate))
             }
-            None => Box::new(Http1Transport::new(NoWireAuth)),
+            None => Box::new(gated(Http1Transport::new(NoWireAuth), gate)),
         };
 
         let backend = match active.entry.provider {
@@ -441,6 +451,16 @@ impl ConfiguredModel<'_> {
         fold_stream(&stream, 0)
             .map(|_| ())
             .map_err(|_| ProviderError::UnknownVariant)
+    }
+}
+
+fn gated<A>(
+    transport: Http1Transport<A>,
+    gate: Option<std::sync::Arc<dyn llm_router::providers::dial::DialGate>>,
+) -> Http1Transport<A> {
+    match gate {
+        Some(gate) => transport.with_dial_gate(gate),
+        None => transport,
     }
 }
 

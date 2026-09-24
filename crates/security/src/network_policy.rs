@@ -45,6 +45,8 @@ pub enum NetworkClient {
     Sandbox,
     Browser,
     Tool,
+    /// A model provider's endpoint.
+    Provider,
 }
 
 /// Sandbox/browser/tool network mode. Isolated default is [`EgressMode::None`].
@@ -189,6 +191,7 @@ impl NetworkClient {
             Self::Sandbox => "sandbox",
             Self::Browser => "browser",
             Self::Tool => "tool",
+            Self::Provider => "provider",
         }
     }
 }

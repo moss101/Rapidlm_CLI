@@ -1377,11 +1377,19 @@ pub fn classify(err: &llm_router::provider::ProviderError) -> ProbeFailure {
 /// [`VERIFY_MAX_OUTPUT_TOKENS`] through the model client a run would build
 /// for the planned profile — the config as the plan leaves it, the key as
 /// the plan names it (`stdin_key` for `--key-stdin`). Nothing is written.
+/// The egress gate the probe dials through: exactly the planned endpoint.
+pub fn probe_egress(plan: &SetupPlan) -> Result<crate::provider_egress::ProviderEgress, String> {
+    let (scheme, host, port) = origin_of(&plan.choice.base_url)
+        .ok_or_else(|| "rapid setup: the planned endpoint has no origin".to_owned())?;
+    crate::provider_egress::ProviderEgress::for_endpoint(scheme == "https", &host, port, None)
+}
+
 pub fn verify(
     plan: &SetupPlan,
     env: &[(String, String)],
     stdin_key: Option<&str>,
     policy: Option<&crate::managed_config::ManagedPolicy>,
+    egress: &std::sync::Arc<crate::provider_egress::ProviderEgress>,
     cancel: &llm_router::provider::CancellationToken,
 ) -> Result<(), ProbeFailure> {
     if let Credential::Env { var } = &plan.choice.credential
@@ -1424,11 +1432,13 @@ pub fn verify(
         .map(str::to_owned);
     let unset_var = active.entry.env_key.first().cloned();
     let store = auth::InMemoryCredentialStore::new();
-    let model = crate::model::ConfiguredModel::build(&active, &store).map_err(|err| match err {
-        crate::model::ModelConfigError::Credential { .. } => ProbeFailure::UnusableKey,
-        crate::model::ModelConfigError::BaseUrl { .. } => ProbeFailure::Refused,
-        _ => ProbeFailure::Invalid,
-    })?;
+    let gate: std::sync::Arc<dyn llm_router::providers::dial::DialGate> = egress.clone();
+    let model = crate::model::ConfiguredModel::build_with_gate(&active, &store, Some(gate))
+        .map_err(|err| match err {
+            crate::model::ModelConfigError::Credential { .. } => ProbeFailure::UnusableKey,
+            crate::model::ModelConfigError::BaseUrl { .. } => ProbeFailure::Refused,
+            _ => ProbeFailure::Invalid,
+        })?;
     model.probe(cancel).map_err(|err| match classify(&err) {
         ProbeFailure::Auth if !sends_key => match (kept_keychain, unset_var) {
             (Some(key), _) => ProbeFailure::KeyNotRead { key },
@@ -1552,15 +1562,25 @@ changed"
             .iter()
             .map(|note| format!("note: {note}\n"))
             .collect();
+        // The probe's receipt (S10): every dial decision its egress gate
+        // made, allowed or refused — reported, never written (AC-02).
+        let mut receipts = Vec::new();
         if !parsed.no_verify {
+            let egress = match probe_egress(&plan) {
+                Ok(egress) => std::sync::Arc::new(egress),
+                Err(message) => return failed(message),
+            };
             let cancel = llm_router::provider::CancellationToken::new();
-            if let Err(failure) = verify(
+            let verified = verify(
                 &plan,
                 &env.env,
                 stdin_key.as_deref(),
                 policy.as_ref(),
+                &egress,
                 &cancel,
-            ) {
+            );
+            receipts = egress.receipts();
+            if let Err(failure) = verified {
                 let hint = failure.hint(&plan);
                 let stdout = match parsed.output {
                     OutputFormat::Json => format!(
@@ -1570,6 +1590,7 @@ changed"
                             "verified": false,
                             "class": failure.class(),
                             "hint": hint,
+                            "egress": receipts_json(&receipts),
                             "written": false,
                         })
                     ),
@@ -1578,8 +1599,9 @@ changed"
                 return SetupOutcome {
                     stdout,
                     stderr: format!(
-                        "{notes}rapid setup: verification failed ({}): {hint}\nno files were \
+                        "{notes}{}rapid setup: verification failed ({}): {hint}\nno files were \
 changed\n",
+                        receipts_text(&receipts),
                         failure.class()
                     ),
                     exit: failure.exit_code(),
@@ -1595,6 +1617,7 @@ changed\n",
                 serde_json::json!({
                     "schema": "rapidlm.setup_outcome/v1",
                     "verified": verified,
+                    "egress": receipts_json(&receipts),
                     "written": false,
                 })
             ),
@@ -1603,8 +1626,9 @@ changed\n",
         return SetupOutcome {
             stdout,
             stderr: format!(
-                "{notes}rapid setup: {}writing the configuration is not in this build yet — no \
+                "{notes}{}rapid setup: {}writing the configuration is not in this build yet — no \
 files were changed; --dry-run prints what would be written\n",
+                receipts_text(&receipts),
                 if verified {
                     format!("{} answered; ", plan.choice.base_url)
                 } else {
@@ -1623,6 +1647,37 @@ files were changed; --dry-run prints what would be written\n",
         stderr: String::new(),
         exit: 0,
     }
+}
+
+/// The egress receipt as the outcome's JSON.
+fn receipts_json(receipts: &[crate::provider_egress::EgressReceipt]) -> serde_json::Value {
+    serde_json::Value::Array(
+        receipts
+            .iter()
+            .map(|receipt| {
+                serde_json::json!({
+                    "allowed": receipt.allowed,
+                    "dialled": receipt.dialled,
+                    "reason": receipt.reason,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The egress receipt as lines of the outcome's text.
+fn receipts_text(receipts: &[crate::provider_egress::EgressReceipt]) -> String {
+    receipts
+        .iter()
+        .map(|receipt| match (&receipt.reason, receipt.allowed) {
+            (_, true) => format!(
+                "egress: allowed {} (policy: this endpoint only)\n",
+                receipt.dialled
+            ),
+            (Some(reason), false) => format!("egress: refused {} ({reason})\n", receipt.dialled),
+            (None, false) => format!("egress: refused {}\n", receipt.dialled),
+        })
+        .collect()
 }
 
 /// The file a symlink chain ends at — followed by hand, not canonicalised:
@@ -3186,6 +3241,10 @@ own_knob = 2
         assert_eq!(value["verified"], false);
         assert_eq!(value["class"], "auth");
         assert_eq!(value["written"], false);
+        assert_eq!(
+            value["egress"][0]["allowed"], true,
+            "the refused key went out on the lease, and the receipt says so: {value}"
+        );
         assert!(
             value["hint"]
                 .as_str()
@@ -3432,6 +3491,21 @@ own_knob = 2
         let json: serde_json::Value = serde_json::from_str(&outcome.stdout).expect("json");
         assert_eq!(json["verified"], true);
         assert_eq!(json["written"], false);
+        // The egress receipt: one dial, on a lease for exactly this endpoint.
+        let origin = url.trim_end_matches("/v1");
+        assert_eq!(
+            json["egress"],
+            serde_json::json!([{ "allowed": true, "dialled": origin, "reason": null }]),
+            "{}",
+            outcome.stdout
+        );
+        assert!(
+            outcome.stderr.contains(&format!(
+                "egress: allowed {origin} (policy: this endpoint only)"
+            )),
+            "{}",
+            outcome.stderr
+        );
         assert_eq!(home.snapshot(), before);
         let requests = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
         assert_eq!(requests.len(), 1, "exactly one request");
@@ -3466,6 +3540,11 @@ own_knob = 2
             outcome.stderr
         );
         assert!(outcome.stderr.contains("no files were changed"));
+        assert!(
+            !outcome.stderr.contains("egress:"),
+            "nothing dialled, nothing to receipt: {}",
+            outcome.stderr
+        );
         assert!(
             matches!(listener.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock)
         );
