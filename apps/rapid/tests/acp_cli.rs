@@ -4,8 +4,10 @@
 //! What the unit tests cannot show: that a prompt survives every approval
 //! its turn raises — the editor's answers route to the waiting prompt, the
 //! serve stays up, the prompt ends with its real stop reason, and a cancel
-//! during an approval wait ends it — and that each prompt streams only its
-//! own turn's events, never the previous turn's again.
+//! during an approval wait ends it — that an answer is read in the
+//! protocol's shape, so an approved write lands in the project and a
+//! rejected one does not, and that each prompt streams only its own turn's
+//! events, never the previous turn's again.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -552,6 +554,131 @@ fn an_error_answer_decides_nothing_and_ends_the_prompt() {
     let events = ledger(&project, &home.0, &config, &session);
     assert_eq!(count_kind(&events, "approval.resolved"), 0, "{events:#?}");
     assert_eq!(count_kind(&events, "turn.started"), 1, "{events:#?}");
+}
+
+/// What a [`one_write`] prompt left behind once its permission request was
+/// answered with `result` and the editor disconnected.
+struct Answered {
+    frames: Vec<Value>,
+    stderr: String,
+    exit: Option<i32>,
+    /// `first.txt` in the project, if the write ran.
+    written: Option<String>,
+    events: Vec<(String, Value)>,
+}
+
+fn answer_one_write(name: &str, result: Value) -> Answered {
+    let home = temp_dir(name);
+    let (project, config) = trusted_project(&home.0, one_write);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+
+    editor.start_prompt(3, &session, "write it");
+    let permission = editor.until_permission();
+    assert_eq!(
+        permission["params"]["toolCall"]["toolCallId"], "call_1",
+        "{permission}"
+    );
+    editor.answer_permission(&permission, result);
+    let frames = editor.play(3);
+    let stderr = editor.stderr_text();
+    let exit = editor.finish();
+    Answered {
+        frames,
+        stderr,
+        exit,
+        written: std::fs::read_to_string(project.join("first.txt")).ok(),
+        events: ledger(&project, &home.0, &config, &session),
+    }
+}
+
+/// The `decision` of every `approval.resolved` in `events`, in order.
+fn decisions(events: &[(String, Value)]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|(kind, _)| kind == "approval.resolved")
+        .map(|(_, payload)| payload["decision"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+#[test]
+fn an_allow_once_answer_runs_the_write_it_approves() {
+    let run = answer_one_write(
+        "allow-once",
+        json!({ "outcome": { "outcome": "selected", "optionId": "allow-once" } }),
+    );
+    let (frames, stderr, events) = (&run.frames, &run.stderr, &run.events);
+    assert_eq!(
+        frames.last().expect("response")["result"]["stopReason"],
+        "end_turn",
+        "{frames:#?}\nstderr: {stderr}"
+    );
+    assert_eq!(run.exit, Some(0), "stderr: {stderr}");
+    assert_eq!(decisions(events), ["approved"], "{events:#?}");
+    assert_eq!(
+        run.written.as_deref(),
+        Some("from the model"),
+        "the approved write never ran: {events:#?}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_reject_once_answer_leaves_the_project_untouched() {
+    let run = answer_one_write(
+        "reject-once",
+        json!({ "outcome": { "outcome": "selected", "optionId": "reject-once" } }),
+    );
+    let (frames, stderr, events) = (&run.frames, &run.stderr, &run.events);
+    // Denied, the turn resumes and the model answers.
+    assert_eq!(
+        frames.last().expect("response")["result"]["stopReason"],
+        "end_turn",
+        "{frames:#?}\nstderr: {stderr}"
+    );
+    assert_eq!(run.exit, Some(0), "stderr: {stderr}");
+    assert_eq!(decisions(events), ["denied"], "{events:#?}");
+    assert_eq!(run.written, None, "a rejected write ran");
+}
+
+#[test]
+fn a_cancelled_answer_is_a_cancel_not_a_denial() {
+    // The editor answers `cancelled` without a `session/cancel` ahead of
+    // it: the prompt ends as the cancel would end it.
+    let run = answer_one_write(
+        "cancelled-answer",
+        json!({ "outcome": { "outcome": "cancelled" } }),
+    );
+    let (frames, stderr, events) = (&run.frames, &run.stderr, &run.events);
+    assert_eq!(
+        frames.last().expect("response")["result"]["stopReason"],
+        "cancelled",
+        "{frames:#?}\nstderr: {stderr}"
+    );
+    assert_eq!(run.exit, Some(0), "stderr: {stderr}");
+    // Nothing was decided and nothing resumed: the approval stays pending.
+    assert_eq!(count_kind(events, "approval.resolved"), 0, "{events:#?}");
+    assert_eq!(count_kind(events, "turn.started"), 1, "{events:#?}");
+    assert_eq!(run.written, None);
+}
+
+#[test]
+fn an_answer_outside_the_protocol_s_shape_decides_nothing() {
+    // `outcome` not nested: an "allow once" only in appearance.
+    let run = answer_one_write(
+        "flat-answer",
+        json!({ "outcome": "selected", "optionId": "allow-once" }),
+    );
+    let (frames, stderr, events) = (&run.frames, &run.stderr, &run.events);
+    assert_eq!(
+        frames.last().expect("response")["result"]["stopReason"],
+        "refusal",
+        "{frames:#?}\nstderr: {stderr}"
+    );
+    assert!(stderr.contains("not an offered option"), "stderr: {stderr}");
+    assert_eq!(run.exit, Some(0), "stderr: {stderr}");
+    assert_eq!(count_kind(events, "approval.resolved"), 0, "{events:#?}");
+    assert_eq!(count_kind(events, "turn.started"), 1, "{events:#?}");
+    assert_eq!(run.written, None);
 }
 
 #[test]

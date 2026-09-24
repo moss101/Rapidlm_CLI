@@ -326,6 +326,16 @@ pub enum PermissionOutcome {
     Denied,
 }
 
+/// The client's answer to a `session/request_permission` request, decoded
+/// by [`decode_permission_response`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum PermissionAnswer {
+    /// The user selected one of the offered options.
+    Selected(PermissionOutcome),
+    /// The prompt turn was cancelled before the user chose.
+    Cancelled,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentCapabilities {
@@ -424,6 +434,12 @@ struct PermissionOutcomeParams {
     outcome: PermissionOutcomeWire,
 }
 
+/// The result of a `session/request_permission` response.
+#[derive(Clone, Debug, Deserialize)]
+struct PermissionResponseWire {
+    outcome: PermissionOutcomeWire,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 enum PermissionOutcomeWire {
@@ -432,6 +448,25 @@ enum PermissionOutcomeWire {
         #[serde(rename = "optionId")]
         option_id: String,
     },
+}
+
+impl PermissionOutcomeWire {
+    /// Read against the options [`permission_options`] offers; an option
+    /// never offered is `InvalidParams`.
+    fn answer(self) -> Result<PermissionAnswer, V1Error> {
+        match self {
+            Self::Cancelled => Ok(PermissionAnswer::Cancelled),
+            Self::Selected { option_id } => match option_id.as_str() {
+                OPTION_ALLOW_ONCE | OPTION_ALLOW_ALWAYS => {
+                    Ok(PermissionAnswer::Selected(PermissionOutcome::Approved))
+                }
+                OPTION_REJECT_ONCE | OPTION_REJECT_ALWAYS => {
+                    Ok(PermissionAnswer::Selected(PermissionOutcome::Denied))
+                }
+                _ => Err(V1Error::InvalidParams),
+            },
+        }
+    }
 }
 
 impl<C: KernelClient> V1Adapter<C> {
@@ -672,13 +707,9 @@ impl<C: KernelClient> V1Adapter<C> {
         self.require_ready()?;
         let parsed: PermissionOutcomeParams = parse_params(params)?;
         let session_id = parse_session_id(&parsed.session_id)?;
-        let outcome = match parsed.outcome {
-            PermissionOutcomeWire::Cancelled => PermissionOutcome::Denied,
-            PermissionOutcomeWire::Selected { option_id } => match option_id.as_str() {
-                OPTION_ALLOW_ONCE | OPTION_ALLOW_ALWAYS => PermissionOutcome::Approved,
-                OPTION_REJECT_ONCE | OPTION_REJECT_ALWAYS => PermissionOutcome::Denied,
-                _ => return Err(V1Error::InvalidParams),
-            },
+        let outcome = match parsed.outcome.answer()? {
+            PermissionAnswer::Cancelled => PermissionOutcome::Denied,
+            PermissionAnswer::Selected(outcome) => outcome,
         };
         self.resolve_permission(session_id, outcome).await
     }
@@ -1062,6 +1093,17 @@ pub fn encode_permission_request(
         method: METHOD_SESSION_REQUEST_PERMISSION.to_owned(),
         params: Some(params),
     })
+}
+
+/// Decode the result of the client's response to a
+/// `session/request_permission` request: the protocol nests the outcome,
+/// `{"outcome":{"outcome":"selected","optionId":"allow-once"}}` or
+/// `{"outcome":{"outcome":"cancelled"}}`. An option id the request never
+/// offered, or any other shape, is `InvalidParams`.
+pub fn decode_permission_response(result: Value) -> Result<PermissionAnswer, V1Error> {
+    parse_params::<PermissionResponseWire>(result)?
+        .outcome
+        .answer()
 }
 
 /// Encode a completed `session/prompt` result.
@@ -1611,6 +1653,54 @@ mod tests {
         assert!(matches!(err, V1Error::InvalidParams));
         let snapshot = block_on(tmp.client.get_session(created.session_id())).expect("unchanged");
         assert_eq!(snapshot.seq(), created.seq());
+    }
+
+    #[test]
+    fn a_permission_response_is_read_in_the_protocol_s_nested_shape() {
+        let selected = |option: &str| {
+            decode_permission_response(serde_json::json!({
+                "outcome": {"outcome": "selected", "optionId": option}
+            }))
+        };
+        for option in permission_options() {
+            let expected = match option.kind {
+                PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways => {
+                    PermissionOutcome::Approved
+                }
+                PermissionOptionKind::RejectOnce | PermissionOptionKind::RejectAlways => {
+                    PermissionOutcome::Denied
+                }
+            };
+            assert_eq!(
+                selected(&option.option_id).expect("an offered option"),
+                PermissionAnswer::Selected(expected),
+                "{}",
+                option.option_id
+            );
+        }
+        assert_eq!(
+            decode_permission_response(serde_json::json!({"outcome": {"outcome": "cancelled"}}))
+                .expect("cancelled"),
+            PermissionAnswer::Cancelled
+        );
+        assert!(matches!(
+            selected("allow-everything"),
+            Err(V1Error::InvalidParams)
+        ));
+        // The outcome not nested under `outcome` is no answer at all.
+        for flat in [
+            serde_json::json!({"outcome": "selected", "optionId": "allow-once"}),
+            serde_json::json!({"outcome": "cancelled"}),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                matches!(
+                    decode_permission_response(flat.clone()),
+                    Err(V1Error::InvalidParams)
+                ),
+                "{flat}"
+            );
+        }
     }
 
     #[test]

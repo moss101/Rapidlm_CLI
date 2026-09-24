@@ -31,7 +31,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use acp::stdio::{FrameReader, FrameWriter, JsonRpcId, JsonRpcMessage, MAX_FRAME_BYTES};
-use acp::v1::{MappedEvent, V1Adapter, map_kernel_event};
+use acp::v1::{MappedEvent, PermissionAnswer, PermissionOutcome, V1Adapter, map_kernel_event};
 use kernel::InProcessKernelClient;
 use protocol::ProjectId;
 
@@ -744,6 +744,26 @@ the approval stays pending"
                     );
                     return finish_prompt(routes, &out_tx, request_id, StopReason::Refusal);
                 };
+                let approve = match acp::v1::decode_permission_response(decision) {
+                    Ok(PermissionAnswer::Selected(outcome)) => {
+                        outcome == PermissionOutcome::Approved
+                    }
+                    // The editor's own cancel, answered before (or instead
+                    // of) its `session/cancel`: the same as that cancel —
+                    // nothing is recorded, the approval stays pending.
+                    Ok(PermissionAnswer::Cancelled) => {
+                        return finish_prompt(routes, &out_tx, request_id, StopReason::Cancelled);
+                    }
+                    // Not one of the offered options, or not the protocol's
+                    // shape: no decision, like an error answer.
+                    Err(_) => {
+                        eprintln!(
+                            "rapid acp: the editor's answer to a permission request is not an \
+offered option in the protocol's response shape; the approval stays pending"
+                        );
+                        return finish_prompt(routes, &out_tx, request_id, StopReason::Refusal);
+                    }
+                };
                 let resumed = acp_resolve_and_continue(
                     &client,
                     turn.session_id(),
@@ -752,7 +772,7 @@ the approval stays pending"
                     trusted,
                     &held.token,
                     &held.call_id,
-                    permission_approves(&decision),
+                    approve,
                     track_turn(&routes.turns, routes.session_id),
                 );
                 if let Err(reason) = resumed {
@@ -871,18 +891,6 @@ see; it stays pending"
 
 const LOOP_DOWN: &str = "the editor's transport closed";
 const ACP_DISCONNECT: &str = "clean disconnect";
-
-fn permission_approves(decision: &serde_json::Value) -> bool {
-    match decision.get("outcome") {
-        Some(serde_json::Value::String(text)) => {
-            text == "selected"
-                && decision["optionId"]
-                    .as_str()
-                    .is_some_and(|option| option.starts_with("allow"))
-        }
-        _ => false,
-    }
-}
 
 static NEXT_PERMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
