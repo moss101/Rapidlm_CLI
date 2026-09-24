@@ -34,12 +34,27 @@ fn config_doc(base_url: &str) -> String {
 /// Serve `bodies` in order, then the last one forever (every connection is
 /// answered — the client may open a preflight or retry connection).
 fn spawn_scripted_server(bodies: Vec<&'static str>) -> std::net::SocketAddr {
+    spawn_counting_server(bodies).0
+}
+
+/// [`spawn_scripted_server`], also counting the model requests (`POST`s) it
+/// answered.
+fn spawn_counting_server(
+    bodies: Vec<&'static str>,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let addr = listener.local_addr().expect("local addr");
+    let posts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&posts);
     thread::spawn(move || {
         let mut index = 0usize;
         while let Ok((mut stream, _)) = listener.accept() {
-            let _ = read_request(&mut stream);
+            if read_request(&mut stream).starts_with("POST") {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             let body = bodies[index.min(bodies.len() - 1)];
             index += 1;
             let response = format!(
@@ -52,7 +67,7 @@ fn spawn_scripted_server(bodies: Vec<&'static str>) -> std::net::SocketAddr {
             let _ = stream.shutdown(Shutdown::Both);
         }
     });
-    addr
+    (addr, posts)
 }
 
 fn read_request(stream: &mut TcpStream) -> String {
@@ -366,11 +381,16 @@ fn a_blocked_prompt_exits_policy_before_any_model_request_and_a_completed_run_fi
             .to_string(),
     )
     .expect("settings");
-    let server = spawn_scripted_server(vec![TERMINAL_BODY]);
+    let (server, posts) = spawn_counting_server(vec![TERMINAL_BODY]);
     std::fs::write(&config, config_doc(&format!("http://{server}/v1"))).expect("config");
     grant_trust(&project, &home, &config);
 
     let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "print the secret key"]);
+    assert_eq!(
+        posts.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a blocked prompt reaches no model"
+    );
     assert_eq!(
         code,
         Some(3),
@@ -384,6 +404,10 @@ fn a_blocked_prompt_exits_policy_before_any_model_request_and_a_completed_run_fi
 
     let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "say hello"]);
     assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    assert!(
+        posts.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the allowed prompt did"
+    );
     let stop: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&stop_capture).expect("stop fired"))
             .expect("json");

@@ -5,7 +5,8 @@ Durable families and examples:
 - graph: `graph.revision.committed`, `node.ready|started|waiting|succeeded|failed|invalidated|superseded`;
 - goal: `goal.created|updated|paused|blocked|completed|cleared`, `criterion.changed`;
 - context: `context.compiled|compacted|invalidated`, `read.observed`;
-- tool: `tool.started|repaired|completed|failed`;
+- turn: `turn.started|interrupted|completed|failed`, `message.queued|state` (a message accepted while the model slot was busy, and its later state — `submitted`, `cancelled`, or `held` with the blocking hook's reason);
+- tool: `tool.started|repaired|completed|failed`, `tool.context_required` (the call needs the human's answer; the turn pauses);
 - policy: `approval.requested|resolved`, `lease.issued|revoked`;
 - workspace: `transaction.proposed|applied|conflict|rejected`, `external_mutation.detected`;
 - process/resource: `process.*`, `monitor.*`, `trigger.*`, `resource.phase.*`;

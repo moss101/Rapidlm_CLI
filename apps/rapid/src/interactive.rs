@@ -2943,6 +2943,12 @@ struct LiveSubagentRunner {
 }
 
 impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
+    fn settle(&self, agent: protocol::AgentId, blocked: bool) -> Option<String> {
+        self.agent_views
+            .as_ref()?
+            .settle(&self.root, agent, self.auto_integrate, blocked)
+    }
+
     fn run(
         &self,
         agent: protocol::AgentId,
@@ -3129,48 +3135,13 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             ));
         }
         // Isolation epilogue: an isolated child's changes live in its
-        // worktree, so the report says where they are and what happens
-        // next — applied automatically (headless), held for review
-        // (interactive), or discarded when the child failed.
+        // worktree. What happens to them — applied (headless), held for
+        // review (interactive), or held because a `subagent_stop` hook
+        // blocked the completion — is decided after that hook has run
+        // (`settle`), so nothing is applied before a hook could block it.
         let mut diff_note = String::new();
-        if let Some(views) = self.agent_views.as_ref() {
-            if let Some(_view) = &held_view {
-                diff_note = views.diff_stat(agent).unwrap_or_default();
-            }
-            let held = held_view.is_some();
-            if held && self.auto_integrate {
-                match views.integrate(&self.root, agent, None) {
-                    Ok((outcome, _)) if outcome.applied() => {
-                        summary.push_str(
-                            " Changes were applied to the parent workspace (three-way merge).",
-                        );
-                    }
-                    Ok((crate::agent_views::IntegrationOutcome::Conflict { files }, _)) => {
-                        summary.push_str(&format!(
-                            " CONFLICT: the parent workspace changed the same file(s) ({}); \
-the child's changes are held in its isolated worktree at {} and were NOT applied.",
-                            files.join(", "),
-                            held_view
-                                .as_ref()
-                                .map(|view| view.worktree.display().to_string())
-                                .unwrap_or_default(),
-                        ));
-                    }
-                    Ok(_) => {
-                        summary.push_str(" The child changed no files.");
-                    }
-                    Err(reason) => {
-                        summary.push_str(&format!(
-                            " The child's changes are held in its isolated worktree ({reason})."
-                        ));
-                    }
-                }
-            } else if held {
-                summary.push_str(
-                    " Changes are held in the child's isolated worktree for review: \
-/agents integrate <id> [check-command] applies them, /agents abandon <id> discards them.",
-                );
-            }
+        if let (Some(views), Some(_view)) = (self.agent_views.as_ref(), &held_view) {
+            diff_note = views.diff_stat(agent).unwrap_or_default();
         }
         let claims = outcome
             .result
@@ -4483,6 +4454,7 @@ run without --continue to start one"
         fire_turn_end_hooks(
             &turn_end_hooks,
             &run_result,
+            cancel.is_cancelled(),
             sink.as_ref()
                 .map(|s| s as &dyn crate::exec_tools::HookEvents),
             &mut |line| eprintln!("{line}"),
@@ -5430,29 +5402,28 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
         if !crate::approvals::pending_approvals(self.client, self.session_id).is_empty() {
             return Ok(());
         }
-        // A held head holds the queue: later messages do not jump ahead of a
-        // blocked one, and the hook is not re-run every tick.
-        if self.message_queue[0].held.is_some() {
+        // A held message stays queued — `/queue` shows why — until `/queue
+        // edit`, `run` or `cancel` settles it. It does not hold up the
+        // messages queued after it (they were promised a run after the
+        // current turn), and its hooks are not re-run every tick.
+        let Some(index) = self
+            .message_queue
+            .iter()
+            .position(|message| message.held.is_none())
+        else {
             return Ok(());
-        }
-        let text = self.message_queue[0].text.clone();
+        };
+        let text = self.message_queue[index].text.clone();
         if let Some((hook, reason)) = self.prompt_block(&text) {
-            let id = self.message_queue[0].id.clone();
-            self.message_queue[0].held = Some(format!("{hook}: {reason}"));
-            let _ = self.client.append_turn_progress(
-                self.session_id,
-                self.actor,
-                TraceId::new(),
-                event_ledger::event::EventKind::MessageState,
-                serde_json::json!({ "id": id, "state": "held", "reason": format!("{hook}: {reason}") }),
-            );
+            let id = self.message_queue[index].id.clone();
+            self.hold_message(index, &hook, &reason);
             self.append_command_error(format!(
                 "queued message {id} held: blocked by {hook} hook: {reason}\n\
 /queue edit {id} <text> or /queue run {id} retries it; /queue cancel {id} drops it."
             ));
             return Ok(());
         }
-        let next = self.message_queue.remove(0);
+        let next = self.message_queue.remove(index);
         self.mark_message(&next.id, "submitted");
         self.start_submitted_turn(&next.text)
     }
@@ -5461,27 +5432,35 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
     /// projects only; hooks are project settings) and record what they
     /// decided. `Some((hook, reason))` when a hook blocked the prompt.
     fn prompt_block(&mut self, text: &str) -> Option<(String, String)> {
-        if !self.trusted {
-            return None;
-        }
-        let hooks = load_project_integrations(self.root).hooks;
-        if hooks.user_prompt_submit.is_empty() {
-            return None;
-        }
-        let report = crate::hooks::run_prompt_submit_stage(
-            &hooks.user_prompt_submit,
-            text,
-            crate::hooks::HOOK_TIMEOUT,
-        );
-        let sink = LedgerHookEvents::new(self.client, self.session_id, self.actor);
         let mut warnings = Vec::new();
-        record_hook_report(Some(&sink), "", "", &report, &mut |line| {
-            warnings.push(line.to_owned())
-        });
+        let blocked = prompt_submit_block(
+            self.client,
+            self.session_id,
+            self.actor,
+            self.root,
+            self.trusted,
+            text,
+            &mut |line| warnings.push(line.to_owned()),
+        );
         for line in warnings {
             self.append_command_error(line);
         }
-        report.first_deny()
+        blocked
+    }
+
+    /// Hold queued message `index` (a `user_prompt_submit` hook blocked it),
+    /// durably: a restart restores it held, with the reason.
+    fn hold_message(&mut self, index: usize, hook: &str, reason: &str) {
+        let id = self.message_queue[index].id.clone();
+        let why = format!("{hook}: {reason}");
+        self.message_queue[index].held = Some(why.clone());
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::MessageState,
+            serde_json::json!({ "id": id, "state": "held", "reason": why }),
+        );
     }
 
     /// Record a queue-state transition (`submitted`/`cancelled`) durably.
@@ -5512,8 +5491,22 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
                         payload.get("id").and_then(serde_json::Value::as_str),
                         payload.get("text").and_then(serde_json::Value::as_str),
                     ) {
-                        latest.retain(|entry| entry.0 != id);
-                        latest.push((id.to_owned(), text.to_owned(), "queued".to_owned(), None));
+                        // A repeated id is an edit (`/queue edit` re-records
+                        // the text): the message keeps its place and is
+                        // queued again, its hold lifted.
+                        match latest.iter_mut().find(|entry| entry.0 == id) {
+                            Some(entry) => {
+                                entry.1 = text.to_owned();
+                                entry.2 = "queued".to_owned();
+                                entry.3 = None;
+                            }
+                            None => latest.push((
+                                id.to_owned(),
+                                text.to_owned(),
+                                "queued".to_owned(),
+                                None,
+                            )),
+                        }
                     }
                 }
                 event_ledger::event::EventKind::MessageState => {
@@ -5538,16 +5531,23 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
             // dropped by a restart.
             if state == "queued" || state == "held" {
                 let held = (state == "held").then(|| reason.unwrap_or_default());
+                match &held {
+                    Some(why) => self.append_command_output(format!(
+                        "restored queued message {id} from a previous run, held ({why}): {}\n\
+/queue edit {id} <text> or /queue run {id} retries it; /queue cancel {id} drops it.",
+                        first_line(&text),
+                    )),
+                    None => self.append_command_output(format!(
+                        "restored queued message {id} from a previous run: {}\n\
+It will run after the current turn; /queue cancels or edits it.",
+                        first_line(&text),
+                    )),
+                }
                 self.message_queue.push(QueuedMessage {
                     id: id.clone(),
                     text: text.clone(),
                     held,
                 });
-                self.append_command_output(format!(
-                    "restored queued message {id} from a previous run: {}\n\
-It will run after the current turn; /queue cancels or edits it.",
-                    first_line(&text),
-                ));
             }
         }
     }
@@ -5898,7 +5898,7 @@ workspace was never touched by it"
                 let text = self.message_queue[index].text.clone();
                 if let Some((hook, reason)) = self.prompt_block(&text) {
                     let id = self.message_queue[index].id.clone();
-                    self.message_queue[index].held = Some(format!("{hook}: {reason}"));
+                    self.hold_message(index, &hook, &reason);
                     self.append_command_error(format!(
                         "queued message {id} still held: blocked by {hook} hook: {reason}"
                     ));
@@ -6922,11 +6922,21 @@ denied\n",
             return Ok(());
         }
         let prompt = compile_autonomous_prompt(&snapshot, outcome.hint());
+        // The compiled prompt passes the same `user_prompt_submit` gate a
+        // typed one does — a policy about what reaches the model holds for
+        // the goal loop too — but a block stops the goal instead of being
+        // retried: the loop would compile the same prompt on the next tick
+        // and be blocked again, forever, with the composer overwritten each
+        // time. The composer is left alone.
+        if let Some((hook, reason)) = self.prompt_block(&prompt) {
+            self.stop_autonomous_goal(&format!("prompt blocked by {hook} hook: {reason}"));
+            return Ok(());
+        }
         let before_len = self.ui.transcript().len();
         if let Some(auto) = &mut self.autonomous {
             auto.transcript_len_before_iteration = Some(before_len);
         }
-        self.submit_turn(&prompt)
+        self.start_submitted_turn(&prompt)
     }
 
     /// Move this live session onto `target`, rebuilding its transcript from
@@ -8370,6 +8380,58 @@ impl crate::exec_tools::WorkspaceChanges for LedgerWorkspaceChanges {
     }
 }
 
+thread_local! {
+    /// Whether the turn running on this thread already ran its turn-end
+    /// stage (`fire_turn_end_hooks`). Every turn runs on a thread of its own
+    /// (the `spawn_*_turn` wrappers), so the wrapper can fire the stage itself
+    /// — from the kernel outcome — for each way a turn ends before reaching
+    /// it: an early failure (no credential, a context that cannot be built),
+    /// a continuation that pauses again or is cancelled, a panic.
+    static TURN_END_FIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run one turn section (`turn`) with its turn-end stage guaranteed exactly
+/// once: the stage `turn` ran itself, with the run's own counts and stop
+/// reason, or else one fired here from the kernel outcome (counts 0).
+fn with_turn_end_hooks(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    turn: impl FnOnce() -> kernel::TurnOutcome,
+) -> kernel::TurnOutcome {
+    TURN_END_FIRED.with(|fired| fired.set(false));
+    let outcome = turn();
+    if !TURN_END_FIRED.with(|fired| fired.replace(false)) && trusted {
+        let hooks = load_project_integrations(root).hooks;
+        if !(hooks.stop.is_empty() && hooks.stop_cancelled.is_empty()) {
+            let end = match &outcome {
+                kernel::TurnOutcome::Completed { .. } => crate::hooks::TurnEnd::Completed,
+                kernel::TurnOutcome::Interrupted => crate::hooks::TurnEnd::Cancelled {
+                    reason: "cancelled".to_owned(),
+                },
+                kernel::TurnOutcome::Waiting => crate::hooks::TurnEnd::Cancelled {
+                    reason: "approval_required".to_owned(),
+                },
+                kernel::TurnOutcome::Failed { .. } => crate::hooks::TurnEnd::Cancelled {
+                    reason: "error".to_owned(),
+                },
+            };
+            let report =
+                crate::hooks::run_turn_end_stage(&hooks, &end, 0, 0, crate::hooks::HOOK_TIMEOUT);
+            record_hook_report(
+                Some(&LedgerHookEvents::new(client, session_id, actor)),
+                "",
+                "",
+                &report,
+                &mut |_| {},
+            );
+        }
+    }
+    outcome
+}
+
 /// Run `f`, converting a panic into a `Failed` outcome instead of letting it
 /// unwind past whatever the caller does afterward — `spawn_interactive_
 /// turn`'s cleanup (releasing the turn's lease, clearing `turn_in_flight`)
@@ -8418,19 +8480,21 @@ fn spawn_interactive_turn(
         // to fix. `catch_unwind` (`AssertUnwindSafe`: this closure only
         // reports the panic as a normal `Failed` outcome, it doesn't rely on
         // any invariant broken by unwinding) keeps that guarantee even here.
-        let outcome = catching_panics(std::panic::AssertUnwindSafe(|| {
-            run_interactive_turn(
-                &client,
-                session_id,
-                &actor,
-                &root,
-                trusted,
-                &text,
-                &kernel_cancel,
-                &jobs,
-                &shared,
-            )
-        }));
+        let outcome = with_turn_end_hooks(&client, session_id, &actor, &root, trusted, || {
+            catching_panics(std::panic::AssertUnwindSafe(|| {
+                run_interactive_turn(
+                    &client,
+                    session_id,
+                    &actor,
+                    &root,
+                    trusted,
+                    &text,
+                    &kernel_cancel,
+                    &jobs,
+                    &shared,
+                )
+            }))
+        });
         let _ = client.finish_turn(kernel::FinishTurn::new(
             session_id,
             turn_id,
@@ -8465,21 +8529,23 @@ fn spawn_interactive_turn_with_backing<B: crate::host::LiveModelCall + Send + 's
     shared: SessionShared,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let outcome = catching_panics(std::panic::AssertUnwindSafe(|| {
-            run_interactive_turn_with_backing(
-                &client,
-                session_id,
-                &actor,
-                &root,
-                trusted,
-                &text,
-                &kernel_cancel,
-                backing,
-                budget,
-                &jobs,
-                &shared,
-            )
-        }));
+        let outcome = with_turn_end_hooks(&client, session_id, &actor, &root, trusted, || {
+            catching_panics(std::panic::AssertUnwindSafe(|| {
+                run_interactive_turn_with_backing(
+                    &client,
+                    session_id,
+                    &actor,
+                    &root,
+                    trusted,
+                    &text,
+                    &kernel_cancel,
+                    backing,
+                    budget,
+                    &jobs,
+                    &shared,
+                )
+            }))
+        });
         let _ = client.finish_turn(kernel::FinishTurn::new(
             session_id,
             turn_id,
@@ -9000,19 +9066,41 @@ pub(crate) fn spawn_acp_turn(
             permission_mode_override: mode_override,
             ..SessionShared::default()
         };
-        let outcome = catching_panics(std::panic::AssertUnwindSafe(|| {
-            run_interactive_turn(
-                &client,
-                session_id,
-                &actor,
-                &root,
-                trusted,
-                &text,
-                &kernel_cancel,
-                &crate::exec_tools::JobRegistry::default(),
-                &shared,
-            )
-        }));
+        // `user_prompt_submit` (ADR 0022 §7): the ACP and `rapid daemon`
+        // submit paths hand the prompt to the kernel before this thread runs,
+        // so a blocked prompt finishes its turn here, failed with the hook's
+        // reason (an ACP client reads stop reason `refusal`) — no model
+        // request, no tool call and, as for a blocked TUI prompt, no
+        // turn-end hooks: no turn ran.
+        let blocked = prompt_submit_block(
+            &client,
+            session_id,
+            &actor,
+            &root,
+            trusted,
+            &text,
+            &mut |_| {},
+        );
+        let outcome = match blocked {
+            Some((hook, reason)) => kernel::TurnOutcome::Failed {
+                reason: format!("prompt blocked by {hook} hook: {reason}"),
+            },
+            None => with_turn_end_hooks(&client, session_id, &actor, &root, trusted, || {
+                catching_panics(std::panic::AssertUnwindSafe(|| {
+                    run_interactive_turn(
+                        &client,
+                        session_id,
+                        &actor,
+                        &root,
+                        trusted,
+                        &text,
+                        &kernel_cancel,
+                        &crate::exec_tools::JobRegistry::default(),
+                        &shared,
+                    )
+                }))
+            }),
+        };
         let _ = client.finish_turn(kernel::FinishTurn::new(
             session_id,
             turn_id,
@@ -9124,21 +9212,23 @@ fn spawn_continuation_turn(
     decision: ContinuationDecision,
 ) {
     std::thread::spawn(move || {
-        let outcome = catching_panics(std::panic::AssertUnwindSafe(|| {
-            run_continuation_turn(
-                &client,
-                session_id,
-                &actor,
-                &root,
-                trusted,
-                &kernel_cancel,
-                &jobs,
-                &shared,
-                token,
-                call_id,
-                decision,
-            )
-        }));
+        let outcome = with_turn_end_hooks(&client, session_id, &actor, &root, trusted, || {
+            catching_panics(std::panic::AssertUnwindSafe(|| {
+                run_continuation_turn(
+                    &client,
+                    session_id,
+                    &actor,
+                    &root,
+                    trusted,
+                    &kernel_cancel,
+                    &jobs,
+                    &shared,
+                    token,
+                    call_id,
+                    decision,
+                )
+            }))
+        });
         // `finish_turn` releases the continuation's own kernel lease; a no-op
         // if a racing `interrupt` released it first.
         let _ = client.finish_turn(kernel::FinishTurn::new(
@@ -9523,10 +9613,12 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
         record_outcome_suspension(client, session_id, actor, root, &suspended.task, outcome);
         record_turn_context(client, session_id, actor, outcome, history_through);
     }
-    // The continuation is the rest of the turn: its end is the turn's end.
+    // The continuation is the next section of the turn: its end fires its
+    // own `stop` or `stop_cancelled` (the paused section fired one too).
     fire_turn_end_hooks(
         &tools.hooks_config(),
         &run_result,
+        cancel.is_cancelled(),
         Some(&LedgerHookEvents::new(client, session_id, actor)),
         &mut |_| {},
     );
@@ -10076,6 +10168,7 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
     fire_turn_end_hooks(
         &turn_end_hooks,
         &run_result,
+        cancel.is_cancelled(),
         Some(&LedgerHookEvents::new(client, session_id, actor)),
         &mut |_| {},
     );
@@ -10179,7 +10272,10 @@ fn record_outcome_suspension(
 /// choice: a turn that succeeded completed; anything else — interrupted,
 /// paused for approval, out of budget, a failed step, an error before an
 /// outcome — ended without completing, and carries the stop reason's token.
-fn turn_end_of<E>(run_result: &Result<crate::host::ExecOutcome, E>) -> crate::hooks::TurnEnd {
+fn turn_end_of<E>(
+    run_result: &Result<crate::host::ExecOutcome, E>,
+    cancelled: bool,
+) -> crate::hooks::TurnEnd {
     match run_result {
         Ok(outcome) if outcome.result.status() == AgentTerminalStatus::Succeeded => {
             crate::hooks::TurnEnd::Completed
@@ -10189,6 +10285,11 @@ fn turn_end_of<E>(run_result: &Result<crate::host::ExecOutcome, E>) -> crate::ho
                 .stop_reason
                 .map(|reason| reason.as_str().to_owned())
                 .unwrap_or_else(|| "failed".to_owned()),
+        },
+        // An interrupt can surface as an error (cancelled at the start of
+        // the turn, or during context recovery): it is still `cancelled`.
+        Err(_) if cancelled => crate::hooks::TurnEnd::Cancelled {
+            reason: "cancelled".to_owned(),
         },
         Err(_) => crate::hooks::TurnEnd::Cancelled {
             reason: "error".to_owned(),
@@ -10203,9 +10304,11 @@ fn turn_end_of<E>(run_result: &Result<crate::host::ExecOutcome, E>) -> crate::ho
 fn fire_turn_end_hooks<E>(
     hooks: &crate::hooks::HooksConfig,
     run_result: &Result<crate::host::ExecOutcome, E>,
+    cancelled: bool,
     sink: Option<&dyn crate::exec_tools::HookEvents>,
     warn: &mut dyn FnMut(&str),
 ) {
+    TURN_END_FIRED.with(|fired| fired.set(true));
     if hooks.stop.is_empty() && hooks.stop_cancelled.is_empty() {
         return;
     }
@@ -10215,12 +10318,45 @@ fn fire_turn_end_hooks<E>(
     };
     let report = crate::hooks::run_turn_end_stage(
         hooks,
-        &turn_end_of(run_result),
+        &turn_end_of(run_result, cancelled),
         tool_calls,
         tokens,
         crate::hooks::HOOK_TIMEOUT,
     );
     record_hook_report(sink, "", "", &report, warn);
+}
+
+/// Run the project's `user_prompt_submit` hooks for a prompt about to start a
+/// turn — trusted projects only; hooks are project settings — and record what
+/// they decided. `Some((hook, reason))` when a hook blocked the prompt. Every
+/// surface that starts a turn from a human prompt asks this first: the TUI
+/// composer and queue, the ACP and `rapid daemon` submit paths
+/// (`spawn_acp_turn`), and headless `rapid exec` (its own copy, which exits
+/// `Policy`).
+pub(crate) fn prompt_submit_block(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    text: &str,
+    warn: &mut dyn FnMut(&str),
+) -> Option<(String, String)> {
+    if !trusted || text.trim().is_empty() {
+        return None;
+    }
+    let hooks = load_project_integrations(root).hooks;
+    if hooks.user_prompt_submit.is_empty() {
+        return None;
+    }
+    let report = crate::hooks::run_prompt_submit_stage(
+        &hooks.user_prompt_submit,
+        text,
+        crate::hooks::HOOK_TIMEOUT,
+    );
+    let sink = LedgerHookEvents::new(client, session_id, actor);
+    record_hook_report(Some(&sink), "", "", &report, warn);
+    report.first_deny()
 }
 
 /// Record a fail-open stage's decisions (`hook.decided`) and failures
@@ -16310,6 +16446,269 @@ question the panel answers"
     }
 
     #[test]
+    fn a_goal_prompt_a_hook_blocks_stops_the_goal_instead_of_retrying_every_tick() {
+        // The goal loop's compiled prompt passes the prompt gate; a block
+        // stops the loop (it would be blocked again on every tick) and
+        // leaves the composer alone.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let _goal = session.create_active_goal();
+        let capture = env.project.join("prompts.jsonl");
+        settings_with_hooks(
+            &env.project,
+            serde_json::json!({
+                "user_prompt_submit": [capturing_hook(
+                    &env.project,
+                    "gate.sh",
+                    &capture,
+                    r#"{"decision":"deny","reason":"prompts must name a ticket"}"#,
+                )],
+            }),
+        );
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(vec![ScriptedModel::terminal("unused")]);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight,
+            backings,
+        );
+        loop_state.start_autonomous_goal().expect("start");
+        drive_autonomous_goal(&mut loop_state);
+        assert!(
+            loop_state.autonomous.is_none(),
+            "a blocked goal prompt stops the loop"
+        );
+        let runs = fs::read_to_string(&capture)
+            .expect("the gate ran")
+            .matches("\"prompt\"")
+            .count();
+        assert_eq!(runs, 1, "judged once, not on every tick");
+        assert_eq!(
+            loop_state.ui.composer().text(),
+            "",
+            "the composer is left alone"
+        );
+        let transcript = format!("{:?}", loop_state.ui.transcript());
+        assert!(
+            transcript.contains(
+                "prompt blocked by user_prompt_submit[0] hook: prompts must name a ticket"
+            ),
+            "{transcript}"
+        );
+    }
+
+    #[test]
+    fn every_way_a_turn_ends_fires_the_turn_end_stage_exactly_once() {
+        // The turn wrappers fire `stop`/`stop_cancelled` from the kernel
+        // outcome when the turn did not reach `fire_turn_end_hooks` — an
+        // early failure, a continuation that pauses again, a panic — and not
+        // a second time when it did.
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let stops = root.join("stops.jsonl");
+        let cancelled = root.join("cancelled.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [capturing_hook(&root, "stop.sh", &stops, r#"{"decision":"allow"}"#)],
+                "stop_cancelled": [capturing_hook(&root, "cancelled.sh", &cancelled, r#"{"decision":"allow"}"#)],
+            }),
+        );
+        let session = ScriptedSession::create(&env);
+        let fire = |outcome: kernel::TurnOutcome, fired_inside: bool| {
+            with_turn_end_hooks(
+                &session.client,
+                session.session_id,
+                &session.actor,
+                &root,
+                true,
+                || {
+                    if fired_inside {
+                        let run: Result<crate::host::ExecOutcome, String> = Err("x".to_owned());
+                        fire_turn_end_hooks(
+                            &crate::hooks::HooksConfig::default(),
+                            &run,
+                            false,
+                            None,
+                            &mut |_| {},
+                        );
+                    }
+                    outcome
+                },
+            )
+        };
+        let count = |path: &Path| {
+            fs::read_to_string(path)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+        fire(
+            kernel::TurnOutcome::Failed {
+                reason: "no credential".to_owned(),
+            },
+            false,
+        );
+        assert_eq!(
+            (count(&stops), count(&cancelled)),
+            (0, 1),
+            "an early failure fires stop_cancelled"
+        );
+        assert!(
+            fs::read_to_string(&cancelled)
+                .expect("fired")
+                .contains("\"reason\":\"error\"")
+        );
+        fire(kernel::TurnOutcome::Waiting, false);
+        assert!(
+            fs::read_to_string(&cancelled)
+                .expect("fired")
+                .contains("\"reason\":\"approval_required\"")
+        );
+        fire(kernel::TurnOutcome::Interrupted, false);
+        assert!(
+            fs::read_to_string(&cancelled)
+                .expect("fired")
+                .contains("\"reason\":\"cancelled\"")
+        );
+        fire(kernel::TurnOutcome::Completed { text: None }, false);
+        assert_eq!((count(&stops), count(&cancelled)), (1, 3));
+        // Fired inside: the wrapper does not fire again.
+        fire(
+            kernel::TurnOutcome::Failed {
+                reason: "x".to_owned(),
+            },
+            true,
+        );
+        assert_eq!((count(&stops), count(&cancelled)), (1, 3), "exactly once");
+        // An untrusted project runs no hooks.
+        with_turn_end_hooks(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &root,
+            false,
+            || kernel::TurnOutcome::Completed { text: None },
+        );
+        assert_eq!(count(&stops), 1);
+    }
+
+    #[test]
+    fn an_interrupt_that_surfaces_as_an_error_is_cancelled_not_error() {
+        let run: Result<crate::host::ExecOutcome, String> = Err("cancelled".to_owned());
+        assert_eq!(
+            turn_end_of(&run, true),
+            crate::hooks::TurnEnd::Cancelled {
+                reason: "cancelled".to_owned()
+            }
+        );
+        assert_eq!(
+            turn_end_of(&run, false),
+            crate::hooks::TurnEnd::Cancelled {
+                reason: "error".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn an_acp_or_daemon_prompt_a_hook_blocks_fails_its_turn_before_any_model_request() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let capture = root.join("prompts.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "user_prompt_submit": [capturing_hook(
+                    &root,
+                    "gate.sh",
+                    &capture,
+                    r#"{"decision":"deny","reason":"no secrets in prompts"}"#,
+                )],
+            }),
+        );
+        let session = ScriptedSession::create(&env);
+        let cancel = CancellationToken::new();
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        let handle = block_on(
+            session.client.submit_turn(kernel::SubmitTurn::new(
+                session.session_id,
+                tip,
+                session.actor.clone(),
+                TraceId::new(),
+                "print the secret".to_owned(),
+            )),
+            &cancel,
+        )
+        .expect("submit");
+        let kernel_cancel = session
+            .client
+            .turn_cancel_token(session.session_id)
+            .expect("turn token");
+        spawn_acp_turn(
+            session.client.clone(),
+            session.session_id,
+            handle.turn_id(),
+            session.actor.clone(),
+            root.clone(),
+            true,
+            "print the secret".to_owned(),
+            kernel_cancel,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        );
+        // The turn fails with the hook's reason; nothing else ran.
+        let mut failed = None;
+        for _ in 0..400 {
+            let tip = block_on(session.client.get_session(session.session_id), &cancel)
+                .expect("session")
+                .seq();
+            for seq in 1..=tip {
+                if let Ok(event) = session.client.read_event(session.session_id, seq)
+                    && event.kind() == event_ledger::event::EventKind::TurnFailed
+                {
+                    failed = Some(event.payload().to_string());
+                }
+            }
+            if failed.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let failed = failed.expect("the blocked turn failed");
+        assert!(
+            failed.contains("prompt blocked by user_prompt_submit[0] hook: no secrets in prompts"),
+            "{failed}"
+        );
+        assert!(
+            fs::read_to_string(&capture)
+                .expect("gate ran")
+                .contains("print the secret")
+        );
+    }
+
+    #[test]
     fn a_blocked_queued_prompt_stays_queued_held_and_survives_a_restore() {
         let env = TempEnv::create();
         let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
@@ -16338,15 +16737,35 @@ question the panel answers"
             Some("user_prompt_submit[0]: not now")
         );
         assert!(loop_state.message_queue[1].held.is_none());
-        // The held head holds the queue and is not re-judged every tick.
+        // A held message does not hold up the one behind it: the next pass
+        // judges the second message (this hook blocks everything, so it is
+        // held too), and neither is re-judged on later passes.
         loop_state.dequeue_if_ready().expect("dequeue");
         loop_state.dequeue_if_ready().expect("dequeue");
-        let runs = fs::read_to_string(&capture)
-            .expect("hook ran")
-            .matches("queued follow-up")
-            .count();
-        assert_eq!(runs, 1, "the hook ran once for the held message");
+        let captured = fs::read_to_string(&capture).expect("hook ran");
+        assert_eq!(
+            captured.matches("queued follow-up").count(),
+            1,
+            "{captured}"
+        );
+        assert_eq!(
+            captured.matches("second follow-up").count(),
+            1,
+            "{captured}"
+        );
         assert_eq!(loop_state.message_queue.len(), 2);
+        assert!(loop_state.message_queue[1].held.is_some());
+        // `/queue edit` lifts a hold; a `/queue run` the hook blocks again
+        // holds it again — durably.
+        let id = loop_state.message_queue[0].id.clone();
+        loop_state
+            .run_queue_command(&format!("edit {id} queued follow-up, revised"))
+            .expect("edit");
+        assert!(loop_state.message_queue[0].held.is_none());
+        loop_state
+            .run_queue_command(&format!("run {id}"))
+            .expect("run");
+        assert!(loop_state.message_queue[0].held.is_some());
         assert!(
             !loop_state
                 .turn_in_flight
@@ -16359,12 +16778,13 @@ question the panel answers"
         restored.message_queue.clear();
         restored.restore_queued_messages();
         assert_eq!(restored.message_queue.len(), 2);
-        assert_eq!(restored.message_queue[0].text, "queued follow-up");
+        assert_eq!(restored.message_queue[0].text, "queued follow-up, revised");
         assert_eq!(
             restored.message_queue[0].held.as_deref(),
-            Some("user_prompt_submit[0]: not now")
+            Some("user_prompt_submit[0]: not now"),
+            "the hold `/queue run` set survives the restart"
         );
-        assert!(restored.message_queue[1].held.is_none());
+        assert!(restored.message_queue[1].held.is_some());
     }
 
     #[test]

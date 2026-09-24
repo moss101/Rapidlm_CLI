@@ -300,7 +300,9 @@ pub struct HookFailure {
 pub enum TurnEnd {
     Completed,
     /// Ended without completing; `reason` is a stable token
-    /// (`interrupted`, `approval_required`, `budget_exhausted`, …).
+    /// (`cancelled`, `approval_required`, `budget_exhausted`, …; `failed` for
+    /// an outcome with no stop reason, `error` when the turn failed before
+    /// producing one).
     Cancelled {
         reason: String,
     },

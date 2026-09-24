@@ -1432,6 +1432,16 @@ pub trait SubagentRunner: Send + Sync {
         write_scope: Option<&str>,
         cancel: &CancellationToken,
     ) -> Result<SubagentReport, String>;
+
+    /// Settle a finished child's changes once `subagent_stop` has decided:
+    /// `blocked` is whether a hook blocked its completion. An isolated
+    /// child's writes are applied (headless auto-integration) or held for
+    /// review only now — a blocked child's are never applied — and the note
+    /// returned tells the parent which happened. `None`: nothing to say (no
+    /// isolated view, or a runner without one).
+    fn settle(&self, _agent: protocol::AgentId, _blocked: bool) -> Option<String> {
+        None
+    }
 }
 
 /// Structured result of one `task_spawn` child run. Kept typed across the
@@ -2635,13 +2645,18 @@ impl WorkspaceTools {
                 }
                 crate::hooks::PreHookOutcome::Allowed => {}
             }
-            // On the approved resume: answered when the approval names one of
-            // this run's asking hooks and covers these exact arguments. A
-            // lattice approval (no hook source), a different hook, or
-            // different (rewritten) arguments are not that answer.
+            // On the approved resume: answered when the approval names the
+            // hook whose question leads — the asking hook when one asks, else
+            // the rewriting hook — and covers these exact arguments. That is
+            // the request this run raises, so its approval answers the run's
+            // other question too (they are about the same call); a lattice
+            // approval (no hook source), a different hook, or different
+            // (rewritten) arguments are not that answer — and a hook that
+            // starts asking only on a later run is asked, not waved through
+            // on an approval of the rewrite.
             let answered = approved.is_some_and(|approved| {
                 approved.covers(call.arguments())
-                    && questions.iter().any(|(hook, digest, _)| {
+                    && questions.first().is_some_and(|(hook, digest, _)| {
                         approved.source.as_deref()
                             == Some(crate::approvals::hook_source(hook, digest).as_str())
                     })
@@ -2708,15 +2723,15 @@ impl WorkspaceTools {
         // An invalid-arguments failure is a result like any other failure:
         // it takes the same tail (failure hooks, the hooks' context), rather
         // than returning past it with the context already computed.
-        let mut result = if !arguments_parseable {
-            ToolStepResult::Failed {
+        let dispatched = if !arguments_parseable {
+            Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
                 detail: Some(bounded_detail(&format!(
                     "invalid arguments for {} (JSON with the documented fields and bounds)",
                     call.tool()
                 ))),
-            }
+            })
         } else {
             match call.tool() {
                 WORKSPACE_WRITE_TOOL => self.execute_write(call, cancel),
@@ -2758,7 +2773,35 @@ impl WorkspaceTools {
                         ))),
                     })
                 }
-            }?
+            }
+        };
+        // A call that failed with a runtime error (a shell timeout, an I/O
+        // failure) has no result to follow and ends the turn, but it did
+        // fail: `post_tool_use_failure` observes it too. Nothing it adds can
+        // be delivered, so only its decisions and failures are recorded.
+        let mut result = match dispatched {
+            Ok(result) => result,
+            Err(err) => {
+                if matches!(err, ToolStepError::Failed)
+                    && !self.hooks.post_tool_use_failure.is_empty()
+                {
+                    let report = crate::hooks::run_post_tool_failure_stage(
+                        &self.hooks.post_tool_use_failure,
+                        call.tool(),
+                        "the tool failed with a runtime error; the turn ends",
+                        crate::hooks::HOOK_TIMEOUT,
+                    );
+                    if let Some(events) = self.hook_events.as_ref() {
+                        for record in &report.decisions {
+                            events.decided(call.tool(), call.call_id(), record);
+                        }
+                        for failure in &report.failures {
+                            events.failed(call.tool(), call.call_id(), failure);
+                        }
+                    }
+                }
+                return Err(err);
+            }
         };
         // A successful workspace mutation stales durable verification
         // evidence (see `EvidenceInvalidator`); the outcome rides on the
@@ -4358,35 +4401,46 @@ read with job_output, in this turn or a later one — the job is stopped when th
             }),
             other => other,
         };
-        let (end, detail) = match &outcome {
-            Ok(report) if report.status == "cancelled" => (SubagentEnd::Cancelled, None),
-            Ok(report) if report.status == "succeeded" => (SubagentEnd::Succeeded, None),
-            Ok(report) => (SubagentEnd::Failed, Some(report.status.as_str())),
-            Err(reason) => (SubagentEnd::Failed, Some(reason.as_str())),
-        };
-        lifecycle.end(end, detail);
         // `subagent_stop` (ADR 0022 §7): a v2 `deny` blocks the child's
         // completion — the parent is told so, naming the hook, instead of
-        // receiving the report as a result it may act on.
-        if let Some((hook, reason)) = subagent_stop_block(
+        // receiving the report as a result it may act on. It decides before
+        // anything the child wrote is applied (`settle`), and before the
+        // child's end is recorded, so a blocked child is never shown as a
+        // success.
+        let blocked = subagent_stop_block(
             &self.hooks,
             self.hook_events.as_deref(),
             call.call_id(),
             &args.agent_type,
             &outcome,
-        ) {
+        );
+        let note = runner.settle(agent_id, blocked.is_some());
+        let (end, detail) = match (&blocked, &outcome) {
+            (Some(_), _) => (SubagentEnd::Failed, Some("completion blocked by a hook")),
+            (None, Ok(report)) if report.status == "cancelled" => (SubagentEnd::Cancelled, None),
+            (None, Ok(report)) if report.status == "succeeded" => (SubagentEnd::Succeeded, None),
+            (None, Ok(report)) => (SubagentEnd::Failed, Some(report.status.as_str())),
+            (None, Err(reason)) => (SubagentEnd::Failed, Some(reason.as_str())),
+        };
+        lifecycle.end(end, detail);
+        if let Some((hook, reason)) = blocked {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
-                detail: Some(self.redact_output(bounded_detail(&format!(
-                    "subagent ({}) completion blocked by {hook} hook: {reason}",
-                    args.agent_type
-                )))),
+                detail: Some(self.redact_output(blocked_completion_detail(
+                    &args.agent_type,
+                    &hook,
+                    &reason,
+                    note.as_deref(),
+                ))),
             });
         }
         match &outcome {
             Ok(_) => {
-                let summary = render_subagent_report(&args.agent_type, &outcome);
+                let mut summary = render_subagent_report(&args.agent_type, &outcome);
+                if let Some(note) = note {
+                    summary.push_str(&note);
+                }
                 Ok(ToolStepResult::Succeeded {
                     call_id: call.call_id().to_owned(),
                     summary,
@@ -4537,14 +4591,8 @@ read with job_output, in this turn or a later one — the job is stopped when th
                 }),
                 other => other,
             };
-            let (end, detail) = match &outcome {
-                Ok(report) if report.status == "cancelled" => (SubagentEnd::Cancelled, None),
-                Ok(report) if report.status == "succeeded" => (SubagentEnd::Succeeded, None),
-                Ok(report) => (SubagentEnd::Failed, Some(report.status.as_str())),
-                Err(reason) => (SubagentEnd::Failed, Some(reason.as_str())),
-            };
-            lifecycle.end(end, detail);
-            registry.release_detached();
+            // The hook decides before the child's writes are settled and
+            // before its end is recorded — as on the inline path.
             let blocked = subagent_stop_block(
                 &stop_hooks,
                 hook_events.as_deref(),
@@ -4552,14 +4600,33 @@ read with job_output, in this turn or a later one — the job is stopped when th
                 &agent_type,
                 &outcome,
             );
+            let note = runner.settle(agent_id, blocked.is_some());
+            let (end, detail) = match (&blocked, &outcome) {
+                (Some(_), _) => (SubagentEnd::Failed, Some("completion blocked by a hook")),
+                (None, Ok(report)) if report.status == "cancelled" => {
+                    (SubagentEnd::Cancelled, None)
+                }
+                (None, Ok(report)) if report.status == "succeeded" => {
+                    (SubagentEnd::Succeeded, None)
+                }
+                (None, Ok(report)) => (SubagentEnd::Failed, Some(report.status.as_str())),
+                (None, Err(reason)) => (SubagentEnd::Failed, Some(reason.as_str())),
+            };
+            lifecycle.end(end, detail);
+            registry.release_detached();
             // Spool the report BEFORE marking the job terminal, so a
             // completion notification never shows an empty output page.
             if let Ok(mut buffer) = shared.output.lock() {
                 let rendered = match &blocked {
                     Some((hook, reason)) => format!(
-                        "subagent ({agent_type}) completion blocked by {hook} hook: {reason}"
+                        "subagent ({agent_type}) completion blocked by {hook} hook: {reason}{}",
+                        note.as_deref().unwrap_or_default()
                     ),
-                    None => render_subagent_report(&agent_type, &outcome),
+                    None => format!(
+                        "{}{}",
+                        render_subagent_report(&agent_type, &outcome),
+                        note.as_deref().unwrap_or_default()
+                    ),
                 };
                 buffer.extend_from_slice(rendered.as_bytes());
             }
@@ -7497,6 +7564,31 @@ impl ToolDriver for WorkspaceTools {
 /// Run the `subagent_stop` stage for a finished child and record what its
 /// hooks decided (and which failed). `Some((hook, reason))` when a hook's
 /// v2 `deny` blocks the child's completion.
+/// The parent's result for a child whose completion a `subagent_stop` hook
+/// blocked: the hook and its reason, then what became of the child's changes
+/// (`note`). The reason is cut first, so the note — how to reach the held
+/// changes — survives the result bound.
+fn blocked_completion_detail(
+    agent_type: &str,
+    hook: &str,
+    reason: &str,
+    note: Option<&str>,
+) -> String {
+    let head = format!("subagent ({agent_type}) completion blocked by {hook} hook: ");
+    let note = note.unwrap_or_default();
+    let room = MAX_RESULT_DETAIL_BYTES.saturating_sub(head.len() + note.len());
+    let reason = if reason.len() <= room {
+        reason.to_owned()
+    } else {
+        let mut cut = room.saturating_sub(3);
+        while cut > 0 && !reason.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}...", &reason[..cut])
+    };
+    bounded_detail(&format!("{head}{reason}{note}"))
+}
+
 fn subagent_stop_block(
     hooks: &crate::hooks::HooksConfig,
     events: Option<&dyn HookEvents>,
@@ -10168,6 +10260,223 @@ mod tests {
         assert_eq!(decisions[0].0, TASK_SPAWN_TOOL);
         assert_eq!(decisions[0].1, "s1");
         assert_eq!(decisions[0].2.decision, protocol::HookDecision::Deny);
+    }
+
+    #[test]
+    fn a_blocked_childs_changes_are_settled_after_the_hook_and_it_ends_failed() {
+        // `subagent_stop` decides before the child's writes are settled — a
+        // blocked child's are held, never applied — and before its end is
+        // recorded, so `/agents` never shows a blocked child as succeeded;
+        // the note about its changes survives a long reason.
+        struct SettlingRunner(Arc<Mutex<Vec<bool>>>);
+        impl crate::exec_tools::SubagentRunner for SettlingRunner {
+            fn run(
+                &self,
+                _agent: protocol::AgentId,
+                _prompt: &str,
+                _agent_type: &str,
+                _write_scope: Option<&str>,
+                _cancel: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                Ok(SubagentReport {
+                    summary: "done".to_owned(),
+                    status: "succeeded".to_owned(),
+                    tool_calls: 1,
+                    tokens: 1,
+                    cost_usd_micros: None,
+                    stop_reason: None,
+                    claims: Vec::new(),
+                    blockers: Vec::new(),
+                    open_questions: Vec::new(),
+                    patch_summary: None,
+                    artifacts: Vec::new(),
+                })
+            }
+            fn settle(&self, _agent: protocol::AgentId, blocked: bool) -> Option<String> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(blocked);
+                Some(
+                    if blocked {
+                        " [held, not applied]"
+                    } else {
+                        " [applied]"
+                    }
+                    .to_owned(),
+                )
+            }
+        }
+        let long_reason = "no tests were run; ".repeat(40);
+        let deny = format!(r#"{{"decision":"deny","reason":"{long_reason}"}}"#);
+        for (label, decision, blocked) in [
+            ("deny", deny.as_str(), true),
+            ("allow", r#"{"decision":"allow"}"#, false),
+        ] {
+            let root = TempRoot::new("hook-subagent-settle");
+            let settled = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut tools = permissive_workspace(&root.0);
+            tools.set_subagent_runner(Arc::new(SettlingRunner(Arc::clone(&settled))));
+            tools.set_agent_events(Arc::new(RecordingAgentEvents {
+                seen: Arc::clone(&seen),
+                spawned_lands: true,
+            }));
+            tools.set_hooks(crate::hooks::HooksConfig {
+                subagent_stop: vec![hook_printing(&root.0, "stop.sh", decision)],
+                ..Default::default()
+            });
+            let result = run_one(
+                &mut tools,
+                &make_call(
+                    "s1",
+                    TASK_SPAWN_TOOL,
+                    r#"{"prompt":"do it","type":"explore"}"#,
+                ),
+            );
+            assert_eq!(
+                *settled.lock().unwrap_or_else(|p| p.into_inner()),
+                vec![blocked],
+                "{label}: settled once, after the hook, knowing its decision"
+            );
+            let seen = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let finished = seen
+                .iter()
+                .find(|line| line.starts_with("finished"))
+                .unwrap_or_else(|| panic!("{label}: the end is recorded: {seen:?}"))
+                .clone();
+            match result {
+                ToolStepResult::Failed { detail, .. } if blocked => {
+                    let detail = detail.unwrap_or_default();
+                    assert!(
+                        detail.contains("completion blocked by subagent_stop[0] hook: no tests"),
+                        "{detail}"
+                    );
+                    assert!(
+                        detail.ends_with("[held, not applied]"),
+                        "the note survives the bound: {detail}"
+                    );
+                    assert!(
+                        finished.contains("Failed") && finished.contains("completion blocked"),
+                        "{finished}"
+                    );
+                }
+                ToolStepResult::Succeeded { summary, .. } if !blocked => {
+                    assert!(summary.ends_with("[applied]"), "{summary}");
+                    assert!(finished.contains("Succeeded"), "{finished}");
+                }
+                other => panic!("{label}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_hook_that_starts_asking_later_is_asked_not_waved_through_on_the_rewrites_approval() {
+        // hook0 allows on its first run and asks from then on; hook1 always
+        // rewrites. The rewrite's question is raised alone and approved
+        // (naming hook1); on the next resume hook0 asks about the same
+        // arguments — its question leads now, so the approval of hook1's
+        // question is not its answer: it is raised, and only its own
+        // approval runs the call.
+        let root = TempRoot::new("hook-late-ask");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default);
+        let mut tools = WorkspaceTools::open_with_permissions(&root.0, lattice).expect("tools");
+        tools.set_approval_source(approvals.clone());
+        let counter = root.0.join("counter");
+        let late = root.0.join("late.sh");
+        fs::write(
+            &late,
+            format!(
+                "n=$(cat {c} 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > {c}\nif [ \"$n\" -ge 2 ]; then echo '{{\"decision\":\"ask\",\"reason\":\"now review\"}}'; else echo '{{\"decision\":\"allow\"}}'; fi\nexit 0\n",
+                c = test_fixtures::sh_quote(&counter)
+            ),
+        )
+        .expect("script");
+        tools.set_hooks(crate::hooks::HooksConfig {
+            pre_tool_use: vec![
+                format!("sh {}", test_fixtures::slash_path(&late)),
+                hook_printing(
+                    &root.0,
+                    "rewrite.sh",
+                    r#"{"decision":"allow","updated_input":{"path":"out.txt","content":"x"}}"#,
+                ),
+            ],
+            ..Default::default()
+        });
+        let (asked, result) =
+            approve_until_it_runs(&mut tools, &approvals, &write_call("c1", "orig.txt"), 6);
+        assert!(
+            matches!(result, ToolStepResult::Succeeded { .. }),
+            "{result:?}"
+        );
+        let requests = approvals.requests.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            asked, 3,
+            "the lattice's, the rewrite's, then hook0's own: {requests:?}"
+        );
+        assert!(
+            requests[1]
+                .source
+                .as_deref()
+                .is_some_and(|s| s.starts_with("hook:pre_tool_use[1]#"))
+        );
+        assert!(
+            requests[2]
+                .source
+                .as_deref()
+                .is_some_and(|s| s.starts_with("hook:pre_tool_use[0]#")),
+            "the late ask is raised as its own question"
+        );
+        assert!(
+            requests[2].summary.contains("now review"),
+            "{}",
+            requests[2].summary
+        );
+    }
+
+    #[test]
+    fn a_runtime_error_is_observed_by_the_failure_stage() {
+        // A failure that comes back as a runtime error (no result, the turn
+        // ends) still fires `post_tool_use_failure`; what it decides is
+        // recorded.
+        let root = TempRoot::new("hook-failure-runtime");
+        let sink = Arc::new(RecordingHookEvents::default());
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_hook_events(sink.clone());
+        let capture = root.0.join("failure.json");
+        let script = root.0.join("failure.sh");
+        fs::write(
+            &script,
+            format!(
+                "cat > {}\necho '{{\"decision\":\"allow\"}}'\nexit 0\n",
+                test_fixtures::sh_quote(&capture)
+            ),
+        )
+        .expect("script");
+        tools.set_hooks(crate::hooks::HooksConfig {
+            post_tool_use_failure: vec![format!("sh {}", test_fixtures::slash_path(&script))],
+            ..Default::default()
+        });
+        // A plan file that cannot be read (here: a directory) is a runtime
+        // error from `plan_exit`, not a result — on every platform.
+        run_one(&mut tools, &make_call("p0", PLAN_ENTER_TOOL, "{}"));
+        fs::create_dir_all(root.0.join(PLAN_PATH)).expect("plan path is a directory");
+        let cancel = CancellationToken::new();
+        let call = make_call("p1", PLAN_EXIT_TOOL, "{}");
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        assert!(matches!(
+            tools.execute(&validated, &cancel),
+            Err(ToolStepError::Failed)
+        ));
+        let seen: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&capture).expect("the failure stage fired"))
+                .expect("json");
+        assert_eq!(seen["event"], "post_tool_use_failure");
+        assert_eq!(seen["tool"], PLAN_EXIT_TOOL);
+        let decisions = sink.records.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].1, "p1");
     }
 
     /// Drive a call through approvals until it runs (or `limit` requests),
