@@ -947,14 +947,13 @@ fn encode_for_endpoint(
     Ok(payload)
 }
 
-/// A reply's own malformation is the provider's failure (`Permanent`):
-/// `InvalidRequest` is kept for what is refused before anything is sent.
-/// Other errors (`BoundExceeded` for an over-long id) pass through.
-pub(crate) fn reply_error(err: ProviderError) -> ProviderError {
-    match err {
-        ProviderError::InvalidRequest => ProviderError::Permanent,
-        other => other,
-    }
+/// A reply's own malformation — a tool id or name out of the alphabet or
+/// over its length bound — is the provider's failure (`Permanent`): never a
+/// request refused before sending (`InvalidRequest`), and never a context
+/// bound (`BoundExceeded`), which would have the host compact the
+/// conversation to "fix" a reply.
+pub(crate) fn reply_error(_err: ProviderError) -> ProviderError {
+    ProviderError::Permanent
 }
 
 /// Convert a canonical request to the provider JSON object (no secrets).
@@ -1540,9 +1539,11 @@ fn ingest_chat_tool_deltas(
                         name,
                     },
                 )?,
-                // An id repeated on a later delta of a started call is fine;
-                // a new call without a name could never be run.
-                None if !tool_ids.contains_key(&index) => return Err(ProviderError::Permanent),
+                // The same id repeated on a later delta of a started call is
+                // fine; a new call without a name could never be run.
+                None if tool_ids.get(&index) != Some(&call_id) => {
+                    return Err(ProviderError::Permanent);
+                }
                 None => {}
             }
             tool_ids.insert(index, call_id);
@@ -4321,8 +4322,9 @@ mod tests {
             .expect_err("bad tool name"),
             ProviderError::Permanent
         );
-        // Tool calls a reply spells wrong: the provider's failure, and an
-        // over-long id stays a bound, not a rejection.
+        // Tool calls a reply spells wrong — out of the alphabet, nameless,
+        // over the length bound — are the provider's failure (a bound here
+        // would have the host compact the conversation).
         let stream = |call: &str| {
             format!(
                 "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{call}]}}}}]}}\n\ndata: [DONE]\n\n"
@@ -4344,7 +4346,12 @@ mod tests {
             ),
             (
                 format!(r#"{{"index":0,"id":"{long_id}","type":"function","function":{{"name":"x","arguments":""}}}}"#),
-                ProviderError::BoundExceeded,
+                ProviderError::Permanent,
+            ),
+            // A second call at a used index, with no name of its own.
+            (
+                r#"{"index":0,"id":"c1","type":"function","function":{"name":"x","arguments":""}},{"index":0,"id":"c2","type":"function","function":{"arguments":"{}"}}"#.to_owned(),
+                ProviderError::Permanent,
             ),
         ] {
             assert_eq!(

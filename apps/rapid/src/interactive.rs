@@ -5606,17 +5606,21 @@ It will run after the current turn; /queue cancels or edits it.",
 
     /// The environment `/model` resolves configuration in: the session's
     /// RapidLM home (`RAPIDLM_HOME`, whose `config.toml` a turn reads by
-    /// default), with `RAPIDLM_CONFIG` and the managed policy (if the process
-    /// names them) still in force. A variable set but not valid Unicode is an
+    /// default), then the process's `HOME` and `USERPROFILE` fall-backs, with
+    /// `RAPIDLM_CONFIG` and the managed policy (if the process names them)
+    /// still in force — the variables a turn's resolution reads. A variable set but not valid Unicode is an
     /// error — a policy path must never silently read as "no policy".
     fn model_env(&self) -> Result<Vec<(String, String)>, String> {
         let mut model_env: Vec<(String, String)> = vec![(
             crate::user_config::RAPIDLM_HOME_ENV.to_owned(),
             self.user_home.display().to_string(),
         )];
+        // The fall-backs a turn's resolution reads after the RapidLM home.
         for key in [
             crate::user_config::CONFIG_PATH_ENV,
             crate::managed_config::MANAGED_CONFIG_ENV,
+            crate::user_config::HOME_ENV,
+            crate::user_config::USERPROFILE_ENV,
         ] {
             if let Some(value) = std::env::var_os(key) {
                 let value = value
@@ -5723,11 +5727,18 @@ running on it",
             } else {
                 lines.push("using the configured default".to_owned());
             }
-            // A managed lock decides whatever the session asks.
-            if let Ok(Some(policy)) = crate::managed_config::load_policy(&model_env)
-                && let Some(locked) = policy.locked_default()
-            {
-                lines.push(format!("the managed policy locks the model to {locked}"));
+            // A managed lock decides whatever the session asks; a policy that
+            // cannot be read is said, never read as "no policy".
+            match crate::managed_config::load_policy(&model_env) {
+                Ok(Some(policy)) => {
+                    if let Some(locked) = policy.locked_default() {
+                        lines.push(format!("the managed policy locks the model to {locked}"));
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => lines.push(format!(
+                    "the managed policy cannot be read ({err}); turns will refuse to run"
+                )),
             }
             lines.push(
                 "/model select <id> switches for the rest of the session; /model clear returns to the default"
@@ -11472,6 +11483,11 @@ impl TuiRenderer {
     }
 
     fn sync_transcript(&mut self, ui: &AppState) {
+        // The painted copy keeps growing between rebuilds: rebuilt from the
+        // projection (itself bounded) once it holds twice the bound.
+        if self.transcript.len() > 2 * tui::state::MAX_TRANSCRIPT_ENTRIES {
+            self.rendered_mark = None;
+        }
         match self
             .rendered_mark
             .and_then(|mark| ui.transcript_since(mark))
@@ -11488,6 +11504,9 @@ impl TuiRenderer {
                 for entry in ui.transcript() {
                     self.transcript.push_entry(entry);
                 }
+                // Block ids restart with the rebuild: an anchor into the old
+                // copy would point at an unrelated block.
+                self.viewport.follow_end();
             }
         }
         self.rendered_mark = Some(ui.transcript_end());
@@ -17241,6 +17260,46 @@ question the panel answers"
             painted + 1,
             "one more block painted"
         );
+        // Scrolled back when the repaint comes: the view follows the tail
+        // again (block ids restart with a rebuild).
+        renderer.page_up();
+        assert!(!renderer.viewport.follow_tail());
+        // More than the bound between two frames: the dropped entries were
+        // never painted, so the frame repaints what the projection holds.
+        for n in 0..=tui::state::MAX_TRANSCRIPT_ENTRIES {
+            ui = reduce(
+                ui,
+                &UiEvent::Local(tui::state::LocalUiEvent::AppendCommandOutput(format!(
+                    "flood {n}"
+                ))),
+            );
+        }
+        renderer.sync_transcript(&ui);
+        assert_eq!(
+            renderer.transcript.len(),
+            tui::state::MAX_TRANSCRIPT_ENTRIES,
+            "a repaint, not an append"
+        );
+        assert!(
+            renderer.viewport.follow_tail(),
+            "the rebuilt view follows the tail"
+        );
+        // One entry a frame, past twice the bound: the painted copy is
+        // rebuilt rather than growing without end.
+        for n in 0..=(2 * tui::state::MAX_TRANSCRIPT_ENTRIES) {
+            ui = reduce(
+                ui,
+                &UiEvent::Local(tui::state::LocalUiEvent::AppendCommandOutput(format!(
+                    "steady {n}"
+                ))),
+            );
+            renderer.sync_transcript(&ui);
+        }
+        assert!(
+            renderer.transcript.len() <= 2 * tui::state::MAX_TRANSCRIPT_ENTRIES + 1,
+            "{}",
+            renderer.transcript.len()
+        );
         // A switched session is painted afresh.
         let other = reduce(
             AppState::new(),
@@ -17289,8 +17348,9 @@ question the panel answers"
             .start_autonomous_goal()
             .expect("start while busy");
         for n in 0..=tui::state::MAX_TRANSCRIPT_ENTRIES {
+            let ui = std::mem::replace(&mut *loop_state.ui, AppState::new());
             *loop_state.ui = reduce(
-                loop_state.ui.clone(),
+                ui,
                 &UiEvent::Local(tui::state::LocalUiEvent::AppendCommandOutput(format!(
                     "flood {n}"
                 ))),
@@ -18558,9 +18618,31 @@ for line in sys.stdin:
 
         let mut locals = LoopLocals::for_session(&session);
         let mut loop_state = locals.session_loop(&session, Vec::new());
+        loop_state.append_command_output("painted in the parent".to_owned());
+        loop_state.drain().expect("paint the parent");
+        assert!(
+            loop_state
+                .renderer
+                .transcript
+                .blocks()
+                .iter()
+                .any(|block| block.text().contains("painted in the parent")),
+            "the parent's line is on screen before the switch"
+        );
         loop_state
             .dispatch_slash(&format!("/rewind {after_first}"))
             .expect("rewind");
+        loop_state.drain().expect("paint the child");
+        // The screen is the child's, not the parent's with more appended.
+        assert!(
+            !loop_state
+                .renderer
+                .transcript
+                .blocks()
+                .iter()
+                .any(|block| block.text().contains("painted in the parent")),
+            "the painted transcript was repainted on the switch"
+        );
         let child_id = loop_state.session_id;
         assert_ne!(child_id, session.session_id);
         let shown: Vec<String> = loop_state
