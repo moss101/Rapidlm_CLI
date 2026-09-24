@@ -5244,12 +5244,13 @@ struct AutonomousGoalState {
     agent_id: protocol::AgentId,
     _lease: DriverLease,
     loop_detector: MessageLoopDetector,
-    /// `AppState.transcript().len()` immediately before the current
-    /// iteration's turn was submitted, `None` while no iteration is
-    /// in flight (i.e. between the decision to continue and the next
-    /// `submit_turn` call, which is instantaneous in practice but kept
-    /// `Option` for clarity rather than a sentinel `usize`).
-    transcript_len_before_iteration: Option<usize>,
+    /// The transcript position (`AppState::transcript_end`) from which the
+    /// loop has not yet inspected entries: marked before an iteration's turn
+    /// is submitted (or when a goal starts behind a running turn) and moved
+    /// past each inspected range. A position, not a length: the transcript's
+    /// bound drops the oldest entries, and a length stops moving at the cap.
+    /// `None` while no iteration is in flight.
+    transcript_mark: Option<u64>,
 }
 
 impl SessionLoop<'_> {
@@ -6781,13 +6782,13 @@ denied\n",
         // Started while a turn holds the slot: that turn's end is inspected
         // like an iteration's — interrupted or failed stops the goal, as it
         // would have stopped the loop — before the first iteration starts.
-        let busy_since = self.model_busy().then(|| self.ui.transcript().len());
+        let busy_since = self.model_busy().then(|| self.ui.transcript_end());
         self.autonomous = Some(AutonomousGoalState {
             goal_id,
             agent_id: protocol::AgentId::new(),
             _lease: lease,
             loop_detector: MessageLoopDetector::new(),
-            transcript_len_before_iteration: busy_since,
+            transcript_mark: busy_since,
         });
         self.append_command_output("autonomous goal execution started".to_owned());
         self.continue_or_stop_autonomous_goal()
@@ -6826,10 +6827,15 @@ denied\n",
         let started_at = self
             .autonomous
             .as_ref()
-            .and_then(|auto| auto.transcript_len_before_iteration);
-        if let Some(start) = started_at {
-            let start = start.min(self.ui.transcript().len());
-            let new_entries = self.ui.transcript()[start..].to_vec();
+            .and_then(|auto| auto.transcript_mark);
+        if let Some(mark) = started_at {
+            let Some(new_entries) = self.ui.transcript_since(mark).map(<[_]>::to_vec) else {
+                self.stop_autonomous_goal(
+                    "the session view dropped entries before the goal loop read them — /goal \
+run to resume",
+                );
+                return Ok(());
+            };
             let mut context_required = false;
             let mut interrupted = false;
             let mut failed = false;
@@ -6875,9 +6881,9 @@ denied\n",
             // The range is inspected once: when the loop then waits (for an
             // approval), the next pass must not observe the same entries —
             // the loop detector would count one finished turn as a loop.
-            let inspected = self.ui.transcript().len();
+            let inspected = self.ui.transcript_end();
             if let Some(auto) = &mut self.autonomous {
-                auto.transcript_len_before_iteration = Some(inspected);
+                auto.transcript_mark = Some(inspected);
             }
         }
         self.continue_or_stop_autonomous_goal()
@@ -7016,9 +7022,9 @@ session, then /goal run",
             self.stop_autonomous_goal(&format!("prompt blocked by {hook} hook: {reason}"));
             return Ok(());
         }
-        let before_len = self.ui.transcript().len();
+        let mark = self.ui.transcript_end();
         if let Some(auto) = &mut self.autonomous {
-            auto.transcript_len_before_iteration = Some(before_len);
+            auto.transcript_mark = Some(mark);
         }
         self.start_submitted_turn(&prompt)
     }
@@ -7723,7 +7729,7 @@ the full history, where `/diff` lists every file it wrote\n"
     /// tail delivers an event a poll interval after it lands, so just after
     /// a turn ends — or pauses on an approval — the ledger can be ahead of
     /// `self.ui`: the goal loop deciding then would miss the turn's end or
-    /// the approval it raised, and submit its next turn at a stale seq.
+    /// the approval it raised.
     fn ui_caught_up(&self) -> bool {
         let Ok(tip) = self.client.session_tip(self.session_id) else {
             return false;
@@ -16969,7 +16975,7 @@ question the panel answers"
             loop_state
                 .autonomous
                 .as_ref()
-                .is_some_and(|auto| auto.transcript_len_before_iteration.is_none()),
+                .is_some_and(|auto| auto.transcript_mark.is_none()),
             "no iteration before the projection caught up"
         );
         drain_until_caught_up(&mut loop_state);
@@ -16978,7 +16984,7 @@ question the panel answers"
             loop_state
                 .autonomous
                 .as_ref()
-                .is_some_and(|auto| auto.transcript_len_before_iteration.is_none()),
+                .is_some_and(|auto| auto.transcript_mark.is_none()),
             "no iteration over a pending approval"
         );
         loop_state.stop_autonomous_goal("test");
@@ -17059,6 +17065,80 @@ question the panel answers"
                 .iter()
                 .any(|entry| matches!(entry, TranscriptEntry::Assistant { .. })),
             "no iteration ran over it"
+        );
+    }
+
+    #[test]
+    fn a_goal_at_the_transcript_bound_still_sees_the_turn_it_waited_behind_fail() {
+        // At the bound a length stops moving: the loop must read positions.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let _goal = session.create_active_goal();
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let tip = snapshot.seq();
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        for n in 0..tui::state::MAX_TRANSCRIPT_ENTRIES {
+            ui = reduce(
+                ui,
+                &UiEvent::Local(tui::state::LocalUiEvent::AppendCommandOutput(format!(
+                    "earlier {n}"
+                ))),
+            );
+        }
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(vec![ScriptedModel::terminal("never")]);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            std::sync::Arc::clone(&turn_in_flight),
+            backings,
+        );
+        loop_state
+            .start_autonomous_goal()
+            .expect("start while busy");
+        let handle = block_on(
+            session.client.submit_turn(SubmitTurn::new(
+                session.session_id,
+                tip,
+                session.actor.clone(),
+                TraceId::new(),
+                "the turn that was running".to_owned(),
+            )),
+            &cancel,
+        )
+        .expect("occupying turn");
+        let _ = session.client.finish_turn(kernel::FinishTurn::new(
+            session.session_id,
+            handle.turn_id(),
+            session.actor.clone(),
+            TraceId::new(),
+            kernel::TurnOutcome::Failed {
+                reason: "it failed".to_owned(),
+            },
+        ));
+        turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+        drive_autonomous_goal(&mut loop_state);
+        let transcript = format!("{:?}", loop_state.ui.transcript());
+        assert!(
+            transcript.contains("the last autonomous turn failed"),
+            "the failure was seen at the bound: {transcript:.2000}"
         );
     }
 
@@ -17245,7 +17325,7 @@ question the panel answers"
             std::sync::Arc::clone(&turn_in_flight),
             backings,
         );
-        let before = loop_state.ui.transcript().len();
+        let before = loop_state.ui.transcript_end();
         loop_state
             .start_autonomous_goal()
             .expect("start while busy");
@@ -17260,7 +17340,7 @@ question the panel answers"
             loop_state
                 .autonomous
                 .as_ref()
-                .and_then(|auto| auto.transcript_len_before_iteration),
+                .and_then(|auto| auto.transcript_mark),
             Some(before),
             "no iteration started while the slot was busy"
         );

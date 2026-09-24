@@ -1445,6 +1445,27 @@ pub trait SubagentRunner: Send + Sync {
     }
 }
 
+/// The settle note, told that a hook's block changed nothing when the child
+/// failed or was cancelled anyway — its own end is what the parent hears.
+fn moot_block_note(
+    blocked: Option<&(String, String)>,
+    end: ChildEnd,
+    note: Option<String>,
+) -> Option<String> {
+    match (blocked, end) {
+        (Some((hook, _)), ChildEnd::Failed | ChildEnd::Cancelled) => Some(format!(
+            " (the {hook} hook's block is moot: the child {}){}",
+            if end == ChildEnd::Cancelled {
+                "was cancelled"
+            } else {
+                "failed"
+            },
+            note.unwrap_or_default()
+        )),
+        _ => note,
+    }
+}
+
 /// How a delegated child ended, for [`SubagentRunner::settle`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChildEnd {
@@ -4485,10 +4506,14 @@ read with job_output, in this turn or a later one — the job is stopped when th
             &outcome,
         );
         let child_end = ChildEnd::of(blocked.is_some(), &outcome);
-        let note = runner.settle(agent_id, child_end);
+        let note = moot_block_note(
+            blocked.as_ref(),
+            child_end,
+            runner.settle(agent_id, child_end),
+        );
         let (end, detail) = child_end.lifecycle(&outcome);
         lifecycle.end(end, detail);
-        if let Some((hook, reason)) = blocked {
+        if let Some((hook, reason)) = blocked.filter(|_| child_end == ChildEnd::Blocked) {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
@@ -4667,14 +4692,18 @@ read with job_output, in this turn or a later one — the job is stopped when th
                 &outcome,
             );
             let child_end = ChildEnd::of(blocked.is_some(), &outcome);
-            let note = runner.settle(agent_id, child_end);
+            let note = moot_block_note(
+                blocked.as_ref(),
+                child_end,
+                runner.settle(agent_id, child_end),
+            );
             let (end, detail) = child_end.lifecycle(&outcome);
             lifecycle.end(end, detail);
             registry.release_detached();
             // Spool the report BEFORE marking the job terminal, so a
             // completion notification never shows an empty output page.
             if let Ok(mut buffer) = shared.output.lock() {
-                let rendered = match &blocked {
+                let rendered = match blocked.as_ref().filter(|_| child_end == ChildEnd::Blocked) {
                     Some((hook, reason)) => format!(
                         "subagent ({agent_type}) completion blocked by {hook} hook: {reason}{}",
                         note.as_deref().unwrap_or_default()
@@ -10435,6 +10464,7 @@ mod tests {
             ("deny", deny.as_str(), true, false),
             ("allow", r#"{"decision":"allow"}"#, false, false),
             ("failed child", r#"{"decision":"allow"}"#, false, true),
+            ("failed child a hook denies", deny.as_str(), true, true),
         ] {
             let root = TempRoot::new("hook-subagent-settle");
             let settled = Arc::new(Mutex::new(Vec::new()));
@@ -10458,8 +10488,8 @@ mod tests {
                 ),
             );
             let expected = match (blocked, fails) {
-                (true, _) => ChildEnd::Blocked,
-                (false, true) => ChildEnd::Failed,
+                (_, true) => ChildEnd::Failed,
+                (true, false) => ChildEnd::Blocked,
                 (false, false) => ChildEnd::Completed,
             };
             assert_eq!(
@@ -10474,7 +10504,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{label}: the end is recorded: {seen:?}"))
                 .clone();
             match result {
-                ToolStepResult::Failed { detail, .. } if blocked => {
+                ToolStepResult::Failed { detail, .. } if blocked && !fails => {
                     let detail = detail.unwrap_or_default();
                     assert!(
                         detail.contains("completion blocked by subagent_stop[0] hook: no tests"),
@@ -10498,6 +10528,11 @@ mod tests {
                     assert!(
                         detail.ends_with("[discarded]"),
                         "the note reaches the parent: {detail}"
+                    );
+                    assert_eq!(
+                        detail.contains("block is moot: the child failed"),
+                        blocked,
+                        "{label}: {detail}"
                     );
                     assert!(finished.contains("Failed"), "{finished}");
                 }
