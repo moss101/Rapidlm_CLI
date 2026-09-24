@@ -4,7 +4,8 @@
 //! What the unit tests cannot show: that a prompt survives every approval
 //! its turn raises — the editor's answers route to the waiting prompt, the
 //! serve stays up, the prompt ends with its real stop reason, and a cancel
-//! during an approval wait ends it.
+//! during an approval wait ends it — and that each prompt streams only its
+//! own turn's events, never the previous turn's again.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -429,5 +430,75 @@ fn a_cancel_while_the_turn_waits_on_an_approval_ends_the_prompt_and_nothing_resu
     );
     assert!(!project.join("first.txt").exists(), "the write never ran");
     // The answer to the cancelled prompt's request is dropped, not fatal.
+    assert_eq!(editor.finish(), Some(0), "stderr: {stderr}");
+}
+
+/// How many of `frames` carry `needle` anywhere.
+fn mentions(frames: &[Value], needle: &str) -> usize {
+    frames
+        .iter()
+        .filter(|frame| frame.to_string().contains(needle))
+        .count()
+}
+
+#[test]
+fn the_next_prompt_streams_only_its_own_turn() {
+    // Each prompt proposes one write of its own (one approval each), then
+    // finishes. The second must stream its own tool activity and approval,
+    // and none of the first's.
+    fn model(request: &str) -> String {
+        if request.contains("PROMPT-TWO") {
+            if request.contains("call_second") {
+                answer("second done")
+            } else {
+                write_call("call_second", "second.txt")
+            }
+        } else if tool_results(request) == 0 {
+            write_call("call_first", "first.txt")
+        } else {
+            answer("first done")
+        }
+    }
+    let home = temp_dir("two-prompts");
+    let (project, config) = trusted_project(&home.0, model);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+
+    let first = editor.prompt(3, &session, "PROMPT-ONE write it");
+    let stderr = editor.stderr_text();
+    // What the second prompt must not repeat, seen once where it belongs.
+    assert_eq!(
+        permission_requests(&first),
+        1,
+        "{first:#?}\nstderr: {stderr}"
+    );
+    assert!(mentions(&first, "call_first") > 0, "{first:#?}");
+    assert_eq!(
+        first.last().expect("response")["result"]["stopReason"],
+        "end_turn"
+    );
+
+    let second = editor.prompt(4, &session, "PROMPT-TWO write another");
+    let stderr = editor.stderr_text();
+    assert_eq!(
+        mentions(&second, "call_first"),
+        0,
+        "the first turn's tool activity replayed: {second:#?}\nstderr: {stderr}"
+    );
+    let asked: Vec<&Value> = second
+        .iter()
+        .filter(|frame| frame["method"] == "session/request_permission")
+        .collect();
+    assert_eq!(
+        asked.len(),
+        1,
+        "only the second turn's own approval: {second:#?}"
+    );
+    assert_eq!(asked[0]["params"]["toolCall"]["toolCallId"], "call_second");
+    assert!(mentions(&second, "call_second") > 1, "{second:#?}");
+    assert_eq!(
+        second.last().expect("response")["result"]["stopReason"],
+        "end_turn"
+    );
     assert_eq!(editor.finish(), Some(0), "stderr: {stderr}");
 }

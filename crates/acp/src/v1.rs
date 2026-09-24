@@ -618,6 +618,11 @@ impl<C: KernelClient> V1Adapter<C> {
             ))
             .await
             .map_err(map_kernel_err)?;
+        // A prompt's updates are its own turn's. The turn was submitted
+        // against `snapshot.seq()` (its `turn.started` is the next event), so
+        // the drain starts there: anything earlier belongs to earlier turns,
+        // which their own prompts already streamed, and is never replayed.
+        self.cursors.insert(session_id, snapshot.seq());
         let events = self.drain_updates(session_id).await?;
         Ok((prompt_turn(handle), events))
     }
@@ -1477,6 +1482,61 @@ mod tests {
         let busy = block_on(tmp.client.get_session(kernel_session.id())).expect("busy");
         assert_eq!(busy.active_turn(), Some(turn.turn_id()));
         assert_eq!(busy.status(), SessionStatus::Busy);
+    }
+
+    #[test]
+    fn a_prompt_drains_only_its_own_turn_never_the_previous_ones() {
+        let tmp = TempClient::create();
+        let mut acp = block_on(ready_adapter(tmp.client.clone()));
+        let created = block_on(acp.session_new(serde_json::json!({
+            "cwd": "/tmp/project",
+            "mcpServers": []
+        })))
+        .expect("new");
+        let session_id = created.session_id();
+        let prompt = |text: &str| {
+            serde_json::json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": text}]
+            })
+        };
+        let (first, _) = block_on(acp.session_prompt(prompt("first"))).expect("first prompt");
+        // The first turn runs to its end outside the adapter, the way a serve
+        // executes a turn and streams it from its own `turn.started`.
+        let author = actor();
+        tmp.client
+            .append_turn_progress(
+                session_id,
+                &author,
+                TraceId::new(),
+                EventKind::ModelCompleted,
+                serde_json::json!({"text": "the first answer"}),
+            )
+            .expect("progress");
+        tmp.client
+            .finish_turn(kernel::FinishTurn::new(
+                session_id,
+                first.turn_id(),
+                author,
+                TraceId::new(),
+                kernel::TurnOutcome::Completed { text: None },
+            ))
+            .expect("finish");
+
+        let (second, events) =
+            block_on(acp.session_prompt(prompt("second"))).expect("second prompt");
+        let replayed: Vec<_> = events
+            .iter()
+            .filter(|event| match event {
+                MappedEvent::PromptStopped(_) | MappedEvent::PermissionRequired(_) => true,
+                MappedEvent::SessionUpdate(update) => {
+                    matches!(update.update(), SessionUpdate::AgentMessageChunk { .. })
+                }
+            })
+            .collect();
+        assert!(replayed.is_empty(), "the first turn replayed: {replayed:?}");
+        // Drained through its own `turn.started`, and no further.
+        assert_eq!(acp.cursor(session_id), Some(second.seq()));
     }
 
     #[test]
