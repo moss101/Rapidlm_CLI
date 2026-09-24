@@ -292,7 +292,7 @@
       "id": "SEAM-01-6",
       "title": "Managed gates: hooks.managed_only and hooks.denied_events",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-01-1"
       ],
@@ -309,7 +309,13 @@
       "validation": [
         "A non-managed hook is blocked under managed_only with the gate report; a denied stage does not fire; user/project settings cannot widen either."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goal-delivery-2026-09-20.md \u00a7 SEAM-01-6 \u2014 criterion table",
+        "apps/rapid/src/managed_config.rs \u2014 ManagedHooks ([hooks] table), gate_hooks; tests managed_only_runs_only_the_policys_hooks_and_reports_the_gate, denied_events_drop_only_those_stages_and_the_managed_hooks_go_first, the_hooks_table_is_closed_and_validated",
+        "apps/rapid/src/interactive.rs \u2014 load_project_integrations applies the gate (hook_gates, warnings); test the_project_loader_applies_the_managed_hook_policy (incl. an unloadable policy runs no project hooks)",
+        "apps/rapid/src/doctor.rs \u2014 the hooks check warns with each gate report; test the_hooks_check_reports_what_the_managed_policy_dropped",
+        "revert cycle: gate_hooks made a no-op \u2192 the four tests fail; doctor ignoring the reports \u2192 the doctor test fails"
+      ]
     },
     {
       "id": "SEAM-01-7",

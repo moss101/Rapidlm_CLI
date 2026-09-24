@@ -943,7 +943,11 @@ fn check_scanner(root: &Path) -> DoctorCheck {
 
 fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegrations) -> DoctorCheck {
     let hooks = &integrations.hooks;
-    if hooks.is_empty() {
+    // What the managed hook policy removed is a finding of its own: the
+    // project's settings name hooks that will not run, and without this a
+    // project whose every hook was dropped would read "no hooks configured".
+    let gates = &integrations.hook_gates;
+    if hooks.is_empty() && gates.is_empty() {
         return DoctorCheck::skipped("hooks", "no hooks configured in project settings");
     }
     // Every stage the config carries — the list used to name six of them,
@@ -972,21 +976,27 @@ fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegratio
             }
         }
     }
-    if unresolved.is_empty() {
-        DoctorCheck::pass(
+    if unresolved.is_empty() && gates.is_empty() {
+        return DoctorCheck::pass(
             "hooks",
             format!("{total} hook(s) configured; run through `sh -c`, not executed here"),
-        )
-    } else {
-        DoctorCheck::warn(
-            "hooks",
-            format!(
-                "{total} hook(s) configured; path not found for {}",
-                unresolved.join(", ")
-            ),
-            "create the hook scripts above or remove them from the project settings",
-        )
+        );
     }
+    let mut findings = Vec::new();
+    let mut remediation = Vec::new();
+    if !unresolved.is_empty() {
+        findings.push(format!("path not found for {}", unresolved.join(", ")));
+        remediation.push("create the hook scripts above or remove them from the project settings");
+    }
+    for gate in gates {
+        findings.push(gate.to_string());
+        remediation.push(gate.remediation);
+    }
+    DoctorCheck::warn(
+        "hooks",
+        format!("{total} hook(s) configured; {}", findings.join("; ")),
+        remediation.join("; "),
+    )
 }
 
 fn check_mcp(
@@ -1587,6 +1597,50 @@ fn finalize(report: DoctorReport, secrets: &[String]) -> DoctorReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hooks_check_reports_what_the_managed_policy_dropped() {
+        // Every project hook dropped by `managed_only`: not "no hooks
+        // configured" (skipped) but a warning naming the gate.
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-doctor-managed-hooks-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"hooks":{"stop":["project-stop"]}}"#,
+        )
+        .expect("settings");
+        let policy = dir.join("managed.toml");
+        std::fs::write(
+            &policy,
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[hooks]\nmanaged_only = true\n",
+        )
+        .expect("policy");
+        let integrations = crate::interactive::load_project_integrations_with(
+            &dir,
+            &[(
+                crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                policy.display().to_string(),
+            )],
+        );
+        let check = check_hooks(&dir, &integrations);
+        assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+        assert!(
+            check.detail.contains("0 hook(s) configured"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("hooks.managed_only"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("origin=managed"), "{}", check.detail);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn report(rows: Vec<DoctorCheck>) -> DoctorReport {
         DoctorReport { checks: rows }

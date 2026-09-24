@@ -128,6 +128,19 @@ impl HooksConfig {
         ]
     }
 
+    /// Every stage with its settings key, mutably (for a gate that drops a
+    /// stage by name).
+    pub fn stages_named_mut(&mut self) -> [(&'static str, &mut Vec<String>); HOOK_STAGE_COUNT] {
+        let names = HooksConfig::default().named_stages().map(|(name, _)| name);
+        let stages = self.stages_mut();
+        let mut index = 0;
+        stages.map(|stage| {
+            let name = names[index];
+            index += 1;
+            (name, stage)
+        })
+    }
+
     /// Every stage with its settings key, in declaration order — what a
     /// reader (`rapid doctor`, a managed gate) walks, so a new stage cannot
     /// be listed in one place and forgotten in another.

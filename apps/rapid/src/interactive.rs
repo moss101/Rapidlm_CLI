@@ -2517,6 +2517,9 @@ pub(crate) fn project_marker_dir_in(cwd: &Path) -> PathBuf {
 pub(crate) struct ProjectIntegrations {
     fetch_allowlist: Vec<String>,
     pub(crate) hooks: crate::hooks::HooksConfig,
+    /// What the managed hook policy removed, as gate reports — surfaced by
+    /// the run that loads these integrations (a warning per entry).
+    pub(crate) hook_gates: Vec<crate::managed_config::GateReportEntry>,
     shadow: Option<crate::shadow_diagnostics::ShadowDiagnosticsConfig>,
     /// Merged, deduplicated, project-wide-capped MCP configuration plus the
     /// entries that were *rejected* and why — see [`crate::mcp_config`],
@@ -2586,9 +2589,13 @@ fn configure_trusted_integrations(
     let ProjectIntegrations {
         fetch_allowlist: allowlist,
         hooks: merged_hooks,
+        hook_gates,
         shadow: shadow_config,
         mcp: mcp_config,
     } = load_project_integrations(root);
+    for gate in &hook_gates {
+        warn(&format!("warning: {gate}"));
+    }
     tools.set_fetch_allowlist(allowlist);
     let session_hooks = SessionHooks {
         session_start: merged_hooks.session_start.clone(),
@@ -2727,6 +2734,15 @@ fn configure_trusted_model_tools(
 /// strict enough to refuse the run typed; this integration config was never
 /// that strict even before this function existed).
 pub(crate) fn load_project_integrations(root: &Path) -> ProjectIntegrations {
+    load_project_integrations_with(root, &std::env::vars().collect::<Vec<_>>())
+}
+
+/// [`load_project_integrations`] against an explicit environment (where the
+/// managed policy is found), so a test need not mutate the process's.
+pub(crate) fn load_project_integrations_with(
+    root: &Path,
+    env: &[(String, String)],
+) -> ProjectIntegrations {
     let mut fetch_allowlist: Vec<String> = Vec::new();
     let mut hooks = crate::hooks::HooksConfig::default();
     let mut shadow = None;
@@ -2761,9 +2777,28 @@ pub(crate) fn load_project_integrations(root: &Path) -> ProjectIntegrations {
     for stage in hooks.stages_mut() {
         stage.truncate(crate::hooks::MAX_HOOKS_PER_STAGE);
     }
+    // The managed hook policy narrows what the project declares (ADR 0022
+    // §8) — here, the one loader every surface's hooks come from, so no
+    // surface can run a hook the policy drops. A policy that cannot be
+    // loaded runs no project hooks at all: fail closed, reported.
+    let (hooks, hook_gates) = match crate::managed_config::load_policy(env) {
+        Ok(policy) => crate::managed_config::gate_hooks(hooks, policy.as_ref()),
+        Err(err) => (
+            crate::hooks::HooksConfig::default(),
+            vec![crate::managed_config::GateReportEntry {
+                field_id: "hooks".to_string(),
+                origin: crate::managed_config::ConfigOrigin::Managed,
+                detail: format!(
+                    "no project hooks run: the managed policy could not be loaded ({err})"
+                ),
+                remediation: "fix the managed policy document",
+            }],
+        ),
+    };
     ProjectIntegrations {
         fetch_allowlist,
         hooks,
+        hook_gates,
         shadow,
         // Its own loader: MCP config is the one integration whose bounds
         // are project-wide rather than per-file, so it cannot be merged by
@@ -16089,6 +16124,65 @@ question the panel answers"
         )
         .expect("hook script");
         format!("sh {}", test_fixtures::slash_path(&script))
+    }
+
+    #[test]
+    fn the_project_loader_applies_the_managed_hook_policy() {
+        // Every surface's hooks come from `load_project_integrations`, so the
+        // gate applied there is the gate every surface obeys.
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-managed-hooks-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(dir.join(PROJECT_MARKER)).expect("marker");
+        fs::write(
+            dir.join(PROJECT_MARKER).join("settings.json"),
+            r#"{"hooks":{"pre_tool_use":["project-pre"],"stop":["project-stop"]}}"#,
+        )
+        .expect("settings");
+        let policy = dir.join("managed.toml");
+        fs::write(
+            &policy,
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[hooks]\nmanaged_only = true\npre_tool_use = [\"org-gate\"]\n",
+        )
+        .expect("policy");
+        let integrations = load_project_integrations_with(
+            &dir,
+            &[(
+                crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                policy.display().to_string(),
+            )],
+        );
+        assert_eq!(integrations.hooks.pre_tool_use, vec!["org-gate".to_owned()]);
+        assert!(integrations.hooks.stop.is_empty());
+        assert_eq!(integrations.hook_gates.len(), 1);
+        assert_eq!(integrations.hook_gates[0].field_id, "hooks.managed_only");
+        // A policy that cannot be loaded runs no project hooks — fail
+        // closed, and say so.
+        fs::write(
+            &policy,
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[hooks]\nmanaged_only = \"yes\"\n",
+        )
+        .expect("broken policy");
+        let integrations = load_project_integrations_with(
+            &dir,
+            &[(
+                crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                policy.display().to_string(),
+            )],
+        );
+        assert!(integrations.hooks.is_empty(), "{:?}", integrations.hooks);
+        assert_eq!(integrations.hook_gates.len(), 1);
+        assert_eq!(integrations.hook_gates[0].field_id, "hooks");
+        assert!(
+            integrations.hook_gates[0]
+                .detail
+                .contains("could not be loaded"),
+            "{}",
+            integrations.hook_gates[0].detail
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

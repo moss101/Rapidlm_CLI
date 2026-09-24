@@ -182,6 +182,8 @@ pub struct ManagedPolicy {
     /// Per-turn `task_spawn` count ceiling override, applied via
     /// `WorkspaceTools::narrow_subagent_spawn_ceiling` — narrow-only.
     max_subagent_spawns_per_turn: Option<u64>,
+    /// `[hooks]`: the managed hook policy (ADR 0022 §8) — narrow-only.
+    hooks: ManagedHooks,
     /// Stable content identity of the raw document this was parsed from
     /// (Modbit `MOD-005`'s "policy version" half — the other half,
     /// *estimated* cost, needs a real `ModelCatalog` pricing lookup this
@@ -222,10 +224,11 @@ impl ManagedPolicy {
             reason: "top level must be a table".to_string(),
         })?;
         for key in table.keys() {
-            if key != "schema" && key != "policy" {
+            if key != "schema" && key != "policy" && key != "hooks" {
                 return Err(ManagedConfigError::UnknownField { field: key.clone() });
             }
         }
+        let hooks = ManagedHooks::parse(table.get("hooks"))?;
         let schema = table
             .get("schema")
             .and_then(toml::Value::as_str)
@@ -427,8 +430,14 @@ impl ManagedPolicy {
             max_write_bytes_per_turn,
             max_fetch_bytes_per_turn,
             max_subagent_spawns_per_turn,
+            hooks,
             policy_version: fnv1a_hex(toml_str.as_bytes()),
         })
+    }
+
+    /// The managed hook policy (`[hooks]`); the default when absent.
+    pub fn hooks(&self) -> &ManagedHooks {
+        &self.hooks
     }
 
     /// Stable content identity of the document this was parsed from — see
@@ -572,6 +581,169 @@ pub struct GatedResolution {
     pub default_origin: ConfigOrigin,
     /// Enforced gates, for the operator report.
     pub reports: Vec<GateReportEntry>,
+}
+
+/// The managed policy's `[hooks]` table (ADR 0022 §8):
+///
+/// ```toml
+/// [hooks]
+/// managed_only = true                 # only the hooks declared here run
+/// denied_events = ["post_tool_use"]   # stages project settings may not use
+/// pre_tool_use = ["/opt/org/bin/review-gate"]   # the organisation's own hooks
+/// ```
+///
+/// Narrow-only: project settings can never re-enable a stage this denies or
+/// run beside a `managed_only` policy; the managed hooks themselves always
+/// run (on a trusted project — hooks are never run for an untrusted one).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManagedHooks {
+    pub managed_only: bool,
+    pub denied_events: Vec<String>,
+    /// The hooks the policy itself declares, same shape as settings hooks.
+    pub commands: crate::hooks::HooksConfig,
+}
+
+impl ManagedHooks {
+    fn parse(raw: Option<&toml::Value>) -> Result<Self, ManagedConfigError> {
+        let Some(raw) = raw else {
+            return Ok(Self::default());
+        };
+        let table = raw.as_table().ok_or_else(|| {
+            ManagedConfigError::PolicyField(field_error("hooks", "[hooks] must be a table"))
+        })?;
+        let stage_names: Vec<&'static str> = crate::hooks::HooksConfig::default()
+            .named_stages()
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        let mut hooks = Self::default();
+        let mut commands = serde_json::Map::new();
+        for (key, value) in table {
+            match key.as_str() {
+                "managed_only" => {
+                    hooks.managed_only = value.as_bool().ok_or_else(|| {
+                        ManagedConfigError::PolicyField(field_error(
+                            "hooks.managed_only",
+                            "must be true or false",
+                        ))
+                    })?;
+                }
+                "denied_events" => {
+                    let entries = value.as_array().ok_or_else(|| {
+                        ManagedConfigError::PolicyField(field_error(
+                            "hooks.denied_events",
+                            "must be an array of hook stage names",
+                        ))
+                    })?;
+                    for entry in entries {
+                        let name = entry.as_str().ok_or_else(|| {
+                            ManagedConfigError::PolicyField(field_error(
+                                "hooks.denied_events",
+                                "entries must be strings",
+                            ))
+                        })?;
+                        if !stage_names.contains(&name) {
+                            return Err(ManagedConfigError::PolicyField(field_error(
+                                "hooks.denied_events",
+                                &format!(
+                                    "'{name}' is not a hook stage (one of: {})",
+                                    stage_names.join(", ")
+                                ),
+                            )));
+                        }
+                        hooks.denied_events.push(name.to_owned());
+                    }
+                }
+                stage if stage_names.contains(&stage) => {
+                    let entries = value.as_array().ok_or_else(|| {
+                        ManagedConfigError::PolicyField(field_error(
+                            &format!("hooks.{stage}"),
+                            "must be an array of hook command lines",
+                        ))
+                    })?;
+                    let mut lines = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        let line = entry.as_str().ok_or_else(|| {
+                            ManagedConfigError::PolicyField(field_error(
+                                &format!("hooks.{stage}"),
+                                "entries must be strings",
+                            ))
+                        })?;
+                        lines.push(serde_json::Value::String(line.to_owned()));
+                    }
+                    commands.insert(stage.to_owned(), serde_json::Value::Array(lines));
+                }
+                other => {
+                    return Err(ManagedConfigError::UnknownField {
+                        field: format!("hooks.{other}"),
+                    });
+                }
+            }
+        }
+        hooks.commands =
+            crate::hooks::HooksConfig::parse(&serde_json::json!({ "hooks": commands }))
+                .unwrap_or_default();
+        Ok(hooks)
+    }
+}
+
+/// Apply the managed hook policy to a project's hooks: narrow-only. Under
+/// `managed_only` every project hook is dropped; otherwise a stage in
+/// `denied_events` is dropped from the project's hooks. The policy's own
+/// hooks are then added. Each drop that removed something is reported with
+/// field, origin and remediation, like every other gate.
+pub fn gate_hooks(
+    project: crate::hooks::HooksConfig,
+    policy: Option<&ManagedPolicy>,
+) -> (crate::hooks::HooksConfig, Vec<GateReportEntry>) {
+    let Some(policy) = policy else {
+        return (project, Vec::new());
+    };
+    let managed = policy.hooks();
+    let mut reports = Vec::new();
+    let mut effective = crate::hooks::HooksConfig::default();
+    if managed.managed_only {
+        let dropped: usize = project
+            .named_stages()
+            .iter()
+            .map(|(_, commands)| commands.len())
+            .sum();
+        if dropped > 0 {
+            reports.push(GateReportEntry {
+                field_id: "hooks.managed_only".to_string(),
+                origin: ConfigOrigin::Managed,
+                detail: format!(
+                    "{dropped} project hook(s) not run; only the managed policy's hooks run"
+                ),
+                remediation: "ask your administrator to add the hook to the managed policy",
+            });
+        }
+    } else {
+        let mut kept = project;
+        for (stage, commands) in kept.stages_named_mut() {
+            if managed.denied_events.iter().any(|denied| denied == stage) && !commands.is_empty() {
+                reports.push(GateReportEntry {
+                    field_id: "hooks.denied_events".to_string(),
+                    origin: ConfigOrigin::Managed,
+                    detail: format!(
+                        "{} project hook(s) on '{stage}' not run; the stage is denied by the managed policy",
+                        commands.len()
+                    ),
+                    remediation: "remove the hook from project settings or ask your administrator to allow the stage",
+                });
+                commands.clear();
+            }
+        }
+        effective = kept;
+    }
+    // The policy's own hooks always run; they go first, so a managed
+    // `pre_tool_use` gate decides before a project's.
+    let mut combined = managed.commands.clone();
+    combined.extend(effective);
+    for stage in combined.stages_mut() {
+        stage.truncate(crate::hooks::MAX_HOOKS_PER_STAGE);
+    }
+    (combined, reports)
 }
 
 /// One enforced gate, reported with provenance and remediation.
@@ -830,6 +1002,104 @@ fn finish(
 
 #[cfg(test)]
 mod tests {
+
+    fn hooks_policy(body: &str) -> ManagedPolicy {
+        ManagedPolicy::parse(&format!(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n{body}"
+        ))
+        .expect("policy parses")
+    }
+
+    fn project_hooks() -> crate::hooks::HooksConfig {
+        crate::hooks::HooksConfig {
+            pre_tool_use: vec!["project-pre".to_owned()],
+            post_tool_use: vec!["project-post".to_owned()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn managed_only_runs_only_the_policys_hooks_and_reports_the_gate() {
+        // SEAM-01 AC-07: non-managed hooks are blocked and the gate is
+        // reported with field, origin and remediation.
+        let policy =
+            hooks_policy("[hooks]\nmanaged_only = true\npre_tool_use = [\"/opt/org/bin/gate\"]\n");
+        let (effective, reports) = gate_hooks(project_hooks(), Some(&policy));
+        assert_eq!(effective.pre_tool_use, vec!["/opt/org/bin/gate".to_owned()]);
+        assert!(
+            effective.post_tool_use.is_empty(),
+            "project hooks do not run"
+        );
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert_eq!(report.field_id, "hooks.managed_only");
+        assert_eq!(report.origin, ConfigOrigin::Managed);
+        assert!(
+            report.detail.contains("2 project hook(s) not run"),
+            "{}",
+            report.detail
+        );
+        assert!(!report.remediation.is_empty());
+        assert!(report.to_string().contains("origin=managed"), "{report}");
+    }
+
+    #[test]
+    fn denied_events_drop_only_those_stages_and_the_managed_hooks_go_first() {
+        let policy = hooks_policy(
+            "[hooks]\ndenied_events = [\"post_tool_use\"]\npre_tool_use = [\"/opt/org/bin/gate\"]\n",
+        );
+        let (effective, reports) = gate_hooks(project_hooks(), Some(&policy));
+        assert_eq!(
+            effective.pre_tool_use,
+            vec!["/opt/org/bin/gate".to_owned(), "project-pre".to_owned()],
+            "the organisation's gate decides first"
+        );
+        assert!(effective.post_tool_use.is_empty());
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].field_id, "hooks.denied_events");
+        assert!(
+            reports[0].detail.contains("'post_tool_use'"),
+            "{}",
+            reports[0].detail
+        );
+        // A denied stage the project does not use reports nothing.
+        let policy = hooks_policy("[hooks]\ndenied_events = [\"stop\"]\n");
+        let (effective, reports) = gate_hooks(project_hooks(), Some(&policy));
+        assert_eq!(effective, project_hooks());
+        assert!(reports.is_empty());
+        // No policy: the project's hooks, unchanged.
+        assert_eq!(
+            gate_hooks(project_hooks(), None),
+            (project_hooks(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn the_hooks_table_is_closed_and_validated() {
+        for (body, field) in [
+            ("[hooks]\nmanaged_only = \"yes\"\n", "hooks.managed_only"),
+            (
+                "[hooks]\ndenied_events = [\"not_a_stage\"]\n",
+                "hooks.denied_events",
+            ),
+            ("[hooks]\npre_tool_use = \"one\"\n", "hooks.pre_tool_use"),
+        ] {
+            let err = ManagedPolicy::parse(&format!(
+                "schema = \"rapidlm.managed_config.v1\"\n[policy]\n{body}"
+            ))
+            .expect_err("invalid [hooks] must be refused");
+            assert!(format!("{err:?}").contains(field), "{body} -> {err:?}");
+        }
+        let err = ManagedPolicy::parse(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[hooks]\nsomething_else = 1\n",
+        )
+        .expect_err("unknown key refused");
+        assert!(
+            format!("{err:?}").contains("hooks.something_else"),
+            "{err:?}"
+        );
+    }
+
     use super::*;
     use crate::user_config::{parse_config_document, resolve_fallback_chain};
 
@@ -845,7 +1115,7 @@ base_url = "http://127.0.0.1:11434/v1"
 
 [model.cloud]
 provider = "anthropic"
-model = "claude-3-5-sonnet"
+model = "cloud-model"
 base_url = "http://gateway.internal:8080"
 "#
     }
@@ -1100,7 +1370,7 @@ reasoning_effort = "ultra"
 
 [model.alt]
 provider = "anthropic"
-model = "claude"
+model = "alt-model"
 base_url = "https://api.anthropic.com"
 reasoning_effort = "low"
 "#;
