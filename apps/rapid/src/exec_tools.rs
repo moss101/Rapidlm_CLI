@@ -255,6 +255,7 @@ struct JobShared {
     sandbox_cancel: Option<capability_broker::CancellationToken>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum JobState {
     Running,
     Completed(i32),
@@ -1451,8 +1452,11 @@ pub enum ChildEnd {
     Completed,
     /// A `subagent_stop` hook blocked its completion.
     Blocked,
-    /// It returned a report but did not succeed (cancelled, needs context).
+    /// It returned a report but did not finish (needs context, out of budget).
     Incomplete,
+    /// It was cancelled: its changes are discarded, a hook's block
+    /// notwithstanding.
+    Cancelled,
     /// It failed: an error, not a report.
     Failed,
 }
@@ -1460,8 +1464,10 @@ pub enum ChildEnd {
 impl ChildEnd {
     fn of(blocked: bool, outcome: &Result<SubagentReport, String>) -> Self {
         match (blocked, outcome) {
-            // A failed child is discarded whatever a hook said of it.
+            // A failed or cancelled child is discarded whatever a hook said
+            // of it.
             (_, Err(_)) => Self::Failed,
+            (_, Ok(report)) if report.status == "cancelled" => Self::Cancelled,
             (true, Ok(_)) => Self::Blocked,
             // The runner's "effectively successful" child — tool calls, then
             // an empty final message — kept its work; it is completed here too.
@@ -1472,8 +1478,6 @@ impl ChildEnd {
             {
                 Self::Completed
             }
-            // A cancelled child's changes are discarded: the user stopped it.
-            (false, Ok(report)) if report.status == "cancelled" => Self::Failed,
             (false, Ok(_)) => Self::Incomplete,
         }
     }
@@ -1484,9 +1488,27 @@ impl ChildEnd {
         match (self, outcome) {
             (Self::Blocked, _) => (SubagentEnd::Failed, Some("completion blocked by a hook")),
             (Self::Completed, _) => (SubagentEnd::Succeeded, None),
-            (_, Ok(report)) if report.status == "cancelled" => (SubagentEnd::Cancelled, None),
+            (Self::Cancelled, _) => (SubagentEnd::Cancelled, None),
             (_, Ok(report)) => (SubagentEnd::Failed, Some(report.status.as_str())),
             (_, Err(reason)) => (SubagentEnd::Failed, Some(reason.as_str())),
+        }
+    }
+
+    /// A detached child's job state, from the same end: a job whose changes
+    /// were applied (or are held as completed) is completed.
+    fn job_state(
+        self,
+        blocked_by: Option<&str>,
+        outcome: &Result<SubagentReport, String>,
+    ) -> JobState {
+        match (self, blocked_by, outcome) {
+            (Self::Completed, ..) => JobState::Completed(0),
+            (Self::Cancelled, ..) => JobState::Cancelled,
+            (Self::Blocked, Some(hook), _) => {
+                JobState::Failed(format!("completion blocked by {hook} hook"))
+            }
+            (_, _, Ok(report)) => JobState::Failed(format!("status {}", report.status)),
+            (_, _, Err(reason)) => JobState::Failed(reason.clone()),
         }
     }
 }
@@ -4666,15 +4688,8 @@ read with job_output, in this turn or a later one — the job is stopped when th
                 buffer.extend_from_slice(rendered.as_bytes());
             }
             if let Ok(mut state) = shared.state.lock() {
-                *state = match (&blocked, &outcome) {
-                    (Some((hook, _)), _) => {
-                        JobState::Failed(format!("completion blocked by {hook} hook"))
-                    }
-                    (None, _) if child_end == ChildEnd::Completed => JobState::Completed(0),
-                    (None, Ok(report)) if report.status == "cancelled" => JobState::Cancelled,
-                    (None, Ok(report)) => JobState::Failed(format!("status {}", report.status)),
-                    (None, Err(reason)) => JobState::Failed(reason.clone()),
-                };
+                *state =
+                    child_end.job_state(blocked.as_ref().map(|(hook, _)| hook.as_str()), &outcome);
             }
             // The worker's exit: stop the watchdog and wait for it. Reaching
             // here is what an ordinarily completed child used to miss.
@@ -10325,18 +10340,32 @@ mod tests {
             ChildEnd::of(false, &Ok(report("succeeded", None, 0))),
             ChildEnd::Completed
         );
-        // A cancelled child's changes are discarded; `/agents` shows it cancelled.
+        // A cancelled child's changes are discarded, a hook's block
+        // notwithstanding; `/agents` and the job table show it cancelled.
         let cancelled = Ok(report("cancelled", None, 1));
-        assert_eq!(ChildEnd::of(false, &cancelled), ChildEnd::Failed);
+        assert_eq!(ChildEnd::of(false, &cancelled), ChildEnd::Cancelled);
+        assert_eq!(ChildEnd::of(true, &cancelled), ChildEnd::Cancelled);
         assert_eq!(
-            ChildEnd::Failed.lifecycle(&cancelled).0,
+            ChildEnd::Cancelled.lifecycle(&cancelled).0,
             SubagentEnd::Cancelled
+        );
+        assert_eq!(
+            ChildEnd::Cancelled.job_state(Some("subagent_stop[0]"), &cancelled),
+            JobState::Cancelled
         );
         // A merged "effective success" is recorded as a success, not a failure.
         let effective = Ok(report("failed", Some("empty_response"), 2));
         assert_eq!(
             ChildEnd::of(false, &effective).lifecycle(&effective),
             (SubagentEnd::Succeeded, None)
+        );
+        assert_eq!(
+            ChildEnd::of(false, &effective).job_state(None, &effective),
+            JobState::Completed(0)
+        );
+        assert_eq!(
+            ChildEnd::Blocked.job_state(Some("subagent_stop[0]"), &effective),
+            JobState::Failed("completion blocked by subagent_stop[0] hook".to_owned())
         );
         assert_eq!(
             ChildEnd::of(false, &Ok(report("failed", Some("budget_exhausted"), 1))),
@@ -10392,7 +10421,9 @@ mod tests {
                     match end {
                         ChildEnd::Completed => " [applied]",
                         ChildEnd::Blocked => " [held, not applied]",
-                        ChildEnd::Incomplete | ChildEnd::Failed => " [discarded]",
+                        ChildEnd::Incomplete | ChildEnd::Cancelled | ChildEnd::Failed => {
+                            " [discarded]"
+                        }
                     }
                     .to_owned(),
                 )

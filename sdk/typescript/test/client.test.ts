@@ -395,6 +395,12 @@ describe("RapidClient session API", () => {
     reply(peer, request.id, { ...GOLDEN_SESSION, seq: before + 3 });
     await refreshing;
     assert.equal(session.seq, before + 3);
+    // A reply older than what this object already saw never moves it back.
+    const stale = session.refresh();
+    const staleReq = await peer.recv();
+    reply(peer, staleReq.id, { ...GOLDEN_SESSION, seq: before + 1 });
+    await stale;
+    assert.equal(session.seq, before + 3);
     const other = session.refresh();
     const otherReq = await peer.recv();
     reply(peer, otherReq.id, { ...GOLDEN_SESSION, id: CHILD_ID });

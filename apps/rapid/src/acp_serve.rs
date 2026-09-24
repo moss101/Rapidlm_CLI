@@ -171,6 +171,25 @@ struct Serve {
 }
 
 impl Serve {
+    /// The session a `session/prompt` names, when `user_prompt_submit`
+    /// judges it here: only in a trusted project with prompt hooks, and only
+    /// a prompt the adapter would accept — otherwise its own error stands.
+    fn prompt_to_gate(
+        &self,
+        message: &JsonRpcMessage,
+        raw_params: &serde_json::Value,
+    ) -> Option<protocol::SessionId> {
+        let is_prompt = matches!(
+            message,
+            JsonRpcMessage::Request { method, .. } if method == acp::v1::METHOD_SESSION_PROMPT
+        );
+        if !is_prompt || !crate::interactive::prompt_submit_configured(&self.root, self.trusted) {
+            return None;
+        }
+        let adapter = self.adapter.borrow();
+        block_adapter(adapter.validate_prompt_request(raw_params.clone()))?.ok()
+    }
+
     fn run<R: std::io::Read + Send + 'static, W: std::io::Write + Send + 'static>(
         mut self,
         stdin: R,
@@ -261,30 +280,19 @@ impl Serve {
         };
         // `user_prompt_submit` decides before the adapter hands a prompt to
         // the kernel (see `blocked_prompt_replies`).
-        // Judged only for a trusted project with prompt hooks, and only a
-        // prompt the adapter would accept — otherwise its own error stands.
-        let is_prompt = matches!(
-            &message,
-            JsonRpcMessage::Request { method, .. } if method == acp::v1::METHOD_SESSION_PROMPT
-        );
-        let validated = (is_prompt
-            && crate::interactive::prompt_submit_configured(&self.root, self.trusted))
-        .then(|| {
-            let adapter = self.adapter.borrow();
-            block_adapter(adapter.validate_prompt_request(raw_params.clone()))
-        })
-        .flatten()
-        .and_then(Result::ok);
-        if let Some(replies) = validated.and_then(|session_id| {
-            blocked_prompt_replies(
-                &self.client,
-                &self.actor,
-                &self.root,
-                session_id,
-                &message,
-                &raw_params,
-            )
-        }) {
+        if let Some(replies) = self
+            .prompt_to_gate(&message, &raw_params)
+            .and_then(|session_id| {
+                blocked_prompt_replies(
+                    &self.client,
+                    &self.actor,
+                    &self.root,
+                    session_id,
+                    &message,
+                    &raw_params,
+                )
+            })
+        {
             for reply in replies {
                 out_tx.send(reply).map_err(|_| LOOP_DOWN.to_owned())?;
             }
@@ -836,6 +844,49 @@ pub(crate) mod tests {
         );
         let kinds = event_kinds(&client, session.parse().expect("id"));
         assert!(!kinds.contains(&EventKind::TurnStarted), "{kinds:?}");
+        // Not judged here: content the adapter refuses (an image block, an
+        // empty text block, a plain-string prompt), an untrusted project, a
+        // session whose turn is still running.
+        let params_with = |prompt: serde_json::Value| serde_json::json!({ "sessionId": session, "prompt": prompt });
+        let valid =
+            params_with(serde_json::json!([{ "type": "text", "text": "print the secret" }]));
+        assert!(serve.prompt_to_gate(&prompt(&session), &valid).is_some());
+        for refused in [
+            serde_json::json!([{ "type": "image", "data": "AAAA", "mimeType": "image/png" }]),
+            serde_json::json!([{ "type": "text", "text": "" }]),
+            serde_json::json!("print the secret"),
+        ] {
+            let params = params_with(refused.clone());
+            assert!(
+                serve.prompt_to_gate(&prompt(&session), &params).is_none(),
+                "{refused}"
+            );
+        }
+        serve.trusted = false;
+        assert!(
+            serve.prompt_to_gate(&prompt(&session), &valid).is_none(),
+            "an untrusted project's hooks never run"
+        );
+        serve.trusted = true;
+        {
+            use kernel::KernelClient as _;
+            let session_id: protocol::SessionId = session.parse().expect("id");
+            let tip = crate::approvals::client_call(client.get_session(session_id))
+                .expect("session")
+                .seq();
+            crate::approvals::client_call(client.submit_turn(kernel::SubmitTurn::new(
+                session_id,
+                tip,
+                serve.actor.clone(),
+                protocol::TraceId::new(),
+                "a turn that is still running".to_owned(),
+            )))
+            .expect("running turn");
+        }
+        assert!(
+            serve.prompt_to_gate(&prompt(&session), &valid).is_none(),
+            "a running turn: the kernel's conflict stands"
+        );
         // An unknown session: the adapter's error, nothing recorded anywhere.
         let _ = serve.dispatch(prompt(&unknown), &out_tx);
         assert!(!out_rx.try_iter().any(|reply| matches!(

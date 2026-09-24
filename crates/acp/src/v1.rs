@@ -596,7 +596,8 @@ impl<C: KernelClient> V1Adapter<C> {
     }
 
     /// Check a `session/prompt` request as [`Self::session_prompt`] would —
-    /// ready, well-formed, a known and open session — without submitting it:
+    /// ready, well-formed, a known and open session with no turn running, a
+    /// binding to spare — without submitting it:
     /// the session it names. A composition root judges a prompt itself only
     /// when this is `Ok`; otherwise the adapter's own error stands.
     pub async fn validate_prompt_request(&self, params: Value) -> Result<SessionId, V1Error> {
@@ -607,6 +608,18 @@ impl<C: KernelClient> V1Adapter<C> {
         let snapshot = self.load_kernel_session(session_id).await?;
         if snapshot.status() == SessionStatus::Closed {
             return Err(V1Error::SessionClosed);
+        }
+        if !self.cursors.contains_key(&session_id) && self.cursors.len() >= MAX_SESSION_BINDINGS {
+            return Err(V1Error::TooManySessions);
+        }
+        // A running turn: the kernel refuses the submit.
+        if snapshot.active_turn().is_some() {
+            return Err(ApiError::new(
+                protocol::ErrorCode::SessionConflict,
+                "a turn is already running on this session",
+                TraceId::new(),
+            )
+            .map_or(V1Error::InvalidParams, V1Error::Kernel));
         }
         Ok(session_id)
     }

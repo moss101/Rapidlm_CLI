@@ -351,7 +351,9 @@ export class Session {
     if (snapshot.id !== this.#snapshot.id) {
       throw new ClientError("protocol", "sessions.get returned another session");
     }
-    this.#snapshot = snapshot;
+    // A run or subscription may have noted a newer seq meanwhile.
+    this.#snapshot =
+      snapshot.seq >= this.#snapshot.seq ? snapshot : { ...snapshot, seq: this.#snapshot.seq };
   }
 
   async fork(request: ForkRequest = {}): Promise<Session> {

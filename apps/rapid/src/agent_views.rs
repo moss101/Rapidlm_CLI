@@ -467,6 +467,7 @@ impl AgentViewManager {
         };
         Some(match (end, auto_integrate) {
             (ChildEnd::Failed, _) => discard("the child failed"),
+            (ChildEnd::Cancelled, _) => discard("the child was cancelled"),
             (ChildEnd::Blocked, true) => {
                 discard("the completion was blocked and a headless run holds nothing for review")
             }
@@ -966,6 +967,13 @@ mod tests {
                 false,
                 false,
                 "discarded: the child failed",
+            ),
+            (
+                ChildEnd::Cancelled,
+                false,
+                false,
+                false,
+                "discarded: the child was cancelled",
             ),
             (
                 ChildEnd::Blocked,

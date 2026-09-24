@@ -889,6 +889,16 @@ impl InProcessKernelClient {
         })
     }
 
+    /// The session's highest committed `seq` — one ledger query, where
+    /// `get_session` replays every event to rebuild the projection. For a
+    /// caller that only needs to know whether it has seen everything.
+    pub fn session_tip(&self, session_id: SessionId) -> Result<u64, ApiError> {
+        let trace = TraceId::new();
+        self.ledger
+            .last_seq(session_id, &ledger_live())
+            .map_err(|err| ledger_api(err, trace))
+    }
+
     /// The cancellation token for the turn currently live on `session_id`,
     /// if any. `crates/kernel` has no dependency on any execution engine
     /// (e.g. `agent-runtime`), so a caller that actually runs the turn on
