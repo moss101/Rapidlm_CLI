@@ -1283,6 +1283,10 @@ fn classify_http_error(response: &ProviderHttpResponse) -> Result<(), ProviderEr
         400 | 413 if parsed.as_ref().is_some_and(json_is_context_too_large) => {
             Err(ProviderError::ContextTooLarge)
         }
+        // Only a proxy asks for its own credentials: asking again sends the
+        // same ones (and can lock a directory account). An authentication
+        // failure is the class nothing retries.
+        407 => Err(ProviderError::AuthFailed),
         408 | 409 | 425 | 500 | 502 | 503 | 504 => Err(ProviderError::Transient),
         // A redirect is never followed, and asking again is redirected again.
         300..=499 => Err(ProviderError::Permanent),
@@ -4505,20 +4509,21 @@ mod tests {
     }
 
     #[test]
-    fn a_proxy_refusing_its_own_credentials_is_permanent_never_retried() {
-        // Asking again sends the same credentials (and can lock the account).
+    fn a_proxy_refusing_its_own_credentials_is_an_authentication_failure() {
+        // Asking again sends the same credentials (and can lock the account):
+        // the step layer retries neither this class nor the fallback chain
+        // anything but an explicit alternate.
         let response = ProviderHttpResponse::new(407, Vec::new(), Vec::new()).expect("response");
         assert_eq!(
             classify_http_error(&response),
-            Err(ProviderError::Permanent)
+            Err(ProviderError::AuthFailed)
         );
-        assert!(!ProviderError::Permanent.is_retryable());
     }
 
     #[test]
-    fn a_request_is_planned_before_its_credential_is_read() {
+    fn a_request_is_planned_before_its_bearer_is_asked_for() {
         // `execute` resolves and guards the address before the bearer is
-        // asked for: an unresolvable host never reads the credential.
+        // asked for: an unresolvable host never asks for it.
         struct Recording(std::sync::atomic::AtomicBool);
         impl WireAuthorization for Recording {
             fn bearer_token(
@@ -4565,7 +4570,7 @@ mod tests {
         }
         assert!(
             !auth.0.load(std::sync::atomic::Ordering::SeqCst),
-            "the credential was never read"
+            "the bearer was never asked for"
         );
     }
 }

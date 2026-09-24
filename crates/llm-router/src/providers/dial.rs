@@ -18,10 +18,12 @@
 //!   credential. An `http://` target through a proxy is an absolute-form
 //!   request to the proxy — which then sees the whole request, its bearer
 //!   included, as anything on a plain-http path does.
-//! * A proxied target is not resolved to be dialled (the proxy resolves it),
-//!   but a name that resolves locally to an address the transport's guard
-//!   refuses is refused through the proxy too; a name only the proxy can
-//!   resolve goes through.
+//! * A proxied target is not resolved to be dialled (the proxy resolves it).
+//!   Without a gate, a name that resolves locally to an address the
+//!   transport's guard refuses is refused through the proxy too (best
+//!   effort: a name only the proxy can resolve goes through). With a gate,
+//!   the gate alone judges the target through a proxy — it is told the
+//!   target and asked about the proxy's addresses.
 //! * [`DialGate`] is asked before any connection is made, with the target
 //!   the request is for, the proxy it goes through, and the addresses about
 //!   to be dialled; it returns the addresses that may be dialled (an egress
@@ -127,14 +129,28 @@ impl std::fmt::Display for ProxyConfigError {
             ),
             Self::InvalidEntry { variable, entry } => write!(
                 f,
-                "{variable} entry {entry:?} is not a name, an address (with an optional port) or \
-a range such as 10.0.0.0/8"
+                "{variable} entry {:?} is not a name, an address (with an optional port) or a \
+range such as 10.0.0.0/8",
+                shown_entry(entry)
             ),
         }
     }
 }
 
 impl std::error::Error for ProxyConfigError {}
+
+/// An entry as an error shows it: anything before an `@` (a credential in a
+/// mistaken URL) withheld, and at most 64 characters.
+fn shown_entry(entry: &str) -> String {
+    let shown = match entry.rsplit_once('@') {
+        Some((_, host)) => format!("[withheld]@{host}"),
+        None => entry.to_owned(),
+    };
+    match shown.char_indices().nth(64) {
+        Some((cut, _)) => format!("{}...", &shown[..cut]),
+        None => shown,
+    }
+}
 
 impl ProxyConfig {
     /// Read the proxy variables from `env`: `https_proxy` then
@@ -145,7 +161,7 @@ impl ProxyConfig {
     pub fn from_env(env: &[(String, String)]) -> Result<Self, ProxyConfigError> {
         // Exact spellings first, in order; then — on Windows, where names
         // compare ignoring case — any spelling. So the preference holds
-        // everywhere, and an error names a spelling the user set.
+        // everywhere; an error names the spelling looked up.
         let value = |names: &[&'static str]| -> Option<(&'static str, String)> {
             let exact = names.iter().find_map(|name| {
                 env.iter()
@@ -437,7 +453,9 @@ fn base64(bytes: &[u8]) -> String {
 /// (`ProviderError::Connection` reads as "could not reach it"). The name to
 /// resolve is the proxy's when `via` is set (the transport dials the proxy),
 /// the target's otherwise; `addrs` is empty when the system resolver found
-/// nothing. What the gate returns is dialled only on the port being dialled
+/// nothing. Through a proxy the transport does not look at the target's
+/// addresses at all: a gate that must keep a name off refused addresses
+/// judges `target` itself. What the gate returns is dialled only on the port being dialled
 /// and only where the transport's address guard allows it.
 pub trait DialGate: Send + Sync {
     fn permit(
@@ -520,8 +538,9 @@ pub(crate) fn connect_tunnel(
     match status {
         200..=299 => Ok(()),
         // The proxy refused its own credentials: asking again sends the same
-        // ones (and can lock a directory account), so it is not retried.
-        407 => Err(ProviderError::Permanent),
+        // ones (and can lock a directory account). An authentication failure
+        // is the class nothing retries.
+        407 => Err(ProviderError::AuthFailed),
         _ => Err(ProviderError::Connection),
     }
 }
@@ -583,19 +602,12 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn the_upper_case_http_proxy_is_not_read_and_an_empty_value_turns_a_proxy_off() {
+    fn the_upper_case_http_proxy_is_not_read_outside_windows() {
         // The upper-case name can arrive from a request header in some
         // server environments.
         let upper_only =
             ProxyConfig::from_env(&env(&[("HTTP_PROXY", "http://proxy:3128")])).expect("config");
         assert!(upper_only.for_target(false, "gw.example.com", 80).is_none());
-        // Set but empty: off, not a fall-back to the other spelling.
-        let off = ProxyConfig::from_env(&env(&[
-            ("https_proxy", ""),
-            ("HTTPS_PROXY", "http://proxy:3128"),
-        ]))
-        .expect("config");
-        assert!(off.for_target(true, "api.example.com", 443).is_none());
     }
 
     #[test]
@@ -658,6 +670,24 @@ mod tests {
         .expect("config");
         assert!(spaced.for_target(true, "b.example", 443).is_none());
         assert!(ProxyConfig::from_env(&env(&[("no_proxy", "192.168.*")])).is_ok());
+        // A mistaken URL in the list: its credential is never shown.
+        let err = ProxyConfig::from_env(&env(&[
+            ("https_proxy", "http://proxy:3128"),
+            ("no_proxy", "http://svc:hunter2@internal.example"),
+        ]))
+        .expect_err("a URL is not an entry");
+        assert!(!err.to_string().contains("hunter2"), "{err}");
+        assert!(
+            err.to_string().contains("[withheld]@internal.example"),
+            "{err}"
+        );
+        // Set but empty turns a proxy off, on every system.
+        let off = ProxyConfig::from_env(&env(&[
+            ("https_proxy", ""),
+            ("HTTPS_PROXY", "http://proxy:3128"),
+        ]))
+        .expect("config");
+        assert!(off.for_target(true, "api.example.com", 443).is_none());
     }
 
     #[cfg(windows)]
@@ -769,7 +799,7 @@ mod tests {
             );
             assert_eq!(result.is_ok(), ok, "{answer}");
             if answer.contains(" 407 ") {
-                assert_eq!(result, Err(ProviderError::Permanent), "not retried");
+                assert_eq!(result, Err(ProviderError::AuthFailed), "not retried");
             }
         }
     }
