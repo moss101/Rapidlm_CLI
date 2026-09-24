@@ -552,9 +552,6 @@ fn classify_http_error(
         400 | 413 if parsed.as_ref().is_some_and(json_is_context_too_large) => {
             Err(ProviderError::ContextTooLarge)
         }
-        // Only a proxy asks for its own credentials: the path, not the
-        // provider, refused.
-        407 => Err(ProviderError::Connection),
         408 | 409 | 425 | 500 | 502 | 503 | 504 | 529 => Err(ProviderError::Transient),
         // A redirect is never followed, and asking again is redirected again.
         300..=499 => Err(ProviderError::Permanent),
@@ -1933,8 +1930,8 @@ mod tests {
         .expect("response");
         assert_eq!(
             classify_http_error(&proxy_auth),
-            Err(ProviderError::Connection),
-            "only a proxy sends 407"
+            Err(ProviderError::Permanent),
+            "a proxy refusing its own credentials is not retried"
         );
         assert_eq!(
             parse_anthropic_stream(b"{}", &CancellationToken::new()).expect_err("empty"),

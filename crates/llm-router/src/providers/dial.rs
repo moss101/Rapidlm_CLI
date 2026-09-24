@@ -3,8 +3,9 @@
 //! [`DialGate`] permits.
 //!
 //! * [`ProxyConfig`] reads `https_proxy` / `HTTPS_PROXY`, `http_proxy`
-//!   (lower case only: the upper-case name can be set from a request header
-//!   in some server environments) and `no_proxy` / `NO_PROXY` from explicit
+//!   (lower case only, except on Windows, where names compare ignoring
+//!   case: the upper-case name can be set from a request header in some
+//!   server environments) and `no_proxy` / `NO_PROXY` from explicit
 //!   environment pairs — the caller decides where they come from. Only
 //!   `http://` proxies are supported: an `https://` proxy is refused when
 //!   the configuration is read, not silently ignored. A loopback target
@@ -103,6 +104,11 @@ pub enum ProxyConfigError {
     HttpsProxyUnsupported { variable: &'static str },
     /// `<variable>` lists more entries than are read.
     TooManyEntries { variable: &'static str },
+    /// One `<variable>` entry is not a name, an address or a range.
+    InvalidEntry {
+        variable: &'static str,
+        entry: String,
+    },
 }
 
 impl std::fmt::Display for ProxyConfigError {
@@ -119,6 +125,11 @@ impl std::fmt::Display for ProxyConfigError {
                 f,
                 "{variable} lists more than {MAX_NO_PROXY_ENTRIES} entries"
             ),
+            Self::InvalidEntry { variable, entry } => write!(
+                f,
+                "{variable} entry {entry:?} is not a name, an address (with an optional port) or \
+a range such as 10.0.0.0/8"
+            ),
         }
     }
 }
@@ -132,20 +143,24 @@ impl ProxyConfig {
     /// falling back to the other spelling. Names are compared ignoring case
     /// on Windows, as the system compares them. No variable set: no proxy.
     pub fn from_env(env: &[(String, String)]) -> Result<Self, ProxyConfigError> {
+        // Exact spellings first, in order; then — on Windows, where names
+        // compare ignoring case — any spelling. So the preference holds
+        // everywhere, and an error names a spelling the user set.
         let value = |names: &[&'static str]| -> Option<(&'static str, String)> {
-            names
-                .iter()
-                .find_map(|name| {
+            let exact = names.iter().find_map(|name| {
+                env.iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| (*name, value.trim().to_owned()))
+            });
+            let any_case = || {
+                names.iter().find_map(|name| {
                     env.iter()
-                        .find(|(key, _)| {
-                            if cfg!(windows) {
-                                key.eq_ignore_ascii_case(name)
-                            } else {
-                                key == name
-                            }
-                        })
+                        .find(|(key, _)| key.eq_ignore_ascii_case(name))
                         .map(|(_, value)| (*name, value.trim().to_owned()))
                 })
+            };
+            exact
+                .or_else(|| if cfg!(windows) { any_case() } else { None })
                 .filter(|(_, value)| !value.is_empty())
         };
         let https = value(&["https_proxy", "HTTPS_PROXY"])
@@ -154,9 +169,10 @@ impl ProxyConfig {
         let http = value(&["http_proxy"])
             .map(|(name, url)| parse_proxy(name, &url))
             .transpose()?;
+        // Read only when a proxy is set: nothing else consults it.
         let no_proxy = match value(&["no_proxy", "NO_PROXY"]) {
-            Some((name, list)) => parse_no_proxy(name, &list)?,
-            None => Vec::new(),
+            Some((name, list)) if https.is_some() || http.is_some() => parse_no_proxy(name, &list)?,
+            _ => Vec::new(),
         };
         Ok(Self {
             https,
@@ -240,10 +256,8 @@ fn parse_no_proxy(
     variable: &'static str,
     list: &str,
 ) -> Result<Vec<NoProxyEntry>, ProxyConfigError> {
-    let invalid = ProxyConfigError::Invalid { variable };
     let entries: Vec<&str> = list
-        .split(',')
-        .map(str::trim)
+        .split(|ch: char| ch == ',' || ch.is_whitespace())
         .filter(|entry| !entry.is_empty())
         .collect();
     if entries.len() > MAX_NO_PROXY_ENTRIES {
@@ -252,6 +266,10 @@ fn parse_no_proxy(
     entries
         .into_iter()
         .map(|raw| {
+            let invalid = ProxyConfigError::InvalidEntry {
+                variable,
+                entry: raw.to_owned(),
+            };
             let entry = raw.to_ascii_lowercase();
             if entry == "*" {
                 return Ok(NoProxyEntry::Everything);
@@ -499,10 +517,12 @@ pub(crate) fn connect_tunnel(
         .nth(1)
         .and_then(|code| code.parse().ok())
         .ok_or(ProviderError::Connection)?;
-    if (200..300).contains(&status) {
-        Ok(())
-    } else {
-        Err(ProviderError::Connection)
+    match status {
+        200..=299 => Ok(()),
+        // The proxy refused its own credentials: asking again sends the same
+        // ones (and can lock a directory account), so it is not retried.
+        407 => Err(ProviderError::Permanent),
+        _ => Err(ProviderError::Connection),
     }
 }
 
@@ -612,17 +632,40 @@ mod tests {
         }
         let many = vec!["a.example"; MAX_NO_PROXY_ENTRIES + 1].join(",");
         assert_eq!(
-            ProxyConfig::from_env(&env(&[("no_proxy", many.as_str())])).expect_err("too many"),
+            ProxyConfig::from_env(&env(&[
+                ("https_proxy", "http://proxy:3128"),
+                ("no_proxy", many.as_str()),
+            ]))
+            .expect_err("too many"),
             ProxyConfigError::TooManyEntries {
                 variable: "no_proxy"
             }
         );
-        for bad in ["10.0.0.0/40", "host:port", "a b"] {
-            assert!(
-                ProxyConfig::from_env(&env(&[("no_proxy", bad)])).is_err(),
-                "{bad}"
-            );
+        for bad in ["10.0.0.0/40", "host:port", "192.168.*"] {
+            let err = ProxyConfig::from_env(&env(&[
+                ("https_proxy", "http://proxy:3128"),
+                ("no_proxy", bad),
+            ]))
+            .expect_err(bad);
+            assert!(err.to_string().contains(bad), "the entry is named: {err}");
         }
+        // Entries may be separated by whitespace too; and without a proxy
+        // nothing reads the list, so a bad one breaks nothing.
+        let spaced = ProxyConfig::from_env(&env(&[
+            ("https_proxy", "http://proxy:3128"),
+            ("no_proxy", "a.example b.example"),
+        ]))
+        .expect("config");
+        assert!(spaced.for_target(true, "b.example", 443).is_none());
+        assert!(ProxyConfig::from_env(&env(&[("no_proxy", "192.168.*")])).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_any_spelling_of_a_name_is_read() {
+        let config =
+            ProxyConfig::from_env(&env(&[("Https_Proxy", "http://proxy:3128")])).expect("config");
+        assert!(config.for_target(true, "api.example.com", 443).is_some());
     }
 
     #[test]
@@ -725,6 +768,9 @@ mod tests {
                 "{request}"
             );
             assert_eq!(result.is_ok(), ok, "{answer}");
+            if answer.contains(" 407 ") {
+                assert_eq!(result, Err(ProviderError::Permanent), "not retried");
+            }
         }
     }
 

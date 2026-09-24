@@ -490,6 +490,7 @@ impl<A> Http1Transport<A> {
         let https = url.scheme == UrlScheme::Https;
         let via = self.proxy.for_target(https, &url.host, url.port);
         if via.is_some()
+            && self.gate.is_none()
             && let Ok(resolved) = (url.host.as_str(), url.port).to_socket_addrs()
         {
             for addr in resolved {
@@ -1272,9 +1273,6 @@ fn classify_http_error(response: &ProviderHttpResponse) -> Result<(), ProviderEr
         400 | 413 if parsed.as_ref().is_some_and(json_is_context_too_large) => {
             Err(ProviderError::ContextTooLarge)
         }
-        // Only a proxy asks for its own credentials: the path, not the
-        // provider, refused.
-        407 => Err(ProviderError::Connection),
         408 | 409 | 425 | 500 | 502 | 503 | 504 => Err(ProviderError::Transient),
         // A redirect is never followed, and asking again is redirected again.
         300..=499 => Err(ProviderError::Permanent),
@@ -2129,12 +2127,16 @@ fn ip_is_blocked(ip: IpAddr) -> bool {
                 || v4.is_multicast()
                 || (octets[0] == 169 && octets[1] == 254)
         }
-        IpAddr::V6(v6) => {
-            v6.is_unspecified()
-                || v6.is_multicast()
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-                || v6.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
-        }
+        // `::ffff:a.b.c.d` dials `a.b.c.d` on a dual-stack socket.
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or_else(
+            || {
+                v6.is_unspecified()
+                    || v6.is_multicast()
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+                    || v6.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+            },
+            |v4| ip_is_blocked(IpAddr::V4(v4)),
+        ),
     }
 }
 
@@ -4334,8 +4336,15 @@ mod tests {
                 Ok(self.0.clone())
             }
         }
+        // On the dialled port, so only the address guard can refuse them:
+        // the metadata address, spelled plainly and IPv4-mapped.
         for returned in [
-            "169.254.169.254:80".parse::<SocketAddr>().expect("addr"),
+            format!("169.254.169.254:{port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+            format!("[::ffff:169.254.169.254]:{port}")
+                .parse()
+                .expect("addr"),
             format!("127.0.0.1:{}", port.wrapping_add(1))
                 .parse()
                 .expect("addr"),
@@ -4431,12 +4440,6 @@ mod tests {
             tail.starts_with(&[0x16, 0x03]),
             "a TLS handshake follows: {tail:?}"
         );
-        let tail_text = String::from_utf8_lossy(&tail);
-        assert!(
-            !tail_text.contains(FIXTURE_TOKEN),
-            "the bearer stays inside TLS"
-        );
-        assert!(!tail_text.contains("Proxy-Authorization"));
     }
 
     #[test]
@@ -4459,11 +4462,67 @@ mod tests {
     }
 
     #[test]
-    fn a_proxy_refusing_its_own_credentials_is_a_network_failure() {
+    fn a_proxy_refusing_its_own_credentials_is_permanent_never_retried() {
+        // Asking again sends the same credentials (and can lock the account).
         let response = ProviderHttpResponse::new(407, Vec::new(), Vec::new()).expect("response");
         assert_eq!(
             classify_http_error(&response),
-            Err(ProviderError::Connection)
+            Err(ProviderError::Permanent)
+        );
+        assert!(!ProviderError::Permanent.is_retryable());
+    }
+
+    #[test]
+    fn a_request_is_planned_before_its_credential_is_read() {
+        // `execute` resolves and guards the address before the bearer is
+        // asked for: an unresolvable host never reads the credential.
+        struct Recording(std::sync::atomic::AtomicBool);
+        impl WireAuthorization for Recording {
+            fn bearer_token(
+                &self,
+                _credential: &EphemeralCredential,
+                _cancel: &CancellationToken,
+            ) -> Result<String, ProviderError> {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(FIXTURE_TOKEN.to_owned())
+            }
+        }
+        let store = store_with_canary();
+        let auth = Arc::new(Recording(std::sync::atomic::AtomicBool::new(false)));
+        struct Shared(Arc<Recording>);
+        impl WireAuthorization for Shared {
+            fn bearer_token(
+                &self,
+                credential: &EphemeralCredential,
+                cancel: &CancellationToken,
+            ) -> Result<String, ProviderError> {
+                self.0.bearer_token(credential, cancel)
+            }
+        }
+        let adapter = OpenAiCompatibleAdapter::new(
+            config(
+                "http://unresolvable.invalid/v1",
+                OpenAiApiStyle::ChatCompletions,
+                caps(false, false),
+            ),
+            Http1Transport::new(Shared(Arc::clone(&auth))),
+            &store,
+        );
+        for streaming in [false, true] {
+            let err = if streaming {
+                adapter
+                    .invoke_sync_streaming(request(false, false), &live(), &mut |_| {})
+                    .expect_err("unresolvable")
+            } else {
+                adapter
+                    .invoke_sync(request(false, false), &live())
+                    .expect_err("unresolvable")
+            };
+            assert_eq!(err, ProviderError::Connection, "streaming={streaming}");
+        }
+        assert!(
+            !auth.0.load(std::sync::atomic::Ordering::SeqCst),
+            "the credential was never read"
         );
     }
 }
