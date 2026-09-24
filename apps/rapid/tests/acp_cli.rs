@@ -6,8 +6,10 @@
 //! serve stays up, the prompt ends with its real stop reason, and a cancel
 //! during an approval wait ends it — that an answer is read in the
 //! protocol's shape, so an approved write lands in the project and a
-//! rejected one does not, and that each prompt streams only its own turn's
-//! events, never the previous turn's again.
+//! rejected one does not, that "Allow always" is offered only where it is
+//! kept and, chosen, stops the same call being asked again, and that each
+//! prompt streams only its own turn's events, never the previous turn's
+//! again.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -68,7 +70,6 @@ fn write_calls(calls: &[(&str, &str)]) -> String {
 }
 
 /// A non-streaming chat completion proposing one call of `tool`.
-#[cfg(unix)]
 fn tool_call(id: &str, tool: &str, arguments: Value) -> String {
     json!({
         "choices": [{
@@ -238,8 +239,14 @@ struct Editor {
 
 impl Editor {
     fn spawn(project: &Path, home: &Path, config: &Path) -> Self {
+        Self::spawn_from(rapid(project, home, config), home)
+    }
+
+    /// `rapid acp` from `command` (a [`rapid`] command, perhaps with more
+    /// environment).
+    fn spawn_from(mut command: Command, home: &Path) -> Self {
         let stderr = home.join("acp.stderr");
-        let mut child = rapid(project, home, config)
+        let mut child = command
             .arg("acp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -695,6 +702,205 @@ fn an_answer_outside_the_protocol_s_shape_decides_nothing() {
         assert_eq!(count_kind(events, "turn.started"), 1, "{name}: {events:#?}");
         assert_eq!(run.written, None, "{name}");
     }
+}
+
+/// The option ids a `session/request_permission` offers, in order.
+fn offered(permission: &Value) -> Vec<String> {
+    permission["params"]["options"]
+        .as_array()
+        .map(|options| {
+            options
+                .iter()
+                .map(|option| option["optionId"].as_str().unwrap_or_default().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `rapid permissions list` for `project`.
+fn permissions_list(project: &Path, home: &Path, config: &Path) -> String {
+    let listed = rapid(project, home, config)
+        .args(["permissions", "list"])
+        .output()
+        .expect("permissions list");
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    String::from_utf8_lossy(&listed.stdout).into_owned()
+}
+
+/// The `remember` flag of every `approval.resolved` in `events`, in order.
+fn remembered(events: &[(String, Value)]) -> Vec<bool> {
+    events
+        .iter()
+        .filter(|(kind, _)| kind == "approval.resolved")
+        .map(|(_, payload)| payload["remember"].as_bool().unwrap_or_default())
+        .collect()
+}
+
+/// One prompt of a fresh serve, in a new session, the editor answering any
+/// permission request "allow once": the frames, and the session's ledger.
+fn prompt_in_a_new_serve(
+    command: Command,
+    project: &Path,
+    home: &Path,
+    config: &Path,
+) -> (Vec<Value>, String, Vec<(String, Value)>) {
+    let mut editor = Editor::spawn_from(command, home);
+    let session = editor.open_session(project);
+    let frames = editor.prompt(3, &session, "write it");
+    let stderr = editor.stderr_text();
+    assert_eq!(editor.finish(), Some(0), "stderr: {stderr}");
+    let events = ledger(project, home, config, &session);
+    (frames, stderr, events)
+}
+
+#[test]
+fn an_allow_always_answer_is_kept_so_the_same_call_is_not_asked_again() {
+    let home = temp_dir("allow-always");
+    let (project, config) = trusted_project(&home.0, one_write);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+
+    editor.start_prompt(3, &session, "write it");
+    let permission = editor.until_permission();
+    // Offered because it is kept; "Reject always" is never offered, since
+    // nothing keeps a refusal.
+    assert_eq!(
+        offered(&permission),
+        ["allow-once", "allow-always", "reject-once"],
+        "{permission}"
+    );
+    editor.answer_permission(
+        &permission,
+        json!({ "outcome": { "outcome": "selected", "optionId": "allow-always" } }),
+    );
+    let frames = editor.play(3);
+    let stderr = editor.stderr_text();
+    assert_eq!(
+        frames.last().expect("response")["result"]["stopReason"],
+        "end_turn",
+        "{frames:#?}\nstderr: {stderr}"
+    );
+    assert_eq!(editor.finish(), Some(0), "stderr: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(project.join("first.txt"))
+            .ok()
+            .as_deref(),
+        Some("from the model"),
+        "stderr: {stderr}"
+    );
+    let events = ledger(&project, &home.0, &config, &session);
+    assert_eq!(decisions(&events), ["approved"], "{events:#?}");
+    assert_eq!(remembered(&events), [true], "{events:#?}");
+    // Kept where the permission lattice reads it, for this exact call.
+    let listed = permissions_list(&project, &home.0, &config);
+    assert!(
+        listed.contains("allow=workspace_write(first.txt)\n"),
+        "{listed}"
+    );
+    assert!(listed.contains("grants=1\n"), "{listed}");
+
+    // The same call in a new serve — as after a restart — runs unasked.
+    std::fs::remove_file(project.join("first.txt")).expect("remove first.txt");
+    let (frames, stderr, events) = prompt_in_a_new_serve(
+        rapid(&project, &home.0, &config),
+        &project,
+        &home.0,
+        &config,
+    );
+    assert_eq!(
+        permission_requests(&frames),
+        0,
+        "asked again: {frames:#?}\nstderr: {stderr}"
+    );
+    assert_eq!(count_kind(&events, "approval.requested"), 0, "{events:#?}");
+    assert_eq!(
+        frames.last().expect("response")["result"]["stopReason"],
+        "end_turn",
+        "{frames:#?}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("first.txt"))
+            .ok()
+            .as_deref(),
+        Some("from the model"),
+        "the remembered write never ran: {events:#?}\nstderr: {stderr}"
+    );
+
+    // Managed policy still outranks the kept grant: a banned write is
+    // denied, unasked, and never runs.
+    std::fs::remove_file(project.join("first.txt")).expect("remove first.txt");
+    let policy = home.0.join("managed.toml");
+    std::fs::write(
+        &policy,
+        "schema = \"rapidlm.managed_config.v1\"\n[policy]\ndenied_tools = [\"workspace_write\"]\n",
+    )
+    .expect("policy");
+    let mut managed = rapid(&project, &home.0, &config);
+    managed.env("RAPIDLM_MANAGED_CONFIG", &policy);
+    let (frames, stderr, events) = prompt_in_a_new_serve(managed, &project, &home.0, &config);
+    assert_eq!(
+        permission_requests(&frames),
+        0,
+        "{frames:#?}\nstderr: {stderr}"
+    );
+    assert!(
+        !project.join("first.txt").exists(),
+        "a managed ban lost to a kept grant: {events:#?}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("managed policy bans"),
+        "the policy was not in force: {stderr}"
+    );
+}
+
+#[test]
+fn allow_always_is_not_offered_where_nothing_would_keep_it_and_is_no_answer_there() {
+    // A command: a joined argv names no one command, so no grant can keep
+    // "always" for it.
+    fn model(request: &str) -> String {
+        match tool_results(request) {
+            0 => tool_call(
+                "call_1",
+                "shell_exec",
+                json!({ "argv": ["git", "--version"] }),
+            ),
+            _ => answer("resumed"),
+        }
+    }
+    let home = temp_dir("allow-always-not-offered");
+    let (project, config) = trusted_project(&home.0, model);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+
+    editor.start_prompt(3, &session, "run it");
+    let permission = editor.until_permission();
+    assert_eq!(
+        offered(&permission),
+        ["allow-once", "reject-once"],
+        "{permission}"
+    );
+    // Chosen anyway, it is not an option this request offered: no decision.
+    editor.answer_permission(
+        &permission,
+        json!({ "outcome": { "outcome": "selected", "optionId": "allow-always" } }),
+    );
+    let frames = editor.play(3);
+    let stderr = editor.stderr_text();
+    assert_eq!(
+        frames.last().expect("response")["result"]["stopReason"],
+        "refusal",
+        "{frames:#?}\nstderr: {stderr}"
+    );
+    assert!(stderr.contains("not an offered option"), "stderr: {stderr}");
+    assert_eq!(editor.finish(), Some(0), "stderr: {stderr}");
+    let events = ledger(&project, &home.0, &config, &session);
+    assert_eq!(count_kind(&events, "approval.resolved"), 0, "{events:#?}");
+    let listed = permissions_list(&project, &home.0, &config);
+    assert!(listed.contains("grants=0\n"), "{listed}");
 }
 
 #[test]

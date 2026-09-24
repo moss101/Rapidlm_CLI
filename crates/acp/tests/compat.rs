@@ -61,9 +61,19 @@ const GOLDEN_PERMISSION: &str = concat!(
     r#"{"jsonrpc":"2.0","id":2,"method":"session/request_permission","params":{"#,
     r#""options":["#,
     r#"{"kind":"allow_once","name":"Allow once","optionId":"allow-once"},"#,
+    r#"{"kind":"reject_once","name":"Reject once","optionId":"reject-once"}],"#,
+    r#""sessionId":"018f3c8a-7e2b-7a10-8c4d-0123456789ab","toolCall":{"#,
+    r#""title":"repo.search","toolCallId":"call_7"}}}"#
+);
+
+/// An approval that names the grant "Allow always" records offers it; the
+/// grant itself stays off the wire.
+const GOLDEN_PERMISSION_ALWAYS: &str = concat!(
+    r#"{"jsonrpc":"2.0","id":5,"method":"session/request_permission","params":{"#,
+    r#""options":["#,
+    r#"{"kind":"allow_once","name":"Allow once","optionId":"allow-once"},"#,
     r#"{"kind":"allow_always","name":"Allow always","optionId":"allow-always"},"#,
-    r#"{"kind":"reject_once","name":"Reject once","optionId":"reject-once"},"#,
-    r#"{"kind":"reject_always","name":"Reject always","optionId":"reject-always"}],"#,
+    r#"{"kind":"reject_once","name":"Reject once","optionId":"reject-once"}],"#,
     r#""sessionId":"018f3c8a-7e2b-7a10-8c4d-0123456789ab","toolCall":{"#,
     r#""title":"repo.search","toolCallId":"call_7"}}}"#
 );
@@ -291,13 +301,27 @@ fn event_stream_and_error_goldens() {
     let frame = encode_session_update(update).expect("encode completed");
     assert_eq!(encode(&frame), GOLDEN_TOOL_COMPLETED);
 
-    let permission = map_kernel_event(&envelope(EventKind::ApprovalRequested, tool_payload))
-        .expect("permission");
+    let permission = map_kernel_event(&envelope(
+        EventKind::ApprovalRequested,
+        tool_payload.clone(),
+    ))
+    .expect("permission");
     let MappedEvent::PermissionRequired(request) = &permission else {
         panic!("expected permission, got {permission:?}");
     };
     let frame = encode_permission_request(JsonRpcId::Number(2), request).expect("encode perm");
     assert_eq!(encode(&frame), GOLDEN_PERMISSION);
+    assert_no_canary(&frame);
+
+    let mut rememberable = tool_payload;
+    rememberable["remember_as"] = json!(format!("repo.search({SECRET_CANARY})"));
+    let permission = map_kernel_event(&envelope(EventKind::ApprovalRequested, rememberable))
+        .expect("permission");
+    let MappedEvent::PermissionRequired(request) = &permission else {
+        panic!("expected permission, got {permission:?}");
+    };
+    let frame = encode_permission_request(JsonRpcId::Number(5), request).expect("encode perm");
+    assert_eq!(encode(&frame), GOLDEN_PERMISSION_ALWAYS);
     assert_no_canary(&frame);
 
     let stopped = map_kernel_event(&envelope(

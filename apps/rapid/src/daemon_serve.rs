@@ -448,6 +448,7 @@ re-read it before the next submit)"
                         &token,
                         &call_id,
                         decision == kernel::ApprovalDecision::Approved,
+                        None,
                         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                     );
                 }

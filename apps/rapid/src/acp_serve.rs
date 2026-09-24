@@ -550,11 +550,13 @@ fn send_mapped(event: &MappedEvent, out_tx: &Sender<JsonRpcMessage>) -> Result<(
 }
 
 /// The approval a paused prompt waits on: the request id the editor
-/// answers, and the durable wait it resolves.
+/// answers, the durable wait it resolves, and the request itself — its
+/// answer is read against the options it offered.
 struct HeldPermission {
     id: JsonRpcId,
     token: String,
     call_id: String,
+    request: acp::v1::PermissionRequest,
 }
 
 /// An approval the running turn asked for, not yet surfaced. Several calls
@@ -744,10 +746,18 @@ the approval stays pending"
                     );
                     return finish_prompt(routes, &out_tx, request_id, StopReason::Refusal);
                 };
-                let approve = match acp::v1::decode_permission_response(decision) {
+                let answer = acp::v1::decode_permission_response(decision, &held.request);
+                // "Allow always" is offered only with the grant that answers
+                // this call from now on: recorded, then approved.
+                let remember = match answer {
+                    Ok(PermissionAnswer::AllowAlways) => held.request.remember_as(),
+                    _ => None,
+                };
+                let approve = match answer {
                     Ok(PermissionAnswer::Selected(outcome)) => {
                         outcome == PermissionOutcome::Approved
                     }
+                    Ok(PermissionAnswer::AllowAlways) => true,
                     // The editor's own cancel, answered before (or instead
                     // of) its `session/cancel`: the same as that cancel —
                     // nothing is recorded, the approval stays pending.
@@ -773,6 +783,7 @@ offered option in the protocol's response shape; the approval stays pending"
                     &held.token,
                     &held.call_id,
                     approve,
+                    remember,
                     track_turn(&routes.turns, routes.session_id),
                 );
                 if let Err(reason) = resumed {
@@ -829,17 +840,19 @@ see; it stays pending"
                     // The route exists before the request is written, under
                     // the id the request carries.
                     let id = next_permit_id();
+                    let Ok(request) = acp::v1::encode_permission_request(id.clone(), &ask.request)
+                    else {
+                        return finish_prompt(routes, &out_tx, request_id, StopReason::Refusal);
+                    };
                     routes.hold(
                         HeldPermission {
-                            id: id.clone(),
+                            id,
                             token: ask.token,
                             call_id: ask.call_id,
+                            request: ask.request,
                         },
                         &decision_tx,
                     );
-                    let Ok(request) = acp::v1::encode_permission_request(id, &ask.request) else {
-                        return finish_prompt(routes, &out_tx, request_id, StopReason::Refusal);
-                    };
                     if !send(request) {
                         return;
                     }

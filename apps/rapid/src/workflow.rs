@@ -1091,6 +1091,7 @@ pub fn record_human_wait(
         diff: String::new(),
         source: None,
         arguments_digest: None,
+        remember_as: None,
     };
     ApprovalSink::request(&sink, &request)
 }

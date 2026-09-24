@@ -9159,9 +9159,13 @@ pub(crate) fn spawn_acp_turn(
 /// The serve-side half of the durable approval flow (shared with the TUI's
 /// `/approvals`): record the decision durably, then submit and spawn the
 /// continuation turn that replays the suspension. Used by `rapid acp` so an
-/// editor's permission decision resumes the exact turn. `running` is the
-/// continuation thread's flag, set by the caller: the thread clears it as it
-/// ends, and it is cleared here on every path that spawns no thread.
+/// editor's permission decision resumes the exact turn. `remember` is the
+/// persisted grant an approval also records — "Allow always" — for this
+/// project, in the store the permission lattice reads it from, after the
+/// approval (which then carries `remember`) and before the continuation
+/// builds its lattice. `running` is the continuation thread's
+/// flag, set by the caller: the thread clears it as it ends, and it is
+/// cleared here on every path that spawns no thread.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn acp_resolve_and_continue(
     client: &InProcessKernelClient,
@@ -9172,6 +9176,7 @@ pub(crate) fn acp_resolve_and_continue(
     token: &str,
     call_id: &str,
     approve: bool,
+    remember: Option<&str>,
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), String> {
     let spawned = (|| -> Result<bool, String> {
@@ -9181,11 +9186,29 @@ pub(crate) fn acp_resolve_and_continue(
         } else {
             kernel::ApprovalDecision::Denied
         };
-        crate::approvals::client_approve(
-            client,
+        let remember = remember.filter(|_| approve);
+        let mut resolution =
             kernel::ResolveApproval::new(session_id, tip, decision, actor.clone(), TraceId::new())
-                .with_wait_token(token),
-        )?;
+                .with_wait_token(token);
+        if remember.is_some() {
+            resolution = resolution.remembering();
+        }
+        crate::approvals::client_approve(client, resolution)?;
+        // Only once the approval is resolved: a resolution that fails (one
+        // already decided elsewhere) leaves no grant behind.
+        if let Some(pattern) = remember {
+            let recorded = exec_user_home()
+                .ok_or_else(|| "no RapidLM home directory could be resolved".to_owned())
+                .and_then(|home| {
+                    crate::permissions_cli::record_persisted_grant(root, &home, pattern)
+                });
+            if let Err(reason) = recorded {
+                eprintln!(
+                    "rapid acp: the standing grant {pattern} could not be recorded: {reason}; \
+the call is approved once"
+                );
+            }
+        }
         let _suspended = crate::approvals::recorded_suspension(client, session_id, token)
             .ok_or_else(|| "the paused turn's resumable state could not be loaded".to_owned())?;
         let decision = if approve {
@@ -10295,6 +10318,7 @@ fn record_outcome_suspension(
                 diff: String::new(),
                 source: None,
                 arguments_digest: None,
+                remember_as: None,
             };
             if let Ok(recorded) = crate::approvals::ApprovalSink::request(&sink, &request) {
                 token = Some(recorded);
@@ -16849,6 +16873,7 @@ question the panel answers"
             diff: String::new(),
             source: None,
             arguments_digest: None,
+            remember_as: None,
         })
         .expect("pending approval");
         loop_state.start_autonomous_goal().expect("start");

@@ -99,7 +99,6 @@ const CANCEL_STRIDE: usize = 32;
 const OPTION_ALLOW_ONCE: &str = "allow-once";
 const OPTION_ALLOW_ALWAYS: &str = "allow-always";
 const OPTION_REJECT_ONCE: &str = "reject-once";
-const OPTION_REJECT_ALWAYS: &str = "reject-always";
 
 /// Frontend adapter over [`KernelClient`]. Bindings are IDs and cursors only.
 pub struct V1Adapter<C> {
@@ -317,6 +316,10 @@ pub struct PermissionRequest {
     session_id: SessionId,
     tool_call: PermissionToolCall,
     options: Vec<PermissionOption>,
+    /// The persisted grant "Allow always" records — the approval's
+    /// `remember_as`. "Allow always" is offered only when there is one.
+    #[serde(skip)]
+    remember_as: Option<String>,
 }
 
 /// Client decision forwarded to [`kernel::KernelClient::approve`].
@@ -332,6 +335,10 @@ pub enum PermissionOutcome {
 pub enum PermissionAnswer {
     /// The user selected one of the offered options.
     Selected(PermissionOutcome),
+    /// The user selected "Allow always": approve, and record the request's
+    /// [`PermissionRequest::remember_as`] grant. Decoded only against a
+    /// request that offered it.
+    AllowAlways,
     /// The prompt turn was cancelled before the user chose.
     Cancelled,
 }
@@ -386,7 +393,6 @@ enum PermissionOptionKind {
     AllowOnce,
     AllowAlways,
     RejectOnce,
-    RejectAlways,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -451,20 +457,26 @@ enum PermissionOutcomeWire {
 }
 
 impl PermissionOutcomeWire {
-    /// Read against the options [`permission_options`] offers; an option
-    /// never offered is `InvalidParams`.
-    fn answer(self) -> Result<PermissionAnswer, V1Error> {
+    /// Read against the options the request `offered`; an option it never
+    /// offered is `InvalidParams`.
+    fn answer(self, offered: &[PermissionOption]) -> Result<PermissionAnswer, V1Error> {
         match self {
             Self::Cancelled => Ok(PermissionAnswer::Cancelled),
-            Self::Selected { option_id } => match option_id.as_str() {
-                OPTION_ALLOW_ONCE | OPTION_ALLOW_ALWAYS => {
-                    Ok(PermissionAnswer::Selected(PermissionOutcome::Approved))
-                }
-                OPTION_REJECT_ONCE | OPTION_REJECT_ALWAYS => {
-                    Ok(PermissionAnswer::Selected(PermissionOutcome::Denied))
-                }
-                _ => Err(V1Error::InvalidParams),
-            },
+            Self::Selected { option_id } => {
+                let option = offered
+                    .iter()
+                    .find(|option| option.option_id == option_id)
+                    .ok_or(V1Error::InvalidParams)?;
+                Ok(match option.kind {
+                    PermissionOptionKind::AllowOnce => {
+                        PermissionAnswer::Selected(PermissionOutcome::Approved)
+                    }
+                    PermissionOptionKind::AllowAlways => PermissionAnswer::AllowAlways,
+                    PermissionOptionKind::RejectOnce => {
+                        PermissionAnswer::Selected(PermissionOutcome::Denied)
+                    }
+                })
+            }
         }
     }
 }
@@ -707,9 +719,12 @@ impl<C: KernelClient> V1Adapter<C> {
         self.require_ready()?;
         let parsed: PermissionOutcomeParams = parse_params(params)?;
         let session_id = parse_session_id(&parsed.session_id)?;
-        let outcome = match parsed.outcome.answer()? {
+        // No request to read against: only the options every request
+        // offers. "Allow always" records a grant this adapter cannot.
+        let outcome = match parsed.outcome.answer(&permission_options(false))? {
             PermissionAnswer::Cancelled => PermissionOutcome::Denied,
             PermissionAnswer::Selected(outcome) => outcome,
+            PermissionAnswer::AllowAlways => return Err(V1Error::InvalidParams),
         };
         self.resolve_permission(session_id, outcome).await
     }
@@ -934,6 +949,12 @@ impl PermissionRequest {
     pub fn tool_call_id(&self) -> &str {
         &self.tool_call.tool_call_id
     }
+
+    /// The persisted grant "Allow always" records; `None` when the request
+    /// does not offer it.
+    pub fn remember_as(&self) -> Option<&str> {
+        self.remember_as.as_deref()
+    }
 }
 
 impl SessionUpdateNotification {
@@ -1050,14 +1071,22 @@ pub fn map_kernel_event(event: &ErasedEventEnvelope) -> Option<MappedEvent> {
         EventKind::WorkspacePatchStaged | EventKind::WorkspaceTransactionCommitted => {
             file_edit_update(session_id, payload).map(MappedEvent::SessionUpdate)
         }
-        EventKind::ApprovalRequested => Some(MappedEvent::PermissionRequired(PermissionRequest {
-            session_id,
-            tool_call: PermissionToolCall {
-                tool_call_id: tool_call_id(payload).unwrap_or_else(|| "approval".to_owned()),
-                title: tool_title(payload),
-            },
-            options: permission_options(),
-        })),
+        EventKind::ApprovalRequested => {
+            let remember_as = payload
+                .get("remember_as")
+                .and_then(Value::as_str)
+                .filter(|pattern| !pattern.is_empty())
+                .map(str::to_owned);
+            Some(MappedEvent::PermissionRequired(PermissionRequest {
+                session_id,
+                tool_call: PermissionToolCall {
+                    tool_call_id: tool_call_id(payload).unwrap_or_else(|| "approval".to_owned()),
+                    title: tool_title(payload),
+                },
+                options: permission_options(remember_as.is_some()),
+                remember_as,
+            }))
+        }
         EventKind::TurnCompleted => Some(MappedEvent::PromptStopped(stop_reason(
             payload,
             StopReason::EndTurn,
@@ -1095,12 +1124,14 @@ pub fn encode_permission_request(
     })
 }
 
-/// Decode the result of the client's response to a
-/// `session/request_permission` request: the protocol nests the outcome,
-/// `{"outcome":{"outcome":"selected","optionId":"allow-once"}}` or
-/// `{"outcome":{"outcome":"cancelled"}}`. An option id the request never
+/// Decode the result of the client's response to `request`: the protocol
+/// nests the outcome, `{"outcome":{"outcome":"selected","optionId":"allow-once"}}`
+/// or `{"outcome":{"outcome":"cancelled"}}`. An option id `request` never
 /// offered, or any other shape, is `InvalidParams`.
-pub fn decode_permission_response(result: Value) -> Result<PermissionAnswer, V1Error> {
+pub fn decode_permission_response(
+    result: Value,
+    request: &PermissionRequest,
+) -> Result<PermissionAnswer, V1Error> {
     // serde would also read the struct, or the tagged outcome, from an
     // array; the protocol's answer is an object holding an object.
     if !result.get("outcome").is_some_and(Value::is_object) {
@@ -1108,7 +1139,7 @@ pub fn decode_permission_response(result: Value) -> Result<PermissionAnswer, V1E
     }
     parse_params::<PermissionResponseWire>(result)?
         .outcome
-        .answer()
+        .answer(&request.options)
 }
 
 /// Encode a completed `session/prompt` result.
@@ -1333,29 +1364,30 @@ fn stop_reason(payload: &Value, default: StopReason) -> StopReason {
     }
 }
 
-fn permission_options() -> Vec<PermissionOption> {
-    vec![
-        PermissionOption {
-            option_id: OPTION_ALLOW_ONCE.to_owned(),
-            name: "Allow once".to_owned(),
-            kind: PermissionOptionKind::AllowOnce,
-        },
-        PermissionOption {
+/// The options a permission request offers: only those whose answer is
+/// carried out as named. "Allow always" only when the approval names the grant that answers the
+/// same call from then on (`rememberable`). Never "Reject always": nothing
+/// records a standing refusal, so it would act once and the user would be
+/// asked again.
+fn permission_options(rememberable: bool) -> Vec<PermissionOption> {
+    let mut options = vec![PermissionOption {
+        option_id: OPTION_ALLOW_ONCE.to_owned(),
+        name: "Allow once".to_owned(),
+        kind: PermissionOptionKind::AllowOnce,
+    }];
+    if rememberable {
+        options.push(PermissionOption {
             option_id: OPTION_ALLOW_ALWAYS.to_owned(),
             name: "Allow always".to_owned(),
             kind: PermissionOptionKind::AllowAlways,
-        },
-        PermissionOption {
-            option_id: OPTION_REJECT_ONCE.to_owned(),
-            name: "Reject once".to_owned(),
-            kind: PermissionOptionKind::RejectOnce,
-        },
-        PermissionOption {
-            option_id: OPTION_REJECT_ALWAYS.to_owned(),
-            name: "Reject always".to_owned(),
-            kind: PermissionOptionKind::RejectAlways,
-        },
-    ]
+        });
+    }
+    options.push(PermissionOption {
+        option_id: OPTION_REJECT_ONCE.to_owned(),
+        name: "Reject once".to_owned(),
+        kind: PermissionOptionKind::RejectOnce,
+    });
+    options
 }
 
 #[cfg(test)]
@@ -1650,46 +1682,119 @@ mod tests {
             "mcpServers": []
         })))
         .expect("new");
-        let err = block_on(acp.resolve_permission_params(serde_json::json!({
-            "sessionId": created.session_id(),
-            "outcome": {"outcome": "selected", "optionId": "allow-everything"}
-        })))
-        .expect_err("unknown option");
-        assert!(matches!(err, V1Error::InvalidParams));
+        // Refused alongside an unknown option: "Allow always", since this
+        // path has no grant to record and would act once, and "Reject
+        // always", which is never offered.
+        for option in ["allow-everything", "allow-always", "reject-always"] {
+            let err = block_on(acp.resolve_permission_params(serde_json::json!({
+                "sessionId": created.session_id(),
+                "outcome": {"outcome": "selected", "optionId": option}
+            })))
+            .expect_err("not an offered option");
+            assert!(matches!(err, V1Error::InvalidParams), "{option}");
+        }
         let snapshot = block_on(tmp.client.get_session(created.session_id())).expect("unchanged");
         assert_eq!(snapshot.seq(), created.seq());
     }
 
+    /// The permission request `approval.requested` with `payload` maps to.
+    fn requested(payload: Value) -> PermissionRequest {
+        let session_id = SessionId::from_str("018f3c8a-7e2b-7a10-8c4d-0123456789ab").expect("id");
+        match map_kernel_event(&envelope(EventKind::ApprovalRequested, session_id, payload)) {
+            Some(MappedEvent::PermissionRequired(request)) => request,
+            other => panic!("expected permission, got {other:?}"),
+        }
+    }
+
+    fn offered(request: &PermissionRequest) -> Vec<&str> {
+        request
+            .options
+            .iter()
+            .map(|option| option.option_id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn allow_always_is_offered_only_with_a_grant_to_record_and_reject_always_never() {
+        let once = requested(serde_json::json!({"call_id": "c1", "tool": "shell_exec"}));
+        assert_eq!(offered(&once), ["allow-once", "reject-once"]);
+        assert_eq!(once.remember_as(), None);
+        for empty in [
+            serde_json::json!(""),
+            serde_json::json!(null),
+            serde_json::json!(7),
+        ] {
+            let request = requested(serde_json::json!({
+                "call_id": "c1", "tool": "workspace_write", "remember_as": empty
+            }));
+            assert_eq!(offered(&request), ["allow-once", "reject-once"], "{empty}");
+        }
+        let always = requested(serde_json::json!({
+            "call_id": "c1",
+            "tool": "workspace_write",
+            "remember_as": "workspace_write(first.txt)"
+        }));
+        assert_eq!(
+            offered(&always),
+            ["allow-once", "allow-always", "reject-once"]
+        );
+        assert_eq!(always.remember_as(), Some("workspace_write(first.txt)"));
+        // The grant is the serve's to record, not the editor's to see.
+        let wire = serde_json::to_string(&always).expect("serialize");
+        assert!(!wire.contains("first.txt"), "{wire}");
+    }
+
     #[test]
     fn a_permission_response_is_read_in_the_protocol_s_nested_shape() {
-        let selected = |option: &str| {
-            decode_permission_response(serde_json::json!({
-                "outcome": {"outcome": "selected", "optionId": option}
-            }))
+        let always = requested(serde_json::json!({
+            "call_id": "c1",
+            "tool": "workspace_write",
+            "remember_as": "workspace_write(first.txt)"
+        }));
+        let once = requested(serde_json::json!({"call_id": "c1", "tool": "shell_exec"}));
+        let selected = |option: &str, request: &PermissionRequest| {
+            decode_permission_response(
+                serde_json::json!({
+                    "outcome": {"outcome": "selected", "optionId": option}
+                }),
+                request,
+            )
         };
-        for option in permission_options() {
-            let expected = match option.kind {
-                PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways => {
-                    PermissionOutcome::Approved
-                }
-                PermissionOptionKind::RejectOnce | PermissionOptionKind::RejectAlways => {
-                    PermissionOutcome::Denied
-                }
-            };
+        for request in [&always, &once] {
             assert_eq!(
-                selected(&option.option_id).expect("an offered option"),
-                PermissionAnswer::Selected(expected),
-                "{}",
-                option.option_id
+                selected("allow-once", request).expect("offered"),
+                PermissionAnswer::Selected(PermissionOutcome::Approved)
             );
+            assert_eq!(
+                selected("reject-once", request).expect("offered"),
+                PermissionAnswer::Selected(PermissionOutcome::Denied)
+            );
+            // Never offered, so never an answer: acting on it once would
+            // not be what the user chose.
+            assert!(matches!(
+                selected("reject-always", request),
+                Err(V1Error::InvalidParams)
+            ));
         }
         assert_eq!(
-            decode_permission_response(serde_json::json!({"outcome": {"outcome": "cancelled"}}))
-                .expect("cancelled"),
+            selected("allow-always", &always).expect("offered"),
+            PermissionAnswer::AllowAlways
+        );
+        // "Allow always" to a request that did not offer it is no answer.
+        assert!(matches!(
+            selected("allow-always", &once),
+            Err(V1Error::InvalidParams)
+        ));
+        assert_eq!(
+            decode_permission_response(
+                serde_json::json!({"outcome": {"outcome": "cancelled"}}),
+                &always
+            )
+            .expect("cancelled"),
             PermissionAnswer::Cancelled
         );
         assert!(matches!(
-            selected("allow-everything"),
+            selected("allow-everything", &always),
             Err(V1Error::InvalidParams)
         ));
         // The outcome not nested under `outcome` is no answer at all; nor
@@ -1705,7 +1810,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    decode_permission_response(other.clone()),
+                    decode_permission_response(other.clone(), &always),
                     Err(V1Error::InvalidParams)
                 ),
                 "{other}"

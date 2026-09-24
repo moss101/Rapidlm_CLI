@@ -586,6 +586,7 @@ fn concurrent_approval_requests_both_land_despite_sequence_conflicts() {
                     diff: String::new(),
                     source: Some("hook:pre_tool_use[0]#0123456789ab".to_owned()),
                     arguments_digest: None,
+                    remember_as: None,
                 })
             }));
         }
@@ -845,6 +846,7 @@ fn a_clarification_is_pending_until_answered_then_continues() {
             diff: String::new(),
             source: None,
             arguments_digest: None,
+            remember_as: None,
         })
         .expect("records");
     let suspended = rapid::approvals::SuspendedTurn {

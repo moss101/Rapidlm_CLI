@@ -630,6 +630,45 @@ impl PermissionLattice {
             PermissionMode::BypassPermissions => Decision::Allow(DecisionReason::BypassAllow),
         }
     }
+
+    /// The persisted grant that would answer this call from now on — what
+    /// an approve-and-remember answer to its ask records — or `None` when
+    /// no grant can. `subject` is the call's rule subject, `None` for a tool
+    /// whose calls carry none (every call of it is the same to the lattice).
+    ///
+    /// The grant names this tool and exactly this subject, so it covers no
+    /// other call's subject. There is none for `shell_exec` (its subject is
+    /// a joined argv, which `["a b"]` and `["a", "b"]` share, so no pattern
+    /// names one command; standing shell approvals stay the user's own
+    /// `rapid permissions allow` patterns), for an empty subject or one
+    /// holding a glob character (the pattern would match more than this
+    /// call), for a project already at [`MAX_GRANTS`] (the store refuses
+    /// one more), or when a layer ranked above grants would still decide
+    /// the call — a managed ban or write confinement, a write scope, plan
+    /// mode, a deny or ask rule: a grant never outranks them, so
+    /// remembering would not stop the next ask.
+    pub fn standing_grant_for(
+        &self,
+        tool: &str,
+        subject: Option<&str>,
+        class: ToolClass,
+    ) -> Option<ToolPattern> {
+        if tool == "shell_exec" || self.grants.len() >= MAX_GRANTS {
+            return None;
+        }
+        let grant = match subject {
+            None => ToolPattern::parse(tool)?,
+            Some(subject) if subject.is_empty() || subject.contains(['*', '?']) => return None,
+            Some(subject) => ToolPattern::parse(&format!("{tool}({subject})"))?,
+        };
+        let remembered = Self {
+            grants: vec![grant.clone()],
+            ..self.clone()
+        };
+        (remembered.evaluate(tool, subject.unwrap_or_default(), class)
+            == Decision::Allow(DecisionReason::PersistedGrant))
+        .then_some(grant)
+    }
 }
 
 /// A parsed project settings document (`permissions` rules + default mode).
@@ -889,6 +928,83 @@ mod tests {
             confined.evaluate("workspace_write", "elsewhere/a.rs", ToolClass::FileEdit),
             Decision::Deny(DecisionReason::AdminWriteScopeViolation)
         );
+    }
+
+    #[test]
+    fn a_standing_grant_names_exactly_its_call_and_only_where_it_would_answer_it() {
+        let lattice = PermissionLattice::new(PermissionMode::Default);
+        let grant = |lattice: &PermissionLattice, tool: &str, subject: Option<&str>| {
+            lattice
+                .standing_grant_for(tool, subject, ToolClass::FileEdit)
+                .map(|grant| grant.render())
+        };
+        // This tool, this exact subject: the grant answers the same call and
+        // no other path.
+        let exact = lattice
+            .standing_grant_for("workspace_write", Some("first.txt"), ToolClass::FileEdit)
+            .expect("a plain write is rememberable");
+        assert_eq!(exact.render(), "workspace_write(first.txt)");
+        let remembered = PermissionLattice::new(PermissionMode::Default).with_grants(vec![exact]);
+        assert_eq!(
+            remembered.evaluate("workspace_write", "first.txt", ToolClass::FileEdit),
+            Decision::Allow(DecisionReason::PersistedGrant)
+        );
+        for other in ["first.txt.bak", "second.txt", "dir/first.txt"] {
+            assert_eq!(
+                remembered.evaluate("workspace_write", other, ToolClass::FileEdit),
+                Decision::Ask(DecisionReason::ModeAsk),
+                "{other}"
+            );
+        }
+        // A tool whose calls carry no subject: the bare tool is exact.
+        assert_eq!(
+            grant(&lattice, "mcp__server__lookup", None).as_deref(),
+            Some("mcp__server__lookup")
+        );
+        // A subject a pattern cannot state exactly, or none where the tool
+        // has one: no grant, never a wider one.
+        for subject in ["", "a*.txt", "a?.txt"] {
+            assert_eq!(
+                grant(&lattice, "workspace_write", Some(subject)),
+                None,
+                "{subject:?}"
+            );
+        }
+        // A joined argv names no one command.
+        assert_eq!(
+            lattice.standing_grant_for("shell_exec", Some("git status"), ToolClass::Other),
+            None
+        );
+        // Every layer ranked above grants still decides, so remembering
+        // would not stop the next ask — or would widen past it.
+        let ruled = PermissionLattice::new(PermissionMode::Default).with_rules(vec![ToolRule {
+            effect: RuleEffect::Ask,
+            pattern: ToolPattern::parse("workspace_write(first*)").expect("rule"),
+        }]);
+        let banned = PermissionLattice::new(PermissionMode::Default)
+            .with_denied_tools([ToolPattern::parse("workspace_write").expect("pattern")]);
+        let confined =
+            PermissionLattice::new(PermissionMode::Default).with_admin_write_scope("src");
+        let planning = PermissionLattice::new(PermissionMode::Plan);
+        for (name, above) in [
+            ("ask rule", &ruled),
+            ("managed ban", &banned),
+            ("managed write confinement", &confined),
+            ("plan mode", &planning),
+        ] {
+            assert_eq!(
+                grant(above, "workspace_write", Some("first.txt")),
+                None,
+                "{name}"
+            );
+        }
+        // A project at its grant bound: the store refuses one more.
+        let full = PermissionLattice::new(PermissionMode::Default).with_grants(
+            (0..MAX_GRANTS)
+                .map(|n| ToolPattern::parse(&format!("workspace_write(f{n})")).expect("pattern"))
+                .collect(),
+        );
+        assert_eq!(grant(&full, "workspace_write", Some("first.txt")), None);
     }
 
     #[test]

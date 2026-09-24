@@ -2289,7 +2289,14 @@ impl WorkspaceTools {
     /// Rule-matching subject for one call: the workspace-relative path for
     /// file tools, the joined argv for `shell_exec`.
     fn rule_subject(tool: &str, arguments: &str) -> Option<String> {
-        match tool {
+        Self::read_rule_subject(tool, arguments).flatten()
+    }
+
+    /// [`Self::rule_subject`], telling its two `None`s apart: `None` for a
+    /// tool whose calls carry no subject, `Some(None)` for a call whose
+    /// arguments do not yield the subject its tool has.
+    fn read_rule_subject(tool: &str, arguments: &str) -> Option<Option<String>> {
+        Some(match tool {
             WORKSPACE_WRITE_TOOL => parse_write_args(arguments).ok().map(|args| args.path),
             WORKSPACE_READ_TOOL | REPO_READ_TOOL => parse_path_argument(arguments),
             WORKSPACE_PATCH_TOOL => parse_patch_args(arguments).ok().map(|args| args.path),
@@ -2306,8 +2313,23 @@ impl WorkspaceTools {
             WEB_FETCH_TOOL => parse_web_fetch_args(arguments).ok().and_then(|(url, _)| {
                 crate::web_fetch::host_of(&url).map(|host| format!("domain:{host}"))
             }),
-            _ => None,
-        }
+            _ => return None,
+        })
+    }
+
+    /// The persisted grant an approve-and-remember answer to this call's
+    /// ask would record, when that grant would answer the same call from
+    /// then on ([`crate::permissions::PermissionLattice::standing_grant_for`]);
+    /// `None` when the call's subject cannot be read, so no grant names it.
+    fn standing_grant(&self, call: &ValidatedToolCall) -> Option<String> {
+        let subject = match Self::read_rule_subject(call.tool(), call.arguments()) {
+            None => None,
+            Some(Some(subject)) => Some(subject),
+            Some(None) => return None,
+        };
+        self.permissions
+            .standing_grant_for(call.tool(), subject.as_deref(), tool_class(call.tool()))
+            .map(|grant| grant.render())
     }
 
     /// Permission decision for one validated call. Total: every call of a
@@ -2530,12 +2552,13 @@ impl WorkspaceTools {
             if matches!(decision, crate::permissions::Decision::Ask(_))
                 && let Some(sink) = self.approval_sink.as_ref()
             {
-                let request = crate::approvals::build_request(
+                let mut request = crate::approvals::build_request(
                     call.tool(),
                     call.call_id(),
                     call.arguments(),
                     &self.root,
                 );
+                request.remember_as = self.standing_grant(call);
                 if let Ok(_token) = sink.request(&request) {
                     return Ok(ToolStepResult::ApprovalRequired {
                         call_id: call.call_id().to_owned(),
@@ -9131,6 +9154,75 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_lattice_ask_names_the_grant_that_answers_it_only_where_one_would() {
+        // Default mode asks for every write and command. The request for a
+        // plain write names the exact grant that answers that call from then
+        // on; an ask rule outranks any grant, a joined argv names no one
+        // command, and a write whose path cannot be read has no subject to
+        // name (a bare-tool grant would cover every write), so none of those
+        // requests names one.
+        let root = TempRoot::new("standing-grant");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default)
+            .with_rules(vec![ToolRule {
+                effect: RuleEffect::Ask,
+                pattern: ToolPattern::parse("workspace_write(ruled.txt)").expect("rule"),
+            }]);
+        let mut tools = WorkspaceTools::open_with_permissions(&root.0, lattice).expect("tools");
+        tools.set_approval_source(approvals.clone());
+        let shell = make_call(
+            "c3",
+            SHELL_EXEC_TOOL,
+            &format!(
+                r#"{{"argv":["{}","hi"]}}"#,
+                test_fixtures::tool_static("echo")
+            ),
+        );
+        for call in [
+            write_call("c1", "first.txt"),
+            write_call("c2", "ruled.txt"),
+            shell,
+            make_call("c4", WORKSPACE_WRITE_TOOL, r#"{"content":"hi"}"#),
+        ] {
+            assert!(matches!(
+                run_one(&mut tools, &call),
+                ToolStepResult::ApprovalRequired { .. }
+            ));
+        }
+        let requests = approvals.requests.lock().unwrap_or_else(|p| p.into_inner());
+        let remembered: Vec<Option<&str>> = requests
+            .iter()
+            .map(|request| request.remember_as.as_deref())
+            .collect();
+        assert_eq!(
+            remembered,
+            [Some("workspace_write(first.txt)"), None, None, None],
+            "{requests:#?}"
+        );
+    }
+
+    #[test]
+    fn a_call_whose_subject_cannot_be_read_is_told_apart_from_a_tool_without_one() {
+        // A write whose arguments do not parse has a subject it cannot
+        // show; a bare-tool grant for it would cover every write.
+        assert_eq!(
+            WorkspaceTools::read_rule_subject(WORKSPACE_WRITE_TOOL, "not json"),
+            Some(None)
+        );
+        assert_eq!(
+            WorkspaceTools::read_rule_subject(
+                WORKSPACE_WRITE_TOOL,
+                r#"{"path":"a.txt","content":"x"}"#
+            ),
+            Some(Some("a.txt".to_owned()))
+        );
+        assert_eq!(
+            WorkspaceTools::read_rule_subject("mcp__server__lookup", "{}"),
+            None
+        );
+    }
+
     /// What the resume carries for an approval the fake sink recorded.
     fn approved(request: &crate::approvals::ApprovalRequest) -> crate::approvals::ApprovedAsk {
         crate::approvals::ApprovedAsk {
@@ -9215,6 +9307,8 @@ mod tests {
             assert_eq!(request.call_id, "c1");
             let source = request.source.clone().expect("a hook ask names its source");
             assert!(source.starts_with("hook:pre_tool_use[0]#"), "{source}");
+            // No grant answers a hook's ask: remembering it is not offered.
+            assert_eq!(request.remember_as, None);
             assert_eq!(
                 request.summary,
                 "create e.txt — pre_tool_use[0] hook asks: a reviewer must see this",

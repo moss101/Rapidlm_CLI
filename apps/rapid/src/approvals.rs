@@ -50,6 +50,13 @@ pub struct ApprovalRequest {
     /// SHA-256 of the arguments this request describes — what the human is
     /// approving. The resume runs a call only when its arguments match.
     pub arguments_digest: Option<String>,
+    /// The persisted grant that would answer the same call from then on,
+    /// set only by a lattice `Ask` that has one
+    /// (`PermissionLattice::standing_grant_for`); what `rapid acp`'s "Allow
+    /// always" records, and offered only with it. `None` for every other
+    /// ask — a hook's, a question, a shell command, a call a rule or policy
+    /// ranked above grants still decides.
+    pub remember_as: Option<String>,
 }
 
 /// Lowercase hex SHA-256 of `arguments` — the digest approvals and hook
@@ -436,6 +443,7 @@ pub fn build_request(tool: &str, call_id: &str, arguments: &str, root: &Path) ->
         diff,
         source: None,
         arguments_digest: Some(arguments_digest(arguments)),
+        remember_as: None,
     }
 }
 
@@ -530,14 +538,17 @@ impl LedgerApprovalSink {
 
 fn with_source(
     record: kernel::RecordApproval,
-    source: Option<&str>,
-    arguments_digest: Option<&str>,
+    request: &ApprovalRequest,
 ) -> kernel::RecordApproval {
-    let record = match source {
+    let record = match request.source.as_deref() {
         Some(source) => record.with_source(source),
         None => record,
     };
-    match arguments_digest {
+    let record = match request.remember_as.as_deref() {
+        Some(pattern) => record.with_remember_as(pattern),
+        None => record,
+    };
+    match request.arguments_digest.as_deref() {
         Some(digest) => record.with_arguments_digest(digest),
         None => record,
     }
@@ -579,8 +590,7 @@ impl ApprovalSink for LedgerApprovalSink {
                     )
                     .with_scope(request.scope.clone())
                     .with_diff(request.diff.clone()),
-                    request.source.as_deref(),
-                    request.arguments_digest.as_deref(),
+                    request,
                 )),
             )?;
             match outcome {

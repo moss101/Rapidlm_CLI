@@ -562,6 +562,7 @@ pub struct RecordApproval {
     detail: String,
     source: Option<String>,
     arguments_digest: Option<String>,
+    remember_as: Option<String>,
 }
 
 impl RecordApproval {
@@ -590,6 +591,7 @@ impl RecordApproval {
             detail: String::new(),
             source: None,
             arguments_digest: None,
+            remember_as: None,
         }
     }
 
@@ -630,6 +632,17 @@ impl RecordApproval {
     /// and not a later rewrite of it.
     pub fn with_arguments_digest(mut self, digest: impl Into<String>) -> Self {
         self.arguments_digest = Some(bounded_payload_str(&digest.into(), 64));
+        self
+    }
+
+    /// The persisted grant that would answer the same call from then on,
+    /// set by the surface that raised the ask only when it has one. Never
+    /// cut to fit: a shortened pattern could name another tool, so one over
+    /// the bound is dropped, as if there were none.
+    pub fn with_remember_as(mut self, pattern: impl Into<String>) -> Self {
+        let pattern = pattern.into();
+        self.remember_as =
+            (!pattern.is_empty() && pattern.len() <= MAX_APPROVAL_SUMMARY_BYTES).then_some(pattern);
         self
     }
 
@@ -707,6 +720,12 @@ pub struct ApprovalRequestedPayload {
     /// refuses to treat a call with different arguments as approved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arguments_digest: Option<String>,
+    /// The persisted grant pattern (`Tool` or `Tool(subject)`) that would
+    /// answer this same call from then on, as the asking surface found it.
+    /// Absent when it found none, and on every request recorded before the
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remember_as: Option<String>,
 }
 
 /// Wire payload of `approval.resolved`.
@@ -1270,6 +1289,7 @@ impl InProcessKernelClient {
             detail: req.detail.clone(),
             source: req.source.clone(),
             arguments_digest: req.arguments_digest.clone(),
+            remember_as: req.remember_as.clone(),
         };
         if let Err(err) = self.ledger.append(
             req.session_id,
