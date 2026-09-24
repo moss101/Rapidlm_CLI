@@ -1507,14 +1507,15 @@ fn ingest_chat_tool_deltas(
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
         {
-            let call_id = ToolCallId::parse(id)?;
+            let call_id = ToolCallId::parse(id).map_err(|_| ProviderError::Permanent)?;
             let name = call
                 .get("function")
                 .and_then(|function| function.get("name"))
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
                 .map(ToolName::parse)
-                .transpose()?
+                .transpose()
+                .map_err(|_| ProviderError::Permanent)?
                 .or_else(|| {
                     call.get("name")
                         .and_then(Value::as_str)
@@ -1656,8 +1657,8 @@ fn ingest_responses_item(
         .get("name")
         .and_then(Value::as_str)
         .ok_or(ProviderError::Permanent)?;
-    let parsed_id = ToolCallId::parse(call_id)?;
-    let parsed_name = ToolName::parse(name)?;
+    let parsed_id = ToolCallId::parse(call_id).map_err(|_| ProviderError::Permanent)?;
+    let parsed_name = ToolName::parse(name).map_err(|_| ProviderError::Permanent)?;
     if let Some(item_id) = item.get("id").and_then(Value::as_str) {
         tools.insert(item_id.to_owned(), parsed_id.clone());
     }
@@ -4292,6 +4293,17 @@ mod tests {
                 &live()
             )
             .expect_err("bad usage"),
+            ProviderError::Permanent
+        );
+        // A tool call named outside the alphabet is the provider's failure.
+        let bad_tool = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"get weather","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
+        assert_eq!(
+            parse_provider_stream(
+                OpenAiApiStyle::ChatCompletions,
+                bad_tool.as_bytes(),
+                &live()
+            )
+            .expect_err("bad tool name"),
             ProviderError::Permanent
         );
         // An empty answer the server finished is still an answer.

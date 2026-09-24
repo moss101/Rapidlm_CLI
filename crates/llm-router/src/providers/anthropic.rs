@@ -809,8 +809,8 @@ fn ingest_content_block_start(
             .get("name")
             .and_then(Value::as_str)
             .ok_or(ProviderError::Permanent)?;
-        let parsed_id = ToolCallId::parse(call_id)?;
-        let parsed_name = ToolName::parse(name)?;
+        let parsed_id = ToolCallId::parse(call_id).map_err(|_| ProviderError::Permanent)?;
+        let parsed_name = ToolName::parse(name).map_err(|_| ProviderError::Permanent)?;
         tool_ids.insert(index, parsed_id.clone());
         push_event(
             events,
@@ -901,12 +901,13 @@ fn ingest_non_stream_message(
                         .get("name")
                         .and_then(Value::as_str)
                         .ok_or(ProviderError::Permanent)?;
-                    let parsed_id = ToolCallId::parse(call_id)?;
+                    let parsed_id =
+                        ToolCallId::parse(call_id).map_err(|_| ProviderError::Permanent)?;
                     push_event(
                         events,
                         ModelStreamEvent::ToolCallStart {
                             call_id: parsed_id.clone(),
-                            name: ToolName::parse(name)?,
+                            name: ToolName::parse(name).map_err(|_| ProviderError::Permanent)?,
                         },
                     )?;
                     if let Some(input) = block.get("input") {
@@ -1901,6 +1902,25 @@ mod tests {
             .expect("resolve");
         assert_eq!(resolved.byte_len(), CANARY.len());
         assert_no_canary("resolved", &format!("{resolved:?}"));
+    }
+
+    #[test]
+    fn a_malformed_reply_is_the_providers_failure_not_a_refusal_before_sending() {
+        let cancel = CancellationToken::new();
+        let bad_usage = br#"{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":3.5}}"#;
+        assert_eq!(
+            parse_anthropic_stream(bad_usage, &cancel).expect_err("bad usage"),
+            ProviderError::Permanent
+        );
+        let bad_tool = br#"{"content":[{"type":"tool_use","id":"t1","name":"get weather","input":{}}],"stop_reason":"tool_use"}"#;
+        assert_eq!(
+            parse_anthropic_stream(bad_tool, &cancel).expect_err("bad tool name"),
+            ProviderError::Permanent
+        );
+        assert_eq!(
+            parse_anthropic_stream(b"data: {}\n\ndata: [DONE]\n\n", &cancel).expect_err("empty"),
+            ProviderError::Permanent
+        );
     }
 
     #[test]

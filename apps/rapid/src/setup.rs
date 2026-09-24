@@ -863,14 +863,13 @@ untouched: {err}",
             )
         })?;
     // Under a lock the gate above judged the locked profile: the one this
-    // writes must pass the allowlist too — any run that selects it would
-    // refuse it.
+    // writes becomes the file's default, so it must pass the allowlist too.
     if let Some(allowed) = policy.and_then(crate::managed_config::ManagedPolicy::allowed_providers)
         && !allowed.iter().any(|name| name == choice.dialect.as_str())
     {
         return Err(format!(
-            "rapid setup: the managed policy allows only the providers {} and a run would refuse \
-{}, so {} is left untouched",
+            "rapid setup: the managed policy allows only the providers {}, not {}, which this \
+would make the default, so {} is left untouched",
             allowed.join(", "),
             choice.dialect.as_str(),
             config_path.display()
@@ -1260,8 +1259,8 @@ pub enum ProbeFailure {
     /// The endpoint refused the key (401/403).
     Auth,
     /// The endpoint requires a key, and none was sent (401/403 to a request
-    /// without one). `var`: the preset's key variable, if any.
-    AuthNoKey { var: Option<String> },
+    /// without one).
+    AuthNoKey,
     /// No quota or credit left, or rate-limited (402/429).
     Quota,
     /// The endpoint could not be reached (DNS, connect, TLS, timeout).
@@ -1284,7 +1283,7 @@ impl ProbeFailure {
             | Self::KeptKeyUnset { .. }
             | Self::UnusableKey
             | Self::Auth
-            | Self::AuthNoKey { .. } => 11,
+            | Self::AuthNoKey => 11,
             Self::Quota => 12,
             Self::Network | Self::Refused => 13,
             Self::Server => 14,
@@ -1299,7 +1298,7 @@ impl ProbeFailure {
             | Self::KeptKeyUnset { .. }
             | Self::UnusableKey
             | Self::Auth
-            | Self::AuthNoKey { .. } => "auth",
+            | Self::AuthNoKey => "auth",
             Self::Quota => "quota",
             Self::Network | Self::Refused => "network",
             Self::Server => "server",
@@ -1332,10 +1331,9 @@ rapid setup again"
                 "{endpoint} refused the key — check it, or give another with rapid setup \
 --key-env <VAR> or --key-stdin"
             ),
-            Self::AuthNoKey { var } => format!(
+            Self::AuthNoKey => format!(
                 "{endpoint} requires a key and none was sent — give one with rapid setup \
---key-env {} or --key-stdin",
-                var.as_deref().unwrap_or("<VAR>")
+--key-env <VAR> or --key-stdin"
             ),
             Self::Quota => format!(
                 "{endpoint} reports no quota or credit left, or a rate limit — check the account's \
@@ -1437,14 +1435,9 @@ pub fn verify(
             (None, Some(var)) => ProbeFailure::KeptKeyUnset { var },
             // The preset's variable is named only for its own origin: on
             // another, its key is deliberately kept off this host.
-            (None, None) => ProbeFailure::AuthNoKey {
-                var: plan
-                    .choice
-                    .preset
-                    .filter(|preset| same_origin(preset.base_url, &plan.choice.base_url))
-                    .and_then(|preset| preset.key_env)
-                    .map(str::to_owned),
-            },
+            // A preset on its own origin always sends its variable (or stops
+            // before sending); here the key is deliberately not the preset's.
+            (None, None) => ProbeFailure::AuthNoKey,
         },
         failure => failure,
     })
@@ -1667,7 +1660,13 @@ fn follow_symlinks(link: &Path) -> Result<PathBuf, String> {
 /// the target always agrees with the file a run's reader opens.
 fn resolve_symlinks(link: &Path) -> Result<PathBuf, String> {
     let target = follow_symlinks(link)?;
-    if target.exists() && std::fs::metadata(link).is_err() {
+    // Refused unless the OS follows the link too: resolved, or ends at a
+    // file not created yet (the target itself missing).
+    let followed = match std::fs::metadata(link) {
+        Ok(_) => true,
+        Err(err) => err.kind() == std::io::ErrorKind::NotFound && !target.exists(),
+    };
+    if !followed {
         return Err(format!(
             "rapid setup: {} is a chain of more symbolic links than this system follows",
             link.display()
@@ -2642,11 +2641,11 @@ base_url = \"http://10.0.0.5:9000/v1\"
         let plan = super::plan(
             choice_for(&[
                 "--base-url",
-                "http://10.0.0.6:9000/v1",
+                "http://10.0.0.5:9000/v1",
                 "--model",
                 "m",
                 "--profile",
-                "x",
+                "corp",
             ]),
             Path::new("c.toml"),
             Some(existing),
@@ -2656,7 +2655,9 @@ base_url = \"http://10.0.0.5:9000/v1\"
             "T",
         )
         .expect("plan");
-        assert_eq!(plan.effective, Some(("corp".to_owned(), "managed")));
+        // The planned profile is the locked one, so the shell's override is
+        // read — and overruled, not a failure.
+        assert_eq!(plan.effective, None);
         assert!(
             !plan.notes.iter().any(|note| note.contains("would fail")),
             "{:?}",
@@ -2972,12 +2973,17 @@ own_knob = 2
                 .unwrap_or_default()
         ));
         std::fs::create_dir_all(&dir).expect("dir");
+        // No symlink in the directory's own path (a temp directory under a
+        // symlinked root would add a hop the count below does not see).
+        let dir = std::fs::canonicalize(&dir).expect("canonical dir");
         let target = dir.join("config.toml");
-        let mut previous = target.clone();
+        // Relative links: each hop is exactly one link for the OS too (an
+        // absolute path through a symlinked temp directory adds hops).
+        let mut previous = std::path::PathBuf::from("config.toml");
         for hop in 1..=41 {
-            let link = dir.join(format!("link{hop}"));
-            std::os::unix::fs::symlink(&previous, &link).expect("symlink");
-            previous = link;
+            let name = format!("link{hop}");
+            std::os::unix::fs::symlink(&previous, dir.join(&name)).expect("symlink");
+            previous = std::path::PathBuf::from(name);
         }
         assert_eq!(
             follow_symlinks(&dir.join("link40")).expect("forty links"),
@@ -2988,15 +2994,32 @@ own_knob = 2
                 .expect_err("forty-one")
                 .contains("symlink loop")
         );
-        // With the file there, the chain is planned exactly when the system
-        // itself follows it (some stop at 32 links).
-        std::fs::write(&target, "").expect("target");
-        for hops in [1, 32, 33, 40] {
-            let link = dir.join(format!("link{hops}"));
+        // A chain this system will not follow is refused, whether or not its
+        // file exists yet; this one follows 32 links.
+        #[cfg(target_os = "macos")]
+        for exists in [false, true] {
+            if exists {
+                std::fs::write(&target, "").expect("target");
+            }
             assert_eq!(
-                resolve_symlinks(&link).is_ok(),
-                std::fs::metadata(&link).is_ok(),
-                "{hops} links"
+                resolve_symlinks(&dir.join("link32")).expect("32 links"),
+                target,
+                "exists={exists}"
+            );
+            assert!(
+                resolve_symlinks(&dir.join("link33"))
+                    .expect_err("33 links")
+                    .contains("more symbolic links than this system follows"),
+                "exists={exists}"
+            );
+        }
+        // Where the system follows 40, all 40 are planned.
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::write(&target, "").expect("target");
+            assert_eq!(
+                resolve_symlinks(&dir.join("link40")).expect("40 links"),
+                target
             );
         }
         let _ = std::fs::remove_dir_all(&dir);

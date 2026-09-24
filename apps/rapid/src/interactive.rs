@@ -5608,12 +5608,41 @@ It will run after the current turn; /queue cancels or edits it.",
     /// and `KernelAction::SelectModel`: validate the id against the session's
     /// own config catalog, then record the override for every later turn.
     /// The NEXT turn runs on it; the current turn is unaffected.
+    /// The environment `/model` resolves configuration in: the session's own
+    /// home, with `RAPIDLM_CONFIG` and the managed policy (if the process
+    /// names them) still in force, exactly like turn-side resolution. Read
+    /// one variable at a time, so an unrelated non-Unicode variable cannot
+    /// panic the session.
+    fn model_env(&self) -> Vec<(String, String)> {
+        let mut model_env: Vec<(String, String)> =
+            vec![("HOME".to_owned(), self.user_home.display().to_string())];
+        for key in [
+            crate::user_config::CONFIG_PATH_ENV,
+            crate::managed_config::MANAGED_CONFIG_ENV,
+        ] {
+            if let Some(value) = std::env::var_os(key).and_then(|value| value.into_string().ok()) {
+                model_env.push((key.to_owned(), value));
+            }
+        }
+        model_env
+    }
+
     fn select_model(
         &mut self,
         model_env: &[(String, String)],
         id: &str,
     ) -> Result<(), InteractiveError> {
         match crate::user_config::select_active_model_with_override(model_env, Some(id)) {
+            Ok(crate::user_config::ModelSelection::Configured { active, .. })
+                if active.profile_id != id =>
+            {
+                // A managed lock picks the model whatever the session asks.
+                self.append_command_error(format!(
+                    "/model select: the managed policy locks the model to {}; turns keep \
+running on it",
+                    active.profile_id
+                ));
+            }
             Ok(crate::user_config::ModelSelection::Configured { active, .. }) => {
                 *self
                     .shared
@@ -5648,13 +5677,7 @@ It will run after the current turn; /queue cancels or edits it.",
         // Config resolution for this command uses the session's own home —
         // the same catalog every turn reads — with RAPIDLM_CONFIG (if the
         // process set one) still winning, exactly like turn-side resolution.
-        let mut model_env: Vec<(String, String)> =
-            vec![("HOME".to_owned(), self.user_home.display().to_string())];
-        for (key, value) in std::env::vars() {
-            if key == "RAPIDLM_CONFIG" {
-                model_env.push((key, value));
-            }
-        }
+        let model_env = self.model_env();
         if args.is_empty() || args == "list" {
             let models = crate::user_config::list_configured_models(&model_env);
             let override_active = self
@@ -7416,13 +7439,7 @@ session, then /goal run",
                 return self.drain();
             }
             KernelAction::SelectModel { name } => {
-                let mut model_env: Vec<(String, String)> =
-                    vec![("HOME".to_owned(), self.user_home.display().to_string())];
-                for (key, value) in std::env::vars() {
-                    if key == "RAPIDLM_CONFIG" {
-                        model_env.push((key, value));
-                    }
-                }
+                let model_env = self.model_env();
                 self.select_model(&model_env, &name)?;
             }
             KernelAction::CompactSession => self.compact_session()?,
@@ -20759,6 +20776,56 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         assert_eq!(report.outcome, InteractiveOutcome::Quit);
         let canonical = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
         assert!(persisted_grants_for(&canonical, &env.user_home).is_empty());
+    }
+
+    #[test]
+    fn model_select_under_a_managed_lock_says_the_lock_decides() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let config = env.user_home.join("locked-config.toml");
+        fs::write(
+            &config,
+            "[models]\ndefault = \"corp\"\n\n[model.corp]\nprovider = \"openai-compatible\"\nmodel = \"m\"\nbase_url = \"http://127.0.0.1:9/v1\"\n\n[model.other]\nprovider = \"openai-compatible\"\nmodel = \"n\"\nbase_url = \"http://127.0.0.1:9/v1\"\n",
+        )
+        .expect("config");
+        let policy = env.user_home.join("policy.toml");
+        fs::write(
+            &policy,
+            format!(
+                "schema = \"{}\"\n[policy]\nlocked_default = \"corp\"\n",
+                crate::managed_config::MANAGED_SCHEMA
+            ),
+        )
+        .expect("policy");
+        let model_env = vec![
+            (
+                crate::user_config::CONFIG_PATH_ENV.to_owned(),
+                config.display().to_string(),
+            ),
+            (
+                crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                policy.display().to_string(),
+            ),
+        ];
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, vec![ScriptedModel::terminal("unused")]);
+        loop_state
+            .select_model(&model_env, "other")
+            .expect("select");
+        let transcript = format!("{:?}", loop_state.ui.transcript());
+        assert!(
+            transcript.contains("the managed policy locks the model to corp"),
+            "{transcript}"
+        );
+        assert!(
+            loop_state
+                .shared
+                .model_override
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "no override is recorded that turns would not honour"
+        );
     }
 
     #[test]

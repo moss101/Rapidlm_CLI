@@ -106,7 +106,8 @@ impl ConfigProvider {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelEntry {
     pub provider: ConfigProvider,
-    /// Provider-side model id sent on the wire (e.g. `gpt-4.1`, `llama3.2`).
+    /// Provider-side model id sent on the wire (a hosted model's id, or a local
+    /// server's model tag).
     pub model: String,
     /// Provider origin (http for local servers, https for TLS-verified
     /// remotes; e.g. `http://127.0.0.1:11434/v1`).
@@ -896,13 +897,13 @@ pub fn select_active_model_with_override(
     // config's default, so `[phases]` routes and warnings stay consistent.
     let mut effective_env: Vec<(String, String)> = env.to_vec();
     let policy = crate::managed_config::load_policy(env)?;
-    // Under a managed lock the override is overruled whatever it names — a
-    // profile removed since `/model select` included, like `RAPIDLM_MODEL`.
     let locked = policy
         .as_ref()
         .is_some_and(|policy| policy.locked_default().is_some());
-    if let Some(id) = override_id.filter(|_| !locked) {
-        if !config.model_ids().contains(&id.to_owned()) {
+    if let Some(id) = override_id {
+        // Under a lock the choice is overruled (and reported as such by the
+        // gate), even when it names a profile removed since `/model select`.
+        if !locked && !config.model_ids().contains(&id.to_owned()) {
             return Err(crate::managed_config::GatedConfigError::Config(
                 UserConfigError::UnknownDefaultModel {
                     id: id.to_owned(),
@@ -959,10 +960,10 @@ default = "local"
 
 [model.local]
 provider = "openai-compatible"
-model = "llama3.2"
+model = "local-small"
 base_url = "http://127.0.0.1:11434/v1"
-name = "Ollama local"
-env_key = "OLLAMA_API_KEY"
+name = "Local server"
+env_key = "LOCAL_API_KEY"
 max_tokens = 2048
 context_window = 65536
 
@@ -980,8 +981,8 @@ api_key = "inline-secret"
         assert_eq!(config.models.entries.len(), 2);
         let local = &config.models.entries["local"];
         assert_eq!(local.provider, ConfigProvider::OpenAiCompatible);
-        assert_eq!(local.model, "llama3.2");
-        assert_eq!(local.env_key, vec!["OLLAMA_API_KEY".to_owned()]);
+        assert_eq!(local.model, "local-small");
+        assert_eq!(local.env_key, vec!["LOCAL_API_KEY".to_owned()]);
         assert_eq!(local.max_tokens, Some(2048));
         assert_eq!(local.context_window, Some(65536));
         assert!(config.unknown_keys.is_empty());
@@ -1019,7 +1020,7 @@ review = "local"
 
 [model.local]
 provider = "openai-compatible"
-model = "llama3.2"
+model = "local-small"
 base_url = "http://127.0.0.1:11434/v1"
 reasoning_effort = "high"
 
@@ -1113,7 +1114,7 @@ compact = "missing"
 
 [model.local]
 provider = "openai-compatible"
-model = "llama3.2"
+model = "local-small"
 base_url = "http://127.0.0.1:11434/v1"
 "#;
         let config = parse_config_document(doc, "test.toml").expect("parse");
@@ -1133,7 +1134,7 @@ fallback = ["cloud", "cloud2"]
 
 [model.local]
 provider = "openai-compatible"
-model = "llama3.2"
+model = "local-small"
 base_url = "http://127.0.0.1:11434/v1"
 
 [model.cloud]
@@ -1166,7 +1167,7 @@ fallback = ["typo-id"]
 
 [model.local]
 provider = "openai-compatible"
-model = "llama3.2"
+model = "local-small"
 base_url = "http://127.0.0.1:11434/v1"
 "#;
         let config = parse_config_document(doc, "test.toml").expect("parse");
@@ -1186,7 +1187,7 @@ fallback = ["local", "cloud"]
 
 [model.local]
 provider = "openai-compatible"
-model = "llama3.2"
+model = "local-small"
 base_url = "http://127.0.0.1:11434/v1"
 
 [model.cloud]
@@ -1211,7 +1212,7 @@ default = "local"
 
 [model.local]
 provider = "openai-compatible"
-model = "llama3.2"
+model = "local-small"
 base_url = "http://127.0.0.1:11434/v1"
 "#;
         let config = parse_config_document(doc, "test.toml").expect("parse");
@@ -1232,7 +1233,7 @@ compact = "cloud"
 
 [model.local]
 provider = "openai-compatible"
-model = "llama3.2"
+model = "local-small"
 base_url = "http://127.0.0.1:11434/v1"
 
 [model.cloud]
@@ -1351,13 +1352,13 @@ env_key = "not a name!"
             .models
             .entries["local"];
         // api_key absent; first set, non-empty env entry wins.
-        let resolved = resolve_credential(entry, &env(&[("B_KEY", "b"), ("OLLAMA_API_KEY", "k")]));
+        let resolved = resolve_credential(entry, &env(&[("B_KEY", "b"), ("LOCAL_API_KEY", "k")]));
         assert_eq!(
             resolved.source,
-            CredentialSource::EnvVar("OLLAMA_API_KEY".to_owned())
+            CredentialSource::EnvVar("LOCAL_API_KEY".to_owned())
         );
         // Empty values are skipped, not selected.
-        let resolved = resolve_credential(entry, &env(&[("OLLAMA_API_KEY", "")]));
+        let resolved = resolve_credential(entry, &env(&[("LOCAL_API_KEY", "")]));
         assert_eq!(resolved.source, CredentialSource::Keyless);
         assert!(resolved.plaintext.is_none());
 
@@ -1595,7 +1596,7 @@ mod capability_override_tests {
         let config = dir.join("config.toml");
         std::fs::write(
             &config,
-            "[models]\ndefault = \"corp\"\n\n[model.corp]\nprovider = \"openai-compatible\"\nmodel = \"m\"\nbase_url = \"http://127.0.0.1:11434/v1\"\n",
+            "[models]\ndefault = \"corp\"\n\n[model.corp]\nprovider = \"openai-compatible\"\nmodel = \"m\"\nbase_url = \"http://127.0.0.1:11434/v1\"\n\n[model.other]\nprovider = \"openai-compatible\"\nmodel = \"n\"\nbase_url = \"http://127.0.0.1:11434/v1\"\n",
         )
         .expect("config");
         let policy = dir.join("policy.toml");
@@ -1615,10 +1616,23 @@ mod capability_override_tests {
             crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
             policy.display().to_string(),
         ));
-        match select_active_model_with_override(&locked, Some("removed")).expect("the lock decides")
-        {
-            ModelSelection::Configured { active, .. } => assert_eq!(active.profile_id, "corp"),
-            other => panic!("configured, got {other:?}"),
+        // A stale choice and a valid one alike: overruled, and said so.
+        for choice in ["removed", "other"] {
+            match select_active_model_with_override(&locked, Some(choice))
+                .expect("the lock decides")
+            {
+                ModelSelection::Configured { active, warnings } => {
+                    assert_eq!(active.profile_id, "corp", "{choice}");
+                    assert!(
+                        warnings
+                            .iter()
+                            .any(|warning| warning.contains("managed gate")
+                                && warning.contains("locked")),
+                        "{choice}: {warnings:?}"
+                    );
+                }
+                other => panic!("configured, got {other:?}"),
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
