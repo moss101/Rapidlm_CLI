@@ -35,20 +35,28 @@ fn config_doc(base_url: &str) -> String {
 
 /// A non-streaming chat completion proposing one `workspace_write`.
 fn write_call(id: &str, path: &str) -> String {
+    write_calls(&[(id, path)])
+}
+
+/// A non-streaming chat completion proposing one `workspace_write` per
+/// `(id, path)`, all in one model step.
+fn write_calls(calls: &[(&str, &str)]) -> String {
+    let tool_calls: Vec<Value> = calls
+        .iter()
+        .map(|(id, path)| {
+            json!({
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": "workspace_write",
+                    "arguments": json!({ "path": path, "content": "from the model" }).to_string(),
+                },
+            })
+        })
+        .collect();
     json!({
         "choices": [{
-            "message": {
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": id,
-                    "type": "function",
-                    "function": {
-                        "name": "workspace_write",
-                        "arguments": json!({ "path": path, "content": "from the model" }).to_string(),
-                    },
-                }],
-            },
+            "message": { "role": "assistant", "content": null, "tool_calls": tool_calls },
             "finish_reason": "tool_calls",
         }],
         "usage": { "prompt_tokens": 3, "completion_tokens": 5 },
@@ -274,16 +282,44 @@ impl Editor {
             .to_owned()
     }
 
-    /// Send `session/prompt` as request `id` and play the editor until its
-    /// response: every `session/request_permission` is answered "allow once"
-    /// in the protocol's response shape. Returns every frame the prompt
-    /// streamed, its response last. Panics if the serve exits first.
-    fn prompt(&mut self, id: i64, session: &str, text: &str) -> Vec<Value> {
+    /// Send `session/prompt` as request `id`.
+    fn start_prompt(&mut self, id: i64, session: &str, text: &str) {
         self.request(
             id,
             "session/prompt",
             json!({ "sessionId": session, "prompt": [{ "type": "text", "text": text }] }),
         );
+    }
+
+    /// Frames until the next `session/request_permission`, which is
+    /// returned (not answered).
+    fn until_permission(&self) -> Value {
+        let deadline = Instant::now() + DEADLINE;
+        while let Some(frame) = self.next(deadline) {
+            if frame["method"] == "session/request_permission" {
+                return frame;
+            }
+        }
+        panic!("no permission request; stderr: {}", self.stderr_text());
+    }
+
+    /// Answer the permission request `request` with `result`.
+    fn answer_permission(&mut self, request: &Value, result: Value) {
+        self.send(json!({ "jsonrpc": "2.0", "id": request["id"].clone(), "result": result }));
+    }
+
+    /// Send `session/prompt` as request `id` and play the editor until its
+    /// response (see [`Editor::play`]).
+    fn prompt(&mut self, id: i64, session: &str, text: &str) -> Vec<Value> {
+        self.start_prompt(id, session, text);
+        self.play(id)
+    }
+
+    /// Play the editor until the response to request `id`: every
+    /// `session/request_permission` is answered "allow once" in the
+    /// protocol's response shape. Returns every frame seen, the response
+    /// last. Panics if the serve exits first.
+    fn play(&mut self, id: i64) -> Vec<Value> {
         let deadline = Instant::now() + DEADLINE;
         let mut seen = Vec::new();
         while let Some(frame) = self.next(deadline) {
@@ -321,6 +357,36 @@ impl Editor {
             }
         }
     }
+}
+
+/// Every ledger event of `session` as `(kind, payload)`, through the real
+/// export command, read once `rapid acp` has exited.
+fn ledger(project: &Path, home: &Path, config: &Path, session: &str) -> Vec<(String, Value)> {
+    let out = home.join(format!("export-{session}.jsonl"));
+    let export = rapid(project, home, config)
+        .args(["inspect-export", session, out.to_str().expect("utf-8 path")])
+        .output()
+        .expect("inspect-export");
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    std::fs::read_to_string(&out)
+        .expect("export file")
+        .lines()
+        .map(|line| {
+            let event: Value = serde_json::from_str(line).expect("export line");
+            (
+                event["kind"].as_str().unwrap_or_default().to_owned(),
+                event["payload"].clone(),
+            )
+        })
+        .collect()
+}
+
+fn count_kind(events: &[(String, Value)], kind: &str) -> usize {
+    events.iter().filter(|(event, _)| event == kind).count()
 }
 
 fn permission_requests(frames: &[Value]) -> usize {
@@ -363,73 +429,176 @@ fn every_permission_request_of_one_prompt_reaches_the_prompt_and_it_completes() 
     assert_eq!(editor.finish(), Some(0), "stderr: {stderr}");
 }
 
+/// One write that asks, then an answer — a prompt that pauses once.
+fn one_write(request: &str) -> String {
+    match tool_results(request) {
+        0 => write_call("call_1", "first.txt"),
+        _ => answer("resumed"),
+    }
+}
+
 #[test]
 fn a_cancel_while_the_turn_waits_on_an_approval_ends_the_prompt_and_nothing_resumes() {
-    fn model(request: &str) -> String {
-        match tool_results(request) {
-            0 => write_call("call_1", "first.txt"),
-            _ => answer("resumed after the cancel"),
-        }
-    }
     let home = temp_dir("cancel-while-waiting");
-    let (project, config) = trusted_project(&home.0, model);
+    let (project, config) = trusted_project(&home.0, one_write);
     let mut editor = Editor::spawn(&project, &home.0, &config);
     let session = editor.open_session(&project);
 
-    editor.request(
-        3,
-        "session/prompt",
-        json!({ "sessionId": session, "prompt": [{ "type": "text", "text": "write it" }] }),
-    );
-    let deadline = Instant::now() + DEADLINE;
-    let permission = loop {
-        let frame = editor
-            .next(deadline)
-            .unwrap_or_else(|| panic!("no permission request; stderr: {}", editor.stderr_text()));
-        if frame["method"] == "session/request_permission" {
-            break frame;
-        }
-    };
-    // Let the turn record its pause (milliseconds), so the cancel meets a
+    editor.start_prompt(3, &session, "write it");
+    // Surfaced only once the turn's pause is recorded: the cancel meets a
     // session with no live turn — the case the kernel cannot interrupt.
-    thread::sleep(Duration::from_secs(1));
+    let permission = editor.until_permission();
     // The protocol's order: cancel, then answer the outstanding request.
     editor.send(json!({
         "jsonrpc": "2.0",
         "method": "session/cancel",
         "params": { "sessionId": session },
     }));
+    editor.answer_permission(
+        &permission,
+        json!({ "outcome": { "outcome": "cancelled" } }),
+    );
+    let frames = editor.play(3);
+    let stderr = editor.stderr_text();
+    assert_eq!(
+        frames.last().expect("response")["result"]["stopReason"],
+        "cancelled",
+        "{frames:#?}\nstderr: {stderr}"
+    );
+    // The answer to the cancelled prompt's request is dropped, not fatal.
+    assert_eq!(editor.finish(), Some(0), "stderr: {stderr}");
+    // Nothing was decided and nothing resumed: the approval stays pending.
+    let events = ledger(&project, &home.0, &config, &session);
+    assert_eq!(count_kind(&events, "approval.resolved"), 0, "{events:#?}");
+    assert_eq!(count_kind(&events, "turn.started"), 1, "{events:#?}");
+}
+
+#[test]
+fn a_disconnect_while_the_turn_waits_on_an_approval_lets_the_serve_exit() {
+    let home = temp_dir("disconnect-while-waiting");
+    let (project, config) = trusted_project(&home.0, one_write);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+
+    editor.start_prompt(3, &session, "write it");
+    let _unanswered = editor.until_permission();
+    let stderr = editor.stderr_text();
+    assert_eq!(editor.finish(), Some(0), "stderr: {stderr}");
+    let events = ledger(&project, &home.0, &config, &session);
+    assert_eq!(count_kind(&events, "approval.resolved"), 0, "{events:#?}");
+}
+
+#[test]
+fn an_error_answer_decides_nothing_and_ends_the_prompt() {
+    let home = temp_dir("error-answer");
+    let (project, config) = trusted_project(&home.0, one_write);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+
+    editor.start_prompt(3, &session, "write it");
+    let permission = editor.until_permission();
     editor.send(json!({
         "jsonrpc": "2.0",
         "id": permission["id"].clone(),
-        "result": { "outcome": { "outcome": "cancelled" } },
+        "error": { "code": -32601, "message": "Method not found" },
     }));
-    let mut rest = Vec::new();
-    let response = loop {
-        let frame = editor.next(deadline).unwrap_or_else(|| {
-            panic!(
-                "the cancelled prompt never answered; frames: {rest:#?}; stderr: {}",
-                editor.stderr_text()
-            )
-        });
-        if frame["id"] == 3 && frame.get("method").is_none() {
-            break frame;
-        }
-        rest.push(frame);
-    };
+    let frames = editor.play(3);
     let stderr = editor.stderr_text();
     assert_eq!(
-        response["result"]["stopReason"], "cancelled",
-        "{rest:#?}\nstderr: {stderr}"
+        frames.last().expect("response")["result"]["stopReason"],
+        "refusal",
+        "{frames:#?}\nstderr: {stderr}"
     );
+    assert_eq!(editor.finish(), Some(0), "stderr: {stderr}");
+    // No decision is recorded that nobody made, and nothing resumed.
+    let events = ledger(&project, &home.0, &config, &session);
+    assert_eq!(count_kind(&events, "approval.resolved"), 0, "{events:#?}");
+    assert_eq!(count_kind(&events, "turn.started"), 1, "{events:#?}");
+}
+
+#[test]
+fn a_second_prompt_while_the_first_waits_is_refused() {
+    let home = temp_dir("overlapping-prompt");
+    let (project, config) = trusted_project(&home.0, one_write);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+
+    editor.start_prompt(3, &session, "write it");
+    let permission = editor.until_permission();
+    editor.start_prompt(4, &session, "and meanwhile this");
+    let refused = editor.until_result(4);
+    let stderr = editor.stderr_text();
+    assert_eq!(
+        refused["error"]["code"], -32600,
+        "{refused}\nstderr: {stderr}"
+    );
+    // The first prompt is untouched: answered, it resumes and completes.
+    editor.answer_permission(
+        &permission,
+        json!({ "outcome": { "outcome": "selected", "optionId": "allow-once" } }),
+    );
+    let frames = editor.play(3);
+    assert_eq!(
+        frames.last().expect("response")["result"]["stopReason"],
+        "end_turn",
+        "{frames:#?}\nstderr: {stderr}"
+    );
+    // Its end frees the session: the next prompt is accepted at once.
+    let next = editor.prompt(5, &session, "now this");
+    assert_eq!(
+        next.last().expect("response")["result"]["stopReason"],
+        "end_turn",
+        "{next:#?}"
+    );
+    assert_eq!(editor.finish(), Some(0), "stderr: {stderr}");
+    let events = ledger(&project, &home.0, &config, &session);
     assert!(
-        !rest
-            .iter()
-            .any(|frame| frame.to_string().contains("resumed after the cancel")),
-        "no continuation ran: {rest:#?}"
+        !events.iter().any(
+            |(kind, payload)| kind == "turn.started" && payload["text"] == "and meanwhile this"
+        ),
+        "the refused prompt never became a turn: {events:#?}"
     );
-    assert!(!project.join("first.txt").exists(), "the write never ran");
-    // The answer to the cancelled prompt's request is dropped, not fatal.
+}
+
+#[test]
+fn only_the_approval_the_turn_suspended_on_is_asked() {
+    // One model step proposes two writes; both ask, and the turn suspends
+    // on the first. Only that one can be resumed, so only it is surfaced.
+    fn model(request: &str) -> String {
+        match tool_results(request) {
+            0 => write_calls(&[("call_a", "a.txt"), ("call_b", "b.txt")]),
+            _ => answer("done"),
+        }
+    }
+    let home = temp_dir("parallel-asks");
+    let (project, config) = trusted_project(&home.0, model);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+
+    editor.start_prompt(3, &session, "write both");
+    let permission = editor.until_permission();
+    assert_eq!(
+        permission["params"]["toolCall"]["toolCallId"], "call_a",
+        "{permission}"
+    );
+    // Unanswered, nothing else is asked: the turn is paused on this one.
+    let settle = Instant::now() + Duration::from_secs(1);
+    let mut meanwhile = Vec::new();
+    while let Some(frame) = editor.next(settle) {
+        meanwhile.push(frame);
+    }
+    assert_eq!(permission_requests(&meanwhile), 0, "{meanwhile:#?}");
+    editor.answer_permission(
+        &permission,
+        json!({ "outcome": { "outcome": "selected", "optionId": "allow-once" } }),
+    );
+    let frames = editor.play(3);
+    let stderr = editor.stderr_text();
+    assert_eq!(
+        frames.last().expect("response")["result"]["stopReason"],
+        "end_turn",
+        "{frames:#?}\nstderr: {stderr}"
+    );
     assert_eq!(editor.finish(), Some(0), "stderr: {stderr}");
 }
 

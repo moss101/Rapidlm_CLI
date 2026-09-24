@@ -11,13 +11,14 @@
 //!   the durable approval sink) while the loop streams kernel events back as
 //!   `session/update` notifications and ends the prompt with the mapped
 //!   stop reason.
-//! - A pending approval surfaces as a real `session/request_permission`
-//!   request to the editor; the editor's decision lands through the same
-//!   durable approval machinery the TUI uses (`approvals.rs`), and the
-//!   paused turn is resumed as a continuation — the exact pending action
-//!   executes once, never the completed side effects. The prompt stays in
-//!   flight across every approval its turn and continuations raise; it ends
-//!   with the terminal event of the last continuation, or on a cancel.
+//! - When the turn pauses on an approval, the one it suspended on surfaces
+//!   as a real `session/request_permission` request to the editor; the
+//!   editor's decision lands through the same durable approval machinery the
+//!   TUI uses (`approvals.rs`), and the paused turn is resumed as a
+//!   continuation — the exact pending action executes once, never the
+//!   completed side effects. The prompt stays in flight across every such
+//!   pause; it ends with the terminal event of the last continuation, or on
+//!   a cancel. One prompt per session is in flight at a time.
 //!
 //! Frames are newline-delimited JSON-RPC over stdio (`crates/acp::stdio`).
 
@@ -35,8 +36,9 @@ use protocol::ProjectId;
 use crate::interactive::{acp_resolve_and_continue, spawn_acp_turn};
 
 /// Where the editor's answer to one `session/request_permission` goes: the
-/// waiting prompt thread, told which request it answers.
-type PendingPermit = Sender<(JsonRpcId, serde_json::Value)>;
+/// waiting prompt thread, told which request it answers. `None`: the editor
+/// answered with a JSON-RPC error — no decision at all.
+type PendingPermit = Sender<(JsonRpcId, Option<serde_json::Value>)>;
 
 /// Every outstanding permission request, keyed by the JSON-RPC id it was
 /// sent under. A prompt thread registers the id before the request is
@@ -44,9 +46,10 @@ type PendingPermit = Sender<(JsonRpcId, serde_json::Value)>;
 type PendingPermits = Arc<Mutex<HashMap<JsonRpcId, PendingPermit>>>;
 
 /// Each in-flight prompt's cancel flag, by session, set by
-/// `session/cancel`. A turn paused on an approval has released its lease,
-/// so the kernel has no live turn to interrupt: the prompt thread reads
-/// this flag instead.
+/// `session/cancel` (and for every prompt when the editor disconnects). A
+/// turn paused on an approval has finished as far as the kernel knows, so
+/// there is no live turn to interrupt: the prompt thread reads this flag
+/// instead.
 type PromptCancels = Arc<Mutex<HashMap<protocol::SessionId, Arc<AtomicBool>>>>;
 
 pub const ACP_USAGE: &str = "\
@@ -179,10 +182,11 @@ struct Serve {
     root: PathBuf,
     trusted: bool,
     /// Where each outstanding permission request's answer goes, by request
-    /// id. An entry lives from the request's send to its answer (or its
-    /// prompt's end).
+    /// id. An entry lives from the request's send to its answer or its
+    /// prompt's end, whichever comes first.
     pending: PendingPermits,
-    /// The cancel flag of each session's in-flight prompt.
+    /// The cancel flag of each session's in-flight prompt: an entry is also
+    /// what makes a session's prompt "in flight".
     cancels: PromptCancels,
     /// The session's permission-mode cell: written by
     /// `session/set_mode` (through [`RapidSessionModes`]) and read by
@@ -240,8 +244,9 @@ impl Serve {
         'looping: while let Ok(message) = in_rx.recv() {
             // An editor response answers one of the serve's permission
             // requests: it routes to the prompt thread waiting on that id and
-            // is never a fresh request. One nothing waits for any more (its
-            // prompt already ended) asks nothing of the serve and is dropped.
+            // is never a fresh request. One nothing waits for (its prompt
+            // ended first, e.g. on a cancel) asks nothing of the serve and is
+            // dropped.
             if let JsonRpcMessage::Result { id, .. } | JsonRpcMessage::Error { id, .. } = &message {
                 let route = self
                     .pending
@@ -250,11 +255,10 @@ impl Serve {
                     .remove(id);
                 match (route, message) {
                     (Some(route), JsonRpcMessage::Result { id, result }) => {
-                        let _ = route.send((id, result));
+                        let _ = route.send((id, Some(result)));
                     }
-                    // An error answer approves nothing.
                     (Some(route), JsonRpcMessage::Error { id, .. }) => {
-                        let _ = route.send((id, serde_json::Value::Null));
+                        let _ = route.send((id, None));
                     }
                     _ => eprintln!("rapid acp: dropped a response no request awaits"),
                 }
@@ -274,6 +278,17 @@ impl Serve {
                     break 'looping;
                 }
             }
+        }
+        // The editor is gone (or the protocol failed): a prompt waiting on
+        // an approval would wait forever and hold the writer open, so every
+        // in-flight prompt is cancelled. Its approval stays pending.
+        for flag in self
+            .cancels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+        {
+            flag.store(true, Ordering::SeqCst);
         }
         drop(out_tx);
         let _ = writer_handle.join();
@@ -295,6 +310,29 @@ impl Serve {
             }
             _ => serde_json::json!({}),
         };
+        // One prompt per session at a time. While a prompt waits on an
+        // approval its turn has finished as far as the kernel knows, so it
+        // would accept a second one — whose turn the first prompt's stream
+        // would then report as its own. Refused before anything is
+        // recorded for it.
+        if let JsonRpcMessage::Request { id, method, .. } = &message
+            && method == acp::v1::METHOD_SESSION_PROMPT
+            && let Some(session_id) = session_id_of(&raw_params)
+            && self
+                .cancels
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&session_id)
+        {
+            let refused = JsonRpcMessage::Error {
+                id: id.clone(),
+                error: acp::stdio::JsonRpcErrorObject::new(
+                    acp::stdio::INVALID_REQUEST,
+                    "a prompt is already in flight on this session",
+                ),
+            };
+            return out_tx.send(refused).map_err(|_| LOOP_DOWN.to_owned());
+        }
         // `user_prompt_submit` decides before the adapter hands a prompt to
         // the kernel (see `blocked_prompt_replies`).
         let ready = self.adapter.borrow().is_ready();
@@ -410,20 +448,31 @@ fn send_mapped(event: &MappedEvent, out_tx: &Sender<JsonRpcMessage>) -> Result<(
     }
 }
 
-/// The approval a prompt is waiting on: the request id the editor answers,
-/// and the durable wait it resolves.
+/// The approval a paused prompt waits on: the request id the editor
+/// answers, and the durable wait it resolves.
 struct HeldPermission {
     id: JsonRpcId,
     token: String,
     call_id: String,
-    /// The turn has recorded its pause (lease released, suspension
-    /// written): only now can a continuation resume it.
-    paused: bool,
 }
 
-/// A prompt thread's routing state, released on every exit: its
+/// An approval the running turn asked for, not yet surfaced. Several calls
+/// of one model step can ask, but the turn suspends on one of them — only
+/// that one's answer can resume it, so only that one becomes a
+/// `session/request_permission`; the rest stay pending in the ledger.
+struct Asked {
+    token: String,
+    call_id: String,
+    request: acp::v1::PermissionRequest,
+}
+
+/// At most this many asks are remembered between pauses; the oldest go
+/// first.
+const MAX_ASKED: usize = 64;
+
+/// A prompt thread's routing state, released when the prompt ends: its
 /// outstanding permission route (a later answer is dropped, never
-/// misrouted) and its cancel flag (unless a newer prompt of the session
+/// misrouted) and its session's in-flight entry (unless a newer prompt
 /// already replaced it).
 struct PromptRoutes {
     pending: PendingPermits,
@@ -467,13 +516,30 @@ impl Drop for PromptRoutes {
     }
 }
 
-/// `session/cancel`: flag the session's in-flight prompt, if any.
-fn flag_cancel(cancels: &PromptCancels, params: Option<&serde_json::Value>) {
-    let Some(session_id) = params
-        .and_then(|params| params.get("sessionId"))
+/// End the prompt with `stop`. Its routes are released first, so the
+/// editor's next prompt on the session — sent the moment this answer
+/// lands — is never refused as overlapping.
+fn finish_prompt(
+    routes: PromptRoutes,
+    out_tx: &Sender<JsonRpcMessage>,
+    request_id: JsonRpcId,
+    stop: acp::v1::StopReason,
+) {
+    drop(routes);
+    let _ = out_tx.send(acp::v1::encode_prompt_response(request_id, stop));
+}
+
+/// The session a request's params name, when it parses.
+fn session_id_of(params: &serde_json::Value) -> Option<protocol::SessionId> {
+    params
+        .get("sessionId")
         .and_then(serde_json::Value::as_str)
         .and_then(|raw| raw.parse::<protocol::SessionId>().ok())
-    else {
+}
+
+/// `session/cancel`: flag the session's in-flight prompt, if any.
+fn flag_cancel(cancels: &PromptCancels, params: Option<&serde_json::Value>) {
+    let Some(session_id) = params.and_then(session_id_of) else {
         return;
     };
     if let Some(flag) = cancels
@@ -496,12 +562,25 @@ fn is_approval_pause(event: &event_ledger::event::ErasedEventEnvelope) -> bool {
             == Some(kernel::InterruptReason::ApprovalPending.as_str())
 }
 
-/// The prompt thread: stream mapped kernel events as notifications; a
-/// pending approval becomes a real `session/request_permission` whose
-/// decision (routed here by the main loop) resolves through the durable
-/// approval machinery and resumes the exact turn as a continuation — as
-/// many times as the continuations ask; the terminal event is the prompt's
-/// response.
+/// The wait token a turn suspended on, from its suspension record — the
+/// `tool.approval_required` event carrying `approval_token`
+/// (`approvals::record_suspension`), written before the turn's pause.
+fn suspension_token(event: &event_ledger::event::ErasedEventEnvelope) -> Option<&str> {
+    if event.kind() != event_ledger::event::EventKind::ToolApprovalRequired {
+        return None;
+    }
+    event
+        .payload()
+        .get("approval_token")
+        .and_then(serde_json::Value::as_str)
+}
+
+/// The prompt thread: stream mapped kernel events as notifications. When
+/// the turn pauses on an approval, the one it suspended on becomes a real
+/// `session/request_permission`; the editor's answer (routed here by the
+/// main loop) resolves through the durable approval machinery and resumes
+/// the exact turn as a continuation — as many times as the continuations
+/// pause. The terminal event is the prompt's response.
 #[allow(clippy::too_many_arguments)]
 fn stream_prompt(
     client: InProcessKernelClient,
@@ -514,50 +593,50 @@ fn stream_prompt(
     initial: Vec<MappedEvent>,
     out_tx: Sender<JsonRpcMessage>,
 ) {
+    use acp::v1::StopReason;
     use kernel::KernelClient as _;
     let send = |message: JsonRpcMessage| -> bool { out_tx.send(message).is_ok() };
-    let (decision_tx, decisions): (PendingPermit, Receiver<(JsonRpcId, serde_json::Value)>) =
-        std::sync::mpsc::channel();
+    let (decision_tx, decisions): (
+        PendingPermit,
+        Receiver<(JsonRpcId, Option<serde_json::Value>)>,
+    ) = std::sync::mpsc::channel();
     let Some(subscribed) = block_adapter(
         client.subscribe(kernel::SubscribeEvents::new(turn.session_id(), turn.seq())),
     ) else {
-        let _ = send(acp::v1::encode_prompt_response(
-            request_id,
-            acp::v1::StopReason::Cancelled,
-        ));
-        return;
+        return finish_prompt(routes, &out_tx, request_id, StopReason::Cancelled);
     };
     let Ok(mut stream) = subscribed else {
-        let _ = send(acp::v1::encode_prompt_response(
-            request_id,
-            acp::v1::StopReason::Cancelled,
-        ));
-        return;
+        return finish_prompt(routes, &out_tx, request_id, StopReason::Cancelled);
     };
     for event in &initial {
         if send_mapped(event, &out_tx).is_err() {
             return;
         }
     }
+    // The running turn's asks, and the token its suspension record names.
+    let mut asked: Vec<Asked> = Vec::new();
+    let mut suspended: Option<String> = None;
     loop {
         // A turn paused on the held approval waits for the editor: its
         // answer resumes it as a continuation; a cancel ends the prompt.
-        if routes.held.as_ref().is_some_and(|held| held.paused) {
+        if routes.held.is_some() {
             if routes.is_cancelled() {
                 // Nothing runs; the approval stays pending in the ledger,
                 // resumable from any surface that lists approvals.
-                let _ = send(acp::v1::encode_prompt_response(
-                    request_id,
-                    acp::v1::StopReason::Cancelled,
-                ));
-                return;
+                return finish_prompt(routes, &out_tx, request_id, StopReason::Cancelled);
             }
-            while let Ok((answered, decision)) = decisions.try_recv() {
-                if routes.held.as_ref().is_none_or(|held| held.id != answered) {
-                    continue; // an answer to a request this prompt no longer holds
-                }
-                let Some(held) = routes.held.take() else {
-                    break;
+            if let Ok((answered, decision)) = decisions.try_recv()
+                && routes.held.as_ref().is_some_and(|held| held.id == answered)
+                && let Some(held) = routes.held.take()
+            {
+                let Some(decision) = decision else {
+                    // An error answer is no decision: nothing is recorded,
+                    // nothing runs, the approval stays pending.
+                    eprintln!(
+                        "rapid acp: the editor answered a permission request with an error; \
+the approval stays pending"
+                    );
+                    return finish_prompt(routes, &out_tx, request_id, StopReason::Refusal);
                 };
                 let resumed = acp_resolve_and_continue(
                     &client,
@@ -572,11 +651,7 @@ fn stream_prompt(
                 if let Err(reason) = resumed {
                     // No continuation runs, so nothing is left to stream.
                     eprintln!("rapid acp: the paused turn could not resume: {reason}");
-                    let _ = send(acp::v1::encode_prompt_response(
-                        request_id,
-                        acp::v1::StopReason::Refusal,
-                    ));
-                    return;
+                    return finish_prompt(routes, &out_tx, request_id, StopReason::Refusal);
                 }
                 // A cancel that landed while no turn was live interrupted
                 // nothing; the continuation is live now.
@@ -588,58 +663,70 @@ fn stream_prompt(
                         protocol::TraceId::new(),
                     )));
                 }
-                break;
             }
         }
         match stream.try_recv() {
             Ok(Some(event)) => {
-                // The turn paused on the approval this prompt holds: not the
-                // end of the prompt — the continuation its answer resumes is.
+                if event.kind() == event_ledger::event::EventKind::TurnStarted {
+                    // A continuation: the previous turn's asks are settled.
+                    asked.clear();
+                    suspended = None;
+                }
+                if let Some(token) = suspension_token(&event) {
+                    suspended = Some(token.to_owned());
+                }
+                // The turn paused: surface the approval it suspended on and
+                // wait. Not the end of the prompt — the continuation the
+                // answer resumes is.
                 if is_approval_pause(&event)
-                    && let Some(held) = routes.held.as_mut()
+                    && let Some(token) = suspended.take()
+                    && let Some(position) = asked.iter().position(|ask| ask.token == token)
                 {
-                    held.paused = true;
+                    let ask = asked.swap_remove(position);
+                    asked.clear();
+                    // The route exists before the request is written, under
+                    // the id the request carries.
+                    let id = next_permit_id();
+                    routes.hold(
+                        HeldPermission {
+                            id: id.clone(),
+                            token: ask.token,
+                            call_id: ask.call_id,
+                        },
+                        &decision_tx,
+                    );
+                    let Ok(request) = acp::v1::encode_permission_request(id, &ask.request) else {
+                        return finish_prompt(routes, &out_tx, request_id, StopReason::Refusal);
+                    };
+                    if !send(request) {
+                        return;
+                    }
                     continue;
                 }
                 if let Some(mapped) = map_kernel_event(&event) {
                     match &mapped {
                         MappedEvent::PermissionRequired(request) => {
-                            // Capture the durable wait token + call id from
-                            // the raw payload before encoding.
+                            // Remembered with its durable wait token + call
+                            // id (from the raw payload) until the pause.
                             let payload = event.payload();
-                            let token = payload
-                                .get("id")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or_default()
-                                .to_owned();
-                            let call_id = payload
-                                .get("call_id")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or_default()
-                                .to_owned();
-                            // The route exists before the request is written,
-                            // under the id the request carries.
-                            let id = next_permit_id();
-                            routes.hold(
-                                HeldPermission {
-                                    id: id.clone(),
-                                    token,
-                                    call_id,
-                                    paused: false,
-                                },
-                                &decision_tx,
-                            );
-                            let Ok(request) = acp::v1::encode_permission_request(id, request)
-                            else {
-                                return;
+                            let field = |key: &str| {
+                                payload
+                                    .get(key)
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned()
                             };
-                            if !send(request) {
-                                return;
+                            if asked.len() == MAX_ASKED {
+                                asked.remove(0);
                             }
+                            asked.push(Asked {
+                                token: field("id"),
+                                call_id: field("call_id"),
+                                request: request.clone(),
+                            });
                         }
                         MappedEvent::PromptStopped(stop) => {
-                            let _ = send(acp::v1::encode_prompt_response(request_id, *stop));
-                            return;
+                            return finish_prompt(routes, &out_tx, request_id, *stop);
                         }
                         MappedEvent::SessionUpdate(_) => {
                             if send_mapped(&mapped, &out_tx).is_err() {
@@ -654,11 +741,7 @@ fn stream_prompt(
             }
             Err(err) => {
                 eprintln!("rapid acp: event stream ended: {err}");
-                let _ = send(acp::v1::encode_prompt_response(
-                    request_id,
-                    acp::v1::StopReason::Cancelled,
-                ));
-                return;
+                return finish_prompt(routes, &out_tx, request_id, StopReason::Cancelled);
             }
         }
     }
