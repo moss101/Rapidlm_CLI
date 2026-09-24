@@ -21,6 +21,8 @@ use protocol::{HookDecision, HookResult, HookResultError, MAX_HOOK_RESULT_BYTES}
 pub const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum hooks per stage.
 pub const MAX_HOOKS_PER_STAGE: usize = 8;
+/// Maximum bytes of one hook command line.
+pub const MAX_HOOK_COMMAND_BYTES: usize = 512;
 /// Hard byte cap on captured hook stderr.
 pub const MAX_HOOK_STDERR_BYTES: usize = 2048;
 
@@ -95,7 +97,7 @@ impl HooksConfig {
                 let Some(command) = entry.as_str() else {
                     continue;
                 };
-                if command.is_empty() || command.len() > 512 {
+                if command.is_empty() || command.len() > MAX_HOOK_COMMAND_BYTES {
                     continue;
                 }
                 if target.len() >= MAX_HOOKS_PER_STAGE {

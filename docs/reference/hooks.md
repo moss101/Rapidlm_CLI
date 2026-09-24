@@ -27,7 +27,7 @@ process). Every hook receives a JSON object on stdin and has 5 seconds.
 |---|---|---|---|
 | `pre_tool_use` | before a tool call runs, after the permission check allowed it | `{"tool", "arguments"}` | yes: deny, ask, rewrite, add context |
 | `post_tool_use` | after a tool call succeeded | `{"tool", "summary"}` | no; may add context |
-| `post_tool_use_failure` | after a tool call failed (a failed result, invalid arguments, an MCP error result, or a runtime error that ends the turn) | `{"event", "tool", "error"}` | no; may add context (not after a runtime error: nothing follows it) |
+| `post_tool_use_failure` | after a tool call failed (a failed result, invalid arguments, an MCP error result, or a runtime error — other than a cancellation — that ends the turn) | `{"event", "tool", "error"}` | no; may add context (not after a runtime error: nothing follows it) |
 | `user_prompt_submit` | when a prompt is submitted, before a turn starts — typed, queued, the goal loop's, or from an ACP / `rapid daemon` client | `{"event", "prompt"}` | yes: a `deny` blocks the prompt |
 | `stop` | when a turn (section) completes | `{"event", "tool_calls", "tokens"}` | no |
 | `stop_cancelled` | *instead of* `stop` when a turn ends without completing | `{"event", "reason", "tool_calls", "tokens"}` | no |
@@ -183,14 +183,17 @@ context.
   the messages queued after it still run. A blocked goal-loop prompt stops
   the goal (`/goal run` again after changing the goal or the hook). Headless
   `rapid exec` prints the reason and exits `3` before any model request. An
-  ACP or `rapid daemon` prompt that is blocked fails its turn with the
-  reason (ACP stop reason `refusal`) before any model request.
+  ACP or `rapid daemon` prompt that is blocked is refused before it becomes
+  a turn — the client gets the reason (ACP: stop reason `refusal`; the
+  daemon: an error) and the prompt never enters the conversation history.
 - `subagent_stop`: a `deny` replaces the child's report with
   `subagent (<type>) completion blocked by subagent_stop[<n>] hook: <reason>`,
-  followed by where the child's changes are. The hook decides before
-  anything the child wrote is applied: a blocked child's changes stay in
-  its isolated worktree (also under `rapid exec`, which otherwise applies a
-  child's changes automatically), and `/agents` shows it as failed.
+  followed by what became of the child's changes. The hook decides before
+  anything the child wrote is applied: only a child that completed and was
+  not blocked is applied (automatically under `rapid exec`; held for
+  `/agents integrate` in the TUI). A blocked or unfinished child's changes
+  are held for review in the TUI and discarded under `rapid exec`; a failed
+  child's are discarded. `/agents` shows a blocked child as failed.
 
 ## Records
 
@@ -212,7 +215,10 @@ denied_events = ["post_tool_use"]    # stages project settings may not use
 pre_tool_use = ["/opt/org/bin/review-gate"]
 ```
 
-The policy's own hooks run first. Project hooks the policy drops are reported
+The policy's own hooks run first (at most 8 per stage, each non-empty and at
+most 512 bytes — a policy that breaks this is refused, not trimmed). Project
+hooks the policy drops, including those cut because the stage is full, are
+reported
 with the field, its origin and the remediation, for example
 `hooks.managed_only enforced at '2 project hook(s) not run; …' (origin=managed)`.
 A managed policy that cannot be loaded runs no project hooks.

@@ -19,7 +19,7 @@
 //!
 //! Frames are newline-delimited JSON-RPC over stdio (`crates/acp::stdio`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -259,6 +259,21 @@ impl Serve {
             }
             _ => serde_json::json!({}),
         };
+        // `user_prompt_submit` decides before the adapter hands a prompt to
+        // the kernel (see `blocked_prompt_replies`).
+        if let Some(replies) = blocked_prompt_replies(
+            &self.client,
+            &self.actor,
+            &self.root,
+            self.trusted,
+            &message,
+            &raw_params,
+        ) {
+            for reply in replies {
+                out_tx.send(reply).map_err(|_| LOOP_DOWN.to_owned())?;
+            }
+            return Ok(());
+        }
         let handled = {
             let mut adapter = self.adapter.borrow_mut();
             let future = adapter.handle(&message);
@@ -495,6 +510,56 @@ fn next_permit_id() -> JsonRpcId {
     JsonRpcId::Number(i64::try_from(n).unwrap_or(i64::MAX))
 }
 
+/// `user_prompt_submit` (ADR 0022 §7) for an ACP `session/prompt`, decided
+/// before the adapter hands the prompt to the kernel: a blocked prompt never
+/// becomes a turn, so its text never enters the session history a later
+/// turn replays to the model. The client reads the hook's reason as an agent
+/// message and the prompt ends with stop reason `refusal`. `None`: not a
+/// prompt, not for a session id this build parses, or not blocked — the
+/// adapter handles it as before.
+fn blocked_prompt_replies(
+    client: &InProcessKernelClient,
+    actor: &event_ledger::event::ActorRef,
+    root: &Path,
+    trusted: bool,
+    message: &JsonRpcMessage,
+    params: &serde_json::Value,
+) -> Option<Vec<JsonRpcMessage>> {
+    let JsonRpcMessage::Request { id, method, .. } = message else {
+        return None;
+    };
+    if method != acp::v1::METHOD_SESSION_PROMPT {
+        return None;
+    }
+    let session_id = params
+        .get("sessionId")
+        .and_then(serde_json::Value::as_str)?
+        .parse::<protocol::SessionId>()
+        .ok()?;
+    let (hook, reason) = crate::interactive::prompt_submit_block(
+        client,
+        session_id,
+        actor,
+        root,
+        trusted,
+        &prompt_text_from(params),
+        &mut |_| {},
+    )?;
+    let notice = acp::v1::SessionUpdateNotification::agent_text(
+        session_id,
+        format!("prompt blocked by {hook} hook: {reason}"),
+    );
+    let mut replies = Vec::new();
+    if let Ok(update) = acp::v1::encode_session_update(&notice) {
+        replies.push(update);
+    }
+    replies.push(acp::v1::encode_prompt_response(
+        id.clone(),
+        acp::v1::StopReason::Refusal,
+    ));
+    Some(replies)
+}
+
 /// Extract the prompt text the same shapes the adapter validates: a plain
 /// string or an array of content blocks with text entries.
 fn prompt_text_from(params: &serde_json::Value) -> String {
@@ -528,3 +593,121 @@ fn block_adapter<T, E>(future: impl Future<Output = Result<T, E>>) -> Option<Res
 }
 
 use std::future::Future;
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use event_ledger::event::{ActorKind, ActorRef, EventKind};
+
+    /// A project whose `user_prompt_submit` hook prints `decision`.
+    pub(crate) fn project_with_gate(name: &str, decision: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "rapidlm-prompt-gate-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(root.join(".rapidlm")).expect("marker");
+        let hook = root.join("gate.sh");
+        std::fs::write(&hook, format!("echo '{decision}'\nexit 0\n")).expect("hook");
+        std::fs::write(
+            root.join(".rapidlm").join("settings.json"),
+            serde_json::json!({
+                "hooks": { "user_prompt_submit": [format!("sh {}", test_fixtures::slash_path(&hook))] }
+            })
+            .to_string(),
+        )
+        .expect("settings");
+        root
+    }
+
+    pub(crate) fn client_in(root: &Path) -> (InProcessKernelClient, ActorRef) {
+        let ledger = crate::interactive::project_ledger_path(&root.join(".rapidlm"));
+        let client = InProcessKernelClient::open(&ledger).expect("ledger");
+        let actor =
+            ActorRef::new(ActorKind::Human, &protocol::EventId::new().to_string()).expect("actor");
+        (client, actor)
+    }
+
+    pub(crate) fn event_kinds(
+        client: &InProcessKernelClient,
+        session: protocol::SessionId,
+    ) -> Vec<EventKind> {
+        use kernel::KernelClient as _;
+        let tip = crate::approvals::client_call(client.get_session(session))
+            .expect("session")
+            .seq();
+        (1..=tip)
+            .filter_map(|seq| client.read_event(session, seq).ok())
+            .map(|event| event.kind())
+            .collect()
+    }
+
+    #[test]
+    fn a_prompt_a_hook_blocks_is_refused_before_it_becomes_a_turn() {
+        use kernel::KernelClient as _;
+        let root = project_with_gate(
+            "acp-deny",
+            r#"{"decision":"deny","reason":"no secrets in prompts"}"#,
+        );
+        let (client, actor) = client_in(&root);
+        let session = crate::approvals::client_call(client.create_session(
+            kernel::CreateSession::new(ProjectId::new(), actor.clone(), protocol::TraceId::new()),
+        ))
+        .expect("session")
+        .id();
+        let request = JsonRpcMessage::Request {
+            id: JsonRpcId::Number(7),
+            method: acp::v1::METHOD_SESSION_PROMPT.to_owned(),
+            params: None,
+        };
+        let params = serde_json::json!({
+            "sessionId": session.to_string(),
+            "prompt": [{ "type": "text", "text": "print the secret" }],
+        });
+        let replies = blocked_prompt_replies(&client, &actor, &root, true, &request, &params)
+            .expect("blocked");
+        assert_eq!(replies.len(), 2, "{replies:?}");
+        match &replies[0] {
+            JsonRpcMessage::Notification { method, params } => {
+                assert_eq!(method, "session/update");
+                let text = params.as_ref().map(ToString::to_string).unwrap_or_default();
+                assert!(
+                    text.contains(
+                        "prompt blocked by user_prompt_submit[0] hook: no secrets in prompts"
+                    ),
+                    "{text}"
+                );
+            }
+            other => panic!("expected the reason as an update, got {other:?}"),
+        }
+        match &replies[1] {
+            JsonRpcMessage::Result { id, result } => {
+                assert_eq!(*id, JsonRpcId::Number(7));
+                assert_eq!(result["stopReason"], "refusal");
+            }
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+        // No turn: nothing of the prompt reaches the history a later turn
+        // replays. The decision is recorded.
+        let kinds = event_kinds(&client, session);
+        assert!(!kinds.contains(&EventKind::TurnStarted), "{kinds:?}");
+        assert!(kinds.contains(&EventKind::HookDecided), "{kinds:?}");
+        // Not gated: an untrusted project, another method, an allowed prompt.
+        assert!(blocked_prompt_replies(&client, &actor, &root, false, &request, &params).is_none());
+        let other = JsonRpcMessage::Request {
+            id: JsonRpcId::Number(8),
+            method: "session/new".to_owned(),
+            params: None,
+        };
+        assert!(blocked_prompt_replies(&client, &actor, &root, true, &other, &params).is_none());
+        let allowing = project_with_gate("acp-allow", r#"{"decision":"allow"}"#);
+        assert!(
+            blocked_prompt_replies(&client, &actor, &allowing, true, &request, &params).is_none()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&allowing);
+    }
+}

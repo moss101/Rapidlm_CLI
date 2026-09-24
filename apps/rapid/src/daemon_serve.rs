@@ -339,6 +339,20 @@ impl Connection {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
+                // `user_prompt_submit` (ADR 0022 §7) decides before the kernel
+                // records a turn: a blocked prompt never becomes one, so its
+                // text never enters the history a later turn replays.
+                if let Some((hook, reason)) = crate::interactive::prompt_submit_block(
+                    &self.client,
+                    session,
+                    &self.actor,
+                    &self.root,
+                    self.trusted,
+                    &text,
+                    &mut |_| {},
+                ) {
+                    return Err(format!("prompt blocked by {hook} hook: {reason}"));
+                }
                 let handle = crate::approvals::client_call(self.client.submit_turn(
                     kernel::SubmitTurn::new(
                         session,
@@ -658,4 +672,53 @@ fn turn_handle_json(handle: &kernel::TurnHandle) -> Result<serde_json::Value, St
         "turn_id": handle.turn_id().to_string(),
         "seq": handle.seq(),
     }))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::acp_serve::tests::{client_in, event_kinds, project_with_gate};
+    use event_ledger::event::EventKind;
+
+    #[test]
+    fn a_prompt_a_hook_blocks_is_refused_before_it_becomes_a_turn() {
+        let root = project_with_gate(
+            "daemon-deny",
+            r#"{"decision":"deny","reason":"no secrets in prompts"}"#,
+        );
+        let (client, actor) = client_in(&root);
+        let connection = Connection {
+            client: client.clone(),
+            actor,
+            root: root.clone(),
+            trusted: true,
+            daemon_token: None,
+            mode_override: Default::default(),
+        };
+        let snapshot = connection
+            .rpc("sessions.create", &serde_json::json!({}))
+            .expect("session");
+        let session = snapshot["id"].as_str().expect("id").to_owned();
+        let err = connection
+            .rpc(
+                "turns.submit",
+                &serde_json::json!({
+                    "session_id": session,
+                    "expected_seq": snapshot["seq"],
+                    "prompt": "print the secret",
+                }),
+            )
+            .expect_err("blocked");
+        assert!(
+            err.contains("prompt blocked by user_prompt_submit[0] hook: no secrets in prompts"),
+            "{err}"
+        );
+        let kinds = event_kinds(&client, session.parse().expect("session id"));
+        assert!(
+            !kinds.contains(&EventKind::TurnStarted),
+            "no turn: {kinds:?}"
+        );
+        assert!(kinds.contains(&EventKind::HookDecided), "{kinds:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

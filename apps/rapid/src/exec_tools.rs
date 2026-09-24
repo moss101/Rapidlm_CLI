@@ -1433,14 +1433,38 @@ pub trait SubagentRunner: Send + Sync {
         cancel: &CancellationToken,
     ) -> Result<SubagentReport, String>;
 
-    /// Settle a finished child's changes once `subagent_stop` has decided:
-    /// `blocked` is whether a hook blocked its completion. An isolated
-    /// child's writes are applied (headless auto-integration) or held for
-    /// review only now — a blocked child's are never applied — and the note
-    /// returned tells the parent which happened. `None`: nothing to say (no
-    /// isolated view, or a runner without one).
-    fn settle(&self, _agent: protocol::AgentId, _blocked: bool) -> Option<String> {
+    /// Settle a finished child's changes once `subagent_stop` has decided,
+    /// by how the child ended ([`ChildEnd`]): only a child that completed and
+    /// was not blocked has its writes applied (headless auto-integration);
+    /// otherwise they are held for review or discarded — never applied. The
+    /// note returned tells the parent which happened. `None`: nothing to say
+    /// (no isolated view, or a runner without one).
+    fn settle(&self, _agent: protocol::AgentId, _end: ChildEnd) -> Option<String> {
         None
+    }
+}
+
+/// How a delegated child ended, for [`SubagentRunner::settle`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildEnd {
+    /// It succeeded and no `subagent_stop` hook blocked it.
+    Completed,
+    /// A `subagent_stop` hook blocked its completion.
+    Blocked,
+    /// It returned a report but did not succeed (cancelled, needs context).
+    Incomplete,
+    /// It failed: an error, not a report.
+    Failed,
+}
+
+impl ChildEnd {
+    fn of(blocked: bool, outcome: &Result<SubagentReport, String>) -> Self {
+        match (blocked, outcome) {
+            (true, _) => Self::Blocked,
+            (false, Ok(report)) if report.status == "succeeded" => Self::Completed,
+            (false, Ok(_)) => Self::Incomplete,
+            (false, Err(_)) => Self::Failed,
+        }
     }
 }
 
@@ -2591,10 +2615,10 @@ impl WorkspaceTools {
             // The questions this run's hooks raise about the call: the rewrite's
             // (an Ask-class rewritten call the human has not seen) and the
             // asking hook's. They are about the same call — the call as it
-            // would run — so they are raised as *one* request, and one
-            // approval naming any of those hooks about these exact arguments
-            // answers them all (two questions answered in turn would each
-            // re-raise the other forever).
+            // would run — so they are raised as *one* request, led by the
+            // asking hook's question, and approving that request (it names
+            // the leading question's hook) answers them all (two questions
+            // answered in turn would each re-raise the other forever).
             let mut questions: Vec<(String, String, String)> = Vec::new();
             hook_context = report.context;
             rewritten_call = match report.rewrite {
@@ -2775,14 +2799,15 @@ impl WorkspaceTools {
                 }
             }
         };
-        // A call that failed with a runtime error (a shell timeout, an I/O
-        // failure) has no result to follow and ends the turn, but it did
+        // A call that failed with a runtime error (an I/O failure, a path
+        // that resolves outside the workspace) has no result to follow and
+        // ends the turn, but it did
         // fail: `post_tool_use_failure` observes it too. Nothing it adds can
         // be delivered, so only its decisions and failures are recorded.
         let mut result = match dispatched {
             Ok(result) => result,
             Err(err) => {
-                if matches!(err, ToolStepError::Failed)
+                if !matches!(err, ToolStepError::Cancelled)
                     && !self.hooks.post_tool_use_failure.is_empty()
                 {
                     let report = crate::hooks::run_post_tool_failure_stage(
@@ -4414,7 +4439,7 @@ read with job_output, in this turn or a later one — the job is stopped when th
             &args.agent_type,
             &outcome,
         );
-        let note = runner.settle(agent_id, blocked.is_some());
+        let note = runner.settle(agent_id, ChildEnd::of(blocked.is_some(), &outcome));
         let (end, detail) = match (&blocked, &outcome) {
             (Some(_), _) => (SubagentEnd::Failed, Some("completion blocked by a hook")),
             (None, Ok(report)) if report.status == "cancelled" => (SubagentEnd::Cancelled, None),
@@ -4450,8 +4475,9 @@ read with job_output, in this turn or a later one — the job is stopped when th
                 call_id: call.call_id().to_owned(),
                 handled: true,
                 detail: Some(bounded_detail(&format!(
-                    "subagent ({}) failed: {reason}",
-                    args.agent_type
+                    "subagent ({}) failed: {reason}{}",
+                    args.agent_type,
+                    note.as_deref().unwrap_or_default()
                 ))),
             }),
         }
@@ -4600,7 +4626,7 @@ read with job_output, in this turn or a later one — the job is stopped when th
                 &agent_type,
                 &outcome,
             );
-            let note = runner.settle(agent_id, blocked.is_some());
+            let note = runner.settle(agent_id, ChildEnd::of(blocked.is_some(), &outcome));
             let (end, detail) = match (&blocked, &outcome) {
                 (Some(_), _) => (SubagentEnd::Failed, Some("completion blocked by a hook")),
                 (None, Ok(report)) if report.status == "cancelled" => {
@@ -7561,13 +7587,9 @@ impl ToolDriver for WorkspaceTools {
     }
 }
 
-/// Run the `subagent_stop` stage for a finished child and record what its
-/// hooks decided (and which failed). `Some((hook, reason))` when a hook's
-/// v2 `deny` blocks the child's completion.
 /// The parent's result for a child whose completion a `subagent_stop` hook
 /// blocked: the hook and its reason, then what became of the child's changes
-/// (`note`). The reason is cut first, so the note — how to reach the held
-/// changes — survives the result bound.
+/// (`note`). The reason is cut first, so the note survives the result bound.
 fn blocked_completion_detail(
     agent_type: &str,
     hook: &str,
@@ -7589,6 +7611,9 @@ fn blocked_completion_detail(
     bounded_detail(&format!("{head}{reason}{note}"))
 }
 
+/// Run the `subagent_stop` stage for a finished child and record what its
+/// hooks decided (and which failed). `Some((hook, reason))` when a hook's
+/// v2 `deny` blocks the child's completion.
 fn subagent_stop_block(
     hooks: &crate::hooks::HooksConfig,
     events: Option<&dyn HookEvents>,
@@ -10268,7 +10293,7 @@ mod tests {
         // blocked child's are held, never applied — and before its end is
         // recorded, so `/agents` never shows a blocked child as succeeded;
         // the note about its changes survives a long reason.
-        struct SettlingRunner(Arc<Mutex<Vec<bool>>>);
+        struct SettlingRunner(Arc<Mutex<Vec<ChildEnd>>>, bool);
         impl crate::exec_tools::SubagentRunner for SettlingRunner {
             fn run(
                 &self,
@@ -10278,6 +10303,9 @@ mod tests {
                 _write_scope: Option<&str>,
                 _cancel: &CancellationToken,
             ) -> Result<SubagentReport, String> {
+                if self.1 {
+                    return Err("the child's model step failed".to_owned());
+                }
                 Ok(SubagentReport {
                     summary: "done".to_owned(),
                     status: "succeeded".to_owned(),
@@ -10292,16 +10320,13 @@ mod tests {
                     artifacts: Vec::new(),
                 })
             }
-            fn settle(&self, _agent: protocol::AgentId, blocked: bool) -> Option<String> {
-                self.0
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .push(blocked);
+            fn settle(&self, _agent: protocol::AgentId, end: ChildEnd) -> Option<String> {
+                self.0.lock().unwrap_or_else(|p| p.into_inner()).push(end);
                 Some(
-                    if blocked {
-                        " [held, not applied]"
-                    } else {
-                        " [applied]"
+                    match end {
+                        ChildEnd::Completed => " [applied]",
+                        ChildEnd::Blocked => " [held, not applied]",
+                        ChildEnd::Incomplete | ChildEnd::Failed => " [discarded]",
                     }
                     .to_owned(),
                 )
@@ -10309,15 +10334,16 @@ mod tests {
         }
         let long_reason = "no tests were run; ".repeat(40);
         let deny = format!(r#"{{"decision":"deny","reason":"{long_reason}"}}"#);
-        for (label, decision, blocked) in [
-            ("deny", deny.as_str(), true),
-            ("allow", r#"{"decision":"allow"}"#, false),
+        for (label, decision, blocked, fails) in [
+            ("deny", deny.as_str(), true, false),
+            ("allow", r#"{"decision":"allow"}"#, false, false),
+            ("failed child", r#"{"decision":"allow"}"#, false, true),
         ] {
             let root = TempRoot::new("hook-subagent-settle");
             let settled = Arc::new(Mutex::new(Vec::new()));
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
             let mut tools = permissive_workspace(&root.0);
-            tools.set_subagent_runner(Arc::new(SettlingRunner(Arc::clone(&settled))));
+            tools.set_subagent_runner(Arc::new(SettlingRunner(Arc::clone(&settled), fails)));
             tools.set_agent_events(Arc::new(RecordingAgentEvents {
                 seen: Arc::clone(&seen),
                 spawned_lands: true,
@@ -10334,10 +10360,15 @@ mod tests {
                     r#"{"prompt":"do it","type":"explore"}"#,
                 ),
             );
+            let expected = match (blocked, fails) {
+                (true, _) => ChildEnd::Blocked,
+                (false, true) => ChildEnd::Failed,
+                (false, false) => ChildEnd::Completed,
+            };
             assert_eq!(
                 *settled.lock().unwrap_or_else(|p| p.into_inner()),
-                vec![blocked],
-                "{label}: settled once, after the hook, knowing its decision"
+                vec![expected],
+                "{label}: settled once, after the hook, knowing how the child ended"
             );
             let seen = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
             let finished = seen
@@ -10360,6 +10391,18 @@ mod tests {
                         finished.contains("Failed") && finished.contains("completion blocked"),
                         "{finished}"
                     );
+                }
+                ToolStepResult::Failed { detail, .. } if fails => {
+                    let detail = detail.unwrap_or_default();
+                    assert!(
+                        detail.contains("failed: the child's model step failed"),
+                        "{detail}"
+                    );
+                    assert!(
+                        detail.ends_with("[discarded]"),
+                        "the note reaches the parent: {detail}"
+                    );
+                    assert!(finished.contains("Failed"), "{finished}");
                 }
                 ToolStepResult::Succeeded { summary, .. } if !blocked => {
                     assert!(summary.ends_with("[applied]"), "{summary}");
@@ -10433,6 +10476,39 @@ mod tests {
             "{}",
             requests[2].summary
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_runtime_invalid_is_observed_by_the_failure_stage_too() {
+        // A write through a symlink that leaves the workspace is refused as
+        // `Invalid`, which ends the turn like `Failed`; the failure stage
+        // observes every runtime error but a cancellation.
+        let root = TempRoot::new("hook-failure-invalid");
+        let outside = TempRoot::new("hook-failure-outside");
+        std::os::unix::fs::symlink(&outside.0, root.0.join("escape")).expect("symlink");
+        let mut tools = permissive_workspace(&root.0);
+        let capture = root.0.join("failure.json");
+        let script = root.0.join("failure.sh");
+        fs::write(
+            &script,
+            format!(
+                "cat > {}\necho '{{\"decision\":\"allow\"}}'\nexit 0\n",
+                test_fixtures::sh_quote(&capture)
+            ),
+        )
+        .expect("script");
+        tools.set_hooks(crate::hooks::HooksConfig {
+            post_tool_use_failure: vec![format!("sh {}", test_fixtures::slash_path(&script))],
+            ..Default::default()
+        });
+        let cancel = CancellationToken::new();
+        let call = write_call("w1", "escape/out.txt");
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        let result = tools.execute(&validated, &cancel);
+        assert!(matches!(result, Err(ToolStepError::Invalid)), "{result:?}");
+        assert!(capture.exists(), "the failure stage observed the Invalid");
+        assert!(!outside.0.join("out.txt").exists());
     }
 
     #[test]

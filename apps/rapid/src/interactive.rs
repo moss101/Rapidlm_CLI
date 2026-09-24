@@ -2741,7 +2741,19 @@ fn configure_trusted_model_tools(
 /// strict enough to refuse the run typed; this integration config was never
 /// that strict even before this function existed).
 pub(crate) fn load_project_integrations(root: &Path) -> ProjectIntegrations {
-    load_project_integrations_with(root, &std::env::vars().collect::<Vec<_>>())
+    // Only the managed-policy variable is read (`std::env::vars` panics on a
+    // non-Unicode variable anywhere in the environment, and this runs on the
+    // TUI's own thread for every prompt).
+    let env: Vec<(String, String)> = std::env::var_os(crate::managed_config::MANAGED_CONFIG_ENV)
+        .map(|value| {
+            (
+                crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .into_iter()
+        .collect();
+    load_project_integrations_with(root, &env)
 }
 
 /// [`load_project_integrations`] against an explicit environment (where the
@@ -2950,10 +2962,10 @@ struct LiveSubagentRunner {
 }
 
 impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
-    fn settle(&self, agent: protocol::AgentId, blocked: bool) -> Option<String> {
+    fn settle(&self, agent: protocol::AgentId, end: crate::exec_tools::ChildEnd) -> Option<String> {
         self.agent_views
             .as_ref()?
-            .settle(&self.root, agent, self.auto_integrate, blocked)
+            .settle(&self.root, agent, self.auto_integrate, end)
     }
 
     fn run(
@@ -5370,10 +5382,9 @@ impl SessionLoop<'_> {
     /// ledger before this returns, so a crash never loses an accepted
     /// message.
     fn queue_message(&mut self, text: &str) -> Result<(), InteractiveError> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = format!(
             "q{}",
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            NEXT_QUEUE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         let bounded = kernel::bounded_turn_text(text);
         let _ = self.client.append_turn_progress(
@@ -5549,6 +5560,16 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
 It will run after the current turn; /queue cancels or edits it.",
                         first_line(&text),
                     )),
+                }
+                // A new message never reuses a restored message's id: the
+                // counter restarts with the process, and two messages under
+                // one id would share every later state change (and merge on
+                // the next restore).
+                if let Some(number) = id.strip_prefix('q').and_then(|n| n.parse::<u64>().ok()) {
+                    NEXT_QUEUE_ID.fetch_max(
+                        number.saturating_add(1),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
                 self.message_queue.push(QueuedMessage {
                     id: id.clone(),
@@ -6835,14 +6856,23 @@ denied\n",
     /// state, auto-complete it if evidence already satisfies every
     /// criterion (mechanical, never based on model prose), stop if the real
     /// (not driver-internal, not zero) accrued usage already exhausts the
-    /// budget, or otherwise compile the next boundary prompt and submit it
-    /// through the existing `submit_turn` — the identical kernel
+    /// budget, or otherwise compile the next boundary prompt, pass it through
+    /// the `user_prompt_submit` gate (a block stops the goal) and start it
+    /// through `start_submitted_turn` — the identical kernel
     /// `SubmitTurn`/lease/background-thread path an ordinary Enter-press
-    /// turn already uses, just driven by this loop instead of a keypress.
+    /// turn uses, just driven by this loop instead of a keypress.
     fn continue_or_stop_autonomous_goal(&mut self) -> Result<(), InteractiveError> {
         let Some(auto) = &self.autonomous else {
             return Ok(());
         };
+        // A turn or a compaction holds the model slot (`/goal run` typed
+        // while one runs): starting a turn now would bounce off the kernel's
+        // lease — an error that ends the session — or race the compaction.
+        // The loop's next pass (`step_autonomous_goal`) starts the iteration
+        // once the slot is free.
+        if self.model_busy() {
+            return Ok(());
+        }
         let goal_id = auto.goal_id;
         let agent_id = auto.agent_id;
         let goal_path = self.goal_path();
@@ -8387,6 +8417,10 @@ impl crate::exec_tools::WorkspaceChanges for LedgerWorkspaceChanges {
     }
 }
 
+/// The next queued message's number (`q<n>`), shared by every session loop
+/// in the process and moved past every restored id.
+static NEXT_QUEUE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 thread_local! {
     /// Whether the turn running on this thread already ran its turn-end
     /// stage (`fire_turn_end_hooks`). Every turn runs on a thread of its own
@@ -9073,41 +9107,25 @@ pub(crate) fn spawn_acp_turn(
             permission_mode_override: mode_override,
             ..SessionShared::default()
         };
-        // `user_prompt_submit` (ADR 0022 §7): the ACP and `rapid daemon`
-        // submit paths hand the prompt to the kernel before this thread runs,
-        // so a blocked prompt finishes its turn here, failed with the hook's
-        // reason (an ACP client reads stop reason `refusal`) — no model
-        // request, no tool call and, as for a blocked TUI prompt, no
-        // turn-end hooks: no turn ran.
-        let blocked = prompt_submit_block(
-            &client,
-            session_id,
-            &actor,
-            &root,
-            trusted,
-            &text,
-            &mut |_| {},
-        );
-        let outcome = match blocked {
-            Some((hook, reason)) => kernel::TurnOutcome::Failed {
-                reason: format!("prompt blocked by {hook} hook: {reason}"),
-            },
-            None => with_turn_end_hooks(&client, session_id, &actor, &root, trusted, || {
-                catching_panics(std::panic::AssertUnwindSafe(|| {
-                    run_interactive_turn(
-                        &client,
-                        session_id,
-                        &actor,
-                        &root,
-                        trusted,
-                        &text,
-                        &kernel_cancel,
-                        &crate::exec_tools::JobRegistry::default(),
-                        &shared,
-                    )
-                }))
-            }),
-        };
+        // `user_prompt_submit` was decided before the prompt reached the
+        // kernel (`acp_serve`'s `session/prompt`, the daemon's
+        // `turns.submit`): a blocked prompt never becomes a turn, so its text
+        // never enters the history a later turn replays to the model.
+        let outcome = with_turn_end_hooks(&client, session_id, &actor, &root, trusted, || {
+            catching_panics(std::panic::AssertUnwindSafe(|| {
+                run_interactive_turn(
+                    &client,
+                    session_id,
+                    &actor,
+                    &root,
+                    trusted,
+                    &text,
+                    &kernel_cancel,
+                    &crate::exec_tools::JobRegistry::default(),
+                    &shared,
+                )
+            }))
+        });
         let _ = client.finish_turn(kernel::FinishTurn::new(
             session_id,
             turn_id,
@@ -10336,10 +10354,12 @@ fn fire_turn_end_hooks<E>(
 /// Run the project's `user_prompt_submit` hooks for a prompt about to start a
 /// turn — trusted projects only; hooks are project settings — and record what
 /// they decided. `Some((hook, reason))` when a hook blocked the prompt. Every
-/// surface that starts a turn from a human prompt asks this first: the TUI
-/// composer and queue, the ACP and `rapid daemon` submit paths
-/// (`spawn_acp_turn`), and headless `rapid exec` (its own copy, which exits
-/// `Policy`).
+/// surface that starts a turn from a human prompt asks this first, before the
+/// kernel records a turn: the TUI composer, queue and goal loop, ACP's
+/// `session/prompt` (`acp_serve`), the daemon's `turns.submit`, and headless
+/// `rapid exec` (its own copy, which exits `Policy`). A blocked prompt must
+/// never become a turn: a failed turn's prompt is part of the history the
+/// next turn replays to the model.
 pub(crate) fn prompt_submit_block(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
@@ -16694,81 +16714,90 @@ question the panel answers"
     }
 
     #[test]
-    fn an_acp_or_daemon_prompt_a_hook_blocks_fails_its_turn_before_any_model_request() {
+    fn a_queued_id_restored_from_a_previous_run_is_never_reused() {
+        // The id counter restarts with the process: a message restored as
+        // `q<n>` and a new message numbered from 1 again would share an id,
+        // every later state change, and merge on the next restore.
         let env = TempEnv::create();
-        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
-        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
-        let capture = root.join("prompts.jsonl");
-        settings_with_hooks(
-            &root,
-            serde_json::json!({
-                "user_prompt_submit": [capturing_hook(
-                    &root,
-                    "gate.sh",
-                    &capture,
-                    r#"{"decision":"deny","reason":"no secrets in prompts"}"#,
-                )],
-            }),
-        );
         let session = ScriptedSession::create(&env);
+        let _ = session.client.append_turn_progress(
+            session.session_id,
+            &session.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::MessageQueued,
+            serde_json::json!({ "id": "q900000", "text": "from a previous run" }),
+        );
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, vec![ScriptedModel::terminal("unused")]);
+        loop_state.message_queue.clear();
+        loop_state.restore_queued_messages();
+        assert_eq!(loop_state.message_queue.len(), 1);
+        loop_state.queue_message("new").expect("queue");
+        let new_id = &loop_state.message_queue[1].id;
+        let number: u64 = new_id.trim_start_matches('q').parse().expect("q<n>");
+        assert!(
+            number > 900_000,
+            "{new_id} must not collide with the restored q900000"
+        );
+    }
+
+    #[test]
+    fn a_goal_run_while_the_model_slot_is_busy_waits_instead_of_starting_a_second_turn() {
+        // `/goal run` typed while a turn runs: starting one now would bounce
+        // off the kernel's lease (an error that ends the session) or race a
+        // compaction. The loop waits and starts the iteration once free.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let _goal = session.create_active_goal();
         let cancel = CancellationToken::new();
-        let tip = block_on(session.client.get_session(session.session_id), &cancel)
-            .expect("session")
-            .seq();
-        let handle = block_on(
-            session.client.submit_turn(kernel::SubmitTurn::new(
-                session.session_id,
-                tip,
-                session.actor.clone(),
-                TraceId::new(),
-                "print the secret".to_owned(),
-            )),
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
             &cancel,
         )
-        .expect("submit");
-        let kernel_cancel = session
-            .client
-            .turn_cancel_token(session.session_id)
-            .expect("turn token");
-        spawn_acp_turn(
-            session.client.clone(),
-            session.session_id,
-            handle.turn_id(),
-            session.actor.clone(),
-            root.clone(),
-            true,
-            "print the secret".to_owned(),
-            kernel_cancel,
-            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(vec![ScriptedModel::terminal("done")]);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            std::sync::Arc::clone(&turn_in_flight),
+            backings,
         );
-        // The turn fails with the hook's reason; nothing else ran.
-        let mut failed = None;
-        for _ in 0..400 {
-            let tip = block_on(session.client.get_session(session.session_id), &cancel)
-                .expect("session")
-                .seq();
-            for seq in 1..=tip {
-                if let Ok(event) = session.client.read_event(session.session_id, seq)
-                    && event.kind() == event_ledger::event::EventKind::TurnFailed
-                {
-                    failed = Some(event.payload().to_string());
-                }
-            }
-            if failed.is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        let failed = failed.expect("the blocked turn failed");
+        loop_state
+            .start_autonomous_goal()
+            .expect("start while busy");
         assert!(
-            failed.contains("prompt blocked by user_prompt_submit[0] hook: no secrets in prompts"),
-            "{failed}"
+            loop_state.autonomous.is_some(),
+            "the goal is still being driven"
         );
         assert!(
-            fs::read_to_string(&capture)
-                .expect("gate ran")
-                .contains("print the secret")
+            loop_state
+                .autonomous
+                .as_ref()
+                .is_some_and(|auto| auto.transcript_len_before_iteration.is_none()),
+            "no iteration started while the slot was busy"
         );
+        turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+        drive_autonomous_goal(&mut loop_state);
+        let started = loop_state
+            .ui
+            .transcript()
+            .iter()
+            .any(|entry| matches!(entry, TranscriptEntry::Assistant { .. }));
+        assert!(started, "the iteration ran once the slot was free");
     }
 
     #[test]

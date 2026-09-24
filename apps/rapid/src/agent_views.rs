@@ -434,6 +434,68 @@ impl AgentViewManager {
         paths
     }
 
+    /// Settle a finished child's isolated changes once `subagent_stop` has
+    /// decided, by how the child ended. Only a child that completed and was
+    /// not blocked is applied — and only by a headless run
+    /// (`auto_integrate`: there is no reviewer); an interactive run holds its
+    /// changes for `/agents integrate|abandon`. A blocked or unfinished
+    /// child's changes are held for review interactively and discarded
+    /// headless (nothing there could ever review or remove the worktree, and
+    /// each counts against the repository's worktree limit); a failed
+    /// child's are discarded. Returns the note the parent reads; `None` when
+    /// the child has no view (not write-capable, or already cleaned up).
+    pub fn settle(
+        &self,
+        root: &Path,
+        agent: AgentId,
+        auto_integrate: bool,
+        end: crate::exec_tools::ChildEnd,
+    ) -> Option<String> {
+        use crate::exec_tools::ChildEnd;
+        let view = self.get(agent)?;
+        let discard = |why: &str| -> String {
+            match self.cleanup(root, agent) {
+                Ok(()) => format!(" Its changes were discarded: {why}."),
+                Err(reason) => format!(
+                    " Its changes were not applied ({why}); removing its worktree at {} failed: {reason}.",
+                    view.worktree.display()
+                ),
+            }
+        };
+        let hold = |why: &str| -> String {
+            format!(" Its changes were not applied ({why}); /agents integrate|abandon {agent}.")
+        };
+        Some(match (end, auto_integrate) {
+            (ChildEnd::Failed, _) => discard("the child failed"),
+            (ChildEnd::Blocked, true) => {
+                discard("the completion was blocked and a headless run holds nothing for review")
+            }
+            (ChildEnd::Blocked, false) => hold("the completion was blocked"),
+            (ChildEnd::Incomplete, true) => discard("the child did not finish"),
+            (ChildEnd::Incomplete, false) => hold("the child did not finish"),
+            (ChildEnd::Completed, false) => {
+                " Changes are held in the child's isolated worktree for review: \
+/agents integrate <id> [check-command] applies them, /agents abandon <id> discards them."
+                    .to_owned()
+            }
+            (ChildEnd::Completed, true) => match self.integrate(root, agent, None) {
+                Ok((outcome, _)) if outcome.applied() => {
+                    " Changes were applied to the parent workspace (three-way merge).".to_owned()
+                }
+                Ok((IntegrationOutcome::Conflict { files }, _)) => format!(
+                    " CONFLICT: the parent workspace changed the same file(s) ({}); \
+the child's changes are held in its isolated worktree at {} and were NOT applied.",
+                    files.join(", "),
+                    view.worktree.display(),
+                ),
+                Ok(_) => " The child changed no files.".to_owned(),
+                Err(reason) => {
+                    format!(" The child's changes are held in its isolated worktree ({reason}).")
+                }
+            },
+        })
+    }
+
     /// Apply the child's patch to the parent tree.
     ///
     /// `git apply --3way` is a real three-way merge: the binary diff carries
@@ -441,55 +503,6 @@ impl AgentViewManager {
     /// conflicts on content, not on timestamps. The dry run decides before
     /// anything is written — a conflicting integration leaves the parent
     /// byte-identical and the worktree in place.
-    /// Settle a finished child's isolated changes once `subagent_stop` has
-    /// decided (`blocked`): applied now when `auto_integrate` (headless —
-    /// there is no reviewer) and nothing blocked the completion; otherwise
-    /// held in the child's worktree for review. A blocked child's changes are
-    /// never applied. Returns the note the parent reads about them; `None`
-    /// when the child has no view (not write-capable, or already cleaned up
-    /// because it failed).
-    pub fn settle(
-        &self,
-        root: &Path,
-        agent: AgentId,
-        auto_integrate: bool,
-        blocked: bool,
-    ) -> Option<String> {
-        let view = self.get(agent)?;
-        if blocked {
-            return Some(if auto_integrate {
-                format!(
-                    " Its changes were not applied; they are held in {}.",
-                    view.worktree.display()
-                )
-            } else {
-                format!(" Its changes were not applied; /agents integrate|abandon {agent}.")
-            });
-        }
-        if !auto_integrate {
-            return Some(
-                " Changes are held in the child's isolated worktree for review: \
-/agents integrate <id> [check-command] applies them, /agents abandon <id> discards them."
-                    .to_owned(),
-            );
-        }
-        Some(match self.integrate(root, agent, None) {
-            Ok((outcome, _)) if outcome.applied() => {
-                " Changes were applied to the parent workspace (three-way merge).".to_owned()
-            }
-            Ok((IntegrationOutcome::Conflict { files }, _)) => format!(
-                " CONFLICT: the parent workspace changed the same file(s) ({}); \
-the child's changes are held in its isolated worktree at {} and were NOT applied.",
-                files.join(", "),
-                view.worktree.display(),
-            ),
-            Ok(_) => " The child changed no files.".to_owned(),
-            Err(reason) => {
-                format!(" The child's changes are held in its isolated worktree ({reason}).")
-            }
-        })
-    }
-
     pub fn integrate(
         &self,
         root: &Path,
@@ -925,45 +938,97 @@ mod tests {
     }
 
     #[test]
-    fn a_blocked_childs_changes_are_held_never_applied_and_an_allowed_one_settles_as_before() {
+    fn only_a_completed_unblocked_child_is_applied_and_headless_discards_what_it_cannot_hold() {
         // `subagent_stop` decides before anything the child wrote reaches
-        // the parent: blocked, the changes stay in the worktree (headless
-        // too); allowed, headless applies them and interactive holds them.
-        let repo = repo("settle-blocked");
+        // the parent, and a failed or unfinished child is never applied —
+        // its partial writes stay out of the user's tree. Interactive runs
+        // hold what is not applied for review; headless runs discard it.
+        use crate::exec_tools::ChildEnd;
+        let child = |manager: &AgentViewManager, repo: &Repo| {
+            let agent = AgentId::new();
+            let view = manager.create_for(&repo.root, agent).expect("view");
+            std::fs::write(view.worktree.join("child.txt"), "from the child\n").unwrap();
+            agent
+        };
+        let repo = repo("settle-ends");
         let manager = AgentViewManager::new();
-        let agent = AgentId::new();
-        let view = manager.create_for(&repo.root, agent).expect("view");
-        std::fs::write(view.worktree.join("child.txt"), "from the child\n").unwrap();
-
-        let note = manager.settle(&repo.root, agent, true, true).expect("note");
-        assert!(note.contains("not applied"), "{note}");
-        assert!(
-            !repo.root.join("child.txt").exists(),
-            "a blocked child's write is not applied"
-        );
-        assert!(
-            manager.held_agents().contains(&agent),
-            "its view is kept for review"
-        );
-
+        for (end, auto, applied, kept, needle) in [
+            (
+                ChildEnd::Failed,
+                true,
+                false,
+                false,
+                "discarded: the child failed",
+            ),
+            (
+                ChildEnd::Failed,
+                false,
+                false,
+                false,
+                "discarded: the child failed",
+            ),
+            (
+                ChildEnd::Blocked,
+                true,
+                false,
+                false,
+                "discarded: the completion was blocked",
+            ),
+            (
+                ChildEnd::Blocked,
+                false,
+                false,
+                true,
+                "/agents integrate|abandon",
+            ),
+            (
+                ChildEnd::Incomplete,
+                true,
+                false,
+                false,
+                "discarded: the child did not finish",
+            ),
+            (
+                ChildEnd::Incomplete,
+                false,
+                false,
+                true,
+                "the child did not finish",
+            ),
+            (
+                ChildEnd::Completed,
+                false,
+                false,
+                true,
+                "held in the child's isolated worktree",
+            ),
+        ] {
+            let agent = child(&manager, &repo);
+            let note = manager.settle(&repo.root, agent, auto, end).expect("note");
+            assert!(note.contains(needle), "{end:?} auto={auto}: {note}");
+            assert_eq!(
+                repo.root.join("child.txt").exists(),
+                applied,
+                "{end:?} auto={auto}"
+            );
+            assert_eq!(
+                manager.held_agents().contains(&agent),
+                kept,
+                "{end:?} auto={auto}"
+            );
+            if kept {
+                manager.cleanup(&repo.root, agent).expect("cleanup");
+            }
+        }
+        let agent = child(&manager, &repo);
         let note = manager
-            .settle(&repo.root, agent, false, false)
-            .expect("note");
-        assert!(
-            note.contains("held in the child's isolated worktree"),
-            "{note}"
-        );
-        assert!(!repo.root.join("child.txt").exists());
-
-        let note = manager
-            .settle(&repo.root, agent, true, false)
+            .settle(&repo.root, agent, true, ChildEnd::Completed)
             .expect("note");
         assert!(note.contains("applied to the parent workspace"), "{note}");
         assert!(repo.root.join("child.txt").exists());
-
         // No view: nothing to say.
         assert_eq!(
-            manager.settle(&repo.root, AgentId::new(), true, false),
+            manager.settle(&repo.root, AgentId::new(), true, ChildEnd::Completed),
             None
         );
     }

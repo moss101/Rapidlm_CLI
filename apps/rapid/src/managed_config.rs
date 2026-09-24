@@ -661,6 +661,19 @@ impl ManagedHooks {
                             "must be an array of hook command lines",
                         ))
                     })?;
+                    // The organisation's own hooks are refused, not silently
+                    // dropped, when project settings would drop them: under
+                    // `managed_only` a vanished line means no hook runs at
+                    // all, and nothing would say so.
+                    if entries.len() > crate::hooks::MAX_HOOKS_PER_STAGE {
+                        return Err(ManagedConfigError::PolicyField(field_error(
+                            &format!("hooks.{stage}"),
+                            &format!(
+                                "at most {} hook command lines per stage",
+                                crate::hooks::MAX_HOOKS_PER_STAGE
+                            ),
+                        )));
+                    }
                     let mut lines = Vec::with_capacity(entries.len());
                     for entry in entries {
                         let line = entry.as_str().ok_or_else(|| {
@@ -669,6 +682,17 @@ impl ManagedHooks {
                                 "entries must be strings",
                             ))
                         })?;
+                        if line.trim().is_empty()
+                            || line.len() > crate::hooks::MAX_HOOK_COMMAND_BYTES
+                        {
+                            return Err(ManagedConfigError::PolicyField(field_error(
+                                &format!("hooks.{stage}"),
+                                &format!(
+                                    "a hook command line must be non-empty and at most {} bytes",
+                                    crate::hooks::MAX_HOOK_COMMAND_BYTES
+                                ),
+                            )));
+                        }
                         lines.push(serde_json::Value::String(line.to_owned()));
                     }
                     commands.insert(stage.to_owned(), serde_json::Value::Array(lines));
@@ -740,8 +764,22 @@ pub fn gate_hooks(
     // `pre_tool_use` gate decides before a project's.
     let mut combined = managed.commands.clone();
     combined.extend(effective);
-    for stage in combined.stages_mut() {
-        stage.truncate(crate::hooks::MAX_HOOKS_PER_STAGE);
+    // The policy's own hooks go first, so a stage over the limit loses
+    // project hooks — reported like every other drop.
+    for (name, stage) in combined.stages_named_mut() {
+        if stage.len() > crate::hooks::MAX_HOOKS_PER_STAGE {
+            reports.push(GateReportEntry {
+                field_id: format!("hooks.{name}"),
+                origin: ConfigOrigin::Managed,
+                detail: format!(
+                    "{} project hook(s) on '{name}' not run; the managed policy's hooks and the project's exceed {} per stage",
+                    stage.len() - crate::hooks::MAX_HOOKS_PER_STAGE,
+                    crate::hooks::MAX_HOOKS_PER_STAGE
+                ),
+                remediation: "remove project hooks from that stage",
+            });
+            stage.truncate(crate::hooks::MAX_HOOKS_PER_STAGE);
+        }
     }
     (combined, reports)
 }
@@ -1075,6 +1113,33 @@ mod tests {
     }
 
     #[test]
+    fn project_hooks_cut_by_the_per_stage_limit_are_reported() {
+        let eight = (0..crate::hooks::MAX_HOOKS_PER_STAGE)
+            .map(|i| format!("\"/opt/org/gate-{i}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let policy = hooks_policy(&format!("[hooks]\npre_tool_use = [{eight}]\n"));
+        let (effective, reports) = gate_hooks(project_hooks(), Some(&policy));
+        assert_eq!(
+            effective.pre_tool_use.len(),
+            crate::hooks::MAX_HOOKS_PER_STAGE
+        );
+        assert!(
+            effective
+                .pre_tool_use
+                .iter()
+                .all(|line| line.starts_with("/opt/org/"))
+        );
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].field_id, "hooks.pre_tool_use");
+        assert!(
+            reports[0].detail.contains("1 project hook(s)"),
+            "{}",
+            reports[0].detail
+        );
+    }
+
+    #[test]
     fn the_hooks_table_is_closed_and_validated() {
         for (body, field) in [
             ("[hooks]\nmanaged_only = \"yes\"\n", "hooks.managed_only"),
@@ -1089,6 +1154,23 @@ mod tests {
             ))
             .expect_err("invalid [hooks] must be refused");
             assert!(format!("{err:?}").contains(field), "{body} -> {err:?}");
+        }
+        // The organisation's own lines are refused, not silently dropped.
+        let nine = (0..9)
+            .map(|i| format!("\"h{i}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let long = "x".repeat(crate::hooks::MAX_HOOK_COMMAND_BYTES + 1);
+        for body in [
+            format!("[hooks]\npre_tool_use = [{nine}]\n"),
+            "[hooks]\npre_tool_use = [\"\"]\n".to_owned(),
+            format!("[hooks]\npre_tool_use = [\"{long}\"]\n"),
+        ] {
+            let err = ManagedPolicy::parse(&format!(
+                "schema = \"rapidlm.managed_config.v1\"\n[policy]\n{body}"
+            ))
+            .expect_err("refused");
+            assert!(format!("{err:?}").contains("hooks.pre_tool_use"), "{err:?}");
         }
         let err = ManagedPolicy::parse(
             "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[hooks]\nsomething_else = 1\n",

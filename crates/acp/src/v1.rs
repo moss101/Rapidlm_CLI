@@ -185,6 +185,18 @@ pub struct SessionUpdateNotification {
     update: SessionUpdate,
 }
 
+impl SessionUpdateNotification {
+    /// A text message from the agent to the client on `session_id`.
+    pub fn agent_text(session_id: SessionId, text: impl Into<String>) -> Self {
+        Self {
+            session_id,
+            update: SessionUpdate::AgentMessageChunk {
+                content: ContentBlock::Text { text: text.into() },
+            },
+        }
+    }
+}
+
 /// ACP v1 session update body.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "sessionUpdate", rename_all = "snake_case")]
