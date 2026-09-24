@@ -7,6 +7,7 @@ pub mod phase;
 pub mod provider;
 pub mod providers {
     pub mod anthropic;
+    pub mod dial;
     pub mod openai_compatible;
 }
 pub mod route;

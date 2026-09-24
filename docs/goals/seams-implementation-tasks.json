@@ -423,7 +423,8 @@
         "part a: docs/goal-delivery-2026-09-20.md \u00a7 SEAM-02-2 (part a) \u2014 criterion table",
         "apps/rapid/src/model.rs \u2014 ConfiguredModel::probe; apps/rapid/src/setup.rs \u2014 verify, classify, ProbeFailure (exit codes 11-15); tests each_verification_failure_has_its_own_exit_code_and_changes_no_file, a_verified_plan_sent_one_bounded_request_with_the_named_key, an_unset_key_variable_sends_nothing",
         "crates/llm-router \u2014 ProviderError::QuotaExceeded (402), FailureClass::Quota, StopReason::QuotaExhausted; crates/agent-runtime \u2014 FailureCause::Quota; tests payment_required_is_an_exhausted_quota_never_retried (both adapters), an_exhausted_quota_is_its_own_class_and_stop_reason, an_exhausted_quota_is_not_retried",
-        "part b pending: the probe's dial bound to an egress-proxy lease, HTTP(S)_PROXY/NO_PROXY in Http1Transport, rapid doctor --live (with journal::record_egress in the project ledger)"
+        "part b1: crates/llm-router/src/providers/dial.rs \u2014 ProxyConfig (HTTPS_PROXY/HTTP_PROXY/NO_PROXY from explicit pairs), DialGate, connect_tunnel; Http1Transport::with_proxy/with_dial_gate and one open_stream for post_raw/execute/execute_streaming \u2014 tests an_http_target_through_a_proxy_names_its_whole_url_and_the_proxy_credentials, an_https_target_through_a_proxy_is_a_connect_tunnel_and_a_refusal_is_a_network_failure, the_dial_gate_is_asked_before_any_connection_and_a_refusal_dials_nothing, dial::tests; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-02-2 (part b1)",
+        "part b2/b3 pending: the probe's dial bound to an egress-proxy lease with its receipt, the proxy opt-in read by runs and the probe alike, rapid doctor --live (with journal::record_egress in the project ledger)"
       ]
     },
     {
