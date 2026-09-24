@@ -19,8 +19,8 @@
 //!   completed side effects. The prompt stays in flight across every such
 //!   pause; it ends with the terminal event of the last continuation, or on
 //!   a cancel. One prompt per session is in flight at a time; a cancel
-//!   completes before the next frame is read, and a closing serve waits for
-//!   its interrupted turns to stop.
+//!   completes (bounded) before the next frame is read, and a closing serve
+//!   waits (bounded) for its interrupted turns to stop.
 //!
 //! Frames are newline-delimited JSON-RPC over stdio (`crates/acp::stdio`).
 
@@ -55,10 +55,11 @@ type PendingPermits = Arc<Mutex<HashMap<JsonRpcId, PendingPermit>>>;
 type PromptCancels = Arc<Mutex<HashMap<protocol::SessionId, Arc<AtomicBool>>>>;
 
 /// Every turn thread the serve started — prompt turns and continuations —
-/// each flag cleared by its thread as it ends (after the turn-end hooks and
-/// `finish_turn`). The serve waits for them before it exits, so an
-/// interrupted turn stops its commands and runs its hooks first.
-type TurnThreads = Arc<Mutex<Vec<Arc<AtomicBool>>>>;
+/// by session, each flag cleared by its thread as it ends (after the
+/// turn-end hooks and `finish_turn`). A cancel waits for its session's, and
+/// the serve waits for all of them before it exits, so an interrupted turn
+/// stops its commands, records their end and runs its hooks first.
+type TurnThreads = Arc<Mutex<Vec<(protocol::SessionId, Arc<AtomicBool>)>>>;
 
 /// How long `session/cancel` waits for the cancelled prompt to end before
 /// the loop reads on (a prompt still in flight after it refuses the next).
@@ -66,14 +67,28 @@ const CANCEL_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 /// How long a closing serve waits for its prompts, then for its turns.
 const SHUTDOWN_SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// A fresh flag for a turn thread about to start, tracked in `turns`
-/// (finished threads' flags are dropped as new ones arrive).
-fn track_turn(turns: &TurnThreads) -> Arc<AtomicBool> {
-    let running = Arc::new(AtomicBool::new(false));
+/// The flag for a turn thread about to start on `session_id`, tracked in
+/// `turns`. It is born set — a thread that has not started yet is still
+/// one to wait for — and cleared by the thread as it ends, or by whoever
+/// ends up spawning none. Cleared flags are dropped as new ones arrive.
+fn track_turn(turns: &TurnThreads, session_id: protocol::SessionId) -> Arc<AtomicBool> {
+    let running = Arc::new(AtomicBool::new(true));
     let mut turns = turns.lock().unwrap_or_else(PoisonError::into_inner);
-    turns.retain(|flag| flag.load(Ordering::SeqCst));
-    turns.push(Arc::clone(&running));
+    turns.retain(|(_, flag)| flag.load(Ordering::SeqCst));
+    turns.push((session_id, Arc::clone(&running)));
     running
+}
+
+/// Whether a turn thread of `session_id` (or, for `None`, of any session)
+/// is still running.
+fn turns_running(turns: &TurnThreads, session_id: Option<protocol::SessionId>) -> bool {
+    turns
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|(session, flag)| {
+            session_id.is_none_or(|id| id == *session) && flag.load(Ordering::SeqCst)
+        })
 }
 
 /// Poll `done` until it holds or `bound` passes; whether it held.
@@ -322,11 +337,13 @@ impl Serve {
                     break 'looping;
                 }
             }
-            // The cancel completes before the next frame is read: the
-            // cancelled prompt ends (its continuation, if one was starting,
-            // interrupted) before a new prompt on the session can begin, so
-            // an editor may prompt again straight after `session/cancel`
-            // and never overlaps the prompt it cancelled.
+            // The cancel completes (bounded by CANCEL_SETTLE) before the
+            // next frame is read: the cancelled prompt ends — its
+            // continuation, if one was starting, interrupted — and so do
+            // the session's interrupted turn threads, whose last events
+            // (a stopped command's end) would otherwise land in the next
+            // prompt's stream. An editor may prompt again straight after
+            // `session/cancel`.
             if let Some((session_id, flag)) = cancelled {
                 settle(CANCEL_SETTLE, || {
                     !self
@@ -335,6 +352,7 @@ impl Serve {
                         .unwrap_or_else(PoisonError::into_inner)
                         .get(&session_id)
                         .is_some_and(|entry| Arc::ptr_eq(entry, &flag))
+                        && !turns_running(&self.turns, Some(session_id))
                 });
             }
         }
@@ -369,13 +387,7 @@ impl Serve {
                 .unwrap_or_else(PoisonError::into_inner)
                 .is_empty()
         });
-        settle(SHUTDOWN_SETTLE, || {
-            self.turns
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .iter()
-                .all(|running| !running.load(Ordering::SeqCst))
-        });
+        settle(SHUTDOWN_SETTLE, || !turns_running(&self.turns, None));
         drop(out_tx);
         let _ = writer_handle.join();
         match failure {
@@ -400,8 +412,8 @@ impl Serve {
         // approval its turn has finished as far as the kernel knows, so it
         // would accept a second one — whose turn the first prompt's stream
         // would then report as its own. Refused before anything is
-        // recorded for it. (A cancelled prompt has already ended: the loop
-        // waits for it after `session/cancel`.)
+        // recorded for it. (A cancelled prompt has normally ended by now:
+        // the loop waits for it, bounded, after `session/cancel`.)
         if let JsonRpcMessage::Request { id, method, .. } = &message
             && method == acp::v1::METHOD_SESSION_PROMPT
             && let Some(session_id) = session_id_of(&raw_params)
@@ -487,7 +499,7 @@ impl Serve {
                     text,
                     kernel_cancel,
                     self.mode_override.clone(),
-                    track_turn(&self.turns),
+                    track_turn(&self.turns, turn.session_id()),
                 );
                 // Registered before the loop reads another frame, so a
                 // `session/cancel` right behind this prompt finds it.
@@ -741,7 +753,7 @@ the approval stays pending"
                     &held.token,
                     &held.call_id,
                     permission_approves(&decision),
-                    track_turn(&routes.turns),
+                    track_turn(&routes.turns, routes.session_id),
                 );
                 if let Err(reason) = resumed {
                     // No continuation runs, so nothing is left to stream.
@@ -1088,6 +1100,25 @@ pub(crate) mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&allowing);
+    }
+
+    #[test]
+    fn a_turn_not_started_yet_is_still_waited_for() {
+        // Born set: tracking another turn prunes only finished flags, never
+        // one whose thread has not started (and set nothing) yet.
+        let turns = TurnThreads::default();
+        let session = protocol::SessionId::new();
+        let starting = track_turn(&turns, session);
+        let finished = track_turn(&turns, session);
+        finished.store(false, Ordering::SeqCst);
+        let _next = track_turn(&turns, protocol::SessionId::new());
+        let tracked = turns.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(tracked.iter().any(|(_, flag)| Arc::ptr_eq(flag, &starting)));
+        assert!(!tracked.iter().any(|(_, flag)| Arc::ptr_eq(flag, &finished)));
+        drop(tracked);
+        assert!(turns_running(&turns, Some(session)));
+        starting.store(false, Ordering::SeqCst);
+        assert!(!turns_running(&turns, Some(session)));
     }
 
     fn serve_in(root: &Path) -> (Serve, InProcessKernelClient) {

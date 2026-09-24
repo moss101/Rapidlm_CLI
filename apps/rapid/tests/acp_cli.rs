@@ -86,6 +86,22 @@ fn tool_call(id: &str, tool: &str, arguments: Value) -> String {
     .to_string()
 }
 
+/// A `sleep` duration for test `test` that no other process uses — not
+/// another test here, not another run — so its command is found by argv.
+#[cfg(unix)]
+fn sleep_marker(test: u32) -> String {
+    format!("3{test}.{}", std::process::id())
+}
+
+/// Whether a `sleep <seconds>` process is running.
+#[cfg(unix)]
+fn sleeping(seconds: &str) -> bool {
+    Command::new("pgrep")
+        .args(["-f", &format!("sleep {seconds}")])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
 /// A terminal answer.
 fn answer(text: &str) -> String {
     json!({
@@ -849,24 +865,18 @@ fn a_call_id_reused_after_a_cancelled_approval_is_asked_again() {
 #[cfg(unix)]
 #[test]
 fn a_disconnect_while_a_command_runs_stops_it_before_the_serve_exits() {
-    // A duration no other process uses, so the command is found by argv.
-    const LINE: &str = "sleep 37.25";
     fn model(request: &str) -> String {
         match tool_results(request) {
             0 => tool_call(
                 "call_1",
                 "shell_exec",
-                json!({ "argv": ["sleep", "37.25"] }),
+                json!({ "argv": ["sleep", sleep_marker(1)] }),
             ),
             _ => answer("done"),
         }
     }
-    fn running() -> bool {
-        Command::new("pgrep")
-            .args(["-f", LINE])
-            .output()
-            .is_ok_and(|out| out.status.success())
-    }
+    let marker = sleep_marker(1);
+    let running = || sleeping(&marker);
     let home = temp_dir("disconnect-while-command-runs");
     let (project, config) = trusted_project(&home.0, model);
     let mut editor = Editor::spawn(&project, &home.0, &config);
@@ -893,8 +903,105 @@ fn a_disconnect_while_a_command_runs_stops_it_before_the_serve_exits() {
     let code = editor.finish();
     let orphaned = running();
     if orphaned {
-        let _ = Command::new("pkill").args(["-f", LINE]).status();
+        let _ = Command::new("pkill")
+            .args(["-f", &format!("sleep {marker}")])
+            .status();
     }
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert!(!orphaned, "the interrupted command outlived the serve");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_cancel_while_a_command_runs_keeps_its_end_out_of_the_next_prompt() {
+    // The cancelled turn's command is stopped and its end recorded after
+    // the kernel records the interruption — here about two seconds after,
+    // while a background child still holds the command's output open. The
+    // next prompt, sent at once and still running then (its model takes
+    // four), must not stream that end as its own.
+    fn model(request: &str) -> String {
+        if request.contains("PROMPT-TWO") {
+            thread::sleep(Duration::from_secs(4));
+            answer("second")
+        } else {
+            match tool_results(request) {
+                0 => tool_call(
+                    "call_old",
+                    "shell_exec",
+                    json!({ "argv": [
+                        "sh",
+                        "-c",
+                        format!("sleep 2 & exec sleep {}", sleep_marker(2)),
+                    ] }),
+                ),
+                _ => answer("done"),
+            }
+        }
+    }
+    let marker = sleep_marker(2);
+    let home = temp_dir("cancel-while-command-runs");
+    let (project, config) = trusted_project(&home.0, model);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+    editor.request(
+        3,
+        "session/set_mode",
+        json!({ "sessionId": session, "mode": "bypassPermissions" }),
+    );
+    let set = editor.until_result(3);
+    assert!(set.get("result").is_some(), "{set}");
+    editor.start_prompt(4, &session, "run it");
+    let deadline = Instant::now() + DEADLINE;
+    while !sleeping(&marker) {
+        assert!(
+            Instant::now() < deadline,
+            "the command never started; stderr: {}",
+            editor.stderr_text()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    editor.send(json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": { "sessionId": session },
+    }));
+    editor.start_prompt(5, &session, "PROMPT-TWO now");
+    let (mut first, mut second) = (None, None);
+    let mut after_first = Vec::new();
+    while second.is_none() {
+        let frame = editor
+            .next(deadline)
+            .unwrap_or_else(|| panic!("a prompt never answered; stderr: {}", editor.stderr_text()));
+        if frame.get("method").is_none() && frame["id"] == 4 {
+            first = Some(frame);
+        } else if frame.get("method").is_none() && frame["id"] == 5 {
+            second = Some(frame);
+        } else if first.is_some() {
+            after_first.push(frame);
+        }
+    }
+    let stderr = editor.stderr_text();
+    let first = first.expect("the cancelled prompt answers before the next one ends");
+    assert_eq!(
+        first["result"]["stopReason"], "cancelled",
+        "{first}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        second.expect("5")["result"]["stopReason"],
+        "end_turn",
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        mentions(&after_first, "call_old"),
+        0,
+        "the cancelled turn's command end streamed into the next prompt: {after_first:#?}"
+    );
+    let stopped = !sleeping(&marker);
+    if !stopped {
+        let _ = Command::new("pkill")
+            .args(["-f", &format!("sleep {marker}")])
+            .status();
+    }
+    assert!(stopped, "the cancelled command was stopped");
+    assert_eq!(editor.finish(), Some(0), "stderr: {stderr}");
 }

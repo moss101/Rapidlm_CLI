@@ -448,7 +448,7 @@ re-read it before the next submit)"
                         &token,
                         &call_id,
                         decision == kernel::ApprovalDecision::Approved,
-                        std::sync::Arc::default(),
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                     );
                 }
                 Ok(serde_json::json!({}))

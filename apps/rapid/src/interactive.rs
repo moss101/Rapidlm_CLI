@@ -9159,8 +9159,9 @@ pub(crate) fn spawn_acp_turn(
 /// The serve-side half of the durable approval flow (shared with the TUI's
 /// `/approvals`): record the decision durably, then submit and spawn the
 /// continuation turn that replays the suspension. Used by `rapid acp` so an
-/// editor's permission decision resumes the exact turn. `running` is set
-/// only when a continuation thread is spawned, and cleared as it ends.
+/// editor's permission decision resumes the exact turn. `running` is the
+/// continuation thread's flag, set by the caller: the thread clears it as it
+/// ends, and it is cleared here on every path that spawns no thread.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn acp_resolve_and_continue(
     client: &InProcessKernelClient,
@@ -9173,31 +9174,33 @@ pub(crate) fn acp_resolve_and_continue(
     approve: bool,
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), String> {
-    let tip = block_on_session_tip(client, session_id)?;
-    let decision = if approve {
-        kernel::ApprovalDecision::Approved
-    } else {
-        kernel::ApprovalDecision::Denied
-    };
-    crate::approvals::client_approve(
-        client,
-        kernel::ResolveApproval::new(session_id, tip, decision, actor.clone(), TraceId::new())
-            .with_wait_token(token),
-    )?;
-    let _suspended = crate::approvals::recorded_suspension(client, session_id, token)
-        .ok_or_else(|| "the paused turn's resumable state could not be loaded".to_owned())?;
-    let decision = if approve {
-        ContinuationDecision::Execute
-    } else {
-        ContinuationDecision::Deny
-    };
-    let expected_seq = block_on_session_tip(client, session_id)?;
-    let handle = crate::approvals::client_submit_turn(
-        client,
-        kernel::SubmitTurn::new(session_id, expected_seq, actor.clone(), TraceId::new(), ""),
-    )?;
-    if let Some(turn_cancel) = client.turn_cancel_token(session_id) {
-        running.store(true, std::sync::atomic::Ordering::SeqCst);
+    let spawned = (|| -> Result<bool, String> {
+        let tip = block_on_session_tip(client, session_id)?;
+        let decision = if approve {
+            kernel::ApprovalDecision::Approved
+        } else {
+            kernel::ApprovalDecision::Denied
+        };
+        crate::approvals::client_approve(
+            client,
+            kernel::ResolveApproval::new(session_id, tip, decision, actor.clone(), TraceId::new())
+                .with_wait_token(token),
+        )?;
+        let _suspended = crate::approvals::recorded_suspension(client, session_id, token)
+            .ok_or_else(|| "the paused turn's resumable state could not be loaded".to_owned())?;
+        let decision = if approve {
+            ContinuationDecision::Execute
+        } else {
+            ContinuationDecision::Deny
+        };
+        let expected_seq = block_on_session_tip(client, session_id)?;
+        let handle = crate::approvals::client_submit_turn(
+            client,
+            kernel::SubmitTurn::new(session_id, expected_seq, actor.clone(), TraceId::new(), ""),
+        )?;
+        let Some(turn_cancel) = client.turn_cancel_token(session_id) else {
+            return Ok(false);
+        };
         spawn_continuation_turn(
             client.clone(),
             session_id,
@@ -9206,15 +9209,19 @@ pub(crate) fn acp_resolve_and_continue(
             root.to_path_buf(),
             trusted,
             turn_cancel,
-            running,
+            std::sync::Arc::clone(&running),
             crate::exec_tools::JobRegistry::default(),
             SessionShared::default(),
             token.to_owned(),
             call_id.to_owned(),
             decision,
         );
+        Ok(true)
+    })();
+    if !matches!(spawned, Ok(true)) {
+        running.store(false, std::sync::atomic::Ordering::SeqCst);
     }
-    Ok(())
+    spawned.map(|_| ())
 }
 
 fn block_on_session_tip(
