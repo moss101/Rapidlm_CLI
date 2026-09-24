@@ -477,3 +477,11 @@ Governing document: `docs/goals/seams-governing-principles.md`. Worklist: `docs/
 | SEAM-13 | P3 | NOT_STARTED |  |  |  |  |  | memory consolidation — 2 tasks; no file watcher exists |
 | SEAM-14 | P3 | NOT_STARTED |  |  |  |  | audit §5 D-3 recorded, not blocking | update notice — 1 task |
 | SEAM-15 | P3 | NOT_STARTED |  |  |  |  |  | dashboard — 1 task; deferred behind SEAM-03/04 |
+
+## ACP serve defects (`rapid acp`)
+
+Defects found in the ACP serve loop (`apps/rapid/src/acp_serve.rs`) and its adapter (`crates/acp/src/v1.rs`) outside the task roadmap. A row is VERIFIED only when its end-to-end test drives the real `rapid acp` binary against a scripted model, and a revert of the fix has been seen to fail that test.
+
+| Task | Phase | Status | Owner/Agent | Started | Completed | Commit/PR | Evidence | Notes |
+|---|---|---|---|---|---|---|---|---|
+| ACP-FIX-1 | — | VERIFIED | coder | 2026-09-24 | 2026-09-24 | this row's commit | `apps/rapid/tests/acp_cli.rs`: `every_permission_request_of_one_prompt_reaches_the_prompt_and_it_completes` (two approvals in one prompt, answered, `end_turn`, clean exit 0), `a_cancel_while_the_turn_waits_on_an_approval_ends_the_prompt_and_nothing_resumes` (`cancelled`, no continuation, no write, exit 0). Revert-cycled: the pre-fix serve fails both (one request then `cancelled`; exit 1); pause mapping reverted → one request; first-answer-only routing → the prompt never answers; cancel flag disabled → `end_turn` | Broader than reported: every prompt ended at its *first* approval — the turn's pause (`turn.interrupted`, reason `approval_pending`) mapped to stop reason `cancelled`, then the editor's answer found no route and `rapid acp` exited 1. Now answers route by request id (registered before the request is written, under the id it carries), the prompt stays open across each pause and resumes only after the pause is recorded, `session/cancel` during a wait ends the prompt with the approval left pending, and a response no request awaits is dropped instead of ending the serve |
