@@ -14,6 +14,11 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 > paragraph cannot drift from the dispatcher without failing the build. A subcommand
 > this reference lists but that table does not carry exits 2 with
 > "rapid: unknown subcommand", and `rapid --help` does not advertise it.
+>
+> Hooks have no subcommand: they are project settings (`.rapidlm/settings.json`
+> `"hooks"`), narrowed by the managed policy's `[hooks]` table — see
+> [hooks](hooks.md). `rapid doctor` lists them; `rapid plugins hook-test`
+> dry-runs a plugin hook.
 
 | Command | Purpose |
 |---|---|
@@ -38,7 +43,6 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 | `rapid mcp list|get|add|remove|probe` | project MCP servers (stdio); see the MCP section below |
 | `rapid plugins validate|register|list|approve|reject|hook-test` | plugin manifest validation, trust ledger (register stores untrusted; only explicit approve grants capabilities), and hook dry-run against a fixture event |
 | `rapid permissions list|allow|revoke` | persisted per-project tool grants; see the permissions section below |
-| `rapid hooks list|test|enable|disable` | lifecycle hooks |
 | `rapid skills list|show|enable|disable` | skills |
 | `rapid eval --offline\|--live [--grant-shell] [--trials <n>] [--arms <names>] [--suite <dir>] [--scratch <dir>]` | evaluation harness (shipped): three suites (`eval/suite` representative, `eval/suite-smoke` mechanical smoke, `eval/suite-heldout` held-out), grading v2 outside the agent workspace (protected-file integrity, verification, mutation checks), typed infrastructure skips via a health probe, per-arm accounting with coverage/lower-bound flags, full provenance; exit 0 only when every task of every requested arm passed — see `eval/README.md` |
 | `rapid inspect <session/run>` | diagnostic state |

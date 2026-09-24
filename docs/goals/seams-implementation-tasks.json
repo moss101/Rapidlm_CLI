@@ -322,7 +322,7 @@
       "id": "SEAM-01-7",
       "title": "Hooks reference page, event catalog, SDK wire kinds, stale CLI-reference row",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-01-2",
         "SEAM-01-3",
@@ -344,7 +344,13 @@
         "pnpm generate:check green; a test executes every command line in hooks.md against --help."
       ],
       "evidence": [
-        "rule 2.4 part done early (overdue since SEAM-01-1): peer-product names removed from the comments, a test name and fixture model ids of every file SEAM-01 touched (exec_tools.rs, interactive.rs, model.rs, headless/jsonl.rs); the compat settings path stays, spelled once in PROJECT_SETTINGS_FILES \u2014 docs/goal-delivery-2026-09-20.md \u00a7 Rule 2.4"
+        "rule 2.4 part done early (overdue since SEAM-01-1): peer-product names removed from the comments, a test name and fixture model ids of every file SEAM-01 touched (exec_tools.rs, interactive.rs, model.rs, headless/jsonl.rs); the compat settings path stays, spelled once in PROJECT_SETTINGS_FILES \u2014 docs/goal-delivery-2026-09-20.md \u00a7 Rule 2.4",
+        "docs/goal-delivery-2026-09-20.md \u00a7 SEAM-01-7 \u2014 criterion table",
+        "docs/reference/hooks.md \u2014 stages, v1 and v2 contracts, decisions, rewrites, context, failure semantics, records, managed policy, checking hooks",
+        "apps/rapid/src/interactive.rs \u2014 test every_command_the_hooks_reference_names_is_dispatched (every `rapid \u2026` the page names is in SUBCOMMANDS, a verb among its operands; tripwires for a missing subcommand and verb)",
+        "docs/reference/cli-command-reference.md \u2014 the non-existent `rapid hooks` row removed; hooks pointed at the reference page",
+        "docs/reference/event-catalog.md + sdk/typescript/schemas/wire.v1.json \u2014 hook.decided / hook.input_rewritten / hook.failed (SEAM-01-1..5), pnpm generate:check green",
+        "revert cycle: a `rapid serve` line added to hooks.md \u2192 the test fails naming it"
       ]
     },
     {

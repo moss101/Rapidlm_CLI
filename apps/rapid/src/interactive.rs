@@ -13123,6 +13123,62 @@ alignment below it: {line:?}",
         );
     }
 
+    /// Whether `rapid <words…>` names a command this binary dispatches: the
+    /// subcommand is in [`SUBCOMMANDS`] and a following verb (not a flag or
+    /// a `<placeholder>`) is one of its operands' alternatives.
+    fn is_dispatched_command(words: &[&str]) -> bool {
+        let Some(entry) = words
+            .first()
+            .and_then(|name| SUBCOMMANDS.iter().find(|entry| entry.name == *name))
+        else {
+            return false;
+        };
+        match words.get(1) {
+            Some(verb) if !verb.starts_with('-') && !verb.starts_with('<') => entry
+                .operands
+                .split(|ch: char| ch == '|' || ch.is_whitespace() || ch == '[' || ch == ']')
+                .any(|alternative| alternative == *verb),
+            _ => true,
+        }
+    }
+
+    #[test]
+    fn every_command_the_hooks_reference_names_is_dispatched() {
+        // `docs/reference/hooks.md` tells users what to run (`rapid trust
+        // grant`, `rapid resume <session>`, `rapid doctor`, …). Every such
+        // command must be one the binary dispatches — the table `rapid
+        // --help` and `rapid <name> --help` are rendered from — so the page
+        // cannot point at a command that does not exist.
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference/hooks.md");
+        let doc =
+            fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        let mut named = Vec::new();
+        let mut rest = doc.as_str();
+        while let Some(open) = rest.find('`') {
+            rest = &rest[open + 1..];
+            let Some(close) = rest.find('`') else { break };
+            let span = &rest[..close];
+            rest = &rest[close + 1..];
+            if let Some(command) = span.strip_prefix("rapid ") {
+                named.push(command.to_owned());
+            }
+        }
+        assert!(named.len() >= 5, "the page names its commands: {named:?}");
+        for command in &named {
+            let words: Vec<&str> = command.split_whitespace().collect();
+            assert!(
+                is_dispatched_command(&words),
+                "docs/reference/hooks.md names `rapid {command}`, which this binary does not dispatch"
+            );
+        }
+        // The check is only worth anything if it can fail.
+        assert!(!is_dispatched_command(&["serve"]));
+        assert!(!is_dispatched_command(&["hooks", "list"]));
+        assert!(!is_dispatched_command(&["trust", "bogus"]));
+        assert!(is_dispatched_command(&["resume", "<session>"]));
+    }
+
     #[test]
     fn every_dispatched_subcommand_carries_a_summary_and_a_unique_name() {
         let mut seen = std::collections::BTreeSet::new();

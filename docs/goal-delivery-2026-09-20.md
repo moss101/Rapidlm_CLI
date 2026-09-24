@@ -143,3 +143,21 @@ The background review found ten issues; all verified against the code and fixed,
 Disclosed: a command that exits non-zero is a completed call (its exit status is in the result), so it fires `post_tool_use`, not the failure stage; the turn-end stage fired by a wrapper reports `tool_calls`/`tokens` as 0 (the kernel outcome carries no usage); a blocked ACP or `rapid daemon` prompt leaves a failed turn in the ledger (the adapter submits before the turn thread runs), where a blocked TUI or headless prompt starts no turn; the strengthened `hooks_cli` assertion is test-only and has no revert cycle.
 
 Revert cycles (two batched builds, each mutation with its own test): settle not told the decision, a blocked child ended as succeeded, the old any-hook answer, the failure stage skipping runtime errors, the locator only quote-escaped, a blocked child applied anyway, `/queue run` not journaling its hold, a cancelled error read as `error`, the goal loop back on `submit_turn`, a held head holding the queue, the wrapper never firing, the ACP gate never blocking — each fails its test (twelve); restored, green. The restore-order fix was caught failing by the extended queue test before it existed.
+
+## SEAM-01-7 — Hooks reference page, catalogs, the stale CLI-reference row
+
+Contract restated: `docs/reference/hooks.md` (new: stages and payloads, the v1 exit-code and v2 JSON contracts and their bounds, what each `pre_tool_use` decision does, approvals and the one-request rule, rewrites, fenced context, failure semantics per stage, records, the managed `[hooks]` policy, checking hooks), `docs/reference/cli-command-reference.md` (the `rapid hooks list|test|enable|disable` row named a command that has never existed — removed; hooks are pointed at the reference page), `apps/rapid/src/interactive.rs` (a test that every command the page names is dispatched). The event catalog and the SDK wire catalog already carry the three hook kinds (SEAM-01-1, -3, -5); `pnpm generate:check` is green. Migration impact: documentation only.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-08 `docs/reference/hooks.md` documents stages, v1/v2 contracts, failure semantics and managed gates | done | the page; kept true by the tests below and by the delivery records it summarises |
+| Every command the page names exists | done | `every_command_the_hooks_reference_names_is_dispatched` — each `` `rapid …` `` span is checked against `SUBCOMMANDS` (the table `rapid --help`, `rapid <name> --help` and `rapid man` render from), a following verb against that entry's operands; tripwires assert a missing subcommand, a missing verb and the old `rapid hooks list` all fail |
+| The stale CLI-reference row is gone (S9) | done | `rapid hooks …` removed; `the_reference_doc_lists_exactly_the_dispatched_subcommands` still green |
+| Catalogs: `hook.decided`, `hook.input_rewritten`, `hook.failed` | done | `docs/reference/event-catalog.md`, `sdk/typescript/schemas/wire.v1.json` (count pin 111), `pnpm generate:check` |
+| Rule 2.4 in the files SEAM-01 touched | done | § Rule 2.4 above (`5285f78`); `hooks.rs` names no peer product |
+| Revert cycle | done | a `` `rapid serve` `` line appended to the page: the test fails naming it; removed, green |
+
+Disclosed: the worklist's validation line asks for "a test [that] executes every command line in hooks.md against --help"; the test checks each command against the dispatch table that `--help` is rendered from instead of spawning the binary, because `--help` short-circuits before dispatch (`rapid mcp bogus --help` succeeds — see `every_subcommand_the_top_level_help_advertises_is_accepted`), so a spawned `--help` could not tell a real command from a misspelt one. Writing the page caught one real error: the review of `61b5114` + `4a1f521` called the SDK server `rapid serve`, and that name had been carried into two comments, a test name and the records before this test existed; it is `rapid daemon`, corrected before `2ec4fcd` was committed.
+
+SEAM-01 is complete: seven tasks, six self-review rounds whose findings were all fixed and revert-cycled. The review of `b91f622` + `2ec4fcd` was running when SEAM-01 closed; its confirmed findings are the next task.
+
