@@ -396,6 +396,7 @@ impl Http1Transport<StaticWireAuth> {
         if host_is_blocked(&parsed.host) {
             return Err(ProviderError::InvalidRequest);
         }
+        let dial = self.plan_dial(&parsed, cancel)?;
         if token
             .bytes()
             .any(|b| b < 0x20 || b == 0x7f || b == b'\n' || b == b'\r')
@@ -404,7 +405,8 @@ impl Http1Transport<StaticWireAuth> {
         }
 
         cancel.check()?;
-        let (mut stream, via) = self.open_stream(&parsed, cancel)?;
+        let mut stream = self.connect(&parsed, &dial, cancel)?;
+        let via = dial.via;
         let deadline = Instant::now() + self.timeout;
         write_http_request(
             &mut stream,
@@ -471,35 +473,49 @@ impl<A> Http1Transport<A> {
         self
     }
 
-    /// The stream for one exchange with `url`: TCP to the target, or to the
-    /// proxy the configuration names for it — a `CONNECT` tunnel when the
-    /// target is `https` — once the gate (if any) has permitted the
-    /// addresses, then TLS to the target when it is `https`. Also returns
-    /// the proxy an `http` target's request goes to, whose request line
-    /// then carries the absolute URL. A proxied target is not resolved
-    /// here — the proxy resolves it — so the address guard applies to the
-    /// proxy's addresses; the name guard (`host_is_blocked`) has already
-    /// judged the target.
-    fn open_stream(
+    /// Where one exchange with `url` dials: the addresses — the proxy's
+    /// when the configuration names one for it — resolved, guarded and
+    /// permitted by the gate (if any), before any socket is opened. Also
+    /// the proxy an `http` target's request goes to, whose request line then
+    /// carries the absolute URL. A proxied target is not dialled here, but a
+    /// name that resolves locally to an address the guard refuses is refused
+    /// through the proxy too (best effort: a name only the proxy can resolve
+    /// goes through). What a gate returns is dialled only on the port being
+    /// dialled and only where the guard allows it.
+    fn plan_dial(
         &self,
         url: &ParsedUrl,
         cancel: &CancellationToken,
-    ) -> Result<(MaybeTlsStream, Option<&ProxyTarget>), ProviderError> {
+    ) -> Result<Dial<'_>, ProviderError> {
         let https = url.scheme == UrlScheme::Https;
         let via = self.proxy.for_target(https, &url.host, url.port);
+        if via.is_some()
+            && let Ok(resolved) = (url.host.as_str(), url.port).to_socket_addrs()
+        {
+            for addr in resolved {
+                cancel.check()?;
+                if ip_is_blocked(addr.ip()) {
+                    return Err(ProviderError::InvalidRequest);
+                }
+            }
+        }
         let (host, port) = via.map_or((url.host.as_str(), url.port), |proxy| {
             (proxy.host(), proxy.port())
         });
         let mut addrs: Vec<SocketAddr> = Vec::new();
-        for addr in (host, port)
-            .to_socket_addrs()
-            .map_err(|_| ProviderError::Connection)?
-        {
-            cancel.check()?;
-            if ip_is_blocked(addr.ip()) {
-                return Err(ProviderError::InvalidRequest);
+        match (host, port).to_socket_addrs() {
+            Ok(resolved) => {
+                for addr in resolved {
+                    cancel.check()?;
+                    if ip_is_blocked(addr.ip()) {
+                        return Err(ProviderError::InvalidRequest);
+                    }
+                    addrs.push(addr);
+                }
             }
-            addrs.push(addr);
+            // A gate may resolve what the system resolver cannot.
+            Err(_) if self.gate.is_some() => {}
+            Err(_) => return Err(ProviderError::Connection),
         }
         if let Some(gate) = &self.gate {
             addrs = gate.permit(
@@ -511,10 +527,36 @@ impl<A> Http1Transport<A> {
                 via,
                 &addrs,
             )?;
+            if addrs
+                .iter()
+                .any(|addr| ip_is_blocked(addr.ip()) || addr.port() != port)
+            {
+                return Err(ProviderError::InvalidRequest);
+            }
         }
-        let addr = *addrs.first().ok_or(ProviderError::Connection)?;
+        if addrs.is_empty() {
+            return Err(ProviderError::Connection);
+        }
+        Ok(Dial {
+            addrs,
+            via: via.filter(|_| !https),
+            tunnel: via.filter(|_| https),
+        })
+    }
+
+    /// The stream for a planned dial: TCP to its first address — through a
+    /// `CONNECT` tunnel for an `https` target behind a proxy — then TLS to
+    /// the target when it is `https`. Connecting and tunnelling share one
+    /// timeout.
+    fn connect(
+        &self,
+        url: &ParsedUrl,
+        dial: &Dial<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<MaybeTlsStream, ProviderError> {
+        let deadline = Instant::now() + self.timeout;
         cancel.check()?;
-        let mut tcp = TcpStream::connect_timeout(&addr, self.timeout)
+        let mut tcp = TcpStream::connect_timeout(&dial.addrs[0], self.timeout)
             .map_err(|_| ProviderError::Connection)?;
         tcp.set_read_timeout(Some(slice_timeout(self.timeout)))
             .map_err(|_| ProviderError::Connection)?;
@@ -524,27 +566,38 @@ impl<A> Http1Transport<A> {
             .map_err(|_| ProviderError::Connection)?;
         // TLS is negotiated lazily on first write/read against the Mozilla
         // root set; the same deadline/SSRF guards bound the handshake.
-        let stream = if https {
-            if let Some(proxy) = via {
+        if url.scheme == UrlScheme::Https {
+            if let Some(proxy) = dial.tunnel {
                 connect_tunnel(
                     &mut tcp,
                     &url.host,
                     url.port,
                     proxy.authorization(),
                     cancel,
-                    Instant::now() + self.timeout,
+                    deadline,
                 )?;
             }
             let server_name = ServerName::try_from(url.host.to_string())
                 .map_err(|_| ProviderError::InvalidRequest)?;
             let connection = ClientConnection::new(Arc::clone(&TLS_CLIENT_CONFIG), server_name)
                 .map_err(|_| ProviderError::Connection)?;
-            MaybeTlsStream::Tls(Box::new(StreamOwned::new(connection, tcp)))
+            Ok(MaybeTlsStream::Tls(Box::new(StreamOwned::new(
+                connection, tcp,
+            ))))
         } else {
-            MaybeTlsStream::Plain(tcp)
-        };
-        Ok((stream, via.filter(|_| !https)))
+            Ok(MaybeTlsStream::Plain(tcp))
+        }
     }
+}
+
+/// A dial planned by [`Http1Transport::plan_dial`].
+struct Dial<'a> {
+    /// Guarded, permitted, never empty.
+    addrs: Vec<SocketAddr>,
+    /// The proxy an `http` request is sent to (absolute form).
+    via: Option<&'a ProxyTarget>,
+    /// The proxy an `https` target is tunnelled through.
+    tunnel: Option<&'a ProxyTarget>,
 }
 
 impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
@@ -569,6 +622,7 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         if host_is_blocked(&parsed.host) {
             return Err(ProviderError::InvalidRequest);
         }
+        let dial = self.plan_dial(&parsed, cancel)?;
 
         let token = self.auth.bearer_token(request.credential, cancel)?;
         if token
@@ -579,7 +633,8 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         }
 
         cancel.check()?;
-        let (mut stream, via) = self.open_stream(&parsed, cancel)?;
+        let mut stream = self.connect(&parsed, &dial, cancel)?;
+        let via = dial.via;
 
         let deadline = Instant::now() + self.timeout;
         write_http_request(
@@ -615,6 +670,7 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         if host_is_blocked(&parsed.host) {
             return Err(ProviderError::InvalidRequest);
         }
+        let dial = self.plan_dial(&parsed, cancel)?;
 
         let token = self.auth.bearer_token(request.credential, cancel)?;
         if token
@@ -625,7 +681,8 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         }
 
         cancel.check()?;
-        let (mut stream, via) = self.open_stream(&parsed, cancel)?;
+        let mut stream = self.connect(&parsed, &dial, cancel)?;
+        let via = dial.via;
 
         let deadline = Instant::now() + self.timeout;
         write_http_request(
@@ -1215,6 +1272,9 @@ fn classify_http_error(response: &ProviderHttpResponse) -> Result<(), ProviderEr
         400 | 413 if parsed.as_ref().is_some_and(json_is_context_too_large) => {
             Err(ProviderError::ContextTooLarge)
         }
+        // Only a proxy asks for its own credentials: the path, not the
+        // provider, refused.
+        407 => Err(ProviderError::Connection),
         408 | 409 | 425 | 500 | 502 | 503 | 504 => Err(ProviderError::Transient),
         // A redirect is never followed, and asking again is redirected again.
         300..=499 => Err(ProviderError::Permanent),
@@ -1981,7 +2041,7 @@ fn host_is_blocked(host: &str) -> bool {
     false
 }
 
-fn decode_ipv4_literal(host: &str) -> Option<Ipv4Addr> {
+pub(crate) fn decode_ipv4_literal(host: &str) -> Option<Ipv4Addr> {
     if host.is_empty() || host.len() > 63 {
         return None;
     }
@@ -3970,7 +4030,7 @@ mod tests {
                 Duration::from_secs(3),
                 MAX_HTTP_RESPONSE_BYTES,
             )
-            .with_proxy(proxy_env("HTTP_PROXY", proxy));
+            .with_proxy(proxy_env("http_proxy", proxy));
             let adapter = OpenAiCompatibleAdapter::new(
                 config(
                     "http://gw.example.test:8080/v1",
@@ -4081,7 +4141,7 @@ mod tests {
             asked: std::sync::Mutex::new(Vec::new()),
         });
         let transport = Http1Transport::new(StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"))
-            .with_proxy(proxy_env("HTTP_PROXY", proxy))
+            .with_proxy(proxy_env("http_proxy", proxy))
             .with_dial_gate(Arc::clone(&permitting) as Arc<dyn DialGate>);
         let response = transport
             .post_raw(
@@ -4243,6 +4303,155 @@ mod tests {
                 &live()
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn what_a_gate_returns_is_dialled_only_where_the_guard_allows_and_on_the_port_dialled() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("addr").port();
+        struct Returning(Vec<SocketAddr>);
+        impl DialGate for Returning {
+            fn permit(
+                &self,
+                _target: DialTarget<'_>,
+                _via: Option<&ProxyTarget>,
+                _addrs: &[SocketAddr],
+            ) -> Result<Vec<SocketAddr>, ProviderError> {
+                Ok(self.0.clone())
+            }
+        }
+        for returned in [
+            "169.254.169.254:80".parse::<SocketAddr>().expect("addr"),
+            format!("127.0.0.1:{}", port.wrapping_add(1))
+                .parse()
+                .expect("addr"),
+        ] {
+            let transport =
+                Http1Transport::new(StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"))
+                    .with_dial_gate(Arc::new(Returning(vec![returned])));
+            let result = transport.post_raw(
+                &format!("http://127.0.0.1:{port}/v1/x"),
+                &[],
+                b"{}",
+                FIXTURE_TOKEN,
+                &live(),
+            );
+            assert!(
+                matches!(result, Err(ProviderError::InvalidRequest)),
+                "{returned}: refused"
+            );
+        }
+        assert!(
+            matches!(listener.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock),
+            "nothing was dialled"
+        );
+        // A name the system resolver cannot resolve: a gate may.
+        let (server, heads) =
+            scripted_proxy("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+        let transport = Http1Transport::new(StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"))
+            .with_dial_gate(Arc::new(Returning(vec![server])));
+        let response = transport
+            .post_raw(
+                &format!("http://gate-resolves.invalid:{}/v1/x", server.port()),
+                &[],
+                b"{}",
+                FIXTURE_TOKEN,
+                &live(),
+            )
+            .expect("dialled where the gate said");
+        assert_eq!(response.status, 200);
+        assert_eq!(heads.lock().expect("heads").len(), 1);
+    }
+
+    #[test]
+    fn an_opened_tunnel_carries_tls_to_the_target_and_nothing_of_the_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let captured = Arc::new(std::sync::Mutex::new((String::new(), Vec::new())));
+        let seen = Arc::clone(&captured);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 64 * 1024 {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let _ = stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n");
+                let mut tail = vec![0u8; 512];
+                let read = stream.read(&mut tail).unwrap_or(0);
+                tail.truncate(read);
+                *seen.lock().expect("captured") =
+                    (String::from_utf8_lossy(&head).into_owned(), tail);
+            }
+        });
+        let transport = Http1Transport::with_limits(
+            StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"),
+            Duration::from_secs(3),
+            MAX_HTTP_RESPONSE_BYTES,
+        )
+        .with_proxy(proxy_env("HTTPS_PROXY", addr));
+        // The stand-in proxy closes after the first bytes: the handshake
+        // fails, which is all this needs.
+        let _ = transport.post_raw(
+            "https://api.example.test/v1/x",
+            &[],
+            b"{}",
+            FIXTURE_TOKEN,
+            &live(),
+        );
+        let (head, tail) = captured.lock().expect("captured").clone();
+        assert!(
+            head.starts_with("CONNECT api.example.test:443 HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.contains("\r\nProxy-Authorization: Basic dXNlcjpwdw==\r\n"),
+            "{head}"
+        );
+        assert!(
+            tail.starts_with(&[0x16, 0x03]),
+            "a TLS handshake follows: {tail:?}"
+        );
+        let tail_text = String::from_utf8_lossy(&tail);
+        assert!(
+            !tail_text.contains(FIXTURE_TOKEN),
+            "the bearer stays inside TLS"
+        );
+        assert!(!tail_text.contains("Proxy-Authorization"));
+    }
+
+    #[test]
+    fn the_address_is_resolved_and_guarded_before_the_credential_is_looked_at() {
+        // An unresolvable host with an unusable token: the host decides, as
+        // it did before the transport could dial through a proxy.
+        let transport = Http1Transport::new(StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"));
+        let result = transport.post_raw(
+            "http://unresolvable.invalid/v1/x",
+            &[],
+            b"{}",
+            "bad\ntoken",
+            &live(),
+        );
+        assert!(
+            matches!(result, Err(ProviderError::Connection)),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn a_proxy_refusing_its_own_credentials_is_a_network_failure() {
+        let response = ProviderHttpResponse::new(407, Vec::new(), Vec::new()).expect("response");
+        assert_eq!(
+            classify_http_error(&response),
+            Err(ProviderError::Connection)
         );
     }
 }

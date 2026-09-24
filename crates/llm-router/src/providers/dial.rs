@@ -2,16 +2,25 @@
 //! when the environment names one, and only where a composition root's
 //! [`DialGate`] permits.
 //!
-//! * [`ProxyConfig`] reads `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` (either
-//!   case) from explicit environment pairs — the caller decides where they
-//!   come from. Only `http://` proxies are supported: an `https://` proxy
-//!   is refused when the configuration is read, not silently ignored. A
-//!   loopback target (`localhost`, `127.0.0.0/8`, `::1`) is always dialled
+//! * [`ProxyConfig`] reads `https_proxy` / `HTTPS_PROXY`, `http_proxy`
+//!   (lower case only: the upper-case name can be set from a request header
+//!   in some server environments) and `no_proxy` / `NO_PROXY` from explicit
+//!   environment pairs — the caller decides where they come from. Only
+//!   `http://` proxies are supported: an `https://` proxy is refused when
+//!   the configuration is read, not silently ignored. A loopback target
+//!   (`localhost`, `127.0.0.0/8` in any spelling, `::1`) is always dialled
 //!   directly — a local model server behind a corporate proxy variable is
-//!   the common case.
+//!   the common case. `NO_PROXY` takes names (and their subdomains, `.x` and
+//!   `*.x` alike), exact addresses, address ranges (`10.0.0.0/8`) and `*`.
 //! * An `https://` target through a proxy is a `CONNECT` tunnel with TLS to
-//!   the target inside it; an `http://` target through a proxy is an
-//!   absolute-form request to the proxy.
+//!   the target inside it: the proxy sees neither the request nor its
+//!   credential. An `http://` target through a proxy is an absolute-form
+//!   request to the proxy — which then sees the whole request, its bearer
+//!   included, as anything on a plain-http path does.
+//! * A proxied target is not resolved to be dialled (the proxy resolves it),
+//!   but a name that resolves locally to an address the transport's guard
+//!   refuses is refused through the proxy too; a name only the proxy can
+//!   resolve goes through.
 //! * [`DialGate`] is asked before any connection is made, with the target
 //!   the request is for, the proxy it goes through, and the addresses about
 //!   to be dialled; it returns the addresses that may be dialled (an egress
@@ -25,8 +34,8 @@ use crate::provider::{CancellationToken, ProviderError};
 
 /// Most bytes of a proxy's `CONNECT` response head read before giving up.
 const MAX_CONNECT_RESPONSE_BYTES: usize = 8 * 1024;
-/// Most `NO_PROXY` entries honoured.
-const MAX_NO_PROXY_ENTRIES: usize = 64;
+/// Most `NO_PROXY` entries read; more is refused, not cut short.
+const MAX_NO_PROXY_ENTRIES: usize = 256;
 
 /// One HTTP proxy: where to dial it and, when its URL carried credentials,
 /// the `Proxy-Authorization` value (never printed: `Debug` redacts it).
@@ -69,7 +78,20 @@ impl ProxyTarget {
 pub struct ProxyConfig {
     https: Option<ProxyTarget>,
     http: Option<ProxyTarget>,
-    no_proxy: Vec<String>,
+    no_proxy: Vec<NoProxyEntry>,
+}
+
+/// One `NO_PROXY` entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum NoProxyEntry {
+    /// `*`: nothing is proxied.
+    Everything,
+    /// A name and its subdomains, on any port or one.
+    Name { name: String, port: Option<u16> },
+    /// One address, on any port or one.
+    Address { ip: IpAddr, port: Option<u16> },
+    /// An address range (`10.0.0.0/8`, `fd00::/8`).
+    Range { network: IpAddr, prefix: u8 },
 }
 
 /// Why the proxy configuration was refused. Never echoes a credential.
@@ -79,6 +101,8 @@ pub enum ProxyConfigError {
     Invalid { variable: &'static str },
     /// `<variable>` names an `https://` proxy, which is not supported.
     HttpsProxyUnsupported { variable: &'static str },
+    /// `<variable>` lists more entries than are read.
+    TooManyEntries { variable: &'static str },
 }
 
 impl std::fmt::Display for ProxyConfigError {
@@ -91,6 +115,10 @@ impl std::fmt::Display for ProxyConfigError {
                 f,
                 "{variable} names an https:// proxy; only http:// proxies are supported"
             ),
+            Self::TooManyEntries { variable } => write!(
+                f,
+                "{variable} lists more than {MAX_NO_PROXY_ENTRIES} entries"
+            ),
         }
     }
 }
@@ -98,33 +126,38 @@ impl std::fmt::Display for ProxyConfigError {
 impl std::error::Error for ProxyConfigError {}
 
 impl ProxyConfig {
-    /// Read the proxy variables from `env` (upper case wins over lower
-    /// case, as most tools read them). No variable set: no proxy.
+    /// Read the proxy variables from `env`: `https_proxy` then
+    /// `HTTPS_PROXY`, `http_proxy` (lower case only), `no_proxy` then
+    /// `NO_PROXY`. A variable set but empty turns its proxy off rather than
+    /// falling back to the other spelling. Names are compared ignoring case
+    /// on Windows, as the system compares them. No variable set: no proxy.
     pub fn from_env(env: &[(String, String)]) -> Result<Self, ProxyConfigError> {
-        let value = |upper: &'static str, lower: &'static str| -> Option<(&'static str, String)> {
-            [upper, lower].into_iter().find_map(|name| {
-                env.iter()
-                    .find(|(key, _)| key == name)
-                    .map(|(_, value)| value.trim().to_owned())
-                    .filter(|value| !value.is_empty())
-                    .map(|value| (name, value))
-            })
+        let value = |names: &[&'static str]| -> Option<(&'static str, String)> {
+            names
+                .iter()
+                .find_map(|name| {
+                    env.iter()
+                        .find(|(key, _)| {
+                            if cfg!(windows) {
+                                key.eq_ignore_ascii_case(name)
+                            } else {
+                                key == name
+                            }
+                        })
+                        .map(|(_, value)| (*name, value.trim().to_owned()))
+                })
+                .filter(|(_, value)| !value.is_empty())
         };
-        let https = value("HTTPS_PROXY", "https_proxy")
+        let https = value(&["https_proxy", "HTTPS_PROXY"])
             .map(|(name, url)| parse_proxy(name, &url))
             .transpose()?;
-        let http = value("HTTP_PROXY", "http_proxy")
+        let http = value(&["http_proxy"])
             .map(|(name, url)| parse_proxy(name, &url))
             .transpose()?;
-        let no_proxy = value("NO_PROXY", "no_proxy")
-            .map(|(_, list)| {
-                list.split(',')
-                    .map(|entry| entry.trim().trim_start_matches('.').to_ascii_lowercase())
-                    .filter(|entry| !entry.is_empty())
-                    .take(MAX_NO_PROXY_ENTRIES)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let no_proxy = match value(&["no_proxy", "NO_PROXY"]) {
+            Some((name, list)) => parse_no_proxy(name, &list)?,
+            None => Vec::new(),
+        };
         Ok(Self {
             https,
             http,
@@ -149,35 +182,127 @@ impl ProxyConfig {
             .trim_start_matches('[')
             .trim_end_matches(']')
             .to_ascii_lowercase();
-        if is_loopback_host(&host) || self.bypasses(&host, port) {
+        let address = literal_address(&host);
+        if is_loopback_host(&host, address) || self.bypasses(&host, address, port) {
             return None;
         }
         Some(proxy)
     }
 
-    fn bypasses(&self, host: &str, port: u16) -> bool {
-        self.no_proxy.iter().any(|entry| {
-            if entry == "*" {
-                return true;
+    fn bypasses(&self, host: &str, address: Option<IpAddr>, port: u16) -> bool {
+        let on_port = |entry_port: &Option<u16>| entry_port.is_none_or(|entry| entry == port);
+        self.no_proxy.iter().any(|entry| match entry {
+            NoProxyEntry::Everything => true,
+            // A name never matches an address by suffix (`0.1` is not a
+            // domain of `10.0.0.1`).
+            NoProxyEntry::Name { name, port } => {
+                address.is_none()
+                    && on_port(port)
+                    && (host == name || host.ends_with(&format!(".{name}")))
             }
-            let (name, entry_port) = match entry.rsplit_once(':') {
-                Some((name, entry_port)) if !name.contains(':') => {
-                    (name, entry_port.parse::<u16>().ok())
-                }
-                _ => (entry.as_str(), None),
-            };
-            if entry_port.is_some_and(|entry_port| entry_port != port) {
-                return false;
+            NoProxyEntry::Address { ip, port } => address == Some(*ip) && on_port(port),
+            NoProxyEntry::Range { network, prefix } => {
+                address.is_some_and(|ip| in_range(ip, *network, *prefix))
             }
-            host == name || host.ends_with(&format!(".{name}"))
         })
     }
 }
 
-fn is_loopback_host(host: &str) -> bool {
+/// The address a host names literally, in any spelling the transport
+/// accepts (`127.1` and `0x7f000001` included).
+fn literal_address(host: &str) -> Option<IpAddr> {
+    host.parse::<IpAddr>()
+        .ok()
+        .or_else(|| crate::providers::openai_compatible::decode_ipv4_literal(host).map(IpAddr::V4))
+}
+
+fn is_loopback_host(host: &str, address: Option<IpAddr>) -> bool {
     host == "localhost"
         || host.ends_with(".localhost")
-        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        || address.is_some_and(|ip| ip.is_loopback())
+}
+
+fn in_range(ip: IpAddr, network: IpAddr, prefix: u8) -> bool {
+    match (ip, network) {
+        (IpAddr::V4(ip), IpAddr::V4(network)) => {
+            let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+            u32::from(ip) & mask == u32::from(network) & mask
+        }
+        (IpAddr::V6(ip), IpAddr::V6(network)) => {
+            let mask = u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0);
+            u128::from(ip) & mask == u128::from(network) & mask
+        }
+        _ => false,
+    }
+}
+
+fn parse_no_proxy(
+    variable: &'static str,
+    list: &str,
+) -> Result<Vec<NoProxyEntry>, ProxyConfigError> {
+    let invalid = ProxyConfigError::Invalid { variable };
+    let entries: Vec<&str> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    if entries.len() > MAX_NO_PROXY_ENTRIES {
+        return Err(ProxyConfigError::TooManyEntries { variable });
+    }
+    entries
+        .into_iter()
+        .map(|raw| {
+            let entry = raw.to_ascii_lowercase();
+            if entry == "*" {
+                return Ok(NoProxyEntry::Everything);
+            }
+            if let Some((network, prefix)) = entry.split_once('/') {
+                let network = network
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<IpAddr>()
+                    .map_err(|_| invalid.clone())?;
+                let prefix = prefix.parse::<u8>().map_err(|_| invalid.clone())?;
+                let bits = if network.is_ipv4() { 32 } else { 128 };
+                if prefix > bits {
+                    return Err(invalid.clone());
+                }
+                return Ok(NoProxyEntry::Range { network, prefix });
+            }
+            // `[addr]:port`, `host:port`, a bare IPv6 address, or a name.
+            let (host, port) = if let Some(bracketed) = entry.strip_prefix('[') {
+                let (host, after) = bracketed.split_once(']').ok_or(invalid.clone())?;
+                let port = match after {
+                    "" => None,
+                    rest => Some(
+                        rest.strip_prefix(':')
+                            .and_then(|port| port.parse::<u16>().ok())
+                            .ok_or(invalid.clone())?,
+                    ),
+                };
+                (host.to_owned(), port)
+            } else if entry.matches(':').count() == 1 {
+                let (host, port) = entry.split_once(':').ok_or(invalid.clone())?;
+                (
+                    host.to_owned(),
+                    Some(port.parse::<u16>().map_err(|_| invalid.clone())?),
+                )
+            } else {
+                (entry.clone(), None)
+            };
+            if let Some(ip) = literal_address(&host) {
+                return Ok(NoProxyEntry::Address { ip, port });
+            }
+            let name = host.trim_start_matches("*.").trim_start_matches('.');
+            if name.is_empty() || name.contains(['*', '/', ' ']) {
+                return Err(invalid.clone());
+            }
+            Ok(NoProxyEntry::Name {
+                name: name.to_owned(),
+                port,
+            })
+        })
+        .collect()
 }
 
 fn parse_proxy(variable: &'static str, url: &str) -> Result<ProxyTarget, ProxyConfigError> {
@@ -199,9 +324,12 @@ fn parse_proxy(variable: &'static str, url: &str) -> Result<ProxyTarget, ProxyCo
     };
     let (host, port) = if let Some(bracketed) = hostport.strip_prefix('[') {
         let (host, after) = bracketed.split_once(']').ok_or(invalid.clone())?;
-        let port = match after.strip_prefix(':') {
-            Some(port) => port.parse().map_err(|_| invalid.clone())?,
-            None => 80,
+        let port = match after {
+            "" => 80,
+            rest => rest
+                .strip_prefix(':')
+                .and_then(|port| port.parse().ok())
+                .ok_or(invalid.clone())?,
         };
         (host.to_owned(), port)
     } else {
@@ -218,8 +346,18 @@ fn parse_proxy(variable: &'static str, url: &str) -> Result<ProxyTarget, ProxyCo
     {
         return Err(invalid);
     }
+    // Basic credentials are `user:password`; a user alone has an empty one.
     let authorization = userinfo
-        .map(|userinfo| percent_decode(userinfo).ok_or(invalid))
+        .map(|userinfo| {
+            percent_decode(userinfo)
+                .map(|mut decoded| {
+                    if !decoded.contains(&b':') {
+                        decoded.push(b':');
+                    }
+                    decoded
+                })
+                .ok_or(invalid)
+        })
         .transpose()?
         .map(|userinfo| format!("Basic {}", base64(&userinfo)));
     Ok(ProxyTarget {
@@ -237,8 +375,11 @@ fn percent_decode(text: &str) -> Option<Vec<u8>> {
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' {
-            let hex = std::str::from_utf8(bytes.get(index + 1..index + 3)?).ok()?;
-            out.push(u8::from_str_radix(hex, 16).ok()?);
+            let pair = bytes.get(index + 1..index + 3)?;
+            if !pair.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
+            out.push(u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?);
             index += 3;
         } else {
             out.push(bytes[index]);
@@ -275,7 +416,11 @@ fn base64(bytes: &[u8]) -> String {
 /// to be dialled (the proxy's when there is one). Returns the addresses that
 /// may be dialled — a gate that resolves the name itself returns its own
 /// resolution, so a second, different DNS answer is never used — or refuses
-/// (`ProviderError::Connection` reads as "could not reach it").
+/// (`ProviderError::Connection` reads as "could not reach it"). The name to
+/// resolve is the proxy's when `via` is set (the transport dials the proxy),
+/// the target's otherwise; `addrs` is empty when the system resolver found
+/// nothing. What the gate returns is dialled only on the port being dialled
+/// and only where the transport's address guard allows it.
 pub trait DialGate: Send + Sync {
     fn permit(
         &self,
@@ -323,7 +468,7 @@ pub(crate) fn connect_tunnel(
     let mut byte = [0u8; 1];
     // Byte by byte, so nothing past the proxy's head (the target's TLS
     // handshake) is consumed here.
-    while !head.ends_with(b"\r\n\r\n") {
+    while !(head.ends_with(b"\r\n\r\n") || head.ends_with(b"\n\n")) {
         cancel.check()?;
         if Instant::now() >= deadline || head.len() >= MAX_CONNECT_RESPONSE_BYTES {
             return Err(ProviderError::Connection);
@@ -346,6 +491,9 @@ pub(crate) fn connect_tunnel(
         .next()
         .map(|line| String::from_utf8_lossy(line).into_owned())
         .unwrap_or_default();
+    if !status_line.starts_with("HTTP/") {
+        return Err(ProviderError::Connection);
+    }
     let status: u16 = status_line
         .split_whitespace()
         .nth(1)
@@ -370,11 +518,11 @@ mod tests {
     }
 
     #[test]
-    fn proxy_variables_are_read_upper_case_first_and_credentials_never_printed() {
+    fn proxy_variables_are_read_lower_case_first_and_credentials_never_printed() {
         let config = ProxyConfig::from_env(&env(&[
-            ("https_proxy", "http://lower:1"),
-            ("HTTPS_PROXY", "http://user:s3cret@proxy.corp.example:3128/"),
-            ("HTTP_PROXY", "proxy.corp.example:8080"),
+            ("HTTPS_PROXY", "http://upper:1"),
+            ("https_proxy", "http://user:s3cret@proxy.corp.example:3128/"),
+            ("http_proxy", "proxy.corp.example:8080"),
         ]))
         .expect("config");
         let https = config
@@ -400,6 +548,81 @@ mod tests {
             Some(format!("Basic {}", base64(b"us@er:p:ss")).as_str())
         );
         assert!(ProxyConfig::from_env(&env(&[("HTTPS_PROXY", "http://u:%zz@proxy:1")])).is_err());
+        assert!(ProxyConfig::from_env(&env(&[("HTTPS_PROXY", "http://u:%+1@proxy:1")])).is_err());
+        // A user alone is `user:` (an empty password).
+        let user_only =
+            ProxyConfig::from_env(&env(&[("HTTPS_PROXY", "http://user@proxy:1")])).expect("config");
+        assert_eq!(
+            user_only
+                .for_target(true, "api.example.com", 443)
+                .and_then(ProxyTarget::authorization),
+            Some(format!("Basic {}", base64(b"user:")).as_str())
+        );
+        assert!(ProxyConfig::from_env(&env(&[("HTTPS_PROXY", "http://[::1]x")])).is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_upper_case_http_proxy_is_not_read_and_an_empty_value_turns_a_proxy_off() {
+        // The upper-case name can arrive from a request header in some
+        // server environments.
+        let upper_only =
+            ProxyConfig::from_env(&env(&[("HTTP_PROXY", "http://proxy:3128")])).expect("config");
+        assert!(upper_only.for_target(false, "gw.example.com", 80).is_none());
+        // Set but empty: off, not a fall-back to the other spelling.
+        let off = ProxyConfig::from_env(&env(&[
+            ("https_proxy", ""),
+            ("HTTPS_PROXY", "http://proxy:3128"),
+        ]))
+        .expect("config");
+        assert!(off.for_target(true, "api.example.com", 443).is_none());
+    }
+
+    #[test]
+    fn no_proxy_takes_names_addresses_and_ranges_and_refuses_what_it_cannot_read() {
+        let config = ProxyConfig::from_env(&env(&[
+            ("https_proxy", "http://proxy:3128"),
+            (
+                "no_proxy",
+                "*.corp.example, 10.0.0.0/8, 192.168.1.7, [fd00::1]:8443, 0.1",
+            ),
+        ]))
+        .expect("config");
+        for (host, port, direct) in [
+            ("api.corp.example", 443, true),
+            ("corp.example", 443, true),
+            ("10.1.2.3", 11434, true),
+            ("192.168.1.7", 443, true),
+            ("192.168.1.8", 443, false),
+            ("fd00::1", 8443, true),
+            ("fd00::1", 443, false),
+            // A name entry never matches an address by suffix.
+            ("172.16.0.1", 443, false),
+            ("api.example.com", 443, false),
+        ] {
+            assert_eq!(
+                config.for_target(true, host, port).is_none(),
+                direct,
+                "{host}:{port}"
+            );
+        }
+        // Loopback in any spelling the transport accepts goes direct.
+        for local in ["127.1", "0x7f000001", "127.000.000.001"] {
+            assert!(config.for_target(true, local, 443).is_none(), "{local}");
+        }
+        let many = vec!["a.example"; MAX_NO_PROXY_ENTRIES + 1].join(",");
+        assert_eq!(
+            ProxyConfig::from_env(&env(&[("no_proxy", many.as_str())])).expect_err("too many"),
+            ProxyConfigError::TooManyEntries {
+                variable: "no_proxy"
+            }
+        );
+        for bad in ["10.0.0.0/40", "host:port", "a b"] {
+            assert!(
+                ProxyConfig::from_env(&env(&[("no_proxy", bad)])).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -459,9 +682,9 @@ mod tests {
             "http://user:pw@:3128",
             "http://proxy:notaport",
         ] {
-            let err = ProxyConfig::from_env(&env(&[("HTTP_PROXY", bad)])).expect_err(bad);
+            let err = ProxyConfig::from_env(&env(&[("http_proxy", bad)])).expect_err(bad);
             assert!(!err.to_string().contains("pw"), "{err}");
-            assert!(err.to_string().contains("HTTP_PROXY"), "{err}");
+            assert!(err.to_string().contains("http_proxy"), "{err}");
         }
     }
 
@@ -470,6 +693,8 @@ mod tests {
         use std::net::TcpListener;
         for (answer, ok) in [
             ("HTTP/1.1 200 Connection established\r\n\r\n", true),
+            ("HTTP/1.1 200 OK\n\n", true),
+            ("SPDY 200 OK\r\n\r\n", false),
             ("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n", false),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
