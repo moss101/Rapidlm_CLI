@@ -463,7 +463,7 @@ Governing document: `docs/goals/seams-governing-principles.md`. Worklist: `docs/
 | SEAM-00-2 | P0 | VERIFIED | planner | 2026-09-20 | 2026-09-20 |  | ADR 0022 (hook result v2), ADR 0023 (inbox edges), ADR 0024 (plan proposals) | each extends an existing primitive; none adds an engine |
 | SEAM-00-3 | P0 | VERIFIED | planner | 2026-09-20 | 2026-09-20 |  | `docs/goals/seams-implementation-tasks.json` (53 tasks); governing document §4 "today" paragraphs corrected with pointers to the audit | commit names the audit |
 | SEAM-01 | P1 | VERIFIED | coder | 2026-09-20 | 2026-09-24 | 01e64f3 … the SEAM-01-7 commit | `docs/goal-delivery-2026-09-20.md` §§ SEAM-01-1 … SEAM-01-7 and six self-review sections; `docs/reference/hooks.md` | hook decision contract v2 — 7 of 7 tasks (result v2 and fixture, `ask` on the approval wait, validated rewrites, fenced context, new stages, managed hook policy, reference page); six self-review rounds fixed; findings of the review of `b91f622` + `2ec4fcd` are follow-ups |
-| SEAM-02 | P1 | NOT_STARTED |  |  |  |  |  | provider onboarding and resilience — 6 tasks |
+| SEAM-02 | P1 | IN_PROGRESS | coder | 2026-09-24 |  |  | SEAM-02-1: `docs/goal-delivery-2026-09-20.md` (preset table; `rapid setup` argument surface; the plan and `--dry-run`, no network and no write) | provider onboarding and resilience — 1 of 6 tasks landed |
 | SEAM-03 | P1 | NOT_STARTED |  |  |  |  |  | background work — 5 tasks; `/jobs` rows verified ledger-derived |
 | SEAM-04 | P1 | NOT_STARTED |  |  |  |  |  | subagent control — 5 tasks |
 | SEAM-05 | P1 | NOT_STARTED |  |  |  |  |  | plan mode — 3 tasks; read-only floor already in the lattice |

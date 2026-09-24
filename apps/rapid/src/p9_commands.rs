@@ -1477,6 +1477,20 @@ pub fn run_permissions(args: &[String]) -> Result<i32, P9CommandError> {
     }
 }
 
+/// `rapid setup`: print what [`crate::setup::run`] produced and exit with its
+/// code (usage errors included — the message and the pointer to `--help` are
+/// already in its stderr).
+pub fn run_setup(args: &[String]) -> Result<i32, P9CommandError> {
+    let outcome = crate::setup::run(
+        args,
+        &crate::setup::SetupEnv::from_process(),
+        &mut crate::setup::TerminalPrompter,
+    );
+    print!("{}", outcome.stdout);
+    eprint!("{}", outcome.stderr);
+    Ok(outcome.exit)
+}
+
 /// `rapid doctor --help`.
 pub const DOCTOR_USAGE: &str = "\
 usage: rapid doctor

@@ -357,7 +357,7 @@
       "id": "SEAM-02-1",
       "title": "Preset table and `rapid setup` argument surface with --dry-run/--non-interactive/--output json",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-00-3"
       ],
@@ -377,7 +377,12 @@
       "validation": [
         "Dry-run in a temp home leaves the directory hash unchanged and opens no socket (a stub listener proves no connection); the JSON output lists the files and keys."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goal-delivery-2026-09-20.md \u00a7 SEAM-02-1 \u2014 criterion table",
+        "apps/rapid/src/setup.rs \u2014 PRESETS, parse_args, resolve_choice, config_target, plan (toml_edit), render_text/render_json, run; tests every_preset_row_is_usable_as_written, a_dry_run_prints_the_plan_and_writes_nothing_and_connects_nowhere, an_existing_config_is_edited_not_replaced_and_a_shadowing_key_is_unset, an_existing_config_that_does_not_parse_is_left_untouched, a_key_on_the_command_line_is_refused_with_the_reason, the_argument_surface_is_closed_and_consistent, a_missing_choice_is_asked_on_a_terminal_and_a_usage_error_otherwise, the_config_target_is_the_file_a_run_would_read",
+        "apps/rapid/src/interactive.rs \u2014 `setup` in SUBCOMMANDS; apps/rapid/src/p9_commands.rs \u2014 run_setup",
+        "revert cycle: five mutations (dry run writes, key flags unrefused, unparseable file replaced, wrong preset dialect, shadowing key kept) each fail their test"
+      ]
     },
     {
       "id": "SEAM-02-2",

@@ -53,6 +53,7 @@ auth = { path = "../../crates/auth" }
 llm-router = { path = "../../crates/llm-router" }
 # toml: MIT/Apache-2.0; Grok-style user model config document parsing.
 toml = "0.8"
+toml_edit = "0.22"
 # event-ledger: ErasedEventEnvelope / EventKind are the kernel event inputs mapped
 # onto JSONL records. event-ledger does not depend on this crate.
 event-ledger = { path = "../../crates/event-ledger" }

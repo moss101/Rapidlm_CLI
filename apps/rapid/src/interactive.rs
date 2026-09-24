@@ -687,6 +687,13 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         handler: SubcommandHandler::P9(crate::p9_commands::run_permissions),
     },
     Subcommand {
+        name: "setup",
+        operands: "[--preset <id>] [--model <id>] [--base-url <url>] [--key-env <VAR> | --key-stdin] [--dry-run]",
+        summary: "write a model configuration (dry run today)",
+        own_help: true,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_setup),
+    },
+    Subcommand {
         name: "doctor",
         operands: "",
         summary: "config/model/trust/sandbox diagnosis (offline)",

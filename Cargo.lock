@@ -1279,6 +1279,7 @@ dependencies = [
  "test-fixtures",
  "time",
  "toml",
+ "toml_edit",
  "tui",
  "workspace",
 ]
