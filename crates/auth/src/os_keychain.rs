@@ -78,7 +78,8 @@ impl PlatformKeychain for MacosKeychain {
         // key. Refused whole instead.
         if line.len() >= MAX_INTERACTIVE_LINE {
             return Err(StoreError::BoundExceeded {
-                limit: (MAX_INTERACTIVE_LINE - (line.len() - hex.len())) / 2,
+                // The longest key whose line (newline included) still fits.
+                limit: (MAX_INTERACTIVE_LINE - 1 - (line.len() - hex.len())) / 2,
                 requested: secret.len(),
             });
         }

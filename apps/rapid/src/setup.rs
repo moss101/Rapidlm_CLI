@@ -573,14 +573,46 @@ pub fn keychain_alias(profile: &str) -> String {
     format!("rapidlm-model-{profile}")
 }
 
+/// `path` as one file has one spelling: absolute, and resolved through
+/// every link its existing part goes through (the rest appended as given).
+fn stable_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|dir| dir.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut existing = absolute.as_path();
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(resolved) = std::fs::canonicalize(existing) {
+            let mut out = resolved;
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                existing = parent;
+            }
+            _ => return absolute,
+        }
+    }
+}
+
 /// The keychain alias a profile's key is stored under:
 /// `rapidlm-model-<profile>-<digest>`, the digest the first 12 hex digits of
-/// SHA-256 over the config file's path and the endpoint's origin — so two
+/// SHA-256 over the config file's path (absolute, links resolved) and the
+/// endpoint's origin — so two
 /// config files (or two endpoints) with a profile of the same name keep two
 /// keys. The config names the alias, so moving the file later changes
 /// nothing.
 pub fn keychain_alias_for(profile: &str, config_path: &Path, base_url: &str) -> String {
     use sha2::Digest;
+    let config_path = stable_path(config_path);
     let origin = origin_of(base_url)
         .map(|(scheme, host, port)| format!("{scheme}://{host}:{port}"))
         .unwrap_or_else(|| base_url.to_owned());
@@ -787,6 +819,19 @@ pub fn plan(
         changed |= set_value(profile, "model", &choice.model, &prefix, &mut set);
         changed |= set_value(profile, "base_url", &choice.base_url, &prefix, &mut set);
         let credential_keys = ["api_key", "env_key", "keychain"];
+        // A profile that already keeps its key in the keychain for this
+        // endpoint keeps its alias: a rerun is the same key's place, not a
+        // new one (whatever the path it was reached by, or the build that
+        // named it).
+        if let Credential::Keychain { alias } = &mut choice.credential
+            && let Some(existing) = profile.get("keychain").and_then(toml_edit::Item::as_str)
+            && previous_base_url
+                .as_deref()
+                .is_some_and(|previous| same_origin(previous, &choice.base_url))
+            && auth::SecretRef::from_alias(existing).is_ok()
+        {
+            *alias = existing.to_owned();
+        }
         let keep = match &choice.credential {
             Credential::Env { var } => {
                 changed |= set_value(profile, "env_key", var, &prefix, &mut set);
@@ -4621,5 +4666,97 @@ base_url = \"http://10.0.0.5:9000/v1\"
             outcome.stderr
         );
         assert_eq!(home.snapshot(), before);
+    }
+
+    #[test]
+    fn a_profiles_keychain_alias_is_stable_across_reruns_links_and_older_builds() {
+        let url = "http://10.0.0.5:9000/v1";
+        // Kept: an alias the profile already names for this endpoint (one an
+        // older build wrote) is its key's place; a rerun changes nothing.
+        let existing = format!(
+            "[models]\ndefault = \"default\"\n\n[model.default]\nprovider = \"openai-compatible\"\n\
+model = \"m\"\nbase_url = \"{url}\"\nkeychain = \"rapidlm-model-default\"\n"
+        );
+        let kept = plan(
+            choice_for(&["--base-url", url, "--model", "m", "--key-stdin"]),
+            Path::new("c.toml"),
+            Some(&existing),
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert_eq!(
+            kept.choice.credential,
+            Credential::Keychain {
+                alias: "rapidlm-model-default".to_owned()
+            }
+        );
+        assert_eq!(kept.action, FileAction::Unchanged, "{}", kept.document);
+        // Another endpoint: another alias.
+        let moved = plan(
+            choice_for(&[
+                "--base-url",
+                "http://10.0.0.6:9000/v1",
+                "--model",
+                "m",
+                "--key-stdin",
+            ]),
+            Path::new("c.toml"),
+            Some(&existing),
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert_ne!(
+            moved.choice.credential,
+            Credential::Keychain {
+                alias: "rapidlm-model-default".to_owned()
+            }
+        );
+        // One file, however it is reached: the same alias.
+        #[cfg(unix)]
+        {
+            let home = Home::new("alias-link");
+            let real = home.0.join("real");
+            std::fs::create_dir_all(real.join(".rapidlm")).expect("dir");
+            let link = home.0.join("link");
+            std::os::unix::fs::symlink(&real, &link).expect("link");
+            let via_real = keychain_alias_for("p", &real.join(".rapidlm/config.toml"), url);
+            let via_link = keychain_alias_for("p", &link.join(".rapidlm/config.toml"), url);
+            let via_dots =
+                keychain_alias_for("p", &link.join(".rapidlm/../.rapidlm/config.toml"), url);
+            assert_eq!(via_real, via_link);
+            assert_eq!(via_real, via_dots);
+        }
+    }
+
+    #[test]
+    fn a_keychain_item_rapid_could_not_put_back_is_left_alone() {
+        let keychain =
+            std::sync::Arc::new(crate::provider_keychain::testing::MemoryKeychain::default());
+        keychain.items.lock().expect("lock").insert(
+            "rapidlm-model-p-000000000000".to_owned(),
+            vec![0x01, 0xff, b'x'],
+        );
+        let backend: std::sync::Arc<dyn auth::PlatformKeychain> = keychain.clone();
+        let err = crate::provider_keychain::with_backend(backend, || {
+            crate::provider_keychain::store("rapidlm-model-p-000000000000", "sk-new")
+        })
+        .expect_err("left alone");
+        assert!(err.to_string().contains("did not write"), "{err}");
+        assert_eq!(*keychain.puts.lock().expect("lock"), 0);
+        assert_eq!(
+            keychain
+                .items
+                .lock()
+                .expect("lock")
+                .get("rapidlm-model-p-000000000000")
+                .cloned(),
+            Some(vec![0x01, 0xff, b'x'])
+        );
     }
 }

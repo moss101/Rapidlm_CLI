@@ -25,6 +25,9 @@ pub enum KeychainError {
     UnsendableKey,
     /// Longer than the keychain takes in one piece: not stored.
     TooLong,
+    /// Something this build could not put back as it was (not a key it
+    /// writes) is stored under the alias: left alone.
+    Foreign { alias: String },
 }
 
 impl std::fmt::Display for KeychainError {
@@ -47,6 +50,11 @@ impl std::fmt::Display for KeychainError {
                 "the key has characters no HTTP header can carry (a line break from a file?)"
             ),
             Self::TooLong => write!(f, "the key is longer than the OS keychain takes"),
+            Self::Foreign { alias } => write!(
+                f,
+                "the OS keychain holds something under '{alias}' that rapid did not write; it is \
+left alone — remove it, or choose another --profile"
+            ),
         }
     }
 }
@@ -147,6 +155,13 @@ pub fn store(alias: &str, key: &str) -> Result<Stored, KeychainError> {
     let cancel = CancellationToken::new();
     let previous = match backend.get(&item, &cancel) {
         Ok(bytes) if bytes == key.as_bytes() => return Ok(Stored::Unchanged),
+        // What a keychain gives back for anything but printable ASCII is not
+        // what was stored (macOS prints it as hex): it could not be put back.
+        Ok(bytes) if bytes.is_empty() || !bytes.iter().all(|byte| (0x21..=0x7e).contains(byte)) => {
+            return Err(KeychainError::Foreign {
+                alias: alias.to_owned(),
+            });
+        }
         Ok(bytes) => Previous::Bytes(bytes),
         Err(auth::StoreError::NotFound) => Previous::Nothing,
         Err(_) => return Err(KeychainError::Unavailable),
