@@ -5,6 +5,7 @@
 //! records are the egress receipt a caller reports.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Mutex;
 
 use capability_broker::{
     CancellationToken, Hostname, NetworkIntent, NetworkNormalizeError, NetworkResolver,
@@ -12,9 +13,7 @@ use capability_broker::{
 };
 use llm_router::provider::ProviderError;
 use llm_router::providers::dial::{DialGate, DialTarget, ProxyTarget};
-use security::{
-    EgressAuditRecord, EgressOutcome, EgressPolicy, EgressProxy, EgressRule, NetworkClient,
-};
+use security::{EgressOutcome, EgressPolicy, EgressProxy, EgressRule, NetworkClient};
 
 /// One endpoint's egress gate.
 pub struct ProviderEgress {
@@ -22,6 +21,8 @@ pub struct ProviderEgress {
     https: bool,
     host: String,
     port: u16,
+    /// One per dial asked for, in order.
+    receipts: Mutex<Vec<EgressReceipt>>,
 }
 
 /// One decision the gate made: what a caller reports as the receipt.
@@ -35,16 +36,11 @@ pub struct EgressReceipt {
 }
 
 impl EgressReceipt {
-    fn from_record(record: &EgressAuditRecord) -> Self {
-        let scheme = record.scheme().map_or("?", |scheme| scheme.as_str());
-        let host = record.host().unwrap_or("?");
-        let port = record
-            .port()
-            .map_or_else(|| "?".to_owned(), |port| port.to_string());
+    fn new(allowed: bool, dialled: &str, reason: Option<&str>) -> Self {
         Self {
-            allowed: record.is_allow(),
-            dialled: format!("{scheme}://{}:{port}", bracketed(host)),
-            reason: record.reason().map(|reason| reason.as_str().to_owned()),
+            allowed,
+            dialled: dialled.trim_end_matches('/').to_owned(),
+            reason: reason.map(str::to_owned),
         }
     }
 }
@@ -63,12 +59,15 @@ impl ProviderEgress {
         } else {
             NetworkScheme::Http
         };
+        // Endpoints the operator named: a local or private address is theirs
+        // to use (the address classes a model server never has stay refused).
         let mut rules = vec![
-            EgressRule::exact(scheme, host, port).map_err(|err| format!("egress rule: {err}"))?,
+            EgressRule::exact_operator_endpoint(scheme, host, port)
+                .map_err(|err| format!("egress rule: {err}"))?,
         ];
         if let Some((proxy_host, proxy_port)) = via {
             rules.push(
-                EgressRule::exact(NetworkScheme::Http, proxy_host, proxy_port)
+                EgressRule::exact_operator_endpoint(NetworkScheme::Http, proxy_host, proxy_port)
                     .map_err(|err| format!("egress rule: {err}"))?,
             );
         }
@@ -79,19 +78,23 @@ impl ProviderEgress {
             https,
             host: host.to_ascii_lowercase(),
             port,
+            receipts: Mutex::new(Vec::new()),
         })
     }
 
-    /// Every decision so far, oldest first — one per dial: issuing a lease
-    /// and consuming it at the dial are one decision, recorded twice.
+    /// Every decision so far, oldest first: one per dial asked for.
     pub fn receipts(&self) -> Vec<EgressReceipt> {
-        let mut receipts: Vec<EgressReceipt> = self
-            .proxy
-            .audit_log()
-            .map(|log| log.iter().map(EgressReceipt::from_record).collect())
-            .unwrap_or_default();
-        receipts.dedup();
-        receipts
+        self.receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn receipt(&self, receipt: EgressReceipt) {
+        self.receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(receipt);
     }
 }
 
@@ -104,7 +107,13 @@ impl NetworkResolver for Resolved<'_> {
         if self.0.is_empty() {
             return Err(NetworkNormalizeError::UnresolvedHost);
         }
-        Ok(self.0.iter().map(SocketAddr::ip).collect())
+        // At most as many as a lease binds; the dial takes the first.
+        Ok(self
+            .0
+            .iter()
+            .map(SocketAddr::ip)
+            .take(capability_broker::MAX_RESOLVED_IPS)
+            .collect())
     }
 }
 
@@ -123,6 +132,20 @@ impl DialGate for ProviderEgress {
         via: Option<&ProxyTarget>,
         addrs: &[SocketAddr],
     ) -> Result<Vec<SocketAddr>, ProviderError> {
+        // What is dialled: the proxy, when there is one.
+        let dialled = match via {
+            Some(proxy) => format!("http://{}:{}", bracketed(proxy.host()), proxy.port()),
+            None => format!(
+                "{}://{}:{}",
+                if target.https { "https" } else { "http" },
+                bracketed(target.host),
+                target.port
+            ),
+        };
+        let refuse = |reason: &str| {
+            self.receipt(EgressReceipt::new(false, &dialled, Some(reason)));
+            Err(ProviderError::Connection)
+        };
         // Through a proxy the dial is to the proxy, so the policy judges that;
         // the request must still be for the endpoint this gate was made for
         // (dialled directly, the policy judges the endpoint itself).
@@ -131,24 +154,18 @@ impl DialGate for ProviderEgress {
                 || !target.host.eq_ignore_ascii_case(&self.host)
                 || target.port != self.port)
         {
-            return Err(ProviderError::Connection);
+            return refuse("not_the_planned_endpoint");
         }
-        // What is dialled: the proxy, when there is one.
-        let url = match via {
-            Some(proxy) => format!("http://{}:{}/", bracketed(proxy.host()), proxy.port()),
-            None => format!(
-                "{}://{}:{}/",
-                if target.https { "https" } else { "http" },
-                bracketed(target.host),
-                target.port
-            ),
-        };
+        if addrs.is_empty() {
+            return refuse("unresolved");
+        }
         let resolver = Resolved(addrs);
         let cancel = CancellationToken::new();
-        let intent = NetworkIntent::connect(url);
+        let intent = NetworkIntent::connect(format!("{dialled}/"));
         let lease = match self.proxy.authorize_connect(&intent, &resolver, &cancel) {
             Ok(EgressOutcome::Allow(lease)) => lease,
-            _ => return Err(ProviderError::Connection),
+            Ok(EgressOutcome::Deny(denial)) => return refuse(denial.reason().as_str()),
+            Err(_) => return refuse("not_judged"),
         };
         let consumed = match self.proxy.consume_connect(
             &lease,
@@ -157,13 +174,24 @@ impl DialGate for ProviderEgress {
             &cancel,
         ) {
             Ok(EgressOutcome::Allow(consumed)) => consumed,
-            _ => return Err(ProviderError::Connection),
+            Ok(EgressOutcome::Deny(denial)) => return refuse(denial.reason().as_str()),
+            Err(_) => return refuse("not_judged"),
         };
-        Ok(addrs
+        // The lease binds canonical addresses (an IPv4-mapped one as IPv4).
+        let canonical = |ip: IpAddr| match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            v4 => v4,
+        };
+        let permitted: Vec<SocketAddr> = addrs
             .iter()
-            .filter(|addr| consumed.dial_ips().contains(&addr.ip()))
+            .filter(|addr| consumed.dial_ips().contains(&canonical(addr.ip())))
             .copied()
-            .collect())
+            .collect();
+        if permitted.is_empty() {
+            return refuse("not_judged");
+        }
+        self.receipt(EgressReceipt::new(true, &dialled, None));
+        Ok(permitted)
     }
 }
 
@@ -204,7 +232,7 @@ mod tests {
                 .filter(|receipt| receipt.allowed && receipt.dialled == "http://127.0.0.1:4000")
                 .count(),
             1,
-            "one receipt per dial: {receipts:?}"
+            "one receipt for the one permitted dial: {receipts:?}"
         );
         assert!(
             receipts.iter().any(|receipt| !receipt.allowed
@@ -212,6 +240,92 @@ mod tests {
                 && receipt.reason.is_some()),
             "{receipts:?}"
         );
+    }
+
+    #[test]
+    fn a_local_or_private_endpoint_the_operator_named_is_dialled() {
+        // A model server on this machine or the operator's network: a name
+        // resolving to loopback, private or shared-address space is theirs.
+        for (host, addr) in [
+            ("localhost", "[::1]:8080"),
+            ("gateway.internal", "10.0.0.5:8080"),
+            ("llm-0x1.corp.example", "192.168.1.7:8080"),
+            ("gpu.ts.example", "100.64.0.9:8080"),
+        ] {
+            let gate = ProviderEgress::for_endpoint(false, host, 8080, None).expect("gate");
+            let target = DialTarget {
+                https: false,
+                host,
+                port: 8080,
+            };
+            let addrs = vec![addr.parse::<SocketAddr>().expect("addr")];
+            assert_eq!(
+                gate.permit(target, None, &addrs),
+                Ok(addrs.clone()),
+                "{host} -> {addr}: {:?}",
+                gate.receipts()
+            );
+        }
+        // Never a link-local (metadata) address, whoever named it.
+        let gate = ProviderEgress::for_endpoint(false, "gateway.internal", 80, None).expect("gate");
+        let target = DialTarget {
+            https: false,
+            host: "gateway.internal",
+            port: 80,
+        };
+        assert_eq!(
+            gate.permit(target, None, &["169.254.169.254:80".parse().expect("addr")]),
+            Err(ProviderError::Connection)
+        );
+        assert_eq!(
+            gate.receipts(),
+            vec![EgressReceipt::new(
+                false,
+                "http://gateway.internal:80",
+                Some("sensitive_class")
+            )]
+        );
+    }
+
+    #[test]
+    fn many_addresses_are_judged_by_the_first_a_lease_binds_and_mapped_ones_are_dialled() {
+        let host = "big.internal";
+        let target = DialTarget {
+            https: false,
+            host,
+            port: 8080,
+        };
+        // More addresses than one lease binds: the first 16 are judged, and
+        // the dial takes the first.
+        let many: Vec<SocketAddr> = (1..=20)
+            .map(|n| SocketAddr::from(([10, 0, 0, n], 8080)))
+            .collect();
+        let gate = ProviderEgress::for_endpoint(false, host, 8080, None).expect("gate");
+        let permitted = gate.permit(target, None, &many).expect("permitted");
+        assert_eq!(permitted.first(), many.first(), "{:?}", gate.receipts());
+        // An IPv4-mapped address is the address it maps.
+        let mapped = vec![
+            "[::ffff:10.0.0.5]:8080"
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        ];
+        let gate = ProviderEgress::for_endpoint(false, host, 8080, None).expect("gate");
+        assert_eq!(gate.permit(target, None, &mapped), Ok(mapped.clone()));
+    }
+
+    #[test]
+    fn two_dials_are_two_receipts() {
+        let gate = ProviderEgress::for_endpoint(false, "127.0.0.1", 4000, None).expect("gate");
+        let planned = DialTarget {
+            https: false,
+            host: "127.0.0.1",
+            port: 4000,
+        };
+        for _ in 0..2 {
+            gate.permit(planned, None, &loopback(4000))
+                .expect("permitted");
+        }
+        assert_eq!(gate.receipts().len(), 2);
     }
 
     #[test]
@@ -225,6 +339,15 @@ mod tests {
         assert_eq!(
             gate.permit(target, None, &[]),
             Err(ProviderError::Connection)
+        );
+        assert_eq!(
+            gate.receipts(),
+            vec![EgressReceipt::new(
+                false,
+                "https://api.example.test:443",
+                Some("unresolved")
+            )],
+            "the receipt names what was not dialled and why"
         );
     }
 }

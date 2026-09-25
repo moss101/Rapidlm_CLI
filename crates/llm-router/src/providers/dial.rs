@@ -129,9 +129,8 @@ impl std::fmt::Display for ProxyConfigError {
             ),
             Self::InvalidEntry { variable, entry } => write!(
                 f,
-                "{variable} entry {:?} is not a name, an address (with an optional port) or a \
-range such as 10.0.0.0/8",
-                shown_entry(entry)
+                "{variable} entry {entry:?} is not a name, an address (with an optional port) or a \
+range such as 10.0.0.0/8"
             ),
         }
     }
@@ -272,6 +271,14 @@ fn parse_no_proxy(
     variable: &'static str,
     list: &str,
 ) -> Result<Vec<NoProxyEntry>, ProxyConfigError> {
+    // A URL in the list (a mistake) is refused whole, before splitting: a
+    // comma in its password would otherwise show a piece of it.
+    if list.contains("://") {
+        return Err(ProxyConfigError::InvalidEntry {
+            variable,
+            entry: "a URL".to_owned(),
+        });
+    }
     let entries: Vec<&str> = list
         .split(|ch: char| ch == ',' || ch.is_whitespace())
         .filter(|entry| !entry.is_empty())
@@ -284,7 +291,7 @@ fn parse_no_proxy(
         .map(|raw| {
             let invalid = ProxyConfigError::InvalidEntry {
                 variable,
-                entry: raw.to_owned(),
+                entry: shown_entry(raw),
             };
             let entry = raw.to_ascii_lowercase();
             if entry == "*" {
@@ -675,11 +682,26 @@ mod tests {
             ("no_proxy", "http://svc:hunter2@internal.example"),
         ]))
         .expect_err("a URL is not an entry");
-        assert!(!err.to_string().contains("hunter2"), "{err}");
+        assert!(!format!("{err} {err:?}").contains("hunter2"), "{err:?}");
+        // A comma in the password: nothing of it shows either.
+        let comma = ProxyConfig::from_env(&env(&[
+            ("https_proxy", "http://proxy:3128"),
+            ("no_proxy", "localhost,http://svc:hun,ter2@internal.example"),
+        ]))
+        .expect_err("a URL is not an entry");
+        assert!(!format!("{comma} {comma:?}").contains("hun"), "{comma:?}");
+        // An entry with a credential but no scheme: withheld, in Display and
+        // Debug alike.
+        let at = ProxyConfig::from_env(&env(&[
+            ("https_proxy", "http://proxy:3128"),
+            ("no_proxy", "svc:hunter2@internal.example"),
+        ]))
+        .expect_err("not an entry");
         assert!(
-            err.to_string().contains("[withheld]@internal.example"),
-            "{err}"
+            at.to_string().contains("[withheld]@internal.example"),
+            "{at}"
         );
+        assert!(!format!("{at:?}").contains("hunter2"), "{at:?}");
         // Set but empty turns a proxy off, on every system.
         let off = ProxyConfig::from_env(&env(&[
             ("https_proxy", ""),
@@ -692,9 +714,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn on_windows_any_spelling_of_a_name_is_read() {
-        let config =
-            ProxyConfig::from_env(&env(&[("Https_Proxy", "http://proxy:3128")])).expect("config");
+        let config = ProxyConfig::from_env(&env(&[
+            ("Https_Proxy", "http://proxy:3128"),
+            ("HTTP_PROXY", "http://proxy:8080"),
+        ]))
+        .expect("config");
         assert!(config.for_target(true, "api.example.com", 443).is_some());
+        assert!(config.for_target(false, "gw.example.com", 80).is_some());
     }
 
     #[test]

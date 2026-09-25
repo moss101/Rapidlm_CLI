@@ -70,6 +70,10 @@ pub struct EgressRule {
     scheme: Option<NetworkScheme>,
     host: EgressHost,
     port: Option<u16>,
+    /// The operator named this exact endpoint (a model server they
+    /// configured): its name may resolve to loopback or private addresses —
+    /// never link-local, metadata-like or unspecified ones.
+    local_addresses: bool,
 }
 
 /// Enforceable egress envelope. Empty allowlists deny every connect.
@@ -238,6 +242,7 @@ impl EgressRule {
             scheme: None,
             host: EgressHost::parse(host)?,
             port: None,
+            local_addresses: false,
         })
     }
 
@@ -249,6 +254,7 @@ impl EgressRule {
             scheme: None,
             host: EgressHost::parse(host)?,
             port: Some(port),
+            local_addresses: false,
         })
     }
 
@@ -260,6 +266,22 @@ impl EgressRule {
             scheme: Some(scheme),
             host: EgressHost::parse(host)?,
             port: Some(port),
+            local_addresses: false,
+        })
+    }
+
+    /// An exact endpoint the operator configured — a model server on this
+    /// machine or their network is legitimate: its name may resolve to
+    /// loopback or private addresses (never link-local, metadata-like or
+    /// unspecified ones, which [`Self::exact`] refuses as well).
+    pub fn exact_operator_endpoint(
+        scheme: NetworkScheme,
+        host: &str,
+        port: u16,
+    ) -> Result<Self, EgressError> {
+        Ok(Self {
+            local_addresses: true,
+            ..Self::exact(scheme, host, port)?
         })
     }
 
@@ -797,7 +819,26 @@ fn sensitive_explicitly_allowed(
     if every_ip_has_literal_rule(policy, target, cancel)? {
         return Ok(true);
     }
+    if operator_endpoint_covers(policy, target) {
+        return Ok(true);
+    }
     inherent_hostname_covers(policy, target, cancel)
+}
+
+/// An operator-named endpoint's rule covers loopback and private addresses,
+/// never link-local, metadata-like or unspecified ones.
+fn operator_endpoint_covers(policy: &EgressPolicy, target: &CanonicalNetworkTarget) -> bool {
+    let never = target.ip_classes().iter().any(|class| {
+        matches!(
+            class,
+            IpClass::LinkLocal | IpClass::MetadataLike | IpClass::Unspecified
+        )
+    });
+    !never
+        && policy
+            .rules
+            .iter()
+            .any(|rule| rule.local_addresses && origin_rule_matches(rule, target))
 }
 
 fn every_ip_has_literal_rule(
@@ -1539,5 +1580,58 @@ mod tests {
             deny_connect(&proxy, "https://example.com:8443").reason(),
             EgressReason::NotAllowlisted
         );
+    }
+
+    #[test]
+    fn an_operator_endpoint_may_be_local_but_never_link_local() {
+        let resolver = MapResolver::new()
+            .with("gateway.internal", &["10.0.0.5"])
+            .with("both.internal", &["10.0.0.5", "203.0.113.9"])
+            .with("meta.internal", &["169.254.169.254"]);
+        let judge = |host: &str| {
+            let proxy = EgressProxy::new(
+                EgressPolicy::allowlist([EgressRule::exact_operator_endpoint(
+                    NetworkScheme::Http,
+                    host,
+                    8080,
+                )
+                .expect("rule")])
+                .expect("policy"),
+                NetworkClient::Provider,
+            );
+            authorize_connect(
+                &proxy,
+                &NetworkIntent::connect(format!("http://{host}:8080/")),
+                &resolver,
+                &CancellationToken::new(),
+            )
+            .expect("judged")
+        };
+        assert!(matches!(judge("gateway.internal"), EgressOutcome::Allow(_)));
+        assert!(matches!(judge("both.internal"), EgressOutcome::Allow(_)));
+        assert!(
+            matches!(judge("meta.internal"), EgressOutcome::Deny(deny) if deny.reason() == EgressReason::SensitiveClass)
+        );
+        // A plain exact rule still refuses a private address.
+        let plain = EgressProxy::new(
+            EgressPolicy::allowlist([EgressRule::exact(
+                NetworkScheme::Http,
+                "gateway.internal",
+                8080,
+            )
+            .expect("rule")])
+            .expect("policy"),
+            NetworkClient::Provider,
+        );
+        assert!(matches!(
+            authorize_connect(
+                &plain,
+                &NetworkIntent::connect("http://gateway.internal:8080/"),
+                &resolver,
+                &CancellationToken::new(),
+            )
+            .expect("judged"),
+            EgressOutcome::Deny(_)
+        ));
     }
 }

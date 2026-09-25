@@ -1379,17 +1379,17 @@ pub fn classify(err: &llm_router::provider::ProviderError) -> ProbeFailure {
     }
 }
 
+/// The egress gate the probe dials through: exactly the planned endpoint.
+pub fn probe_egress(plan: &SetupPlan) -> Result<crate::provider_egress::ProviderEgress, String> {
+    let (scheme, host, port) = origin_of(&plan.choice.base_url)
+        .ok_or_else(|| "the planned endpoint has no origin".to_owned())?;
+    crate::provider_egress::ProviderEgress::for_endpoint(scheme == "https", &host, port, None)
+}
+
 /// The live verification (SEAM-02): one request of at most
 /// [`VERIFY_MAX_OUTPUT_TOKENS`] through the model client a run would build
 /// for the planned profile — the config as the plan leaves it, the key as
 /// the plan names it (`stdin_key` for `--key-stdin`). Nothing is written.
-/// The egress gate the probe dials through: exactly the planned endpoint.
-pub fn probe_egress(plan: &SetupPlan) -> Result<crate::provider_egress::ProviderEgress, String> {
-    let (scheme, host, port) = origin_of(&plan.choice.base_url)
-        .ok_or_else(|| "rapid setup: the planned endpoint has no origin".to_owned())?;
-    crate::provider_egress::ProviderEgress::for_endpoint(scheme == "https", &host, port, None)
-}
-
 pub fn verify(
     plan: &SetupPlan,
     env: &[(String, String)],
@@ -1574,7 +1574,16 @@ changed"
         if !parsed.no_verify {
             let egress = match probe_egress(&plan) {
                 Ok(egress) => std::sync::Arc::new(egress),
-                Err(message) => return failed(message),
+                Err(message) => {
+                    return SetupOutcome {
+                        stdout: String::new(),
+                        stderr: format!(
+                            "rapid setup: the planned endpoint cannot be verified ({message}); \
+no files were changed\n"
+                        ),
+                        exit: 2,
+                    };
+                }
             };
             let cancel = llm_router::provider::CancellationToken::new();
             let verified = verify(
