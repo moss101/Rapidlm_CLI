@@ -17,7 +17,9 @@
 //! - `approvals.resolve` → the durable approval machinery: the wait row is
 //!   marked terminal and the paused turn resumes as a continuation (the
 //!   SDK names a turn-scoped `expected_seq`; the daemon resolves the
-//!   session's oldest pending wait, which is that turn's);
+//!   session's oldest pending wait, which is that turn's, once and by its
+//!   token — a stale `expected_seq` or a session with nothing pending is
+//!   refused and writes nothing);
 //! - `events.subscribe` → `{kind:"event"}` frames streamed from the session
 //!   cursor, ended by `stream_end` on cancel or terminal.
 //!
@@ -437,36 +439,43 @@ session, which moved: refresh the session before the next submit)"
                     other => return Err(format!("unknown decision {other:?}")),
                 };
                 // The SDK names the turn, not the wait; resolve the session's
-                // oldest pending wait — single-turn-per-session makes that
-                // the one being answered — and resume it as a continuation.
+                // oldest pending wait once, by its token, and resume it as a
+                // continuation. Nothing pending is nothing to answer.
                 let pendings =
-                    crate::approvals::client_call(self.client.pending_approvals(session))
-                        .map_err(|err| err.to_string())?;
-                let oldest = pendings.first().map(|pending| pending.payload().id.clone());
-                let call_id = pendings
-                    .first()
-                    .map(|pending| pending.payload().call_id.clone());
-                crate::approvals::client_call(self.client.approve(kernel::ResolveApproval::new(
+                    crate::approvals::client_call(self.client.pending_approvals(session))?;
+                let Some(pending) = pendings.first() else {
+                    return Err("no pending approval to resolve in this session".to_owned());
+                };
+                let token = pending.payload().id.clone();
+                let call_id = pending.payload().call_id.clone();
+                // The resolution appends at the tip it reads, so the SDK's
+                // view of the session is checked here; the wait, not this
+                // check, is what keeps the answer single.
+                let tip = crate::approvals::client_call(self.client.get_session(session))?.seq();
+                if tip != expected_seq {
+                    return Err(format!(
+                        "the session moved past expected_seq {expected_seq} (it is at {tip}); \
+refresh and answer again"
+                    ));
+                }
+                if let Err(err) = acp_resolve_and_continue(
+                    &self.client,
                     session,
-                    expected_seq,
-                    decision,
-                    self.actor.clone(),
-                    trace_id_of(params),
-                )))
-                .map_err(|err| err.to_string())?;
-                if let (Some(token), Some(call_id)) = (oldest, call_id) {
-                    let _ = acp_resolve_and_continue(
-                        &self.client,
-                        session,
+                    &self.actor,
+                    &self.root,
+                    self.trusted,
+                    &token,
+                    &call_id,
+                    decision == kernel::ApprovalDecision::Approved,
+                    None,
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                ) {
+                    return Err(resolve_failure(
+                        recorded_answer(&self.client, session, tip, &token),
+                        decision,
                         &self.actor,
-                        &self.root,
-                        self.trusted,
-                        &token,
-                        &call_id,
-                        decision == kernel::ApprovalDecision::Approved,
-                        None,
-                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                    );
+                        err,
+                    ));
                 }
                 Ok(serde_json::json!({}))
             }
@@ -702,6 +711,51 @@ fn snapshot_json(snapshot: &kernel::SessionSnapshot) -> Result<serde_json::Value
     serde_json::to_value(snapshot).map_err(|err| err.to_string())
 }
 
+/// The decision and actor of the `approval.resolved` recorded for `token`
+/// after `from_seq`, if one was. A ledger that cannot be read answers
+/// `None`, the same as no resolution: the caller then reports the resolver's
+/// own error rather than claim either outcome.
+#[cfg(unix)]
+fn recorded_answer(
+    client: &InProcessKernelClient,
+    session: SessionId,
+    from_seq: u64,
+    token: &str,
+) -> Option<(kernel::ApprovalDecision, event_ledger::event::ActorRef)> {
+    use kernel::KernelClient as _;
+    let tip = crate::approvals::client_call(client.get_session(session))
+        .ok()?
+        .seq();
+    ((from_seq + 1)..=tip).find_map(|seq| {
+        let event = client.read_event(session, seq).ok()?;
+        if event.kind() != event_ledger::event::EventKind::ApprovalResolved {
+            return None;
+        }
+        let payload: kernel::ApprovalResolvedPayload =
+            serde_json::from_value(event.payload().clone()).ok()?;
+        (payload.wait_token == token).then(|| (payload.decision, event.actor().clone()))
+    })
+}
+
+/// What a failed `approvals.resolve` tells the SDK. A refused resolution
+/// wrote nothing; a recorded one whose turn could not resume must read as
+/// neither; and an answer another resolver recorded first is not this one.
+#[cfg(unix)]
+fn resolve_failure(
+    recorded: Option<(kernel::ApprovalDecision, event_ledger::event::ActorRef)>,
+    decision: kernel::ApprovalDecision,
+    actor: &event_ledger::event::ActorRef,
+    err: String,
+) -> String {
+    match recorded {
+        Some((recorded, by)) if recorded == decision && &by == actor => {
+            format!("the decision was recorded, but the paused turn could not resume: {err}")
+        }
+        Some(_) => format!("the approval was answered by another resolver first: {err}"),
+        None => err,
+    }
+}
+
 #[cfg(unix)]
 fn turn_handle_json(handle: &kernel::TurnHandle) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({
@@ -842,6 +896,165 @@ mod tests {
             .position(|kind| *kind == EventKind::HookDecided)
             .expect("hook.decided");
         assert!(started < decided, "{kinds:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every `approval.resolved` payload in `session`, oldest first.
+    fn resolutions(client: &InProcessKernelClient, session: SessionId) -> Vec<serde_json::Value> {
+        use kernel::KernelClient as _;
+        let tip = crate::approvals::client_call(client.get_session(session))
+            .expect("session")
+            .seq();
+        (1..=tip)
+            .filter_map(|seq| client.read_event(session, seq).ok())
+            .filter(|event| event.kind() == EventKind::ApprovalResolved)
+            .map(|event| event.payload().clone())
+            .collect()
+    }
+
+    #[test]
+    fn an_sdk_decision_resolves_the_pending_wait_once_by_its_token() {
+        use kernel::KernelClient as _;
+        let root = project_with_gate("daemon-approve", r#"{"decision":"allow"}"#);
+        let (client, actor) = client_in(&root);
+        let connection = Connection {
+            client: client.clone(),
+            actor: actor.clone(),
+            root: root.clone(),
+            trusted: true,
+            daemon_token: None,
+            mode_override: Default::default(),
+        };
+        let snapshot = connection
+            .rpc("sessions.create", &serde_json::json!({}))
+            .expect("session");
+        let session: SessionId = snapshot["id"].as_str().expect("id").parse().expect("id");
+        let resolve = |expected_seq: u64, decision: &str| {
+            connection.rpc(
+                "approvals.resolve",
+                &serde_json::json!({
+                    "session_id": session.to_string(),
+                    "expected_seq": expected_seq,
+                    "decision": decision,
+                }),
+            )
+        };
+        let tip = || {
+            crate::approvals::client_call(client.get_session(session))
+                .expect("session")
+                .seq()
+        };
+
+        // Nothing pending: nothing to answer, nothing written.
+        let err = resolve(tip(), "approved").expect_err("nothing pending");
+        assert!(err.contains("no pending approval"), "{err}");
+        assert!(resolutions(&client, session).is_empty());
+
+        crate::approvals::client_call(client.record_approval(kernel::RecordApproval::new(
+            session,
+            tip(),
+            actor,
+            protocol::TraceId::new(),
+            "wait-1",
+            "call-1",
+            "workspace_write",
+            "write notes.txt",
+        )))
+        .expect("record approval");
+
+        // A stale view of the session is refused before anything is written.
+        let err = resolve(tip() - 1, "approved").expect_err("stale expected_seq");
+        assert!(err.contains("moved past expected_seq"), "{err}");
+        assert!(resolutions(&client, session).is_empty());
+
+        // One resolution, by the wait's token. No turn was suspended here, so
+        // the continuation cannot load — reported, not swallowed.
+        let err = resolve(tip(), "approved").expect_err("no suspension to resume");
+        assert!(err.contains("the decision was recorded"), "{err}");
+        let resolved = resolutions(&client, session);
+        assert_eq!(resolved.len(), 1, "{resolved:?}");
+        assert_eq!(resolved[0]["id"], "wait-1");
+        assert_eq!(resolved[0]["wait_token"], "wait-1");
+        assert_eq!(resolved[0]["decision"], "approved");
+
+        // The wait is spent: a second answer has nothing to resolve.
+        let err = resolve(tip(), "denied").expect_err("already answered");
+        assert!(err.contains("no pending approval"), "{err}");
+        assert_eq!(resolutions(&client, session).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_recorded_answer_is_attributed_to_its_resolver() {
+        use kernel::KernelClient as _;
+        let root = project_with_gate("daemon-answer", r#"{"decision":"allow"}"#);
+        let (client, actor) = client_in(&root);
+        let session = crate::approvals::client_call(client.create_session(
+            kernel::CreateSession::new(ProjectId::new(), actor.clone(), protocol::TraceId::new()),
+        ))
+        .expect("session")
+        .id();
+        let tip = || {
+            crate::approvals::client_call(client.get_session(session))
+                .expect("session")
+                .seq()
+        };
+        crate::approvals::client_call(client.record_approval(kernel::RecordApproval::new(
+            session,
+            tip(),
+            actor.clone(),
+            protocol::TraceId::new(),
+            "wait-1",
+            "call-1",
+            "workspace_write",
+            "write notes.txt",
+        )))
+        .expect("record approval");
+        let before = tip();
+        assert!(recorded_answer(&client, session, before, "wait-1").is_none());
+
+        // Another resolver answers first: its decision and actor, not ours.
+        let other = event_ledger::event::ActorRef::new(
+            event_ledger::event::ActorKind::Human,
+            &protocol::EventId::new().to_string(),
+        )
+        .expect("actor");
+        crate::approvals::client_approve(
+            &client,
+            kernel::ResolveApproval::new(
+                session,
+                before,
+                kernel::ApprovalDecision::Denied,
+                other.clone(),
+                protocol::TraceId::new(),
+            )
+            .with_wait_token("wait-1"),
+        )
+        .expect("resolve");
+        let (decision, by) = recorded_answer(&client, session, before, "wait-1").expect("recorded");
+        assert_eq!(decision, kernel::ApprovalDecision::Denied);
+        assert_eq!(by, other);
+        assert_ne!(by, actor);
+        // Only resolutions after `from_seq` count, and only this token's.
+        assert!(recorded_answer(&client, session, tip(), "wait-1").is_none());
+        assert!(recorded_answer(&client, session, before, "wait-2").is_none());
+
+        // What the SDK is told: ours, another resolver's (either field
+        // differs), or — nothing recorded — the resolver's own error.
+        let approved = kernel::ApprovalDecision::Approved;
+        let denied = kernel::ApprovalDecision::Denied;
+        let failed = || "boom".to_owned();
+        assert!(
+            resolve_failure(Some((denied, other.clone())), denied, &other, failed())
+                .starts_with("the decision was recorded")
+        );
+        for recorded in [(denied, actor.clone()), (approved, other.clone())] {
+            assert!(
+                resolve_failure(Some(recorded), denied, &other, failed())
+                    .starts_with("the approval was answered by another resolver first")
+            );
+        }
+        assert_eq!(resolve_failure(None, denied, &other, failed()), "boom");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

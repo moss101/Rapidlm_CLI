@@ -719,7 +719,10 @@ impl<C: KernelClient> V1Adapter<C> {
         Ok(())
     }
 
-    /// Forward a permission decision to the kernel approval API.
+    /// Forward a permission decision to the kernel approval API. The answer
+    /// names no request, so it resolves the session's oldest pending wait
+    /// by its token; with nothing pending there is nothing to answer, and it
+    /// is refused before anything is appended.
     pub async fn resolve_permission(
         &mut self,
         session_id: SessionId,
@@ -731,14 +734,25 @@ impl<C: KernelClient> V1Adapter<C> {
             PermissionOutcome::Approved => ApprovalDecision::Approved,
             PermissionOutcome::Denied => ApprovalDecision::Denied,
         };
+        let pending = self
+            .client
+            .pending_approvals(session_id)
+            .await
+            .map_err(map_kernel_err)?;
+        let Some(token) = pending.first().map(|pending| pending.payload().id.clone()) else {
+            return Err(V1Error::InvalidParams);
+        };
         self.client
-            .approve(ResolveApproval::new(
-                session_id,
-                snapshot.seq(),
-                decision,
-                self.actor.clone(),
-                TraceId::new(),
-            ))
+            .approve(
+                ResolveApproval::new(
+                    session_id,
+                    snapshot.seq(),
+                    decision,
+                    self.actor.clone(),
+                    TraceId::new(),
+                )
+                .with_wait_token(token),
+            )
             .await
             .map_err(map_kernel_err)?;
         Ok(())
@@ -1683,16 +1697,25 @@ mod tests {
             "mcpServers": []
         })))
         .expect("new");
+        block_on(tmp.client.record_approval(kernel::RecordApproval::new(
+            created.session_id(),
+            created.seq(),
+            acp.actor.clone(),
+            TraceId::new(),
+            "wait-1",
+            "call-1",
+            "workspace_write",
+            "write notes.txt",
+        )))
+        .expect("record approval");
         block_on(acp.resolve_permission(created.session_id(), PermissionOutcome::Approved))
             .expect("approve");
         let snapshot = block_on(tmp.client.get_session(created.session_id())).expect("get");
-        assert_eq!(snapshot.seq(), created.seq() + 1);
-        let updates = block_on(acp.drain_updates(created.session_id())).expect("drain");
-        assert!(updates.is_empty());
-        let mut stream = block_on(
-            tmp.client
-                .subscribe(SubscribeEvents::new(created.session_id(), 1)),
-        )
+        assert_eq!(snapshot.seq(), created.seq() + 2);
+        let mut stream = block_on(tmp.client.subscribe(SubscribeEvents::new(
+            created.session_id(),
+            created.seq() + 1,
+        )))
         .expect("subscribe");
         let resolved = stream.recv().expect("approval.resolved");
         assert_eq!(resolved.kind(), EventKind::ApprovalResolved);
@@ -1700,6 +1723,51 @@ mod tests {
             resolved.payload().get("decision").and_then(Value::as_str),
             Some("approved")
         );
+        assert_eq!(
+            resolved.payload().get("id").and_then(Value::as_str),
+            Some("wait-1")
+        );
+
+        // Nothing is pending any more: a second answer has nothing to
+        // resolve and appends nothing.
+        let err = block_on(acp.resolve_permission(created.session_id(), PermissionOutcome::Denied))
+            .expect_err("nothing pending");
+        assert!(matches!(err, V1Error::InvalidParams), "{err:?}");
+        let after = block_on(tmp.client.get_session(created.session_id())).expect("get");
+        assert_eq!(after.seq(), snapshot.seq());
+    }
+
+    #[test]
+    fn an_unknown_permission_option_leaves_the_pending_approval_unanswered() {
+        let tmp = TempClient::create();
+        let mut acp = block_on(ready_adapter(tmp.client.clone()));
+        let created = block_on(acp.session_new(serde_json::json!({
+            "cwd": "/tmp/project",
+            "mcpServers": []
+        })))
+        .expect("new");
+        block_on(tmp.client.record_approval(kernel::RecordApproval::new(
+            created.session_id(),
+            created.seq(),
+            acp.actor.clone(),
+            TraceId::new(),
+            "wait-1",
+            "call-1",
+            "workspace_write",
+            "write notes.txt",
+        )))
+        .expect("record approval");
+        let err = block_on(acp.resolve_permission_params(serde_json::json!({
+            "sessionId": created.session_id(),
+            "outcome": {"outcome": "selected", "optionId": "allow-everything"}
+        })))
+        .expect_err("unknown option");
+        assert!(matches!(err, V1Error::InvalidParams));
+        let snapshot = block_on(tmp.client.get_session(created.session_id())).expect("unchanged");
+        assert_eq!(snapshot.seq(), created.seq() + 1);
+        let pending =
+            block_on(tmp.client.pending_approvals(created.session_id())).expect("pending");
+        assert_eq!(pending.len(), 1);
     }
 
     #[test]

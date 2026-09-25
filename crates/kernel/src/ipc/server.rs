@@ -230,6 +230,12 @@ struct ApproveParams {
     decision: String,
     actor: ActorRef,
     trace_id: TraceId,
+    /// The wait the resolution answers. Absent decodes as empty, which the
+    /// kernel refuses before anything is appended.
+    #[serde(default)]
+    wait_token: String,
+    #[serde(default)]
+    remember: bool,
 }
 
 #[derive(Deserialize)]
@@ -1028,13 +1034,17 @@ where
         "approve" => {
             let params: ApproveParams = decode_params(&req.params)?;
             let decision = parse_approval_decision(&params.decision)?;
-            let call = ResolveApproval::new(
+            let mut call = ResolveApproval::new(
                 params.session_id,
                 params.expected_seq,
                 decision,
                 params.actor,
                 params.trace_id,
-            );
+            )
+            .with_wait_token(params.wait_token);
+            if params.remember {
+                call = call.remembering();
+            }
             match call_client(client.approve(call)) {
                 Ok(()) => write_ok(writer, &req.id, EmptyOk {}, limits.max_frame_bytes),
                 Err(err) => write_error_frame(writer, &req.id, &err, limits.max_frame_bytes),
