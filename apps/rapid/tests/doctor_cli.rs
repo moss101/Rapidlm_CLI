@@ -730,15 +730,63 @@ fn model_server(status: u16, body: &'static str) -> (String, Arc<Mutex<Vec<Strin
     (origin, seen)
 }
 
+/// `rapid doctor --live` in `fixture` with `config` (and a managed policy).
+fn run_live(fixture: &Fixture, config: &Path, policy: Option<&Path>) -> Run {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rapid"));
+    command
+        .args(["doctor", "--live"])
+        .current_dir(&fixture.project)
+        .env("HOME", &fixture.home)
+        .env("RAPIDLM_CONFIG", config)
+        .env_remove("RAPIDLM_HOME")
+        .env_remove("RAPIDLM_MODEL")
+        .env_remove("RAPIDLM_MANAGED_CONFIG")
+        .env_remove("RAPIDLM_PROXY");
+    if let Some(policy) = policy {
+        command.env("RAPIDLM_MANAGED_CONFIG", policy);
+    }
+    let output = command.output().expect("run rapid doctor --live");
+    Run {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+const GOOD_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#;
+
+/// A `[model.<id>]` table for `origin`, with `key` inline when given.
+fn live_entry(id: &str, origin: &str, key: Option<&str>) -> String {
+    let key = key
+        .map(|key| format!("api_key = \"{key}\"\n"))
+        .unwrap_or_default();
+    format!(
+        "[model.{id}]\nprovider = \"openai-compatible\"\nmodel = \"test-model\"\n\
+         base_url = \"{origin}/v1\"\n{key}\n"
+    )
+}
+
+/// The status-prefixed rows of a report.
+fn rows(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter(|line| {
+            ["PASS", "FAIL", "WARN", "SKIP"]
+                .iter()
+                .any(|label| line.starts_with(label))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
 #[test]
 fn live_probes_every_profile_once_and_reports_one_typed_row_each() {
     // SEAM-02 AC-07: one typed check per profile; the offline rows are the
-    // same rows in the same order, the live ones follow them.
-    let (good, good_seen) = model_server(
-        200,
-        r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
-    );
+    // same rows, in the same order, with the same text; the live ones follow.
+    let (good, good_seen) = model_server(200, GOOD_BODY);
     let (refusing, refusing_seen) = model_server(401, r#"{"error":{"message":"bad key"}}"#);
+    let (keyless, keyless_seen) = model_server(401, r#"{"error":{"message":"key needed"}}"#);
+    let (limited, limited_seen) = model_server(429, r#"{"error":{"message":"slow down"}}"#);
     let down = {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let origin = format!("http://{}", listener.local_addr().expect("addr"));
@@ -746,37 +794,20 @@ fn live_probes_every_profile_once_and_reports_one_typed_row_each() {
         origin
     };
     let fixture = fixture("live");
-    let entry = |id: &str, origin: &str| {
-        format!(
-            "[model.{id}]\nprovider = \"openai-compatible\"\nmodel = \"test-model\"\n\
-             base_url = \"{origin}/v1\"\napi_key = \"doctor-live-secret-{id}\"\n\n"
-        )
-    };
     let config = write_config(
         &fixture,
         &format!(
-            "[models]\ndefault = \"good\"\n\n{}{}{}",
-            entry("good", &good),
-            entry("refusing", &refusing),
-            entry("down", &down)
+            "[models]\ndefault = \"good\"\n\n{}{}{}{}{}",
+            live_entry("good", &good, Some("doctor-live-secret-good")),
+            live_entry("refusing", &refusing, Some("doctor-live-secret-refusing")),
+            live_entry("down", &down, Some("doctor-live-secret-down")),
+            live_entry("keyless", &keyless, None),
+            // A placeholder key a local server ignores: too short to redact,
+            // it must not blank an "x" out of every other row.
+            live_entry("limited", &limited, Some("x")),
         ),
     );
-    let mut command = Command::new(env!("CARGO_BIN_EXE_rapid"));
-    command
-        .args(["doctor", "--live"])
-        .current_dir(&fixture.project)
-        .env("HOME", &fixture.home)
-        .env("RAPIDLM_CONFIG", &config)
-        .env_remove("RAPIDLM_HOME")
-        .env_remove("RAPIDLM_MODEL")
-        .env_remove("RAPIDLM_MANAGED_CONFIG")
-        .env_remove("RAPIDLM_PROXY");
-    let output = command.output().expect("run rapid doctor --live");
-    let run = Run {
-        code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    };
+    let run = run_live(&fixture, &config, None);
 
     assert_eq!(run.code, Some(1), "a probe failed:\n{}", run.stdout);
     assert_eq!(run.status("live:good"), "PASS");
@@ -790,28 +821,51 @@ fn live_probes_every_profile_once_and_reports_one_typed_row_each() {
     assert!(run.row("live:refusing").contains("auth:"), "{}", run.stdout);
     assert_eq!(run.status("live:down"), "FAIL");
     assert!(run.row("live:down").contains("network:"), "{}", run.stdout);
+    assert_eq!(run.status("live:limited"), "FAIL");
+    assert!(run.row("live:limited").contains("quota:"), "{}", run.stdout);
+    assert_eq!(run.status("live:keyless"), "FAIL");
+    assert!(
+        run.row("live:keyless")
+            .contains("requires a key and none was sent"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout
+            .contains("[model.keyless] names no key: give one with rapid setup --profile keyless"),
+        "{}",
+        run.stdout
+    );
     assert!(
         run.stdout.contains("rapid doctor --live"),
         "a failure names the next command:\n{}",
         run.stdout
     );
-    // The offline rows first, in their fixed order; then one row per profile
+    // The offline rows first, word for word; then one row per profile
     // (sorted), and nothing else.
-    let ids: Vec<String> = run
-        .stdout
-        .lines()
-        .filter(|line| {
-            ["PASS", "FAIL", "WARN", "SKIP"]
-                .iter()
-                .any(|label| line.starts_with(label))
-        })
-        .filter_map(|line| line.split_whitespace().nth(1).map(str::to_owned))
+    let offline = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
+    let live_rows = rows(&run.stdout);
+    let offline_rows = rows(&offline.stdout);
+    assert_eq!(
+        live_rows[..offline_rows.len()],
+        offline_rows[..],
+        "--live changed an offline row"
+    );
+    let ids: Vec<&str> = live_rows
+        .iter()
+        .filter_map(|line| line.split_whitespace().nth(1))
         .collect();
-    let mut expected: Vec<String> = EXPECTED_CHECKS.iter().map(|id| (*id).to_owned()).collect();
-    expected.extend(["live:down", "live:good", "live:refusing"].map(str::to_owned));
+    let mut expected: Vec<&str> = EXPECTED_CHECKS.to_vec();
+    expected.extend([
+        "live:down",
+        "live:good",
+        "live:keyless",
+        "live:limited",
+        "live:refusing",
+    ]);
     assert_eq!(ids, expected);
     // One bounded request each; no key ever printed.
-    for seen in [&good_seen, &refusing_seen] {
+    for seen in [&good_seen, &refusing_seen, &keyless_seen, &limited_seen] {
         let requests = seen.lock().expect("lock").clone();
         assert_eq!(requests.len(), 1, "{requests:?}");
         assert!(requests[0].contains("\"max_tokens\":16"), "{}", requests[0]);
@@ -820,11 +874,69 @@ fn live_probes_every_profile_once_and_reports_one_typed_row_each() {
         let secret = format!("doctor-live-secret-{id}");
         assert!(!run.stdout.contains(&secret) && !run.stderr.contains(&secret));
     }
-
-    // Without --live: the same offline rows, and no request.
-    let offline = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
+    // Without --live: no request.
     assert!(!offline.stdout.contains("live:"), "{}", offline.stdout);
     assert_eq!(good_seen.lock().expect("lock").len(), 1);
+}
+
+#[test]
+fn live_under_a_locked_default_probes_the_other_profiles_as_a_run_dials_them() {
+    let (corp, corp_seen) = model_server(200, GOOD_BODY);
+    let (backup, backup_seen) = model_server(200, GOOD_BODY);
+    let fixture = fixture("live-lock");
+    let config = write_config(
+        &fixture,
+        &format!(
+            "[models]\ndefault = \"backup\"\nfallback = [\"corp\"]\n\n{}{}",
+            live_entry("corp", &corp, Some("doctor-live-secret-corp")),
+            live_entry("backup", &backup, Some("doctor-live-secret-backup")),
+        ),
+    );
+    let policy = fixture.home.join("managed.toml");
+    std::fs::write(
+        &policy,
+        "schema = \"rapidlm.managed_config.v1\"\n[policy]\nlocked_default = \"corp\"\n",
+    )
+    .expect("policy");
+    let run = run_live(&fixture, &config, Some(&policy));
+    assert_eq!(run.code, Some(0), "{}{}", run.stdout, run.stderr);
+    assert_eq!(run.status("live:corp"), "PASS");
+    assert!(!run.row("live:corp").contains("locks"), "{}", run.stdout);
+    assert_eq!(run.status("live:backup"), "PASS");
+    assert!(
+        run.row("live:backup")
+            .contains("the managed policy locks the default to corp; probed as a fallback"),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(corp_seen.lock().expect("lock").len(), 1);
+    assert_eq!(backup_seen.lock().expect("lock").len(), 1);
+}
+
+#[test]
+fn a_profile_name_cannot_put_control_characters_on_the_report() {
+    let (good, _seen) = model_server(200, GOOD_BODY);
+    let fixture = fixture("live-id");
+    let hostile = format!("x{}", "y".repeat(100));
+    let config = write_config(
+        &fixture,
+        &format!(
+            "[models]\ndefault = \"good\"\n\n{}[model.\"a\\u001b[2J\"]\nprovider = \
+             \"openai-compatible\"\nmodel = \"m\"\nbase_url = \"{good}/v1\"\n\n{}",
+            live_entry("good", &good, None),
+            live_entry(&hostile, &good, None),
+        ),
+    );
+    let run = run_live(&fixture, &config, None);
+    assert!(!run.stdout.contains('\u{1b}'), "{:?}", run.stdout);
+    assert!(run.stdout.contains("live:a?[2J"), "{}", run.stdout);
+    // A long profile id is cut, not allowed to pad every row.
+    assert!(
+        run.stdout.lines().all(|line| line.len() < 400),
+        "{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("live:xyyy"), "{}", run.stdout);
 }
 
 #[test]

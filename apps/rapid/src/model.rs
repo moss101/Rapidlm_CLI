@@ -72,11 +72,26 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ModelConfigError {
     Config(UserConfigError),
-    ProfileId { profile_id: String, reason: String },
-    ModelId { model: String, reason: String },
-    BaseUrl { base_url: String, reason: String },
-    Capability { reason: String },
-    Credential { reason: String },
+    ProfileId {
+        profile_id: String,
+        reason: String,
+    },
+    ModelId {
+        model: String,
+        reason: String,
+    },
+    BaseUrl {
+        base_url: String,
+        reason: String,
+    },
+    Capability {
+        reason: String,
+    },
+    Credential {
+        reason: String,
+    },
+    /// The key has characters no HTTP header can carry, or is too long.
+    UnsendableKey,
 }
 
 impl fmt::Display for ModelConfigError {
@@ -94,6 +109,11 @@ impl fmt::Display for ModelConfigError {
             }
             Self::Capability { reason } => write!(f, "model capability pin is invalid: {reason}"),
             Self::Credential { reason } => write!(f, "model credential is unusable: {reason}"),
+            Self::UnsendableKey => write!(
+                f,
+                "model credential is unusable: key contains control characters or exceeds the \
+size bound"
+            ),
         }
     }
 }
@@ -241,10 +261,7 @@ impl<'store> ConfiguredModel<'store> {
         let transport: Box<dyn HttpTransport> = match &active.credential.plaintext {
             Some(key) => {
                 let bearer =
-                    StaticWireAuth::bearer(key).map_err(|_| ModelConfigError::Credential {
-                        reason: "key contains control characters or exceeds the size bound"
-                            .to_owned(),
-                    })?;
+                    StaticWireAuth::bearer(key).map_err(|_| ModelConfigError::UnsendableKey)?;
                 Box::new(routed(Http1Transport::new(bearer), &active.proxy, gate))
             }
             None => Box::new(routed(Http1Transport::new(NoWireAuth), &active.proxy, gate)),

@@ -14,10 +14,12 @@
 //! Guarantees this module holds to, each covered by a test below or in
 //! `apps/rapid/tests/doctor_cli.rs`:
 //!
-//!   - **Offline.** No check performs a network request or a billable model
-//!     call. Provider configuration is validated locally (endpoint parsing,
-//!     capability pinning, credential seeding into a process-local store);
-//!     connectivity is reported as untested, never as verified.
+//!   - **Offline unless `--live`.** Without it no check performs a network
+//!     request or a billable model call. Provider configuration is validated
+//!     locally (endpoint parsing, capability pinning, credential seeding into
+//!     a process-local store); connectivity is reported as untested, never as
+//!     verified. `--live` adds one bounded probe per configured profile,
+//!     after every offline row, each on an egress gate with its receipt.
 //!   - **Read-only.** No check grants or revokes trust, rewrites config,
 //!     installs or approves a plugin, executes a hook or a scanner, or
 //!     touches project source, `goal.json`, or evidence. The one write any
@@ -536,7 +538,7 @@ pub fn diagnose(env: &DoctorEnv) -> DoctorReport {
 
     // --- live: only when asked, after every offline row -----------------
     if env.live {
-        checks.extend(check_live(&env.env, &mut secrets, &cancel));
+        checks.extend(check_live(&env.env, &mut secrets));
     }
 
     finalize(DoctorReport { checks }, &secrets)
@@ -546,20 +548,42 @@ pub fn diagnose(env: &DoctorEnv) -> DoctorReport {
 // individual checks
 // -------------------------------------------------------------------------
 
+/// Shortest probed key registered for redaction. A shorter "key" is a
+/// placeholder local servers ignore (`x`, `EMPTY`), and redaction replaces
+/// exact substrings across the whole report: registering one would blank
+/// that text out of every row. No row prints a key; this is a backstop.
+const MIN_LIVE_KEY_REDACTION: usize = 8;
+
+/// What `--live` does with one profile.
+enum LivePlan {
+    /// Probe this model; `note` says how a run reaches it, when not as the
+    /// default.
+    Probe {
+        active: Box<crate::user_config::ActiveModel>,
+        note: Option<String>,
+    },
+    /// Not probed: the row says why.
+    Row(DoctorCheck),
+}
+
 /// `--live`: one `live:<profile>` row per configured `[model.<id>]`, each
-/// the model a run selecting that profile would build (the managed gates
-/// applied), probed with `rapid setup`'s bounded request on an egress gate
-/// for exactly its endpoint. Every credential a probed profile resolves is
-/// added to `secrets`, so the report scrubs it.
-fn check_live(
-    env: &[(String, String)],
-    secrets: &mut Vec<String>,
-    cancel: &CancellationToken,
-) -> Vec<DoctorCheck> {
+/// the model a run would dial for that profile — as the default when a run
+/// may select it, else as a `[models] fallback` / `[phases]` model under the
+/// managed gates a run applies to one — probed with `rapid setup`'s bounded
+/// request on an egress gate for exactly its endpoint. The probes run side
+/// by side, so the command takes about as long as the slowest. Every probed
+/// key (of at least [`MIN_LIVE_KEY_REDACTION`] bytes) joins `secrets`.
+fn check_live(env: &[(String, String)], secrets: &mut Vec<String>) -> Vec<DoctorCheck> {
     let source = crate::user_config::resolve_config_source(env);
-    let profiles = match crate::user_config::load_config(&source) {
-        Ok(Some(config)) => config.model_ids(),
-        Ok(None) => Vec::new(),
+    let config = match crate::user_config::load_config(&source) {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            return vec![DoctorCheck::warn(
+                "live",
+                "no model configured, nothing to probe",
+                "run rapid setup to configure and verify a model",
+            )];
+        }
         Err(err) => {
             return vec![DoctorCheck::skipped(
                 "live",
@@ -567,6 +591,7 @@ fn check_live(
             )];
         }
     };
+    let profiles = config.model_ids();
     if profiles.is_empty() {
         return vec![DoctorCheck::warn(
             "live",
@@ -574,55 +599,165 @@ fn check_live(
             "run rapid setup to configure and verify a model",
         )];
     }
-    let router_cancel = llm_router::provider::CancellationToken::new();
-    profiles
+    let policy = match crate::managed_config::load_policy(env) {
+        Ok(policy) => policy,
+        Err(err) => {
+            return vec![DoctorCheck::fail(
+                "live",
+                format!("not probed: the managed policy does not load ({err})"),
+                "fix the managed policy file RAPIDLM_MANAGED_CONFIG names",
+            )];
+        }
+    };
+    let plans: Vec<(String, LivePlan)> = profiles
         .into_iter()
         .map(|profile| {
-            let id = format!("live:{profile}");
-            if cancel.is_cancelled() {
-                return DoctorCheck::skipped(id, "not probed: cancelled");
-            }
-            let active =
-                match crate::user_config::select_active_model_with_override(env, Some(&profile)) {
-                    Ok(crate::user_config::ModelSelection::Configured { active, .. }) => active,
-                    Ok(crate::user_config::ModelSelection::Unconfigured { .. }) => {
-                        return DoctorCheck::skipped(id, "not probed: no configuration resolves");
-                    }
-                    Err(err) => {
-                        return DoctorCheck::fail(
-                            id,
-                            format!("not probed: {err}"),
-                            format!("fix [model.{profile}] (rapid setup --profile {profile})"),
-                        );
-                    }
-                };
-            if active.profile_id != profile {
-                return DoctorCheck::skipped(
-                    id,
-                    format!(
-                        "not probed: the managed policy locks the model to {}",
-                        active.profile_id
-                    ),
-                );
-            }
-            if let Some(key) = &active.credential.plaintext {
-                secrets.push(key.clone());
-            }
-            match crate::setup::probe_resolved(&active, &router_cancel) {
-                Err(reason) => DoctorCheck::fail(
-                    id,
-                    format!("not probed: {reason}"),
-                    format!("fix [model.{profile}] (rapid setup --profile {profile})"),
-                ),
-                Ok(probe) => live_row(id, &profile, &probe),
-            }
+            let plan = live_plan(env, &config, policy.as_ref(), &profile);
+            (profile, plan)
         })
-        .collect()
+        .collect();
+    for (_, plan) in &plans {
+        if let LivePlan::Probe { active, .. } = plan
+            && let Some(key) = &active.credential.plaintext
+            && key.len() >= MIN_LIVE_KEY_REDACTION
+        {
+            secrets.push(key.clone());
+        }
+    }
+    let cancel = llm_router::provider::CancellationToken::new();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = plans
+            .into_iter()
+            .map(|(profile, plan)| {
+                let cancel = &cancel;
+                scope.spawn(move || {
+                    let id = format!("live:{profile}");
+                    match plan {
+                        LivePlan::Row(row) => row,
+                        LivePlan::Probe { active, note } => {
+                            match crate::setup::probe_resolved(&active, cancel) {
+                                Err(reason) => DoctorCheck::fail(
+                                    id,
+                                    format!("not probed: {reason}"),
+                                    fix_profile(&profile),
+                                ),
+                                Ok(probe) => live_row(id, &profile, &active, &probe, note),
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.join().unwrap_or_else(|_| {
+                    DoctorCheck::fail(
+                        "live",
+                        "a probe panicked",
+                        "this is an internal fault; report it",
+                    )
+                })
+            })
+            .collect()
+    })
+}
+
+/// How a run reaches `profile`, if it does.
+fn live_plan(
+    env: &[(String, String)],
+    config: &crate::user_config::UserConfig,
+    policy: Option<&crate::managed_config::ManagedPolicy>,
+    profile: &str,
+) -> LivePlan {
+    use crate::managed_config::GatedConfigError;
+    let id = format!("live:{profile}");
+    let locked_to = match crate::user_config::select_active_model_with_override(env, Some(profile))
+    {
+        Ok(crate::user_config::ModelSelection::Configured { active, .. })
+            if active.profile_id == profile =>
+        {
+            return LivePlan::Probe { active, note: None };
+        }
+        Ok(crate::user_config::ModelSelection::Configured { active, .. }) => active.profile_id,
+        Ok(crate::user_config::ModelSelection::Unconfigured { .. }) => {
+            return LivePlan::Row(DoctorCheck::skipped(
+                id,
+                "not probed: no configuration resolves",
+            ));
+        }
+        Err(GatedConfigError::Config(err)) => {
+            return LivePlan::Row(DoctorCheck::fail(
+                id,
+                format!("not probed: {err}"),
+                fix_profile(profile),
+            ));
+        }
+        Err(GatedConfigError::Field(err)) => {
+            return LivePlan::Row(DoctorCheck::skipped(
+                id,
+                format!("not probed: the managed policy refuses it ({err})"),
+            ));
+        }
+        Err(GatedConfigError::Managed(err)) => {
+            return LivePlan::Row(DoctorCheck::fail(
+                id,
+                format!("not probed: the managed policy does not load ({err})"),
+                "fix the managed policy file RAPIDLM_MANAGED_CONFIG names".to_owned(),
+            ));
+        }
+    };
+    // Under a lock a run never selects this profile as its default, yet
+    // still dials it as a fallback or phase model: probe it as one.
+    let mut candidate_env: Vec<(String, String)> = env
+        .iter()
+        .filter(|(key, _)| key != crate::user_config::DEFAULT_MODEL_ENV)
+        .cloned()
+        .collect();
+    candidate_env.push((
+        crate::user_config::DEFAULT_MODEL_ENV.to_owned(),
+        profile.to_owned(),
+    ));
+    let candidate = crate::user_config::resolve_active(&candidate_env, config)
+        .map_err(|err| err.to_string())
+        .and_then(|active| crate::managed_config::apply_to_fallback_candidate(active, policy));
+    match candidate {
+        Ok(active) => LivePlan::Probe {
+            active: Box::new(active),
+            note: Some(format!(
+                "the managed policy locks the default to {locked_to}; probed as a fallback or \
+phase model"
+            )),
+        },
+        Err(reason) => LivePlan::Row(DoctorCheck::skipped(
+            id,
+            format!(
+                "not probed: the managed policy locks the default to {locked_to} and a run does \
+not use this profile ({reason})"
+            ),
+        )),
+    }
+}
+
+/// The remediation for a profile's own configuration: `rapid setup` when it
+/// can edit this profile, else the file.
+fn fix_profile(profile: &str) -> String {
+    if llm_router::credentials::ProfileId::parse(profile).is_ok() {
+        format!("fix [model.{profile}] (rapid setup --profile {profile} rewrites it)")
+    } else {
+        format!("fix [model.\"{profile}\"] in the config file")
+    }
 }
 
 /// The row for one probe: what answered (or the failure class), then the
 /// egress receipt.
-fn live_row(id: String, profile: &str, probe: &crate::setup::LiveProbe) -> DoctorCheck {
+fn live_row(
+    id: String,
+    profile: &str,
+    active: &crate::user_config::ActiveModel,
+    probe: &crate::setup::LiveProbe,
+    note: Option<String>,
+) -> DoctorCheck {
     use crate::setup::ProbeFailure as F;
     let egress = if probe.receipts.is_empty() {
         "egress: nothing dialled".to_owned()
@@ -638,25 +773,35 @@ fn live_row(id: String, profile: &str, probe: &crate::setup::LiveProbe) -> Docto
             .collect();
         format!("egress: {}", decisions.join(", "))
     };
+    let note = note.map(|note| format!(" ({note})")).unwrap_or_default();
     let endpoint = &probe.endpoint;
     let failure = match &probe.result {
         Ok(()) => {
-            return DoctorCheck::pass(id, format!("{endpoint} answered; {egress}"));
+            return DoctorCheck::pass(id, format!("{endpoint} answered{note}; {egress}"));
         }
         Err(failure) => failure,
+    };
+    let setup = llm_router::credentials::ProfileId::parse(profile)
+        .is_ok()
+        .then(|| format!("rapid setup --profile {profile}"));
+    let give_key = match &setup {
+        Some(setup) => format!("give one with {setup} --key-env <VAR> or --key-stdin"),
+        None => format!("give one in [model.\"{profile}\"]"),
     };
     let (what, next) = match failure {
         F::Auth => (
             format!("{endpoint} refused the key"),
-            format!("check the key, or give another with rapid setup --profile {profile}"),
+            format!("check the key, or {give_key}"),
         ),
-        F::AuthNoKey | F::NoKey { .. } | F::KeptKeyUnset { .. } | F::KeyNotRead { .. } => (
-            format!("{endpoint} requires a key and none was sent"),
-            format!(
-                "set the variable [model.{profile}] env_key names, or give a key with rapid setup \
---profile {profile}"
-            ),
-        ),
+        F::AuthNoKey | F::NoKey { .. } | F::KeptKeyUnset { .. } | F::KeyNotRead { .. } => {
+            let next = match active.entry.env_key.first() {
+                Some(var) => {
+                    format!("set ${var}, which [model.{profile}] env_key names, or {give_key}")
+                }
+                None => format!("[model.{profile}] names no key: {give_key}"),
+            };
+            (format!("{endpoint} requires a key and none was sent"), next)
+        }
         F::UnusableKey => (
             "the key cannot be sent (characters no HTTP header can carry, or too long)".to_owned(),
             "check the key for a stray line break".to_owned(),
@@ -679,7 +824,7 @@ fn live_row(id: String, profile: &str, probe: &crate::setup::LiveProbe) -> Docto
         ),
         F::Server => (
             format!("{endpoint} failed on its side"),
-            "run rapid doctor --live again later".to_owned(),
+            "try again later".to_owned(),
         ),
         F::Invalid => (
             format!("{endpoint} did not answer as its provider kind would, or refused the request"),
@@ -688,7 +833,7 @@ fn live_row(id: String, profile: &str, probe: &crate::setup::LiveProbe) -> Docto
     };
     DoctorCheck::fail(
         id,
-        format!("{}: {what}; {egress}", failure.class()),
+        format!("{}: {what}{note}; {egress}", failure.class()),
         format!("{next}, then run rapid doctor --live"),
     )
 }
@@ -1622,6 +1767,27 @@ fn check_release_signature(report: &Result<security::DoctorReport, String>) -> D
 /// forge additional report rows (a fabricated `PASS  model  ...` above the
 /// summary). Every control character, `\n` and `\r` included, becomes a
 /// space so a detail can only ever occupy the one line it was given.
+/// Longest row id rendered, in characters (a `live:<profile>` id carries a
+/// user-chosen profile name; the fixed ids are far shorter).
+const MAX_ID_CHARS: usize = 64;
+
+/// A row id as rendered: control characters replaced, at most
+/// [`MAX_ID_CHARS`] characters. The fixed ids pass through unchanged.
+fn bounded_id(id: std::borrow::Cow<'static, str>) -> std::borrow::Cow<'static, str> {
+    if id.chars().count() <= MAX_ID_CHARS && !id.chars().any(char::is_control) {
+        return id;
+    }
+    let mut clean: String = id
+        .chars()
+        .take(MAX_ID_CHARS)
+        .map(|ch| if ch.is_control() { '?' } else { ch })
+        .collect();
+    if id.chars().count() > MAX_ID_CHARS {
+        clean.push_str("...");
+    }
+    std::borrow::Cow::Owned(clean)
+}
+
 fn bounded(text: &str) -> String {
     let mut clean: String = text
         .chars()
@@ -1749,7 +1915,7 @@ fn finalize(report: DoctorReport, secrets: &[String]) -> DoctorReport {
             .checks
             .into_iter()
             .map(|check| DoctorCheck {
-                id: check.id,
+                id: bounded_id(check.id),
                 status: check.status,
                 detail: scrub(&check.detail),
                 remediation: check.remediation.as_deref().map(scrub),

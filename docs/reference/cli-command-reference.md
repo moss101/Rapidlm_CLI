@@ -106,17 +106,22 @@ store) and the model row says `connectivity not tested` rather than implying the
 was reached. An end-to-end test points a configured provider at a listener that records
 any connection and asserts it stays untouched.
 
-`rapid doctor --live` then probes every configured `[model.<id>]` — the model a run
-selecting that profile would build, managed gates applied — with the request `rapid
-setup` verifies with (at most 16 output tokens), through that profile's key and proxy
-(`[network] proxy`) and on an egress gate for exactly its endpoint. It adds one row per
-profile after the offline rows, in profile order: `live:<id>` `PASS` when the endpoint
-answered, `FAIL` with the class (`auth`, `quota`, `network`, `server`, `invalid`), what
-happened and the next command otherwise, each with its egress receipt (`egress: allowed
-<scheme>://<host>:<port>`, or what was refused and why). A profile the managed policy
-locks away is `SKIP`; no configured model is one `live` `WARN` pointing at `rapid setup`.
-A failed probe fails the command (exit `1`). Nothing is written: the receipt is reported,
-not recorded.
+`rapid doctor --live` then probes every configured `[model.<id>]` — the model a run would
+dial for that profile, managed gates applied: as the default when a run may select it,
+and, under a managed `locked_default`, as the `[models] fallback` or `[phases]` model a
+run still dials it as — with the request `rapid setup` verifies with (at most 16 output
+tokens), through that profile's key and proxy (`[network] proxy`) and on an egress gate
+for exactly its endpoint. The probes run side by side, so the command takes about as long
+as the slowest (each connection and each answer is bounded by the transport's timeouts).
+It adds one row per profile after the offline rows, in profile order: `live:<id>` `PASS`
+when the endpoint answered; `FAIL` with the class (`auth`, `quota`, `network`, `server`,
+`invalid`), what happened, the next command and the egress receipt (`egress: allowed
+<scheme>://<host>:<port>`, or what was refused and why) when the probe failed; `FAIL`
+with the reason and no receipt when the profile's configuration does not resolve, so
+nothing was sent; `SKIP` when the managed policy refuses the profile, or locks the
+default elsewhere and refuses it as a fallback too. No configured model is one `live`
+`WARN` pointing at `rapid setup`. A failed probe fails the command (exit `1`). Nothing is
+written: the receipt is reported, not recorded.
 
 **Read-only.** Doctor never grants or revokes trust, rewrites configuration, installs,
 approves or executes a plugin, runs a hook, or runs a scanner. It reads trust through the

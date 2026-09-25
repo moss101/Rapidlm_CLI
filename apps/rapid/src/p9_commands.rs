@@ -1500,7 +1500,6 @@ pub fn run_setup(args: &[String]) -> Result<i32, P9CommandError> {
     Ok(outcome.exit)
 }
 
-/// `rapid doctor --help`.
 /// `rapid doctor [--live]`: whether `--live` was given. Anything else is
 /// refused — silently ignoring an argument would let `rapid doctor --json`
 /// or `rapid doctor sandbox` look like it did something it did not.
@@ -1515,6 +1514,7 @@ fn parse_doctor_args(args: &[String]) -> Result<bool, String> {
     Ok(live)
 }
 
+/// `rapid doctor --help`.
 pub const DOCTOR_USAGE: &str = "\
 usage: rapid doctor [--live]
 

@@ -695,8 +695,8 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
     },
     Subcommand {
         name: "doctor",
-        operands: "",
-        summary: "config/model/trust/sandbox diagnosis (offline)",
+        operands: "[--live]",
+        summary: "diagnosis (offline; --live probes models)",
         own_help: true,
         handler: SubcommandHandler::P9(crate::p9_commands::run_doctor),
     },

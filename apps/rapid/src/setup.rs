@@ -1447,7 +1447,13 @@ pub fn probe_resolved(
     cancel: &llm_router::provider::CancellationToken,
 ) -> Result<LiveProbe, String> {
     let endpoint = origin_of(&active.entry.base_url)
-        .map(|(scheme, host, port)| format!("{scheme}://{host}:{port}"))
+        .map(|(scheme, host, port)| {
+            if host.contains(':') {
+                format!("{scheme}://[{host}]:{port}")
+            } else {
+                format!("{scheme}://{host}:{port}")
+            }
+        })
         .ok_or_else(|| "base_url has no origin".to_owned())?;
     let egress = std::sync::Arc::new(endpoint_egress(
         &active.entry.base_url,
@@ -1459,7 +1465,7 @@ pub fn probe_resolved(
     let store = auth::InMemoryCredentialStore::new();
     let gate: std::sync::Arc<dyn llm_router::providers::dial::DialGate> = egress.clone();
     let result = match crate::model::ConfiguredModel::build_with_gate(&active, &store, Some(gate)) {
-        Err(crate::model::ModelConfigError::Credential { .. }) => Err(ProbeFailure::UnusableKey),
+        Err(crate::model::ModelConfigError::UnsendableKey) => Err(ProbeFailure::UnusableKey),
         Err(crate::model::ModelConfigError::BaseUrl { .. }) => Err(ProbeFailure::Refused),
         Err(err) => return Err(err.to_string()),
         Ok(model) => model.probe(cancel).map_err(|err| match classify(&err) {
@@ -1529,7 +1535,8 @@ pub fn verify(
     let gate: std::sync::Arc<dyn llm_router::providers::dial::DialGate> = egress.clone();
     let model = crate::model::ConfiguredModel::build_with_gate(&active, &store, Some(gate))
         .map_err(|err| match err {
-            crate::model::ModelConfigError::Credential { .. } => ProbeFailure::UnusableKey,
+            crate::model::ModelConfigError::Credential { .. }
+            | crate::model::ModelConfigError::UnsendableKey => ProbeFailure::UnusableKey,
             crate::model::ModelConfigError::BaseUrl { .. } => ProbeFailure::Refused,
             _ => ProbeFailure::Invalid,
         })?;
@@ -3874,5 +3881,18 @@ own_knob = 2
             requests[0]
         );
         assert_eq!(home.snapshot(), before);
+    }
+
+    #[test]
+    fn a_live_probe_names_an_ipv6_endpoint_in_brackets() {
+        let doc = "[models]\ndefault = \"v6\"\n\n[model.v6]\nprovider = \"openai-compatible\"\n\
+model = \"m\"\nbase_url = \"http://[::1]:1/v1\"\n";
+        let config = parse_config_document(doc, "c").expect("parses");
+        let active = crate::user_config::resolve_active(&[], &config).expect("active");
+        let cancel = llm_router::provider::CancellationToken::new();
+        let probe = probe_resolved(&active, &cancel).expect("probed");
+        // Named as a URL names it (the probe itself fails: nothing listens).
+        assert_eq!(probe.endpoint, "http://[::1]:1");
+        assert!(probe.result.is_err());
     }
 }
