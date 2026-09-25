@@ -348,7 +348,11 @@ fn binary_exec_uses_configured_model_end_to_end() {
     // The turn is recorded in its own project, not in the repository that
     // encloses this test's working directory.
     let listed = sessions_in_exec_project(&dir);
-    assert!(listed.contains("count=1"), "{listed}");
+    assert_eq!(
+        listed.lines().next(),
+        Some("schema=rapidlm.sessions count=1"),
+        "{listed}"
+    );
 }
 
 #[test]
@@ -368,7 +372,11 @@ fn binary_exec_without_config_takes_the_typed_fallback() {
         "typed provider failure missing: {stderr}"
     );
     let listed = sessions_in_exec_project(&dir);
-    assert!(listed.contains("count=1"), "{listed}");
+    assert_eq!(
+        listed.lines().next(),
+        Some("schema=rapidlm.sessions count=1"),
+        "{listed}"
+    );
 }
 
 #[test]

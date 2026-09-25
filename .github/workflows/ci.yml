@@ -68,8 +68,10 @@ jobs:
       # Every project the suite drives lives in a temp directory of its own.
       # A run that resolved this repository as its project accrued its turns
       # to the goal committed in `.rapidlm/goal.json` and left a session
-      # ledger beside it; nothing may land there again.
+      # ledger beside it; nothing may land there again. Checked after a
+      # failed test step too, so a red run still says whether it leaked.
       - name: Tests leave the repository's .rapidlm untouched
+        if: ${{ !cancelled() }}
         run: |
           leaked="$(git status --porcelain --ignored --untracked-files=all -- .rapidlm)"
           if [ -n "$leaked" ]; then
