@@ -939,36 +939,51 @@ fn live_under_a_locked_default_probes_the_other_profiles_as_a_run_dials_them() {
         assert_eq!(seen.lock().expect("lock").len(), expected, "{}", run.stdout);
     }
 
-    // A lock on a provider the policy refuses: the refusal is the locked
-    // profile's; the others are judged as what a run dials them as.
-    std::fs::write(
-        &policy,
-        "schema = \"rapidlm.managed_config.v1\"\n[policy]\nlocked_default = \"corp\"\n\
-         allowed_providers = [\"anthropic\"]\n",
-    )
-    .expect("policy");
-    let run = run_live(&fixture, &config, Some(&policy));
-    assert_eq!(run.status("live:corp"), "SKIP");
-    assert!(
-        run.row("live:corp").contains("refuses it"),
-        "{}",
-        run.stdout
+    // A lock the policy's own allowlist refuses, or one naming no profile:
+    // every run is refused before it dials anything, so nothing is probed —
+    // not even a fallback the allowlist would let through.
+    let (alt, alt_seen) = model_server(200, GOOD_BODY);
+    let refused = write_config(
+        &fixture,
+        &format!(
+            "[models]\ndefault = \"corp\"\nfallback = [\"alt\"]\n\n{}\
+             [model.alt]\nprovider = \"anthropic\"\nmodel = \"m\"\nbase_url = \"{alt}\"\n",
+            live_entry("corp", &corp, Some("doctor-live-secret-corp")),
+        ),
     );
-    assert_eq!(run.status("live:spare"), "SKIP");
-    assert!(
-        run.row("live:spare")
-            .contains("refuses this profile as a [models] fallback"),
-        "{}",
-        run.stdout
-    );
-    assert!(
-        run.row("live:backup")
-            .contains("a run does not dial this profile"),
-        "{}",
-        run.stdout
-    );
+    for (lock, corp_row) in [
+        (
+            "locked_default = \"corp\"\nallowed_providers = [\"anthropic\"]\n",
+            "refuses it",
+        ),
+        (
+            "locked_default = \"ghost\"\n",
+            "every run is refused at the locked default ghost",
+        ),
+    ] {
+        std::fs::write(
+            &policy,
+            format!("schema = \"rapidlm.managed_config.v1\"\n[policy]\n{lock}"),
+        )
+        .expect("policy");
+        let run = run_live(&fixture, &refused, Some(&policy));
+        assert_eq!(run.status("live:alt"), "SKIP", "{lock}");
+        assert!(
+            run.row("live:alt")
+                .contains("every run is refused at the locked default"),
+            "{lock}: {}",
+            run.stdout
+        );
+        assert_eq!(run.status("live:corp"), "SKIP", "{lock}");
+        assert!(
+            run.row("live:corp").contains(corp_row),
+            "{lock}: {}",
+            run.stdout
+        );
+    }
+    assert_eq!(alt_seen.lock().expect("lock").len(), 0, "nothing sent");
     assert_eq!(
-        spare_seen.lock().expect("lock").len(),
+        corp_seen.lock().expect("lock").len(),
         1,
         "nothing more sent"
     );

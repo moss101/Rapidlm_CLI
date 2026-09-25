@@ -672,6 +672,9 @@ fn live_plan(
 ) -> LivePlan {
     use crate::managed_config::GatedConfigError;
     let id = format!("live:{profile}");
+    let lock = policy
+        .and_then(crate::managed_config::ManagedPolicy::locked_default)
+        .filter(|locked| *locked != profile);
     let locked_to = match crate::user_config::select_active_model_with_override(env, Some(profile))
     {
         Ok(crate::user_config::ModelSelection::Configured { active, .. })
@@ -686,24 +689,33 @@ fn live_plan(
                 "not probed: no configuration resolves",
             ));
         }
+        // Under a lock the gates and the resolution judge the locked profile,
+        // whatever was asked: when that fails, every run is refused before it
+        // dials anything — this profile included.
+        Err(GatedConfigError::Config(err)) if lock.is_some() => {
+            return LivePlan::Row(DoctorCheck::skipped(
+                id,
+                format!(
+                    "not probed: every run is refused at the locked default {} ({err})",
+                    lock.unwrap_or_default()
+                ),
+            ));
+        }
+        Err(GatedConfigError::Field(err)) if lock.is_some() => {
+            return LivePlan::Row(DoctorCheck::skipped(
+                id,
+                format!(
+                    "not probed: every run is refused at the locked default {} ({err})",
+                    lock.unwrap_or_default()
+                ),
+            ));
+        }
         Err(GatedConfigError::Config(err)) => {
             return LivePlan::Row(DoctorCheck::fail(
                 id,
                 format!("not probed: {err}"),
                 fix_profile(profile),
             ));
-        }
-        // Under a lock the gates judge the locked profile, whatever was
-        // asked: a refusal is the locked profile's, not this one's.
-        Err(GatedConfigError::Field(_))
-            if policy
-                .and_then(crate::managed_config::ManagedPolicy::locked_default)
-                .is_some_and(|locked| locked != profile) =>
-        {
-            policy
-                .and_then(crate::managed_config::ManagedPolicy::locked_default)
-                .unwrap_or_default()
-                .to_owned()
         }
         Err(GatedConfigError::Field(err)) => {
             return LivePlan::Row(DoctorCheck::skipped(

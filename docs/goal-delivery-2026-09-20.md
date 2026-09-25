@@ -422,3 +422,11 @@ Not changed: the offline path registers the plan's keys for redaction at any len
 Revert cycle: every locked profile probed, the lock's refusal blamed on each profile, any proxy variable named, the lock branch not checking the shell — each fails its test (four mutations, one at a time).
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4113 passed, 0 failed; `pnpm` unaffected.
+
+### Self-review of `cccdf0b` — findings fixed in the follow-up commit
+
+The background review found one defect the previous fix introduced and a wording slip, both verified and fixed, each fix revert-cycled: (1, **medium**) when the managed policy's own allowlist refuses the locked profile, `cccdf0b` treated the refusal as the lock's and probed the other profiles as fallback candidates — but a run is refused at selection (`select_active_model_with_override` fails before the fallback chain or the compact model is built), so `--live` billed a fallback no run ever reaches and could exit 0 while every run failed. Under a lock, a failed selection — refused by a gate, or a lock naming no profile — now makes every other row `SKIP` "every run is refused at the locked default <id>" (`live_under_a_locked_default_probes_the_other_profiles_as_a_run_dials_them`: a refused lock with an allowed fallback, and a lock naming a missing profile; nothing is sent); the lock naming a missing profile no longer blames each profile's own configuration; (2) setup's note named `RAPIDLM_MODEL` whenever it was set, also when it played no part (under a lock, which sets it aside, or when it names a good profile and only the proxy fails) — it is named only when a run fails with it and without the proxy settings (`a_note_names_only_the_shell_settings_that_make_a_run_fail`).
+
+Revert cycle: the refused lock's gate failure, the missing locked profile, `RAPIDLM_MODEL` named unconditionally — each fails its test (three mutations, one at a time).
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4112 passed, 1 failed — the host-desktop test recorded under HYG-001 (it passed on the previous run); `pnpm` unaffected.

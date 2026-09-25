@@ -884,9 +884,18 @@ would make the default, so {} is left untouched",
     let real = crate::managed_config::resolve_gated(env, &parsed, policy);
     if let Err(err) = &real {
         // Name the settings of this shell that make a run here fail: the
-        // proxy settings when they do not resolve, RAPIDLM_MODEL when set.
+        // proxy settings when they do not resolve; RAPIDLM_MODEL when a run
+        // fails with it and without the proxy settings (a lock sets it
+        // aside, so under one it never is).
         let mut set_aside = Vec::new();
-        if env_value(env, crate::user_config::DEFAULT_MODEL_ENV).is_some() {
+        let without_proxy: Vec<(String, String)> = env
+            .iter()
+            .filter(|(key, _)| !crate::user_config::is_shell_proxy_setting(key))
+            .cloned()
+            .collect();
+        if env_value(env, crate::user_config::DEFAULT_MODEL_ENV).is_some()
+            && crate::managed_config::resolve_gated(&without_proxy, &parsed, policy).is_err()
+        {
             set_aside.push("RAPIDLM_MODEL");
         }
         if crate::user_config::resolve_proxy(env, &parsed).is_err() {
@@ -3971,5 +3980,32 @@ base_url = \"http://10.0.0.5:9000/v1\"
             "{:?}",
             plan.notes
         );
+        // RAPIDLM_MODEL is named only when a run fails with it: under the lock
+        // (which sets it aside), and with a valid one, the proxy alone is.
+        for (policy, model) in [(Some(&policy), "nope"), (None, "corp")] {
+            let mut env = env.clone();
+            env.push((
+                crate::user_config::DEFAULT_MODEL_ENV.to_owned(),
+                model.to_owned(),
+            ));
+            let plan = super::plan(
+                choice_for(&["--preset", "openai"]),
+                Path::new("c.toml"),
+                Some(existing),
+                &env,
+                policy,
+                true,
+                "T",
+            )
+            .expect("a good plan is not refused");
+            assert!(
+                plan.notes
+                    .iter()
+                    .any(|note| note
+                        .starts_with("with this shell's proxy settings a run would fail")),
+                "{model}: {:?}",
+                plan.notes
+            );
+        }
     }
 }
