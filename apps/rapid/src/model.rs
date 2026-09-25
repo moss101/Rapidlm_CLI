@@ -245,9 +245,9 @@ impl<'store> ConfiguredModel<'store> {
                         reason: "key contains control characters or exceeds the size bound"
                             .to_owned(),
                     })?;
-                Box::new(gated(Http1Transport::new(bearer), gate))
+                Box::new(routed(Http1Transport::new(bearer), &active.proxy, gate))
             }
-            None => Box::new(gated(Http1Transport::new(NoWireAuth), gate)),
+            None => Box::new(routed(Http1Transport::new(NoWireAuth), &active.proxy, gate)),
         };
 
         let backend = match active.entry.provider {
@@ -454,10 +454,17 @@ impl ConfiguredModel<'_> {
     }
 }
 
-fn gated<A>(
+/// The transport as the configuration routes it: through the proxy the run
+/// resolved (if any), every dial asked of `gate` (if any) first.
+fn routed<A>(
     transport: Http1Transport<A>,
+    proxy: &Option<llm_router::providers::dial::ProxyConfig>,
     gate: Option<std::sync::Arc<dyn llm_router::providers::dial::DialGate>>,
 ) -> Http1Transport<A> {
+    let transport = match proxy {
+        Some(proxy) => transport.with_proxy(proxy.clone()),
+        None => transport,
+    };
     match gate {
         Some(gate) => transport.with_dial_gate(gate),
         None => transport,
@@ -1129,6 +1136,7 @@ mod tests {
                 source: CredentialSource::InlineApiKey,
             },
             phase_route: llm_router::PhaseRoute::new(route_profile),
+            proxy: None,
         }
     }
 
@@ -1873,5 +1881,91 @@ mod tests {
             ContentPart::Text { text } => text,
             ContentPart::Image { .. } | ContentPart::ImageData { .. } => "",
         }
+    }
+
+    /// A loopback stand-in proxy: records each request head and answers 401.
+    fn recording_proxy() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let origin = format!("http://{}", listener.local_addr().expect("addr"));
+        let heads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&heads);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while let Ok(read) = stream.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..read]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                log.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(String::from_utf8_lossy(&buf).to_string());
+                let _ = stream.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        (origin, heads)
+    }
+
+    #[test]
+    fn a_runs_model_client_goes_through_the_proxy_it_resolved() {
+        let (proxy, heads) = recording_proxy();
+        let doc = |network: &str| {
+            format!(
+                "{network}[models]\ndefault = \"remote\"\n\n[model.remote]\n\
+provider = \"openai-compatible\"\nmodel = \"m\"\nbase_url = \"http://model.example.test:8080/v1\"\n"
+            )
+        };
+        let env = vec![("http_proxy".to_owned(), proxy)];
+        let cancel = llm_router::provider::CancellationToken::new();
+        let opted_in = crate::user_config::parse_config_document(
+            &doc("[network]\nproxy = \"environment\"\n"),
+            "c",
+        )
+        .expect("parses");
+        let active = crate::user_config::resolve_active(&env, &opted_in).expect("active");
+        let store = InMemoryCredentialStore::new();
+        let model = ConfiguredModel::build(&active, &store).expect("build");
+        assert_eq!(
+            model.probe(&cancel).expect_err("the proxy answered 401"),
+            ProviderError::AuthFailed
+        );
+        {
+            let heads = heads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(heads.len(), 1, "{heads:?}");
+            assert!(
+                heads[0].starts_with(
+                    "POST http://model.example.test:8080/v1/chat/completions HTTP/1.1\r\n"
+                ),
+                "{}",
+                heads[0]
+            );
+        }
+        // Not opted in: the variable is not read and the proxy sees nothing.
+        let direct = crate::user_config::parse_config_document(&doc(""), "c").expect("parses");
+        let active = crate::user_config::resolve_active(&env, &direct).expect("active");
+        let store = InMemoryCredentialStore::new();
+        let model = ConfiguredModel::build(&active, &store).expect("build");
+        assert_eq!(
+            model.probe(&cancel).expect_err("the name does not resolve"),
+            ProviderError::Connection
+        );
+        assert_eq!(
+            heads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
     }
 }

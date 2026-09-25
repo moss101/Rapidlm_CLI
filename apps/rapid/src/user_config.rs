@@ -12,6 +12,10 @@
 //!   - Precedence: env override `RAPIDLM_MODEL` > `[models].default`.
 //!   - Credentials: inline `api_key` wins, else the first set, non-empty
 //!     `env_key` entry, else keyless (for local servers without auth).
+//!   - Proxy: `[network] proxy = "environment"` (or `RAPIDLM_PROXY`, which
+//!     wins) routes model connections through the proxy the standard proxy
+//!     variables name; the default, `"none"`, dials directly and reads none
+//!     of them (S11: an exported `HTTPS_PROXY` changes nothing unasked).
 //!
 //! Parsing never reads the process env; callers pass env pairs so the pure
 //! core stays testable. Typed errors name keys and never echo credential
@@ -34,6 +38,8 @@ pub const RAPIDLM_HOME_ENV: &str = "RAPIDLM_HOME";
 pub const HOME_ENV: &str = "HOME";
 /// Windows user home root; config lives at `$USERPROFILE/.rapidlm/config.toml`.
 pub const USERPROFILE_ENV: &str = "USERPROFILE";
+/// Env var overriding `[network] proxy` (`environment` | `none`).
+pub const PROXY_MODE_ENV: &str = "RAPIDLM_PROXY";
 
 /// Maximum accepted config document bytes (mirrors the kernel loader bound).
 pub const MAX_USER_CONFIG_BYTES: usize = 256 * 1024;
@@ -53,8 +59,44 @@ pub struct UserConfig {
     pub models: ModelsSection,
     /// `[phases]` purpose → model-id overrides for auxiliary model calls.
     pub phases: PhasesSection,
+    /// `[network]` section: how model connections leave the machine.
+    pub network: NetworkSection,
     /// Dotted key paths that were present but not part of the schema.
     pub unknown_keys: Vec<String>,
+}
+
+/// `[network]` section.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NetworkSection {
+    /// `proxy`: absent reads as [`ProxyMode::None`].
+    pub proxy: Option<ProxyMode>,
+}
+
+/// Whether model connections go through the proxy the environment names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProxyMode {
+    /// Dial directly; the proxy variables are not read (the default).
+    None,
+    /// Read `https_proxy` / `HTTPS_PROXY`, `http_proxy`, `no_proxy` /
+    /// `NO_PROXY` and dial through the proxy they name.
+    Environment,
+}
+
+impl ProxyMode {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "none" => Some(Self::None),
+            "environment" => Some(Self::Environment),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Environment => "environment",
+        }
+    }
 }
 
 /// `[phases]` section: purpose-name → `[model.<id>]` id.
@@ -142,6 +184,11 @@ pub struct ActiveModel {
     /// selected model (so auxiliary phases fail open to the conversation
     /// model when unconfigured).
     pub phase_route: PhaseRoute,
+    /// The proxy model connections go through, resolved once from
+    /// `[network] proxy` / `RAPIDLM_PROXY` and the proxy variables — the
+    /// same for every model a run builds and for the setup probe. `None`:
+    /// direct.
+    pub proxy: Option<llm_router::providers::dial::ProxyConfig>,
 }
 
 /// Credential resolution outcome for an [`ActiveModel`].
@@ -396,7 +443,7 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
 
     let mut unknown_keys = Vec::new();
     for key in root.keys() {
-        if key != "models" && key != "model" && key != "phases" {
+        if key != "models" && key != "model" && key != "phases" && key != "network" {
             unknown_keys.push(key.clone());
         }
     }
@@ -462,9 +509,32 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
         }
     }
 
+    let mut network = NetworkSection::default();
+    if let Some(section) = root.get("network") {
+        let table = expect_table(section, "network")?;
+        for key in table.keys() {
+            if key != "proxy" {
+                unknown_keys.push(format!("network.{key}"));
+            }
+        }
+        if let Some(value) = table.get("proxy") {
+            let raw = value.as_str().ok_or(UserConfigError::TypeMismatch {
+                key: "network.proxy".to_owned(),
+            })?;
+            network.proxy =
+                Some(
+                    ProxyMode::parse(raw).ok_or_else(|| UserConfigError::InvalidValue {
+                        key: "network.proxy".to_owned(),
+                        reason: "expected \"environment\" or \"none\"".to_owned(),
+                    })?,
+                );
+        }
+    }
+
     Ok(UserConfig {
         models,
         phases,
+        network,
         unknown_keys,
     })
 }
@@ -726,7 +796,35 @@ pub fn resolve_active(
         entry: entry.clone(),
         credential: resolve_credential(entry, env),
         phase_route: route,
+        proxy: resolve_proxy(env, config)?,
     })
+}
+
+/// The proxy model connections go through: `RAPIDLM_PROXY` over
+/// `[network] proxy`, default `none`. Under `environment` the proxy
+/// variables are read from `env`; an unusable one is an error naming the
+/// variable (never its value), and none set means direct.
+pub fn resolve_proxy(
+    env: &[(String, String)],
+    config: &UserConfig,
+) -> Result<Option<llm_router::providers::dial::ProxyConfig>, UserConfigError> {
+    let mode = match env_value(env, PROXY_MODE_ENV) {
+        Some(raw) => ProxyMode::parse(raw).ok_or_else(|| UserConfigError::InvalidValue {
+            key: PROXY_MODE_ENV.to_owned(),
+            reason: "expected \"environment\" or \"none\"".to_owned(),
+        })?,
+        None => config.network.proxy.unwrap_or(ProxyMode::None),
+    };
+    if mode == ProxyMode::None {
+        return Ok(None);
+    }
+    let proxy = llm_router::providers::dial::ProxyConfig::from_env(env).map_err(|err| {
+        UserConfigError::InvalidValue {
+            key: "network.proxy = \"environment\"".to_owned(),
+            reason: err.to_string(),
+        }
+    })?;
+    Ok((!proxy.is_empty()).then_some(proxy))
 }
 
 /// Resolve `[models] fallback` into an ordered list of `ActiveModel`s, in
@@ -763,6 +861,7 @@ pub fn resolve_fallback_chain(
             entry: entry.clone(),
             credential: resolve_credential(entry, env),
             phase_route: PhaseRoute::new(profile),
+            proxy: active.proxy.clone(),
         });
     }
     (resolved, warnings)
@@ -808,6 +907,7 @@ pub fn resolve_purpose_model_for(
         entry: entry.clone(),
         credential: resolve_credential(entry, env),
         phase_route: active.phase_route,
+        proxy: active.proxy,
     })
 }
 
@@ -1522,6 +1622,115 @@ env_key = 42
         let rendered = format!("{err}");
         assert!(!rendered.contains("super-secret-value"));
         assert!(rendered.contains("model.a.env_key"));
+    }
+
+    const PROXIED_DOC: &str = r#"
+[models]
+default = "local"
+fallback = ["cloud"]
+
+[network]
+proxy = "environment"
+
+[model.local]
+provider = "openai-compatible"
+model = "local-small"
+base_url = "http://model.example.test:8080/v1"
+
+[model.cloud]
+provider = "openai-compatible"
+model = "cloud-large"
+base_url = "https://cloud.example.test/v1"
+
+[phases]
+compact = "cloud"
+"#;
+
+    #[test]
+    fn the_proxy_is_opt_in_and_every_model_of_a_run_shares_it() {
+        let proxy_vars = [("http_proxy", "http://proxy.example.test:3128")];
+        // S11: an exported proxy variable changes nothing unasked.
+        let direct = parse_config_document(VALID_DOC, "c").expect("parses");
+        assert_eq!(direct.network.proxy, None);
+        let active = resolve_active(&env(&proxy_vars), &direct).expect("active");
+        assert_eq!(active.proxy, None);
+
+        let config = parse_config_document(PROXIED_DOC, "c").expect("parses");
+        assert_eq!(config.network.proxy, Some(ProxyMode::Environment));
+        assert!(config.unknown_keys.is_empty(), "{:?}", config.unknown_keys);
+        let active = resolve_active(&env(&proxy_vars), &config).expect("active");
+        let proxy = active
+            .proxy
+            .clone()
+            .expect("the opt-in reads the variables");
+        let via = proxy
+            .for_target(false, "model.example.test", 8080)
+            .expect("proxied");
+        assert_eq!((via.host(), via.port()), ("proxy.example.test", 3128));
+        // The fallback chain and the phase models go the same way.
+        let (chain, _) = resolve_fallback_chain(&env(&proxy_vars), &config, &active);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].proxy, active.proxy);
+        let compact = resolve_purpose_model_for(
+            active.clone(),
+            &env(&proxy_vars),
+            &config,
+            llm_router::provider::ModelPurpose::Compact,
+        )
+        .expect("compact");
+        assert_eq!(compact.profile_id, "cloud");
+        assert_eq!(compact.proxy, active.proxy);
+
+        // Opted in with no variable set: direct.
+        assert_eq!(resolve_active(&[], &config).expect("active").proxy, None);
+        // RAPIDLM_PROXY wins over the file, both ways.
+        let mut off = env(&proxy_vars);
+        off.push((PROXY_MODE_ENV.to_owned(), "none".to_owned()));
+        assert_eq!(resolve_active(&off, &config).expect("active").proxy, None);
+        let mut on = env(&proxy_vars);
+        on.push((PROXY_MODE_ENV.to_owned(), "environment".to_owned()));
+        assert!(
+            resolve_active(&on, &direct)
+                .expect("active")
+                .proxy
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn an_unusable_proxy_setting_is_an_error_naming_it_never_its_value() {
+        let config = parse_config_document(PROXIED_DOC, "c").expect("parses");
+        let err = resolve_active(
+            &env(&[("HTTPS_PROXY", "https://user:hunter2@proxy.example.test")]),
+            &config,
+        )
+        .expect_err("an https:// proxy is refused");
+        let shown = err.to_string();
+        assert!(shown.contains("network.proxy"), "{shown}");
+        assert!(shown.contains("HTTPS_PROXY"), "{shown}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        // Not opted in, the same variable is never read.
+        let direct = parse_config_document(VALID_DOC, "c").expect("parses");
+        assert!(
+            resolve_active(
+                &env(&[("HTTPS_PROXY", "https://user:hunter2@proxy.example.test")]),
+                &direct
+            )
+            .is_ok()
+        );
+        let err = resolve_active(&env(&[(PROXY_MODE_ENV, "on")]), &direct).expect_err("not a mode");
+        assert!(err.to_string().contains(PROXY_MODE_ENV), "{err}");
+        for (doc, key) in [
+            ("[network]\nproxy = \"system\"\n", "network.proxy"),
+            ("[network]\nproxy = true\n", "network.proxy"),
+        ] {
+            let err = parse_config_document(doc, "c").expect_err(doc);
+            assert!(err.to_string().contains(key), "{err}");
+        }
+        let odd = parse_config_document("[network]\nproxy = \"none\"\ntimeout = 3\n", "c")
+            .expect("parses");
+        assert_eq!(odd.network.proxy, Some(ProxyMode::None));
+        assert_eq!(odd.unknown_keys, vec!["network.timeout".to_owned()]);
     }
 }
 

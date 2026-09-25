@@ -1380,11 +1380,24 @@ pub fn classify(err: &llm_router::provider::ProviderError) -> ProbeFailure {
     }
 }
 
-/// The egress gate the probe dials through: exactly the planned endpoint.
-pub fn probe_egress(plan: &SetupPlan) -> Result<crate::provider_egress::ProviderEgress, String> {
+/// The egress gate the probe dials through: exactly the planned endpoint,
+/// and the proxy a run would reach it through — the planned config's
+/// `[network] proxy` (or `RAPIDLM_PROXY`) read as a run reads it.
+pub fn probe_egress(
+    plan: &SetupPlan,
+    env: &[(String, String)],
+) -> Result<crate::provider_egress::ProviderEgress, String> {
     let (scheme, host, port) = origin_of(&plan.choice.base_url)
         .ok_or_else(|| "the planned endpoint has no origin".to_owned())?;
-    crate::provider_egress::ProviderEgress::for_endpoint(scheme == "https", &host, port, None)
+    let parsed = parse_config_document(&plan.document, "the planned config")
+        .map_err(|err| err.to_string())?;
+    let proxy = crate::user_config::resolve_proxy(env, &parsed).map_err(|err| err.to_string())?;
+    let https = scheme == "https";
+    let via = proxy
+        .as_ref()
+        .and_then(|proxy| proxy.for_target(https, &host, port))
+        .map(|proxy| (proxy.host(), proxy.port()));
+    crate::provider_egress::ProviderEgress::for_endpoint(https, &host, port, via)
 }
 
 /// The live verification (SEAM-02): one request of at most
@@ -1573,7 +1586,7 @@ changed"
         // made, allowed or refused — reported, never written (AC-02).
         let mut receipts = Vec::new();
         if !parsed.no_verify {
-            let egress = match probe_egress(&plan) {
+            let egress = match probe_egress(&plan, &env.env) {
                 Ok(egress) => std::sync::Arc::new(egress),
                 Err(message) => {
                     return SetupOutcome {
@@ -3581,5 +3594,115 @@ own_knob = 2
         assert!(
             matches!(listener.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock)
         );
+    }
+
+    #[test]
+    fn the_probe_goes_through_the_proxy_a_run_would_and_only_when_opted_in() {
+        let (proxy_url, seen) = endpoint(200, GOOD_BODY);
+        let proxy_origin = proxy_url.trim_end_matches("/v1").to_owned();
+        let target = "http://model.example.test:8080/v1";
+        let run_with = |home: &Home, extra_env: &[(&str, &str)]| {
+            let mut env = home.env();
+            env.env
+                .push(("TEST_KEY".to_owned(), "sk-test-env".to_owned()));
+            env.env
+                .push(("http_proxy".to_owned(), proxy_origin.clone()));
+            for (key, value) in extra_env {
+                env.env.push(((*key).to_owned(), (*value).to_owned()));
+            }
+            run(
+                &args(&[
+                    "--base-url",
+                    target,
+                    "--model",
+                    "m",
+                    "--non-interactive",
+                    "--key-env",
+                    "TEST_KEY",
+                    "--output",
+                    "json",
+                ]),
+                &env,
+                &mut Scripted(Vec::new()),
+            )
+        };
+
+        // Opted in by RAPIDLM_PROXY: the one request goes to the proxy, in
+        // absolute form, and the receipt names the proxy as what was dialled.
+        let home = Home::new("verify-proxy-env");
+        let before = home.snapshot();
+        let outcome = run_with(&home, &[("RAPIDLM_PROXY", "environment")]);
+        let json: serde_json::Value = serde_json::from_str(&outcome.stdout).expect("json");
+        assert_eq!(json["verified"], true, "{}", outcome.stderr);
+        assert_eq!(
+            json["egress"],
+            serde_json::json!([{ "allowed": true, "dialled": proxy_origin, "reason": null }]),
+            "{}",
+            outcome.stdout
+        );
+        assert_eq!(home.snapshot(), before);
+        {
+            let requests = seen.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert!(
+                requests[0].starts_with(
+                    "POST http://model.example.test:8080/v1/chat/completions HTTP/1.1\r\n"
+                ),
+                "{}",
+                requests[0]
+            );
+        }
+
+        // Opted in by the config the plan keeps: the same path.
+        let home = Home::new("verify-proxy-file");
+        std::fs::create_dir_all(home.config().parent().expect("dir")).expect("dir");
+        std::fs::write(home.config(), "[network]\nproxy = \"environment\"\n").expect("config");
+        let outcome = run_with(&home, &[]);
+        let json: serde_json::Value = serde_json::from_str(&outcome.stdout).expect("json");
+        assert_eq!(json["verified"], true, "{}", outcome.stderr);
+        assert_eq!(seen.lock().unwrap_or_else(|p| p.into_inner()).len(), 2);
+
+        // Not opted in (or opted out over the file): the variable is not read,
+        // the proxy is sent nothing, and the unresolvable name fails as the
+        // network failure it is.
+        for (name, extra) in [
+            ("verify-proxy-none", &[][..]),
+            ("verify-proxy-off", &[("RAPIDLM_PROXY", "none")][..]),
+        ] {
+            let home = Home::new(name);
+            if extra.is_empty() {
+                // No opt-in anywhere.
+            } else {
+                std::fs::create_dir_all(home.config().parent().expect("dir")).expect("dir");
+                std::fs::write(home.config(), "[network]\nproxy = \"environment\"\n")
+                    .expect("config");
+            }
+            let outcome = run_with(&home, extra);
+            assert_eq!(outcome.exit, 13, "{name}: {}", outcome.stderr);
+            assert_eq!(
+                seen.lock().unwrap_or_else(|p| p.into_inner()).len(),
+                2,
+                "{name}: the proxy was sent nothing"
+            );
+        }
+
+        // An unusable proxy variable under the opt-in: a run would refuse
+        // it, so nothing is dialled or written, and the variable is named,
+        // never its value.
+        let home = Home::new("verify-proxy-bad");
+        let before = home.snapshot();
+        let outcome = run_with(
+            &home,
+            &[
+                ("RAPIDLM_PROXY", "environment"),
+                ("https_proxy", "https://user:hunter2@proxy.example.test"),
+            ],
+        );
+        assert_eq!(outcome.exit, 1, "{}", outcome.stderr);
+        assert!(outcome.stderr.contains("https_proxy"), "{}", outcome.stderr);
+        assert!(!outcome.stderr.contains("hunter2"), "{}", outcome.stderr);
+        assert!(!outcome.stderr.contains("egress:"), "{}", outcome.stderr);
+        assert_eq!(home.snapshot(), before);
+        assert_eq!(seen.lock().unwrap_or_else(|p| p.into_inner()).len(), 2);
     }
 }

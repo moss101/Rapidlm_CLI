@@ -1,9 +1,9 @@
-# Model configuration (Grok Build style)
+# Model configuration
 
 `rapid exec` drives a real model when a user config selects one, and fails
-typed when it does not. The configuration surface mirrors the Grok Build CLI:
-one small user TOML, env overrides on top, and per-model tables that pin the
-provider, model id, endpoint, and credential.
+typed when it does not. The configuration surface is one small user TOML,
+env overrides on top, and per-model tables that pin the provider, model id,
+endpoint, and credential.
 
 ## File locations and precedence
 
@@ -19,10 +19,10 @@ If none of these exist, `rapid exec` stays in its typed unconfigured fallback:
 it prints where it looked, runs the turn with the unconfigured model (a typed
 provider failure), and exits `1`. It never fabricates a completion.
 
-Within a resolved config, values apply with Grok Build precedence:
+Within a resolved config, values apply in this precedence:
 
 ```
-env override (RAPIDLM_MODEL, credential env vars) > config file > typed fallback
+env override (RAPIDLM_MODEL, RAPIDLM_PROXY, credential env vars) > config file > typed fallback
 ```
 
 ## Schema
@@ -51,10 +51,39 @@ single dashes (it becomes the router profile id and credential handle name).
 | `max_tokens` | positive integer | no | Output cap; default `4096` when the provider needs one |
 | `context_window` | positive integer | no | Documented context pin; default `32768` |
 
-Credential precedence follows Grok Build: `api_key` > first set, non-empty
+Credential precedence: `api_key` > first set, non-empty
 `env_key` entry > keyless. Keyless configs (typical for local servers) send no
 bearer token. Config keys that are not part of the schema are reported as
 stderr warnings (`warning: unknown config key '…'`) and ignored.
+
+### `[network]`
+
+| Key | Type | Required | Meaning |
+|---|---|---|---|
+| `proxy` | `"environment"` or `"none"` | no (default `"none"`) | Whether model connections go through the proxy the environment names |
+
+`RAPIDLM_PROXY=environment|none` overrides it without editing the file.
+
+By default model connections are dialled directly and the proxy variables are
+not read, so a shell that already exports `HTTPS_PROXY` behaves as it always
+did. With `proxy = "environment"` every model a run builds — the default, the
+`[models] fallback` chain and the `[phases]` models — and the `rapid setup`
+probe go through the same proxy:
+
+- `https_proxy` (then `HTTPS_PROXY`) for `https://` endpoints, reached through
+  a `CONNECT` tunnel with TLS to the endpoint inside it: the proxy never sees
+  the request or the key.
+- `http_proxy` (lower case only) for `http://` endpoints.
+- `no_proxy` (then `NO_PROXY`): names (and their subdomains), addresses and
+  ranges such as `10.0.0.0/8`, each with an optional port, dialled directly;
+  `*` turns the proxy off. Loopback endpoints are always dialled directly.
+- Only `http://` proxies are supported; credentials in the proxy URL are sent
+  as `Proxy-Authorization` and never printed. A variable set but empty turns
+  its proxy off. An unusable value is a configuration error naming the
+  variable, never its value.
+- A proxy that refuses its own credentials (`407`) ends the turn without
+  trying a fallback model (every model goes through the same proxy);
+  `rapid setup` reports it as a network failure (exit 13).
 
 ## Examples
 

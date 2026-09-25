@@ -15943,6 +15943,7 @@ that is no longer there"
                 fallback: vec!["backup".to_owned()],
             },
             phases: Default::default(),
+            network: Default::default(),
             unknown_keys: Vec::new(),
         };
 
