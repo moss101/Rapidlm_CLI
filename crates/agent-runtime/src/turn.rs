@@ -308,7 +308,13 @@ pub enum FailureCause {
     /// retried — asking again sends the same ones.
     ProxyAuth,
     /// Temporary provider-side condition; the step layer retries within bounds.
-    Transient { retry_after_ms: Option<u64> },
+    /// `rate_limited`: the provider said to slow down (HTTP 429) rather than
+    /// failing on its side (5xx, a dropped stream) — a per-model retry
+    /// policy may treat the two differently.
+    Transient {
+        retry_after_ms: Option<u64>,
+        rate_limited: bool,
+    },
     /// Cause not provider-classified (internal or unclassified stream failure).
     Unspecified,
 }
@@ -1538,6 +1544,9 @@ where
 
 /// Outcome of one dispatched tool batch: either every accepted call produced
 /// a result, or the turn stopped.
+// Private and returned once per tool batch, never stored: the size
+// difference (a `TurnResult` against a `Vec`) costs nothing worth a box.
+#[allow(clippy::large_enum_variant)]
 enum ToolBatchOutcome {
     Completed(Vec<ToolStepResult>),
     Stopped(TurnResult),

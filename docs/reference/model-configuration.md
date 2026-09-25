@@ -49,6 +49,8 @@ single dashes (it becomes the router profile id and credential handle name).
 | `api_key` | string | no | Inline credential; wins over `env_key` |
 | `env_key` | string or array | no | Env var name(s); the first set, non-empty value wins |
 | `keychain` | string | no | OS keychain alias the key is kept under (`rapid setup --key-stdin` writes `rapidlm-model-<id>-<digest>`, the digest naming this config file and endpoint); read when the model client is built |
+| `effort_ids` | table | no | Model id sent at a given reasoning effort, e.g. `{ high = "m-think", low = "m-fast" }` (keys: `none`…`ultra`); the effort after every floor picks it, else `model` |
+| `retry` | table | no | This model's step retry policy (below); replaces the built-in one |
 | `max_tokens` | positive integer | no | Output cap; default `4096` when the provider needs one |
 | `context_window` | positive integer | no | Documented context pin; default `32768` |
 
@@ -60,6 +62,22 @@ holds nothing under the alias, the model fails to build with an error naming
 the alias, before anything is sent. Keyless configs (typical for local servers) send no
 bearer token. Config keys that are not part of the schema are reported as
 stderr warnings (`warning: unknown config key '…'`) and ignored.
+
+### `retry = { … }`
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `max_attempts` | 1–11 | 6 | Attempts in all, the first included (`1`: never retry) |
+| `base_ms` | 0–600000 | 1000 | Wait before the first retry, doubled for each one after; `RAPIDLM_RETRY_BASE_MS` overrides it |
+| `max_ms` | 1–600000 | none | Longest wait; a provider asking (retry-after) for longer ends the retries |
+| `on` | array | all four | Classes retried: `rate_limit` (429), `server` (5xx, a dropped stream), `network` (unreachable, connection broke), `rejected` (other 4xx) |
+
+Authentication, quota and proxy refusals are never retried; naming them in `on`
+is an error, as is an unknown key in the table. A provider's retry-after is
+honoured when longer than the backoff. Without a `retry` table the built-in
+policy applies: six attempts, every class, 1 s doubling, no longest wait. With a
+`[models] fallback` chain, the step layer retries the chain under the primary's
+policy; moving between models is the chain's own decision.
 
 ### `[network]`
 

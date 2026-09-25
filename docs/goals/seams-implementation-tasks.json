@@ -483,7 +483,7 @@
       "id": "SEAM-02-4",
       "title": "Per-effort model identifiers and per-model retry policy",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-00-3"
       ],
@@ -505,7 +505,9 @@
       "validation": [
         "Outgoing request bodies carry the per-effort id per dialect; retry override counted through a scripted failing server; an auth failure is retried zero times."
       ],
-      "evidence": []
+      "evidence": [
+        "apps/rapid/src/user_config.rs \u2014 effort_ids, retry (RetryPolicy, RetryClass, parse_retry); apps/rapid/src/model.rs \u2014 the per-effort id at build, ConfiguredModel::retry_policy; apps/rapid/src/host.rs \u2014 LiveModelCall::retry_policy, SupervisedModel under the model's policy, retry_class; crates/agent-runtime \u2014 FailureCause::Transient.rate_limited \u2014 tests the_request_carries_the_model_id_named_for_its_effort_in_both_dialects, a_models_retry_policy_sets_the_ceiling_the_classes_and_the_longest_wait, the_builtin_retry_policy_is_todays, effort_ids_and_a_retry_table_are_read_and_checked; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-02-4"
+      ]
     },
     {
       "id": "SEAM-02-5",

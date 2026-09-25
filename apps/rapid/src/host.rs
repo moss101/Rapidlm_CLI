@@ -478,6 +478,12 @@ pub trait LiveModelCall {
     fn set_usage_totals(&mut self, totals: Option<crate::model::UsageTotalsHandle>) {
         let _ = totals;
     }
+
+    /// The model's own retry policy (`[model.<id>] retry`), which the step
+    /// supervision uses instead of the built-in one. Default: none.
+    fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
+        None
+    }
 }
 
 /// A [`ModelDriver`] bound to the host-owned live context. Reads the (possibly
@@ -987,6 +993,45 @@ fn sleep_backoff(cancel: &CancellationToken, attempt: u32, retry_after_ms: Optio
     !cancel.is_cancelled()
 }
 
+/// The retry class of a step failure, if it has one: the classes a
+/// `[model.<id>] retry` policy's `on` names. Authentication, quota and proxy
+/// refusals have none — they are never retried.
+fn retry_class(cause: FailureCause) -> Option<crate::user_config::RetryClass> {
+    use crate::user_config::RetryClass;
+    match cause {
+        FailureCause::Transient {
+            rate_limited: true, ..
+        } => Some(RetryClass::RateLimit),
+        FailureCause::Transient { .. } => Some(RetryClass::Server),
+        FailureCause::Connection => Some(RetryClass::Network),
+        FailureCause::Rejected => Some(RetryClass::Rejected),
+        _ => None,
+    }
+}
+
+/// Wait `wait_ms`, in cancellable slices; `false` when cancelled.
+fn sleep_ms(cancel: &CancellationToken, wait_ms: u64) -> bool {
+    let mut waited = 0u64;
+    while waited < wait_ms {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        let slice = RETRY_SLEEP_SLICE_MS.min(wait_ms - waited);
+        std::thread::sleep(std::time::Duration::from_millis(slice));
+        waited += slice;
+    }
+    !cancel.is_cancelled()
+}
+
+/// `RAPIDLM_RETRY_BASE_MS` when set and in range (0..=60000): the
+/// environment's backoff base, above any configured one (S11).
+fn retry_base_override() -> Option<u64> {
+    std::env::var("RAPIDLM_RETRY_BASE_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(|ms| ms.min(60_000))
+}
+
 /// Retry-after base in milliseconds: `RAPIDLM_RETRY_BASE_MS` when set and in
 /// range, else [`RETRY_BACKOFF_BASE_MS`].
 fn retry_base_ms() -> u64 {
@@ -1099,6 +1144,10 @@ fn detect_stall(history: &[agent_runtime::ToolStepExchange]) -> Option<String> {
 }
 
 impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
+    fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
+        self.inner.retry_policy()
+    }
+
     fn step(
         &mut self,
         blocks: &[context_engine::compile::ContextBlock],
@@ -1113,39 +1162,35 @@ impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
         // Connection and transient failures are retryable for a model step: a
         // step that failed committed no tool effects, so re-invoking is safe
         // (bounded retry ceiling).
+        // The model's own `[model.<id>] retry` policy when it has one, else
+        // the built-in one (today's ceiling, classes and backoff).
+        let policy = self
+            .inner
+            .retry_policy()
+            .unwrap_or_else(crate::user_config::RetryPolicy::builtin);
         let mut attempt: u32 = 0;
         loop {
             let result = self.inner.step(blocks, input, cancel);
             match &result {
-                Err(ModelStepError::ProviderFailed {
-                    cause: FailureCause::Transient { retry_after_ms },
-                }) if attempt < MAX_TRANSIENT_RETRIES => {
-                    self.diag_attempt(attempt, "failed:transient", 0);
-                    if !sleep_backoff(cancel, attempt, *retry_after_ms) {
-                        return Err(ModelStepError::Cancelled);
-                    }
-                    attempt += 1;
-                    continue;
-                }
-                Err(ModelStepError::ProviderFailed {
-                    cause: FailureCause::Connection,
-                }) if attempt < MAX_TRANSIENT_RETRIES => {
-                    self.diag_attempt(attempt, "failed:connection", 0);
-                    if !sleep_backoff(cancel, attempt, None) {
-                        return Err(ModelStepError::Cancelled);
-                    }
-                    attempt += 1;
-                    continue;
-                }
-                // A provider rejection of an already-shaped request (free-tier
-                // rate limiting, transient capacity errors) is retryable: a
-                // failed step committed no tool effects, so re-invoking is
-                // safe within the bounded ceiling.
-                Err(ModelStepError::ProviderFailed {
-                    cause: FailureCause::Rejected,
-                }) if attempt < MAX_TRANSIENT_RETRIES => {
-                    self.diag_attempt(attempt, "failed:rejected", 0);
-                    if !sleep_backoff(cancel, attempt, None) {
+                Err(ModelStepError::ProviderFailed { cause })
+                    if attempt + 1 < policy.max_attempts
+                        && retry_class(*cause).is_some_and(|class| policy.on.allows(class)) =>
+                {
+                    let retry_after_ms = match cause {
+                        FailureCause::Transient { retry_after_ms, .. } => *retry_after_ms,
+                        _ => None,
+                    };
+                    // A provider asking for longer than the policy's longest
+                    // wait is not asked again early: the failure stands.
+                    let Some(wait_ms) =
+                        policy.wait_ms(retry_base_override(), attempt, retry_after_ms)
+                    else {
+                        let tag = cause_tag(*cause);
+                        self.diag_attempt(attempt, &format!("failed:{tag}"), 0);
+                        return result;
+                    };
+                    self.diag_attempt(attempt, &format!("failed:{}", cause_tag(*cause)), 0);
+                    if !sleep_ms(cancel, wait_ms) {
                         return Err(ModelStepError::Cancelled);
                     }
                     attempt += 1;
@@ -1395,6 +1440,14 @@ impl<B: LiveModelCall> FallbackChainModel<B> {
 }
 
 impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
+    /// The primary's policy: the step supervision retries the chain as it
+    /// would the primary.
+    fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
+        self.backends
+            .first()
+            .and_then(|(_, backend)| backend.retry_policy())
+    }
+
     fn step(
         &mut self,
         blocks: &[ContextBlock],
@@ -1555,12 +1608,14 @@ fn to_fallback_trigger(err: &ModelStepError) -> FallbackTrigger {
             FailureCause::Connection => ProviderError::Connection,
             FailureCause::Rejected => ProviderError::InvalidRequest,
             FailureCause::Transient {
-                retry_after_ms: Some(after),
+                retry_after_ms,
+                rate_limited: true,
             } => ProviderError::RateLimited {
-                retry_after_ms: Some(*after),
+                retry_after_ms: *retry_after_ms,
             },
             FailureCause::Transient {
-                retry_after_ms: None,
+                rate_limited: false,
+                ..
             } => ProviderError::Transient,
             FailureCause::Unspecified => ProviderError::Permanent,
             // #[non_exhaustive]: an unrecognized future cause fails closed
@@ -4215,6 +4270,7 @@ mod tests {
         let mut outputs = vec![Err(ModelStepError::ProviderFailed {
             cause: FailureCause::Transient {
                 retry_after_ms: None,
+                rate_limited: false,
             },
         })];
         outputs.push(Err(ModelStepError::BoundExceeded));
@@ -4259,6 +4315,7 @@ mod tests {
             Err(ModelStepError::ProviderFailed {
                 cause: FailureCause::Transient {
                     retry_after_ms: None,
+                    rate_limited: false,
                 },
             })
         };
@@ -4285,7 +4342,8 @@ mod tests {
         assert_eq!(
             outcome.failure_cause,
             Some(FailureCause::Transient {
-                retry_after_ms: None
+                retry_after_ms: None,
+                rate_limited: false,
             }),
             "the cause class survives to the CLI boundary"
         );
@@ -4405,6 +4463,186 @@ mod tests {
             )),
             llm_router::fallback::FailureClass::ProxyAuth,
             "the chain has a class of its own for it"
+        );
+    }
+
+    /// A scripted backing that reports a `[model.<id>] retry` policy.
+    struct WithPolicy(ScriptedBacking, crate::user_config::RetryPolicy);
+
+    impl LiveModelCall for WithPolicy {
+        fn step(
+            &mut self,
+            blocks: &[ContextBlock],
+            input: &ModelStepInput<'_>,
+            cancel: &CancellationToken,
+        ) -> Result<ModelStepOutput, ModelStepError> {
+            self.0.step(blocks, input, cancel)
+        }
+
+        fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
+            Some(self.1)
+        }
+    }
+
+    #[test]
+    fn a_models_retry_policy_sets_the_ceiling_the_classes_and_the_longest_wait() {
+        use crate::user_config::{RetryClasses, RetryPolicy};
+        let rate_limited = |after: Option<u64>| ModelStepError::ProviderFailed {
+            cause: FailureCause::Transient {
+                retry_after_ms: after,
+                rate_limited: true,
+            },
+        };
+        let server = || ModelStepError::ProviderFailed {
+            cause: FailureCause::Transient {
+                retry_after_ms: None,
+                rate_limited: false,
+            },
+        };
+        let network = || ModelStepError::ProviderFailed {
+            cause: FailureCause::Connection,
+        };
+        let auth = || ModelStepError::ProviderFailed {
+            cause: FailureCause::Auth,
+        };
+        let ok = || {
+            Ok(ModelStepOutput::Terminal {
+                text: "done".to_owned(),
+                tokens: 1,
+                cost_usd_micros: None,
+            })
+        };
+        let policy = |attempts: u32, on: RetryClasses, max_ms: Option<u64>| RetryPolicy {
+            max_attempts: attempts,
+            base_ms: Some(0),
+            max_ms,
+            on,
+        };
+        let only_network = RetryClasses {
+            rate_limit: false,
+            server: false,
+            network: true,
+            rejected: false,
+        };
+        let only_rate_limit = RetryClasses {
+            rate_limit: true,
+            server: false,
+            network: false,
+            rejected: false,
+        };
+        type Script = Vec<Result<ModelStepOutput, ModelStepError>>;
+        // (script, policy, steps the backing runs, the turn succeeds)
+        let cases: Vec<(Script, RetryPolicy, usize, bool)> = vec![
+            // The ceiling: two attempts in all, whatever the built-in says.
+            (
+                vec![Err(server()), Err(server()), ok()],
+                policy(2, RetryClasses::ALL, None),
+                2,
+                false,
+            ),
+            (
+                vec![Err(server()), ok()],
+                policy(2, RetryClasses::ALL, None),
+                2,
+                true,
+            ),
+            // The classes: only network is retried.
+            (
+                vec![Err(rate_limited(None)), ok()],
+                policy(5, only_network, None),
+                1,
+                false,
+            ),
+            (
+                vec![Err(server()), ok()],
+                policy(5, only_network, None),
+                1,
+                false,
+            ),
+            (
+                vec![Err(network()), ok()],
+                policy(5, only_network, None),
+                2,
+                true,
+            ),
+            // A rate limit and a server failure are told apart.
+            (
+                vec![Err(rate_limited(None)), ok()],
+                policy(5, only_rate_limit, None),
+                2,
+                true,
+            ),
+            (
+                vec![Err(server()), ok()],
+                policy(5, only_rate_limit, None),
+                1,
+                false,
+            ),
+            // Never retried, whatever the policy.
+            (
+                vec![Err(auth()), ok()],
+                policy(5, RetryClasses::ALL, None),
+                1,
+                false,
+            ),
+            // A provider asking for longer than the longest wait: not asked
+            // again early.
+            (
+                vec![Err(rate_limited(Some(60_000))), ok()],
+                policy(5, RetryClasses::ALL, Some(1_000)),
+                1,
+                false,
+            ),
+            // A shorter ask is honoured within it.
+            (
+                vec![Err(rate_limited(Some(1))), ok()],
+                policy(5, RetryClasses::ALL, Some(1_000)),
+                2,
+                true,
+            ),
+        ];
+        for (index, (script, policy, runs, succeeds)) in cases.into_iter().enumerate() {
+            let backing = ScriptedBacking::new(script);
+            let witness = backing.clone();
+            let request = AgentExecutionRequest::new(spec(), SessionId::new());
+            let mut events = Vec::new();
+            let outcome = run_live_exec(
+                preserved(),
+                WithPolicy(backing, policy),
+                &request,
+                &mut CountingTools { executed: 0 },
+                &mut events,
+                &CancellationToken::new(),
+                ContextRetryPolicy::new(2),
+                None,
+            )
+            .expect("execute");
+            assert_eq!(witness.saw_blocks.borrow().len(), runs, "case {index}");
+            assert_eq!(
+                outcome.failure_cause.is_none(),
+                succeeds,
+                "case {index}: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_builtin_retry_policy_is_todays() {
+        use crate::user_config::{RetryClasses, RetryPolicy};
+        let builtin = RetryPolicy::builtin();
+        assert_eq!(builtin.max_attempts, MAX_TRANSIENT_RETRIES + 1);
+        assert_eq!(builtin.on, RetryClasses::ALL);
+        // 1 s doubling, a longer retry-after honoured, no longest wait.
+        assert_eq!(builtin.wait_ms(None, 0, None), Some(RETRY_BACKOFF_BASE_MS));
+        assert_eq!(
+            builtin.wait_ms(None, 3, None),
+            Some(8 * RETRY_BACKOFF_BASE_MS)
+        );
+        assert_eq!(builtin.wait_ms(None, 0, Some(90_000)), Some(90_000));
+        assert_eq!(
+            builtin.wait_ms(Some(10), 2, None),
+            Some(40),
+            "the env base wins"
         );
     }
 
@@ -4614,6 +4852,7 @@ mod tests {
             Err(ModelStepError::ProviderFailed {
                 cause: FailureCause::Transient {
                     retry_after_ms: None,
+                    rate_limited: false,
                 },
             }),
             Ok(ModelStepOutput::Terminal {
@@ -4659,6 +4898,7 @@ mod tests {
                 Err(ModelStepError::ProviderFailed {
                     cause: FailureCause::Transient {
                         retry_after_ms: None,
+                        rate_limited: false,
                     },
                 })
             }
@@ -4693,6 +4933,7 @@ mod tests {
         let mut outputs = vec![Err(ModelStepError::ProviderFailed {
             cause: FailureCause::Transient {
                 retry_after_ms: None,
+                rate_limited: false,
             },
         })];
         outputs.push(Ok(ModelStepOutput::Terminal {

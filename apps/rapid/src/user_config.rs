@@ -120,6 +120,201 @@ pub struct ModelsSection {
     pub fallback: Vec<String>,
 }
 
+/// Longest `retry.max_attempts` accepted (the first attempt included).
+pub const MAX_RETRY_ATTEMPTS: u32 = 11;
+/// Longest `retry.base_ms` / `retry.max_ms` accepted.
+pub const MAX_RETRY_WAIT_MS: u64 = 600_000;
+
+/// A class of step failure a retry policy may retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetryClass {
+    /// The provider said to slow down (HTTP 429).
+    RateLimit,
+    /// The provider failed on its side (5xx, a dropped stream).
+    Server,
+    /// The endpoint could not be reached, or the connection broke.
+    Network,
+    /// The provider rejected an already-shaped request (other 4xx).
+    Rejected,
+}
+
+impl RetryClass {
+    pub const ALL: [Self; 4] = [Self::RateLimit, Self::Server, Self::Network, Self::Rejected];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimit => "rate_limit",
+            Self::Server => "server",
+            Self::Network => "network",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// The classes a policy retries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetryClasses {
+    pub rate_limit: bool,
+    pub server: bool,
+    pub network: bool,
+    pub rejected: bool,
+}
+
+impl RetryClasses {
+    pub const ALL: Self = Self {
+        rate_limit: true,
+        server: true,
+        network: true,
+        rejected: true,
+    };
+
+    pub const fn allows(self, class: RetryClass) -> bool {
+        match class {
+            RetryClass::RateLimit => self.rate_limit,
+            RetryClass::Server => self.server,
+            RetryClass::Network => self.network,
+            RetryClass::Rejected => self.rejected,
+        }
+    }
+}
+
+/// `[model.<id>] retry`: how the step layer retries this model's failures,
+/// in place of the built-in policy. Authentication, quota and proxy
+/// refusals are never retried, whatever a policy says.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetryPolicy {
+    /// Attempts in all, the first included (`1`: never retry).
+    pub max_attempts: u32,
+    /// Backoff before the first retry, doubled for each one after it.
+    /// `None`: the built-in base. `RAPIDLM_RETRY_BASE_MS` overrides it.
+    pub base_ms: Option<u64>,
+    /// The longest wait. `None`: unbounded (the built-in policy). A provider
+    /// asking for longer than this ends the retries.
+    pub max_ms: Option<u64>,
+    pub on: RetryClasses,
+}
+
+impl RetryPolicy {
+    /// Today's policy: six attempts (five retries), every retry class, a 1 s
+    /// base doubling each time, no longest wait.
+    pub const fn builtin() -> Self {
+        Self {
+            max_attempts: 6,
+            base_ms: None,
+            max_ms: None,
+            on: RetryClasses::ALL,
+        }
+    }
+
+    /// The wait before retry `attempt + 1` (the first retry is `attempt` 0):
+    /// the base (`env_base` over the policy's, over 1 s) doubled per retry,
+    /// or a provider's retry-after when longer; capped at `max_ms`. `None`
+    /// when the provider asks for longer than `max_ms`.
+    pub fn wait_ms(
+        &self,
+        env_base: Option<u64>,
+        attempt: u32,
+        retry_after_ms: Option<u64>,
+    ) -> Option<u64> {
+        let base = env_base.or(self.base_ms).unwrap_or(1000);
+        let doubling = base.saturating_mul(1u64 << attempt.min(16));
+        let wait = retry_after_ms.map_or(doubling, |after| after.max(doubling));
+        match self.max_ms {
+            Some(max) if retry_after_ms.is_some_and(|after| after > max) => None,
+            Some(max) => Some(wait.min(max)),
+            None => Some(wait),
+        }
+    }
+}
+
+fn parse_retry(value: &toml::Value, prefix: &str) -> Result<RetryPolicy, UserConfigError> {
+    let key = format!("{prefix}.retry");
+    let table = value
+        .as_table()
+        .ok_or_else(|| UserConfigError::TypeMismatch { key: key.clone() })?;
+    let invalid = |field: &str, reason: String| UserConfigError::InvalidValue {
+        key: format!("{key}.{field}"),
+        reason,
+    };
+    // A typo here would silently change a policy: unknown keys are errors.
+    for field in table.keys() {
+        if !matches!(field.as_str(), "max_attempts" | "base_ms" | "max_ms" | "on") {
+            return Err(invalid(
+                field,
+                "not a retry key (max_attempts, base_ms, max_ms, on)".to_owned(),
+            ));
+        }
+    }
+    let int = |field: &str, min: i64, max: i64| -> Result<Option<i64>, UserConfigError> {
+        match table.get(field) {
+            None => Ok(None),
+            Some(value) => {
+                let number = value
+                    .as_integer()
+                    .ok_or_else(|| UserConfigError::TypeMismatch {
+                        key: format!("{key}.{field}"),
+                    })?;
+                if number < min || number > max {
+                    return Err(invalid(field, format!("must be {min}..={max}")));
+                }
+                Ok(Some(number))
+            }
+        }
+    };
+    let mut policy = RetryPolicy::builtin();
+    if let Some(attempts) = int("max_attempts", 1, i64::from(MAX_RETRY_ATTEMPTS))? {
+        policy.max_attempts = attempts as u32;
+    }
+    policy.base_ms = int("base_ms", 0, MAX_RETRY_WAIT_MS as i64)?.map(|ms| ms as u64);
+    policy.max_ms = int("max_ms", 1, MAX_RETRY_WAIT_MS as i64)?.map(|ms| ms as u64);
+    if let (Some(base), Some(max)) = (policy.base_ms, policy.max_ms)
+        && base > max
+    {
+        return Err(invalid(
+            "max_ms",
+            "must not be less than base_ms".to_owned(),
+        ));
+    }
+    if let Some(on) = table.get("on") {
+        let names = on.as_array().ok_or_else(|| UserConfigError::TypeMismatch {
+            key: format!("{key}.on"),
+        })?;
+        let mut classes = RetryClasses {
+            rate_limit: false,
+            server: false,
+            network: false,
+            rejected: false,
+        };
+        for name in names {
+            let name = name.as_str().ok_or_else(|| UserConfigError::TypeMismatch {
+                key: format!("{key}.on"),
+            })?;
+            match name {
+                "rate_limit" => classes.rate_limit = true,
+                "server" => classes.server = true,
+                "network" => classes.network = true,
+                "rejected" => classes.rejected = true,
+                "auth" | "quota" | "proxy_auth" => {
+                    return Err(invalid(
+                        "on",
+                        format!("{name} failures are never retried: asking again sends the same"),
+                    ));
+                }
+                other => {
+                    return Err(invalid(
+                        "on",
+                        format!(
+                            "{other:?} is not a retry class (rate_limit, server, network, rejected)"
+                        ),
+                    ));
+                }
+            }
+        }
+        policy.on = classes;
+    }
+    Ok(policy)
+}
+
 /// Supported provider adapter kinds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigProvider {
@@ -163,6 +358,12 @@ pub struct ModelEntry {
     /// OS keychain alias the key is stored under (`rapid setup --key-stdin`
     /// writes it); read when the model client is built, never before.
     pub keychain: Option<String>,
+    /// `effort_ids = { high = "…", … }`: the model id sent at a given
+    /// reasoning effort, in place of `model` (resolved when the client is
+    /// built, after every effort floor).
+    pub effort_ids: BTreeMap<ReasoningEffort, String>,
+    /// `retry = { … }`: this model's step retry policy.
+    pub retry: Option<RetryPolicy>,
     pub max_tokens: Option<u32>,
     pub context_window: Option<u32>,
     /// Reasoning-effort request override; `None` means the provider default.
@@ -559,6 +760,8 @@ fn parse_model_entry(
         "api_key",
         "env_key",
         "keychain",
+        "effort_ids",
+        "retry",
         "max_tokens",
         "context_window",
         "reasoning_effort",
@@ -644,6 +847,33 @@ fn parse_model_entry(
         }
     };
 
+    let mut effort_ids = BTreeMap::new();
+    if let Some(value) = table.get("effort_ids") {
+        let ids = value
+            .as_table()
+            .ok_or_else(|| UserConfigError::TypeMismatch {
+                key: format!("{prefix}.effort_ids"),
+            })?;
+        for (name, id) in ids {
+            let effort =
+                ReasoningEffort::parse(name).map_err(|_| UserConfigError::InvalidValue {
+                    key: format!("{prefix}.effort_ids.{name}"),
+                    reason: "expected none|minimal|low|medium|high|xhigh|ultra".to_owned(),
+                })?;
+            let id = expect_non_empty_str(id, &format!("{prefix}.effort_ids.{name}"))?;
+            llm_router::ModelId::parse(id).map_err(|_| UserConfigError::InvalidValue {
+                key: format!("{prefix}.effort_ids.{name}"),
+                reason: "not a model id (alphanumerics with single - _ . / : separators)"
+                    .to_owned(),
+            })?;
+            effort_ids.insert(effort, id.to_owned());
+        }
+    }
+    let retry = match table.get("retry") {
+        None => None,
+        Some(value) => Some(parse_retry(value, &prefix)?),
+    };
+
     let max_tokens = match table.get("max_tokens") {
         None => None,
         Some(value) => Some(positive_u32(value, &format!("{prefix}.max_tokens"))?),
@@ -678,6 +908,8 @@ fn parse_model_entry(
         api_key,
         env_key,
         keychain,
+        effort_ids,
+        retry,
         max_tokens,
         context_window,
         reasoning_effort,
@@ -1712,6 +1944,70 @@ model = \"m\"\nbase_url = \"http://127.0.0.1:1/v1\"\n{extra}"
             .unknown_keys
             .is_empty()
         );
+    }
+
+    #[test]
+    fn effort_ids_and_a_retry_table_are_read_and_checked() {
+        let entry = |extra: &str| {
+            let doc = format!(
+                "[models]\ndefault = \"p\"\n\n[model.p]\nprovider = \"openai-compatible\"\n\
+model = \"m\"\nbase_url = \"http://127.0.0.1:1/v1\"\n{extra}"
+            );
+            parse_config_document(&doc, "c").map(|config| config.models.entries["p"].clone())
+        };
+        let parsed = entry(
+            "effort_ids = { high = \"m-think\", low = \"m-fast\" }\n\
+             retry = { max_attempts = 3, base_ms = 200, max_ms = 5000, on = [\"rate_limit\", \"network\"] }\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            parsed
+                .effort_ids
+                .get(&ReasoningEffort::High)
+                .map(String::as_str),
+            Some("m-think")
+        );
+        assert_eq!(
+            parsed
+                .effort_ids
+                .get(&ReasoningEffort::Low)
+                .map(String::as_str),
+            Some("m-fast")
+        );
+        let retry = parsed.retry.expect("retry");
+        assert_eq!(
+            (retry.max_attempts, retry.base_ms, retry.max_ms),
+            (3, Some(200), Some(5000))
+        );
+        assert!(retry.on.allows(RetryClass::RateLimit) && retry.on.allows(RetryClass::Network));
+        assert!(!retry.on.allows(RetryClass::Server) && !retry.on.allows(RetryClass::Rejected));
+        // Omitted keys keep the built-in values.
+        let partial = entry("retry = { max_attempts = 1 }\n").expect("parses");
+        assert_eq!(
+            partial.retry,
+            Some(RetryPolicy {
+                max_attempts: 1,
+                ..RetryPolicy::builtin()
+            })
+        );
+        for (bad, why) in [
+            ("retry = { on = [\"auth\"] }", "never retried"),
+            ("retry = { on = [\"quota\"] }", "never retried"),
+            ("retry = { on = [\"everything\"] }", "not a retry class"),
+            ("retry = { max_attempts = 0 }", "1..="),
+            ("retry = { max_attempts = 12 }", "1..="),
+            (
+                "retry = { base_ms = 900, max_ms = 100 }",
+                "less than base_ms",
+            ),
+            ("retry = { attempts = 3 }", "not a retry key"),
+            ("effort_ids = { turbo = \"m\" }", "none|minimal"),
+            ("effort_ids = { high = \"has space\" }", "not a model id"),
+        ] {
+            let err = entry(&format!("{bad}\n")).expect_err(bad);
+            assert!(err.to_string().contains(why), "{bad}: {err}");
+        }
+        assert!(entry("retry = 3\n").is_err());
     }
 
     const PROXIED_DOC: &str = r#"

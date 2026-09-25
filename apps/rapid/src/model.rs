@@ -163,6 +163,8 @@ pub struct ConfiguredModel<'store> {
     /// wrappers) use it for cost estimation at published rates. Never
     /// affects turn behavior.
     usage_totals: Option<UsageTotalsHandle>,
+    /// `[model.<id>] retry`, for the step supervision.
+    retry: Option<crate::user_config::RetryPolicy>,
 }
 
 /// Provider-reported per-step token split, summed into a shared
@@ -227,8 +229,15 @@ impl<'store> ConfiguredModel<'store> {
                 reason: "provider kind does not map to a router provider id".to_owned(),
             }
         })?;
-        let model = ModelId::parse(&active.entry.model).map_err(|_| ModelConfigError::ModelId {
-            model: active.entry.model.clone(),
+        // The id sent: the one `effort_ids` names for the effort this client
+        // runs at (every floor already applied), else `model`.
+        let wire_model = active
+            .entry
+            .reasoning_effort
+            .and_then(|effort| active.entry.effort_ids.get(&effort))
+            .unwrap_or(&active.entry.model);
+        let model = ModelId::parse(wire_model).map_err(|_| ModelConfigError::ModelId {
+            model: wire_model.clone(),
             reason: "the canonical layer allows alphanumerics with single '-', '_', '.', '/', \
                      ':' separators (provider-side ids like vendor/model:tag are carried \
                      verbatim)"
@@ -332,6 +341,7 @@ impl<'store> ConfiguredModel<'store> {
             model,
             max_output_tokens: active.entry.max_tokens,
             reasoning_effort: active.entry.reasoning_effort,
+            retry: active.entry.retry,
         })
     }
 
@@ -404,6 +414,10 @@ fn seed_credential(
 }
 
 impl LiveModelCall for ConfiguredModel<'_> {
+    fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
+        self.retry
+    }
+
     fn step(
         &mut self,
         blocks: &[ContextBlock],
@@ -571,6 +585,14 @@ pub enum SelectedModel<'store> {
 }
 
 impl LiveModelCall for SelectedModel<'_> {
+    fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
+        match self {
+            Self::Configured(model) => model.retry_policy(),
+            Self::Unconfigured(fallback) => fallback.retry_policy(),
+            Self::FallbackChain(chain) => chain.retry_policy(),
+        }
+    }
+
     fn step(
         &mut self,
         blocks: &[ContextBlock],
@@ -882,11 +904,15 @@ fn map_provider_error(err: ProviderError) -> ModelStepError {
             cause: FailureCause::Connection,
         },
         ProviderError::RateLimited { retry_after_ms } => ModelStepError::ProviderFailed {
-            cause: FailureCause::Transient { retry_after_ms },
+            cause: FailureCause::Transient {
+                retry_after_ms,
+                rate_limited: true,
+            },
         },
         ProviderError::Transient => ModelStepError::ProviderFailed {
             cause: FailureCause::Transient {
                 retry_after_ms: None,
+                rate_limited: false,
             },
         },
         ProviderError::InvalidRequest
@@ -1154,6 +1180,8 @@ mod tests {
             api_key: Some("test-key".to_owned()),
             env_key: Vec::new(),
             keychain: None,
+            effort_ids: Default::default(),
+            retry: None,
             max_tokens: None,
             context_window: None,
             reasoning_effort: None,
@@ -1303,7 +1331,8 @@ mod tests {
             }),
             ModelStepError::ProviderFailed {
                 cause: FailureCause::Transient {
-                    retry_after_ms: Some(900)
+                    retry_after_ms: Some(900),
+                    rate_limited: true,
                 }
             }
         );
@@ -1311,7 +1340,8 @@ mod tests {
             map_provider_error(ProviderError::Transient),
             ModelStepError::ProviderFailed {
                 cause: FailureCause::Transient {
-                    retry_after_ms: None
+                    retry_after_ms: None,
+                    rate_limited: false,
                 }
             }
         );
@@ -2090,5 +2120,88 @@ model = \"m\"\nbase_url = \"{server}/v1\"\nkeychain = \"rapidlm-model-kept\"\n"
             "{}",
             heads[0]
         );
+    }
+
+    /// A loopback server recording each whole request (head and body),
+    /// answering 401.
+    fn recording_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let origin = format!("http://{}", listener.local_addr().expect("addr"));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while let Ok(read) = stream.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                log.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(String::from_utf8_lossy(&buf).to_string());
+                let _ = stream.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        (origin, seen)
+    }
+
+    #[test]
+    fn the_request_carries_the_model_id_named_for_its_effort_in_both_dialects() {
+        // SEAM-02 AC-04.
+        for (provider, path) in [("openai-compatible", "/v1"), ("anthropic", "")] {
+            let (server, seen) = recording_server();
+            let doc = format!(
+                "[models]\ndefault = \"p\"\n\n[model.p]\nprovider = \"{provider}\"\nmodel = \"m-base\"\n\
+base_url = \"{server}{path}\"\napi_key = \"k\"\nreasoning = true\n\
+effort_ids = {{ high = \"m-think\", low = \"m-fast\" }}\n"
+            );
+            let config = crate::user_config::parse_config_document(&doc, "c").expect("parses");
+            let base = crate::user_config::resolve_active(&[], &config).expect("active");
+            let cancel = llm_router::provider::CancellationToken::new();
+            // (the effort the client runs at — a floor may have raised it —,
+            // the id that goes out)
+            for (effort, expected) in [
+                (Some(ReasoningEffort::High), "m-think"),
+                (Some(ReasoningEffort::Low), "m-fast"),
+                (Some(ReasoningEffort::Medium), "m-base"),
+                (None, "m-base"),
+            ] {
+                let mut active = base.clone();
+                active.entry.reasoning_effort = effort;
+                let store = InMemoryCredentialStore::new();
+                let model = ConfiguredModel::build(&active, &store).expect("build");
+                let _ = model.probe(&cancel);
+                let requests = seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let last = requests.last().expect("a request");
+                assert!(
+                    last.contains(&format!("\"model\":\"{expected}\"")),
+                    "{provider} {effort:?}: {last}"
+                );
+            }
+        }
     }
 }

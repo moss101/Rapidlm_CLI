@@ -941,9 +941,11 @@ mod tests {
             (
                 FailureCause::Transient {
                     retry_after_ms: Some(1200),
+                    rate_limited: true,
                 },
                 Some(FailureCause::Transient {
                     retry_after_ms: Some(1200),
+                    rate_limited: true,
                 }),
             ),
             (FailureCause::Unspecified, Some(FailureCause::Unspecified)),

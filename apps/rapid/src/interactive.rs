@@ -5157,6 +5157,10 @@ impl crate::host::LiveModelCall for Box<dyn crate::host::LiveModelCall + Send> {
     ) -> Result<agent_runtime::ModelStepOutput, agent_runtime::ModelStepError> {
         (**self).step(blocks, input, cancel)
     }
+
+    fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
+        (**self).retry_policy()
+    }
 }
 
 /// Warnings a turn or compaction thread has for the user — a model config
@@ -15943,6 +15947,8 @@ that is no longer there"
             api_key: Some("sk-do-not-render-me".to_owned()),
             env_key: vec!["SOME_KEY".to_owned()],
             keychain: None,
+            effort_ids: Default::default(),
+            retry: None,
             max_tokens: None,
             context_window: window,
             reasoning_effort: None,
