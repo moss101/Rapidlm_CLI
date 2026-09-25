@@ -2319,17 +2319,37 @@ impl WorkspaceTools {
 
     /// The persisted grant an approve-and-remember answer to this call's
     /// ask would record, when that grant would answer the same call from
-    /// then on ([`crate::permissions::PermissionLattice::standing_grant_for`]);
-    /// `None` when the call's subject cannot be read, so no grant names it.
+    /// then on ([`crate::permissions::PermissionLattice::standing_grant_for`]).
+    /// `None` when the call's subject cannot be read (no grant names it),
+    /// when the tool is not one this driver offers (a grant would stand
+    /// for a name the model made up, until something by that name exists),
+    /// or while plan mode would refuse the call the grant allows.
     fn standing_grant(&self, call: &ValidatedToolCall) -> Option<String> {
         let subject = match Self::read_rule_subject(call.tool(), call.arguments()) {
             None => None,
             Some(Some(subject)) => Some(subject),
             Some(None) => return None,
         };
+        if !self
+            .tool_surface()
+            .iter()
+            .any(|tool| tool.name() == call.tool())
+            || self.plan_mode_refuses(call.tool(), subject.as_deref().unwrap_or_default())
+        {
+            return None;
+        }
         self.permissions
             .standing_grant_for(call.tool(), subject.as_deref(), tool_class(call.tool()))
             .map(|grant| grant.render())
+    }
+
+    /// Whether active plan mode refuses a call the lattice allows: only
+    /// read-only calls, the plan tools and writes to the plan file pass.
+    fn plan_mode_refuses(&self, tool: &str, subject: &str) -> bool {
+        self.plan_mode.load(Ordering::SeqCst)
+            && tool_class(tool) != ToolClass::ReadOnly
+            && !matches!(tool, PLAN_ENTER_TOOL | PLAN_EXIT_TOOL)
+            && subject != PLAN_PATH
     }
 
     /// Permission decision for one validated call. Total: every call of a
@@ -2344,11 +2364,7 @@ impl WorkspaceTools {
         if !decision.is_allowed() {
             return decision;
         }
-        if self.plan_mode.load(Ordering::SeqCst)
-            && tool_class(call.tool()) != ToolClass::ReadOnly
-            && !matches!(call.tool(), PLAN_ENTER_TOOL | PLAN_EXIT_TOOL)
-            && subject != PLAN_PATH
-        {
+        if self.plan_mode_refuses(call.tool(), &subject) {
             return Decision::Deny(crate::permissions::DecisionReason::PlanModeDeny);
         }
         decision
@@ -9158,10 +9174,11 @@ mod tests {
     fn a_lattice_ask_names_the_grant_that_answers_it_only_where_one_would() {
         // Default mode asks for every write and command. The request for a
         // plain write names the exact grant that answers that call from then
-        // on; an ask rule outranks any grant, a joined argv names no one
-        // command, and a write whose path cannot be read has no subject to
-        // name (a bare-tool grant would cover every write), so none of those
-        // requests names one.
+        // on. None of these names one: an ask rule outranks any grant, a
+        // joined argv names no one command, a write whose path cannot be
+        // read has no subject to name (a bare-tool grant would cover every
+        // write), a tool this driver does not offer is a name the model made
+        // up, and while plan mode is on it refuses the write a grant allows.
         let root = TempRoot::new("standing-grant");
         let approvals = Arc::new(RecordingApprovalSink::default());
         let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default)
@@ -9184,12 +9201,21 @@ mod tests {
             write_call("c2", "ruled.txt"),
             shell,
             make_call("c4", WORKSPACE_WRITE_TOOL, r#"{"content":"hi"}"#),
+            make_call("c5", "mcp__absent__lookup", "{}"),
         ] {
             assert!(matches!(
                 run_one(&mut tools, &call),
                 ToolStepResult::ApprovalRequired { .. }
             ));
         }
+        assert!(matches!(
+            run_one(&mut tools, &make_call("p1", PLAN_ENTER_TOOL, "{}")),
+            ToolStepResult::Succeeded { .. }
+        ));
+        assert!(matches!(
+            run_one(&mut tools, &write_call("c6", "later.txt")),
+            ToolStepResult::ApprovalRequired { .. }
+        ));
         let requests = approvals.requests.lock().unwrap_or_else(|p| p.into_inner());
         let remembered: Vec<Option<&str>> = requests
             .iter()
@@ -9197,7 +9223,14 @@ mod tests {
             .collect();
         assert_eq!(
             remembered,
-            [Some("workspace_write(first.txt)"), None, None, None],
+            [
+                Some("workspace_write(first.txt)"),
+                None,
+                None,
+                None,
+                None,
+                None
+            ],
             "{requests:#?}"
         );
     }

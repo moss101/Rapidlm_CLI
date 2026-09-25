@@ -748,7 +748,7 @@ the approval stays pending"
                 };
                 let answer = acp::v1::decode_permission_response(decision, &held.request);
                 // "Allow always" is offered only with the grant that answers
-                // this call from now on: recorded, then approved.
+                // this call from now on: approved, then the grant recorded.
                 let remember = match answer {
                     Ok(PermissionAnswer::AllowAlways) => held.request.remember_as(),
                     _ => None,

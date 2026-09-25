@@ -851,9 +851,23 @@ fn an_allow_always_answer_is_kept_so_the_same_call_is_not_asked_again() {
         !project.join("first.txt").exists(),
         "a managed ban lost to a kept grant: {events:#?}\nstderr: {stderr}"
     );
+    // Denied by the ban itself, and the turn went on to its answer.
+    let denials: Vec<&Value> = events
+        .iter()
+        .filter(|(kind, _)| kind == "tool.denied")
+        .map(|(_, payload)| payload)
+        .collect();
+    assert_eq!(denials.len(), 1, "{events:#?}");
     assert!(
-        stderr.contains("managed policy bans"),
-        "the policy was not in force: {stderr}"
+        denials[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("banned by managed policy")),
+        "{events:#?}"
+    );
+    assert_eq!(
+        frames.last().expect("response")["result"]["stopReason"],
+        "end_turn",
+        "{frames:#?}\nstderr: {stderr}"
     );
 }
 

@@ -636,17 +636,20 @@ impl PermissionLattice {
     /// no grant can. `subject` is the call's rule subject, `None` for a tool
     /// whose calls carry none (every call of it is the same to the lattice).
     ///
-    /// The grant names this tool and exactly this subject, so it covers no
-    /// other call's subject. There is none for `shell_exec` (its subject is
-    /// a joined argv, which `["a b"]` and `["a", "b"]` share, so no pattern
-    /// names one command; standing shell approvals stay the user's own
-    /// `rapid permissions allow` patterns), for an empty subject or one
-    /// holding a glob character (the pattern would match more than this
-    /// call), for a project already at [`MAX_GRANTS`] (the store refuses
-    /// one more), or when a layer ranked above grants would still decide
-    /// the call — a managed ban or write confinement, a write scope, plan
-    /// mode, a deny or ask rule: a grant never outranks them, so
-    /// remembering would not stop the next ask.
+    /// The grant names this tool and this subject, so it covers no other
+    /// subject — but paths compare case-insensitively, as every path pattern
+    /// does (on a case-sensitive filesystem it also answers the same path in
+    /// another case), and for a tool whose calls carry no subject (an MCP tool)
+    /// or a fixed one (`task_spawn`, `todo_write`) it answers every call of the
+    /// tool. There is none for `shell_exec` (its subject is a joined argv,
+    /// which `["a b"]` and `["a", "b"]` share, so no pattern names one command;
+    /// standing shell approvals stay the user's own `rapid permissions allow`
+    /// patterns), for an empty subject or one holding a glob character (the
+    /// pattern would match more than this call), for a project already at
+    /// [`MAX_GRANTS`] (the store refuses one more), or when a layer ranked
+    /// above grants would still decide the call — a managed ban or write
+    /// confinement, a write scope, plan mode, a deny or ask rule: a grant never
+    /// outranks them, so remembering would not stop the next ask.
     pub fn standing_grant_for(
         &self,
         tool: &str,
@@ -938,8 +941,9 @@ mod tests {
                 .standing_grant_for(tool, subject, ToolClass::FileEdit)
                 .map(|grant| grant.render())
         };
-        // This tool, this exact subject: the grant answers the same call and
-        // no other path.
+        // This tool, this subject: the grant answers the same call and no
+        // other path (another case of the same path aside: path patterns
+        // compare case-insensitively).
         let exact = lattice
             .standing_grant_for("workspace_write", Some("first.txt"), ToolClass::FileEdit)
             .expect("a plain write is rememberable");
