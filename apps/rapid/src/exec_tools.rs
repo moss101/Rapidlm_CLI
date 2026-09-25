@@ -2339,10 +2339,13 @@ impl WorkspaceTools {
     }
 
     /// Whether `tool` is a real tool of this driver: on its surface, and for
-    /// an MCP tool, one whose call reaches a server that came up — the
-    /// server `execute_mcp_tool` resolves the name to (up to its first
-    /// `__`), not the one the surface recorded. A server that did not come
-    /// up leaves only its `offline` marker, whose calls fail.
+    /// an MCP tool, one whose call reaches the tool behind the name. That
+    /// means the server and tool `execute_mcp_tool` resolves the name to
+    /// (after `mcp__`, split at the next `__`) are the ones that advertised
+    /// it, and that server came up. Otherwise every call fails: a name
+    /// resolving elsewhere (server `db_`'s `query` is `mcp__db___query`,
+    /// which resolves to server `db`), or an unavailable server's `offline`
+    /// marker.
     fn offers_tool(&self, tool: &str) -> bool {
         if !self
             .tool_surface()
@@ -2354,15 +2357,25 @@ impl WorkspaceTools {
         let Some(rest) = tool.strip_prefix("mcp__") else {
             return true;
         };
-        let Some((server, _)) = rest.split_once("__") else {
+        let Some((server, name)) = rest.split_once("__") else {
             return false;
         };
-        self.mcp
+        let advertised = self
+            .mcp_surface
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
-            .find(|connection| connection.server == server)
-            .is_some_and(|connection| connection.online)
+            .any(|(wire, recorded, descriptor)| {
+                wire == tool && recorded == server && descriptor.name == name
+            });
+        advertised
+            && self
+                .mcp
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .find(|connection| connection.server == server)
+                .is_some_and(|connection| connection.online)
     }
 
     /// Permission decision for one validated call. Total: every call of a
@@ -9197,8 +9210,9 @@ mod tests {
         // read has no subject to name (a bare-tool grant would cover every
         // write), a tool this driver does not offer is a name the model made
         // up, an unavailable server's marker is no tool at all, and a tool of
-        // a server named `db_` is dispatched to a server `db` that does not
-        // exist, so its every call fails. Plan mode does not stop the grant:
+        // a server named `db_` or `gh_` resolves to a server `db` or `gh`,
+        // which either does not exist or is not the server that advertised
+        // it, so its every call fails. Plan mode does not stop the grant:
         // the next lattice (the continuation's, or a later turn's) comes
         // with tools whose plan mode is off, where the grant answers.
         let root = TempRoot::new("standing-grant");
@@ -9214,6 +9228,7 @@ mod tests {
             ("mcp__srv__lookup", "srv", true),
             ("mcp__down__offline", "down", false),
             ("mcp__db___query", "db_", true),
+            ("mcp__gh___search", "gh_", true),
         ] {
             tools.mcp_surface.lock().expect("mcp surface").push((
                 tool.to_owned(),
@@ -9232,6 +9247,15 @@ mod tests {
                 child: None,
             });
         }
+        // `gh` is up too, so `mcp__gh___search` resolves to a live server —
+        // just not the one that advertised it.
+        tools.mcp.lock().expect("mcp").push(McpConnection {
+            server: "gh".to_owned(),
+            online: true,
+            offline_reason: None,
+            session: None,
+            child: None,
+        });
         let shell = make_call(
             "c3",
             SHELL_EXEC_TOOL,
@@ -9249,6 +9273,7 @@ mod tests {
             make_call("c6", "mcp__srv__lookup", "{}"),
             make_call("c7", "mcp__down__offline", "{}"),
             make_call("c8", "mcp__db___query", "{}"),
+            make_call("c10", "mcp__gh___search", "{}"),
         ] {
             assert!(matches!(
                 run_one(&mut tools, &call),
@@ -9277,6 +9302,7 @@ mod tests {
                 None,
                 None,
                 Some("mcp__srv__lookup"),
+                None,
                 None,
                 None,
                 Some("workspace_write(later.txt)")
