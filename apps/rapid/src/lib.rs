@@ -37,6 +37,7 @@ pub mod permissions;
 pub mod permissions_cli;
 pub mod preview;
 pub mod provider_egress;
+pub mod provider_keychain;
 pub mod publication;
 pub mod sandbox_exec;
 pub mod setup;

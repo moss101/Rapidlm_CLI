@@ -160,6 +160,9 @@ pub struct ModelEntry {
     pub api_key: Option<String>,
     /// Env var names tried in order; first set, non-empty value wins.
     pub env_key: Vec<String>,
+    /// OS keychain alias the key is stored under (`rapid setup --key-stdin`
+    /// writes it); read when the model client is built, never before.
+    pub keychain: Option<String>,
     pub max_tokens: Option<u32>,
     pub context_window: Option<u32>,
     /// Reasoning-effort request override; `None` means the provider default.
@@ -204,6 +207,9 @@ pub struct ResolvedCredential {
 pub enum CredentialSource {
     InlineApiKey,
     EnvVar(String),
+    /// The OS keychain under this alias: `plaintext` stays `None` until the
+    /// model client is built (invariant 11 — a handle until then).
+    Keychain(String),
     Keyless,
 }
 
@@ -552,6 +558,7 @@ fn parse_model_entry(
         "name",
         "api_key",
         "env_key",
+        "keychain",
         "max_tokens",
         "context_window",
         "reasoning_effort",
@@ -624,6 +631,19 @@ fn parse_model_entry(
         }
     };
 
+    let keychain = match table.get("keychain") {
+        None => None,
+        Some(value) => {
+            let alias = expect_non_empty_str(value, &format!("{prefix}.keychain"))?;
+            auth::SecretRef::from_alias(alias).map_err(|_| UserConfigError::InvalidValue {
+                key: format!("{prefix}.keychain"),
+                reason: "a keychain alias is letters, digits and _ . : / - @, at most 128 bytes"
+                    .to_owned(),
+            })?;
+            Some(alias.to_owned())
+        }
+    };
+
     let max_tokens = match table.get("max_tokens") {
         None => None,
         Some(value) => Some(positive_u32(value, &format!("{prefix}.max_tokens"))?),
@@ -657,6 +677,7 @@ fn parse_model_entry(
         name,
         api_key,
         env_key,
+        keychain,
         max_tokens,
         context_window,
         reasoning_effort,
@@ -928,7 +949,8 @@ pub fn resolve_purpose_model_for(
 }
 
 /// Credential precedence: inline `api_key`, then the first set,
-/// non-empty `env_key` entry, then keyless.
+/// non-empty `env_key` entry, then the `keychain` alias (read when the
+/// client is built), then keyless.
 pub fn resolve_credential(entry: &ModelEntry, env: &[(String, String)]) -> ResolvedCredential {
     if let Some(api_key) = &entry.api_key {
         return ResolvedCredential {
@@ -945,6 +967,12 @@ pub fn resolve_credential(entry: &ModelEntry, env: &[(String, String)]) -> Resol
                 source: CredentialSource::EnvVar(name.clone()),
             };
         }
+    }
+    if let Some(alias) = &entry.keychain {
+        return ResolvedCredential {
+            plaintext: None,
+            source: CredentialSource::Keychain(alias.clone()),
+        };
     }
     ResolvedCredential {
         plaintext: None,
@@ -1638,6 +1666,52 @@ env_key = 42
         let rendered = format!("{err}");
         assert!(!rendered.contains("super-secret-value"));
         assert!(rendered.contains("model.a.env_key"));
+    }
+
+    #[test]
+    fn a_keychain_alias_is_a_credential_source_after_the_inline_key_and_the_variables() {
+        let entry = |extra: &str| {
+            let doc = format!(
+                "[models]\ndefault = \"p\"\n\n[model.p]\nprovider = \"openai-compatible\"\n\
+model = \"m\"\nbase_url = \"http://127.0.0.1:1/v1\"\n{extra}"
+            );
+            parse_config_document(&doc, "c").map(|config| config.models.entries["p"].clone())
+        };
+        let kept = entry("keychain = \"rapidlm-model-p\"\nenv_key = \"P_KEY\"\n").expect("parses");
+        assert_eq!(kept.keychain.as_deref(), Some("rapidlm-model-p"));
+        // A set variable wins; unset, the keychain alias is the source.
+        assert_eq!(
+            resolve_credential(&kept, &env(&[("P_KEY", "sk-env")])).source,
+            CredentialSource::EnvVar("P_KEY".to_owned())
+        );
+        let resolved = resolve_credential(&kept, &[]);
+        assert_eq!(
+            resolved.source,
+            CredentialSource::Keychain("rapidlm-model-p".to_owned())
+        );
+        assert_eq!(resolved.plaintext, None);
+        let inline =
+            entry("keychain = \"rapidlm-model-p\"\napi_key = \"sk-inline\"\n").expect("parses");
+        assert_eq!(
+            resolve_credential(&inline, &[]).source,
+            CredentialSource::InlineApiKey
+        );
+        for bad in [
+            "keychain = \"has space\"",
+            "keychain = \"\"",
+            "keychain = 3",
+        ] {
+            assert!(entry(&format!("{bad}\n")).is_err(), "{bad}");
+        }
+        assert!(
+            parse_config_document(
+                "[model.p]\nprovider = \"openai-compatible\"\nmodel = \"m\"\nbase_url = \"http://127.0.0.1:1/v1\"\nkeychain = \"a\"\n",
+                "c"
+            )
+            .expect("parses")
+            .unknown_keys
+            .is_empty()
+        );
     }
 
     const PROXIED_DOC: &str = r#"

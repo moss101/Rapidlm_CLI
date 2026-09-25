@@ -218,6 +218,10 @@ usage: rapid setup [--preset <id>] [--profile <id>] [--model <id>] [--base-url <
 Write a model configuration: a [model.<profile>] table and [models] default in
 the user config (RAPIDLM_CONFIG, else RAPIDLM_HOME/config.toml, else
 ~/.rapidlm/config.toml). Other profiles, comments and formatting are kept.
+The endpoint is verified first; then the key goes into the OS keychain
+(--key-stdin) and the file is replaced in one step, readable by you only
+(0600). A file that would not change is not touched and the run says
+\"unchanged\"; one that changes is copied to config.toml.<time>.bak first.
 
   --preset <id>       start from a preset (below); --base-url and --model override it
   --profile <id>      the [model.<id>] name to write (default: the preset id, or \"default\")
@@ -228,8 +232,8 @@ the user config (RAPIDLM_CONFIG, else RAPIDLM_HOME/config.toml, else
                       (scheme, host and port; --key-env names one for another)
   --key-env <VAR>     the key is read from this environment variable at request time;
                       the config names the variable, never the value
-  --key-stdin         read the key from stdin and keep it in the OS keychain; the
-                      config names the keychain alias
+  --key-stdin         read the key from a pipe and keep it in the OS keychain; the
+                      config names the keychain alias (keychain = \"rapidlm-model-<id>\")
   --dry-run           print exactly what would be written and requested, then stop:
                       no network call, no file written
   --non-interactive   never prompt; a missing choice is a usage error
@@ -243,10 +247,12 @@ Presets:
 {presets}
 Exit codes:
   0   done (or the dry-run plan was printed)
-  1   the existing config could not be read or does not parse
+  1   the existing config could not be read or does not parse, a run would
+      refuse it, or the key or the file could not be written (the keychain is
+      put back and no file is changed)
   2   usage error
   11  verification: the key was refused or required, or it could not be sent
-      (its variable is not set, or it is held where this build does not read it)
+      (its variable is not set, or the keychain would not give it)
   12  verification: no quota or credit left, or rate-limited
   13  verification: the endpoint could not be reached, rapid does not dial it,
       or a proxy on the way refused its credentials
@@ -1275,10 +1281,9 @@ pub fn read_stdin_key() -> std::io::Result<String> {
 pub enum ProbeFailure {
     /// The key's environment variable is not set: nothing was sent.
     NoKey { var: String },
-    /// The endpoint refused a keyless request, and the profile names its key
-    /// where this build does not read it (the `keychain` alias until the
-    /// reader learns it).
-    KeyNotRead { key: String },
+    /// The key the profile keeps in the OS keychain could not be read:
+    /// nothing was sent.
+    KeyNotRead { alias: String, reason: String },
     /// The endpoint refused a keyless request, and the variable the profile
     /// names for its key is not set.
     KeptKeyUnset { var: String },
@@ -1345,9 +1350,10 @@ impl ProbeFailure {
             Self::NoKey { var } => format!(
                 "${var} is not set, so no request was made — export it, then run rapid setup again"
             ),
-            Self::KeyNotRead { key } => format!(
-                "{endpoint} requires a key, and the profile names it in {key}, which this build \
-does not read — give the key with rapid setup --key-env <VAR>"
+            Self::KeyNotRead { alias, reason } => format!(
+                "the key the profile keeps in the OS keychain under '{alias}' could not be read \
+({reason}), so no request was made — give it again with rapid setup --key-stdin, or name a \
+variable with --key-env <VAR>"
             ),
             Self::KeptKeyUnset { var } => format!(
                 "{endpoint} requires a key, and ${var}, which the profile names for it, is not \
@@ -1468,7 +1474,12 @@ pub fn probe_resolved(
     )?);
     let mut active = active.clone();
     active.entry.max_tokens = Some(VERIFY_MAX_OUTPUT_TOKENS);
-    let sends_key = active.credential.plaintext.is_some();
+    // A keychain key is read when the client is built, and sent.
+    let sends_key = active.credential.plaintext.is_some()
+        || matches!(
+            active.credential.source,
+            crate::user_config::CredentialSource::Keychain(_)
+        );
     let store = auth::InMemoryCredentialStore::new();
     let gate: std::sync::Arc<dyn llm_router::providers::dial::DialGate> = egress.clone();
     let result = match crate::model::ConfiguredModel::build_with_gate(&active, &store, Some(gate)) {
@@ -1528,15 +1539,22 @@ pub fn verify(
     let mut active = crate::managed_config::apply_to_fallback_candidate(active, policy)
         .map_err(|_| ProbeFailure::Invalid)?;
     active.entry.max_tokens = Some(VERIFY_MAX_OUTPUT_TOKENS);
+    // A key the profile keeps in the OS keychain is read as a run reads it;
+    // one that cannot be is said before anything is sent.
+    if let (None, crate::user_config::CredentialSource::Keychain(alias)) =
+        (&active.credential.plaintext, &active.credential.source)
+    {
+        let key =
+            crate::provider_keychain::read(alias).map_err(|err| ProbeFailure::KeyNotRead {
+                alias: alias.clone(),
+                reason: err.to_string(),
+            })?;
+        active.credential.plaintext = Some(key);
+    }
     // Keyless as a run would be (a local server needs no key, whatever its
     // profile names); only a refusal of that keyless request says why no key
     // was sent.
     let sends_key = active.credential.plaintext.is_some();
-    let kept_keychain = plan
-        .kept_credential
-        .as_deref()
-        .filter(|key| key.ends_with(".keychain"))
-        .map(str::to_owned);
     let unset_var = active.entry.env_key.first().cloned();
     let store = auth::InMemoryCredentialStore::new();
     let gate: std::sync::Arc<dyn llm_router::providers::dial::DialGate> = egress.clone();
@@ -1548,15 +1566,171 @@ pub fn verify(
             _ => ProbeFailure::Invalid,
         })?;
     model.probe(cancel).map_err(|err| match classify(&err) {
-        ProbeFailure::Auth if !sends_key => match (kept_keychain, unset_var) {
-            (Some(key), _) => ProbeFailure::KeyNotRead { key },
-            (None, Some(var)) => ProbeFailure::KeptKeyUnset { var },
+        ProbeFailure::Auth if !sends_key => match unset_var {
+            Some(var) => ProbeFailure::KeptKeyUnset { var },
             // A preset on its own origin always sends its variable (or stops
             // before sending); here the key is deliberately not the preset's.
-            (None, None) => ProbeFailure::AuthNoKey,
+            None => ProbeFailure::AuthNoKey,
         },
         failure => failure,
     })
+}
+
+/// What happened to the key under `--key-stdin`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyOutcome {
+    Stored,
+    Unchanged,
+}
+
+impl KeyOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stored => "stored",
+            Self::Unchanged => "unchanged",
+        }
+    }
+}
+
+/// What a writing run did.
+#[derive(Debug)]
+pub struct Persisted {
+    /// `Unchanged`: the file already said this, and was not touched.
+    pub file: FileAction,
+    /// The previous file's copy, when an existing file changed.
+    pub backup: Option<PathBuf>,
+    pub key: Option<KeyOutcome>,
+}
+
+impl Persisted {
+    /// Whether anything was written, file or key.
+    pub fn written(&self) -> bool {
+        self.file != FileAction::Unchanged || self.key == Some(KeyOutcome::Stored)
+    }
+
+    fn describe(&self, plan: &SetupPlan) -> String {
+        let path = plan.config_path.display();
+        let mut out = match (self.file, &self.backup) {
+            (FileAction::Unchanged, _) => format!("{path} already says this: unchanged"),
+            (FileAction::Create, _) => format!("wrote {path} (mode 0600)"),
+            (FileAction::Update, Some(backup)) => format!(
+                "wrote {path} (mode 0600); the previous file is kept as {}",
+                backup.display()
+            ),
+            (FileAction::Update, None) => format!("wrote {path} (mode 0600)"),
+        };
+        if let (Some(key), Credential::Keychain { alias }) = (self.key, &plan.choice.credential) {
+            out.push_str(&match key {
+                KeyOutcome::Stored => {
+                    format!("; the key is stored in the OS keychain as '{alias}'")
+                }
+                KeyOutcome::Unchanged => {
+                    format!("; the OS keychain already holds this key as '{alias}': unchanged")
+                }
+            });
+        }
+        out
+    }
+}
+
+/// Persist a plan (SEAM-02 AC-03): the key into the OS keychain first
+/// (`--key-stdin`), then the file — atomically, mode 0600, the previous
+/// file copied to the plan's timestamped `.bak` first when it changes, and
+/// nothing when it would not change. `existing` is the content the plan was
+/// made from: a file changed since is not overwritten. Any failure puts the
+/// keychain back as it was and leaves no file changed.
+pub fn persist(
+    plan: &SetupPlan,
+    existing: Option<&str>,
+    stdin_key: Option<&str>,
+) -> Result<Persisted, String> {
+    // The file as it is now must be the file the plan read.
+    let now = read_existing(&plan.config_path)?;
+    if now.as_deref() != existing {
+        return Err(format!(
+            "{} changed while rapid setup ran; run it again",
+            plan.config_path.display()
+        ));
+    }
+    let mut stored = None;
+    let key = match (&plan.choice.credential, stdin_key) {
+        (Credential::Keychain { alias }, Some(key)) => {
+            match crate::provider_keychain::store(alias, key)
+                .map_err(|err| format!("the key could not be stored: {err}"))?
+            {
+                crate::provider_keychain::Stored::Unchanged => Some(KeyOutcome::Unchanged),
+                crate::provider_keychain::Stored::Replaced(previous) => {
+                    stored = Some((alias.clone(), previous));
+                    Some(KeyOutcome::Stored)
+                }
+            }
+        }
+        (Credential::Keychain { .. }, None) => {
+            return Err("--key-stdin gave no key".to_owned());
+        }
+        _ => None,
+    };
+    let undo_key = |stored: Option<(String, crate::provider_keychain::Previous)>| {
+        if let Some((alias, previous)) = stored {
+            let _ = crate::provider_keychain::restore(&alias, previous);
+        }
+    };
+    if plan.action == FileAction::Unchanged {
+        return Ok(Persisted {
+            file: FileAction::Unchanged,
+            backup: None,
+            key,
+        });
+    }
+    let mut backup_written = None;
+    let written = (|| -> Result<(), String> {
+        if let Some(parent) = plan.config_path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("{} could not be created: {err}", parent.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        if let (FileAction::Update, Some(backup), Some(previous)) =
+            (plan.action, &plan.backup, existing)
+        {
+            if backup.exists() {
+                return Err(format!("{} already exists", backup.display()));
+            }
+            crate::exec_tools::atomic_write_with_mode(
+                backup,
+                previous.as_bytes(),
+                Some(CONFIG_FILE_MODE),
+            )
+            .map_err(|err| format!("{} could not be written: {err}", backup.display()))?;
+            backup_written = Some(backup.clone());
+        }
+        crate::exec_tools::atomic_write_with_mode(
+            &plan.config_path,
+            plan.document.as_bytes(),
+            Some(CONFIG_FILE_MODE),
+        )
+        .map_err(|err| format!("{} could not be written: {err}", plan.config_path.display()))
+    })();
+    match written {
+        Ok(()) => Ok(Persisted {
+            file: plan.action,
+            backup: backup_written,
+            key,
+        }),
+        Err(message) => {
+            if let Some(backup) = &backup_written {
+                let _ = std::fs::remove_file(backup);
+            }
+            undo_key(stored);
+            Err(message)
+        }
+    }
 }
 
 /// What a run printed and how it exited.
@@ -1586,8 +1760,7 @@ pub fn run(args: &[String], env: &SetupEnv, prompter: &mut dyn Prompter) -> Setu
         Err(message) => return usage_error(message),
     };
     // A key typed at a terminal would echo and stay in its scrollback.
-    // (`--no-verify` reads no key until the key is stored — SEAM-02-3.)
-    if parsed.key == KeyFlag::Stdin && env.stdin_is_tty && !parsed.dry_run && !parsed.no_verify {
+    if parsed.key == KeyFlag::Stdin && env.stdin_is_tty && !parsed.dry_run {
         return usage_error(
             "rapid setup: --key-stdin reads the key from a pipe, and stdin is a terminal (the key \
 would echo) — pipe it in: printf '%s' \"$KEY\" | rapid setup --key-stdin ...; no files were \
@@ -1651,8 +1824,8 @@ changed"
     };
     plan.via_symlink = link;
     if !parsed.dry_run {
-        let stdin_key = match (&plan.choice.credential, parsed.no_verify) {
-            (Credential::Keychain { .. }, false) => match (env.read_key)() {
+        let stdin_key = match &plan.choice.credential {
+            Credential::Keychain { .. } => match (env.read_key)() {
                 Ok(key) if !key.trim().is_empty() => Some(key.trim().to_owned()),
                 _ => {
                     return usage_error(
@@ -1725,9 +1898,38 @@ changed\n",
                 };
             }
         }
-        // Writing is SEAM-02-3: until then a verified plan still writes
-        // nothing, and says so.
         let verified = !parsed.no_verify;
+        let persisted = match persist(&plan, existing.as_deref(), stdin_key.as_deref()) {
+            Ok(persisted) => persisted,
+            Err(message) => {
+                let stdout = match parsed.output {
+                    OutputFormat::Json => format!(
+                        "{}\n",
+                        serde_json::json!({
+                            "schema": "rapidlm.setup_outcome/v1",
+                            "verified": verified,
+                            "egress": receipts_json(&receipts),
+                            "written": false,
+                            "error": message,
+                        })
+                    ),
+                    OutputFormat::Text => String::new(),
+                };
+                return SetupOutcome {
+                    stdout,
+                    stderr: format!(
+                        "{notes}{}rapid setup: {message}; no files were changed\n",
+                        receipts_text(&receipts)
+                    ),
+                    exit: 1,
+                };
+            }
+        };
+        let answered = if verified {
+            format!("{} answered; ", plan.choice.base_url)
+        } else {
+            "not verified (--no-verify); ".to_owned()
+        };
         let stdout = match parsed.output {
             OutputFormat::Json => format!(
                 "{}\n",
@@ -1735,7 +1937,11 @@ changed\n",
                     "schema": "rapidlm.setup_outcome/v1",
                     "verified": verified,
                     "egress": receipts_json(&receipts),
-                    "written": false,
+                    "written": persisted.written(),
+                    "action": persisted.file.as_str(),
+                    "path": plan.config_path.display().to_string(),
+                    "backup": persisted.backup.as_ref().map(|path| path.display().to_string()),
+                    "key": persisted.key.map(KeyOutcome::as_str),
                 })
             ),
             OutputFormat::Text => String::new(),
@@ -1743,16 +1949,11 @@ changed\n",
         return SetupOutcome {
             stdout,
             stderr: format!(
-                "{notes}{}rapid setup: {}writing the configuration is not in this build yet — no \
-files were changed; --dry-run prints what would be written\n",
+                "{notes}{}rapid setup: {answered}{}\n",
                 receipts_text(&receipts),
-                if verified {
-                    format!("{} answered; ", plan.choice.base_url)
-                } else {
-                    String::new()
-                }
+                persisted.describe(&plan)
             ),
-            exit: 2,
+            exit: 0,
         };
     }
     let stdout = match parsed.output {
@@ -2943,7 +3144,7 @@ gw = { provider = \"openai-compatible\", model = \"m\", base_url = \"http://10.0
     }
 
     #[test]
-    fn a_key_a_run_would_not_read_is_named_in_the_plan() {
+    fn a_keychain_alias_is_a_key_a_run_reads() {
         let plan = plan(
             choice_for(&[
                 "--base-url",
@@ -2961,11 +3162,19 @@ gw = { provider = \"openai-compatible\", model = \"m\", base_url = \"http://10.0
         )
         .expect("plan");
         assert!(
-            plan.notes
-                .iter()
-                .any(|note| note.contains("model.default.keychain")),
+            !plan.notes.iter().any(|note| note.contains("would ignore")),
             "{:?}",
             plan.notes
+        );
+        let parsed = parse_config_document(&plan.document, "c").expect("parses");
+        let active = crate::user_config::resolve_active(&[], &parsed).expect("active");
+        assert_eq!(
+            active.credential.source,
+            crate::user_config::CredentialSource::Keychain("rapidlm-model-default".to_owned())
+        );
+        assert_eq!(
+            active.credential.plaintext, None,
+            "a handle until the build"
         );
     }
 
@@ -3396,30 +3605,58 @@ own_knob = 2
         let home = Home::new("verify-kept-keyless");
         config_with(&home, &url, "env_key = \"LOCAL_KEY\"");
         let outcome = verify_run(&home, &url, &[]);
-        assert_eq!(
-            outcome.exit, 2,
-            "verified, not yet written: {}",
-            outcome.stderr
-        );
+        assert_eq!(outcome.exit, 0, "{}", outcome.stderr);
+        assert!(outcome.stderr.contains("unchanged"), "{}", outcome.stderr);
         assert_eq!(seen.lock().expect("seen").len(), 1, "one keyless request");
         // Refused without a key: the message names why no key was sent.
-        for (key_line, expected) in [
-            (
-                "env_key = \"GW_KEY\"",
-                "$GW_KEY, which the profile names for it, is not set",
-            ),
-            (
-                "keychain = \"rapidlm.default\"",
-                "which this build does not read",
-            ),
-        ] {
-            let (url, _) = endpoint(401, r#"{"error":{"message":"missing key"}}"#);
-            let home = Home::new("verify-kept");
-            config_with(&home, &url, key_line);
-            let outcome = verify_run(&home, &url, &[]);
-            assert_eq!(outcome.exit, 11, "{key_line}: {}", outcome.stderr);
-            assert!(outcome.stderr.contains(expected), "{}", outcome.stderr);
-        }
+        let (url, _) = endpoint(401, r#"{"error":{"message":"missing key"}}"#);
+        let home = Home::new("verify-kept");
+        config_with(&home, &url, "env_key = \"GW_KEY\"");
+        let outcome = verify_run(&home, &url, &[]);
+        assert_eq!(outcome.exit, 11, "{}", outcome.stderr);
+        assert!(
+            outcome
+                .stderr
+                .contains("$GW_KEY, which the profile names for it, is not set"),
+            "{}",
+            outcome.stderr
+        );
+        // A kept keychain key is read as a run reads it and sent; one the
+        // keychain does not give is said before anything is sent.
+        let (url, seen) = endpoint(200, GOOD_BODY);
+        let home = Home::new("verify-kept-keychain");
+        config_with(&home, &url, "keychain = \"rapidlm.default\"");
+        let keychain =
+            std::sync::Arc::new(crate::provider_keychain::testing::MemoryKeychain::default());
+        keychain.items.lock().expect("lock").insert(
+            "rapidlm.default".to_owned(),
+            b"sk-kept-in-keychain".to_vec(),
+        );
+        let outcome =
+            crate::provider_keychain::with_backend(keychain, || verify_run(&home, &url, &[]));
+        assert_eq!(outcome.exit, 0, "{}", outcome.stderr);
+        let requests = seen.lock().expect("seen").clone();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].contains("Bearer sk-kept-in-keychain"),
+            "{}",
+            requests[0]
+        );
+        let (url, seen) = endpoint(200, GOOD_BODY);
+        let home = Home::new("verify-kept-keychain-missing");
+        config_with(&home, &url, "keychain = \"rapidlm.default\"");
+        let outcome = crate::provider_keychain::with_backend(
+            std::sync::Arc::new(crate::provider_keychain::testing::MemoryKeychain::default()),
+            || verify_run(&home, &url, &[]),
+        );
+        assert_eq!(outcome.exit, 11, "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("could not be read")
+                && outcome.stderr.contains("no key under 'rapidlm.default'"),
+            "{}",
+            outcome.stderr
+        );
+        assert_eq!(seen.lock().expect("seen").len(), 0, "nothing sent");
         // No key at all, and the endpoint wants one: said so — without
         // steering the preset's key to a host it is deliberately kept off —
         // and the plan's note on the key is shown.
@@ -3525,8 +3762,8 @@ own_knob = 2
             "{}",
             outcome.stderr
         );
-        // A dry run, or one that does not verify, reads no key (yet), so it
-        // may run on a terminal.
+        // A dry run reads no key, so it may run on a terminal; one that does
+        // not verify still reads the key to store it, so it may not.
         let dry = run(
             &args(&["--preset", "openai", "--key-stdin", "--dry-run"]),
             &env,
@@ -3540,7 +3777,7 @@ own_knob = 2
         );
         assert_eq!(unverified.exit, 2, "{}", unverified.stderr);
         assert!(
-            unverified.stderr.contains("not in this build yet"),
+            unverified.stderr.contains("pipe it in"),
             "{}",
             unverified.stderr
         );
@@ -3579,11 +3816,7 @@ own_knob = 2
             &env,
             &mut Scripted(Vec::new()),
         );
-        assert_eq!(
-            outcome.exit, 2,
-            "verified, not yet written: {}",
-            outcome.stderr
-        );
+        assert_eq!(outcome.exit, 0, "{}", outcome.stderr);
         let requests = seen.lock().expect("seen").clone();
         assert_eq!(requests.len(), 1);
         assert!(
@@ -3594,19 +3827,18 @@ own_knob = 2
     }
 
     #[test]
-    fn no_verify_sends_nothing_and_says_nothing_was_written() {
+    fn no_verify_sends_nothing_and_says_it_was_not_verified() {
         let home = Home::new("no-verify");
         let (url, seen) = endpoint(200, GOOD_BODY);
-        let before = home.snapshot();
         let outcome = verify_run(&home, &url, &["--key-env", "TEST_KEY", "--no-verify"]);
-        assert_eq!(outcome.exit, 2, "{}", outcome.stderr);
+        assert_eq!(outcome.exit, 0, "{}", outcome.stderr);
         assert!(
-            outcome.stderr.contains("no files were changed"),
+            outcome.stderr.contains("not verified (--no-verify); wrote"),
             "{}",
             outcome.stderr
         );
         assert!(seen.lock().expect("seen").is_empty(), "no request");
-        assert_eq!(home.snapshot(), before);
+        assert!(home.config().is_file());
     }
 
     #[test]
@@ -3615,16 +3847,12 @@ own_knob = 2
         let (url, seen) = endpoint(200, GOOD_BODY);
         let before = home.snapshot();
         let outcome = verify_run(&home, &url, &["--key-env", "TEST_KEY", "--output", "json"]);
-        assert_eq!(outcome.exit, 2, "writing is SEAM-02-3: {}", outcome.stderr);
+        assert_eq!(outcome.exit, 0, "{}", outcome.stderr);
         assert!(outcome.stderr.contains("answered"), "{}", outcome.stderr);
-        assert!(
-            outcome.stderr.contains("no files were changed"),
-            "{}",
-            outcome.stderr
-        );
         let json: serde_json::Value = serde_json::from_str(&outcome.stdout).expect("json");
         assert_eq!(json["verified"], true);
-        assert_eq!(json["written"], false);
+        assert_eq!(json["written"], true);
+        assert_eq!(json["action"], "create");
         // The egress receipt: one dial, on a lease for exactly this endpoint.
         let origin = url.trim_end_matches("/v1");
         assert_eq!(
@@ -3640,7 +3868,7 @@ own_knob = 2
             "{}",
             outcome.stderr
         );
-        assert_eq!(home.snapshot(), before);
+        assert_ne!(home.snapshot(), before, "the config was written");
         let requests = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
         assert_eq!(requests.len(), 1, "exactly one request");
         assert!(
@@ -3650,8 +3878,11 @@ own_knob = 2
         assert!(requests[0].contains("\"max_tokens\":16"), "{}", requests[0]);
         // --key-stdin: the key read from stdin is the one sent.
         let (url, seen) = endpoint(200, GOOD_BODY);
-        let outcome = verify_run(&home, &url, &["--key-stdin"]);
-        assert_eq!(outcome.exit, 2, "{}", outcome.stderr);
+        let outcome = crate::provider_keychain::with_backend(
+            std::sync::Arc::new(crate::provider_keychain::testing::MemoryKeychain::default()),
+            || verify_run(&home, &url, &["--key-stdin"]),
+        );
+        assert_eq!(outcome.exit, 0, "{}", outcome.stderr);
         let requests = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
         assert!(
             requests[0].contains("Bearer sk-test-from-stdin"),
@@ -3728,7 +3959,7 @@ own_knob = 2
             "{}",
             outcome.stdout
         );
-        assert_eq!(home.snapshot(), before);
+        assert_ne!(home.snapshot(), before, "verified, so written");
         {
             let requests = seen.lock().unwrap_or_else(|p| p.into_inner());
             assert_eq!(requests.len(), 1, "{requests:?}");
@@ -4007,5 +4238,267 @@ base_url = \"http://10.0.0.5:9000/v1\"
                 plan.notes
             );
         }
+    }
+
+    /// `rapid setup` over `url` with extra flags, on `keychain`.
+    fn write_run(
+        home: &Home,
+        keychain: &std::sync::Arc<crate::provider_keychain::testing::MemoryKeychain>,
+        url: &str,
+        extra: &[&str],
+    ) -> SetupOutcome {
+        let keychain: std::sync::Arc<dyn auth::PlatformKeychain> = keychain.clone();
+        crate::provider_keychain::with_backend(keychain, || verify_run(home, url, extra))
+    }
+
+    #[test]
+    fn a_setup_writes_atomically_at_0600_backs_up_only_a_change_and_is_idempotent() {
+        // SEAM-02 AC-03.
+        let keychain =
+            std::sync::Arc::new(crate::provider_keychain::testing::MemoryKeychain::default());
+        let (url, _) = endpoint(200, GOOD_BODY);
+        let home = Home::new("write");
+        let backups = |home: &Home| -> Vec<String> {
+            std::fs::read_dir(home.config().parent().expect("dir"))
+                .expect("dir")
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".bak"))
+                .collect()
+        };
+        // Created: no previous file, so no backup.
+        let first = write_run(
+            &home,
+            &keychain,
+            &url,
+            &["--key-env", "TEST_KEY", "--output", "json"],
+        );
+        assert_eq!(first.exit, 0, "{}", first.stderr);
+        let json: serde_json::Value = serde_json::from_str(&first.stdout).expect("json");
+        assert_eq!(
+            (json["action"].as_str(), json["written"].as_bool()),
+            (Some("create"), Some(true))
+        );
+        assert!(json["backup"].is_null());
+        let written = std::fs::read_to_string(home.config()).expect("config");
+        assert!(written.contains("env_key = \"TEST_KEY\""), "{written}");
+        assert!(
+            !written.contains("sk-test-env"),
+            "the value is never written"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(home.config())
+                .expect("meta")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        }
+        assert!(backups(&home).is_empty());
+        // The same run again: unchanged, nothing written — not even a backup
+        // (the file is the same file: an atomic rewrite would be a new one).
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(home.config()).expect("meta").ino()
+        };
+        let before = home.snapshot();
+        let again = write_run(
+            &home,
+            &keychain,
+            &url,
+            &["--key-env", "TEST_KEY", "--output", "json"],
+        );
+        assert_eq!(again.exit, 0, "{}", again.stderr);
+        let json: serde_json::Value = serde_json::from_str(&again.stdout).expect("json");
+        assert_eq!(
+            (json["action"].as_str(), json["written"].as_bool()),
+            (Some("unchanged"), Some(false))
+        );
+        assert!(
+            again.stderr.contains("already says this: unchanged"),
+            "{}",
+            again.stderr
+        );
+        assert_eq!(home.snapshot(), before);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(home.config()).expect("meta").ino(),
+                inode,
+                "not rewritten"
+            );
+        }
+        // A change: the previous file is kept, byte for byte, at 0600.
+        let changed = write_run(
+            &home,
+            &keychain,
+            &url,
+            &["--key-env", "OTHER_KEY", "--no-verify", "--output", "json"],
+        );
+        assert_eq!(changed.exit, 0, "{}", changed.stderr);
+        let json: serde_json::Value = serde_json::from_str(&changed.stdout).expect("json");
+        assert_eq!(json["action"], "update");
+        let backup = PathBuf::from(json["backup"].as_str().expect("backup"));
+        assert_eq!(std::fs::read_to_string(&backup).expect("backup"), written);
+        assert_eq!(backups(&home).len(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [home.config(), backup] {
+                let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+                assert_eq!(mode & 0o777, 0o600, "{}: {mode:o}", path.display());
+            }
+        }
+        assert!(
+            std::fs::read_to_string(home.config())
+                .expect("config")
+                .contains("env_key = \"OTHER_KEY\"")
+        );
+        // No temporary file is left beside the config.
+        let leftovers: Vec<String> = std::fs::read_dir(home.config().parent().expect("dir"))
+            .expect("dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn a_key_from_stdin_is_kept_in_the_keychain_and_the_config_names_only_its_alias() {
+        let keychain =
+            std::sync::Arc::new(crate::provider_keychain::testing::MemoryKeychain::default());
+        let (url, _) = endpoint(200, GOOD_BODY);
+        let home = Home::new("write-keychain");
+        let first = write_run(&home, &keychain, &url, &["--key-stdin", "--output", "json"]);
+        assert_eq!(first.exit, 0, "{}", first.stderr);
+        let json: serde_json::Value = serde_json::from_str(&first.stdout).expect("json");
+        assert_eq!(json["key"], "stored");
+        let written = std::fs::read_to_string(home.config()).expect("config");
+        assert!(
+            written.contains("keychain = \"rapidlm-model-default\""),
+            "{written}"
+        );
+        assert!(!written.contains("sk-test-from-stdin"), "{written}");
+        assert_eq!(
+            keychain.get_text("rapidlm-model-default").as_deref(),
+            Some("sk-test-from-stdin")
+        );
+        // A run reads it back when it builds the client.
+        let parsed = parse_config_document(&written, "c").expect("parses");
+        let active = crate::user_config::resolve_active(&[], &parsed).expect("active");
+        let backend: std::sync::Arc<dyn auth::PlatformKeychain> = keychain.clone();
+        crate::provider_keychain::with_backend(backend, || {
+            let store = auth::InMemoryCredentialStore::new();
+            crate::model::ConfiguredModel::build(&active, &store).expect("the key is read");
+        });
+        // The same key again: nothing is written, to the keychain or the file.
+        let puts = *keychain.puts.lock().expect("lock");
+        let before = home.snapshot();
+        let again = write_run(&home, &keychain, &url, &["--key-stdin", "--output", "json"]);
+        assert_eq!(again.exit, 0, "{}", again.stderr);
+        let json: serde_json::Value = serde_json::from_str(&again.stdout).expect("json");
+        assert_eq!(
+            (json["key"].as_str(), json["action"].as_str()),
+            (Some("unchanged"), Some("unchanged"))
+        );
+        assert_eq!(json["written"], false);
+        assert_eq!(*keychain.puts.lock().expect("lock"), puts);
+        assert_eq!(home.snapshot(), before);
+    }
+
+    #[test]
+    fn without_a_keychain_a_stdin_key_is_refused_typed_and_nothing_is_written() {
+        // The typed unavailability every platform can run (no backend).
+        let keychain =
+            std::sync::Arc::new(crate::provider_keychain::testing::MemoryKeychain::unavailable());
+        let (url, _) = endpoint(200, GOOD_BODY);
+        let home = Home::new("write-no-keychain");
+        let before = home.snapshot();
+        let outcome = write_run(&home, &keychain, &url, &["--key-stdin", "--output", "json"]);
+        assert_eq!(outcome.exit, 1, "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("the OS keychain is not available")
+                && outcome.stderr.contains("no files were changed"),
+            "{}",
+            outcome.stderr
+        );
+        assert!(!outcome.stderr.contains("sk-test-from-stdin"));
+        let json: serde_json::Value = serde_json::from_str(&outcome.stdout).expect("json");
+        assert_eq!(json["written"], false);
+        assert_eq!(home.snapshot(), before);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_file_that_cannot_be_written_puts_the_keychain_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let keychain =
+            std::sync::Arc::new(crate::provider_keychain::testing::MemoryKeychain::default());
+        keychain.items.lock().expect("lock").insert(
+            "rapidlm-model-default".to_owned(),
+            b"sk-the-old-key".to_vec(),
+        );
+        let home = Home::new("write-fails");
+        let dir = home.config().parent().expect("dir").to_path_buf();
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(home.config(), "# mine\n").expect("config");
+        // The directory takes no new file: the atomic write cannot start.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("mode");
+        let (url, _) = endpoint(200, GOOD_BODY);
+        let outcome = write_run(&home, &keychain, &url, &["--key-stdin", "--no-verify"]);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        assert_eq!(outcome.exit, 1, "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("no files were changed"),
+            "{}",
+            outcome.stderr
+        );
+        assert_eq!(
+            keychain.get_text("rapidlm-model-default").as_deref(),
+            Some("sk-the-old-key"),
+            "the previous key is back"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.config()).expect("config"),
+            "# mine\n"
+        );
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["config.toml".to_owned()],
+            "no backup left behind"
+        );
+    }
+
+    #[test]
+    fn a_file_changed_since_the_plan_is_not_overwritten() {
+        let home = Home::new("write-raced");
+        std::fs::create_dir_all(home.config().parent().expect("dir")).expect("dir");
+        std::fs::write(home.config(), "# mine\n").expect("config");
+        let plan = plan(
+            choice_for(&["--base-url", "http://10.0.0.5:9000/v1", "--model", "m"]),
+            &home.config(),
+            Some("# mine\n"),
+            &[],
+            None,
+            false,
+            "T",
+        )
+        .expect("plan");
+        std::fs::write(home.config(), "# edited meanwhile\n").expect("edit");
+        let err = persist(&plan, Some("# mine\n"), None).expect_err("refused");
+        assert!(err.contains("changed while rapid setup ran"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(home.config()).expect("config"),
+            "# edited meanwhile\n"
+        );
     }
 }

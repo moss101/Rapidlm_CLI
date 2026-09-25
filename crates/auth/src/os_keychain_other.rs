@@ -52,16 +52,29 @@ pub mod windows {
                 reason: crate::store::PersistenceBlockReason::KeychainUnavailable,
             })?;
             let acct = account(item);
-            let pass = String::from_utf8_lossy(secret);
+            // The secret is read from stdin, never put in the script or on a
+            // command line: interpolated, a quote in it would end the string
+            // and run the rest as PowerShell, and argv is readable by any
+            // process.
             let script = format!(
-                "[void][Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime];$v=New-Object Windows.Security.Credentials.PasswordVault;$c=New-Object Windows.Security.Credentials.PasswordCredential('RapidLM','{acct}','{pass}');$v.Add($c)"
+                "[void][Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime];$p=[Console]::In.ReadToEnd();$v=New-Object Windows.Security.Credentials.PasswordVault;$c=New-Object Windows.Security.Credentials.PasswordCredential('RapidLM','{acct}',$p);$v.Add($c)"
             );
-            let out = std::process::Command::new(PS)
-                .args(["-NoProfile", "-Command", &script])
-                .output()
-                .map_err(|_| StoreError::PersistenceBlocked {
-                    reason: crate::store::PersistenceBlockReason::KeychainUnavailable,
-                })?;
+            let blocked = || StoreError::PersistenceBlocked {
+                reason: crate::store::PersistenceBlockReason::KeychainUnavailable,
+            };
+            let mut child = std::process::Command::new(PS)
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|_| blocked())?;
+            {
+                use std::io::Write;
+                let mut stdin = child.stdin.take().ok_or_else(blocked)?;
+                stdin.write_all(secret).map_err(|_| blocked())?;
+            }
+            let out = child.wait_with_output().map_err(|_| blocked())?;
             if out.status.success() {
                 Ok(())
             } else {
@@ -253,6 +266,10 @@ mod windows_live {
         assert_eq!(kc.get(&item, &c).unwrap(), b"secret-1".to_vec());
         kc.put(&item, b"rotated", &c).unwrap();
         assert_eq!(kc.get(&item, &c).unwrap(), b"rotated".to_vec());
+        // A quote in the key is data, not the end of a PowerShell string.
+        let odd = b"it's a key'); $x=1; ('";
+        kc.put(&item, odd, &c).unwrap();
+        assert_eq!(kc.get(&item, &c).unwrap(), odd.to_vec());
         kc.delete(&item, &c).unwrap();
         assert!(matches!(kc.get(&item, &c), Err(StoreError::NotFound)));
     }

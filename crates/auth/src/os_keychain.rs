@@ -67,20 +67,30 @@ impl PlatformKeychain for MacosKeychain {
                 &account,
             ])
             .output();
-        let out = Command::new("/usr/bin/security")
-            .args([
-                "add-generic-password",
-                "-s",
-                &self.service,
-                "-a",
-                &account,
-                "-w",
-            ])
-            .arg(String::from_utf8_lossy(secret).into_owned())
-            .output()
-            .map_err(|_| StoreError::PersistenceBlocked {
-                reason: crate::store::PersistenceBlockReason::KeychainUnavailable,
-            })?;
+        // The secret never goes on a command line (any process can read
+        // another's argv): `security -i` reads the command from stdin, and
+        // the secret travels hex-encoded (`-X`), so no quoting is involved.
+        let hex: String = secret.iter().map(|byte| format!("{byte:02x}")).collect();
+        let blocked = || StoreError::PersistenceBlocked {
+            reason: crate::store::PersistenceBlockReason::KeychainUnavailable,
+        };
+        let mut child = Command::new("/usr/bin/security")
+            .arg("-i")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|_| blocked())?;
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().ok_or_else(blocked)?;
+            let line = format!(
+                "add-generic-password -s {} -a {} -X {hex}\n",
+                self.service, account
+            );
+            stdin.write_all(line.as_bytes()).map_err(|_| blocked())?;
+        }
+        let out = child.wait_with_output().map_err(|_| blocked())?;
         if out.status.success() {
             Ok(())
         } else {
@@ -183,6 +193,10 @@ mod tests {
         // Overwrite replaces in place.
         kc.put(&meta, b"rotated", &cancel).expect("rotate");
         assert_eq!(kc.get(&meta, &cancel).unwrap(), b"rotated".to_vec());
+        // Quotes, spaces and shell characters are data, not syntax.
+        let odd = b"it's a \"key\" $HOME -w x";
+        kc.put(&meta, odd, &cancel).expect("odd");
+        assert_eq!(kc.get(&meta, &cancel).unwrap(), odd.to_vec());
         kc.delete(&meta, &cancel).expect("delete");
         assert!(matches!(kc.get(&meta, &cancel), Err(StoreError::NotFound)));
         assert!(matches!(

@@ -48,11 +48,16 @@ single dashes (it becomes the router profile id and credential handle name).
 | `name` | string | no | Display name |
 | `api_key` | string | no | Inline credential; wins over `env_key` |
 | `env_key` | string or array | no | Env var name(s); the first set, non-empty value wins |
+| `keychain` | string | no | OS keychain alias the key is kept under (`rapid setup --key-stdin` writes it); read when the model client is built |
 | `max_tokens` | positive integer | no | Output cap; default `4096` when the provider needs one |
 | `context_window` | positive integer | no | Documented context pin; default `32768` |
 
 Credential precedence: `api_key` > first set, non-empty
-`env_key` entry > keyless. Keyless configs (typical for local servers) send no
+`env_key` entry > `keychain` > keyless. A `keychain` key is read from the OS
+keychain (macOS Keychain, Windows Credential Manager, the Secret Service on
+Linux) only when the client is built; where no keychain is available, or it
+holds nothing under the alias, the model fails to build with an error naming
+the alias, before anything is sent. Keyless configs (typical for local servers) send no
 bearer token. Config keys that are not part of the schema are reported as
 stderr warnings (`warning: unknown config key '…'`) and ignored.
 

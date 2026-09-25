@@ -689,7 +689,7 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
     Subcommand {
         name: "setup",
         operands: "[--preset <id>] [--model <id>] [--base-url <url>] [--key-env <VAR> | --key-stdin] [--dry-run]",
-        summary: "plan and verify a model configuration",
+        summary: "configure, verify and save a model",
         own_help: true,
         handler: SubcommandHandler::P9(crate::p9_commands::run_setup),
     },
@@ -15929,6 +15929,7 @@ that is no longer there"
             // Configured, and it must not survive into the projection.
             api_key: Some("sk-do-not-render-me".to_owned()),
             env_key: vec!["SOME_KEY".to_owned()],
+            keychain: None,
             max_tokens: None,
             context_window: window,
             reasoning_effort: None,

@@ -60,6 +60,7 @@ use crate::user_config::{
 const INLINE_ALIAS_PREFIX: &str = "inline:";
 const ENV_ALIAS_PREFIX: &str = "env:";
 const KEYLESS_ALIAS_PREFIX: &str = "keyless:";
+const KEYCHAIN_ALIAS_PREFIX: &str = "keychain:";
 /// Non-empty stand-in so keyless configs pass the resolver's non-empty check;
 /// the no-auth transport never puts it on the wire.
 const KEYLESS_PLACEHOLDER: &str = "rapidlm-keyless";
@@ -204,6 +205,23 @@ impl<'store> ConfiguredModel<'store> {
         store: &'store InMemoryCredentialStore,
         gate: Option<std::sync::Arc<dyn llm_router::providers::dial::DialGate>>,
     ) -> Result<Self, ModelConfigError> {
+        // A key kept in the OS keychain is read here, where the client that
+        // sends it is built, and nowhere earlier (invariant 11).
+        let hydrated;
+        let active = match (&active.credential.plaintext, &active.credential.source) {
+            (None, CredentialSource::Keychain(alias)) => {
+                let key = crate::provider_keychain::read(alias).map_err(|err| {
+                    ModelConfigError::Credential {
+                        reason: err.to_string(),
+                    }
+                })?;
+                let mut copy = active.clone();
+                copy.credential.plaintext = Some(key);
+                hydrated = copy;
+                &hydrated
+            }
+            _ => active,
+        };
         let provider = ProviderId::parse(active.entry.provider.as_str()).map_err(|_| {
             ModelConfigError::Capability {
                 reason: "provider kind does not map to a router provider id".to_owned(),
@@ -356,6 +374,7 @@ fn seed_credential(
     let alias = match &active.credential.source {
         CredentialSource::InlineApiKey => format!("{INLINE_ALIAS_PREFIX}{}", active.profile_id),
         CredentialSource::EnvVar(name) => format!("{ENV_ALIAS_PREFIX}{name}"),
+        CredentialSource::Keychain(alias) => format!("{KEYCHAIN_ALIAS_PREFIX}{alias}"),
         CredentialSource::Keyless => format!("{KEYLESS_ALIAS_PREFIX}{}", active.profile_id),
     };
     let refer = SecretRef::from_alias(&alias).map_err(|_| ModelConfigError::Credential {
@@ -1134,6 +1153,7 @@ mod tests {
             name: None,
             api_key: Some("test-key".to_owned()),
             env_key: Vec::new(),
+            keychain: None,
             max_tokens: None,
             context_window: None,
             reasoning_effort: None,
@@ -2011,6 +2031,64 @@ provider = \"openai-compatible\"\nmodel = \"m\"\nbase_url = \"http://model.inval
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn a_keychain_key_is_read_when_the_client_is_built_and_sent() {
+        let (server, heads) = recording_proxy();
+        let doc = format!(
+            "[models]\ndefault = \"kept\"\n\n[model.kept]\nprovider = \"openai-compatible\"\n\
+model = \"m\"\nbase_url = \"{server}/v1\"\nkeychain = \"rapidlm-model-kept\"\n"
+        );
+        let config = crate::user_config::parse_config_document(&doc, "c").expect("parses");
+        let active = crate::user_config::resolve_active(&[], &config).expect("active");
+        assert_eq!(
+            active.credential.plaintext, None,
+            "a handle until the build"
+        );
+        // No keychain: a typed failure naming it, before anything is sent.
+        let store = InMemoryCredentialStore::new();
+        let err = match ConfiguredModel::build(&active, &store) {
+            Err(err) => err,
+            Ok(_) => panic!("no keychain, no key"),
+        };
+        assert!(
+            err.to_string().contains("keychain is not available"),
+            "{err}"
+        );
+        // An empty keychain: the alias is named.
+        let empty =
+            std::sync::Arc::new(crate::provider_keychain::testing::MemoryKeychain::default());
+        let err = crate::provider_keychain::with_backend(empty, || {
+            let store = InMemoryCredentialStore::new();
+            match ConfiguredModel::build(&active, &store) {
+                Err(err) => err.to_string(),
+                Ok(_) => panic!("nothing stored"),
+            }
+        });
+        assert!(err.contains("no key under 'rapidlm-model-kept'"), "{err}");
+        // The key kept there is the one sent.
+        let keychain =
+            std::sync::Arc::new(crate::provider_keychain::testing::MemoryKeychain::default());
+        keychain.items.lock().expect("lock").insert(
+            "rapidlm-model-kept".to_owned(),
+            b"sk-from-the-keychain".to_vec(),
+        );
+        crate::provider_keychain::with_backend(keychain, || {
+            let store = InMemoryCredentialStore::new();
+            let model = ConfiguredModel::build(&active, &store).expect("build");
+            let cancel = llm_router::provider::CancellationToken::new();
+            let _ = model.probe(&cancel);
+        });
+        let heads = heads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(heads.len(), 1, "{heads:?}");
+        assert!(
+            heads[0].contains("Bearer sk-from-the-keychain"),
+            "{}",
+            heads[0]
         );
     }
 }

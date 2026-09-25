@@ -1026,6 +1026,15 @@ fn check_credentials(plan: &crate::interactive::ModelPlan) -> DoctorCheck {
             "credentials",
             format!("profile '{}': {name} configured", primary.profile_id),
         ),
+        // The model row above built the client, which read the key: had the
+        // keychain not given it, that row would have failed.
+        CredentialSource::Keychain(alias) => DoctorCheck::pass(
+            "credentials",
+            format!(
+                "profile '{}': key in the OS keychain under '{alias}'",
+                primary.profile_id
+            ),
+        ),
         // Keyless is a real, supported configuration (a local server needs no
         // key), and is also what a set-but-empty `env_key` degrades to — so
         // this reports the fact and names both readings rather than guessing.
