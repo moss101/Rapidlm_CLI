@@ -17543,6 +17543,7 @@ question the panel answers"
             diff: String::new(),
             source: None,
             arguments_digest: None,
+            remember_as: None,
         })
         .expect("pending approval");
         turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -17643,6 +17644,7 @@ question the panel answers"
             diff: String::new(),
             source: None,
             arguments_digest: None,
+            remember_as: None,
         })
         .expect("pending approval");
         loop_state.queue_message("queued follow-up").expect("queue");
