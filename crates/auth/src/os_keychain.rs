@@ -8,6 +8,11 @@ use crate::store::{
     KeychainItemMeta, KeychainProbe, PlatformKeychain, PlatformKeychainKind, StoreError,
 };
 
+/// `security -i`'s line buffer: a command line must be shorter.
+const MAX_INTERACTIVE_LINE: usize = 4096;
+/// `security`'s exit status for errSecItemNotFound.
+const ITEM_NOT_FOUND_EXIT: i32 = 44;
+
 /// Production macOS Keychain-backed store. Secrets live only inside the
 /// login keychain; nothing is written to disk by this type.
 pub struct MacosKeychain {
@@ -58,19 +63,25 @@ impl PlatformKeychain for MacosKeychain {
         })?;
         // Replace any existing entry, then add the fresh secret bytes.
         let account = self.account(item);
-        let _ = Command::new("/usr/bin/security")
-            .args([
-                "delete-generic-password",
-                "-s",
-                &self.service,
-                "-a",
-                &account,
-            ])
-            .output();
         // The secret never goes on a command line (any process can read
         // another's argv): `security -i` reads the command from stdin, and
         // the secret travels hex-encoded (`-X`), so no quoting is involved.
+        // `-U` updates an existing item in place: a failed write leaves the
+        // previous one as it was (deleting first would lose it).
         let hex: String = secret.iter().map(|byte| format!("{byte:02x}")).collect();
+        let line = format!(
+            "add-generic-password -U -s {} -a {} -X {hex}\n",
+            self.service, account
+        );
+        // `security -i` reads a line into a 4096-byte buffer and runs what
+        // does not fit as another command: a longer line would store a cut
+        // key. Refused whole instead.
+        if line.len() >= MAX_INTERACTIVE_LINE {
+            return Err(StoreError::BoundExceeded {
+                limit: (MAX_INTERACTIVE_LINE - (line.len() - hex.len())) / 2,
+                requested: secret.len(),
+            });
+        }
         let blocked = || StoreError::PersistenceBlocked {
             reason: crate::store::PersistenceBlockReason::KeychainUnavailable,
         };
@@ -84,10 +95,6 @@ impl PlatformKeychain for MacosKeychain {
         {
             use std::io::Write;
             let mut stdin = child.stdin.take().ok_or_else(blocked)?;
-            let line = format!(
-                "add-generic-password -s {} -a {} -X {hex}\n",
-                self.service, account
-            );
             stdin.write_all(line.as_bytes()).map_err(|_| blocked())?;
         }
         let out = child.wait_with_output().map_err(|_| blocked())?;
@@ -118,7 +125,15 @@ impl PlatformKeychain for MacosKeychain {
             .output()
             .map_err(|_| StoreError::NotFound)?;
         if !out.status.success() {
-            return Err(StoreError::NotFound);
+            // 44: errSecItemNotFound. Anything else (a locked keychain, no
+            // access) is not "nothing stored".
+            return Err(if out.status.code() == Some(ITEM_NOT_FOUND_EXIT) {
+                StoreError::NotFound
+            } else {
+                StoreError::PersistenceBlocked {
+                    reason: crate::store::PersistenceBlockReason::KeychainUnavailable,
+                }
+            });
         }
         let text = String::from_utf8_lossy(&out.stdout);
         let trimmed = text.trim_end_matches(['\r', '\n']);
@@ -192,6 +207,13 @@ mod tests {
         assert_eq!(got, secret.to_vec());
         // Overwrite replaces in place.
         kc.put(&meta, b"rotated", &cancel).expect("rotate");
+        assert_eq!(kc.get(&meta, &cancel).unwrap(), b"rotated".to_vec());
+        // A key too long for one `security -i` line is refused whole, and the
+        // stored one is untouched.
+        assert!(matches!(
+            kc.put(&meta, &[b'k'; 3000], &cancel),
+            Err(StoreError::BoundExceeded { .. })
+        ));
         assert_eq!(kc.get(&meta, &cancel).unwrap(), b"rotated".to_vec());
         // Quotes, spaces and shell characters are data, not syntax.
         let odd = b"it's a \"key\" $HOME -w x";

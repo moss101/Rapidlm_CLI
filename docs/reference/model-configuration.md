@@ -48,7 +48,7 @@ single dashes (it becomes the router profile id and credential handle name).
 | `name` | string | no | Display name |
 | `api_key` | string | no | Inline credential; wins over `env_key` |
 | `env_key` | string or array | no | Env var name(s); the first set, non-empty value wins |
-| `keychain` | string | no | OS keychain alias the key is kept under (`rapid setup --key-stdin` writes it); read when the model client is built |
+| `keychain` | string | no | OS keychain alias the key is kept under (`rapid setup --key-stdin` writes `rapidlm-model-<id>-<digest>`, the digest naming this config file and endpoint); read when the model client is built |
 | `max_tokens` | positive integer | no | Output cap; default `4096` when the provider needs one |
 | `context_window` | positive integer | no | Documented context pin; default `32768` |
 

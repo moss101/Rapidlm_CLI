@@ -20,6 +20,11 @@ pub enum KeychainError {
     InvalidAlias { alias: String },
     /// The stored value is not a key a request can carry (not UTF-8).
     Unreadable { alias: String },
+    /// A key with characters no HTTP header carries (or empty): not stored,
+    /// since what the keychain gives back for it is not the key.
+    UnsendableKey,
+    /// Longer than the keychain takes in one piece: not stored.
+    TooLong,
 }
 
 impl std::fmt::Display for KeychainError {
@@ -37,6 +42,11 @@ impl std::fmt::Display for KeychainError {
             Self::Unreadable { alias } => {
                 write!(f, "the key under '{alias}' in the OS keychain is not text")
             }
+            Self::UnsendableKey => write!(
+                f,
+                "the key has characters no HTTP header can carry (a line break from a file?)"
+            ),
+            Self::TooLong => write!(f, "the key is longer than the OS keychain takes"),
         }
     }
 }
@@ -105,11 +115,11 @@ pub fn read(alias: &str) -> Result<String, KeychainError> {
 }
 
 /// What was under an alias before [`store`] replaced it, so a failed write
-/// after it can put it back.
+/// after it can put it back — byte for byte, whatever it was.
 #[derive(Debug)]
 pub enum Previous {
     Nothing,
-    Key(String),
+    Bytes(Vec<u8>),
 }
 
 /// Whether [`store`] changed anything.
@@ -121,8 +131,14 @@ pub enum Stored {
     Replaced(Previous),
 }
 
-/// Store `key` under `alias`, unless it is already there.
+/// Store `key` under `alias`, unless it is already there. A key a request
+/// could not carry is refused: printable ASCII only (what an HTTP header
+/// takes, and what every keychain gives back as it was put). A failed write
+/// puts back what was there.
 pub fn store(alias: &str, key: &str) -> Result<Stored, KeychainError> {
+    if key.is_empty() || !key.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+        return Err(KeychainError::UnsendableKey);
+    }
     let backend = backend()?;
     if !backend.probe().is_available() {
         return Err(KeychainError::Unavailable);
@@ -130,17 +146,18 @@ pub fn store(alias: &str, key: &str) -> Result<Stored, KeychainError> {
     let item = item(alias)?;
     let cancel = CancellationToken::new();
     let previous = match backend.get(&item, &cancel) {
-        Ok(bytes) => match String::from_utf8(bytes) {
-            Ok(old) if old == key => return Ok(Stored::Unchanged),
-            Ok(old) => Previous::Key(old),
-            Err(_) => Previous::Nothing,
-        },
+        Ok(bytes) if bytes == key.as_bytes() => return Ok(Stored::Unchanged),
+        Ok(bytes) => Previous::Bytes(bytes),
         Err(auth::StoreError::NotFound) => Previous::Nothing,
         Err(_) => return Err(KeychainError::Unavailable),
     };
-    backend
-        .put(&item, key.as_bytes(), &cancel)
-        .map_err(|_| KeychainError::Unavailable)?;
+    if let Err(err) = backend.put(&item, key.as_bytes(), &cancel) {
+        let _ = restore(alias, previous);
+        return Err(match err {
+            auth::StoreError::BoundExceeded { .. } => KeychainError::TooLong,
+            _ => KeychainError::Unavailable,
+        });
+    }
     Ok(Stored::Replaced(previous))
 }
 
@@ -151,8 +168,8 @@ pub fn restore(alias: &str, previous: Previous) -> Result<(), KeychainError> {
     let item = item(alias)?;
     let cancel = CancellationToken::new();
     match previous {
-        Previous::Key(old) => backend
-            .put(&item, old.as_bytes(), &cancel)
+        Previous::Bytes(old) => backend
+            .put(&item, &old, &cancel)
             .map_err(|_| KeychainError::Unavailable),
         Previous::Nothing => match backend.delete(&item, &cancel) {
             Ok(()) | Err(auth::StoreError::NotFound) => Ok(()),
@@ -177,6 +194,9 @@ pub mod testing {
         pub items: Mutex<BTreeMap<String, Vec<u8>>>,
         pub puts: Mutex<usize>,
         pub unavailable: bool,
+        /// The next this many puts fail after dropping what was stored (as
+        /// a backend that deletes before adding would).
+        pub failing_puts: Mutex<usize>,
     }
 
     impl MemoryKeychain {
@@ -212,6 +232,14 @@ pub mod testing {
             _cancel: &CancellationToken,
         ) -> Result<(), StoreError> {
             *self.puts.lock().expect("lock") += 1;
+            let mut failing = self.failing_puts.lock().expect("lock");
+            if *failing > 0 {
+                *failing -= 1;
+                self.items.lock().expect("lock").remove(item.account());
+                return Err(StoreError::PersistenceBlocked {
+                    reason: auth::PersistenceBlockReason::KeychainUnavailable,
+                });
+            }
             self.items
                 .lock()
                 .expect("lock")

@@ -567,9 +567,34 @@ pub fn resolve_choice(
     })
 }
 
-/// The keychain alias a profile's key is stored under.
+/// The keychain alias a profile's key is stored under, before the plan
+/// knows the config file (see [`keychain_alias_for`]).
 pub fn keychain_alias(profile: &str) -> String {
     format!("rapidlm-model-{profile}")
+}
+
+/// The keychain alias a profile's key is stored under:
+/// `rapidlm-model-<profile>-<digest>`, the digest the first 12 hex digits of
+/// SHA-256 over the config file's path and the endpoint's origin — so two
+/// config files (or two endpoints) with a profile of the same name keep two
+/// keys. The config names the alias, so moving the file later changes
+/// nothing.
+pub fn keychain_alias_for(profile: &str, config_path: &Path, base_url: &str) -> String {
+    use sha2::Digest;
+    let origin = origin_of(base_url)
+        .map(|(scheme, host, port)| format!("{scheme}://{host}:{port}"))
+        .unwrap_or_else(|| base_url.to_owned());
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(config_path.display().to_string().as_bytes());
+    hasher.update(b"\n");
+    hasher.update(origin.as_bytes());
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{}-{digest}", keychain_alias(profile))
 }
 
 fn ask_preset(prompter: &mut dyn Prompter) -> Result<&'static Preset, String> {
@@ -687,7 +712,7 @@ pub struct SetupPlan {
 /// Compute the plan for `choice` against the config at `config_path`
 /// (`existing`: its current content, if it exists).
 pub fn plan(
-    choice: Choice,
+    mut choice: Choice,
     config_path: &Path,
     existing: Option<&str>,
     env: &[(String, String)],
@@ -695,6 +720,12 @@ pub fn plan(
     verify: bool,
     now_compact: &str,
 ) -> Result<SetupPlan, String> {
+    // The key's keychain name is this config's and this endpoint's own: a
+    // profile of the same name in another config file, or for another
+    // endpoint, never reads (or overwrites) it.
+    if let Credential::Keychain { alias } = &mut choice.credential {
+        *alias = keychain_alias_for(&choice.profile, config_path, &choice.base_url);
+    }
     let mut doc = match existing {
         Some(text) => text.parse::<toml_edit::DocumentMut>().map_err(|err| {
             format!(
@@ -2590,7 +2621,29 @@ api_key = \"inline-secret\"
         );
         let plan = plan(choice, Path::new("c.toml"), None, &[], None, false, "T").expect("plan");
         let text = render_text(&plan, true);
-        assert!(text.contains("OS keychain as 'rapidlm-model-gw'"), "{text}");
+        // The plan names it for this config file and this endpoint.
+        let alias = keychain_alias_for("gw", Path::new("c.toml"), "http://10.0.0.5:9000/v1");
+        assert!(
+            alias.starts_with("rapidlm-model-gw-") && alias.len() == "rapidlm-model-gw-".len() + 12
+        );
+        assert!(
+            text.contains(&format!("OS keychain as '{alias}'")),
+            "{text}"
+        );
+        // Another config file, or another endpoint, names another key.
+        assert_ne!(
+            alias,
+            keychain_alias_for("gw", Path::new("other.toml"), "http://10.0.0.5:9000/v1")
+        );
+        assert_ne!(
+            alias,
+            keychain_alias_for("gw", Path::new("c.toml"), "http://10.0.0.6:9000/v1")
+        );
+        assert_eq!(
+            alias,
+            keychain_alias_for("gw", Path::new("c.toml"), "http://10.0.0.5:9000/other/v1"),
+            "the origin, not the path"
+        );
         assert!(text.contains("verify   skipped (--no-verify)"), "{text}");
     }
 
@@ -3170,7 +3223,11 @@ gw = { provider = \"openai-compatible\", model = \"m\", base_url = \"http://10.0
         let active = crate::user_config::resolve_active(&[], &parsed).expect("active");
         assert_eq!(
             active.credential.source,
-            crate::user_config::CredentialSource::Keychain("rapidlm-model-default".to_owned())
+            crate::user_config::CredentialSource::Keychain(keychain_alias_for(
+                "default",
+                Path::new("c.toml"),
+                "http://10.0.0.5:9000/v1"
+            ))
         );
         assert_eq!(
             active.credential.plaintext, None,
@@ -4373,18 +4430,19 @@ base_url = \"http://10.0.0.5:9000/v1\"
             std::sync::Arc::new(crate::provider_keychain::testing::MemoryKeychain::default());
         let (url, _) = endpoint(200, GOOD_BODY);
         let home = Home::new("write-keychain");
+        let alias = keychain_alias_for("default", &home.config(), &url);
         let first = write_run(&home, &keychain, &url, &["--key-stdin", "--output", "json"]);
         assert_eq!(first.exit, 0, "{}", first.stderr);
         let json: serde_json::Value = serde_json::from_str(&first.stdout).expect("json");
         assert_eq!(json["key"], "stored");
         let written = std::fs::read_to_string(home.config()).expect("config");
         assert!(
-            written.contains("keychain = \"rapidlm-model-default\""),
+            written.contains(&format!("keychain = \"{alias}\"")),
             "{written}"
         );
         assert!(!written.contains("sk-test-from-stdin"), "{written}");
         assert_eq!(
-            keychain.get_text("rapidlm-model-default").as_deref(),
+            keychain.get_text(&alias).as_deref(),
             Some("sk-test-from-stdin")
         );
         // A run reads it back when it builds the client.
@@ -4438,17 +4496,19 @@ base_url = \"http://10.0.0.5:9000/v1\"
         use std::os::unix::fs::PermissionsExt;
         let keychain =
             std::sync::Arc::new(crate::provider_keychain::testing::MemoryKeychain::default());
-        keychain.items.lock().expect("lock").insert(
-            "rapidlm-model-default".to_owned(),
-            b"sk-the-old-key".to_vec(),
-        );
         let home = Home::new("write-fails");
+        let (url, _) = endpoint(200, GOOD_BODY);
+        let alias = keychain_alias_for("default", &home.config(), &url);
+        keychain
+            .items
+            .lock()
+            .expect("lock")
+            .insert(alias.clone(), b"sk-the-old-key".to_vec());
         let dir = home.config().parent().expect("dir").to_path_buf();
         std::fs::create_dir_all(&dir).expect("dir");
         std::fs::write(home.config(), "# mine\n").expect("config");
         // The directory takes no new file: the atomic write cannot start.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("mode");
-        let (url, _) = endpoint(200, GOOD_BODY);
         let outcome = write_run(&home, &keychain, &url, &["--key-stdin", "--no-verify"]);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("mode");
         assert_eq!(outcome.exit, 1, "{}", outcome.stderr);
@@ -4458,7 +4518,7 @@ base_url = \"http://10.0.0.5:9000/v1\"
             outcome.stderr
         );
         assert_eq!(
-            keychain.get_text("rapidlm-model-default").as_deref(),
+            keychain.get_text(&alias).as_deref(),
             Some("sk-the-old-key"),
             "the previous key is back"
         );
@@ -4500,5 +4560,66 @@ base_url = \"http://10.0.0.5:9000/v1\"
             std::fs::read_to_string(home.config()).expect("config"),
             "# edited meanwhile\n"
         );
+    }
+
+    #[test]
+    fn a_key_no_header_carries_is_not_stored_and_a_failed_store_puts_the_old_one_back() {
+        let keychain =
+            std::sync::Arc::new(crate::provider_keychain::testing::MemoryKeychain::default());
+        let backend: std::sync::Arc<dyn auth::PlatformKeychain> = keychain.clone();
+        crate::provider_keychain::with_backend(backend, || {
+            // What a keychain gives back for these is not the key.
+            for key in ["tab\there", "caf\u{e9}", "", "line\nbreak"] {
+                assert_eq!(
+                    crate::provider_keychain::store("rapidlm-model-p-000000000000", key)
+                        .expect_err(key),
+                    crate::provider_keychain::KeychainError::UnsendableKey
+                );
+            }
+            assert_eq!(*keychain.puts.lock().expect("lock"), 0, "nothing written");
+            // A write that fails after dropping the old key: it is put back.
+            keychain.items.lock().expect("lock").insert(
+                "rapidlm-model-p-000000000000".to_owned(),
+                b"sk-old".to_vec(),
+            );
+            *keychain.failing_puts.lock().expect("lock") = 1;
+            assert!(
+                crate::provider_keychain::store("rapidlm-model-p-000000000000", "sk-new").is_err()
+            );
+            assert_eq!(
+                keychain.get_text("rapidlm-model-p-000000000000").as_deref(),
+                Some("sk-old")
+            );
+        });
+        // Through setup: a key with a tab is refused, nothing written.
+        let home = Home::new("write-tab-key");
+        let before = home.snapshot();
+        let mut env = home.env();
+        env.read_key = || Ok("sk-with\ta-tab".to_owned());
+        let (url, _) = endpoint(200, GOOD_BODY);
+        let backend: std::sync::Arc<dyn auth::PlatformKeychain> = keychain.clone();
+        let outcome = crate::provider_keychain::with_backend(backend, || {
+            run(
+                &args(&[
+                    "--base-url",
+                    &url,
+                    "--model",
+                    "m",
+                    "--non-interactive",
+                    "--key-stdin",
+                    "--no-verify",
+                ]),
+                &env,
+                &mut Scripted(Vec::new()),
+            )
+        });
+        assert_eq!(outcome.exit, 1, "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("no HTTP header can carry")
+                && outcome.stderr.contains("no files were changed"),
+            "{}",
+            outcome.stderr
+        );
+        assert_eq!(home.snapshot(), before);
     }
 }

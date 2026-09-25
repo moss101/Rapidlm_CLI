@@ -2672,7 +2672,20 @@ fn configure_trusted_model_tools(
     // hand it back to the model verbatim. Best-effort: a registration
     // failure (e.g. the credential is empty or oversized) just means
     // nothing gets scrubbed, not a turn failure.
-    if let Some(plaintext) = active.and_then(|active| active.credential.plaintext.as_deref())
+    // A key kept in the OS keychain is scrubbed too: a command can read it
+    // back from the keychain as easily as from the file.
+    let kept =
+        active.and_then(
+            |active| match (&active.credential.plaintext, &active.credential.source) {
+                (None, crate::user_config::CredentialSource::Keychain(alias)) => {
+                    crate::provider_keychain::read(alias).ok()
+                }
+                _ => None,
+            },
+        );
+    if let Some(plaintext) = active
+        .and_then(|active| active.credential.plaintext.as_deref())
+        .or(kept.as_deref())
         && let Ok(refer) = auth::SecretRef::from_alias("active-model-credential")
     {
         let mut registry = security::SecretRedactionRegistry::new();
@@ -23370,5 +23383,50 @@ pre-approve it with `rapid permissions allow <tool>`";
             painted.contains("no goal"),
             "the real production compositor must have painted the Goals sidebar: {painted}"
         );
+    }
+}
+
+#[cfg(test)]
+mod keychain_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn a_keychain_key_is_scrubbed_from_tool_output_like_any_key() {
+        let root = std::env::temp_dir().join(format!(
+            "rapidlm-keychain-scrub-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        let doc = "[models]\ndefault = \"kept\"\n\n[model.kept]\nprovider = \"openai-compatible\"\n\
+model = \"m\"\nbase_url = \"http://127.0.0.1:1/v1\"\nkeychain = \"rapidlm-model-kept\"\n";
+        let config = crate::user_config::parse_config_document(doc, "c").expect("parses");
+        let active = crate::user_config::resolve_active(&[], &config).expect("active");
+        let keychain =
+            std::sync::Arc::new(crate::provider_keychain::testing::MemoryKeychain::default());
+        keychain.items.lock().expect("lock").insert(
+            "rapidlm-model-kept".to_owned(),
+            b"sk-kept-in-the-keychain-9f3c".to_vec(),
+        );
+        let mut tools = ExecTools::workspace(&root).expect("tools");
+        let lattice =
+            crate::permissions::PermissionLattice::new(crate::permissions::PermissionMode::Default);
+        crate::provider_keychain::with_backend(keychain, || {
+            configure_trusted_model_tools(&mut tools, &root, Some(&active), &lattice, None);
+        });
+        let snapshot = tools.redaction_handle().expect("the key is registered");
+        let scrubbed = snapshot
+            .redact_text(
+                security::TextSink::ProcessStdout,
+                "security printed: sk-kept-in-the-keychain-9f3c\n",
+                &security::RedactionCancellation::new(),
+            )
+            .expect("redact");
+        let text = scrubbed.as_text().expect("text");
+        assert!(!text.contains("sk-kept-in-the-keychain-9f3c"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

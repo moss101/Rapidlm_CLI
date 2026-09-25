@@ -369,6 +369,13 @@ pub fn diagnose(env: &DoctorEnv) -> DoctorReport {
         for model in &plan.models {
             if let Some(plaintext) = model.credential.plaintext.as_deref() {
                 secrets.push(plaintext.to_owned());
+            } else if let crate::user_config::CredentialSource::Keychain(alias) =
+                &model.credential.source
+                && let Ok(key) = crate::provider_keychain::read(alias)
+            {
+                // The model row builds the client, which reads it: a
+                // provider error quoting it is scrubbed like any key.
+                secrets.push(key);
             }
             // Credentials embedded in a `base_url`'s userinfo are not the
             // *resolved* credential (a keyless entry has none at all), yet
@@ -617,11 +624,19 @@ fn check_live(env: &[(String, String)], secrets: &mut Vec<String>) -> Vec<Doctor
         })
         .collect();
     for (_, plan) in &plans {
-        if let LivePlan::Probe { active, .. } = plan
-            && let Some(key) = &active.credential.plaintext
-            && key.len() >= MIN_LIVE_KEY_REDACTION
-        {
-            secrets.push(key.clone());
+        if let LivePlan::Probe { active, .. } = plan {
+            let key = match (&active.credential.plaintext, &active.credential.source) {
+                (Some(key), _) => Some(key.clone()),
+                (None, crate::user_config::CredentialSource::Keychain(alias)) => {
+                    crate::provider_keychain::read(alias).ok()
+                }
+                _ => None,
+            };
+            if let Some(key) = key
+                && key.len() >= MIN_LIVE_KEY_REDACTION
+            {
+                secrets.push(key);
+            }
         }
     }
     let cancel = llm_router::provider::CancellationToken::new();
@@ -1714,15 +1729,16 @@ fn check_credential_store(report: &Result<security::DoctorReport, String>) -> Do
     let detail = security_detail(&check);
     match check.status() {
         security::DoctorStatus::Pass => DoctorCheck::pass("credential-store", detail),
-        // Provider credentials come from config/env (`resolve_credential`),
-        // never from the platform keychain, so an unavailable keychain does
-        // not stop Rapid from running a turn — it only removes durable
-        // secure storage for anything that would use it.
+        // Provider credentials come from config/env unless a profile names
+        // a `keychain` alias (`resolve_credential`), so an unavailable
+        // keychain stops only those profiles — whose own model row fails,
+        // naming the alias — not Rapid as a whole.
         _ => DoctorCheck::warn(
             "credential-store",
             detail,
             check.remediation().unwrap_or(
-                "platform keychain is unavailable; model keys still come from config/env",
+                "platform keychain is unavailable; model keys in config/env still work, a \
+profile's `keychain` key does not (give it with rapid setup --key-env <VAR>)",
             ),
         ),
     }

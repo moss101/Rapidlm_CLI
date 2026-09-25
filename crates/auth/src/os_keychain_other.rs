@@ -141,9 +141,12 @@ pub mod linux {
     }
     impl PlatformKeychain for FreedesktopSecretService {
         fn probe(&self) -> KeychainProbe {
+            // `search` exits 0 whenever the service answers (no match
+            // included); `lookup` exits 1 on no match, and `--unlock` is a
+            // `search` option — `lookup --unlock` never succeeded.
             probe_cli(
                 Self::BIN,
-                &["lookup", "--unlock", "rapidlm-service", "RapidLM"],
+                &["search", "--all", "rapidlm-service", "RapidLM-probe"],
             )
         }
         fn put(
