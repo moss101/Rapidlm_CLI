@@ -1921,7 +1921,7 @@ mod tests {
         let doc = |network: &str| {
             format!(
                 "{network}[models]\ndefault = \"remote\"\n\n[model.remote]\n\
-provider = \"openai-compatible\"\nmodel = \"m\"\nbase_url = \"http://model.example.test:8080/v1\"\n"
+provider = \"openai-compatible\"\nmodel = \"m\"\nbase_url = \"http://model.invalid:8080/v1\"\n"
             )
         };
         let env = vec![("http_proxy".to_owned(), proxy)];
@@ -1944,11 +1944,39 @@ provider = \"openai-compatible\"\nmodel = \"m\"\nbase_url = \"http://model.examp
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(heads.len(), 1, "{heads:?}");
             assert!(
-                heads[0].starts_with(
-                    "POST http://model.example.test:8080/v1/chat/completions HTTP/1.1\r\n"
-                ),
+                heads[0]
+                    .starts_with("POST http://model.invalid:8080/v1/chat/completions HTTP/1.1\r\n"),
                 "{}",
                 heads[0]
+            );
+        }
+        // A keyed profile's client goes the same way (the other transport).
+        let keyed = crate::user_config::parse_config_document(
+            &format!(
+                "{}api_key = \"sk-through-proxy\"\n",
+                doc("[network]\nproxy = \"environment\"\n")
+            ),
+            "c",
+        )
+        .expect("parses");
+        let active = crate::user_config::resolve_active(&env, &keyed).expect("active");
+        let store = InMemoryCredentialStore::new();
+        let model = ConfiguredModel::build(&active, &store).expect("build");
+        assert_eq!(
+            model.probe(&cancel).expect_err("the proxy answered 401"),
+            ProviderError::AuthFailed
+        );
+        {
+            let heads = heads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(heads.len(), 2, "{heads:?}");
+            assert!(
+                heads[1]
+                    .starts_with("POST http://model.invalid:8080/v1/chat/completions HTTP/1.1\r\n")
+                    && heads[1].contains("Bearer sk-through-proxy"),
+                "{}",
+                heads[1]
             );
         }
         // Not opted in: the variable is not read and the proxy sees nothing.
@@ -1965,7 +1993,7 @@ provider = \"openai-compatible\"\nmodel = \"m\"\nbase_url = \"http://model.examp
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len(),
-            1
+            2
         );
     }
 }

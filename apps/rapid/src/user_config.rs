@@ -800,6 +800,16 @@ pub fn resolve_active(
     })
 }
 
+/// Whether `key` is a proxy setting of this shell rather than of the config
+/// file: `RAPIDLM_PROXY` or one of the proxy variables (any spelling —
+/// Windows reads them ignoring case).
+pub fn is_shell_proxy_setting(key: &str) -> bool {
+    key == PROXY_MODE_ENV
+        || ["https_proxy", "http_proxy", "no_proxy"]
+            .iter()
+            .any(|name| key.eq_ignore_ascii_case(name))
+}
+
 /// The proxy model connections go through: `RAPIDLM_PROXY` over
 /// `[network] proxy`, default `none`. Under `environment` the proxy
 /// variables are read from `env`; an unusable one is an error naming the
@@ -808,19 +818,25 @@ pub fn resolve_proxy(
     env: &[(String, String)],
     config: &UserConfig,
 ) -> Result<Option<llm_router::providers::dial::ProxyConfig>, UserConfigError> {
-    let mode = match env_value(env, PROXY_MODE_ENV) {
-        Some(raw) => ProxyMode::parse(raw).ok_or_else(|| UserConfigError::InvalidValue {
-            key: PROXY_MODE_ENV.to_owned(),
-            reason: "expected \"environment\" or \"none\"".to_owned(),
-        })?,
-        None => config.network.proxy.unwrap_or(ProxyMode::None),
+    let (mode, origin) = match env_value(env, PROXY_MODE_ENV) {
+        Some(raw) => (
+            ProxyMode::parse(raw).ok_or_else(|| UserConfigError::InvalidValue {
+                key: PROXY_MODE_ENV.to_owned(),
+                reason: "expected \"environment\" or \"none\"".to_owned(),
+            })?,
+            format!("{PROXY_MODE_ENV}=environment"),
+        ),
+        None => (
+            config.network.proxy.unwrap_or(ProxyMode::None),
+            "network.proxy = \"environment\"".to_owned(),
+        ),
     };
     if mode == ProxyMode::None {
         return Ok(None);
     }
     let proxy = llm_router::providers::dial::ProxyConfig::from_env(env).map_err(|err| {
         UserConfigError::InvalidValue {
-            key: "network.proxy = \"environment\"".to_owned(),
+            key: origin,
             reason: err.to_string(),
         }
     })?;

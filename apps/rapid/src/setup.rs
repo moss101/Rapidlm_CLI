@@ -840,9 +840,10 @@ this --base-url"
     // What a turn will read must parse — and resolve, through the same
     // managed gates a run applies, as the file decides it: setup never
     // leaves a config a run refuses (a provider outside a managed
-    // allowlist, say). `RAPIDLM_MODEL` is set aside for this: it is this
-    // shell's choice, not the file's, and must neither refuse a good plan nor
-    // let a bad one through.
+    // allowlist, say). `RAPIDLM_MODEL` and the proxy settings
+    // (`RAPIDLM_PROXY`, the proxy variables) are set aside for this: they are
+    // this shell's choices, not the file's, and must neither refuse a good
+    // plan nor let a bad one through.
     let parsed =
         parse_config_document(&document, &config_path.display().to_string()).map_err(|err| {
             format!(
@@ -852,7 +853,10 @@ this --base-url"
         })?;
     let file_env: Vec<(String, String)> = env
         .iter()
-        .filter(|(key, _)| key != crate::user_config::DEFAULT_MODEL_ENV)
+        .filter(|(key, _)| {
+            key != crate::user_config::DEFAULT_MODEL_ENV
+                && !crate::user_config::is_shell_proxy_setting(key)
+        })
         .cloned()
         .collect();
     let resolution =
@@ -889,8 +893,24 @@ would make the default, so {} is left untouched",
             }
             Ok(_) => None,
             Err(err) => {
+                // Name the settings of this shell the file was judged
+                // without: those are what make a run here differ.
+                let mut set_aside = Vec::new();
+                if env_value(env, crate::user_config::DEFAULT_MODEL_ENV).is_some() {
+                    set_aside.push("RAPIDLM_MODEL");
+                }
+                if env
+                    .iter()
+                    .any(|(key, _)| crate::user_config::is_shell_proxy_setting(key))
+                {
+                    set_aside.push("proxy settings");
+                }
+                if set_aside.is_empty() {
+                    set_aside.push("settings");
+                }
                 notes.push(format!(
-                    "with this shell's RAPIDLM_MODEL a run would fail: {err}"
+                    "with this shell's {} a run would fail: {err}",
+                    set_aside.join(" and ")
                 ));
                 None
             }
@@ -3654,7 +3674,7 @@ own_knob = 2
     fn the_probe_goes_through_the_proxy_a_run_would_and_only_when_opted_in() {
         let (proxy_url, seen) = endpoint(200, GOOD_BODY);
         let proxy_origin = proxy_url.trim_end_matches("/v1").to_owned();
-        let target = "http://model.example.test:8080/v1";
+        let target = "http://model.invalid:8080/v1";
         let run_with = |home: &Home, extra_env: &[(&str, &str)]| {
             let mut env = home.env();
             env.env
@@ -3699,9 +3719,8 @@ own_knob = 2
             let requests = seen.lock().unwrap_or_else(|p| p.into_inner());
             assert_eq!(requests.len(), 1, "{requests:?}");
             assert!(
-                requests[0].starts_with(
-                    "POST http://model.example.test:8080/v1/chat/completions HTTP/1.1\r\n"
-                ),
+                requests[0]
+                    .starts_with("POST http://model.invalid:8080/v1/chat/completions HTTP/1.1\r\n"),
                 "{}",
                 requests[0]
             );
@@ -3740,9 +3759,10 @@ own_knob = 2
             );
         }
 
-        // An unusable proxy variable under the opt-in: a run would refuse
-        // it, so nothing is dialled or written, and the variable is named,
-        // never its value.
+        // An unusable proxy variable under this shell's opt-in: the file is
+        // not blamed; the probe cannot dial as a run would, says why (the
+        // opt-in's origin and the variable, never its value), and nothing is
+        // dialled or written.
         let home = Home::new("verify-proxy-bad");
         let before = home.snapshot();
         let outcome = run_with(
@@ -3752,11 +3772,107 @@ own_knob = 2
                 ("https_proxy", "https://user:hunter2@proxy.example.test"),
             ],
         );
-        assert_eq!(outcome.exit, 1, "{}", outcome.stderr);
-        assert!(outcome.stderr.contains("https_proxy"), "{}", outcome.stderr);
+        assert_eq!(outcome.exit, 2, "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("cannot be verified")
+                && outcome.stderr.contains("RAPIDLM_PROXY=environment")
+                && outcome.stderr.contains("https_proxy"),
+            "{}",
+            outcome.stderr
+        );
+        assert!(
+            !outcome.stderr.contains("left untouched"),
+            "{}",
+            outcome.stderr
+        );
         assert!(!outcome.stderr.contains("hunter2"), "{}", outcome.stderr);
         assert!(!outcome.stderr.contains("egress:"), "{}", outcome.stderr);
+        assert!(outcome.stderr.contains("no files were changed"));
         assert_eq!(home.snapshot(), before);
         assert_eq!(seen.lock().unwrap_or_else(|p| p.into_inner()).len(), 2);
+        // The same shell without verification: the plan stands, and says a
+        // run in this shell would fail.
+        let mut env = home.env();
+        env.env
+            .push(("RAPIDLM_PROXY".to_owned(), "environment".to_owned()));
+        env.env.push((
+            "https_proxy".to_owned(),
+            "https://user:hunter2@proxy.example.test".to_owned(),
+        ));
+        let outcome = run(
+            &args(&[
+                "--base-url",
+                target,
+                "--model",
+                "m",
+                "--non-interactive",
+                "--no-verify",
+                "--dry-run",
+            ]),
+            &env,
+            &mut Scripted(Vec::new()),
+        );
+        assert_eq!(outcome.exit, 0, "{}", outcome.stderr);
+        assert!(
+            outcome
+                .stdout
+                .contains("with this shell's proxy settings a run would fail"),
+            "{}",
+            outcome.stdout
+        );
+        assert!(!outcome.stdout.contains("hunter2"), "{}", outcome.stdout);
+    }
+
+    #[test]
+    fn an_https_probe_through_the_proxy_is_a_tunnel_to_the_planned_endpoint() {
+        // The stand-in proxy refuses the tunnel: a network failure, after one
+        // CONNECT for exactly the planned endpoint, on a lease for the proxy.
+        let (proxy_url, seen) = endpoint(403, "");
+        let proxy_origin = proxy_url.trim_end_matches("/v1").to_owned();
+        let home = Home::new("verify-proxy-https");
+        let before = home.snapshot();
+        let mut env = home.env();
+        env.env
+            .push(("TEST_KEY".to_owned(), "sk-test-env".to_owned()));
+        env.env
+            .push(("RAPIDLM_PROXY".to_owned(), "environment".to_owned()));
+        env.env
+            .push(("https_proxy".to_owned(), proxy_origin.clone()));
+        let outcome = run(
+            &args(&[
+                "--base-url",
+                "https://model.invalid:8443/v1",
+                "--model",
+                "m",
+                "--non-interactive",
+                "--key-env",
+                "TEST_KEY",
+                "--output",
+                "json",
+            ]),
+            &env,
+            &mut Scripted(Vec::new()),
+        );
+        assert_eq!(outcome.exit, 13, "{}", outcome.stderr);
+        let json: serde_json::Value = serde_json::from_str(&outcome.stdout).expect("json");
+        assert_eq!(
+            json["egress"],
+            serde_json::json!([{ "allowed": true, "dialled": proxy_origin, "reason": null }]),
+            "{}",
+            outcome.stdout
+        );
+        let requests = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(
+            requests[0].starts_with("CONNECT model.invalid:8443 HTTP/1.1\r\n"),
+            "{}",
+            requests[0]
+        );
+        assert!(
+            !requests[0].contains("sk-test-env"),
+            "the key never reaches the proxy: {}",
+            requests[0]
+        );
+        assert_eq!(home.snapshot(), before);
     }
 }

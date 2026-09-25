@@ -73,14 +73,20 @@ probe go through the same proxy:
 - `https_proxy` (then `HTTPS_PROXY`) for `https://` endpoints, reached through
   a `CONNECT` tunnel with TLS to the endpoint inside it: the proxy never sees
   the request or the key.
-- `http_proxy` (lower case only) for `http://` endpoints.
+- `http_proxy` for `http://` endpoints — lower case only, since the upper-case
+  spelling is also a request header name some servers export into the
+  environment (on Windows, where variable names ignore case, either spelling).
+  The proxy receives the whole request, the key included, as it would travel
+  to a plain-`http://` endpoint anyway.
 - `no_proxy` (then `NO_PROXY`): names (and their subdomains), addresses and
   ranges such as `10.0.0.0/8`, each with an optional port, dialled directly;
   `*` turns the proxy off. Loopback endpoints are always dialled directly.
 - Only `http://` proxies are supported; credentials in the proxy URL are sent
   as `Proxy-Authorization` and never printed. A variable set but empty turns
-  its proxy off. An unusable value is a configuration error naming the
-  variable, never its value.
+  its proxy off. An unusable proxy URL is a configuration error naming the
+  variable and where the opt-in came from, never the URL; an unusable
+  `no_proxy` entry is quoted (up to 64 characters, anything before an `@`
+  withheld).
 - A proxy that refuses its own credentials (`407`) ends the turn without
   trying a fallback model (every model goes through the same proxy);
   `rapid setup` reports it as a network failure (exit 13).
