@@ -261,6 +261,8 @@ impl DaemonClient {
             "decision": req.decision().as_str(),
             "actor": req.actor(),
             "trace_id": req.trace_id(),
+            "wait_token": req.wait_token(),
+            "remember": req.remember(),
         });
         let _: Value = self.rpc_non_idempotent("approve", params)?;
         Ok(())
@@ -1389,6 +1391,83 @@ mod tests {
                 TraceId::new(),
             ))
             .expect("interrupt");
+    }
+
+    /// Every `approval.resolved` payload in `session`, oldest first.
+    #[cfg(unix)]
+    fn resolutions(kernel: &InProcessKernelClient, session: SessionId, tip: u64) -> Vec<Value> {
+        (1..=tip)
+            .map(|seq| kernel.read_event(session, seq).expect("event"))
+            .filter(|event| event.kind() == EventKind::ApprovalResolved)
+            .map(|event| event.payload().clone())
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approve_carries_the_wait_token_and_remember_and_a_tokenless_one_is_refused() {
+        use crate::{ApprovalDecision, KernelClient as _, RecordApproval};
+        let tmp = TempDir::create();
+        let kernel = InProcessKernelClient::open(&tmp.db).expect("open kernel");
+        let cancel = CancellationToken::new();
+        let server = IpcServer::bind(
+            ListenSpec::unix_socket(&tmp.sock),
+            kernel.clone(),
+            cancel.clone(),
+        )
+        .expect("bind");
+        let _guard = server.spawn().expect("spawn");
+        let client =
+            DaemonClient::connect(ListenSpec::unix_socket(&tmp.sock), cancel).expect("connect");
+        let created = client.create_session(create_req()).expect("create");
+        let session = created.id();
+        let recorded = kernel.record_approval(RecordApproval::new(
+            session,
+            created.seq(),
+            actor(),
+            TraceId::new(),
+            "wait-1",
+            "call-1",
+            "workspace_write",
+            "write notes.txt",
+        ));
+        let mut recorded = std::pin::pin!(recorded);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            recorded.as_mut().poll(&mut cx),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        let tip = client.get_session(session).expect("tip").seq();
+
+        client
+            .approve(ResolveApproval::new(
+                session,
+                tip,
+                ApprovalDecision::Approved,
+                actor(),
+                TraceId::new(),
+            ))
+            .expect_err("a resolution must name its wait");
+        assert_eq!(client.get_session(session).expect("tip").seq(), tip);
+
+        client
+            .approve(
+                ResolveApproval::new(
+                    session,
+                    tip,
+                    ApprovalDecision::Approved,
+                    actor(),
+                    TraceId::new(),
+                )
+                .with_wait_token("wait-1")
+                .remembering(),
+            )
+            .expect("resolves over IPC");
+        let resolved = resolutions(&kernel, session, tip + 1);
+        assert_eq!(resolved.len(), 1, "{resolved:?}");
+        assert_eq!(resolved[0]["id"], "wait-1");
+        assert_eq!(resolved[0]["wait_token"], "wait-1");
+        assert_eq!(resolved[0]["remember"], true);
     }
 
     #[cfg(unix)]

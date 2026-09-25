@@ -158,10 +158,10 @@ pub struct SubscribeEvents {
     from_seq: u64,
 }
 
-/// Resolve a pending approval. Appends `approval.resolved` at `expected_seq`,
-/// and — when the request names one — marks the matching durable wait record
-/// terminal in the same transaction, so a duplicate or unknown-token
-/// resolution fails closed before anything is appended.
+/// Resolve a pending approval. Appends `approval.resolved` at `expected_seq`
+/// and marks the durable wait record its token names terminal in the same
+/// transaction, so a duplicate, unknown-token or tokenless resolution fails
+/// closed before anything is appended.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolveApproval {
     session_id: SessionId,
@@ -169,8 +169,8 @@ pub struct ResolveApproval {
     decision: ApprovalDecision,
     actor: ActorRef,
     trace_id: TraceId,
-    /// The wait token the pending `approval.requested` carried. Empty for a
-    /// resolution recorded without a matching wait row.
+    /// The wait token the pending `approval.requested` carried. Required:
+    /// an empty token names no wait and is refused.
     wait_token: String,
     /// Approve-and-remember: the approver wants the grant persisted beyond
     /// this one call. The kernel records the intent on `approval.resolved`;
@@ -470,7 +470,9 @@ impl ResolveApproval {
 
     /// Name the wait token of the pending `approval.requested` this resolves,
     /// so the durable wait record is marked terminal (duplicate resolutions
-    /// of the same token then fail closed).
+    /// of the same token then fail closed). Required: a resolution without
+    /// one is refused, since an `approval.resolved` that names nothing
+    /// closes no request and is a malformed event to every projection.
     pub fn with_wait_token(mut self, wait_token: impl Into<String>) -> Self {
         self.wait_token = bounded_payload_str(&wait_token.into(), MAX_APPROVAL_TOKEN_BYTES);
         self
@@ -1218,28 +1220,14 @@ impl InProcessKernelClient {
             remember: req.remember,
             id: req.wait_token.clone(),
         };
-        // A resolution that names no token (recorded before the wait
-        // machinery, or from a surface that tracks its own pending set) has
-        // no wait row to spend and is a plain append.
-        if req.wait_token.is_empty() {
-            self.ledger
-                .append(
-                    req.session_id,
-                    req.actor,
-                    EventKind::ApprovalResolved,
-                    payload,
-                    &options,
-                    &ledger_live(),
-                )
-                .map_err(|err| ledger_api(err, trace))?;
-            return Ok(());
-        }
         // The wait turns terminal in the transaction that appends its
         // `approval.resolved`: an unknown token or an already-resolved wait
         // fails before anything is appended, so one wait is never answered
         // twice in the ledger. `expected_seq` alone cannot catch the
         // duplicate — a second resolver that read the tip after the first
-        // one's event carries a current `expected_seq`.
+        // one's event carries a current `expected_seq`. An empty token names
+        // no wait and is refused the same way: a tokenless resolution closes
+        // no request, and projections keyed on the id reject it as malformed.
         let state = match req.decision {
             ApprovalDecision::Approved => WaitState::Approved,
             ApprovalDecision::Denied => WaitState::Denied,
@@ -2167,17 +2155,23 @@ mod tests {
     fn approve_appends_durable_approval_resolved() {
         let tmp = TempClient::create();
         let created = block_on(tmp.client.create_session(create_req())).expect("create");
-        block_on(tmp.client.approve(ResolveApproval::new(
-            created.id(),
-            created.seq(),
-            ApprovalDecision::Approved,
-            actor(),
-            TraceId::new(),
-        )))
+        record_pending(&tmp, created.id(), "wait-1");
+        block_on(
+            tmp.client.approve(
+                ResolveApproval::new(
+                    created.id(),
+                    tip(&tmp, created.id()),
+                    ApprovalDecision::Approved,
+                    actor(),
+                    TraceId::new(),
+                )
+                .with_wait_token("wait-1"),
+            ),
+        )
         .expect("approve");
         let loaded = block_on(tmp.client.get_session(created.id())).expect("get");
-        assert_eq!(loaded.seq(), 2);
-        let mut stream = block_on(tmp.client.subscribe(SubscribeEvents::new(created.id(), 1)))
+        assert_eq!(loaded.seq(), 3);
+        let mut stream = block_on(tmp.client.subscribe(SubscribeEvents::new(created.id(), 2)))
             .expect("subscribe");
         let event = stream.recv().expect("resolved");
         assert_eq!(event.kind(), EventKind::ApprovalResolved);
@@ -2185,6 +2179,33 @@ mod tests {
             event.payload().get("decision").and_then(|v| v.as_str()),
             Some("approved")
         );
+        assert_eq!(
+            event.payload().get("id").and_then(|v| v.as_str()),
+            Some("wait-1")
+        );
+    }
+
+    #[test]
+    fn tokenless_resolution_is_refused_before_any_append() {
+        let tmp = TempClient::create();
+        let created = block_on(tmp.client.create_session(create_req())).expect("create");
+        let session = created.id();
+        record_pending(&tmp, session, "wait-1");
+
+        let seq = tip(&tmp, session);
+        let err = block_on(tmp.client.approve(ResolveApproval::new(
+            session,
+            seq,
+            ApprovalDecision::Approved,
+            actor(),
+            TraceId::new(),
+        )))
+        .expect_err("a resolution must name its wait");
+        assert_eq!(err.code(), ErrorCode::SessionNotFound);
+        assert!(resolutions(&tmp, session).is_empty());
+        assert_eq!(tip(&tmp, session), seq);
+        let pending = block_on(tmp.client.pending_approvals(session)).expect("pending");
+        assert_eq!(pending.len(), 1);
     }
 
     fn tip(tmp: &TempClient, session: SessionId) -> u64 {
@@ -2341,14 +2362,7 @@ mod tests {
     fn rewind_returns_prefix_projection_without_mutating_stream() {
         let tmp = TempClient::create();
         let created = block_on(tmp.client.create_session(create_req())).expect("create");
-        block_on(tmp.client.approve(ResolveApproval::new(
-            created.id(),
-            created.seq(),
-            ApprovalDecision::Denied,
-            actor(),
-            TraceId::new(),
-        )))
-        .expect("second event");
+        record_pending(&tmp, created.id(), "wait-1");
         let current = block_on(tmp.client.get_session(created.id())).expect("current");
         assert_eq!(current.seq(), 2);
 
