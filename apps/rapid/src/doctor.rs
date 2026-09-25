@@ -693,6 +693,18 @@ fn live_plan(
                 fix_profile(profile),
             ));
         }
+        // Under a lock the gates judge the locked profile, whatever was
+        // asked: a refusal is the locked profile's, not this one's.
+        Err(GatedConfigError::Field(_))
+            if policy
+                .and_then(crate::managed_config::ManagedPolicy::locked_default)
+                .is_some_and(|locked| locked != profile) =>
+        {
+            policy
+                .and_then(crate::managed_config::ManagedPolicy::locked_default)
+                .unwrap_or_default()
+                .to_owned()
+        }
         Err(GatedConfigError::Field(err)) => {
             return LivePlan::Row(DoctorCheck::skipped(
                 id,
@@ -707,8 +719,29 @@ fn live_plan(
             ));
         }
     };
-    // Under a lock a run never selects this profile as its default, yet
-    // still dials it as a fallback or phase model: probe it as one.
+    // Under a lock a run never selects this profile as its default; it dials
+    // it only as a `[models] fallback` entry or the `[phases] compact` model
+    // — probed as one of those, and not at all otherwise.
+    let role = if config.models.fallback.iter().any(|entry| entry == profile) {
+        "a [models] fallback"
+    } else if config
+        .phases
+        .overrides
+        .get(llm_router::purpose_name(
+            llm_router::provider::ModelPurpose::Compact,
+        ))
+        .is_some_and(|routed| routed == profile)
+    {
+        "the [phases] compact model"
+    } else {
+        return LivePlan::Row(DoctorCheck::skipped(
+            id,
+            format!(
+                "not probed: the managed policy locks the default to {locked_to}, and a run does \
+not dial this profile (it is neither a [models] fallback nor the [phases] compact model)"
+            ),
+        ));
+    };
     let mut candidate_env: Vec<(String, String)> = env
         .iter()
         .filter(|(key, _)| key != crate::user_config::DEFAULT_MODEL_ENV)
@@ -725,15 +758,14 @@ fn live_plan(
         Ok(active) => LivePlan::Probe {
             active: Box::new(active),
             note: Some(format!(
-                "the managed policy locks the default to {locked_to}; probed as a fallback or \
-phase model"
+                "the managed policy locks the default to {locked_to}; probed as {role}"
             )),
         },
         Err(reason) => LivePlan::Row(DoctorCheck::skipped(
             id,
             format!(
-                "not probed: the managed policy locks the default to {locked_to} and a run does \
-not use this profile ({reason})"
+                "not probed: the managed policy locks the default to {locked_to} and refuses this \
+profile as {role} ({reason})"
             ),
         )),
     }

@@ -881,14 +881,21 @@ fn live_probes_every_profile_once_and_reports_one_typed_row_each() {
 
 #[test]
 fn live_under_a_locked_default_probes_the_other_profiles_as_a_run_dials_them() {
+    // Locked to corp: a run dials corp, its fallback spare and its compact
+    // model cheap — never backup, the file's own default.
     let (corp, corp_seen) = model_server(200, GOOD_BODY);
+    let (spare, spare_seen) = model_server(200, GOOD_BODY);
+    let (cheap, cheap_seen) = model_server(200, GOOD_BODY);
     let (backup, backup_seen) = model_server(200, GOOD_BODY);
     let fixture = fixture("live-lock");
     let config = write_config(
         &fixture,
         &format!(
-            "[models]\ndefault = \"backup\"\nfallback = [\"corp\"]\n\n{}{}",
+            "[models]\ndefault = \"backup\"\nfallback = [\"corp\", \"spare\"]\n\n\
+             [phases]\ncompact = \"cheap\"\n\n{}{}{}{}",
             live_entry("corp", &corp, Some("doctor-live-secret-corp")),
+            live_entry("spare", &spare, Some("doctor-live-secret-spare")),
+            live_entry("cheap", &cheap, Some("doctor-live-secret-cheap")),
             live_entry("backup", &backup, Some("doctor-live-secret-backup")),
         ),
     );
@@ -902,15 +909,69 @@ fn live_under_a_locked_default_probes_the_other_profiles_as_a_run_dials_them() {
     assert_eq!(run.code, Some(0), "{}{}", run.stdout, run.stderr);
     assert_eq!(run.status("live:corp"), "PASS");
     assert!(!run.row("live:corp").contains("locks"), "{}", run.stdout);
-    assert_eq!(run.status("live:backup"), "PASS");
+    assert_eq!(run.status("live:spare"), "PASS");
     assert!(
-        run.row("live:backup")
-            .contains("the managed policy locks the default to corp; probed as a fallback"),
+        run.row("live:spare")
+            .contains("locks the default to corp; probed as a [models] fallback"),
         "{}",
         run.stdout
     );
-    assert_eq!(corp_seen.lock().expect("lock").len(), 1);
-    assert_eq!(backup_seen.lock().expect("lock").len(), 1);
+    assert_eq!(run.status("live:cheap"), "PASS");
+    assert!(
+        run.row("live:cheap")
+            .contains("probed as the [phases] compact model"),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(run.status("live:backup"), "SKIP");
+    assert!(
+        run.row("live:backup")
+            .contains("a run does not dial this profile"),
+        "{}",
+        run.stdout
+    );
+    for (seen, expected) in [
+        (&corp_seen, 1),
+        (&spare_seen, 1),
+        (&cheap_seen, 1),
+        (&backup_seen, 0),
+    ] {
+        assert_eq!(seen.lock().expect("lock").len(), expected, "{}", run.stdout);
+    }
+
+    // A lock on a provider the policy refuses: the refusal is the locked
+    // profile's; the others are judged as what a run dials them as.
+    std::fs::write(
+        &policy,
+        "schema = \"rapidlm.managed_config.v1\"\n[policy]\nlocked_default = \"corp\"\n\
+         allowed_providers = [\"anthropic\"]\n",
+    )
+    .expect("policy");
+    let run = run_live(&fixture, &config, Some(&policy));
+    assert_eq!(run.status("live:corp"), "SKIP");
+    assert!(
+        run.row("live:corp").contains("refuses it"),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(run.status("live:spare"), "SKIP");
+    assert!(
+        run.row("live:spare")
+            .contains("refuses this profile as a [models] fallback"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.row("live:backup")
+            .contains("a run does not dial this profile"),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(
+        spare_seen.lock().expect("lock").len(),
+        1,
+        "nothing more sent"
+    );
 }
 
 #[test]

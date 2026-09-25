@@ -108,8 +108,8 @@ any connection and asserts it stays untouched.
 
 `rapid doctor --live` then probes every configured `[model.<id>]` — the model a run would
 dial for that profile, managed gates applied: as the default when a run may select it,
-and, under a managed `locked_default`, as the `[models] fallback` or `[phases]` model a
-run still dials it as — with the request `rapid setup` verifies with (at most 16 output
+and, under a managed `locked_default`, as the `[models] fallback` entry or `[phases]
+compact` model a run still dials it as — with the request `rapid setup` verifies with (at most 16 output
 tokens), through that profile's key and proxy (`[network] proxy`) and on an egress gate
 for exactly its endpoint. The probes run side by side, so the command takes about as long
 as the slowest (each connection and each answer is bounded by the transport's timeouts).
@@ -119,7 +119,8 @@ when the endpoint answered; `FAIL` with the class (`auth`, `quota`, `network`, `
 <scheme>://<host>:<port>`, or what was refused and why) when the probe failed; `FAIL`
 with the reason and no receipt when the profile's configuration does not resolve, so
 nothing was sent; `SKIP` when the managed policy refuses the profile, or locks the
-default elsewhere and refuses it as a fallback too. No configured model is one `live`
+default elsewhere and a run does not dial the profile at all (or refuses it in the role
+it would dial it in). No configured model is one `live`
 `WARN` pointing at `rapid setup`. A failed probe fails the command (exit `1`). Nothing is
 written: the receipt is reported, not recorded.
 

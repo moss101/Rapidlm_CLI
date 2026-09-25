@@ -880,6 +880,26 @@ would make the default, so {} is left untouched",
             config_path.display()
         ));
     }
+    // A run in this shell: its RAPIDLM_MODEL and proxy settings in force.
+    let real = crate::managed_config::resolve_gated(env, &parsed, policy);
+    if let Err(err) = &real {
+        // Name the settings of this shell that make a run here fail: the
+        // proxy settings when they do not resolve, RAPIDLM_MODEL when set.
+        let mut set_aside = Vec::new();
+        if env_value(env, crate::user_config::DEFAULT_MODEL_ENV).is_some() {
+            set_aside.push("RAPIDLM_MODEL");
+        }
+        if crate::user_config::resolve_proxy(env, &parsed).is_err() {
+            set_aside.push("proxy settings");
+        }
+        if set_aside.is_empty() {
+            set_aside.push("settings");
+        }
+        notes.push(format!(
+            "with this shell's {} a run would fail: {err}",
+            set_aside.join(" and ")
+        ));
+    }
     let effective = if resolution.active.profile_id != choice.profile {
         // A managed locked default.
         Some((
@@ -887,33 +907,11 @@ would make the default, so {} is left untouched",
             resolution.default_origin.as_str(),
         ))
     } else {
-        match crate::managed_config::resolve_gated(env, &parsed, policy) {
+        match real {
             Ok(real) if real.active.profile_id != choice.profile => {
                 Some((real.active.profile_id, real.default_origin.as_str()))
             }
-            Ok(_) => None,
-            Err(err) => {
-                // Name the settings of this shell the file was judged
-                // without: those are what make a run here differ.
-                let mut set_aside = Vec::new();
-                if env_value(env, crate::user_config::DEFAULT_MODEL_ENV).is_some() {
-                    set_aside.push("RAPIDLM_MODEL");
-                }
-                if env
-                    .iter()
-                    .any(|(key, _)| crate::user_config::is_shell_proxy_setting(key))
-                {
-                    set_aside.push("proxy settings");
-                }
-                if set_aside.is_empty() {
-                    set_aside.push("settings");
-                }
-                notes.push(format!(
-                    "with this shell's {} a run would fail: {err}",
-                    set_aside.join(" and ")
-                ));
-                None
-            }
+            _ => None,
         }
     };
     // Keys of this profile a run would not read (a newer key than this
@@ -3894,5 +3892,84 @@ model = \"m\"\nbase_url = \"http://[::1]:1/v1\"\n";
         // Named as a URL names it (the probe itself fails: nothing listens).
         assert_eq!(probe.endpoint, "http://[::1]:1");
         assert!(probe.result.is_err());
+    }
+
+    #[test]
+    fn a_note_names_only_the_shell_settings_that_make_a_run_fail() {
+        // A proxy variable without the opt-in plays no part.
+        let env = vec![
+            (
+                crate::user_config::DEFAULT_MODEL_ENV.to_owned(),
+                "work".to_owned(),
+            ),
+            (
+                "https_proxy".to_owned(),
+                "http://proxy.example.test:3128".to_owned(),
+            ),
+        ];
+        let plan = plan(
+            choice_for(&["--preset", "openai"]),
+            Path::new("c.toml"),
+            None,
+            &env,
+            None,
+            true,
+            "T",
+        )
+        .expect("a good plan is not refused");
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.starts_with("with this shell's RAPIDLM_MODEL a run would fail")),
+            "{:?}",
+            plan.notes
+        );
+        assert!(
+            !plan.notes.iter().any(|note| note.contains("proxy")),
+            "{:?}",
+            plan.notes
+        );
+        // Under a lock, an unusable proxy in this shell is still said.
+        let existing = "\
+[models]
+default = \"corp\"
+
+[model.corp]
+provider = \"openai-compatible\"
+model = \"m\"
+base_url = \"http://10.0.0.5:9000/v1\"
+";
+        let policy = crate::managed_config::ManagedPolicy::parse(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\nlocked_default = \"corp\"\n",
+        )
+        .expect("policy");
+        let env = vec![
+            (
+                crate::user_config::PROXY_MODE_ENV.to_owned(),
+                "environment".to_owned(),
+            ),
+            (
+                "https_proxy".to_owned(),
+                "https://proxy.example.test".to_owned(),
+            ),
+        ];
+        let plan = super::plan(
+            choice_for(&["--preset", "openai"]),
+            Path::new("c.toml"),
+            Some(existing),
+            &env,
+            Some(&policy),
+            true,
+            "T",
+        )
+        .expect("a good plan is not refused");
+        assert!(plan.effective.is_some(), "the lock decides");
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.starts_with("with this shell's proxy settings a run would fail")),
+            "{:?}",
+            plan.notes
+        );
     }
 }
