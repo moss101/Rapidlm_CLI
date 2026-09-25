@@ -77,6 +77,10 @@ pub enum FailureClass {
     /// The account has no quota left: not retried on this model, like
     /// [`FailureClass::Auth`], and reported as what it is.
     Quota,
+    /// A proxy on the way refused its own credentials. Every model behind
+    /// that proxy gets the same ones, so the chain stops rather than
+    /// sending them again to an alternate.
+    ProxyAuth,
     Config,
     Safety,
     ContextTooLarge,
@@ -97,6 +101,7 @@ pub enum FallbackTrigger {
 pub enum StopReason {
     AuthFailure,
     QuotaExhausted,
+    ProxyAuthFailure,
     ConfigFailure,
     SafetyFailure,
     ContextTooLarge,
@@ -206,6 +211,7 @@ impl FailureClass {
             Self::RateLimited { .. } => "rate_limited",
             Self::Auth => "auth",
             Self::Quota => "quota",
+            Self::ProxyAuth => "proxy_auth",
             Self::Config => "config",
             Self::Safety => "safety",
             Self::ContextTooLarge => "context_too_large",
@@ -246,9 +252,7 @@ pub fn classify_failure(trigger: &FallbackTrigger) -> FailureClass {
             ProviderError::Cancelled => FailureClass::Cancelled,
             ProviderError::AuthFailed => FailureClass::Auth,
             ProviderError::QuotaExceeded => FailureClass::Quota,
-            // Credentials again, though not the provider's: an explicit
-            // alternate (another path) or a stop, never a retry.
-            ProviderError::ProxyRefused => FailureClass::Auth,
+            ProviderError::ProxyRefused => FailureClass::ProxyAuth,
             ProviderError::RateLimited { retry_after_ms } => FailureClass::RateLimited {
                 retry_after_ms: *retry_after_ms,
             },
@@ -267,6 +271,7 @@ impl StopReason {
         match self {
             Self::AuthFailure => "auth_failure",
             Self::QuotaExhausted => "quota_exhausted",
+            Self::ProxyAuthFailure => "proxy_auth_failure",
             Self::ConfigFailure => "config_failure",
             Self::SafetyFailure => "safety_failure",
             Self::ContextTooLarge => "context_too_large",
@@ -633,6 +638,11 @@ impl FallbackController {
             FailureClass::Permanent => {
                 return Ok(stop(current, StopReason::PermanentFailure));
             }
+            // No alternate either: the proxy is the process's, not the
+            // model's, and asking it again can lock a directory account.
+            FailureClass::ProxyAuth => {
+                return Ok(stop(current, StopReason::ProxyAuthFailure));
+            }
             FailureClass::Auth
             | FailureClass::Quota
             | FailureClass::Config
@@ -712,6 +722,7 @@ fn stop_reason_for(failure: FailureClass) -> StopReason {
     match failure {
         FailureClass::Auth => StopReason::AuthFailure,
         FailureClass::Quota => StopReason::QuotaExhausted,
+        FailureClass::ProxyAuth => StopReason::ProxyAuthFailure,
         FailureClass::Config => StopReason::ConfigFailure,
         FailureClass::Safety => StopReason::SafetyFailure,
         FailureClass::ContextTooLarge => StopReason::ContextTooLarge,
@@ -1634,6 +1645,31 @@ mod tests {
         }
         controller.apply(&plan).expect("apply");
         assert_eq!(controller.current(), &alt);
+    }
+
+    #[test]
+    fn a_proxy_refusal_stops_the_chain_even_with_an_alternate_configured() {
+        let primary = pin("b-ai", "deepseek-v4");
+        let alt = pin("openrouter", "ling-3");
+        let mut controller = FallbackController::from_explicit_chain(
+            primary.clone(),
+            vec![alt],
+            FallbackPolicy::standard(),
+            &live(),
+        )
+        .expect("controller");
+        let trigger = FallbackTrigger::Provider(ProviderError::ProxyRefused);
+        assert_eq!(classify_failure(&trigger), FailureClass::ProxyAuth);
+        assert_eq!(FailureClass::ProxyAuth.as_str(), "proxy_auth");
+        let plan = controller
+            .plan(&trigger, AttemptProgress::PreResponse, &live())
+            .expect("plan");
+        assert!(!plan.is_safe_retry());
+        assert_eq!(plan.stop_reason(), Some(StopReason::ProxyAuthFailure));
+        assert_eq!(StopReason::ProxyAuthFailure.as_str(), "proxy_auth_failure");
+        controller.apply(&plan).expect("apply");
+        assert!(controller.is_terminal());
+        assert_eq!(controller.current(), &primary);
     }
 
     #[test]

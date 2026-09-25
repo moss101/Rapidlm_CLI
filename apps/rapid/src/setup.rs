@@ -248,7 +248,8 @@ Exit codes:
   11  verification: the key was refused or required, or it could not be sent
       (its variable is not set, or it is held where this build does not read it)
   12  verification: no quota or credit left, or rate-limited
-  13  verification: the endpoint could not be reached, or rapid does not dial it
+  13  verification: the endpoint could not be reached, rapid does not dial it,
+      or a proxy on the way refused its credentials
   14  verification: the endpoint failed on its side
   15  verification: the endpoint answered, but not usably
 A failed verification changes no file.
@@ -3219,6 +3220,9 @@ own_knob = 2
                 "server",
             ),
             (endpoint(200, "definitely not json").0, 15, "invalid"),
+            // Asked for proxy credentials on a direct connection: the
+            // endpoint's own refusal, and no proxy variable is to blame.
+            (endpoint(407, "").0, 15, "invalid"),
         ];
         for (url, code, class) in cases {
             let home = Home::new("verify-fail");
@@ -3240,6 +3244,11 @@ own_knob = 2
             assert!(
                 !outcome.stderr.contains("sk-test-env"),
                 "the key is never printed"
+            );
+            assert!(
+                !outcome.stderr.contains("proxy"),
+                "no proxy was dialled: {}",
+                outcome.stderr
             );
             assert_eq!(home.snapshot(), before, "{class}: nothing written");
         }
@@ -3336,10 +3345,12 @@ own_knob = 2
     #[test]
     fn what_is_refused_before_sending_is_not_reported_as_an_answer() {
         let home = Home::new("verify-local");
-        // A name that resolves to an address rapid does not dial is refused
-        // by the transport's guard before anything is sent.
+        // Only a proxy rapid dialled through reports this: a network failure
+        // naming the variable it read.
         let proxy = classify(&llm_router::provider::ProviderError::ProxyRefused);
         assert_eq!((proxy.exit_code(), proxy.class()), (13, "network"));
+        // A name that resolves to an address rapid does not dial is refused
+        // by the transport's guard before anything is sent.
         let failure = classify(&llm_router::provider::ProviderError::InvalidRequest);
         assert_eq!(failure, ProbeFailure::Refused);
         assert_eq!((failure.exit_code(), failure.class()), (13, "network"));

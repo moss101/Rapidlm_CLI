@@ -2554,6 +2554,48 @@ mod tests {
     }
 
     #[test]
+    fn a_proxy_refusal_stops_the_chain_before_any_alternate() {
+        // The proxy is the process's: every alternate behind it would be
+        // sent the same refused credentials, so the chain stops at once.
+        let primary_ref = model_ref("b-ai", "deepseek");
+        let alt_ref = model_ref("openrouter", "ling-3");
+        let controller = chain_controller(primary_ref.clone(), vec![alt_ref.clone()]);
+        let primary = ScriptedBacking::new(vec![
+            Err(ModelStepError::ProviderFailed {
+                cause: FailureCause::ProxyAuth,
+            }),
+            ok_terminal("never retried"),
+        ]);
+        let alt = ScriptedBacking::new(vec![ok_terminal("never reached")]);
+        let mut chain = FallbackChainModel::new(
+            vec![(primary_ref, primary.clone()), (alt_ref, alt.clone())],
+            controller,
+            None,
+        );
+        let log = chain.decisions();
+        let err = chain
+            .step(&[], &step_input(), &CancellationToken::new())
+            .expect_err("a proxy refusal is the turn's failure");
+        assert_eq!(
+            err,
+            ModelStepError::ProviderFailed {
+                cause: FailureCause::ProxyAuth
+            }
+        );
+        assert_eq!(primary.saw_blocks.borrow().len(), 1, "the primary ran once");
+        assert!(
+            alt.saw_blocks.borrow().is_empty(),
+            "the alternate never ran"
+        );
+        let decisions = log.snapshot();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(
+            decisions[0].reason,
+            RouterDecisionReason::Stop("proxy_auth_failure".to_owned())
+        );
+    }
+
+    #[test]
     fn fallback_never_switches_when_nothing_is_configured() {
         // Regression guard for the design's central safety property: no
         // configured alternates means an auth failure surfaces exactly as
@@ -4361,8 +4403,8 @@ mod tests {
                     cause: FailureCause::ProxyAuth,
                 }
             )),
-            llm_router::fallback::FailureClass::Auth,
-            "the chain moves only to an explicit alternate"
+            llm_router::fallback::FailureClass::ProxyAuth,
+            "the chain has a class of its own for it"
         );
     }
 

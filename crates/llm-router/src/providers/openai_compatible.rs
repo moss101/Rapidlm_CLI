@@ -649,7 +649,9 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         )?;
         drop(token);
 
-        read_http_response(&mut stream, self.max_response_bytes, cancel, deadline)
+        let response = read_http_response(&mut stream, self.max_response_bytes, cancel, deadline)?;
+        refused_by_proxy(via, response.status)?;
+        Ok(response)
     }
 
     fn execute_streaming(
@@ -708,14 +710,16 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
             false,
         )?;
         let split = find_header_body_split(&raw).ok_or(ProviderError::Permanent)?;
+        let header_text =
+            std::str::from_utf8(&raw[..split]).map_err(|_| ProviderError::Permanent)?;
+        let status = parse_status_line(header_text.split("\r\n").next().unwrap_or(""))?;
+        refused_by_proxy(via, status)?;
         let mut body = raw[split + 4..].to_vec();
         if !body.is_empty()
             && let Ok(text) = std::str::from_utf8(&body)
         {
             on_body(text);
         }
-        let header_text =
-            std::str::from_utf8(&raw[..split]).map_err(|_| ProviderError::Permanent)?;
         let mut content_length: Option<usize> = None;
         for line in header_text.split("\r\n").skip(1) {
             if let Some((name, value)) = line.split_once(':')
@@ -749,18 +753,19 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
                 break;
             }
         }
-        ProviderHttpResponse::new(
-            parse_status_line(
-                std::str::from_utf8(&raw[..split])
-                    .map_err(|_| ProviderError::Permanent)?
-                    .split("\r\n")
-                    .next()
-                    .ok_or(ProviderError::Permanent)?,
-            )?,
-            Vec::new(),
-            body,
-        )
+        ProviderHttpResponse::new(status, Vec::new(), body)
     }
+}
+
+/// A 407 answering a request sent through the configured proxy is that
+/// proxy refusing its own credentials (a tunnel's refusal is judged where it
+/// is opened). On a direct connection a 407 is the endpoint's own answer,
+/// classified like any other refusal: rapid read no proxy variable to blame.
+fn refused_by_proxy(via: Option<&ProxyTarget>, status: u16) -> Result<(), ProviderError> {
+    if via.is_some() && status == 407 {
+        return Err(ProviderError::ProxyRefused);
+    }
+    Ok(())
 }
 
 #[test]
@@ -1282,9 +1287,8 @@ fn classify_http_error(response: &ProviderHttpResponse) -> Result<(), ProviderEr
         400 | 413 if parsed.as_ref().is_some_and(json_is_context_too_large) => {
             Err(ProviderError::ContextTooLarge)
         }
-        // Only a proxy asks for its own credentials: asking again sends the
-        // same ones (and can lock a directory account). Never retried.
-        407 => Err(ProviderError::ProxyRefused),
+        // A 407 reaches here only on a direct connection (the transport
+        // judges a proxy's own): the endpoint's refusal, like any other.
         408 | 409 | 425 | 500 | 502 | 503 | 504 => Err(ProviderError::Transient),
         // A redirect is never followed, and asking again is redirected again.
         300..=499 => Err(ProviderError::Permanent),
@@ -4515,16 +4519,65 @@ mod tests {
     }
 
     #[test]
-    fn a_proxy_refusing_its_own_credentials_is_an_authentication_failure() {
-        // Asking again sends the same credentials (and can lock the account):
-        // the step layer retries neither this class nor the fallback chain
-        // anything but an explicit alternate.
+    fn a_407_is_the_proxys_refusal_only_when_the_request_went_through_the_proxy() {
+        // Asking a proxy again sends the same credentials (and can lock the
+        // account): neither the step layer nor the chain asks again. A 407
+        // on a direct connection is the endpoint's own refusal, and no proxy
+        // variable is to blame.
+        const REFUSAL: &str = "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let response = ProviderHttpResponse::new(407, Vec::new(), Vec::new()).expect("response");
         assert_eq!(
             classify_http_error(&response),
-            Err(ProviderError::ProxyRefused)
+            Err(ProviderError::Permanent)
         );
         assert!(!ProviderError::ProxyRefused.is_retryable());
+
+        let (proxy, heads) = scripted_proxy(REFUSAL);
+        let (endpoint, _) = scripted_proxy(REFUSAL);
+        let store = store_with_canary();
+        for (base_url, via, expected) in [
+            (
+                "http://gw.example.test:8080/v1".to_owned(),
+                Some(proxy),
+                ProviderError::ProxyRefused,
+            ),
+            (
+                format!("http://{endpoint}/v1"),
+                None,
+                ProviderError::Permanent,
+            ),
+        ] {
+            for streaming in [false, true] {
+                let mut transport = Http1Transport::with_limits(
+                    StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"),
+                    Duration::from_secs(3),
+                    MAX_HTTP_RESPONSE_BYTES,
+                );
+                if let Some(proxy) = via {
+                    transport = transport.with_proxy(proxy_env("http_proxy", proxy));
+                }
+                let adapter = OpenAiCompatibleAdapter::new(
+                    config(
+                        &base_url,
+                        OpenAiApiStyle::ChatCompletions,
+                        caps(false, false),
+                    ),
+                    transport,
+                    &store,
+                );
+                let err = if streaming {
+                    adapter
+                        .invoke_sync_streaming(request(false, false), &live(), &mut |_| {})
+                        .expect_err("407")
+                } else {
+                    adapter
+                        .invoke_sync(request(false, false), &live())
+                        .expect_err("407")
+                };
+                assert_eq!(err, expected, "{base_url} streaming={streaming}");
+            }
+        }
+        assert_eq!(heads.lock().expect("heads").len(), 2, "the proxy was asked");
     }
 
     #[test]

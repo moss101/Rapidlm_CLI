@@ -2893,7 +2893,7 @@ mod tests {
             crate::fallback::classify_failure(&crate::fallback::FallbackTrigger::Provider(
                 ProviderError::ProxyRefused
             )),
-            crate::fallback::FailureClass::Auth
+            crate::fallback::FailureClass::ProxyAuth
         );
     }
 }
