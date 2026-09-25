@@ -649,7 +649,8 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         )?;
         drop(token);
 
-        let response = read_http_response(&mut stream, self.max_response_bytes, cancel, deadline)?;
+        let response = read_http_response(&mut stream, self.max_response_bytes, cancel, deadline)
+            .map_err(reply_too_large)?;
         refused_by_proxy(via, response.status)?;
         Ok(response)
     }
@@ -708,7 +709,8 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
             cancel,
             deadline,
             false,
-        )?;
+        )
+        .map_err(reply_too_large)?;
         let split = find_header_body_split(&raw).ok_or(ProviderError::Permanent)?;
         let header_text =
             std::str::from_utf8(&raw[..split]).map_err(|_| ProviderError::Permanent)?;
@@ -731,7 +733,7 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         let mut fed = body.len();
         loop {
             if body.len() >= self.max_response_bytes {
-                return Err(ProviderError::BoundExceeded);
+                return Err(ProviderError::Permanent);
             }
             let mut buf = [0u8; 2048];
             let want = (self.max_response_bytes - body.len()).min(buf.len());
@@ -753,7 +755,7 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
                 break;
             }
         }
-        ProviderHttpResponse::new(status, Vec::new(), body)
+        ProviderHttpResponse::new(status, Vec::new(), body).map_err(reply_too_large)
     }
 }
 
@@ -851,6 +853,7 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
             events,
             cancel,
         )
+        .map_err(reply_too_large)
     }
     /// [`Self::invoke_sync`] with live text delivery: text deltas are
     /// forwarded to `on_text` as they arrive from the wire (via
@@ -904,6 +907,7 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
             events,
             cancel,
         )
+        .map_err(reply_too_large)
     }
 }
 
@@ -952,13 +956,26 @@ fn encode_for_endpoint(
     Ok(payload)
 }
 
-/// A reply's own malformation — a tool id or name out of the alphabet or
-/// over its length bound — is the provider's failure (`Permanent`): never a
-/// request refused before sending (`InvalidRequest`), and never a context
+/// A reply's malformed tool identifier — an id or name out of the alphabet
+/// or over its length bound — is the provider's failure (`Permanent`): never
+/// a request refused before sending (`InvalidRequest`), and never a context
 /// bound (`BoundExceeded`), which would have the host compact the
-/// conversation to "fix" a reply.
-pub(crate) fn reply_error(_err: ProviderError) -> ProviderError {
-    ProviderError::Permanent
+/// conversation to "fix" a reply. Anything else (a cancellation) is kept.
+pub(crate) fn malformed_reply_identifier(err: ProviderError) -> ProviderError {
+    match err {
+        ProviderError::InvalidRequest | ProviderError::BoundExceeded => ProviderError::Permanent,
+        other => other,
+    }
+}
+
+/// A limit the reply broke — its size, its headers, its events — is the
+/// provider's failure (`Permanent`): compacting the conversation would not
+/// shrink the reply, so it is never a context bound.
+pub(crate) fn reply_too_large(err: ProviderError) -> ProviderError {
+    match err {
+        ProviderError::BoundExceeded => ProviderError::Permanent,
+        other => other,
+    }
 }
 
 /// Convert a canonical request to the provider JSON object (no secrets).
@@ -1344,7 +1361,7 @@ fn parse_provider_stream(
     cancel.check()?;
     let text = std::str::from_utf8(body).map_err(|_| ProviderError::Permanent)?;
     let mut events = Vec::new();
-    let mut tool_ids: BTreeMap<u32, ToolCallId> = BTreeMap::new();
+    let mut tool_ids = ChatToolCalls::default();
     let mut response_tools: BTreeMap<String, ToolCallId> = BTreeMap::new();
     let mut finish = None;
     let mut usage = NormalizedUsage::new(None, None, None, None, None, None, UsageCost::Unknown);
@@ -1388,7 +1405,7 @@ fn parse_provider_stream(
             }
         }
         if events.len() > MAX_STREAM_EVENTS {
-            return Err(ProviderError::BoundExceeded);
+            return Err(ProviderError::Permanent);
         }
     }
 
@@ -1479,7 +1496,7 @@ fn map_in_stream_error(value: &Value) -> Result<Vec<ModelStreamEvent>, ProviderE
 fn ingest_chat_chunk(
     value: &Value,
     events: &mut Vec<ModelStreamEvent>,
-    tool_ids: &mut BTreeMap<u32, ToolCallId>,
+    tool_ids: &mut ChatToolCalls,
     finish: &mut Option<FinishReason>,
     usage: &mut NormalizedUsage,
     cancel: &CancellationToken,
@@ -1509,19 +1526,27 @@ fn ingest_chat_chunk(
     Ok(())
 }
 
+/// The chat dialect's tool calls so far: the id each `index` last named, and
+/// the name each started id was given.
+#[derive(Default)]
+struct ChatToolCalls {
+    by_index: BTreeMap<u32, ToolCallId>,
+    started: std::collections::HashMap<ToolCallId, ToolName>,
+}
+
 fn ingest_chat_tool_deltas(
     calls: &[Value],
     events: &mut Vec<ModelStreamEvent>,
-    tool_ids: &mut BTreeMap<u32, ToolCallId>,
+    tool_ids: &mut ChatToolCalls,
 ) -> Result<(), ProviderError> {
     for call in calls {
         let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
-        if let Some(id) = call
+        let named = if let Some(id) = call
             .get("id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
         {
-            let call_id = ToolCallId::parse(id).map_err(reply_error)?;
+            let call_id = ToolCallId::parse(id).map_err(malformed_reply_identifier)?;
             let name = call
                 .get("function")
                 .and_then(|function| function.get("name"))
@@ -1534,24 +1559,33 @@ fn ingest_chat_tool_deltas(
                 })
                 .map(ToolName::parse)
                 .transpose()
-                .map_err(reply_error)?;
-            match name {
-                Some(name) => push_event(
-                    events,
-                    ModelStreamEvent::ToolCallStart {
-                        call_id: call_id.clone(),
-                        name,
-                    },
-                )?,
-                // The same id repeated on a later delta of a started call is
-                // fine; a new call without a name could never be run.
-                None if tool_ids.get(&index) != Some(&call_id) => {
+                .map_err(malformed_reply_identifier)?;
+            // A started id continues its call wherever it appears (a server
+            // may omit `index`, or interleave calls); repeating its name
+            // starts nothing new, and renaming it is malformed. A new id
+            // without a name is a call that could never be run.
+            match (tool_ids.started.get(&call_id), name) {
+                (Some(started), Some(name)) if *started != name => {
                     return Err(ProviderError::Permanent);
                 }
-                None => {}
+                (Some(_), _) => {}
+                (None, Some(name)) => {
+                    push_event(
+                        events,
+                        ModelStreamEvent::ToolCallStart {
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                        },
+                    )?;
+                    tool_ids.started.insert(call_id.clone(), name);
+                }
+                (None, None) => return Err(ProviderError::Permanent),
             }
-            tool_ids.insert(index, call_id);
-        }
+            tool_ids.by_index.insert(index, call_id.clone());
+            Some(call_id)
+        } else {
+            None
+        };
         let arguments = call
             .get("function")
             .and_then(|function| function.get("arguments"))
@@ -1559,9 +1593,8 @@ fn ingest_chat_tool_deltas(
             .or_else(|| call.get("arguments").and_then(Value::as_str))
             .unwrap_or("");
         if !arguments.is_empty() {
-            let call_id = tool_ids
-                .get(&index)
-                .cloned()
+            let call_id = named
+                .or_else(|| tool_ids.by_index.get(&index).cloned())
                 .ok_or(ProviderError::Permanent)?;
             push_argument_deltas(events, call_id, arguments)?;
         }
@@ -1673,8 +1706,8 @@ fn ingest_responses_item(
         .get("name")
         .and_then(Value::as_str)
         .ok_or(ProviderError::Permanent)?;
-    let parsed_id = ToolCallId::parse(call_id).map_err(reply_error)?;
-    let parsed_name = ToolName::parse(name).map_err(reply_error)?;
+    let parsed_id = ToolCallId::parse(call_id).map_err(malformed_reply_identifier)?;
+    let parsed_name = ToolName::parse(name).map_err(malformed_reply_identifier)?;
     if let Some(item_id) = item.get("id").and_then(Value::as_str) {
         tools.insert(item_id.to_owned(), parsed_id.clone());
     }
@@ -1703,9 +1736,14 @@ fn ingest_non_stream_completion(
     cancel: &CancellationToken,
 ) -> Result<(), ProviderError> {
     match style {
-        OpenAiApiStyle::ChatCompletions => {
-            ingest_chat_chunk(value, events, &mut BTreeMap::new(), finish, usage, cancel)
-        }
+        OpenAiApiStyle::ChatCompletions => ingest_chat_chunk(
+            value,
+            events,
+            &mut ChatToolCalls::default(),
+            finish,
+            usage,
+            cancel,
+        ),
         OpenAiApiStyle::Responses => {
             ingest_responses_event(value, events, &mut BTreeMap::new(), finish, usage, cancel)
         }
@@ -1823,12 +1861,43 @@ fn push_argument_deltas(
     Ok(())
 }
 
-fn push_event(
+/// Append `event`, merged into the last one when both are deltas of the same
+/// text or the same call's arguments and together fit
+/// [`MAX_STREAM_DELTA_BYTES`]: servers send a delta per token, and the event
+/// bound counts bytes this way rather than frames. Past the bound the reply
+/// is the provider's failure, never a context bound.
+pub(crate) fn push_event(
     events: &mut Vec<ModelStreamEvent>,
     event: ModelStreamEvent,
 ) -> Result<(), ProviderError> {
+    let merged = match (events.last_mut(), &event) {
+        (
+            Some(ModelStreamEvent::TextDelta { text: last }),
+            ModelStreamEvent::TextDelta { text },
+        ) if last.len() + text.len() <= MAX_STREAM_DELTA_BYTES => {
+            last.push_str(text);
+            true
+        }
+        (
+            Some(ModelStreamEvent::ToolCallArgumentsDelta {
+                call_id: last_id,
+                arguments_delta: last,
+            }),
+            ModelStreamEvent::ToolCallArgumentsDelta {
+                call_id,
+                arguments_delta,
+            },
+        ) if last_id == call_id && last.len() + arguments_delta.len() <= MAX_STREAM_DELTA_BYTES => {
+            last.push_str(arguments_delta);
+            true
+        }
+        _ => false,
+    };
+    if merged {
+        return Ok(());
+    }
     if events.len() >= MAX_STREAM_EVENTS {
-        return Err(ProviderError::BoundExceeded);
+        return Err(ProviderError::Permanent);
     }
     events.push(event);
     Ok(())
@@ -3596,32 +3665,179 @@ mod tests {
     }
 
     #[test]
-    fn oversized_response_is_bound_exceeded() {
+    fn an_oversized_reply_is_the_providers_failure_not_a_context_bound() {
+        // Compacting the conversation would not shrink the reply.
         let huge = format!("data: {}\n\n", "x".repeat(MAX_HTTP_RESPONSE_BYTES + 8));
-        let server = FixtureServer::spawn(FixtureScript {
-            status: 200,
-            body: huge,
-            extra_headers: vec![],
-        });
         let store = store_with_canary();
-        let transport = Http1Transport::with_limits(
-            StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"),
-            Duration::from_secs(3),
-            1024,
+        for streaming in [false, true] {
+            // One fixture server per request: it serves once.
+            let server = FixtureServer::spawn(FixtureScript {
+                status: 200,
+                body: huge.clone(),
+                extra_headers: vec![],
+            });
+            let transport = Http1Transport::with_limits(
+                StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"),
+                Duration::from_secs(3),
+                1024,
+            );
+            let adapter = OpenAiCompatibleAdapter::new(
+                config(
+                    &server.base_url(),
+                    OpenAiApiStyle::ChatCompletions,
+                    caps(false, false),
+                ),
+                transport,
+                &store,
+            );
+            let err = if streaming {
+                adapter
+                    .invoke_sync_streaming(request(false, false), &live(), &mut |_| {})
+                    .expect_err("bound")
+            } else {
+                adapter
+                    .invoke_sync(request(false, false), &live())
+                    .expect_err("bound")
+            };
+            assert_eq!(err, ProviderError::Permanent, "streaming={streaming}");
+        }
+        assert_eq!(
+            reply_too_large(ProviderError::Cancelled),
+            ProviderError::Cancelled
         );
-        let adapter = OpenAiCompatibleAdapter::new(
-            config(
-                &server.base_url(),
-                OpenAiApiStyle::ChatCompletions,
-                caps(false, false),
-            ),
-            transport,
-            &store,
+        assert_eq!(
+            malformed_reply_identifier(ProviderError::Cancelled),
+            ProviderError::Cancelled,
+            "only an identifier's own failures are the reply's"
         );
-        let err = adapter
-            .invoke_sync(request(false, false), &live())
-            .expect_err("bound");
-        assert_eq!(err, ProviderError::BoundExceeded);
+    }
+
+    fn chat_frames(calls: &[&str]) -> String {
+        let mut body: String = calls
+            .iter()
+            .map(|call| {
+                format!(
+                    "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{call}]}}}}]}}\n\n"
+                )
+            })
+            .collect();
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    fn arguments_of(events: &[ModelStreamEvent], id: &str) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ModelStreamEvent::ToolCallArgumentsDelta {
+                    call_id,
+                    arguments_delta,
+                } if call_id.as_str() == id => Some(arguments_delta.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn starts_in(events: &[ModelStreamEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| matches!(event, ModelStreamEvent::ToolCallStart { .. }))
+            .count()
+    }
+
+    #[test]
+    fn tool_calls_are_judged_by_id_wherever_their_deltas_arrive() {
+        let parse = |body: String| {
+            parse_provider_stream(OpenAiApiStyle::ChatCompletions, body.as_bytes(), &live())
+        };
+        // No `index`, two calls interleaved: each call's arguments by its id.
+        let events = parse(chat_frames(&[
+            r#"{"id":"a","type":"function","function":{"name":"read","arguments":""}}"#,
+            r#"{"id":"b","type":"function","function":{"name":"list","arguments":""}}"#,
+            r#"{"id":"a","type":"function","function":{"arguments":"{\"p\":1}"}}"#,
+            r#"{"id":"b","type":"function","function":{"arguments":"{}"}}"#,
+        ]))
+        .expect("interleaved by id");
+        assert_eq!(starts_in(&events), 2);
+        assert_eq!(arguments_of(&events, "a"), r#"{"p":1}"#);
+        assert_eq!(arguments_of(&events, "b"), "{}");
+        // The id and name repeated on every delta start one call.
+        let events = parse(chat_frames(&[
+            r#"{"index":0,"id":"a","type":"function","function":{"name":"read","arguments":"{\"p\""}}"#,
+            r#"{"index":0,"id":"a","type":"function","function":{"name":"read","arguments":":1}"}}"#,
+        ]))
+        .expect("repeated");
+        assert_eq!(starts_in(&events), 1);
+        assert_eq!(arguments_of(&events, "a"), r#"{"p":1}"#);
+        // A started call renamed, and arguments for an id never started.
+        for calls in [
+            [
+                r#"{"index":0,"id":"a","type":"function","function":{"name":"read","arguments":""}}"#,
+                r#"{"index":0,"id":"a","type":"function","function":{"name":"write","arguments":""}}"#,
+            ],
+            [
+                r#"{"index":0,"id":"a","type":"function","function":{"name":"read","arguments":""}}"#,
+                r#"{"index":0,"id":"z","type":"function","function":{"arguments":"{}"}}"#,
+            ],
+        ] {
+            assert_eq!(
+                parse(chat_frames(&calls)).expect_err("malformed"),
+                ProviderError::Permanent,
+                "{calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_of_many_small_deltas_is_merged_under_the_event_bound() {
+        // A delta per token: more frames than the event bound, merged into
+        // deltas no longer than the delta bound.
+        let frames = MAX_STREAM_EVENTS + 904;
+        let mut body = String::new();
+        for _ in 0..frames {
+            body.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ab\"}}]}\n\n");
+        }
+        body.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"write\",\"arguments\":\"\"}}]}}]}\n\n");
+        for _ in 0..frames {
+            body.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"x\"}}]}}]}\n\n");
+        }
+        body.push_str("data: [DONE]\n\n");
+        let events =
+            parse_provider_stream(OpenAiApiStyle::ChatCompletions, body.as_bytes(), &live())
+                .expect("merged");
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ModelStreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "ab".repeat(frames));
+        assert_eq!(arguments_of(&events, "c1"), "x".repeat(frames));
+        assert!(events.len() < 16, "{} events", events.len());
+        assert!(events.iter().all(|event| match event {
+            ModelStreamEvent::TextDelta { text }
+            | ModelStreamEvent::ToolCallArgumentsDelta {
+                arguments_delta: text,
+                ..
+            } => text.len() <= MAX_STREAM_DELTA_BYTES,
+            _ => true,
+        }));
+        // Deltas that cannot merge still meet the bound, and past it the
+        // reply is the provider's failure, never a context bound.
+        let mut body = String::from(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"write\",\"arguments\":\"\"}}]}}]}\n\n",
+        );
+        for _ in 0..=MAX_STREAM_EVENTS / 2 {
+            body.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n");
+            body.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"x\"}}]}}]}\n\n");
+        }
+        body.push_str("data: [DONE]\n\n");
+        assert_eq!(
+            parse_provider_stream(OpenAiApiStyle::ChatCompletions, body.as_bytes(), &live())
+                .expect_err("over the bound"),
+            ProviderError::Permanent
+        );
     }
 
     #[test]

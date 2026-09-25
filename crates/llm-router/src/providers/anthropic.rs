@@ -22,7 +22,7 @@ use crate::provider::{
 };
 use crate::providers::openai_compatible::{
     HttpTransport, MAX_HTTP_REQUEST_BYTES, OpenAiApiStyle, OpenAiCompatibleEndpoint,
-    ProviderHttpRequest,
+    ProviderHttpRequest, push_event, reply_too_large,
 };
 
 /// Wire schema name for [`AnthropicConfig`].
@@ -173,6 +173,7 @@ impl<'store, T: HttpTransport> AnthropicAdapter<'store, T> {
             events,
             cancel,
         )
+        .map_err(reply_too_large)
     }
 
     /// Progressive delivery: the transport's streaming path feeds chunks to
@@ -230,6 +231,7 @@ impl<'store, T: HttpTransport> AnthropicAdapter<'store, T> {
             events,
             cancel,
         )
+        .map_err(reply_too_large)
     }
 }
 
@@ -688,7 +690,7 @@ fn parse_anthropic_stream(
             cancel,
         )?;
         if events.len() > MAX_STREAM_EVENTS {
-            return Err(ProviderError::BoundExceeded);
+            return Err(ProviderError::Permanent);
         }
     }
 
@@ -808,10 +810,10 @@ fn ingest_content_block_start(
             .get("name")
             .and_then(Value::as_str)
             .ok_or(ProviderError::Permanent)?;
-        let parsed_id =
-            ToolCallId::parse(call_id).map_err(crate::providers::openai_compatible::reply_error)?;
-        let parsed_name =
-            ToolName::parse(name).map_err(crate::providers::openai_compatible::reply_error)?;
+        let parsed_id = ToolCallId::parse(call_id)
+            .map_err(crate::providers::openai_compatible::malformed_reply_identifier)?;
+        let parsed_name = ToolName::parse(name)
+            .map_err(crate::providers::openai_compatible::malformed_reply_identifier)?;
         tool_ids.insert(index, parsed_id.clone());
         push_event(
             events,
@@ -903,13 +905,14 @@ fn ingest_non_stream_message(
                         .and_then(Value::as_str)
                         .ok_or(ProviderError::Permanent)?;
                     let parsed_id = ToolCallId::parse(call_id)
-                        .map_err(crate::providers::openai_compatible::reply_error)?;
+                        .map_err(crate::providers::openai_compatible::malformed_reply_identifier)?;
                     push_event(
                         events,
                         ModelStreamEvent::ToolCallStart {
                             call_id: parsed_id.clone(),
-                            name: ToolName::parse(name)
-                                .map_err(crate::providers::openai_compatible::reply_error)?,
+                            name: ToolName::parse(name).map_err(
+                                crate::providers::openai_compatible::malformed_reply_identifier,
+                            )?,
                         },
                     )?;
                     if let Some(input) = block.get("input") {
@@ -1060,17 +1063,6 @@ fn push_argument_deltas(
             },
         )?;
     }
-    Ok(())
-}
-
-fn push_event(
-    events: &mut Vec<ModelStreamEvent>,
-    event: ModelStreamEvent,
-) -> Result<(), ProviderError> {
-    if events.len() >= MAX_STREAM_EVENTS {
-        return Err(ProviderError::BoundExceeded);
-    }
-    events.push(event);
     Ok(())
 }
 
@@ -1395,6 +1387,39 @@ mod tests {
             .to_owned()
     }
 
+    #[test]
+    fn a_reply_of_many_small_deltas_is_merged_under_the_event_bound() {
+        let frames = MAX_STREAM_EVENTS + 904;
+        let mut body = String::from(
+            "event: message_start\n\
+             data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n\
+             event: content_block_start\n\
+             data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        );
+        for _ in 0..frames {
+            body.push_str(
+                "event: content_block_delta\n\
+                 data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ab\"}}\n\n",
+            );
+        }
+        body.push_str(
+            "event: message_delta\n\
+             data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n\
+             event: message_stop\n\
+             data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let events = parse_anthropic_stream(body.as_bytes(), &live()).expect("merged");
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ModelStreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "ab".repeat(frames));
+        assert!(events.len() < 16, "{} events", events.len());
+    }
+
     fn sse_tools() -> String {
         "event: message_start\n\
          data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n\
@@ -1531,13 +1556,9 @@ mod tests {
         let adapter = adapter(&store, transport, caps(false, false));
         let stream = block_on(adapter.invoke(request(false, false), live())).expect("invoke");
         let events = stream.events();
-        assert!(
-            events.iter().any(
-                |event| matches!(event, ModelStreamEvent::TextDelta { text } if text == "Hello")
-            )
-        );
+        // Adjacent text deltas arrive merged.
         assert!(events.iter().any(
-            |event| matches!(event, ModelStreamEvent::TextDelta { text } if text == " world")
+            |event| matches!(event, ModelStreamEvent::TextDelta { text } if text == "Hello world")
         ));
         let usage = stream.terminal_usage().expect("usage");
         assert_eq!(usage.input_tokens(), Some(14));
@@ -1933,6 +1954,23 @@ mod tests {
             parse_anthropic_stream(bad_id, &cancel).expect_err("bad id"),
             ProviderError::Permanent
         );
+        // Over the id's length bound, streamed and whole: the reply's
+        // failure, never a context bound.
+        let long_id = "t".repeat(crate::provider::MAX_TOOL_CALL_ID_BYTES + 1);
+        for body in [
+            format!(
+                "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"{long_id}\",\"name\":\"x\",\"input\":{{}}}}}}\n\n"
+            ),
+            format!(
+                r#"{{"content":[{{"type":"tool_use","id":"{long_id}","name":"x","input":{{}}}}],"stop_reason":"tool_use"}}"#
+            ),
+        ] {
+            assert_eq!(
+                parse_anthropic_stream(body.as_bytes(), &cancel).expect_err("long id"),
+                ProviderError::Permanent,
+                "{body}"
+            );
+        }
     }
 
     #[test]
