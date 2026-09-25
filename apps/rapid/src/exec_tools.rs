@@ -2339,8 +2339,10 @@ impl WorkspaceTools {
     }
 
     /// Whether `tool` is a real tool of this driver: on its surface, and for
-    /// an MCP tool, advertised by a server that came up. A server that did
-    /// not come up leaves only its `offline` marker, whose calls fail.
+    /// an MCP tool, one whose call reaches a server that came up — the
+    /// server `execute_mcp_tool` resolves the name to (up to its first
+    /// `__`), not the one the surface recorded. A server that did not come
+    /// up leaves only its `offline` marker, whose calls fail.
     fn offers_tool(&self, tool: &str) -> bool {
         if !self
             .tool_surface()
@@ -2349,20 +2351,18 @@ impl WorkspaceTools {
         {
             return false;
         }
-        let server = self
-            .mcp_surface
+        let Some(rest) = tool.strip_prefix("mcp__") else {
+            return true;
+        };
+        let Some((server, _)) = rest.split_once("__") else {
+            return false;
+        };
+        self.mcp
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
-            .find(|(name, _, _)| name == tool)
-            .map(|(_, server, _)| server.clone());
-        server.is_none_or(|server| {
-            self.mcp
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .iter()
-                .any(|connection| connection.server == server && connection.online)
-        })
+            .find(|connection| connection.server == server)
+            .is_some_and(|connection| connection.online)
     }
 
     /// Permission decision for one validated call. Total: every call of a
@@ -9196,7 +9196,11 @@ mod tests {
         // joined argv names no one command, a write whose path cannot be
         // read has no subject to name (a bare-tool grant would cover every
         // write), a tool this driver does not offer is a name the model made
-        // up, and an unavailable server's marker is no tool at all.
+        // up, an unavailable server's marker is no tool at all, and a tool of
+        // a server named `db_` is dispatched to a server `db` that does not
+        // exist, so its every call fails. Plan mode does not stop the grant:
+        // the next lattice (the continuation's, or a later turn's) comes
+        // with tools whose plan mode is off, where the grant answers.
         let root = TempRoot::new("standing-grant");
         let approvals = Arc::new(RecordingApprovalSink::default());
         let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default)
@@ -9209,6 +9213,7 @@ mod tests {
         for (tool, server, online) in [
             ("mcp__srv__lookup", "srv", true),
             ("mcp__down__offline", "down", false),
+            ("mcp__db___query", "db_", true),
         ] {
             tools.mcp_surface.lock().expect("mcp surface").push((
                 tool.to_owned(),
@@ -9243,12 +9248,21 @@ mod tests {
             make_call("c5", "mcp__absent__lookup", "{}"),
             make_call("c6", "mcp__srv__lookup", "{}"),
             make_call("c7", "mcp__down__offline", "{}"),
+            make_call("c8", "mcp__db___query", "{}"),
         ] {
             assert!(matches!(
                 run_one(&mut tools, &call),
                 ToolStepResult::ApprovalRequired { .. }
             ));
         }
+        assert!(matches!(
+            run_one(&mut tools, &make_call("p1", PLAN_ENTER_TOOL, "{}")),
+            ToolStepResult::Succeeded { .. }
+        ));
+        assert!(matches!(
+            run_one(&mut tools, &write_call("c9", "later.txt")),
+            ToolStepResult::ApprovalRequired { .. }
+        ));
         let requests = approvals.requests.lock().unwrap_or_else(|p| p.into_inner());
         let remembered: Vec<Option<&str>> = requests
             .iter()
@@ -9263,7 +9277,9 @@ mod tests {
                 None,
                 None,
                 Some("mcp__srv__lookup"),
-                None
+                None,
+                None,
+                Some("workspace_write(later.txt)")
             ],
             "{requests:#?}"
         );
