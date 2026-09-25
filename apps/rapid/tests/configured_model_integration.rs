@@ -265,14 +265,28 @@ fn anthropic_provider_builds_and_reaches_the_loopback_server() {
 // Real-binary end-to-end: the actual `rapid` executable with RAPIDLM_CONFIG.
 // ---------------------------------------------------------------------------
 
+/// The project `run_rapid` runs in: a directory of its own under the test's
+/// HOME, marked with `.rapidlm` so its root resolves there whatever encloses
+/// the temp directory.
+fn exec_project(home: &Path) -> PathBuf {
+    home.join("project")
+}
+
+/// `rapid exec` in [`exec_project`], never in the test process's working
+/// directory: that is this crate's directory, and a run there resolves the
+/// repository as its project and accrues its turn to whatever goal the
+/// repository's own `.rapidlm/goal.json` holds active.
 fn run_rapid(
     config_path: Option<&PathBuf>,
     model_override: Option<&str>,
     home: &PathBuf,
 ) -> (Option<i32>, String, String) {
+    let project = exec_project(home);
+    std::fs::create_dir_all(project.join(".rapidlm")).expect("project marker");
     let mut command = Command::new(env!("CARGO_BIN_EXE_rapid"));
     command
         .args(["exec", "ship the scripted feature"])
+        .current_dir(&project)
         .env("HOME", home)
         .env_remove("RAPIDLM_HOME")
         .env_remove("RAPIDLM_CONFIG")
@@ -289,6 +303,27 @@ fn run_rapid(
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+/// `rapid sessions list` in [`exec_project`] under the same HOME: where a
+/// `run_rapid` exec's session must be recorded.
+fn sessions_in_exec_project(home: &Path) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
+        .args(["sessions", "list"])
+        .current_dir(exec_project(home))
+        .env("HOME", home)
+        .env_remove("RAPIDLM_HOME")
+        .env_remove("RAPIDLM_CONFIG")
+        .env_remove("RAPIDLM_MODEL")
+        .output()
+        .expect("run rapid sessions list");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 #[test]
@@ -310,6 +345,10 @@ fn binary_exec_uses_configured_model_end_to_end() {
     let requests = server.requests.lock().expect("requests");
     assert!(!requests.is_empty(), "no request reached the provider");
     assert!(requests[0].contains("\"model\":\"test-model\""));
+    // The turn is recorded in its own project, not in the repository that
+    // encloses this test's working directory.
+    let listed = sessions_in_exec_project(&dir);
+    assert!(listed.contains("count=1"), "{listed}");
 }
 
 #[test]
@@ -328,6 +367,8 @@ fn binary_exec_without_config_takes_the_typed_fallback() {
         stderr.contains("agent turn failed"),
         "typed provider failure missing: {stderr}"
     );
+    let listed = sessions_in_exec_project(&dir);
+    assert!(listed.contains("count=1"), "{listed}");
 }
 
 #[test]

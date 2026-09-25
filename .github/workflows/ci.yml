@@ -65,6 +65,18 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
 
+      # Every project the suite drives lives in a temp directory of its own.
+      # A run that resolved this repository as its project accrued its turns
+      # to the goal committed in `.rapidlm/goal.json` and left a session
+      # ledger beside it; nothing may land there again.
+      - name: Tests leave the repository's .rapidlm untouched
+        run: |
+          leaked="$(git status --porcelain --ignored --untracked-files=all -- .rapidlm)"
+          if [ -n "$leaked" ]; then
+            printf '%s\n' "$leaked"
+            exit 1
+          fi
+
       - name: Schema fixtures
         run: cargo test --locked -p protocol --test schema_fixtures
 
