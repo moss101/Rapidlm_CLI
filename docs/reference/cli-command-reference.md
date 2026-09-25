@@ -47,7 +47,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 | `rapid eval --offline\|--live [--grant-shell] [--trials <n>] [--arms <names>] [--suite <dir>] [--scratch <dir>]` | evaluation harness (shipped): three suites (`eval/suite` representative, `eval/suite-smoke` mechanical smoke, `eval/suite-heldout` held-out), grading v2 outside the agent workspace (protected-file integrity, verification, mutation checks), typed infrastructure skips via a health probe, per-arm accounting with coverage/lower-bound flags, full provenance; exit 0 only when every task of every requested arm passed — see `eval/README.md` |
 | `rapid inspect <session/run>` | diagnostic state |
 | `rapid export` | transcript/events/graph/evidence bundle |
-| `rapid doctor` | offline, read-only diagnosis of environment/home/config/model/context-budget/project/trust/sandbox/git/scanner/hooks/MCP/plugins and security posture (see the doctor section below) |
+| `rapid doctor [--live]` | offline (unless `--live`), read-only diagnosis of environment/home/config/model/context-budget/project/trust/sandbox/git/scanner/hooks/MCP/plugins and security posture (see the doctor section below) |
 | `rapid update` | signed updater |
 
 Global flags include project/workspace, session, model/provider, permission mode (`default|dont-ask|accept-edits` subject to policy), sandbox requirement, token/cost/time budgets, JSON/JSONL/no-color/quiet, daemon endpoint and trace verbosity. Privilege-affecting flags cannot exceed organization/user ceilings.
@@ -99,12 +99,24 @@ question only — is the thing checked required for core behavior?
 **Exit code.** `0` when no check failed; `1` when at least one did. Warnings and skips
 never fail the command: an absent optional integration is not a broken installation.
 
-**Network policy — offline by default, and there is no opt-in.** No check contacts a
-provider or makes a billable model call. Provider configuration is validated locally
-(endpoint parsing, capability pinning, credential seeding into a process-local store) and
-the model row says `connectivity not tested` rather than implying the endpoint was
-reached. An end-to-end test points a configured provider at a listener that records any
-connection and asserts it stays untouched.
+**Network policy — offline by default; `--live` opts in.** Without `--live` no check
+contacts a provider or makes a billable model call. Provider configuration is validated
+locally (endpoint parsing, capability pinning, credential seeding into a process-local
+store) and the model row says `connectivity not tested` rather than implying the endpoint
+was reached. An end-to-end test points a configured provider at a listener that records
+any connection and asserts it stays untouched.
+
+`rapid doctor --live` then probes every configured `[model.<id>]` — the model a run
+selecting that profile would build, managed gates applied — with the request `rapid
+setup` verifies with (at most 16 output tokens), through that profile's key and proxy
+(`[network] proxy`) and on an egress gate for exactly its endpoint. It adds one row per
+profile after the offline rows, in profile order: `live:<id>` `PASS` when the endpoint
+answered, `FAIL` with the class (`auth`, `quota`, `network`, `server`, `invalid`), what
+happened and the next command otherwise, each with its egress receipt (`egress: allowed
+<scheme>://<host>:<port>`, or what was refused and why). A profile the managed policy
+locks away is `SKIP`; no configured model is one `live` `WARN` pointing at `rapid setup`.
+A failed probe fails the command (exit `1`). Nothing is written: the receipt is reported,
+not recorded.
 
 **Read-only.** Doctor never grants or revokes trust, rewrites configuration, installs,
 approves or executes a plugin, runs a hook, or runs a scanner. It reads trust through the

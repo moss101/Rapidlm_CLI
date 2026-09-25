@@ -1259,7 +1259,8 @@ mod tests {
         for claim in [
             "Offline",
             "Read-only",
-            "connectivity not\ntested",
+            "\"connectivity not tested\"",
+            "--live",
             "Exit code",
         ] {
             assert!(DOCTOR_USAGE.contains(claim), "help missing {claim:?}");
@@ -1270,7 +1271,13 @@ mod tests {
 
     #[test]
     fn doctor_rejects_any_argument_instead_of_silently_ignoring_it() {
-        for arg in ["--json", "sandbox", "--live"] {
+        assert_eq!(parse_doctor_args(&[]), Ok(false));
+        assert_eq!(parse_doctor_args(&["--live".to_owned()]), Ok(true));
+        assert_eq!(
+            parse_doctor_args(&["--live".to_owned(), "--live".to_owned()]),
+            Err("--live".to_owned())
+        );
+        for arg in ["--json", "sandbox", "--live=1"] {
             assert!(
                 matches!(run_doctor(&[arg.to_owned()]), Err(P9CommandError::Usage)),
                 "`rapid doctor {arg}` must not look like it did something"
@@ -1419,15 +1426,17 @@ pub fn run_doctor(args: &[String]) -> Result<i32, P9CommandError> {
         print!("{DOCTOR_USAGE}");
         return Ok(0);
     }
-    // The command takes no arguments at all. Silently ignoring one would let
-    // `rapid doctor --json` or `rapid doctor sandbox` look like it did
-    // something it did not.
-    if let Some(unexpected) = args.first() {
-        eprintln!("rapid doctor: unexpected argument '{unexpected}'");
-        eprint!("{DOCTOR_USAGE}");
-        return Err(P9CommandError::Usage);
-    }
-    let report = crate::doctor::diagnose(&crate::doctor::DoctorEnv::from_process());
+    let live = match parse_doctor_args(args) {
+        Ok(live) => live,
+        Err(unexpected) => {
+            eprintln!("rapid doctor: unexpected argument '{unexpected}'");
+            eprint!("{DOCTOR_USAGE}");
+            return Err(P9CommandError::Usage);
+        }
+    };
+    let mut env = crate::doctor::DoctorEnv::from_process();
+    env.live = live;
+    let report = crate::doctor::diagnose(&env);
     print!("{}", report.render());
     Ok(report.exit_code())
 }
@@ -1492,23 +1501,45 @@ pub fn run_setup(args: &[String]) -> Result<i32, P9CommandError> {
 }
 
 /// `rapid doctor --help`.
+/// `rapid doctor [--live]`: whether `--live` was given. Anything else is
+/// refused — silently ignoring an argument would let `rapid doctor --json`
+/// or `rapid doctor sandbox` look like it did something it did not.
+fn parse_doctor_args(args: &[String]) -> Result<bool, String> {
+    let mut live = false;
+    for arg in args {
+        match arg.as_str() {
+            "--live" if !live => live = true,
+            _ => return Err(arg.clone()),
+        }
+    }
+    Ok(live)
+}
+
 pub const DOCTOR_USAGE: &str = "\
-usage: rapid doctor
+usage: rapid doctor [--live]
 
 Diagnose whether Rapid can operate in this environment and project. Every
 check drives the same configuration, model resolution, project trust,
 sandbox, and execution dependencies real commands use.
 
-Offline: no check contacts a provider or makes a billable model call. Model
-configuration is validated locally and reported as \"connectivity not
-tested\" rather than as verified.
+Offline by default: no check contacts a provider or makes a billable model
+call. Model configuration is validated locally and reported as
+\"connectivity not tested\" rather than as verified.
+
+  --live   after the offline checks, probe every configured [model.<id>]
+           with one request of at most 16 output tokens, through the client
+           a run would build (its key, its proxy) and on an egress gate for
+           exactly its endpoint: one live:<id> row per profile, passing
+           when it answered, failing with the class (auth, quota, network,
+           server, invalid), the egress receipt and the next step otherwise.
 
 Read-only: doctor never grants or revokes trust, rewrites configuration,
 installs or approves plugins, or executes hooks or scanners.
 
 Exit code:
   0   no check failed (warnings and skips do not fail the command)
-  1   at least one check required for core behavior failed
+  1   at least one check required for core behavior failed (with --live,
+      also: a profile's probe failed)
 ";
 
 /// `rapid sessions list|search <text> [--db <path>]` over the kernel

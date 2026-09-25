@@ -1387,17 +1387,71 @@ pub fn probe_egress(
     plan: &SetupPlan,
     env: &[(String, String)],
 ) -> Result<crate::provider_egress::ProviderEgress, String> {
-    let (scheme, host, port) = origin_of(&plan.choice.base_url)
-        .ok_or_else(|| "the planned endpoint has no origin".to_owned())?;
     let parsed = parse_config_document(&plan.document, "the planned config")
         .map_err(|err| err.to_string())?;
     let proxy = crate::user_config::resolve_proxy(env, &parsed).map_err(|err| err.to_string())?;
+    endpoint_egress(&plan.choice.base_url, proxy.as_ref())
+}
+
+/// The egress gate for one endpoint: exactly its origin, and the proxy
+/// `proxy` routes it through (if any).
+pub fn endpoint_egress(
+    base_url: &str,
+    proxy: Option<&llm_router::providers::dial::ProxyConfig>,
+) -> Result<crate::provider_egress::ProviderEgress, String> {
+    let (scheme, host, port) =
+        origin_of(base_url).ok_or_else(|| "the endpoint has no origin".to_owned())?;
     let https = scheme == "https";
     let via = proxy
-        .as_ref()
         .and_then(|proxy| proxy.for_target(https, &host, port))
         .map(|proxy| (proxy.host(), proxy.port()));
     crate::provider_egress::ProviderEgress::for_endpoint(https, &host, port, via)
+}
+
+/// What one live probe of a configured model found (`rapid doctor --live`).
+#[derive(Debug)]
+pub struct LiveProbe {
+    /// `scheme://host:port` of the endpoint probed.
+    pub endpoint: String,
+    pub result: Result<(), ProbeFailure>,
+    /// The egress gate's receipt: one per dial asked for.
+    pub receipts: Vec<crate::provider_egress::EgressReceipt>,
+}
+
+/// The live probe of a model as a run resolved it: the same bounded request
+/// as `rapid setup`'s verification, through the client a run builds (its
+/// key, its proxy), on an egress gate for exactly its endpoint. `Err` when
+/// the probe could not be set up (nothing was dialled).
+pub fn probe_resolved(
+    active: &crate::user_config::ActiveModel,
+    cancel: &llm_router::provider::CancellationToken,
+) -> Result<LiveProbe, String> {
+    let endpoint = origin_of(&active.entry.base_url)
+        .map(|(scheme, host, port)| format!("{scheme}://{host}:{port}"))
+        .ok_or_else(|| "base_url has no origin".to_owned())?;
+    let egress = std::sync::Arc::new(endpoint_egress(
+        &active.entry.base_url,
+        active.proxy.as_ref(),
+    )?);
+    let mut active = active.clone();
+    active.entry.max_tokens = Some(VERIFY_MAX_OUTPUT_TOKENS);
+    let sends_key = active.credential.plaintext.is_some();
+    let store = auth::InMemoryCredentialStore::new();
+    let gate: std::sync::Arc<dyn llm_router::providers::dial::DialGate> = egress.clone();
+    let result = match crate::model::ConfiguredModel::build_with_gate(&active, &store, Some(gate)) {
+        Err(crate::model::ModelConfigError::Credential { .. }) => Err(ProbeFailure::UnusableKey),
+        Err(crate::model::ModelConfigError::BaseUrl { .. }) => Err(ProbeFailure::Refused),
+        Err(err) => return Err(err.to_string()),
+        Ok(model) => model.probe(cancel).map_err(|err| match classify(&err) {
+            ProbeFailure::Auth if !sends_key => ProbeFailure::AuthNoKey,
+            failure => failure,
+        }),
+    };
+    Ok(LiveProbe {
+        endpoint,
+        result,
+        receipts: egress.receipts(),
+    })
 }
 
 /// The live verification (SEAM-02): one request of at most

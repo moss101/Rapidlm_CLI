@@ -681,3 +681,171 @@ fn the_sandbox_probe_executes_the_real_backend_and_leaves_the_project_untouched(
         "the project gained or lost files"
     );
 }
+
+/// A loopback model server answering every request with `status` and `body`,
+/// recording each request it read.
+fn model_server(status: u16, body: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+    use std::io::Write;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let origin = format!("http://{}", listener.local_addr().expect("addr"));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while let Ok(read) = stream.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text[..end]
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            log.lock()
+                .expect("lock")
+                .push(String::from_utf8_lossy(&buf).to_string());
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    (origin, seen)
+}
+
+#[test]
+fn live_probes_every_profile_once_and_reports_one_typed_row_each() {
+    // SEAM-02 AC-07: one typed check per profile; the offline rows are the
+    // same rows in the same order, the live ones follow them.
+    let (good, good_seen) = model_server(
+        200,
+        r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
+    );
+    let (refusing, refusing_seen) = model_server(401, r#"{"error":{"message":"bad key"}}"#);
+    let down = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let origin = format!("http://{}", listener.local_addr().expect("addr"));
+        drop(listener);
+        origin
+    };
+    let fixture = fixture("live");
+    let entry = |id: &str, origin: &str| {
+        format!(
+            "[model.{id}]\nprovider = \"openai-compatible\"\nmodel = \"test-model\"\n\
+             base_url = \"{origin}/v1\"\napi_key = \"doctor-live-secret-{id}\"\n\n"
+        )
+    };
+    let config = write_config(
+        &fixture,
+        &format!(
+            "[models]\ndefault = \"good\"\n\n{}{}{}",
+            entry("good", &good),
+            entry("refusing", &refusing),
+            entry("down", &down)
+        ),
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rapid"));
+    command
+        .args(["doctor", "--live"])
+        .current_dir(&fixture.project)
+        .env("HOME", &fixture.home)
+        .env("RAPIDLM_CONFIG", &config)
+        .env_remove("RAPIDLM_HOME")
+        .env_remove("RAPIDLM_MODEL")
+        .env_remove("RAPIDLM_MANAGED_CONFIG")
+        .env_remove("RAPIDLM_PROXY");
+    let output = command.output().expect("run rapid doctor --live");
+    let run = Run {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    };
+
+    assert_eq!(run.code, Some(1), "a probe failed:\n{}", run.stdout);
+    assert_eq!(run.status("live:good"), "PASS");
+    assert!(
+        run.row("live:good")
+            .contains(&format!("answered; egress: allowed {good}")),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(run.status("live:refusing"), "FAIL");
+    assert!(run.row("live:refusing").contains("auth:"), "{}", run.stdout);
+    assert_eq!(run.status("live:down"), "FAIL");
+    assert!(run.row("live:down").contains("network:"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("rapid doctor --live"),
+        "a failure names the next command:\n{}",
+        run.stdout
+    );
+    // The offline rows first, in their fixed order; then one row per profile
+    // (sorted), and nothing else.
+    let ids: Vec<String> = run
+        .stdout
+        .lines()
+        .filter(|line| {
+            ["PASS", "FAIL", "WARN", "SKIP"]
+                .iter()
+                .any(|label| line.starts_with(label))
+        })
+        .filter_map(|line| line.split_whitespace().nth(1).map(str::to_owned))
+        .collect();
+    let mut expected: Vec<String> = EXPECTED_CHECKS.iter().map(|id| (*id).to_owned()).collect();
+    expected.extend(["live:down", "live:good", "live:refusing"].map(str::to_owned));
+    assert_eq!(ids, expected);
+    // One bounded request each; no key ever printed.
+    for seen in [&good_seen, &refusing_seen] {
+        let requests = seen.lock().expect("lock").clone();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].contains("\"max_tokens\":16"), "{}", requests[0]);
+    }
+    for id in ["good", "refusing", "down"] {
+        let secret = format!("doctor-live-secret-{id}");
+        assert!(!run.stdout.contains(&secret) && !run.stderr.contains(&secret));
+    }
+
+    // Without --live: the same offline rows, and no request.
+    let offline = run_doctor_in(&fixture.project, &fixture.home, Some(&config));
+    assert!(!offline.stdout.contains("live:"), "{}", offline.stdout);
+    assert_eq!(good_seen.lock().expect("lock").len(), 1);
+}
+
+#[test]
+fn live_with_no_model_configured_warns_and_points_at_setup() {
+    let fixture = fixture("live-none");
+    let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
+        .args(["doctor", "--live"])
+        .current_dir(&fixture.project)
+        .env("HOME", &fixture.home)
+        .env_remove("RAPIDLM_HOME")
+        .env_remove("RAPIDLM_MODEL")
+        .env_remove("RAPIDLM_CONFIG")
+        .env_remove("RAPIDLM_MANAGED_CONFIG")
+        .output()
+        .expect("run");
+    let run = Run {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    };
+    assert_eq!(run.code, Some(0), "{}{}", run.stdout, run.stderr);
+    assert_eq!(run.status("live"), "WARN");
+    assert!(run.stdout.contains("-> run rapid setup"), "{}", run.stdout);
+}

@@ -144,7 +144,7 @@ impl Display for DoctorStatus {
 /// remediation when there is a real action to take.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DoctorCheck {
-    id: &'static str,
+    id: std::borrow::Cow<'static, str>,
     status: DoctorStatus,
     detail: String,
     remediation: Option<String>,
@@ -157,37 +157,45 @@ impl DoctorCheck {
     // surviving prefix unmatched by the redaction registry's full-length
     // needle — a real leak, found in review.
     fn new(
-        id: &'static str,
+        id: impl Into<std::borrow::Cow<'static, str>>,
         status: DoctorStatus,
         detail: impl Into<String>,
         remediation: Option<String>,
     ) -> Self {
         Self {
-            id,
+            id: id.into(),
             status,
             detail: detail.into(),
             remediation,
         }
     }
 
-    fn pass(id: &'static str, detail: impl Into<String>) -> Self {
+    fn pass(id: impl Into<std::borrow::Cow<'static, str>>, detail: impl Into<String>) -> Self {
         Self::new(id, DoctorStatus::Pass, detail, None)
     }
 
-    fn skipped(id: &'static str, detail: impl Into<String>) -> Self {
+    fn skipped(id: impl Into<std::borrow::Cow<'static, str>>, detail: impl Into<String>) -> Self {
         Self::new(id, DoctorStatus::Skipped, detail, None)
     }
 
-    fn warn(id: &'static str, detail: impl Into<String>, remediation: impl Into<String>) -> Self {
+    fn warn(
+        id: impl Into<std::borrow::Cow<'static, str>>,
+        detail: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
         Self::new(id, DoctorStatus::Warn, detail, Some(remediation.into()))
     }
 
-    fn fail(id: &'static str, detail: impl Into<String>, remediation: impl Into<String>) -> Self {
+    fn fail(
+        id: impl Into<std::borrow::Cow<'static, str>>,
+        detail: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
         Self::new(id, DoctorStatus::Fail, detail, Some(remediation.into()))
     }
 
-    pub fn id(&self) -> &'static str {
-        self.id
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     pub fn status(&self) -> DoctorStatus {
@@ -292,6 +300,9 @@ pub struct DoctorEnv {
     /// Run the real sandbox smoke probe. Off only for tests that must stay
     /// hermetic on hosts where spawning a sandboxed child is not meaningful.
     pub sandbox_probe: bool,
+    /// `--live`: after the offline checks, probe every configured profile
+    /// with one bounded request (S10: only when asked).
+    pub live: bool,
 }
 
 impl DoctorEnv {
@@ -301,6 +312,7 @@ impl DoctorEnv {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             env: std::env::vars().collect(),
             sandbox_probe: true,
+            live: false,
         }
     }
 }
@@ -522,12 +534,164 @@ pub fn diagnose(env: &DoctorEnv) -> DoctorReport {
     checks.push(check_security_policy(&security_report));
     checks.push(check_release_signature(&security_report));
 
+    // --- live: only when asked, after every offline row -----------------
+    if env.live {
+        checks.extend(check_live(&env.env, &mut secrets, &cancel));
+    }
+
     finalize(DoctorReport { checks }, &secrets)
 }
 
 // -------------------------------------------------------------------------
 // individual checks
 // -------------------------------------------------------------------------
+
+/// `--live`: one `live:<profile>` row per configured `[model.<id>]`, each
+/// the model a run selecting that profile would build (the managed gates
+/// applied), probed with `rapid setup`'s bounded request on an egress gate
+/// for exactly its endpoint. Every credential a probed profile resolves is
+/// added to `secrets`, so the report scrubs it.
+fn check_live(
+    env: &[(String, String)],
+    secrets: &mut Vec<String>,
+    cancel: &CancellationToken,
+) -> Vec<DoctorCheck> {
+    let source = crate::user_config::resolve_config_source(env);
+    let profiles = match crate::user_config::load_config(&source) {
+        Ok(Some(config)) => config.model_ids(),
+        Ok(None) => Vec::new(),
+        Err(err) => {
+            return vec![DoctorCheck::skipped(
+                "live",
+                format!("not probed: the configuration does not load ({err})"),
+            )];
+        }
+    };
+    if profiles.is_empty() {
+        return vec![DoctorCheck::warn(
+            "live",
+            "no model configured, nothing to probe",
+            "run rapid setup to configure and verify a model",
+        )];
+    }
+    let router_cancel = llm_router::provider::CancellationToken::new();
+    profiles
+        .into_iter()
+        .map(|profile| {
+            let id = format!("live:{profile}");
+            if cancel.is_cancelled() {
+                return DoctorCheck::skipped(id, "not probed: cancelled");
+            }
+            let active =
+                match crate::user_config::select_active_model_with_override(env, Some(&profile)) {
+                    Ok(crate::user_config::ModelSelection::Configured { active, .. }) => active,
+                    Ok(crate::user_config::ModelSelection::Unconfigured { .. }) => {
+                        return DoctorCheck::skipped(id, "not probed: no configuration resolves");
+                    }
+                    Err(err) => {
+                        return DoctorCheck::fail(
+                            id,
+                            format!("not probed: {err}"),
+                            format!("fix [model.{profile}] (rapid setup --profile {profile})"),
+                        );
+                    }
+                };
+            if active.profile_id != profile {
+                return DoctorCheck::skipped(
+                    id,
+                    format!(
+                        "not probed: the managed policy locks the model to {}",
+                        active.profile_id
+                    ),
+                );
+            }
+            if let Some(key) = &active.credential.plaintext {
+                secrets.push(key.clone());
+            }
+            match crate::setup::probe_resolved(&active, &router_cancel) {
+                Err(reason) => DoctorCheck::fail(
+                    id,
+                    format!("not probed: {reason}"),
+                    format!("fix [model.{profile}] (rapid setup --profile {profile})"),
+                ),
+                Ok(probe) => live_row(id, &profile, &probe),
+            }
+        })
+        .collect()
+}
+
+/// The row for one probe: what answered (or the failure class), then the
+/// egress receipt.
+fn live_row(id: String, profile: &str, probe: &crate::setup::LiveProbe) -> DoctorCheck {
+    use crate::setup::ProbeFailure as F;
+    let egress = if probe.receipts.is_empty() {
+        "egress: nothing dialled".to_owned()
+    } else {
+        let decisions: Vec<String> = probe
+            .receipts
+            .iter()
+            .map(|receipt| match (&receipt.reason, receipt.allowed) {
+                (_, true) => format!("allowed {}", receipt.dialled),
+                (Some(reason), false) => format!("refused {} ({reason})", receipt.dialled),
+                (None, false) => format!("refused {}", receipt.dialled),
+            })
+            .collect();
+        format!("egress: {}", decisions.join(", "))
+    };
+    let endpoint = &probe.endpoint;
+    let failure = match &probe.result {
+        Ok(()) => {
+            return DoctorCheck::pass(id, format!("{endpoint} answered; {egress}"));
+        }
+        Err(failure) => failure,
+    };
+    let (what, next) = match failure {
+        F::Auth => (
+            format!("{endpoint} refused the key"),
+            format!("check the key, or give another with rapid setup --profile {profile}"),
+        ),
+        F::AuthNoKey | F::NoKey { .. } | F::KeptKeyUnset { .. } | F::KeyNotRead { .. } => (
+            format!("{endpoint} requires a key and none was sent"),
+            format!(
+                "set the variable [model.{profile}] env_key names, or give a key with rapid setup \
+--profile {profile}"
+            ),
+        ),
+        F::UnusableKey => (
+            "the key cannot be sent (characters no HTTP header can carry, or too long)".to_owned(),
+            "check the key for a stray line break".to_owned(),
+        ),
+        F::Quota => (
+            format!("{endpoint} reports no quota or credit left, or a rate limit"),
+            "check the account's billing and limits".to_owned(),
+        ),
+        F::ProxyAuth => (
+            "the proxy on the way refused its credentials".to_owned(),
+            "check the user and password in the proxy variable".to_owned(),
+        ),
+        F::Network => (
+            format!("{endpoint} could not be reached"),
+            format!("check base_url in [model.{profile}], the network, and [network] proxy"),
+        ),
+        F::Refused => (
+            format!("rapid does not dial {endpoint}, so nothing was sent"),
+            format!("check base_url in [model.{profile}]"),
+        ),
+        F::Server => (
+            format!("{endpoint} failed on its side"),
+            "run rapid doctor --live again later".to_owned(),
+        ),
+        F::Invalid => (
+            format!("{endpoint} did not answer as its provider kind would, or refused the request"),
+            format!("check provider, base_url and model in [model.{profile}]"),
+        ),
+    };
+    DoctorCheck::fail(
+        id,
+        format!("{}: {what}; {egress}", failure.class()),
+        format!("{next}, then run rapid doctor --live"),
+    )
+}
 
 fn check_environment() -> DoctorCheck {
     DoctorCheck::pass(
